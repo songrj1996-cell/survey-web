@@ -1,0 +1,24 @@
+# secrets / env
+.env
+*.env.local
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+
+# runtime data (prompts.json / history.json are generated at runtime)
+data/
+
+# editor / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# binaries / archives
+*.exe
+*.zip
