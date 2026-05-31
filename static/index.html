@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/style.css" />
+  <link rel="stylesheet" href="/static/style.css?v=2" />
 </head>
 <body>
   <div class="aurora" aria-hidden="true">
@@ -122,8 +122,9 @@
       <section class="panel" id="panel-1">
         <div class="panel__header">
           <h1 class="panel__title">上传问卷数据</h1>
-          <p class="panel__desc">支持 CSV 和 Excel (.xlsx/.xls) 格式，第一行应为列名（表头）</p>
         </div>
+
+        <div class="upload-guide" id="upload-guide"></div>
 
         <div class="upload-zone" id="upload-zone">
           <input type="file" id="file-input" accept=".csv,.xlsx,.xls" hidden />
@@ -137,30 +138,6 @@
           <div class="upload-zone__text">
             <span class="upload-zone__primary">拖放文件到这里，或点击选择</span>
             <span class="upload-zone__secondary">支持 CSV / Excel（最大 50MB）</span>
-          </div>
-        </div>
-
-        <div class="upload-hint">
-          <div class="hint-card">
-            <div class="hint-card__icon">📋</div>
-            <div class="hint-card__text">
-              <strong>格式要求</strong>
-              <span>第一行为表头，从第二行开始是数据</span>
-            </div>
-          </div>
-          <div class="hint-card">
-            <div class="hint-card__icon">📊</div>
-            <div class="hint-card__text">
-              <strong>题型支持</strong>
-              <span>单选 / 多选 / 量表 / 开放文本，自动识别</span>
-            </div>
-          </div>
-          <div class="hint-card">
-            <div class="hint-card__icon">📄</div>
-            <div class="hint-card__text">
-              <strong>报告导出</strong>
-              <span>生成后可下载为 Word 或 Markdown</span>
-            </div>
           </div>
         </div>
       </section>
@@ -365,6 +342,6 @@
   <div class="toast-container" id="toast-container" aria-live="polite"></div>
 
   <script src="https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js"></script>
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=2"></script>
 </body>
 </html>

@@ -1018,3 +1018,12 @@ $('btn-restart').addEventListener('click', () => {
 // ── Init ──
 goStep(1);
 refreshFeishuStatus();
+
+// ── 上传说明文案 ──
+fetch('/api/upload-guide')
+  .then(r => r.json())
+  .then(({ content }) => {
+    const el = document.getElementById('upload-guide');
+    if (el && content) el.innerHTML = marked.parse(content);
+  })
+  .catch(() => {});
