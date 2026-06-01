@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/style.css?v=2" />
+  <link rel="stylesheet" href="/static/style.css?v=4" />
 </head>
 <body>
   <div class="aurora" aria-hidden="true">
@@ -38,6 +38,13 @@
         </button>
       </div>
 
+      <!-- 模式切换 -->
+      <div class="mode-tabs" id="mode-tabs">
+        <button class="mode-tab mode-tab--active" id="btn-mode-survey">问卷分析</button>
+        <button class="mode-tab" id="btn-mode-annotate">数据标注</button>
+      </div>
+
+      <!-- 问卷分析步骤导航 -->
       <nav class="steps" id="steps-nav">
         <div class="step step--active" id="nav-step-1">
           <div class="step__indicator">
@@ -91,6 +98,70 @@
           <div class="step__info">
             <div class="step__label">报告 &amp; 追问</div>
             <div class="step__desc">下载 / QA 对话</div>
+          </div>
+        </div>
+      </nav>
+
+      <!-- 数据标注步骤导航 -->
+      <nav class="steps" id="ann-steps-nav" style="display:none">
+        <div class="step step--active" id="ann-nav-step-1">
+          <div class="step__indicator">
+            <span class="step__num">1</span>
+            <svg class="step__check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+          </div>
+          <div class="step__info">
+            <div class="step__label">上传数据</div>
+            <div class="step__desc">CSV / Excel 文件</div>
+          </div>
+        </div>
+        <div class="step" id="ann-nav-step-2">
+          <div class="step__indicator">
+            <span class="step__num">2</span>
+            <svg class="step__check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+          </div>
+          <div class="step__info">
+            <div class="step__label">列确认 &amp; 任务</div>
+            <div class="step__desc">选择标注类型</div>
+          </div>
+        </div>
+        <div class="step" id="ann-nav-step-3">
+          <div class="step__indicator">
+            <span class="step__num">3</span>
+            <svg class="step__check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+          </div>
+          <div class="step__info">
+            <div class="step__label">AI 作答识别</div>
+            <div class="step__desc">分批分析中</div>
+          </div>
+        </div>
+        <div class="step" id="ann-nav-step-4">
+          <div class="step__indicator">
+            <span class="step__num">4</span>
+            <svg class="step__check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+          </div>
+          <div class="step__info">
+            <div class="step__label">AI 确认</div>
+            <div class="step__desc">逐行核对结果</div>
+          </div>
+        </div>
+        <div class="step" id="ann-nav-step-5">
+          <div class="step__indicator">
+            <span class="step__num">5</span>
+            <svg class="step__check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+          </div>
+          <div class="step__info">
+            <div class="step__label">质量打标</div>
+            <div class="step__desc">分批标注中</div>
+          </div>
+        </div>
+        <div class="step" id="ann-nav-step-6">
+          <div class="step__indicator">
+            <span class="step__num">6</span>
+            <svg class="step__check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+          </div>
+          <div class="step__info">
+            <div class="step__label">完成 &amp; 下载</div>
+            <div class="step__desc">获取标注 Excel</div>
           </div>
         </div>
       </nav>
@@ -304,6 +375,171 @@
         </div>
       </section>
 
+      <!-- ======================================================
+           数据标注面板（独立于问卷分析 5 步）
+           ====================================================== -->
+
+      <!-- ANN STEP 1: 上传 -->
+      <section class="panel panel--hidden" id="ann-panel-1">
+        <div class="panel__header">
+          <h1 class="panel__title">数据标注 · 上传文件</h1>
+          <p class="panel__desc">上传问卷原始数据，支持 CSV / Excel（最大 50MB）</p>
+        </div>
+        <div class="upload-zone" id="ann-upload-zone">
+          <input type="file" id="ann-file-input" accept=".csv,.xlsx,.xls" hidden />
+          <div class="upload-zone__icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+              <polyline points="17 8 12 3 7 8"/>
+              <line x1="12" y1="3" x2="12" y2="15"/>
+            </svg>
+          </div>
+          <div class="upload-zone__text">
+            <span class="upload-zone__primary">拖放文件到这里，或点击选择</span>
+            <span class="upload-zone__secondary">支持 CSV / Excel（最大 50MB）</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- ANN STEP 2: 列确认 + 任务选择 -->
+      <section class="panel panel--hidden" id="ann-panel-2">
+        <div class="panel__header">
+          <h1 class="panel__title">列确认 &amp; 标注任务选择</h1>
+          <p class="panel__desc" id="ann-preview-meta">已读取文件</p>
+        </div>
+
+        <!-- 任务选择 -->
+        <div class="ann-tasks" id="ann-tasks">
+          <div class="plan-section__title" style="margin-bottom:12px">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 8v4l3 3"/></svg>
+            选择标注任务（可多选）
+          </div>
+          <label class="ann-task-option">
+            <input type="checkbox" id="task-ai-detect" />
+            <span class="ann-task-label">
+              <strong>AI 作答识别</strong>
+              <span>识别哪些受访者可能使用 AI 填写主观题，并提供概率和理由供你确认</span>
+            </span>
+          </label>
+          <label class="ann-task-option">
+            <input type="checkbox" id="task-quality" />
+            <span class="ann-task-label">
+              <strong>回答质量打标</strong>
+              <span>为每道主观题打上 无效反馈 / 普通反馈 / 优秀反馈 标签，并生成整体质量评级</span>
+            </span>
+          </label>
+        </div>
+
+        <!-- 调研背景（可选，用于 AI 识别） -->
+        <div class="ann-background-block" id="ann-background-block" style="display:none">
+          <label class="ann-label">调研背景说明（可选，帮助 AI 更准确识别）</label>
+          <textarea class="plan-input" id="ann-background" rows="2"
+            placeholder="例：这是一份 MLBB 玩家对新英雄技能的满意度调研，主要了解玩家对新英雄游戏体验的看法…"></textarea>
+        </div>
+
+        <!-- 列确认 -->
+        <div class="col-confirm-header">
+          <div class="plan-section__title">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+            列设置
+          </div>
+        </div>
+        <p class="panel__desc">AI 已自动检测 ID 列和主观题列，请核对。主观题列将用于 AI 识别和质量打标。</p>
+
+        <div class="ann-col-config" id="ann-col-config">
+          <!-- 由 JS 渲染：ID 列选择 + 主观题列多选 -->
+        </div>
+
+        <div class="col-confirm-actions">
+          <button class="btn btn--primary" id="ann-btn-start" disabled>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <polygon points="5 3 19 12 5 21 5 3"/>
+            </svg>
+            开始标注
+          </button>
+        </div>
+      </section>
+
+      <!-- ANN STEP 3: AI 识别进行中 -->
+      <section class="panel panel--hidden" id="ann-panel-3">
+        <div class="panel__header">
+          <h1 class="panel__title">AI 作答识别中…</h1>
+          <p class="panel__desc">正在分批分析受访者回答，请耐心等待</p>
+        </div>
+        <div class="ann-progress-block" id="ann-ai-progress">
+          <div class="ann-progress-bar-wrap">
+            <div class="ann-progress-bar" id="ann-ai-progress-bar" style="width:0%"></div>
+          </div>
+          <div class="ann-progress-msg" id="ann-ai-progress-msg">准备中…</div>
+        </div>
+        <div class="ann-warn-log" id="ann-ai-warn-log"></div>
+      </section>
+
+      <!-- ANN STEP 4: AI 确认 -->
+      <section class="panel panel--hidden" id="ann-panel-4">
+        <div class="panel__header">
+          <h1 class="panel__title">AI 作答识别结果确认</h1>
+          <p class="panel__desc" id="ann-confirm-desc">以下受访者 AI 作答概率 ≥ 80%，请逐行确认是否标注为 AI 作答</p>
+        </div>
+        <div class="ann-confirm-actions-top">
+          <button class="btn btn--ghost btn--sm" id="ann-btn-check-all">全选</button>
+          <button class="btn btn--ghost btn--sm" id="ann-btn-uncheck-all">全不选</button>
+          <span class="ann-confirm-hint">勾选 = 确认为 AI 作答；取消勾选 = 视为正常回答并纳入质量打标</span>
+        </div>
+        <div class="ann-confirm-table-wrap">
+          <table class="ann-confirm-table" id="ann-confirm-table">
+            <!-- 由 JS 渲染 -->
+          </table>
+        </div>
+        <div class="col-confirm-actions">
+          <button class="btn btn--primary" id="ann-btn-confirm-ai">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+            确认标注结果，继续下一步
+          </button>
+        </div>
+      </section>
+
+      <!-- ANN STEP 5: 质量打标进行中 -->
+      <section class="panel panel--hidden" id="ann-panel-5">
+        <div class="panel__header">
+          <h1 class="panel__title">回答质量打标中…</h1>
+          <p class="panel__desc">正在分批标注每道主观题的回答质量，请耐心等待</p>
+        </div>
+        <div class="ann-progress-block" id="ann-quality-progress">
+          <div class="ann-progress-bar-wrap">
+            <div class="ann-progress-bar" id="ann-quality-progress-bar" style="width:0%"></div>
+          </div>
+          <div class="ann-progress-msg" id="ann-quality-progress-msg">准备中…</div>
+        </div>
+        <div class="ann-warn-log" id="ann-quality-warn-log"></div>
+      </section>
+
+      <!-- ANN STEP 6: 完成 + 下载 -->
+      <section class="panel panel--hidden" id="ann-panel-6">
+        <div class="panel__header">
+          <h1 class="panel__title">标注完成</h1>
+          <p class="panel__desc">所有标注任务已完成，可下载 Excel 文件</p>
+        </div>
+        <div class="ann-done-block">
+          <div class="ann-done-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+              <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
+              <polyline points="22 4 12 14.01 9 11.01"/>
+            </svg>
+          </div>
+          <div class="ann-done-text" id="ann-done-text">标注完成</div>
+          <button class="btn btn--primary btn--lg" id="ann-btn-download">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+              <polyline points="7 10 12 15 17 10"/>
+              <line x1="12" y1="15" x2="12" y2="3"/>
+            </svg>
+            下载标注结果 Excel
+          </button>
+          <button class="btn btn--ghost" id="ann-btn-restart" style="margin-top:8px">重新标注</button>
+        </div>
+      </section>
+
     </main>
   </div>
 
@@ -342,6 +578,6 @@
   <div class="toast-container" id="toast-container" aria-live="polite"></div>
 
   <script src="https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js"></script>
-  <script src="/static/app.js?v=2"></script>
+  <script src="/static/app.js?v=4"></script>
 </body>
 </html>

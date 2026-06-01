@@ -39,16 +39,19 @@ load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 import secrets
 
+import annotate
 import feishu_export
 import survey_plan
 import survey_stats
 from dify import chat as dify_chat  # noqa: F401 (kept for compatibility)
 
-DIFY_API_BASE    = os.getenv("DIFY_API_BASE", "https://api.dify.ai/v1").rstrip("/")
-DIFY_PLANNER_KEY = os.getenv("DIFY_PLANNER_KEY", "")
-DIFY_ANALYST_KEY = os.getenv("DIFY_ANALYST_KEY", "")
-DIFY_COLUMN_KEY  = os.getenv("DIFY_COLUMN_KEY", "")  # 题型识别（专用 Dify 应用）
-DIFY_BASE_URL    = os.getenv("DIFY_API_BASE", "https://dify.web.moontontech.net/v1")
+DIFY_API_BASE      = os.getenv("DIFY_API_BASE", "https://api.dify.ai/v1").rstrip("/")
+DIFY_PLANNER_KEY   = os.getenv("DIFY_PLANNER_KEY", "")
+DIFY_ANALYST_KEY   = os.getenv("DIFY_ANALYST_KEY", "")
+DIFY_COLUMN_KEY    = os.getenv("DIFY_COLUMN_KEY", "")      # 题型识别
+DIFY_AI_DETECT_KEY = os.getenv("DIFY_AI_DETECT_KEY", "")   # AI 作答识别
+DIFY_QUALITY_KEY   = os.getenv("DIFY_QUALITY_KEY", "")     # 回答质量打标
+DIFY_BASE_URL      = os.getenv("DIFY_API_BASE", "https://dify.web.moontontech.net/v1")
 # 用于前端展示 Dify 后台入口（去掉 /v1 后缀）
 DIFY_CONSOLE_URL = re.sub(r"/v1$", "", DIFY_BASE_URL)
 
@@ -403,9 +406,21 @@ def _heuristic_type(header: str, values: list[str]) -> str:
         if mx - mn <= 15 and mn >= 0:
             return "scale"
 
-    # ── 多选（分隔符检测）──
+    # ── 长文本优先判断（避免后续规则误伤）──
+    avg_len = sum(len(v) for v in non_empty) / total
+    if avg_len > 25:
+        return "open_text"
+
+    # ── 多选（分隔符检测：只认短片段列表，排除句子中的标点）──
     delimiters = [",", "，", ";", "；", "、", "|"]
-    delim_count = sum(1 for v in non_empty if any(d in v for d in delimiters))
+    def _is_list(v: str) -> bool:
+        for d in delimiters:
+            if d in v:
+                parts = [p.strip() for p in v.split(d) if p.strip()]
+                if len(parts) >= 2 and all(len(p) < 30 for p in parts):
+                    return True
+        return False
+    delim_count = sum(1 for v in non_empty if _is_list(v))
     if delim_count / total > 0.25:
         return "multi_choice"
 
@@ -414,18 +429,12 @@ def _heuristic_type(header: str, values: list[str]) -> str:
     n_unique = len(unique_vals)
     ratio = n_unique / total
 
-    # 少量唯一值 → 单选 / 画像
     if n_unique <= 2:
         return "single_choice"
     if n_unique <= 8:
         return "single_choice"
     if ratio < 0.25:
         return "single_choice"
-
-    # ── 长文本 → 开放题 ──
-    avg_len = sum(len(v) for v in non_empty) / total
-    if avg_len > 25:
-        return "open_text"
 
     return "single_choice"
 
@@ -482,6 +491,28 @@ def _group_googleform_matrix(headers: list[str]) -> list[dict]:
             })
             emitted.add(idx)
     return groups
+
+
+def _detect_open_text_cols(rows: list, headers: list) -> list[int]:
+    """检测主观题列，复用 _heuristic_type + 矩阵题过滤，与分析流程保持一致。"""
+    if len(rows) <= 1:
+        return []
+    body = rows[1:]
+
+    # 矩阵题的所有子列均为单选，先排除
+    matrix_idxs: set[int] = set()
+    for g in _group_googleform_matrix(headers):
+        if g["type"] == "matrix":
+            matrix_idxs.update(g["member_indexes"])
+
+    result = []
+    for i, header in enumerate(headers):
+        if i in matrix_idxs:
+            continue
+        vals = [str(r[i]) if i < len(r) else "" for r in body]
+        if _heuristic_type(header, vals) == "open_text":
+            result.append(i)
+    return result
 
 
 def _col_samples(body: list[list], idx: int, n: int = 20) -> list[str]:
@@ -954,6 +985,52 @@ async def sse_dify_stream(
                     break
 
     yield "", final_conv_id
+
+
+async def sse_dify_completion_stream(
+    query: str,
+    user_id: str,
+    api_key: str,
+    input_var: str = "survey_batch",
+) -> AsyncGenerator[str, None]:
+    """调用 Dify completion-messages 端点（文本生成应用）。"""
+    import httpx
+
+    payload = {
+        "inputs": {input_var: query},
+        "response_mode": "streaming",
+        "user": user_id,
+    }
+    req_headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    async with httpx.AsyncClient(timeout=1800, follow_redirects=True) as client:
+        async with client.stream(
+            "POST", f"{DIFY_API_BASE}/completion-messages",
+            headers=req_headers, json=payload,
+        ) as resp:
+            if resp.status_code >= 400:
+                err = await resp.aread()
+                raise RuntimeError(f"Dify {resp.status_code}: {err.decode('utf-8', errors='replace')}")
+            async for line in resp.aiter_lines():
+                if not line or not line.startswith("data:"):
+                    continue
+                raw = line[5:].strip()
+                if not raw:
+                    continue
+                try:
+                    data = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                event = data.get("event")
+                if event == "message":
+                    yield data.get("answer", "")
+                if event == "error":
+                    raise RuntimeError(f"Dify error: {data.get('code')} {data.get('message')}")
+                if event in ("message_end", "workflow_finished"):
+                    break
 
 
 # ============================================================
@@ -1624,6 +1701,332 @@ async def get_history_item(hist_id: str):
     if not entry:
         raise HTTPException(status_code=404, detail="历史记录不存在")
     return entry
+
+
+# ============================================================
+# 数据标注模块
+# ============================================================
+
+annotate_sessions: dict[str, dict] = {}
+
+
+def _new_annotate_session() -> str:
+    _clean_sessions()
+    sid = str(uuid.uuid4())
+    annotate_sessions[sid] = {"ts": time.time()}
+    return sid
+
+
+def _get_annotate_session(sid: str) -> dict:
+    sess = annotate_sessions.get(sid)
+    if not sess:
+        raise HTTPException(status_code=404, detail="标注会话不存在或已过期，请重新上传文件")
+    sess["ts"] = time.time()
+    return sess
+
+
+# ── 上传（标注专用）─────────────────────────────────────
+
+async def _translate_headers(headers: list) -> list:
+    """将表头翻译为中文简体，失败时原样返回。"""
+    if not DIFY_AI_DETECT_KEY:
+        return headers
+    query = (
+        "将以下问卷列名按顺序翻译为中文简体，只输出 JSON 数组，不加其他任何内容：\n"
+        + json.dumps(headers, ensure_ascii=False)
+    )
+    full_text = ""
+    try:
+        async for chunk, _ in sse_dify_stream(query, "hdr-translate", "", DIFY_AI_DETECT_KEY):
+            full_text += chunk
+        result = _parse_string_array(full_text)
+        if result and len(result) == len(headers):
+            return result
+    except Exception:
+        pass
+    return headers
+
+
+def _parse_string_array(text: str) -> list[str] | None:
+    """从 LLM 输出中提取字符串数组，容忍值内部的裸双引号。"""
+    m = re.search(r'\[.*\]', text, re.DOTALL)
+    if not m:
+        return None
+    raw = m.group()
+    # 先尝试直接解析
+    try:
+        result = json.loads(raw)
+        if isinstance(result, list):
+            return [str(r) for r in result]
+    except json.JSONDecodeError:
+        pass
+    # 兜底：逐行提取——取每行最外层引号之间的内容
+    items = []
+    for line in raw.splitlines():
+        line = line.strip().rstrip(',')
+        if line.startswith('"') and line.endswith('"') and len(line) >= 2:
+            items.append(line[1:-1])
+    return items if items else None
+
+
+@app.post("/api/annotate/upload")
+async def annotate_upload(file: UploadFile = File(...)):
+    content = await file.read()
+    try:
+        rows = _parse_file(file.filename or "upload.csv", content)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if not rows or len(rows) <= 1:
+        raise HTTPException(status_code=400, detail="文件为空或只有表头")
+
+    headers = rows[0]
+    body    = rows[1:]
+
+    # 自动检测列（用 server.py 现有逻辑，含矩阵题过滤）
+    id_col         = annotate.detect_id_column(headers, rows)
+    open_text_cols = _detect_open_text_cols(rows, headers)
+
+    # 矩阵子列索引（前端隐藏，不在可选列表中显示）
+    matrix_col_idxs: list[int] = []
+    for g in _group_googleform_matrix(headers):
+        if g["type"] == "matrix":
+            matrix_col_idxs.extend(g["member_indexes"])
+
+    # 翻译表头（用于前端展示，不影响处理逻辑）
+    headers_zh = await _translate_headers(headers)
+
+    sid = _new_annotate_session()
+    annotate_sessions[sid].update({
+        "rows":            rows,
+        "headers":         headers,
+        "headers_zh":      headers_zh,
+        "filename":        file.filename or "upload.csv",
+        "id_col":          id_col,
+        "open_text_cols":  open_text_cols,
+    })
+
+    return {
+        "session_id":       sid,
+        "filename":         file.filename,
+        "total_rows":       len(body),
+        "headers":          headers,
+        "headers_zh":       headers_zh,
+        "id_col":           id_col,
+        "open_text_cols":   open_text_cols,
+        "matrix_col_idxs":  matrix_col_idxs,
+        "preview":          rows[1: min(4, len(rows))],
+    }
+
+
+# ── 确认列 + 任务选择 ────────────────────────────────────
+
+class AnnotateConfirmRequest(BaseModel):
+    id_col: int
+    open_text_cols: list[int]
+    tasks: dict          # {ai_detect: bool, quality: bool}
+    background: str = "" # 可选调研背景，用于 AI 检测
+
+
+@app.post("/api/annotate/{sid}/confirm-columns")
+async def annotate_confirm_columns(sid: str, req: AnnotateConfirmRequest):
+    sess = _get_annotate_session(sid)
+    sess["id_col"]        = req.id_col
+    sess["open_text_cols"] = req.open_text_cols
+    sess["tasks"]         = req.tasks
+    sess["background"]    = req.background
+    sess["ai_results"]    = []
+    sess["confirmed_ai_ids"] = []
+    sess["quality_results"]  = []
+    return {"ok": True}
+
+
+# ── AI 作答识别（SSE）───────────────────────────────────
+
+@app.get("/api/annotate/{sid}/run-ai-detect")
+async def annotate_run_ai_detect(sid: str):
+    sess = _get_annotate_session(sid)
+    rows           = sess.get("rows", [])
+    headers        = sess.get("headers", [])
+    id_col         = sess.get("id_col", 1)
+    open_text_cols = sess.get("open_text_cols", [])
+    background     = sess.get("background", "")
+
+    if not rows or not open_text_cols:
+        raise HTTPException(status_code=400, detail="会话状态不完整，请重新上传")
+    if not DIFY_AI_DETECT_KEY:
+        raise HTTPException(status_code=500, detail="未配置 DIFY_AI_DETECT_KEY")
+
+    body = rows[1:]
+    batch_size = annotate.AI_DETECT_BATCH
+    batches = [body[i: i + batch_size] for i in range(0, len(body), batch_size)]
+    total_batches = len(batches)
+
+    async def generate():
+        all_results: list[dict] = []
+        try:
+            for batch_num, batch in enumerate(batches, 1):
+                yield sse_event({"type": "progress", "done": batch_num - 1, "total": total_batches,
+                                 "msg": f"正在分析第 {batch_num}/{total_batches} 批（{len(batch)} 行）…"})
+
+                query = annotate.build_ai_detect_query(
+                    batch, headers, open_text_cols, id_col, batch_num, background
+                )
+                answer_chunks: list[str] = []
+                final_conv = ""
+                async for chunk, conv_id in sse_dify_stream(query, sid, "", DIFY_AI_DETECT_KEY):
+                    if chunk:
+                        answer_chunks.append(chunk)
+                    if conv_id:
+                        final_conv = conv_id
+
+                results, err = annotate.parse_ai_detect_result("".join(answer_chunks))
+                if not results:
+                    # 重试一次
+                    retry_q = (
+                        f"上次输出无法解析（{err}）。请严格按 schema 用 ```json``` 围栏重新输出，"
+                        "不要附加任何解释文字。"
+                    )
+                    retry_chunks: list[str] = []
+                    async for chunk, _ in sse_dify_stream(retry_q, sid, final_conv, DIFY_AI_DETECT_KEY):
+                        if chunk:
+                            retry_chunks.append(chunk)
+                    results, err = annotate.parse_ai_detect_result("".join(retry_chunks))
+
+                if not results:
+                    yield sse_event({"type": "warn", "msg": f"第 {batch_num} 批解析失败：{err}"})
+                else:
+                    all_results.extend(results)
+
+            sess["ai_results"] = all_results
+
+            # 筛选高概率（≥ 80%）的受访者供用户确认
+            high_prob = [r for r in all_results if r.get("ai_prob", 0) >= 80]
+            yield sse_event({
+                "type":      "ai_detect_done",
+                "results":   all_results,
+                "high_prob": high_prob,
+            })
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            yield sse_event({"type": "error", "message": str(e)})
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+# ── 用户确认 AI 结果 ─────────────────────────────────────
+
+class AnnotateConfirmAIRequest(BaseModel):
+    confirmed_ai_ids: list[str]  # 用户确认为 AI 作答的 player ID 列表
+
+
+@app.post("/api/annotate/{sid}/confirm-ai")
+async def annotate_confirm_ai(sid: str, req: AnnotateConfirmAIRequest):
+    sess = _get_annotate_session(sid)
+    sess["confirmed_ai_ids"] = req.confirmed_ai_ids
+    return {"ok": True, "confirmed_count": len(req.confirmed_ai_ids)}
+
+
+# ── 质量打标（SSE）──────────────────────────────────────
+
+@app.get("/api/annotate/{sid}/run-quality")
+async def annotate_run_quality(sid: str):
+    sess = _get_annotate_session(sid)
+    rows              = sess.get("rows", [])
+    headers           = sess.get("headers", [])
+    id_col            = sess.get("id_col", 1)
+    open_text_cols    = sess.get("open_text_cols", [])
+    confirmed_ai_ids  = set(sess.get("confirmed_ai_ids", []))
+
+    if not rows or not open_text_cols:
+        raise HTTPException(status_code=400, detail="会话状态不完整，请重新上传")
+    if not DIFY_QUALITY_KEY:
+        raise HTTPException(status_code=500, detail="未配置 DIFY_QUALITY_KEY")
+
+    # 质量打标仅处理非 AI 行
+    body = rows[1:]
+    non_ai_body = [r for r in body if str(r[id_col]).strip() not in confirmed_ai_ids] if body and id_col < len(headers) else body
+    batch_size = annotate.QUALITY_BATCH
+    batches = [non_ai_body[i: i + batch_size] for i in range(0, len(non_ai_body), batch_size)]
+    total_batches = len(batches)
+
+    async def generate():
+        all_results: list[dict] = []
+        try:
+            for batch_num, batch in enumerate(batches, 1):
+                yield sse_event({"type": "progress", "done": batch_num - 1, "total": total_batches,
+                                 "msg": f"正在打标第 {batch_num}/{total_batches} 批（{len(batch)} 行）…"})
+
+                query = annotate.build_quality_label_query(
+                    batch, headers, open_text_cols, id_col, batch_num
+                )
+                answer_chunks: list[str] = []
+                final_conv = ""
+                async for chunk, conv_id in sse_dify_stream(query, sid, "", DIFY_QUALITY_KEY):
+                    if chunk:
+                        answer_chunks.append(chunk)
+                    if conv_id:
+                        final_conv = conv_id
+
+                results, err = annotate.parse_quality_result("".join(answer_chunks))
+                if not results:
+                    retry_q = (
+                        f"上次输出无法解析（{err}）。请严格按 schema 用 ```json``` 围栏重新输出，"
+                        "不要附加任何解释文字。"
+                    )
+                    retry_chunks: list[str] = []
+                    async for chunk, _ in sse_dify_stream(retry_q, sid, final_conv, DIFY_QUALITY_KEY):
+                        if chunk:
+                            retry_chunks.append(chunk)
+                    results, err = annotate.parse_quality_result("".join(retry_chunks))
+
+                if not results:
+                    yield sse_event({"type": "warn", "msg": f"第 {batch_num} 批解析失败：{err}"})
+                else:
+                    all_results.extend(results)
+
+            sess["quality_results"] = all_results
+            yield sse_event({"type": "quality_done", "count": len(all_results)})
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            yield sse_event({"type": "error", "message": str(e)})
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+# ── 下载标注 Excel ───────────────────────────────────────
+
+@app.get("/api/annotate/{sid}/download")
+async def annotate_download(sid: str):
+    sess = _get_annotate_session(sid)
+    rows              = sess.get("rows")
+    headers           = sess.get("headers")
+    id_col            = sess.get("id_col", 1)
+    open_text_cols    = sess.get("open_text_cols", [])
+    tasks             = sess.get("tasks", {})
+    ai_results        = sess.get("ai_results", [])
+    confirmed_ai_ids  = set(sess.get("confirmed_ai_ids", []))
+    quality_results   = sess.get("quality_results", [])
+    filename          = sess.get("filename", "annotated")
+
+    if not rows:
+        raise HTTPException(status_code=400, detail="会话中没有数据")
+
+    loop = asyncio.get_event_loop()
+    excel_bytes = await loop.run_in_executor(
+        None,
+        annotate.generate_annotated_excel,
+        rows, headers, ai_results, confirmed_ai_ids,
+        quality_results, open_text_cols, id_col, tasks,
+    )
+
+    stem = re.sub(r"\.(csv|xlsx|xls)$", "", filename, flags=re.IGNORECASE)
+    safe = re.sub(r'[\\/:*?"<>|]', "_", stem)
+    return _make_download_response(
+        excel_bytes,
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        f"{safe}_标注结果.xlsx",
+    )
 
 
 # ── 启动 ────────────────────────────────────────────

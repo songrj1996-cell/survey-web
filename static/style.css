@@ -778,6 +778,239 @@ html, body {
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 999px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--text-3); }
 
+/* ============================================================
+   数据标注模块样式
+   ============================================================ */
+
+/* 模式切换 Tab */
+.mode-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 12px 12px 0;
+  margin-bottom: 4px;
+}
+.mode-tab {
+  flex: 1;
+  padding: 6px 8px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all .2s;
+}
+.mode-tab:hover { background: var(--glass-bg); color: var(--text); }
+.mode-tab--active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+/* 标注进度块 */
+.ann-progress-block {
+  margin: 24px 0;
+  padding: 20px 24px;
+  background: var(--glass-bg);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+.ann-progress-bar-wrap {
+  height: 10px;
+  background: var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  margin-bottom: 10px;
+}
+.ann-progress-bar {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 6px;
+  transition: width .4s ease;
+}
+.ann-progress-msg {
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+/* 警告日志 */
+.ann-warn-log { margin-top: 8px; }
+.ann-warn-item {
+  font-size: 12px;
+  color: #e09f3e;
+  padding: 4px 8px;
+  background: rgba(224,159,62,.12);
+  border-radius: 6px;
+  margin-bottom: 4px;
+}
+
+/* 列配置区 */
+.ann-col-config {
+  background: var(--glass-bg);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 16px 20px;
+  margin-bottom: 16px;
+}
+.ann-col-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+.ann-label {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text);
+  min-width: 140px;
+  flex-shrink: 0;
+}
+.ann-col-check-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+.ann-col-check-list--full {
+  flex-direction: column;
+  flex-wrap: nowrap;
+  width: 100%;
+}
+.ann-col-check-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 12px;
+  transition: border-color .15s;
+}
+.ann-col-check-item--full {
+  align-items: flex-start;
+  padding: 8px 12px;
+  width: 100%;
+  box-sizing: border-box;
+}
+.ann-col-check-item:hover { border-color: var(--accent); }
+.ann-col-check-item--full:has(input:checked) { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 6%, var(--surface)); }
+.ann-col-check-item input[type=checkbox]:checked + .ann-col-idx { color: var(--accent); }
+.ann-col-idx {
+  font-size: 11px;
+  color: var(--text-secondary);
+  font-weight: 600;
+  min-width: 22px;
+  padding-top: 2px;
+  flex-shrink: 0;
+}
+.ann-col-name { color: var(--text); max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ann-col-name-wrap { display: flex; flex-direction: column; gap: 2px; flex: 1; }
+.ann-col-zh { font-size: 13px; color: var(--text); font-weight: 500; line-height: 1.45; }
+.ann-col-original { font-size: 11px; color: var(--text-secondary); line-height: 1.4; }
+
+/* 背景说明 */
+.ann-background-block { margin-bottom: 16px; }
+
+/* 任务选择 */
+.ann-tasks {
+  background: var(--glass-bg);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 16px 20px;
+  margin-bottom: 20px;
+}
+.ann-task-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 10px 0;
+  cursor: pointer;
+  border-bottom: 1px solid var(--border);
+}
+.ann-task-option:last-child { border-bottom: none; }
+.ann-task-option input[type=checkbox] { margin-top: 3px; flex-shrink: 0; width: 16px; height: 16px; cursor: pointer; }
+.ann-task-label { display: flex; flex-direction: column; gap: 3px; }
+.ann-task-label strong { font-size: 13px; color: var(--text); }
+.ann-task-label span { font-size: 12px; color: var(--text-secondary); line-height: 1.5; }
+
+/* AI 确认表格 */
+.ann-confirm-actions-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.btn--sm { padding: 5px 12px; font-size: 12px; }
+.ann-confirm-hint {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-left: 4px;
+}
+.ann-confirm-table-wrap {
+  overflow-x: auto;
+  max-height: 560px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  margin-bottom: 16px;
+}
+.ann-confirm-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.ann-confirm-table th {
+  position: sticky;
+  top: 0;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  padding: 8px 10px;
+  text-align: left;
+  white-space: nowrap;
+  color: var(--text);
+  font-weight: 600;
+  z-index: 2;
+}
+.ann-confirm-table td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+  color: var(--text);
+}
+.ann-confirm-table tr:last-child td { border-bottom: none; }
+.ann-confirm-table tr:hover td { background: var(--glass-bg); }
+.ann-cell-id { font-family: monospace; font-weight: 600; white-space: nowrap; }
+.ann-cell-prob { font-weight: 700; color: #e55; text-align: center; }
+.ann-cell-polish { text-align: center; }
+.ann-cell-reason,
+.ann-cell-evidence,
+.ann-cell-text { max-width: 220px; line-height: 1.5; }
+.ann-cell-trans { color: var(--text-secondary); font-style: italic; }
+
+/* 完成区域 */
+.ann-done-block {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  padding: 48px 0;
+}
+.ann-done-icon svg {
+  width: 64px;
+  height: 64px;
+  color: var(--accent);
+}
+.ann-done-text {
+  font-size: 15px;
+  color: var(--text-secondary);
+  text-align: center;
+  line-height: 1.8;
+}
+.btn--lg { padding: 12px 28px; font-size: 15px; }
+
 /* ── Responsive ─────────────────────────────────────── */
 @media (max-width: 900px) {
   :root { --sidebar-w: 220px; }

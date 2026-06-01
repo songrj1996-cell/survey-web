@@ -105,7 +105,10 @@ function consumeSSE(url, onEvent) {
         const data = JSON.parse(e.data);
         onEvent(data);
         if (data.type === 'error') { es.close(); reject(new Error(data.message)); }
-        if (['columns_ready', 'plan_ready', 'report_done', 'qa_done'].includes(data.type)) {
+        if ([
+          'columns_ready', 'plan_ready', 'report_done', 'qa_done',
+          'ai_detect_done', 'quality_done',
+        ].includes(data.type)) {
           es.close(); resolve(data);
         }
       } catch {}
@@ -1018,6 +1021,453 @@ $('btn-restart').addEventListener('click', () => {
 // ── Init ──
 goStep(1);
 refreshFeishuStatus();
+
+// ============================================================
+// 模式切换（问卷分析 ↔ 数据标注）
+// ============================================================
+
+const surveyPanels = panels;            // panel-1 ~ panel-5
+const surveyNav    = $('steps-nav');
+const annNav       = $('ann-steps-nav');
+const annPanelIds  = [1, 2, 3, 4, 5, 6];
+const annPanels    = annPanelIds.map(n => $(`ann-panel-${n}`));
+const annNavSteps  = annPanelIds.map(n => $(`ann-nav-step-${n}`));
+
+let currentMode = 'survey'; // 'survey' | 'annotate'
+
+function switchMode(mode) {
+  currentMode = mode;
+  const isSurvey = mode === 'survey';
+  $('btn-mode-survey').classList.toggle('mode-tab--active', isSurvey);
+  $('btn-mode-annotate').classList.toggle('mode-tab--active', !isSurvey);
+  surveyNav.style.display  = isSurvey  ? '' : 'none';
+  annNav.style.display     = !isSurvey ? '' : 'none';
+  surveyPanels.forEach(p => p.classList.add('panel--hidden'));
+  annPanels.forEach(p => p.classList.add('panel--hidden'));
+  if (isSurvey) {
+    goStep(state.currentStep);
+  } else {
+    annGoStep(annState.currentStep);
+  }
+}
+
+$('btn-mode-survey').addEventListener('click',   () => switchMode('survey'));
+$('btn-mode-annotate').addEventListener('click', () => switchMode('annotate'));
+
+// ============================================================
+// 数据标注状态机
+// ============================================================
+
+const annState = {
+  sessionId:       null,
+  currentStep:     1,
+  headers:         [],
+  headersZh:       [],
+  idCol:           1,
+  openTextCols:    [],
+  matrixColIdxs:   new Set(),
+  tasks:           { ai_detect: false, quality: false },
+  aiResults:       [],
+  highProbResults: [],
+  confirmedAiIds:  new Set(),
+  qualityCount:    0,
+};
+
+function annGoStep(n) {
+  annState.currentStep = n;
+  annPanels.forEach((p, i) => p.classList.toggle('panel--hidden', i + 1 !== n));
+  annNavSteps.forEach((s, i) => {
+    s.classList.remove('step--active', 'step--done');
+    if (i + 1 === n)       s.classList.add('step--active');
+    else if (i + 1 < n)    s.classList.add('step--done');
+  });
+  document.querySelector('.main').scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+// ── ANN STEP 1: 上传 ────────────────────────────────────────
+
+const annUploadZone = $('ann-upload-zone');
+const annFileInput  = $('ann-file-input');
+
+annUploadZone.addEventListener('click', () => annFileInput.click());
+annUploadZone.addEventListener('dragover', e => { e.preventDefault(); annUploadZone.classList.add('drag-over'); });
+annUploadZone.addEventListener('dragleave', () => annUploadZone.classList.remove('drag-over'));
+annUploadZone.addEventListener('drop', e => {
+  e.preventDefault();
+  annUploadZone.classList.remove('drag-over');
+  const file = e.dataTransfer.files[0];
+  if (file) annHandleUpload(file);
+});
+annFileInput.addEventListener('change', () => {
+  if (annFileInput.files[0]) annHandleUpload(annFileInput.files[0]);
+});
+
+async function annHandleUpload(file) {
+  const MAX = 50 * 1024 * 1024;
+  if (file.size > MAX) { showToast('文件超过 50MB 上限', 'error'); return; }
+  annUploadZone.innerHTML = `
+    <div class="upload-zone__icon"><div class="spinner" style="width:40px;height:40px;border-width:3px"></div></div>
+    <div class="upload-zone__text"><span class="upload-zone__primary">正在上传 ${esc(file.name)}…</span></div>`;
+
+  const fd = new FormData();
+  fd.append('file', file);
+  try {
+    const resp = await fetch('/api/annotate/upload', { method: 'POST', body: fd });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || '上传失败');
+
+    annState.sessionId      = data.session_id;
+    annState.headers        = data.headers;
+    annState.headersZh      = data.headers_zh || data.headers;
+    annState.idCol          = data.id_col;
+    annState.openTextCols   = data.open_text_cols;
+    annState.matrixColIdxs  = new Set(data.matrix_col_idxs || []);
+
+    $('ann-preview-meta').textContent =
+      `${data.filename} · ${data.total_rows} 行数据 · ${data.headers.length} 列`;
+
+    annRenderColConfig(data.headers, data.id_col, data.open_text_cols, data.headers_zh || data.headers, new Set(data.matrix_col_idxs || []));
+    annGoStep(2);
+    showToast(`成功读取 ${data.total_rows} 行数据`, 'success');
+  } catch (e) {
+    showToast(`上传失败：${e.message}`, 'error');
+    annResetUploadZone();
+  }
+}
+
+function annResetUploadZone() {
+  annUploadZone.innerHTML = `
+    <div class="upload-zone__icon">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+        <polyline points="17 8 12 3 7 8"/>
+        <line x1="12" y1="3" x2="12" y2="15"/>
+      </svg>
+    </div>
+    <div class="upload-zone__text">
+      <span class="upload-zone__primary">拖放文件到这里，或点击选择</span>
+      <span class="upload-zone__secondary">支持 CSV / Excel（最大 50MB）</span>
+    </div>`;
+}
+
+// ── ANN STEP 2: 列确认 + 任务 ──────────────────────────────
+
+function annRenderColConfig(headers, idCol, openTextCols, headersZh, matrixIdxs) {
+  const zh     = headersZh || headers;
+  const otSet  = new Set(openTextCols);
+  const mxSet  = matrixIdxs || new Set();
+  const container = $('ann-col-config');
+
+  // ID 列选择（显示中文名，排除矩阵子列）
+  const idOpts = headers.map((h, i) =>
+    `<option value="${i}" ${i === idCol ? 'selected' : ''}>${i}: ${esc(zh[i] || h)}</option>`
+  ).join('');
+
+  // 主观题列多选——每行一题，矩阵子列隐藏
+  const otRows = headers.map((h, i) => {
+    if (mxSet.has(i)) return '';   // 矩阵子列不显示
+    const zhName = zh[i] || h;
+    const hasDiff = zhName !== h;
+    return `
+    <label class="ann-col-check-item ann-col-check-item--full">
+      <input type="checkbox" class="ann-ot-check" value="${i}" ${otSet.has(i) ? 'checked' : ''} />
+      <span class="ann-col-idx">${i}</span>
+      <span class="ann-col-name-wrap">
+        <span class="ann-col-zh">${esc(zhName)}</span>
+        ${hasDiff ? `<span class="ann-col-original">${esc(h)}</span>` : ''}
+      </span>
+    </label>`;
+  }).join('');
+
+  container.innerHTML = `
+    <div class="ann-col-row">
+      <label class="ann-label">玩家唯一 ID 列</label>
+      <select class="type-select" id="ann-id-col-sel">${idOpts}</select>
+    </div>
+    <div class="ann-col-row" style="flex-direction:column;align-items:flex-start">
+      <label class="ann-label">主观题列（可多选）</label>
+      <div class="ann-col-check-list ann-col-check-list--full">${otRows}</div>
+    </div>`;
+
+  // 更新 annState
+  $('ann-id-col-sel').addEventListener('change', e => {
+    annState.idCol = +e.target.value;
+  });
+  container.querySelectorAll('.ann-ot-check').forEach(cb => {
+    cb.addEventListener('change', () => {
+      annState.openTextCols = [...container.querySelectorAll('.ann-ot-check:checked')].map(c => +c.value);
+      annUpdateStartBtn();
+    });
+  });
+  annState.idCol        = idCol;
+  annState.openTextCols = [...otSet];
+  annUpdateStartBtn();
+}
+
+// 任务勾选
+['task-ai-detect', 'task-quality'].forEach(id => {
+  $(id).addEventListener('change', () => {
+    annState.tasks.ai_detect = $('task-ai-detect').checked;
+    annState.tasks.quality   = $('task-quality').checked;
+    $('ann-background-block').style.display = annState.tasks.ai_detect ? '' : 'none';
+    annUpdateStartBtn();
+  });
+});
+
+function annUpdateStartBtn() {
+  const hasTask = annState.tasks.ai_detect || annState.tasks.quality;
+  const hasCols = annState.openTextCols.length > 0;
+  $('ann-btn-start').disabled = !(hasTask && hasCols);
+}
+
+$('ann-btn-start').addEventListener('click', annStartAnnotation);
+
+async function annStartAnnotation() {
+  $('ann-btn-start').disabled = true;
+  // 读取最新 id_col
+  const idColSel = $('ann-id-col-sel');
+  if (idColSel) annState.idCol = +idColSel.value;
+
+  try {
+    const resp = await fetch(`/api/annotate/${annState.sessionId}/confirm-columns`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        id_col:         annState.idCol,
+        open_text_cols: annState.openTextCols,
+        tasks:          annState.tasks,
+        background:     ($('ann-background').value || '').trim(),
+      }),
+    });
+    if (!resp.ok) {
+      const d = await resp.json();
+      throw new Error(d.detail || '保存失败');
+    }
+    annState.aiResults       = [];
+    annState.highProbResults = [];
+    annState.confirmedAiIds  = new Set();
+    annState.qualityCount    = 0;
+
+    if (annState.tasks.ai_detect) {
+      annGoStep(3);
+      await annRunAiDetect();
+    } else if (annState.tasks.quality) {
+      annGoStep(5);
+      await annRunQuality();
+    }
+  } catch (e) {
+    showToast(`启动失败：${e.message}`, 'error');
+    $('ann-btn-start').disabled = false;
+  }
+}
+
+// ── ANN STEP 3: AI 检测 ────────────────────────────────────
+
+async function annRunAiDetect() {
+  const bar     = $('ann-ai-progress-bar');
+  const msg     = $('ann-ai-progress-msg');
+  const warnLog = $('ann-ai-warn-log');
+  bar.style.width = '0%';
+  msg.textContent = '正在连接…';
+  warnLog.innerHTML = '';
+
+  try {
+    await consumeSSE(`/api/annotate/${annState.sessionId}/run-ai-detect`, ev => {
+      if (ev.type === 'progress') {
+        const pct = ev.total > 0 ? Math.round((ev.done / ev.total) * 100) : 0;
+        bar.style.width = `${pct}%`;
+        msg.textContent = ev.msg || `${ev.done}/${ev.total} 批已完成`;
+      }
+      if (ev.type === 'warn') {
+        const div = document.createElement('div');
+        div.className = 'ann-warn-item';
+        div.textContent = ev.msg;
+        warnLog.appendChild(div);
+      }
+      if (ev.type === 'ai_detect_done') {
+        bar.style.width = '100%';
+        msg.textContent = `AI 检测完成，共 ${ev.results.length} 条结果`;
+        annState.aiResults       = ev.results || [];
+        annState.highProbResults = ev.high_prob || [];
+      }
+    });
+
+    // 有高概率结果 → 跳到确认步
+    if (annState.highProbResults.length > 0) {
+      annRenderAiConfirm(annState.highProbResults);
+      annGoStep(4);
+    } else {
+      showToast('未发现高概率 AI 作答（≥ 80%），自动跳过确认步骤', 'info');
+      await annAfterAiConfirm();
+    }
+  } catch (e) {
+    showToast(`AI 检测失败：${e.message}`, 'error');
+  }
+}
+
+// ── ANN STEP 4: AI 确认 ────────────────────────────────────
+
+function annRenderAiConfirm(highProbResults) {
+  const table   = $('ann-confirm-table');
+  const headers = annState.headers;
+  const otCols  = annState.openTextCols;
+
+  // 构建表头
+  let thCells = `<th><input type="checkbox" id="ann-check-master" checked /></th>
+    <th>玩家 ID</th><th>AI 概率</th><th>润色程度</th><th>判断理由</th><th>关键证据</th>`;
+  for (const ci of otCols) {
+    const hdr = headers[ci] || `列${ci}`;
+    thCells += `<th>${esc(hdr)}（原文）</th><th>${esc(hdr)}（中文译）</th>`;
+  }
+
+  let rows = '';
+  highProbResults.forEach((r, i) => {
+    const checked = 'checked';
+    let tdCols = '';
+    for (const ci of otCols) {
+      const key = `col_${ci}`;
+      const trans = (r.translations || {})[key] || '';
+      // 找原文：需要从原始行中取，但这里只有 translations，用原文 evidence 作示意
+      // 实际上我们没有把原文存在 highProbResults 里，用 evidence 代替
+      tdCols += `<td class="ann-cell-text">${esc(trans || '')}</td>
+                 <td class="ann-cell-text ann-cell-trans">${esc(trans)}</td>`;
+    }
+    rows += `<tr data-row="${i}">
+      <td><input type="checkbox" class="ann-ai-check" data-id="${esc(r.id)}" ${checked} /></td>
+      <td class="ann-cell-id">${esc(r.id)}</td>
+      <td class="ann-cell-prob">${r.ai_prob}%</td>
+      <td class="ann-cell-polish">${esc(r.is_polished || '')}</td>
+      <td class="ann-cell-reason">${esc(r.reason || '')}</td>
+      <td class="ann-cell-evidence">${esc(r.evidence || '')}</td>
+      ${tdCols}
+    </tr>`;
+  });
+
+  table.innerHTML = `<thead><tr>${thCells}</tr></thead><tbody>${rows}</tbody>`;
+
+  // 主控勾选
+  $('ann-check-master').addEventListener('change', e => {
+    table.querySelectorAll('.ann-ai-check').forEach(cb => { cb.checked = e.target.checked; });
+  });
+
+  $('ann-confirm-desc').textContent =
+    `以下 ${highProbResults.length} 位受访者 AI 作答概率 ≥ 80%，请逐行确认是否标注为 AI 作答`;
+}
+
+$('ann-btn-check-all').addEventListener('click', () => {
+  document.querySelectorAll('.ann-ai-check').forEach(cb => { cb.checked = true; });
+});
+$('ann-btn-uncheck-all').addEventListener('click', () => {
+  document.querySelectorAll('.ann-ai-check').forEach(cb => { cb.checked = false; });
+});
+
+$('ann-btn-confirm-ai').addEventListener('click', async () => {
+  const checked = [...document.querySelectorAll('.ann-ai-check:checked')].map(cb => cb.dataset.id);
+  annState.confirmedAiIds = new Set(checked);
+
+  try {
+    const resp = await fetch(`/api/annotate/${annState.sessionId}/confirm-ai`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ confirmed_ai_ids: checked }),
+    });
+    if (!resp.ok) {
+      const d = await resp.json();
+      throw new Error(d.detail || '保存失败');
+    }
+    showToast(`已确认 ${checked.length} 位 AI 作答受访者`, 'success');
+    await annAfterAiConfirm();
+  } catch (e) {
+    showToast(`确认失败：${e.message}`, 'error');
+  }
+});
+
+async function annAfterAiConfirm() {
+  if (annState.tasks.quality) {
+    annGoStep(5);
+    await annRunQuality();
+  } else {
+    annGoStep(6);
+    annShowDone();
+  }
+}
+
+// ── ANN STEP 5: 质量打标 ───────────────────────────────────
+
+async function annRunQuality() {
+  const bar     = $('ann-quality-progress-bar');
+  const msg     = $('ann-quality-progress-msg');
+  const warnLog = $('ann-quality-warn-log');
+  bar.style.width = '0%';
+  msg.textContent = '正在连接…';
+  warnLog.innerHTML = '';
+
+  try {
+    await consumeSSE(`/api/annotate/${annState.sessionId}/run-quality`, ev => {
+      if (ev.type === 'progress') {
+        const pct = ev.total > 0 ? Math.round((ev.done / ev.total) * 100) : 0;
+        bar.style.width = `${pct}%`;
+        msg.textContent = ev.msg || `${ev.done}/${ev.total} 批已完成`;
+      }
+      if (ev.type === 'warn') {
+        const div = document.createElement('div');
+        div.className = 'ann-warn-item';
+        div.textContent = ev.msg;
+        warnLog.appendChild(div);
+      }
+      if (ev.type === 'quality_done') {
+        bar.style.width = '100%';
+        msg.textContent = `质量打标完成，共 ${ev.count} 条结果`;
+        annState.qualityCount = ev.count;
+      }
+    });
+    annGoStep(6);
+    annShowDone();
+  } catch (e) {
+    showToast(`质量打标失败：${e.message}`, 'error');
+  }
+}
+
+// ── ANN STEP 6: 完成 ─────────────────────────────────────
+
+function annShowDone() {
+  const parts = [];
+  if (annState.tasks.ai_detect) {
+    parts.push(`AI 作答识别：${annState.aiResults.length} 条，${annState.confirmedAiIds.size} 位确认为 AI 作答`);
+  }
+  if (annState.tasks.quality) {
+    parts.push(`质量打标：${annState.qualityCount} 条`);
+  }
+  $('ann-done-text').innerHTML = parts.join('<br>');
+  showToast('所有标注任务完成！', 'success');
+}
+
+$('ann-btn-download').addEventListener('click', () => {
+  window.location.href = `/api/annotate/${annState.sessionId}/download`;
+});
+
+$('ann-btn-restart').addEventListener('click', () => {
+  if (!confirm('确定要重新标注吗？当前标注数据将被清除。')) return;
+  annState.sessionId       = null;
+  annState.currentStep     = 1;
+  annState.headers         = [];
+  annState.idCol           = 1;
+  annState.openTextCols    = [];
+  annState.tasks           = { ai_detect: false, quality: false };
+  annState.aiResults       = [];
+  annState.highProbResults = [];
+  annState.confirmedAiIds  = new Set();
+  annState.qualityCount    = 0;
+  $('task-ai-detect').checked = false;
+  $('task-quality').checked   = false;
+  $('ann-background').value   = '';
+  $('ann-background-block').style.display = 'none';
+  annResetUploadZone();
+  annFileInput.value = '';
+  annGoStep(1);
+  showToast('已重置，请重新上传文件', 'info');
+});
+
 
 // ── 上传说明文案 ──
 fetch('/api/upload-guide')
