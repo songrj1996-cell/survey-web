@@ -2342,6 +2342,12 @@ web_logins: dict[str, dict] = _load_web_logins()
 oauth_states: dict[str, dict] = {}
 
 
+def _sync_web_logins_from_disk() -> None:
+    """Keep multi-worker processes in sync with the persisted login store."""
+    web_logins.clear()
+    web_logins.update(_load_web_logins())
+
+
 def _extract_core_lines(md: str) -> list[str]:
     """取出 <!--CORE_START-->..<!--CORE_END--> 之间的内容行（供飞书高亮块用）。"""
     if not md or CORE_START not in md:
@@ -2398,6 +2404,7 @@ def _extract_feishu_callout_sections(md: str) -> list[dict]:
 async def _current_login(request: Request) -> dict | None:
     """从 cookie 取登录态；token 临过期则尝试刷新。返回 None 表示未登录。"""
     sid = request.cookies.get(COOKIE_NAME, "")
+    _sync_web_logins_from_disk()
     login = web_logins.get(sid)
     if not login:
         return None
@@ -2449,6 +2456,7 @@ async def feishu_callback(code: str = "", state: str = ""):
     login["created_at"] = now
     login["expires_at"] = now + FEISHU_SESSION_SECONDS
     sid = secrets.token_urlsafe(24)
+    _sync_web_logins_from_disk()
     web_logins[sid] = login
     _save_web_logins()
     resp = RedirectResponse(_safe_next_path(st.get("next") or "/"))
@@ -2479,6 +2487,7 @@ async def feishu_me(request: Request):
 @app.post("/api/feishu/logout")
 async def feishu_logout(request: Request):
     sid = request.cookies.get(COOKIE_NAME, "")
+    _sync_web_logins_from_disk()
     web_logins.pop(sid, None)
     _save_web_logins()
     resp = JSONResponse({"ok": True})
