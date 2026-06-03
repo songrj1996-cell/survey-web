@@ -410,6 +410,72 @@ def _qa_user_count(entry: dict) -> int:
     return sum(1 for m in entry.get("qa_messages", []) if m.get("role") == "user")
 
 
+def _owner_from_login(login: dict | None) -> dict:
+    login = login or {}
+    email = str(login.get("email", "")).strip().lower()
+    open_id = str(login.get("open_id", "")).strip()
+    if email:
+        owner_key = f"email:{email}"
+    elif open_id:
+        owner_key = f"open_id:{open_id}"
+    else:
+        owner_key = ""
+    return {
+        "owner_key": owner_key,
+        "owner_email": email,
+        "owner_open_id": open_id,
+        "owner_name": str(login.get("name", "")).strip(),
+    }
+
+
+def _history_owner_key(entry: dict | None) -> str:
+    entry = entry or {}
+    owner_key = str(entry.get("owner_key", "")).strip()
+    if owner_key:
+        return owner_key
+    email = str(entry.get("owner_email", "")).strip().lower()
+    if email:
+        return f"email:{email}"
+    open_id = str(entry.get("owner_open_id", "")).strip()
+    if open_id:
+        return f"open_id:{open_id}"
+    return ""
+
+
+def _visible_to_owner(item: dict | None, login: dict | None) -> bool:
+    if not FEISHU_LOGIN_REQUIRED:
+        return True
+    viewer_key = _owner_from_login(login).get("owner_key", "")
+    item_key = _history_owner_key(item)
+    return bool(viewer_key and item_key and viewer_key == item_key)
+
+
+def _assign_session_owner(sess: dict, login: dict | None) -> None:
+    if not sess.get("owner_key"):
+        sess.update(_owner_from_login(login))
+
+
+def _find_history_for_login(history: list, hist_id: str, login: dict | None) -> dict | None:
+    entry = next((h for h in history if h.get("id") == hist_id), None)
+    if not entry or not _visible_to_owner(entry, login):
+        return None
+    return entry
+
+
+def _trim_history_for_owner(history: list, owner_key: str) -> list:
+    if not owner_key:
+        return history[:MAX_HISTORY]
+    seen = 0
+    kept = []
+    for entry in history:
+        if _history_owner_key(entry) == owner_key:
+            seen += 1
+            if seen > MAX_HISTORY:
+                continue
+        kept.append(entry)
+    return kept
+
+
 def _sanitize_report_title(title: str) -> str:
     cleaned = re.sub(r"[\r\n\t]+", " ", str(title or "")).strip()
     cleaned = re.sub(r'[\\/:*?"<>|]', "_", cleaned)
@@ -438,6 +504,12 @@ def save_to_history(session_id: str, sess: dict) -> None:
         qa_messages = old_entry.get("qa_messages", [])
     title_m = re.search(r"^#\s+(.+?)$", report_md, re.MULTILINE)
     title = title_m.group(1).strip() if title_m else "未命名报告"
+    owner = {
+        "owner_key": sess.get("owner_key") or (old_entry or {}).get("owner_key", ""),
+        "owner_email": sess.get("owner_email") or (old_entry or {}).get("owner_email", ""),
+        "owner_open_id": sess.get("owner_open_id") or (old_entry or {}).get("owner_open_id", ""),
+        "owner_name": sess.get("owner_name") or (old_entry or {}).get("owner_name", ""),
+    }
     entry = {
         "id": session_id,
         "report_no": old_entry.get("report_no") if old_entry else _next_history_report_no(history),
@@ -450,10 +522,11 @@ def save_to_history(session_id: str, sess: dict) -> None:
         "analyst_conv_id": sess.get("analyst_conv_id", ""),
         "qa_messages": qa_messages or [],
         "rows_fed": True,  # 历史 QA 跳过投喂 rows（对话已包含上下文）
+        **owner,
     }
     history = [h for h in history if h["id"] != session_id]
     history.insert(0, entry)
-    history = history[:MAX_HISTORY]
+    history = _trim_history_for_owner(history, owner.get("owner_key", ""))
     _save_history(history)
 
 
@@ -1014,6 +1087,26 @@ def _build_planner_query_with_confirmed(rows: list[list], confirmed_columns: lis
     )
 
 
+def _build_plan_revision_query(plan: dict, headers: list[str], confirmed_columns: list[dict], user_text: str) -> str:
+    header_lines = "\n".join(f"- 列{i}: {h}" for i, h in enumerate(headers))
+    confirmed_json = json.dumps(confirmed_columns or [], ensure_ascii=False, indent=2)
+    plan_json = json.dumps(plan or {}, ensure_ascii=False, indent=2)
+    return (
+        "你正在修订一份问卷分析方案。请根据用户的修改意见，在当前方案基础上输出一份完整的新 plan JSON。\n\n"
+        "严格要求：\n"
+        "1. 只能输出一个完整 JSON 对象，不要输出解释、确认语、Markdown 文本或 ```json 围栏外的内容。\n"
+        "2. JSON 必须包含 columns、parts、cross_tabs、open_questions 字段，并通过既有 schema 校验。\n"
+        "3. columns 必须保留用户已确认的题型、列号、选项、矩阵题分组等权威信息；不要重新猜测题型或选项。\n"
+        "4. parts 必须使用实际存在的列号；矩阵题成员列必须整体归入同一个 part。\n"
+        "5. 若用户意见只要求调整章节/分析重点，只改 parts、cross_tabs 或 open_questions，不要无故改 columns。\n\n"
+        f"<headers>\n{header_lines}\n</headers>\n\n"
+        f"<confirmed_columns_json>\n{confirmed_json}\n</confirmed_columns_json>\n\n"
+        f"<current_plan_json>\n{plan_json}\n</current_plan_json>\n\n"
+        f"<user_revision_request>\n{user_text.strip()}\n</user_revision_request>\n\n"
+        "请现在返回修订后的完整 JSON 对象。"
+    )
+
+
 def _build_writer_query(stats_md: str, open_text: dict, plan: dict, headers: list[str]) -> str:
     parts_lines = []
     for i, p in enumerate(plan["parts"], 1):
@@ -1556,7 +1649,7 @@ async def feishu_auth_middleware(request: Request, call_next):
 # ── 上传 ──────────────────────────────────────────────
 
 @app.post("/api/upload")
-async def upload_file(file: UploadFile = File(...)):
+async def upload_file(request: Request, file: UploadFile = File(...)):
     content = await file.read()
     try:
         rows = _parse_file(file.filename or "upload.csv", content)
@@ -1571,6 +1664,7 @@ async def upload_file(file: UploadFile = File(...)):
     sid = new_session()
     sessions[sid]["rows"] = rows
     sessions[sid]["filename"] = file.filename or "upload.csv"
+    _assign_session_owner(sessions[sid], await _current_login(request))
 
     return {
         "session_id": sid,
@@ -1744,8 +1838,15 @@ async def confirm_plan(req: PlanConfirmRequest):
         try:
             new_conv_id = planner_conv_id
             answer_chunks: list[str] = []
+            headers = rows[0]
+            revision_query = _build_plan_revision_query(
+                plan,
+                headers,
+                sess.get("confirmed_columns", []),
+                req.user_text,
+            )
             async for chunk, conv_id in sse_dify_stream(
-                req.user_text, req.session_id, planner_conv_id, DIFY_PLANNER_KEY
+                revision_query, req.session_id, "", DIFY_PLANNER_KEY
             ):
                 if chunk:
                     answer_chunks.append(chunk)
@@ -1753,11 +1854,32 @@ async def confirm_plan(req: PlanConfirmRequest):
                 if conv_id:
                     new_conv_id = conv_id
 
-            headers = rows[0]
+            full_answer = "".join(answer_chunks)
             new_plan, err = survey_plan.parse_plan_from_llm(
-                "".join(answer_chunks),
-                survey_plan.header_count_from_plan(plan)
+                full_answer,
+                len(headers)
             )
+            if not new_plan:
+                retry_query = (
+                    f"{revision_query}\n\n"
+                    "上一次输出无法解析为 JSON。请修正并只返回完整 JSON 对象。\n"
+                    f"解析错误：{err}\n"
+                    f"<previous_output>\n{full_answer[:4000]}\n</previous_output>"
+                )
+                retry_chunks: list[str] = []
+                retry_conv_id = new_conv_id
+                yield sse_event({"type": "chunk", "content": "\n\n正在按严格 JSON 格式重新修订方案...\n"})
+                async for chunk, conv_id in sse_dify_stream(
+                    retry_query, req.session_id, "", DIFY_PLANNER_KEY
+                ):
+                    if chunk:
+                        retry_chunks.append(chunk)
+                        yield sse_event({"type": "chunk", "content": chunk})
+                    if conv_id:
+                        retry_conv_id = conv_id
+                new_plan, err = survey_plan.parse_plan_from_llm("".join(retry_chunks), len(headers))
+                if new_plan:
+                    new_conv_id = retry_conv_id
             if not new_plan:
                 yield sse_event({"type": "error", "message": f"修订方案解析失败：{err}"}); return
 
@@ -1795,8 +1917,9 @@ async def compute_stats(session_id: str):
 # ── 报告（SSE）──────────────────────────────────────
 
 @app.get("/api/report/{session_id}")
-async def generate_report(session_id: str):
+async def generate_report(session_id: str, request: Request):
     sess = get_session(session_id)
+    _assign_session_owner(sess, await _current_login(request))
     plan = sess.get("plan")
     rows = sess.get("rows")
     stats_md = sess.get("stats_md")
@@ -1849,8 +1972,9 @@ class QARequest(BaseModel):
 
 
 @app.post("/api/qa")
-async def qa(req: QARequest):
+async def qa(req: QARequest, request: Request):
     sess = get_session(req.session_id)
+    _assign_session_owner(sess, await _current_login(request))
     analyst_conv_id = sess.get("analyst_conv_id", "")
     rows = sess.get("rows", [])
     plan = sess.get("plan", {})
@@ -1905,10 +2029,11 @@ class HistoryQARequest(BaseModel):
 
 
 @app.post("/api/history-qa")
-async def history_qa(req: HistoryQARequest):
+async def history_qa(req: HistoryQARequest, request: Request):
     """从历史记录中续聊 QA（无行数据，直接使用 analyst conv_id）。"""
+    login = await _current_login(request)
     history = _load_history()
-    entry = next((h for h in history if h["id"] == req.history_id), None)
+    entry = _find_history_for_login(history, req.history_id, login)
     if not entry:
         raise HTTPException(status_code=404, detail="历史记录不存在")
 
@@ -2365,9 +2490,10 @@ async def export_pdf(session_id: str):
 
 
 @app.get("/api/export/word-history/{history_id}")
-async def export_word_history(history_id: str):
+async def export_word_history(history_id: str, request: Request):
+    login = await _current_login(request)
     history = _load_history()
-    entry = next((h for h in history if h["id"] == history_id), None)
+    entry = _find_history_for_login(history, history_id, login)
     if not entry:
         raise HTTPException(status_code=404, detail="历史记录不存在")
     report_md = _prep_export_md(entry.get("report_md", ""))
@@ -2382,9 +2508,10 @@ async def export_word_history(history_id: str):
 
 
 @app.get("/api/export/pdf-history/{history_id}")
-async def export_pdf_history(history_id: str):
+async def export_pdf_history(history_id: str, request: Request):
+    login = await _current_login(request)
     history = _load_history()
-    entry = next((h for h in history if h["id"] == history_id), None)
+    entry = _find_history_for_login(history, history_id, login)
     if not entry:
         raise HTTPException(status_code=404, detail="历史记录不存在")
     report_md = entry.get("report_md", "")
@@ -2722,7 +2849,7 @@ async def export_feishu_history(history_id: str, request: Request):
     if not login:
         raise HTTPException(status_code=401, detail="请先登录飞书")
     history = _load_history()
-    entry = next((h for h in history if h["id"] == history_id), None)
+    entry = _find_history_for_login(history, history_id, login)
     if not entry:
         raise HTTPException(status_code=404, detail="历史记录不存在")
     try:
@@ -2872,9 +2999,11 @@ async def update_ui_text(key: str, req: UiTextUpdateRequest):
 # ── 历史记录 ──────────────────────────────────────────
 
 @app.get("/api/history")
-async def get_history():
+async def get_history(request: Request):
+    login = await _current_login(request)
     history = _load_history()
     history = _ensure_history_report_numbers(history)
+    visible_history = [h for h in history if _visible_to_owner(h, login)]
     # 列表视图不返回完整 report_md（节省带宽）
     return [
         {
@@ -2886,15 +3015,16 @@ async def get_history():
             "has_qa": bool(h.get("analyst_conv_id")),
             "qa_count": _qa_user_count(h),
         }
-        for h in history
+        for h in visible_history
     ]
 
 
 @app.get("/api/history/{hist_id}")
-async def get_history_item(hist_id: str):
+async def get_history_item(hist_id: str, request: Request):
+    login = await _current_login(request)
     history = _load_history()
     history = _ensure_history_report_numbers(history)
-    entry = next((h for h in history if h["id"] == hist_id), None)
+    entry = _find_history_for_login(history, hist_id, login)
     if not entry:
         raise HTTPException(status_code=404, detail="历史记录不存在")
     return entry
@@ -2909,21 +3039,22 @@ class HistoryTitleUpdateByIdRequest(BaseModel):
     title: str
 
 
-def _update_history_title_by_id(hist_id: str, title: str) -> dict:
+def _update_history_title_by_id(hist_id: str, title: str, login: dict | None = None) -> dict:
     hist_id = str(hist_id or "").strip()
     new_title = _sanitize_report_title(title)
     history = _load_history()
     history = _ensure_history_report_numbers(history, save=False)
-    entry = next((h for h in history if h["id"] == hist_id), None)
+    entry = _find_history_for_login(history, hist_id, login)
     if not entry:
         sess = sessions.get(hist_id)
-        if sess and sess.get("report_md"):
+        if sess and sess.get("report_md") and _visible_to_owner(sess, login):
+            _assign_session_owner(sess, login)
             sess["report_md"] = _replace_report_h1(sess.get("report_md", ""), new_title)
             sess["ts"] = time.time()
             save_to_history(hist_id, sess)
             history = _load_history()
             history = _ensure_history_report_numbers(history, save=False)
-            entry = next((h for h in history if h["id"] == hist_id), None)
+            entry = _find_history_for_login(history, hist_id, login)
     if not entry:
         print(f"[history-title] not found id={hist_id!r} existing={[h.get('id') for h in history]}")
         raise HTTPException(status_code=404, detail="未找到这份报告，请刷新历史记录后重试")
@@ -2947,23 +3078,23 @@ def _update_history_title_by_id(hist_id: str, title: str) -> dict:
 
 
 @app.patch("/api/history-title")
-async def update_history_title_by_body(req: HistoryTitleUpdateByIdRequest):
-    return _update_history_title_by_id(req.id, req.title)
+async def update_history_title_by_body(req: HistoryTitleUpdateByIdRequest, request: Request):
+    return _update_history_title_by_id(req.id, req.title, await _current_login(request))
 
 
 @app.post("/api/history-title")
-async def update_history_title_by_body_post(req: HistoryTitleUpdateByIdRequest):
-    return _update_history_title_by_id(req.id, req.title)
+async def update_history_title_by_body_post(req: HistoryTitleUpdateByIdRequest, request: Request):
+    return _update_history_title_by_id(req.id, req.title, await _current_login(request))
 
 
 @app.patch("/api/history/{hist_id}/title")
-async def update_history_title(hist_id: str, req: HistoryTitleUpdateRequest):
-    return _update_history_title_by_id(hist_id, req.title)
+async def update_history_title(hist_id: str, req: HistoryTitleUpdateRequest, request: Request):
+    return _update_history_title_by_id(hist_id, req.title, await _current_login(request))
 
 
 @app.post("/api/history/{hist_id}/title")
-async def update_history_title_post(hist_id: str, req: HistoryTitleUpdateRequest):
-    return _update_history_title_by_id(hist_id, req.title)
+async def update_history_title_post(hist_id: str, req: HistoryTitleUpdateRequest, request: Request):
+    return _update_history_title_by_id(hist_id, req.title, await _current_login(request))
 
 
 # ============================================================

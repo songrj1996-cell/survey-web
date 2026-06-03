@@ -266,6 +266,7 @@ async function handleUpload(file) {
     state.sessionId = data.session_id;
     state.viewMode  = 'session';
     state.historyId = null;
+    clearPlanInput();
     state.sessionReport = {
       reportMd: null,
       title: '',
@@ -550,6 +551,7 @@ $('btn-start-plan').addEventListener('click', startPlan);
 async function startPlan() {
   const btn = $('btn-start-plan');
   btn.disabled = true;
+  clearPlanInput();
 
   // 先存储用户确认的题型
   try {
@@ -602,7 +604,7 @@ function showPlanCard(plan, headers) {
   $('plan-thinking').style.display = 'none';
   $('plan-card').style.display = 'block';
   $('plan-card-content').innerHTML = buildPlanHTML(plan, headers);
-  syncPlanActionButtons();
+  clearPlanInput();
 }
 
 function buildPlanHTML(plan, headers) {
@@ -682,6 +684,14 @@ function syncPlanActionButtons() {
   $('btn-plan-revise').disabled = !hasText;
 }
 
+function clearPlanInput() {
+  const input = $('plan-input');
+  if (!input) return;
+  input.value = '';
+  input.setAttribute('autocomplete', 'off');
+  syncPlanActionButtons();
+}
+
 $('btn-plan-ok').addEventListener('click', () => {
   if (($('plan-input').value || '').trim()) return;
   confirmPlan('ok');
@@ -689,6 +699,7 @@ $('btn-plan-ok').addEventListener('click', () => {
 $('btn-plan-revise').addEventListener('click', () => {
   const txt = $('plan-input').value.trim();
   if (!txt) { showToast('请先输入修改意见', 'info'); return; }
+  clearPlanInput();
   confirmPlan(txt);
 });
 $('plan-input').addEventListener('input', syncPlanActionButtons);
@@ -696,7 +707,10 @@ $('plan-input').addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
     const txt = $('plan-input').value.trim();
-    if (txt) confirmPlan(txt);
+    if (txt) {
+      clearPlanInput();
+      confirmPlan(txt);
+    }
   }
 });
 
@@ -738,9 +752,7 @@ async function confirmPlan(text) {
       if (newPlan) {
         state.planData = newPlan;
         showPlanCard(newPlan, newHeaders);
-        $('plan-input').value = '';
         showToast('方案已修订，请再次确认', 'success');
-        syncPlanActionButtons();
         return;
       }
     }
@@ -1965,6 +1977,7 @@ $('btn-restart').addEventListener('click', () => {
   };
   resetUploadZone();
   fileInput.value = '';
+  clearPlanInput();
   $('qa-input').disabled = false;
   $('btn-qa-send').disabled = false;
   // 回到分析类型选择层
