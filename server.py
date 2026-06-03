@@ -15,6 +15,7 @@ import io
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -1963,15 +1964,20 @@ def _make_download_response(data: bytes, mime: str, filename: str) -> StreamingR
 
 
 PDF_CSS = """
-@page { margin: 0; }
+@page { size: 10in 14in; margin: 0; }
 * { box-sizing: border-box; }
+html {
+  margin: 0;
+  background: #fff;
+}
 body {
   font-family: "Noto Sans CJK SC", "Noto Sans CJK", "WenQuanYi Micro Hei", "Microsoft YaHei", "PingFang SC", "Source Han Sans SC", Arial, sans-serif;
   font-size: 13px;
   line-height: 1.75;
   color: #222;
   background: #fff;
-  width: 900px;
+  width: auto;
+  max-width: 900px;
   margin: 0 auto;
   padding: 36px 44px 48px;
 }
@@ -2005,7 +2011,18 @@ blockquote {
   font-style: italic;
   background: #f9f9f9;
 }
-table { border-collapse: collapse; width: 100%; margin: 14px 0; font-size: 12px; page-break-inside: avoid; table-layout: auto; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  max-width: 100%;
+  margin: 14px 0;
+  font-size: 11.5px;
+  line-height: 1.55;
+  page-break-inside: avoid;
+  table-layout: auto;
+}
+thead { display: table-header-group; }
+tr { page-break-inside: avoid; }
 th {
   background: #f0ebff;
   color: #3d1d8a;
@@ -2013,10 +2030,21 @@ th {
   padding: 7px 10px;
   border: 1px solid #d6c8ff;
   text-align: left;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: normal;
 }
-th:first-child, td:first-child { min-width: 88px; white-space: normal; word-break: keep-all; }
-td { padding: 6px 10px; border: 1px solid #e0e0e0; vertical-align: top; word-break: normal; overflow-wrap: anywhere; }
+th:first-child, td:first-child { min-width: 72px; }
+td {
+  padding: 6px 10px;
+  border: 1px solid #e0e0e0;
+  vertical-align: top;
+  white-space: normal;
+  word-break: normal;
+  overflow-wrap: anywhere;
+}
 tr:nth-child(even) td { background: #fafafa; }
+img { max-width: 100%; height: auto; }
 code { background: #f3f0ff; color: #5b21b6; padding: 1px 5px; border-radius: 3px; font-size: 12px; }
 pre { background: #f5f5f5; padding: 12px; border-radius: 4px; overflow-wrap: break-word; white-space: pre-wrap; }
 code, pre { font-family: "Noto Sans Mono CJK SC", "Noto Sans CJK SC", "WenQuanYi Micro Hei", "Microsoft YaHei", monospace; }
@@ -2089,15 +2117,26 @@ def report_markdown_to_pdf(md_text: str) -> bytes:
 def _find_pdf_browser() -> str:
     candidates = [
         os.getenv("PDF_BROWSER_PATH", "").strip(),
+        shutil.which("google-chrome"),
+        shutil.which("google-chrome-stable"),
+        shutil.which("chromium"),
+        shutil.which("chromium-browser"),
+        shutil.which("microsoft-edge"),
         r"C:\Program Files\Google\Chrome\Application\chrome.exe",
         r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
         r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
         r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/snap/bin/chromium",
+        "/usr/bin/microsoft-edge",
     ]
     for path in candidates:
         if path and os.path.exists(path):
             return path
-    raise RuntimeError("未找到可用于生成 PDF 的 Chrome/Edge，请安装浏览器或设置 PDF_BROWSER_PATH")
+    raise RuntimeError("未找到可用于生成 PDF 的 Chrome/Edge/Chromium，请安装浏览器或设置 PDF_BROWSER_PATH")
 
 
 def _free_local_port() -> int:
@@ -2218,8 +2257,16 @@ def _html_to_pdf_with_browser(doc: str) -> bytes:
 
 def html_to_pdf_bytes(doc: str) -> bytes:
     renderer = os.getenv("PDF_RENDERER", "").strip().lower()
-    if renderer == "browser" or (os.name == "nt" and renderer != "weasyprint"):
-        return _html_to_pdf_with_browser(doc)
+    if renderer == "browser":
+        try:
+            return _html_to_pdf_with_browser(doc)
+        except Exception:
+            pass
+    try:
+        if renderer != "weasyprint":
+            return _html_to_pdf_with_browser(doc)
+    except Exception:
+        pass
     try:
         from weasyprint import HTML  # type: ignore
         return HTML(string=doc).write_pdf()
