@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>飞书登录 · 问卷分析平台</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body class="login-page">
+  <main class="login-shell">
+    <section class="login-panel">
+      <div class="brand-icon login-brand-icon">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M9 11l3 3L22 4" />
+          <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" />
+        </svg>
+      </div>
+      <h1>问卷分析平台</h1>
+      <p class="login-subtitle">请使用飞书账号验证身份</p>
+      <div class="login-alert" id="login-alert" hidden></div>
+      <a class="btn btn--primary login-button" id="login-button" href="#">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+          <polyline points="14 2 14 8 20 8" />
+        </svg>
+        使用飞书登录
+      </a>
+      <p class="login-footnote" id="login-footnote">验证通过后会自动回到刚才的页面。</p>
+    </section>
+  </main>
+
+  <script>
+    const params = new URLSearchParams(location.search);
+    const next = params.get('next') || '/';
+    const error = params.get('error') || '';
+    const alertEl = document.getElementById('login-alert');
+    const btn = document.getElementById('login-button');
+    const footnote = document.getElementById('login-footnote');
+
+    function showAlert(message) {
+      alertEl.textContent = message;
+      alertEl.hidden = false;
+    }
+
+    if (error) {
+      showAlert(error);
+      // 如果错误信息里含 Open ID，高亮显示方便复制给管理员
+      if (error.includes('Open ID:')) {
+        const match = error.match(/Open ID:\s*(ou_\S+)/);
+        if (match) {
+          const idBox = document.createElement('div');
+          idBox.style.cssText = 'margin-top:10px;padding:8px 12px;background:rgba(0,0,0,.08);border-radius:6px;font-size:13px;word-break:break-all;cursor:pointer;';
+          idBox.title = '点击复制 Open ID';
+          idBox.textContent = `Open ID: ${match[1]}（点击复制，发给管理员）`;
+          idBox.onclick = () => { navigator.clipboard?.writeText(match[1]); idBox.textContent = '已复制！'; };
+          alertEl.parentNode.insertBefore(idBox, alertEl.nextSibling);
+        }
+      }
+    }
+    btn.href = `/api/feishu/login?next=${encodeURIComponent(next)}`;
+
+    fetch('/api/feishu/me')
+      .then(r => r.json())
+      .then(data => {
+        if (!data.configured) {
+          btn.removeAttribute('href');
+          btn.classList.add('btn--disabled');
+          showAlert('服务端未配置飞书应用，请先填写 FEISHU_APP_ID、FEISHU_APP_SECRET 和 FEISHU_REDIRECT_URI。');
+          footnote.textContent = '配置完成并重启服务后即可登录。';
+          return;
+        }
+        if (data.logged_in && data.allowed !== false) {
+          location.href = next.startsWith('/') && !next.startsWith('//') ? next : '/';
+        }
+      })
+      .catch(() => {
+        showAlert('暂时无法读取登录状态，请稍后重试。');
+      });
+  </script>
+</body>
+</html>

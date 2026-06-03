@@ -28,7 +28,8 @@
       "options": ["选项A","选项B"],
       "scale_min": 1, "scale_max": 5,
       "rows": ["子项1","子项2"],
-      "value_aliases": {"中文标准值": ["原始变体1","Mythic","Mítica"]}
+      "value_aliases": {"中文标准值": ["原始变体1","Mythic","Mítica"]},
+      "low_confidence": false
     }
   ]
 }
@@ -37,10 +38,10 @@
 - column_indexes：普通题给 1 个列号；矩阵题给该题的全部子项列号（用 <columns> 里给出的 column_indexes 原样照抄，顺序不要变）。
 - name_zh：必填。
 - delimiter：仅 multi_choice 需要，是样本里分隔多个选项的符号（如英文逗号、中文逗号、分号、顿号）。
-- options：multi_choice 和 matrix_multi 必填——从样本里归纳出**完整、去重**的选项清单（保留选项原文，包括其中可能含的逗号）。
+- options：选项题清单。优先使用合并后的中文标准值；中文标准值可以不直接出现在原始数据里，但必须能由 value_aliases 中的真实取值支撑。
 - scale_min/scale_max：scale 和 matrix_scale 必填，是评分量程（如 1 和 5）。
 - rows：matrix_scale / matrix_multi 必填，与 column_indexes 顺序一一对应，用 <columns> 里给出的子项标签。
-- value_aliases：仅对选项题（single_choice / profile_dim / multi_choice / matrix_multi）给出。我会在每列附「去重取值」，请把语义相同但写法/语种不同的取值（如 神话/Mythic/Mítica、中国/China/CN）归并到同一个**中文标准值**：key=中文标准值，value=所有原始变体。只有确属同义才合并，拿不准就不合并；无同义可并可省略或给 {}。options 也用中文标准值。
+- value_aliases：仅对选项题（single_choice / profile_dim / multi_choice / matrix_multi）给出。我会在每列附「去重取值」，请把语义相同但写法/语种不同的取值（如 神话/Mythic/Mítica、中国/China/CN）归并到同一个**中文标准值**：key=中文标准值，value=所有原始变体。只有确属同义才合并，拿不准就不合并；无同义可并可省略或给 {}。options 也用中文标准值，且每个中文标准值都必须能由 value_aliases 或真实取值支撑。
 
 角色判断要点：
 - 玩家ID/编号/邮箱 → id；明确是 MLBB 游戏内 ID → mlbbid；提交时间戳、序号等无分析价值的 → ignore
@@ -50,9 +51,12 @@
 - 较长的主观文字回答 → open_text
 - 【疑似矩阵题】：若每个子项填的是分数 → matrix_scale；若每个子项填的是可多选的选项 → matrix_multi
 - 单选但选项固定且不用于分群（如"是/否"）→ single_choice
+- low_confidence：当你对某道题的题型判断**不确定**（样本稀少、题名模糊、多种题型均可解释）时，设为 true；其余设 false 或省略。
 
 只返回 JSON，不要寒暄、不要 markdown 标题、不要解释。
 ```
+
+补充规则：`options` 只能来自对应列「去重取值」中的真实单元格取值或多选拆分值，严禁从题干/表头描述中抽取选项；例如 `New Medal` 只在题干中出现时，不得作为选项输出。
 
 ## 说明
 

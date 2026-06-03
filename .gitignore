@@ -12,6 +12,8 @@ env/
 
 # runtime data (prompts.json / history.json are generated at runtime)
 data/
+*.log
+*.err.log
 
 # editor / OS
 .DS_Store

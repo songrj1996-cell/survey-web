@@ -16,8 +16,9 @@ import openpyxl
 from openpyxl.styles import Alignment, Font, PatternFill
 
 # 分批大小
-AI_DETECT_BATCH = 200
+AI_DETECT_BATCH = 10
 QUALITY_BATCH = 150
+AI_DETECT_MAX_CELL_CHARS = 420
 
 # 标注列样式
 _YELLOW_FILL  = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
@@ -91,12 +92,20 @@ def _try_float(s: str) -> bool:
 # 格式化工具
 # ============================================================
 
-def _rows_to_md_table(batch_rows: list[list], headers: list[str], col_indexes: list[int]) -> str:
+def _rows_to_md_table(
+    batch_rows: list[list],
+    headers: list[str],
+    col_indexes: list[int],
+    max_cell_chars: int | None = None,
+) -> str:
     """把选定列格式化为 Markdown 表格。"""
     sel_headers = [headers[i] if i < len(headers) else f"列{i}" for i in col_indexes]
 
     def esc(s: str) -> str:
-        return str(s).replace("|", "\\|").replace("\n", " ").strip()
+        text = str(s).replace("|", "\\|").replace("\n", " ").strip()
+        if max_cell_chars and len(text) > max_cell_chars:
+            return text[:max_cell_chars].rstrip() + "…（已截断）"
+        return text
 
     lines = ["| " + " | ".join(esc(h) for h in sel_headers) + " |"]
     lines.append("| " + " | ".join(["---"] * len(sel_headers)) + " |")
@@ -193,12 +202,12 @@ def build_ai_detect_query(
     headers: list[str],
     open_text_cols: list[int],
     id_col: int,
-    batch_num: int = 1,
+    batch_num: int | str = 1,
     background: str = "",
 ) -> str:
     """构建 AI 检测 Dify 查询。"""
     cols = [id_col] + [c for c in open_text_cols if c != id_col]
-    table = _rows_to_md_table(batch_rows, headers, cols)
+    table = _rows_to_md_table(batch_rows, headers, cols, max_cell_chars=AI_DETECT_MAX_CELL_CHARS)
     col_keys_example = ", ".join(f'"col_{c}": "..."' for c in open_text_cols[:3])
     if len(open_text_cols) > 3:
         col_keys_example += ", ..."

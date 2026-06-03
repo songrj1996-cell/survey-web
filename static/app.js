@@ -12,13 +12,36 @@ marked.setOptions({ breaks: true, gfm: true });
 const state = {
   sessionId: null,
   currentStep: 1,
+  viewStep: 1,        // 当前查看的步骤（可回看已完成步骤，不影响 currentStep）
   columns: null,      // Step 2 题型数据
   planData: null,
   reportMd: null,
   qaLoading: false,
   viewMode: 'session', // 'session' | 'history'
   historyId: null,     // 当前查看/续聊的历史 id
+  sessionReport: {
+    reportMd: null,
+    title: '',
+    reportNo: '',
+    qaHtml: '',
+    qaMessages: [],
+    feishuLinkHtml: '',
+    running: false,
+    stream: '',
+  },
+  historyReport: {
+    id: null,
+    reportMd: null,
+    title: '',
+    reportNo: '',
+    analystConvId: null,
+    qaHtml: '',
+    qaMessages: [],
+    feishuLinkHtml: '',
+    planData: null,
+  },
 };
+window.__surveyState = state;
 
 // ── 题型选项（与后端 ROLE_LABEL_MAP 对齐）──
 const ROLE_OPTIONS = [
@@ -34,11 +57,11 @@ const ROLE_OPTIONS = [
   ['ignore',        '忽略此列'],
 ];
 const MATRIX_ROLES = ['matrix_scale', 'matrix_multi'];
+const CHOICE_ROLES = ['single_choice', 'profile_dim', 'multi_choice', 'matrix_multi'];
 
 // ── DOM 引用 ──
 const $  = id => document.getElementById(id);
 const panels   = [1,2,3,4,5].map(n => $(`panel-${n}`));
-const navSteps = [1,2,3,4,5].map(n => $(`nav-step-${n}`));
 
 // ── 工具 ──
 
@@ -66,14 +89,51 @@ function shortName(name, max = 20) {
   return name.length <= max ? name : name.slice(0, max - 1) + '…';
 }
 
+function renderSideNav() {
+  // 已无二级步骤，只维护一级 nav-item active 状态
+}
+
+function renderStepBars() {
+  // 更新所有问卷分析 step-bar 按钮状态
+  document.querySelectorAll('[data-survey-step]').forEach(btn => {
+    const n = +btn.dataset.surveyStep;
+    btn.classList.remove('step-bar__item--active', 'step-bar__item--done');
+    if (n === state.viewStep) {
+      btn.classList.add('step-bar__item--active');
+    } else if (n <= state.currentStep) {
+      // currentStep 本身在回看其他步骤时也显示为 --done（可点击）
+      btn.classList.add('step-bar__item--done');
+    }
+    btn.disabled = n > state.currentStep;
+  });
+}
+
 function goStep(n) {
   state.currentStep = n;
-  panels.forEach((p, i) => p.classList.toggle('panel--hidden', i + 1 !== n));
-  navSteps.forEach((s, i) => {
-    s.classList.remove('step--active', 'step--done');
-    if (i + 1 === n)        s.classList.add('step--active');
-    else if (i + 1 < n)     s.classList.add('step--done');
+  state.viewStep = n;
+  panels.forEach((p, i) => {
+    const showing = i + 1 === n;
+    p.classList.toggle('panel--hidden', !showing);
+    p.classList.remove('panel--readonly');
   });
+  renderStepBars();
+  document.querySelector('.main').scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+function setViewStep(n) {
+  if (n > state.currentStep) return;
+  state.viewStep = n;
+  panels.forEach((p, i) => {
+    const showing = i + 1 === n;
+    p.classList.toggle('panel--hidden', !showing);
+    // 回看已完成步骤时加只读遮罩
+    if (showing && n < state.currentStep) {
+      p.classList.add('panel--readonly');
+    } else {
+      p.classList.remove('panel--readonly');
+    }
+  });
+  renderStepBars();
   document.querySelector('.main').scrollTo({ top: 0, behavior: 'smooth' });
 }
 
@@ -86,8 +146,8 @@ function applyTheme(theme) {
 }
 
 (function initTheme() {
-  let saved = 'dark';
-  try { saved = localStorage.getItem('survey-theme') || 'dark'; } catch {}
+  let saved = 'light';
+  try { saved = localStorage.getItem('survey-theme') || 'light'; } catch {}
   applyTheme(saved);
 })();
 
@@ -104,7 +164,7 @@ function consumeSSE(url, onEvent) {
       try {
         const data = JSON.parse(e.data);
         onEvent(data);
-        if (data.type === 'error') { es.close(); reject(new Error(data.message)); }
+        if (data.type === 'error') { es.close(); reject(new Error(data.message || data.msg || '服务端处理失败')); }
         if ([
           'columns_ready', 'plan_ready', 'report_done', 'qa_done',
           'ai_detect_done', 'quality_done',
@@ -206,6 +266,16 @@ async function handleUpload(file) {
     state.sessionId = data.session_id;
     state.viewMode  = 'session';
     state.historyId = null;
+    state.sessionReport = {
+      reportMd: null,
+      title: '',
+      reportNo: '',
+      qaHtml: '',
+      qaMessages: [],
+      feishuLinkHtml: '',
+      running: false,
+      stream: '',
+    };
     renderPreview(data);
     goStep(2);
     showToast(`成功读取 ${data.total_rows} 行数据`, 'success');
@@ -272,6 +342,75 @@ function renderColumnRows(columns) {
   columns.forEach((c, i) => updateExtra(i, c.role));
 }
 
+function optionEditorHTML(i, c) {
+  const options = c.options || [];
+  const aliases = c.value_aliases || {};
+  const aliasGroups = Object.entries(aliases).filter(([canon, values]) =>
+    Array.isArray(values) && values.some(v => String(v).trim() && String(v).trim() !== canon)
+  ).length;
+  const chips = options.slice(0, 6).map(opt => `<span class="option-summary-chip">${esc(opt)}</span>`).join('');
+  const more = options.length > 6 ? `<span class="option-summary-more">+${options.length - 6}</span>` : '';
+  const mergeBadge = aliasGroups ? `<span class="option-merge-badge">已合并 ${aliasGroups} 组</span>` : '';
+  const rows = options.map(opt => `
+    <div class="option-edit-row">
+      <div class="option-edit-row__main">
+        <input class="extra-input option-input" data-option="${i}" value="${esc(opt)}" placeholder="选项内容" />
+        ${Array.isArray(aliases[opt]) && aliases[opt].length
+          ? `<div class="option-alias-hint">${esc(aliases[opt].join(' / '))}</div>`
+          : ''}
+      </div>
+      <button class="btn-icon option-remove" data-option-remove="${i}" title="删除选项" type="button">×</button>
+    </div>
+  `).join('');
+  return `<div class="option-editor" data-option-editor="${i}">
+    <details class="option-editor__details" ${c.low_confidence ? 'open' : ''}>
+      <summary class="option-editor__summary">
+        <span class="option-editor__summary-main">${chips || '<span class="option-summary-empty">暂无选项</span>'}${more}</span>
+        <span class="option-editor__summary-actions">${mergeBadge}<span class="option-edit-link">编辑</span></span>
+      </summary>
+      <div class="option-editor__body">
+        <div class="option-editor__head">
+          <span>标准选项</span>
+          <button class="btn btn--ghost btn--sm option-add" data-option-add="${i}" type="button">添加选项</button>
+        </div>
+        <div class="option-editor__rows">${rows}</div>
+      </div>
+    </details>
+  </div>`;
+}
+
+function collectOptionsForColumn(i) {
+  const seen = new Set();
+  const values = [];
+  document.querySelectorAll(`.option-input[data-option="${i}"]`).forEach(input => {
+    const v = input.value.trim();
+    const key = v.toLocaleLowerCase();
+    if (v && !seen.has(key)) {
+      seen.add(key);
+      values.push(v);
+    }
+  });
+  return values;
+}
+
+function buildEditedOptionAliases(c, editedOptions) {
+  const aliases = { ...(c.value_aliases || {}) };
+  const original = c.options_original || c.options || [];
+  const editedSet = new Set(editedOptions);
+
+  original.forEach((oldValue, idx) => {
+    const newValue = editedOptions[idx];
+    if (!oldValue || !newValue || oldValue === newValue) return;
+    aliases[newValue] = [...new Set([...(aliases[newValue] || []), oldValue, ...((aliases[oldValue] || []))])];
+    delete aliases[oldValue];
+  });
+
+  Object.keys(aliases).forEach(k => {
+    if (!editedSet.has(k)) delete aliases[k];
+  });
+  return aliases;
+}
+
 function columnRowHTML(c, i) {
   const opts = ROLE_OPTIONS.map(([val, label]) =>
     `<option value="${val}" ${val === c.role ? 'selected' : ''}>${label}</option>`
@@ -279,11 +418,17 @@ function columnRowHTML(c, i) {
   const name = c.name_zh || c.name || `列${(c.column_indexes || [])[0] ?? i}`;
   const isMatrix = MATRIX_ROLES.includes(c.role) || (c.column_indexes || []).length > 1;
   const matrixTag = isMatrix ? `<span class="col-row__tag">矩阵 · ${(c.column_indexes || []).length} 列</span>` : '';
+  const roleClass = c.role ? ` col-row--role-${c.role}` : '';
+  const lowConfClass = '';  // 不改背景色，跟随题型颜色
+  const lowConfBadge = c.low_confidence
+    ? `<div class="col-row__low-conf-badge"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>AI 判断信心低，请人工确认</div>`
+    : '';
 
-  return `<div class="col-row" data-card="${i}">
+  return `<div class="col-row${roleClass}${lowConfClass}" data-card="${i}">
     <span class="col-row__num">${i + 1}</span>
     <div class="col-row__main">
       <div class="col-row__name" title="${esc(name)}">${esc(name)}${matrixTag}</div>
+      ${lowConfBadge}
       <div class="q-extra" data-extra="${i}"></div>
     </div>
     <select class="type-select col-row__select" data-card="${i}">${opts}</select>
@@ -296,7 +441,6 @@ function updateExtra(i, role) {
   const c = state.columns[i] || {};
   const bits = [];
 
-  // 矩阵题：只读展示子项行
   if (MATRIX_ROLES.includes(role) && (c.rows || []).length) {
     bits.push(`<span class="col-extra-readonly">子项：${esc(c.rows.join(' / '))}</span>`);
   }
@@ -305,18 +449,15 @@ function updateExtra(i, role) {
     const delim = c.delimiter || '，';
     bits.push(`<span class="q-extra-inline">分隔符
       <input class="extra-input extra-input--sm" data-delim="${i}" value="${esc(delim)}" placeholder="，" /></span>`);
-    if ((c.options || []).length) {
-      bits.push(`<span class="col-extra-readonly" title="${esc(c.options.join(' / '))}">选项：${esc(shortName(c.options.join(' / '), 60))}</span>`);
-    }
-  } else if (role === 'matrix_multi') {
-    if ((c.options || []).length) {
-      bits.push(`<span class="col-extra-readonly" title="${esc(c.options.join(' / '))}">列选项：${esc(shortName(c.options.join(' / '), 60))}</span>`);
-    }
+  }
+
+  if (CHOICE_ROLES.includes(role)) {
+    bits.push(optionEditorHTML(i, c));
   } else if (role === 'scale' || role === 'matrix_scale') {
     const mn = (c.scale_min ?? 1), mx = (c.scale_max ?? 5);
     bits.push(`<span class="q-extra-inline">量程
       <input class="extra-input extra-input--sm" type="number" data-smin="${i}" value="${mn}" />
-      <span class="scale-sep">—</span>
+      <span class="scale-sep">-</span>
       <input class="extra-input extra-input--sm" type="number" data-smax="${i}" value="${mx}" /></span>`);
   }
 
@@ -324,13 +465,43 @@ function updateExtra(i, role) {
   box.style.display = bits.length ? 'flex' : 'none';
 }
 
-// 事件委托：题型下拉变化
 $('col-list').addEventListener('change', e => {
   const sel = e.target.closest('.type-select');
   if (sel) {
     const i = +sel.dataset.card;
-    state.columns[i].role = sel.value;
-    updateExtra(i, sel.value);
+    const newRole = sel.value;
+    state.columns[i].role = newRole;
+    updateExtra(i, newRole);
+    // 同步更新颜色类
+    const row = document.querySelector(`.col-row[data-card="${i}"]`);
+    if (row) {
+      row.className = row.className.replace(/\bcol-row--role-\S+/g, '').trim();
+      if (newRole) row.classList.add(`col-row--role-${newRole}`);
+    }
+  }
+});
+
+$('col-list').addEventListener('click', e => {
+  const addBtn = e.target.closest('[data-option-add]');
+  if (addBtn) {
+    const i = +addBtn.dataset.optionAdd;
+    const rows = document.querySelector(`[data-option-editor="${i}"] .option-editor__rows`);
+    if (rows) {
+      rows.insertAdjacentHTML('beforeend', `
+        <div class="option-edit-row">
+          <div class="option-edit-row__main">
+            <input class="extra-input option-input" data-option="${i}" value="" placeholder="选项内容" />
+          </div>
+          <button class="btn-icon option-remove" data-option-remove="${i}" title="删除选项" type="button">×</button>
+        </div>
+      `);
+      rows.querySelector('.option-edit-row:last-child .option-input')?.focus();
+    }
+  }
+
+  const removeBtn = e.target.closest('[data-option-remove]');
+  if (removeBtn) {
+    removeBtn.closest('.option-edit-row')?.remove();
   }
 });
 
@@ -342,15 +513,24 @@ function collectConfirmedColumns() {
       role,
       column_indexes: c.column_indexes || (c.index != null ? [c.index] : []),
     };
+
     if (role === 'multi_choice') {
       const el = document.querySelector(`[data-delim="${i}"]`);
       out.delimiter = el ? el.value : (c.delimiter || '，');
-      if (c.options) out.options = c.options;
     }
-    if (role === 'matrix_multi') {
-      if (c.options) out.options = c.options;
-      if (c.delimiter) out.delimiter = c.delimiter;
+
+    if (CHOICE_ROLES.includes(role)) {
+      const options = collectOptionsForColumn(i);
+      if (options.length) {
+        out.options = options;
+        out.options_original = c.options_original || c.options || [];
+        const aliases = buildEditedOptionAliases(c, options);
+        if (Object.keys(aliases).length) out.value_aliases = aliases;
+      }
     }
+
+    if (role === 'matrix_multi' && c.delimiter) out.delimiter = c.delimiter;
+
     if (role === 'scale' || role === 'matrix_scale') {
       const mnEl = document.querySelector(`[data-smin="${i}"]`);
       const mxEl = document.querySelector(`[data-smax="${i}"]`);
@@ -358,8 +538,7 @@ function collectConfirmedColumns() {
       out.scale_max = mxEl ? Number(mxEl.value) : (c.scale_max ?? 5);
     }
     if (MATRIX_ROLES.includes(role) && c.rows) out.rows = c.rows;
-    // 同义归并（LLM 识别，UI 只读透传）
-    if (c.value_aliases && ['single_choice', 'profile_dim', 'multi_choice', 'matrix_multi'].includes(role)) {
+    if (!out.value_aliases && c.value_aliases && CHOICE_ROLES.includes(role)) {
       out.value_aliases = c.value_aliases;
     }
     return out;
@@ -423,6 +602,7 @@ function showPlanCard(plan, headers) {
   $('plan-thinking').style.display = 'none';
   $('plan-card').style.display = 'block';
   $('plan-card-content').innerHTML = buildPlanHTML(plan, headers);
+  syncPlanActionButtons();
 }
 
 function buildPlanHTML(plan, headers) {
@@ -496,12 +676,22 @@ function buildPlanHTML(plan, headers) {
 
 // ── Plan confirm ──
 
-$('btn-plan-ok').addEventListener('click', () => confirmPlan('ok'));
+function syncPlanActionButtons() {
+  const hasText = !!($('plan-input').value || '').trim();
+  $('btn-plan-ok').disabled = hasText;
+  $('btn-plan-revise').disabled = !hasText;
+}
+
+$('btn-plan-ok').addEventListener('click', () => {
+  if (($('plan-input').value || '').trim()) return;
+  confirmPlan('ok');
+});
 $('btn-plan-revise').addEventListener('click', () => {
   const txt = $('plan-input').value.trim();
   if (!txt) { showToast('请先输入修改意见', 'info'); return; }
   confirmPlan(txt);
 });
+$('plan-input').addEventListener('input', syncPlanActionButtons);
 $('plan-input').addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
@@ -550,8 +740,7 @@ async function confirmPlan(text) {
         showPlanCard(newPlan, newHeaders);
         $('plan-input').value = '';
         showToast('方案已修订，请再次确认', 'success');
-        $('btn-plan-ok').disabled = false;
-        $('btn-plan-revise').disabled = false;
+        syncPlanActionButtons();
         return;
       }
     }
@@ -561,8 +750,7 @@ async function confirmPlan(text) {
     }
   } catch (e) {
     showToast(`操作失败：${e.message}`, 'error');
-    $('btn-plan-ok').disabled = false;
-    $('btn-plan-revise').disabled = false;
+    syncPlanActionButtons();
   }
 }
 
@@ -571,6 +759,12 @@ async function confirmPlan(text) {
 // ============================================================
 
 async function runStats() {
+  state.viewMode = 'session';
+  state.historyId = null;
+  state.sessionReport.running = true;
+  state.sessionReport.stream = '';
+  state.sessionReport.reportMd = null;
+  state.sessionReport.title = '';
   goStep(4);
   $('ps-stats').classList.add('progress-step--active');
   $('ps-writing').classList.remove('progress-step--active', 'progress-step--done');
@@ -593,33 +787,406 @@ async function runStats() {
     await consumeSSE(`/api/report/${state.sessionId}`, ev => {
       if (ev.type === 'chunk') {
         fullReport += ev.content;
-        const el = $('report-stream-content');
-        el.textContent = fullReport;
-        el.scrollTop = el.scrollHeight;
+        state.sessionReport.stream = fullReport;
+        if (state.viewMode === 'session') {
+          const el = $('report-stream-content');
+          el.textContent = fullReport;
+          el.scrollTop = el.scrollHeight;
+        }
       }
       if (ev.type === 'report_done') {
-        state.viewMode = 'session';
-        state.historyId = null;
-        showReport(ev.report_md);
+        state.sessionReport.running = false;
+        state.sessionReport.reportMd = ev.report_md;
+        state.sessionReport.title = reportTitleFromMarkdown(ev.report_md);
+        if (state.viewMode === 'session') {
+          state.historyId = null;
+          showReport(ev.report_md);
+        } else {
+          showToast('当前报告已生成完成，可点击「当前分析」查看', 'success', 7000);
+          updateReportContextSwitch();
+        }
       }
     });
   } catch (e) {
+    state.sessionReport.running = false;
     showToast(`报告生成失败：${e.message}`, 'error');
   }
 }
 
-function showReport(md) {
-  state.reportMd = md;
-  goStep(5);
+function applyCoreHighlight() {
+  const content = $('report-content');
+  if (!content) return;
 
-  const titleMatch = md.match(/^#\s+(.+?)$/m);
-  $('report-title-display').textContent = titleMatch ? titleMatch[1].trim() : '分析报告';
+  const wrapElements = (items, extraClass = '') => {
+    const cleanItems = items.filter(Boolean);
+    if (!cleanItems.length) return;
+    if (cleanItems[0].closest('.core-highlight-box')) return;
+    const wrapper = document.createElement('div');
+    wrapper.className = `core-highlight-box ${extraClass}`.trim();
+    cleanItems[0].parentNode.insertBefore(wrapper, cleanItems[0]);
+    cleanItems.forEach(item => wrapper.appendChild(item));
+  };
+
+  // 找「核心结论」h2
+  let coreH2 = null;
+  for (const h of content.querySelectorAll('h2')) {
+    if (h.textContent.trim() === '核心结论') { coreH2 = h; break; }
+  }
+  if (coreH2) {
+    const toWrap = [coreH2];
+    let el = coreH2.nextElementSibling;
+    while (el && el.tagName !== 'H1' && el.tagName !== 'H2') {
+      toWrap.push(el);
+      el = el.nextElementSibling;
+    }
+    wrapElements(toWrap, 'core-summary-box');
+  }
+
+  const isSummaryTitle = text => /^(本章总结|本节总结|章节总结|本部分总结)\s*[:：]?$/.test(text.trim());
+  const summaryHeadings = Array.from(content.querySelectorAll('h3, h4')).filter(h => isSummaryTitle(h.textContent));
+  summaryHeadings.forEach(heading => {
+    const items = [heading];
+    let el = heading.nextElementSibling;
+    while (el) {
+      if (/^H[1-6]$/.test(el.tagName)) break;
+      items.push(el);
+      el = el.nextElementSibling;
+    }
+    wrapElements(items, 'chapter-summary-box');
+  });
+
+  const inlineSummaries = Array.from(content.querySelectorAll('p')).filter(p => {
+    if (p.closest('.core-highlight-box')) return false;
+    return /^(本章总结|本节总结|章节总结|本部分总结)\s*[:：]/.test(p.textContent.trim());
+  });
+  inlineSummaries.forEach(p => {
+    const items = [p];
+    let el = p.nextElementSibling;
+    while (el && !/^H[1-6]$/.test(el.tagName)) {
+      if (!['P', 'UL', 'OL', 'BLOCKQUOTE'].includes(el.tagName)) break;
+      items.push(el);
+      el = el.nextElementSibling;
+    }
+    wrapElements(items, 'chapter-summary-box');
+  });
+}
+
+function buildTOC() {
+  const tocList = $('report-toc-list');
+  if (!tocList) return;
+  const content = $('report-content');
+  if (!content) return;
+  // 选取 h1/h2/h3，跳过第一个 h1（报告大标题）
+  const headings = Array.from(content.querySelectorAll('h1, h2, h3'));
+  const filtered = headings.filter((h, idx) => {
+    if (h.tagName === 'H1' && idx === 0) return false;
+    if (h.closest('.core-summary-box') && h.tagName !== 'H2') return false;
+    return true;
+  });
+  if (!filtered.length) { $('report-toc').style.display = 'none'; return; }
+  $('report-toc').style.display = '';
+  tocList.innerHTML = '';
+  filtered.forEach((h, idx) => {
+    if (!h.id) h.id = `toc-h-${idx}`;
+    const li = document.createElement('li');
+    const a = document.createElement('a');
+    a.href = `#${h.id}`;
+    a.textContent = h.textContent;
+    if (h.tagName === 'H2') {
+      a.style.paddingLeft = '10px';
+      a.style.fontSize = '12px';
+    } else if (h.tagName === 'H3') {
+      a.style.paddingLeft = '20px';
+      a.style.fontSize = '11px';
+      a.style.color = 'var(--text-3)';
+    }
+    a.addEventListener('click', e => {
+      e.preventDefault();
+      const reportBody = document.querySelector('#panel-5 .report-layout .report-body');
+      if (reportBody) {
+        const top = h.offsetTop - reportBody.offsetTop;
+        reportBody.scrollTo({ top, behavior: 'smooth' });
+      } else {
+        h.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }
+    });
+    li.appendChild(a);
+    tocList.appendChild(li);
+  });
+}
+
+let _tocDebounce = null;
+function buildTOCDebounced() {
+  clearTimeout(_tocDebounce);
+  _tocDebounce = setTimeout(buildTOC, 800);
+}
+
+function reportTitleFromMarkdown(md) {
+  const titleMatch = (md || '').match(/^#\s+(.+?)$/m);
+  return titleMatch ? titleMatch[1].trim() : '分析报告';
+}
+
+function replaceReportTitleInMarkdown(md, title) {
+  const cleanTitle = String(title || '').trim() || '分析报告';
+  if (/^#\s+.+?$/m.test(md || '')) {
+    return (md || '').replace(/^#\s+.+?$/m, `# ${cleanTitle}`);
+  }
+  return `# ${cleanTitle}\n\n${String(md || '').trimStart()}`;
+}
+
+function activeReportCtx() {
+  return state.viewMode === 'history' ? state.historyReport : state.sessionReport;
+}
+
+function activeReportId() {
+  if (state.viewMode === 'history') {
+    return state.historyId || state.historyReport.id || '';
+  }
+  return state.sessionId || state.sessionReport.id || '';
+}
+
+function saveActiveReportUi() {
+  const ctx = activeReportCtx();
+  const qa = $('qa-messages');
+  const inline = $('feishu-link-inline');
+  if (qa) ctx.qaHtml = qa.innerHTML;
+  if (inline) ctx.feishuLinkHtml = inline.innerHTML;
+}
+
+function normalizeQAMessages(messages) {
+  if (!Array.isArray(messages)) return [];
+  return messages
+    .filter(m => m && (m.role === 'user' || m.role === 'ai') && String(m.content || '').trim())
+    .map(m => ({
+      role: m.role,
+      content: String(m.content || ''),
+      ts: m.ts || '',
+    }));
+}
+
+function renderQAMessages(messages) {
+  const container = $('qa-messages');
+  if (!container) return;
+  container.innerHTML = '';
+  normalizeQAMessages(messages).forEach(m => appendQABubble(m.role, m.content));
+}
+
+function updateReportContextSwitch() {
+  const bar = $('report-context-switch');
+  const sessionBtn = $('btn-report-session');
+  const historyBtn = $('btn-report-history');
+  if (!bar || !sessionBtn || !historyBtn) return;
+  const hasSession = !!(state.sessionId || state.sessionReport.reportMd || state.sessionReport.running);
+  const hasHistory = !!state.historyReport.reportMd;
+  bar.style.display = hasSession || hasHistory ? '' : 'none';
+  sessionBtn.classList.toggle('report-context-switch__btn--active', state.viewMode === 'session');
+  sessionBtn.disabled = !hasSession;
+  historyBtn.style.display = hasHistory ? '' : 'none';
+  historyBtn.classList.toggle('report-context-switch__btn--active', state.viewMode === 'history');
+  historyBtn.textContent = hasHistory ? `历史报告：${shortName(state.historyReport.title || '历史报告', 18)}` : '历史报告';
+}
+
+function applyQAAvailability() {
+  const input = $('qa-input');
+  const btn = $('btn-qa-send');
+  if (!input || !btn) return;
+  if (state.viewMode === 'history') {
+    const canChat = !!state.historyReport.analystConvId;
+    input.placeholder = canChat ? '可基于该历史报告继续追问（Enter 发送）' : '该历史记录无可续聊的对话，仅供查看';
+    input.disabled = !canChat;
+    btn.disabled = !canChat || state.qaLoading;
+  } else {
+    input.placeholder = '基于报告或原始数据继续提问…（Enter 发送，Shift+Enter 换行）';
+    input.disabled = false;
+    btn.disabled = state.qaLoading;
+  }
+}
+
+function showReportPanelPreservingProgress() {
+  state.viewStep = 5;
+  panels.forEach((p, i) => {
+    const showing = i + 1 === 5;
+    p.classList.toggle('panel--hidden', !showing);
+    p.classList.remove('panel--readonly');
+  });
+  renderStepBars();
+  document.querySelector('.main').scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+function renderReportWorkspace(md, { preserveQa = true } = {}) {
+  state.reportMd = md;
+  if (state.viewMode === 'history') showReportPanelPreservingProgress();
+  else goStep(5);
+
+  const ctx = activeReportCtx();
+  const title = ctx.title || reportTitleFromMarkdown(md);
+  $('report-title-display').textContent = title;
+  const renameBtn = $('btn-report-rename');
+  if (renameBtn) {
+    const reportId = activeReportId();
+    renameBtn.dataset.reportId = reportId;
+    renameBtn.disabled = !reportId;
+  }
 
   $('report-content').innerHTML = renderMarkdown(md);
-  $('qa-messages').innerHTML = '';
-  const lb = $('feishu-link-box'); if (lb) lb.remove();  // 清掉上一份报告的飞书链接
+  if (preserveQa && ctx.qaHtml) {
+    $('qa-messages').innerHTML = ctx.qaHtml;
+  } else if (preserveQa && normalizeQAMessages(ctx.qaMessages).length) {
+    renderQAMessages(ctx.qaMessages);
+  } else {
+    $('qa-messages').innerHTML = '';
+  }
+  const lb = $('feishu-link-box'); if (lb) lb.remove();
+  const li = $('feishu-link-inline'); if (li) li.innerHTML = ctx.feishuLinkHtml || '';
+  applyQAAvailability();
+  updateReportContextSwitch();
+  applyCoreHighlight();
+  buildTOC();
+}
+
+function showReport(md) {
+  const ctx = activeReportCtx();
+  ctx.reportMd = md;
+  ctx.title = reportTitleFromMarkdown(md);
+  renderReportWorkspace(md, { preserveQa: true });
   if (state.viewMode === 'session') showToast('报告生成完毕！', 'success');
 }
+
+function switchReportContext(mode) {
+  if (mode === state.viewMode) return;
+  saveActiveReportUi();
+  if (mode === 'history') {
+    if (!state.historyReport.reportMd) return;
+    state.viewMode = 'history';
+    state.historyId = state.historyReport.id;
+    renderReportWorkspace(state.historyReport.reportMd, { preserveQa: true });
+    return;
+  }
+  state.viewMode = 'session';
+  state.historyId = null;
+  if (state.sessionReport.reportMd) {
+    renderReportWorkspace(state.sessionReport.reportMd, { preserveQa: true });
+  } else if (state.sessionReport.running) {
+    goStep(4);
+    $('report-stream-container').style.display = 'block';
+    $('report-stream-content').textContent = state.sessionReport.stream || '';
+    $('ps-stats').classList.remove('progress-step--active');
+    $('ps-stats').classList.add('progress-step--done');
+    $('ps-writing').classList.add('progress-step--active');
+  } else {
+    setViewStep(Math.min(state.currentStep, 4));
+  }
+  updateReportContextSwitch();
+}
+
+$('btn-report-session')?.addEventListener('click', () => switchReportContext('session'));
+$('btn-report-history')?.addEventListener('click', () => switchReportContext('history'));
+
+async function updateReportTitle(historyId, title) {
+  const cleanTitle = String(title || '').trim();
+  if (!historyId) throw new Error('没有可改名的报告');
+  if (!cleanTitle) throw new Error('报告名称不能为空');
+  const payload = JSON.stringify({ id: historyId, title: cleanTitle });
+  const attempts = [
+    { url: '/api/history-title', options: { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: payload } },
+    { url: `/api/history/${encodeURIComponent(historyId)}/title`, options: { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: cleanTitle }) } },
+    { url: `/api/history/${encodeURIComponent(historyId)}/title`, options: { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: cleanTitle }) } },
+  ];
+  let lastError = null;
+  for (const attempt of attempts) {
+    const resp = await fetch(attempt.url, { ...attempt.options, credentials: 'same-origin', cache: 'no-store' });
+    let data = {};
+    try { data = await resp.json(); } catch { data = {}; }
+    if (resp.ok) return data;
+    lastError = data.detail || `${resp.status} ${resp.statusText || ''}`.trim();
+    if (resp.status !== 404 && resp.status !== 405) break;
+  }
+  throw new Error(lastError || '改名失败');
+}
+
+function applyRenamedReport(data) {
+  const title = data.title || reportTitleFromMarkdown(data.report_md);
+  const reportMd = data.report_md || replaceReportTitleInMarkdown(activeReportCtx().reportMd || state.reportMd || '', title);
+  if (state.sessionId === data.id) {
+    state.sessionReport.title = title;
+    state.sessionReport.reportNo = data.report_no || state.sessionReport.reportNo || '';
+    state.sessionReport.reportMd = reportMd;
+  }
+  if (state.historyReport.id === data.id) {
+    state.historyReport.title = title;
+    state.historyReport.reportNo = data.report_no || state.historyReport.reportNo || '';
+    state.historyReport.reportMd = reportMd;
+  }
+  if ((state.viewMode === 'history' && state.historyId === data.id) || (state.viewMode === 'session' && state.sessionId === data.id)) {
+    saveActiveReportUi();
+    activeReportCtx().title = title;
+    activeReportCtx().reportMd = reportMd;
+    state.reportMd = reportMd;
+    renderReportWorkspace(reportMd, { preserveQa: true });
+  }
+}
+
+function startReportTitleEdit() {
+  const titleEl = $('report-title-display');
+  const btn = $('btn-report-rename');
+  const row = titleEl?.closest('.report-title-row');
+  const historyId = btn?.dataset.reportId || activeReportId();
+  if (!titleEl || !row || !historyId || row.querySelector('.report-title-edit')) return;
+
+  const oldTitle = titleEl.textContent.trim();
+  const input = document.createElement('input');
+  input.className = 'report-title-edit';
+  input.value = oldTitle;
+  input.setAttribute('aria-label', '报告名称');
+
+  const saveBtn = document.createElement('button');
+  saveBtn.className = 'btn-title-edit btn-title-edit--save';
+  saveBtn.type = 'button';
+  saveBtn.textContent = '保存';
+
+  const cancelBtn = document.createElement('button');
+  cancelBtn.className = 'btn-title-edit btn-title-edit--cancel';
+  cancelBtn.type = 'button';
+  cancelBtn.textContent = '取消';
+
+  const finish = () => {
+    input.remove();
+    saveBtn.remove();
+    cancelBtn.remove();
+    titleEl.style.display = '';
+    btn.style.display = '';
+  };
+
+  const save = async () => {
+    const nextTitle = input.value.trim();
+    if (!nextTitle) { showToast('报告名称不能为空', 'error'); return; }
+    saveBtn.disabled = true;
+    try {
+      const data = await updateReportTitle(historyId, nextTitle);
+      finish();
+      applyRenamedReport(data);
+      showToast('报告名称已更新', 'success');
+    } catch (e) {
+      saveBtn.disabled = false;
+      showToast(`改名失败：${e.message}`, 'error');
+    }
+  };
+
+  titleEl.style.display = 'none';
+  btn.style.display = 'none';
+  row.prepend(input);
+  row.append(saveBtn, cancelBtn);
+  input.focus();
+  input.select();
+  saveBtn.addEventListener('click', save);
+  cancelBtn.addEventListener('click', finish);
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); save(); }
+    if (e.key === 'Escape') { e.preventDefault(); finish(); }
+  });
+}
+
+$('btn-report-rename')?.addEventListener('click', startReportTitleEdit);
 
 // ============================================================
 // STEP 5: Export + QA
@@ -633,8 +1200,29 @@ $('btn-export-word').addEventListener('click', () => {
   }
 });
 
-// ── 飞书登录状态 ──
-state.feishu = { configured: false, logged_in: false, name: '' };
+// ── 飞书登录状态 + 权限门控 ──
+state.feishu = { configured: false, logged_in: false, allowed: true, name: '', email: '',
+                 perms: ['survey','annotate'], is_admin: false };
+
+function applyPermGating() {
+  const perms = state.feishu.perms || [];
+  const hasSurvey = perms.includes('survey');
+  const hasAnnotate = perms.includes('annotate');
+  // 侧边栏：无权限则隐藏入口
+  const navSurvey = $('nav-survey');
+  const navAnnotate = $('nav-annotate');
+  if (navSurvey) navSurvey.style.display = hasSurvey ? '' : 'none';
+  if (navAnnotate) navAnnotate.style.display = hasAnnotate ? '' : 'none';
+  // 如果当前模式无权限，切换到有权限的模式
+  if (currentMode === 'survey' && !hasSurvey && hasAnnotate) switchMode('annotate');
+  if (currentMode === 'annotate' && !hasAnnotate && hasSurvey) switchMode('survey');
+  // 非管理员隐藏整个「设置」入口
+  const navSettings = $('nav-settings');
+  if (navSettings) navSettings.style.display = state.feishu.is_admin ? '' : 'none';
+  // 管理员才显示权限配置 tab
+  const permNav = $('stab-perms-nav');
+  if (permNav) permNav.style.display = state.feishu.is_admin ? '' : 'none';
+}
 
 async function refreshFeishuStatus() {
   try {
@@ -644,25 +1232,71 @@ async function refreshFeishuStatus() {
   const label = $('feishu-login-label');
   if (label) {
     label.textContent = state.feishu.logged_in
-      ? `飞书：${state.feishu.name || '已登录'}`
+      ? `飞书：${state.feishu.email || state.feishu.name || '已登录'}`
       : '登录飞书';
   }
+  applyPermGating();
 }
 
-$('btn-feishu-login').addEventListener('click', () => {
+$('btn-feishu-login').addEventListener('click', async () => {
   if (!state.feishu.configured) {
     showToast('服务端未配置飞书应用（FEISHU_APP_ID/SECRET/REDIRECT_URI）', 'error');
     return;
   }
   if (state.feishu.logged_in) {
-    showToast(`已登录飞书：${state.feishu.name || ''}`, 'info');
+    try {
+      await fetch('/api/feishu/logout', { method: 'POST' });
+    } catch {}
+    showToast('已退出飞书登录', 'info');
+    window.location.href = '/login';
     return;
   }
   window.location.href = `/api/feishu/login?next=${encodeURIComponent(location.pathname)}`;
 });
 
 // ── 飞书文档导出 ──
+$('btn-export-pdf').addEventListener('click', () => {
+  if (state.viewMode === 'history' && state.historyId) {
+    window.location.href = `/api/export/pdf-history/${state.historyId}`;
+  } else if (state.sessionId) {
+    window.location.href = `/api/export/pdf/${state.sessionId}`;
+  } else {
+    showToast('还没有生成报告', 'error');
+  }
+});
+
 $('btn-export-feishu').addEventListener('click', exportFeishu);
+
+function showFeishuConfirmModal(email) {
+  return new Promise(resolve => {
+    let existing = $('feishu-export-modal');
+    if (existing) existing.remove();
+
+    const modal = document.createElement('div');
+    modal.id = 'feishu-export-modal';
+    modal.style.cssText = 'position:fixed;inset:0;z-index:200;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.5);backdrop-filter:blur(4px);';
+    modal.innerHTML = `
+      <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
+                  padding:24px 28px;width:min(400px,90vw);display:flex;flex-direction:column;gap:16px;
+                  box-shadow:var(--shadow-lg)">
+        <div style="font-size:15px;font-weight:600;color:var(--text)">上传 PDF 到飞书</div>
+        <div style="font-size:13px;color:var(--text-2);line-height:1.7">
+          系统会把当前报告导出为 PDF，并通过「让我看看你又在做什么调研」机器人推送给
+          <strong style="color:var(--text)">${esc(email)}</strong>
+        </div>
+        <div style="display:flex;gap:8px;justify-content:flex-end">
+          <button class="btn btn--ghost" id="feishu-modal-cancel">取消</button>
+          <button class="btn btn--primary" id="feishu-modal-confirm">确认生成</button>
+        </div>
+      </div>`;
+    document.body.appendChild(modal);
+
+    const cleanup = (result) => { modal.remove(); resolve(result); };
+    $('feishu-modal-cancel').onclick = () => cleanup(false);
+    $('feishu-modal-confirm').onclick = () => cleanup(true);
+    modal.addEventListener('click', e => { if (e.target === modal) cleanup(false); });
+  });
+}
 
 async function exportFeishu() {
   if (!state.feishu.configured) {
@@ -674,10 +1308,15 @@ async function exportFeishu() {
     window.location.href = `/api/feishu/login?next=${encodeURIComponent(location.pathname)}`;
     return;
   }
+
+  const email = state.feishu.email || state.feishu.name || '当前账号';
+  const confirmed = await showFeishuConfirmModal(email);
+  if (!confirmed) return;
+
   const btn = $('btn-export-feishu');
   const original = btn.innerHTML;
   btn.disabled = true;
-  btn.textContent = '生成中…';
+  btn.textContent = '上传中…';
 
   const url = state.viewMode === 'history' && state.historyId
     ? `/api/export/feishu-history/${state.historyId}`
@@ -686,17 +1325,14 @@ async function exportFeishu() {
     const resp = await fetch(url, { method: 'POST' });
     const data = await resp.json();
     if (!resp.ok) {
-      if (resp.status === 401) {
-        showToast('飞书登录已过期，请重新登录', 'error');
-        await refreshFeishuStatus();
-      }
+      if (resp.status === 401) { showToast('飞书登录已过期，请重新登录', 'error'); await refreshFeishuStatus(); }
       throw new Error(data.detail || '生成失败');
     }
     showFeishuLink(data.url);
-    try { await navigator.clipboard.writeText(data.url); showToast('飞书文档已生成，链接已复制', 'success'); }
-    catch { showToast('飞书文档已生成', 'success'); }
+    try { await navigator.clipboard.writeText(data.url); showToast('PDF 已上传到飞书，机器人消息已发送', 'success'); }
+    catch { showToast('PDF 已上传到飞书', 'success'); }
   } catch (e) {
-    showToast(`生成飞书文档失败：${e.message}`, 'error');
+    showToast(`上传 PDF 到飞书失败：${e.message}`, 'error', 10000);
   } finally {
     btn.disabled = false;
     btn.innerHTML = original;
@@ -704,16 +1340,20 @@ async function exportFeishu() {
 }
 
 function showFeishuLink(url) {
-  let box = $('feishu-link-box');
-  if (!box) {
-    box = document.createElement('div');
-    box.id = 'feishu-link-box';
-    box.className = 'feishu-link-box';
-    const reportBody = document.querySelector('#panel-5 .report-body');
-    reportBody.parentNode.insertBefore(box, reportBody);
+  // 清除旧的大 box（如果存在）
+  const oldBox = $('feishu-link-box');
+  if (oldBox) oldBox.remove();
+  // 在按钮下方 inline 显示链接
+  const inline = $('feishu-link-inline');
+  if (inline) {
+    inline.innerHTML = `<a href="${esc(url)}" target="_blank" rel="noopener"
+      style="color:var(--accent);text-decoration:none;display:flex;align-items:center;gap:4px">
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+        <polyline points="14 2 14 8 20 8"/>
+      </svg>查看飞书 PDF</a>`;
+    activeReportCtx().feishuLinkHtml = inline.innerHTML;
   }
-  box.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
-    飞书文档：<a href="${esc(url)}" target="_blank" rel="noopener">${esc(url)}</a>`;
 }
 $('btn-export-md').addEventListener('click', () => {
   if (state.viewMode === 'history') {
@@ -744,14 +1384,17 @@ async function sendQA() {
   $('btn-qa-send').disabled = true;
   $('qa-input').value = '';
 
+  const qaMode = state.viewMode;
+  const qaCtx = activeReportCtx();
   appendQABubble('user', question);
   const typingBubble = appendQABubble('ai', null, true);
 
   try {
     let answer = '';
+    let finalAnswer = '';
 
-    const url  = state.viewMode === 'history' ? '/api/history-qa' : '/api/qa';
-    const body = state.viewMode === 'history'
+    const url  = qaMode === 'history' ? '/api/history-qa' : '/api/qa';
+    const body = qaMode === 'history'
       ? { history_id: state.historyId, question }
       : { session_id: state.sessionId, question };
 
@@ -762,15 +1405,32 @@ async function sendQA() {
         typingBubble.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
       }
       if (ev.type === 'qa_done') {
-        typingBubble.innerHTML = renderMarkdown(ev.answer || answer);
+        finalAnswer = ev.answer || answer;
+        typingBubble.innerHTML = renderMarkdown(finalAnswer);
       }
     });
+    finalAnswer = finalAnswer || answer;
+    if (finalAnswer) {
+      qaCtx.qaMessages = normalizeQAMessages([
+        ...(qaCtx.qaMessages || []),
+        { role: 'user', content: question },
+        { role: 'ai', content: finalAnswer },
+      ]);
+    }
   } catch (e) {
-    typingBubble.textContent = `❌ ${e.message}`;
-    showToast(`追问失败：${e.message}`, 'error');
+    if (String(e.message || '').includes('请先登录飞书')) {
+      await refreshFeishuStatus();
+      const loginUrl = (state.feishu && state.feishu.login_url) || `/api/feishu/login?next=${encodeURIComponent(location.pathname)}`;
+      typingBubble.innerHTML = `❌ 飞书登录态已失效，请<a href="${esc(loginUrl)}" style="color:var(--accent)">重新登录</a>后再追问`;
+      showToast('飞书登录态已失效，请重新登录', 'error', 8000);
+    } else {
+      typingBubble.textContent = `❌ ${e.message}`;
+      showToast(`追问失败：${e.message}`, 'error');
+    }
   } finally {
     state.qaLoading = false;
-    $('btn-qa-send').disabled = false;
+    saveActiveReportUi();
+    applyQAAvailability();
     $('qa-input').focus();
   }
 }
@@ -820,16 +1480,164 @@ document.addEventListener('keydown', e => {
 });
 
 // ============================================================
-// 设置抽屉（提示词管理）
+// 设置抽屉（左导航切换）
 // ============================================================
 
-$('btn-open-settings').addEventListener('click', () => {
-  openDrawer('settings-drawer');
-  loadPrompts();
+const STAB_LOADERS = {
+  texts:   loadUiTextsSettings,
+  prompts: loadPrompts,
+  perms:   loadPermsTab,
+};
+
+function switchSettingsTab(name) {
+  document.querySelectorAll('.settings-nav__item').forEach(el => {
+    el.classList.toggle('settings-nav__item--active', el.dataset.stab === name);
+  });
+  ['texts', 'prompts', 'perms'].forEach(k => {
+    const el = $(`stab-content-${k}`);
+    if (el) el.style.display = k === name ? '' : 'none';
+  });
+  if (STAB_LOADERS[name]) STAB_LOADERS[name]();
+}
+
+document.querySelectorAll('.settings-nav__item[data-stab]').forEach(el => {
+  el.addEventListener('click', () => switchSettingsTab(el.dataset.stab));
 });
 
+function loadActiveSettingsTab() {
+  const active = document.querySelector('.settings-nav__item--active');
+  const name = active ? active.dataset.stab : 'texts';
+  switchSettingsTab(name);
+}
+
+// ── 权限配置 ──────────────────────────────────────────────────
+
+async function loadPermsTab() {
+  const body = $('stab-content-perms');
+  body.innerHTML = `<div class="hist-empty"><div class="spinner" style="margin:0 auto"></div></div>`;
+  try {
+    const resp = await fetch('/api/admin/users');
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || '加载失败');
+    renderPermsTable(data.users || []);
+  } catch (e) {
+    body.innerHTML = `<div class="hist-empty">加载权限配置失败：${esc(e.message)}</div>`;
+  }
+}
+
+function renderPermsTable(users) {
+  const body = $('stab-content-perms');
+  const addRow = `
+    <div class="perm-add-row" id="perm-add-row">
+      <input type="text" id="perm-new-email" class="plan-input" placeholder="飞书邮箱 或 Open ID（ou_xxxxx）" style="flex:1;min-width:240px" />
+      <div class="perm-checkboxes">
+        <label><input type="checkbox" id="perm-new-survey" checked class="perm-toggle" /> 问卷分析</label>
+        <label><input type="checkbox" id="perm-new-annotate" checked class="perm-toggle" /> 数据标注</label>
+      </div>
+      <button class="btn btn--primary btn--sm" id="perm-add-btn">添加成员</button>
+    </div>`;
+
+  const rows = users.map(u => {
+    const isAdmin = u.is_admin;
+    const hasSurvey = u.perms.includes('survey');
+    const hasAnnotate = u.perms.includes('annotate');
+    const adminBadge = isAdmin ? `<span class="perm-badge">管理员</span>` : '';
+    const surveyCell = isAdmin
+      ? `<span style="color:var(--green)">✓</span>`
+      : `<input type="checkbox" class="perm-toggle" ${hasSurvey ? 'checked' : ''} data-perm-email="${esc(u.email)}" data-perm-type="survey" />`;
+    const annotateCell = isAdmin
+      ? `<span style="color:var(--green)">✓</span>`
+      : `<input type="checkbox" class="perm-toggle" ${hasAnnotate ? 'checked' : ''} data-perm-email="${esc(u.email)}" data-perm-type="annotate" />`;
+    const deleteBtn = isAdmin ? `<span style="color:var(--text-3);font-size:12px">—</span>`
+      : `<button class="btn btn--ghost btn--sm" data-perm-delete="${esc(u.email)}">删除</button>`;
+    const enabledToggle = isAdmin ? '' : `
+      <input type="checkbox" class="perm-toggle" ${u.enabled ? 'checked' : ''} data-perm-email="${esc(u.email)}" data-perm-type="enabled" title="${u.enabled ? '已启用（点击禁用）' : '已禁用（点击启用）'}" />`;
+
+    return `<tr>
+      <td>${esc(u.email)} ${adminBadge}</td>
+      <td style="text-align:center">${surveyCell}</td>
+      <td style="text-align:center">${annotateCell}</td>
+      <td style="text-align:center">${enabledToggle}</td>
+      <td style="text-align:center">${deleteBtn}</td>
+    </tr>`;
+  }).join('');
+
+  body.innerHTML = addRow + `
+    <table class="perm-table">
+      <thead><tr>
+        <th>飞书邮箱</th>
+        <th style="text-align:center">问卷分析</th>
+        <th style="text-align:center">数据标注</th>
+        <th style="text-align:center">启用</th>
+        <th style="text-align:center">操作</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+
+  // 添加成员
+  $('perm-add-btn').addEventListener('click', async () => {
+    const email = ($('perm-new-email').value || '').trim();
+    if (!email) { showToast('请输入邮箱或 Open ID', 'error'); return; }
+    const perms = [];
+    if ($('perm-new-survey').checked) perms.push('survey');
+    if ($('perm-new-annotate').checked) perms.push('annotate');
+    try {
+      const r = await fetch('/api/admin/users', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ email, perms }) });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || '添加失败');
+      showToast(`已添加 ${email}`, 'success');
+      loadPermsTab();
+    } catch (e) { showToast(e.message, 'error'); }
+  });
+
+  // 权限勾选 + 启用状态变更
+  body.querySelectorAll('[data-perm-email][data-perm-type]').forEach(cb => {
+    cb.addEventListener('change', async () => {
+      const email = cb.dataset.permEmail;
+      const type = cb.dataset.permType;
+      const checked = cb.checked;
+      try {
+        let patch = {};
+        if (type === 'enabled') {
+          patch = { enabled: checked };
+        } else {
+          // 重新读取该行另一个 checkbox 的状态
+          const row = cb.closest('tr');
+          const surveyEl = row.querySelector('[data-perm-type="survey"]');
+          const annotateEl = row.querySelector('[data-perm-type="annotate"]');
+          const perms = [];
+          if ((type === 'survey' ? checked : surveyEl?.checked)) perms.push('survey');
+          if ((type === 'annotate' ? checked : annotateEl?.checked)) perms.push('annotate');
+          patch = { perms };
+        }
+        const r = await fetch(`/api/admin/users/${encodeURIComponent(email)}`, {
+          method: 'PATCH', headers: {'Content-Type':'application/json'}, body: JSON.stringify(patch)
+        });
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.detail || '更新失败');
+        showToast('已保存', 'success', 1500);
+      } catch (e) { showToast(e.message, 'error'); cb.checked = !checked; }
+    });
+  });
+
+  // 删除
+  body.querySelectorAll('[data-perm-delete]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const email = btn.dataset.permDelete;
+      if (!confirm(`确认删除 ${email}？`)) return;
+      try {
+        const r = await fetch(`/api/admin/users/${encodeURIComponent(email)}`, { method: 'DELETE' });
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.detail || '删除失败');
+        showToast(`已删除 ${email}`, 'success');
+        loadPermsTab();
+      } catch (e) { showToast(e.message, 'error'); }
+    });
+  });
+}
+
 async function loadPrompts() {
-  const body = $('settings-body');
+  const body = $('stab-content-prompts');
   body.innerHTML = `<div class="hist-empty"><div class="spinner" style="margin:0 auto"></div></div>`;
   try {
     const resp = await fetch('/api/prompts');
@@ -840,6 +1648,53 @@ async function loadPrompts() {
     body.innerHTML = `<div class="hist-empty">加载提示词失败：${esc(e.message)}</div>`;
   }
 }
+
+async function loadUiTextsSettings() {
+  const body = $('stab-content-texts');
+  body.innerHTML = `<div class="hist-empty"><div class="spinner" style="margin:0 auto"></div></div>`;
+  try {
+    const resp = await fetch('/api/ui-texts');
+    if (!resp.ok) throw new Error('加载失败');
+    const texts = await resp.json();
+    body.innerHTML = Object.entries(texts).map(([key, item]) => `
+      <div class="uitext-card" data-uitext-key="${esc(key)}">
+        <div class="uitext-card__label">${esc(item.label)}</div>
+        <textarea class="prompt-textarea uitext-textarea" rows="2">${esc(item.current)}</textarea>
+        <div class="uitext-card__actions">
+          <button class="btn btn--primary btn--sm" data-uitext-save="${esc(key)}">保存</button>
+        </div>
+      </div>
+    `).join('');
+  } catch (e) {
+    body.innerHTML = `<div class="hist-empty">加载失败：${esc(e.message)}</div>`;
+  }
+}
+
+$('stab-content-texts').addEventListener('click', async e => {
+  const btn = e.target.closest('[data-uitext-save]');
+  if (!btn) return;
+  const key = btn.dataset.uitextSave;
+  const card = btn.closest('.uitext-card');
+  const textarea = card.querySelector('.uitext-textarea');
+  try {
+    btn.textContent = '保存中…';
+    btn.disabled = true;
+    const resp = await fetch(`/api/ui-texts/${key}`, {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({content: textarea.value}),
+    });
+    if (!resp.ok) { const d = await resp.json(); throw new Error(d.detail || '保存失败'); }
+    showToast('文案已保存', 'success');
+    const el = document.querySelector(`[data-uitext="${key}"]`);
+    if (el) el.textContent = textarea.value;
+  } catch (err) {
+    showToast(`保存失败：${err.message}`, 'error');
+  } finally {
+    btn.textContent = '保存';
+    btn.disabled = false;
+  }
+});
 
 function promptCardHTML(p) {
   const readonly = !p.editable;
@@ -888,7 +1743,7 @@ function promptCardHTML(p) {
   </div>`;
 }
 
-$('settings-body').addEventListener('click', async e => {
+$('stab-content-prompts').addEventListener('click', async e => {
   // 历史折叠
   const toggle = e.target.closest('[data-hist-toggle]');
   if (toggle) {
@@ -947,18 +1802,34 @@ async function loadHistory() {
       return;
     }
 
-    body.innerHTML = `<div class="hist-list">` + list.map(h => `
-      <div class="hist-card" data-hist-id="${esc(h.id)}">
-        <div class="hist-card__title">${esc(h.title)}</div>
-        <div class="hist-card__meta">
-          <span class="hist-card__file">${esc(h.filename)}</span>
-          ${h.has_qa ? `<span class="hist-card__qa-badge">可续聊</span>` : ''}
-          <span class="hist-card__time">${esc(formatTime(h.created_at))}</span>
-        </div>
-      </div>`).join('') + `</div>`;
+    body.innerHTML = `<div class="hist-list">` + list.map(renderHistoryCard).join('') + `</div>`;
   } catch (e) {
     body.innerHTML = `<div class="hist-empty">加载历史失败：${esc(e.message)}</div>`;
   }
+}
+
+function renderHistoryCard(h) {
+  const isActive = state.viewMode === 'history' && state.historyId === h.id;
+  const reportNo = String(h.report_no || '').trim()
+    || (h.id ? `R-${String(h.id).slice(0, 4).toUpperCase()}` : 'R-?');
+  return `
+    <div class="hist-card${isActive ? ' hist-card--active' : ''}" data-hist-id="${esc(h.id)}">
+      <div class="hist-card__top">
+        <span class="hist-card__no">${esc(reportNo)}</span>
+        ${h.qa_count > 0 ? `<span class="hist-card__qa-badge">已追问</span>` : ''}
+        <span class="hist-card__time">${esc(formatTime(h.created_at))}</span>
+      </div>
+      <div class="hist-card__title-row">
+        <div class="hist-card__title" data-hist-title>${esc(h.title)}</div>
+        <button class="hist-card__edit" type="button" data-hist-edit title="修改报告名称" aria-label="修改报告名称">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M12 20h9"/>
+            <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/>
+          </svg>
+        </button>
+      </div>
+      <div class="hist-card__file">${esc(h.filename || '')}</div>
+    </div>`;
 }
 
 function formatTime(iso) {
@@ -971,6 +1842,13 @@ function formatTime(iso) {
 }
 
 $('history-body').addEventListener('click', async e => {
+  const editBtn = e.target.closest('[data-hist-edit]');
+  if (editBtn) {
+    e.stopPropagation();
+    startHistoryTitleEdit(editBtn.closest('[data-hist-id]'));
+    return;
+  }
+  if (e.target.closest('.hist-card-title-edit, .hist-card-title-action')) return;
   const card = e.target.closest('[data-hist-id]');
   if (!card) return;
   const id = card.dataset.histId;
@@ -979,23 +1857,88 @@ $('history-body').addEventListener('click', async e => {
     const entry = await resp.json();
     if (!resp.ok) throw new Error(entry.detail || '加载失败');
 
+    saveActiveReportUi();
     state.viewMode  = 'history';
     state.historyId = id;
-    state.reportMd  = entry.report_md;
-    state.planData  = entry.plan || null;
+    state.historyReport.id = id;
+    state.historyReport.reportNo = entry.report_no || '';
+    state.historyReport.reportMd = entry.report_md;
+    state.historyReport.title = entry.title || reportTitleFromMarkdown(entry.report_md);
+    state.historyReport.analystConvId = entry.analyst_conv_id || null;
+    state.historyReport.planData = entry.plan || null;
+    state.historyReport.qaMessages = normalizeQAMessages(entry.qa_messages);
+    state.historyReport.qaHtml = '';
+    state.historyReport.feishuLinkHtml = '';
 
     closeDrawer('history-drawer');
-    showReport(entry.report_md);
-    $('qa-input').placeholder = entry.analyst_conv_id
-      ? '可基于该历史报告继续追问（Enter 发送）'
-      : '该历史记录无可续聊的对话，仅供查看';
-    $('qa-input').disabled  = !entry.analyst_conv_id;
-    $('btn-qa-send').disabled = !entry.analyst_conv_id;
+    renderReportWorkspace(entry.report_md, { preserveQa: true });
     showToast('已载入历史报告', 'success');
   } catch (err) {
     showToast(`载入失败：${err.message}`, 'error');
   }
 });
+
+function startHistoryTitleEdit(card) {
+  if (!card || card.querySelector('.hist-card-title-edit')) return;
+  const titleEl = card.querySelector('[data-hist-title]');
+  const editBtn = card.querySelector('[data-hist-edit]');
+  const oldTitle = titleEl?.textContent.trim() || '';
+  const historyId = card.dataset.histId;
+  if (!titleEl || !historyId) return;
+
+  const input = document.createElement('input');
+  input.className = 'hist-card-title-edit';
+  input.value = oldTitle;
+  input.setAttribute('aria-label', '报告名称');
+
+  const saveBtn = document.createElement('button');
+  saveBtn.className = 'hist-card-title-action';
+  saveBtn.type = 'button';
+  saveBtn.textContent = '保存';
+
+  const cancelBtn = document.createElement('button');
+  cancelBtn.className = 'hist-card-title-action hist-card-title-action--ghost';
+  cancelBtn.type = 'button';
+  cancelBtn.textContent = '取消';
+
+  const row = titleEl.closest('.hist-card__title-row');
+  const finish = () => {
+    input.remove();
+    saveBtn.remove();
+    cancelBtn.remove();
+    titleEl.style.display = '';
+    if (editBtn) editBtn.style.display = '';
+  };
+  const save = async () => {
+    const nextTitle = input.value.trim();
+    if (!nextTitle) { showToast('报告名称不能为空', 'error'); return; }
+    saveBtn.disabled = true;
+    try {
+      const data = await updateReportTitle(historyId, nextTitle);
+      titleEl.textContent = data.title;
+      finish();
+      applyRenamedReport(data);
+      updateReportContextSwitch();
+      showToast('报告名称已更新', 'success');
+    } catch (err) {
+      saveBtn.disabled = false;
+      showToast(`改名失败：${err.message}`, 'error');
+    }
+  };
+
+  titleEl.style.display = 'none';
+  if (editBtn) editBtn.style.display = 'none';
+  row.prepend(input);
+  row.append(saveBtn, cancelBtn);
+  input.focus();
+  input.select();
+  saveBtn.addEventListener('click', save);
+  cancelBtn.addEventListener('click', finish);
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); save(); }
+    if (e.key === 'Escape') { e.preventDefault(); finish(); }
+  });
+}
 
 // ============================================================
 // Restart
@@ -1010,38 +1953,83 @@ $('btn-restart').addEventListener('click', () => {
   state.qaLoading = false;
   state.viewMode = 'session';
   state.historyId = null;
+  state.sessionReport = {
+    reportMd: null,
+    title: '',
+    reportNo: '',
+    qaHtml: '',
+    qaMessages: [],
+    feishuLinkHtml: '',
+    running: false,
+    stream: '',
+  };
   resetUploadZone();
   fileInput.value = '';
   $('qa-input').disabled = false;
   $('btn-qa-send').disabled = false;
+  // 回到分析类型选择层
+  $('analysis-type-picker').style.display = '';
+  $('upload-area').style.display = 'none';
   goStep(1);
   showToast('已重置，请重新上传文件', 'info');
 });
 
+// ── 分析类型选择器 ──
+$('btn-qual-enter').addEventListener('click', () => {
+  $('analysis-type-picker').style.display = 'none';
+  $('upload-area').style.display = '';
+  // 每次进入上传区都（重新）加载说明文案，确保显示
+  fetch('/api/upload-guide')
+    .then(r => r.json())
+    .then(({ content }) => {
+      const el = $('upload-guide');
+      if (el && content) el.innerHTML = marked.parse(content);
+    })
+    .catch(() => {});
+});
+
+// ── UI 文案初始化 ──
+async function initUiTexts() {
+  try {
+    const resp = await fetch('/api/ui-texts');
+    if (!resp.ok) return;
+    const texts = await resp.json();
+    Object.entries(texts).forEach(([key, item]) => {
+      const el = document.querySelector(`[data-uitext="${key}"]`);
+      if (el) el.textContent = item.current;
+    });
+  } catch {}
+}
+
 // ── Init ──
 goStep(1);
 refreshFeishuStatus();
+initUiTexts();
 
 // ============================================================
 // 模式切换（问卷分析 ↔ 数据标注）
 // ============================================================
 
 const surveyPanels = panels;            // panel-1 ~ panel-5
-const surveyNav    = $('steps-nav');
-const annNav       = $('ann-steps-nav');
 const annPanelIds  = [1, 2, 3, 4, 5, 6];
 const annPanels    = annPanelIds.map(n => $(`ann-panel-${n}`));
-const annNavSteps  = annPanelIds.map(n => $(`ann-nav-step-${n}`));
 
 let currentMode = 'survey'; // 'survey' | 'annotate'
 
 function switchMode(mode) {
   currentMode = mode;
   const isSurvey = mode === 'survey';
-  $('btn-mode-survey').classList.toggle('mode-tab--active', isSurvey);
-  $('btn-mode-annotate').classList.toggle('mode-tab--active', !isSurvey);
-  surveyNav.style.display  = isSurvey  ? '' : 'none';
-  annNav.style.display     = !isSurvey ? '' : 'none';
+
+  // 一级导航激活状态
+  $('nav-survey').classList.toggle('nav-item--active', isSurvey);
+  $('nav-survey').classList.toggle('nav-item--expanded', isSurvey);
+  $('nav-annotate').classList.toggle('nav-item--active', !isSurvey);
+  $('nav-annotate').classList.toggle('nav-item--expanded', !isSurvey);
+  $('nav-settings').classList.remove('nav-item--active');
+
+  // 历史记录按钮仅在问卷分析时显示
+  $('btn-open-history').style.display = isSurvey ? '' : 'none';
+
   surveyPanels.forEach(p => p.classList.add('panel--hidden'));
   annPanels.forEach(p => p.classList.add('panel--hidden'));
   if (isSurvey) {
@@ -1051,8 +2039,65 @@ function switchMode(mode) {
   }
 }
 
-$('btn-mode-survey').addEventListener('click',   () => switchMode('survey'));
-$('btn-mode-annotate').addEventListener('click', () => switchMode('annotate'));
+// 一级导航点击
+$('nav-header-survey').addEventListener('click', () => switchMode('survey'));
+$('nav-header-annotate').addEventListener('click', () => switchMode('annotate'));
+
+// 设置入口
+$('nav-header-settings').addEventListener('click', () => {
+  $('nav-settings').classList.add('nav-item--active');
+  $('nav-survey').classList.remove('nav-item--active');
+  $('nav-annotate').classList.remove('nav-item--active');
+  openDrawer('settings-drawer');
+  loadActiveSettingsTab();
+});
+
+// 步骤条点击（问卷分析和数据标注）—— 已完成步骤可回看
+document.addEventListener('click', e => {
+  const btn = e.target.closest('[data-survey-step]');
+  if (btn) {
+    const n = +btn.dataset.surveyStep;
+    if (currentMode === 'survey' && n <= state.currentStep) setViewStep(n);
+    return;
+  }
+  // 数据标注步骤条（标注流程不支持回看，忽略点击）
+});
+
+// QA 收起/展开按钮
+function updateQAPanelButtons() {
+  const side = $('qa-side');
+  const wideBtn = $('btn-qa-wide');
+  const collapseBtn = $('btn-qa-collapse');
+  if (!side) return;
+  if (wideBtn) {
+    wideBtn.title = side.classList.contains('qa-side--wide') ? '缩小追问面板' : '展开追问面板';
+  }
+  if (collapseBtn) {
+    collapseBtn.title = side.classList.contains('qa-side--collapsed') ? '展开追问面板' : '收起追问面板';
+  }
+}
+
+const btnQaWide = $('btn-qa-wide');
+if (btnQaWide) {
+  btnQaWide.addEventListener('click', () => {
+    const side = $('qa-side');
+    if (!side) return;
+    side.classList.remove('qa-side--collapsed');
+    side.classList.toggle('qa-side--wide');
+    updateQAPanelButtons();
+  });
+}
+
+const btnQaCollapse = $('btn-qa-collapse');
+if (btnQaCollapse) {
+  btnQaCollapse.addEventListener('click', () => {
+    const side = $('qa-side');
+    if (!side) return;
+    side.classList.toggle('qa-side--collapsed');
+    updateQAPanelButtons();
+  });
+}
+updateQAPanelButtons();
 
 // ============================================================
 // 数据标注状态机
@@ -1076,10 +2121,13 @@ const annState = {
 function annGoStep(n) {
   annState.currentStep = n;
   annPanels.forEach((p, i) => p.classList.toggle('panel--hidden', i + 1 !== n));
-  annNavSteps.forEach((s, i) => {
-    s.classList.remove('step--active', 'step--done');
-    if (i + 1 === n)       s.classList.add('step--active');
-    else if (i + 1 < n)    s.classList.add('step--done');
+  // 更新数据标注步骤条状态
+  document.querySelectorAll('[data-ann-step]').forEach(btn => {
+    const i = +btn.dataset.annStep;
+    btn.classList.remove('step-bar__item--active', 'step-bar__item--done');
+    if (i < n)      btn.classList.add('step-bar__item--done');
+    else if (i === n) btn.classList.add('step-bar__item--active');
+    btn.disabled = true; // 标注流程不支持回看
   });
   document.querySelector('.main').scrollTo({ top: 0, behavior: 'smooth' });
 }
@@ -1205,14 +2253,56 @@ function annRenderColConfig(headers, idCol, openTextCols, headersZh, matrixIdxs)
 }
 
 // 任务勾选
+function annArrangeStep2Layout() {
+  const panel = $('ann-panel-2');
+  const colConfig = $('ann-col-config');
+  const tasks = $('ann-tasks');
+  const background = $('ann-background-block');
+  const actions = panel ? panel.querySelector('.col-confirm-actions') : null;
+  if (!panel || !colConfig || !tasks || !background || !actions) return;
+  if (!tasks.querySelector('.ann-task-grid')) {
+    const grid = document.createElement('div');
+    grid.className = 'ann-task-grid';
+    [...tasks.querySelectorAll(':scope > .ann-task-option')].forEach(option => grid.appendChild(option));
+    tasks.appendChild(grid);
+  }
+  colConfig.insertAdjacentElement('afterend', tasks);
+  tasks.insertAdjacentElement('afterend', background);
+  background.insertAdjacentElement('afterend', actions);
+  const bgInput = $('ann-background');
+  if (bgInput) {
+    bgInput.classList.add('ann-background-textarea');
+    bgInput.rows = Math.max(bgInput.rows || 0, 5);
+  }
+  tasks.querySelectorAll('.ann-task-option').forEach(option => {
+    const input = option.querySelector('input[type="checkbox"]');
+    if (!input || option.querySelector('.ann-task-check')) return;
+    const check = document.createElement('span');
+    check.className = 'ann-task-check';
+    check.setAttribute('aria-hidden', 'true');
+    input.insertAdjacentElement('afterend', check);
+  });
+}
+
+function annSyncTaskCards() {
+  document.querySelectorAll('.ann-task-option').forEach(option => {
+    const input = option.querySelector('input[type="checkbox"]');
+    option.classList.toggle('ann-task-option--active', !!input?.checked);
+  });
+}
+
 ['task-ai-detect', 'task-quality'].forEach(id => {
   $(id).addEventListener('change', () => {
     annState.tasks.ai_detect = $('task-ai-detect').checked;
     annState.tasks.quality   = $('task-quality').checked;
     $('ann-background-block').style.display = annState.tasks.ai_detect ? '' : 'none';
+    annSyncTaskCards();
     annUpdateStartBtn();
   });
 });
+
+annArrangeStep2Layout();
+annSyncTaskCards();
 
 function annUpdateStartBtn() {
   const hasTask = annState.tasks.ai_detect || annState.tasks.quality;
@@ -1267,32 +2357,83 @@ async function annRunAiDetect() {
   const bar     = $('ann-ai-progress-bar');
   const msg     = $('ann-ai-progress-msg');
   const warnLog = $('ann-ai-warn-log');
+  let backBtn = $('ann-btn-ai-back');
+  if (!backBtn) {
+    backBtn = document.createElement('button');
+    backBtn.id = 'ann-btn-ai-back';
+    backBtn.className = 'btn btn--ghost';
+    backBtn.textContent = '返回任务选择';
+    warnLog.insertAdjacentElement('afterend', backBtn);
+  }
+  backBtn.style.display = 'none';
+  backBtn.onclick = () => {
+    $('ann-btn-start').disabled = false;
+    annGoStep(2);
+  };
+  const appendAiLog = (text, type = 'warn') => {
+    const div = document.createElement('div');
+    div.className = `ann-warn-item ann-warn-item--${type}`;
+    div.textContent = text;
+    warnLog.appendChild(div);
+  };
   bar.style.width = '0%';
   msg.textContent = '正在连接…';
   warnLog.innerHTML = '';
+  const diagnostics = [];
 
   try {
     await consumeSSE(`/api/annotate/${annState.sessionId}/run-ai-detect`, ev => {
+      if (ev.type === 'started') {
+        bar.style.width = '2%';
+        msg.textContent = ev.msg || `已连接，准备分析 ${ev.rows || 0} 行，约 ${ev.total_batches || 0} 批`;
+      }
+      if (ev.type === 'batch_started') {
+        const pct = ev.total > 0 ? Math.round((ev.done / ev.total) * 100) : 0;
+        bar.style.width = `${Math.max(3, pct)}%`;
+        msg.textContent = ev.msg || `正在分析第 ${ev.batch || 1}/${ev.total || 1} 批`;
+      }
+      if (ev.type === 'dify_waiting') {
+        msg.textContent = ev.msg || '正在等待 AI 返回，请勿关闭页面';
+      }
+      if (ev.type === 'dify_done') {
+        diagnostics.push(ev.msg || `第 ${ev.batch || '?'} 批 AI 已返回`);
+        msg.textContent = ev.msg || msg.textContent;
+      }
+      if (ev.type === 'batch_done') {
+        const pct = ev.total > 0 ? Math.round((ev.done / ev.total) * 100) : 0;
+        bar.style.width = `${pct}%`;
+        msg.textContent = ev.msg || `${ev.done}/${ev.total} 批已完成`;
+      }
       if (ev.type === 'progress') {
         const pct = ev.total > 0 ? Math.round((ev.done / ev.total) * 100) : 0;
         bar.style.width = `${pct}%`;
         msg.textContent = ev.msg || `${ev.done}/${ev.total} 批已完成`;
       }
       if (ev.type === 'warn') {
-        const div = document.createElement('div');
-        div.className = 'ann-warn-item';
-        div.textContent = ev.msg;
-        warnLog.appendChild(div);
+        const warning = ev.msg || '处理警告';
+        diagnostics.push(warning);
+        appendAiLog(warning);
       }
       if (ev.type === 'ai_detect_done') {
         bar.style.width = '100%';
-        msg.textContent = `AI 检测完成，共 ${ev.results.length} 条结果`;
-        annState.aiResults       = ev.results || [];
+        const results = ev.results || [];
+        msg.textContent = `AI 检测完成，共 ${results.length} 条结果`;
+        annState.aiResults       = results;
         annState.highProbResults = ev.high_prob || [];
       }
     });
 
     // 有高概率结果 → 跳到确认步
+    if (annState.aiResults.length === 0) {
+      msg.textContent = 'AI 识别没有得到可用结果，请返回任务选择后重试';
+      const detail = diagnostics.length
+        ? `最近诊断：${diagnostics.slice(-3).join(' ｜ ')}`
+        : '没有收到批次诊断信息，可能是连接在服务端返回前中断。';
+      appendAiLog(`所有批次都没有解析出可用结果。${detail}`, 'error');
+      backBtn.style.display = '';
+      return;
+    }
+
     if (annState.highProbResults.length > 0) {
       annRenderAiConfirm(annState.highProbResults);
       annGoStep(4);
@@ -1301,6 +2442,9 @@ async function annRunAiDetect() {
       await annAfterAiConfirm();
     }
   } catch (e) {
+    msg.textContent = `AI 识别失败：${e.message}`;
+    appendAiLog(e.message, 'error');
+    backBtn.style.display = '';
     showToast(`AI 检测失败：${e.message}`, 'error');
   }
 }
@@ -1462,6 +2606,7 @@ $('ann-btn-restart').addEventListener('click', () => {
   $('task-quality').checked   = false;
   $('ann-background').value   = '';
   $('ann-background-block').style.display = 'none';
+  annSyncTaskCards();
   annResetUploadZone();
   annFileInput.value = '';
   annGoStep(1);

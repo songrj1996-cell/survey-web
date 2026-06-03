@@ -602,6 +602,8 @@ def expand_confirmed_to_columns(confirmed: list[dict]) -> list[dict]:
                 if role == "matrix_multi":
                     if q.get("options"):
                         col["options"] = list(q["options"])
+                    if q.get("options_original"):
+                        col["options_original"] = list(q["options_original"])
                     if q.get("delimiter"):
                         col["delimiter"] = q["delimiter"]
                     if aliases:
@@ -610,9 +612,12 @@ def expand_confirmed_to_columns(confirmed: list[dict]) -> list[dict]:
         else:
             idx = cis[0]
             col = {"index": idx, "role": role, "name": name or None}
-            if role == "multi_choice":
+            if role in ("single_choice", "profile_dim", "multi_choice"):
                 if q.get("options"):
                     col["options"] = list(q["options"])
+                if q.get("options_original"):
+                    col["options_original"] = list(q["options_original"])
+            if role == "multi_choice":
                 if q.get("delimiter"):
                     col["delimiter"] = q["delimiter"]
             if role == "scale":

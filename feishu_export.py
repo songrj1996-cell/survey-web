@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import time
 from urllib.parse import urlencode
 
@@ -63,6 +64,32 @@ def build_authorize_url(state: str) -> str:
     return f"{FEISHU_BASE}/authen/v1/authorize?{urlencode(params)}"
 
 
+async def _get_email_via_contact(open_id: str) -> str:
+    """用 app_access_token + Contact API 查用户邮箱（需 contact:user.base:readonly）。"""
+    try:
+        app_token = await _app_access_token()
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"{FEISHU_BASE}/contact/v3/users/{open_id}",
+                headers={"Authorization": f"Bearer {app_token}"},
+                params={"user_id_type": "open_id"},
+            )
+            data = resp.json()
+            if data.get("code") != 0:
+                print(f"[auth] contact API 查邮箱失败 open_id={open_id}: {data}")
+                return ""
+            user = data.get("data", {}).get("user", {})
+            email = (user.get("email") or user.get("enterprise_email") or "").strip().lower()
+            if email:
+                print(f"[auth] contact API 成功获取邮箱 open_id={open_id} email={email}")
+            else:
+                print(f"[auth] contact API 未返回邮箱 open_id={open_id} user_fields={list(user.keys())}")
+            return email
+    except Exception as e:
+        print(f"[auth] contact API 异常: {e}")
+        return ""
+
+
 async def exchange_code(code: str) -> dict:
     """authorization_code → user_access_token，并取用户信息。返回登录态字典。"""
     app_token = await _app_access_token()
@@ -79,9 +106,18 @@ async def exchange_code(code: str) -> dict:
         d = data["data"]
         token = d["access_token"]
         info = await _get_user_info(token)
+        open_id = info.get("open_id", "")
+        email = (info.get("email") or info.get("enterprise_email") or "").strip().lower()
+        print(f"[auth] user_info open_id={open_id} name={info.get('name','')} email_from_authen={email!r}")
+        # 若 /authen/v1/user_info 未返回邮箱，用 app_access_token + Contact API 补查
+        if not email and open_id:
+            email = await _get_email_via_contact(open_id)
         return {
-            "open_id": info.get("open_id", ""),
+            "open_id": open_id,
+            "union_id": info.get("union_id", ""),
+            "user_id": info.get("user_id", ""),
             "name": info.get("name", ""),
+            "email": email,
             "token": token,
             "refresh": d.get("refresh_token", ""),
             "exp": time.time() + int(d.get("expires_in", 7000)),
@@ -120,7 +156,163 @@ async def _get_user_info(user_token: str) -> dict:
         return data["data"]
 
 
-# ── 用用户身份创建文档 ────────────────────────────────────────
+# ── 用机器人（app_access_token）创建文档 + 发消息 ──────────────
+
+async def create_doc_via_bot(
+    title: str,
+    content: str,
+    open_id: str | None = None,
+    callout_sections: list[dict] | None = None,
+) -> tuple[str, str, str]:
+    """用 tenant_access_token 创建文档，返回 (URL, doc_token, doc_type)。
+    若提供 open_id，文档创建后转移所有权给该用户（文档移入用户我的空间）。
+    """
+    fname = f"{title}.md"
+    md_bytes = content.encode("utf-8")
+    app_token = await _app_access_token()
+
+    # 1. 上传 md 文件
+    files = {"file": (fname, md_bytes, "text/markdown")}
+    fdata = {"file_name": fname, "parent_type": "explorer", "parent_node": "", "size": str(len(md_bytes))}
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(
+            f"{FEISHU_BASE}/drive/v1/files/upload_all",
+            headers={"Authorization": f"Bearer {app_token}"},
+            files=files, data=fdata,
+        )
+        res = r.json()
+        if res.get("code") != 0:
+            raise RuntimeError(f"上传 md 失败 code={res.get('code')} {res.get('msg','')} — 请确认机器人已获取 drive 写入权限")
+        file_token = res["data"]["file_token"]
+
+    # 2. 创建导入任务
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.post(
+            f"{FEISHU_BASE}/drive/v1/import_tasks",
+            headers={"Authorization": f"Bearer {app_token}"},
+            json={"file_extension": "md", "file_token": file_token, "type": "docx",
+                  "file_name": title, "point": {"mount_type": 1, "mount_key": ""}},
+        )
+        res = r.json()
+        if res.get("code") != 0:
+            raise RuntimeError(f"创建导入任务失败: {res}")
+        ticket = res["data"]["ticket"]
+
+    # 3. 轮询任务结果
+    deadline = asyncio.get_event_loop().time() + 180
+    async with httpx.AsyncClient(timeout=10) as client:
+        while True:
+            r = await client.get(
+                f"{FEISHU_BASE}/drive/v1/import_tasks/{ticket}",
+                headers={"Authorization": f"Bearer {app_token}"},
+            )
+            res = r.json()
+            if res.get("code") != 0:
+                raise RuntimeError(f"查询导入任务失败: {res}")
+            task = res["data"]["result"]
+            status = task.get("job_status")
+            if status in (1, 2):
+                if asyncio.get_event_loop().time() > deadline:
+                    raise RuntimeError("导入任务超时")
+                await asyncio.sleep(1.5)
+                continue
+            if status == 0 and task.get("token"):
+                doc_token = task["token"]
+                doc_type = task.get("type") or "docx"
+                doc_url = task.get("url") or f"https://feishu.cn/{doc_type}/{doc_token}"
+                break
+            raise RuntimeError(f"导入失败: status={status} {task.get('job_error_msg','')}")
+
+    # 4. 高亮块处理（best-effort，必须在转移所有权前做，确保机器人仍有编辑权限）
+    if callout_sections:
+        await apply_callout_sections(doc_token, callout_sections)
+
+    # 5. 转移所有权给用户（best-effort）
+    if open_id:
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                await client.post(
+                    f"{FEISHU_BASE}/drive/v1/permissions/{doc_token}/members/transfer_owner",
+                    headers={"Authorization": f"Bearer {app_token}",
+                             "Content-Type": "application/json; charset=utf-8"},
+                    params={"type": doc_type},
+                    json={"member_type": "openid", "member_id": open_id},
+                )
+        except Exception:
+            pass
+
+    return doc_url, doc_token, doc_type
+
+
+async def upload_pdf_via_bot(
+    title: str,
+    content: bytes,
+    open_id: str | None = None,
+) -> tuple[str, str, str]:
+    """Upload a generated PDF to Feishu Drive and return (URL, file_token, type)."""
+    safe_title = re.sub(r'[\\/:*?"<>|]', "_", (title or "调研报告").strip())[:120] or "调研报告"
+    fname = f"{safe_title}.pdf"
+    app_token = await _app_access_token()
+
+    files = {"file": (fname, content, "application/pdf")}
+    fdata = {"file_name": fname, "parent_type": "explorer", "parent_node": "", "size": str(len(content))}
+    async with httpx.AsyncClient(timeout=120) as client:
+        r = await client.post(
+            f"{FEISHU_BASE}/drive/v1/files/upload_all",
+            headers={"Authorization": f"Bearer {app_token}"},
+            files=files,
+            data=fdata,
+        )
+        res = r.json()
+        print(f"[feishu] upload_pdf response={res}")
+        if res.get("code") != 0:
+            raise RuntimeError(
+                f"上传 PDF 失败 code={res.get('code')} {res.get('msg', '')}，请确认应用已开通 drive 文件写入权限"
+            )
+        data = res.get("data") or {}
+        file_token = data.get("file_token")
+        if not file_token:
+            raise RuntimeError(f"上传 PDF 后未返回 file_token: {res}")
+
+    file_url = data.get("url") or data.get("file_url") or f"https://feishu.cn/file/{file_token}"
+
+    if open_id:
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                await client.post(
+                    f"{FEISHU_BASE}/drive/v1/permissions/{file_token}/members/transfer_owner",
+                    headers={
+                        "Authorization": f"Bearer {app_token}",
+                        "Content-Type": "application/json; charset=utf-8",
+                    },
+                    params={"type": "file"},
+                    json={"member_type": "openid", "member_id": open_id},
+                )
+        except Exception as e:
+            print(f"[feishu] transfer PDF owner failed: {e}")
+
+    return file_url, file_token, "file"
+
+
+async def send_message_to_user(open_id: str, text: str) -> None:
+    """用机器人发送文本消息给指定用户。"""
+    import json as _json
+    try:
+        app_token = await _app_access_token()
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(
+                f"{FEISHU_BASE}/im/v1/messages",
+                params={"receive_id_type": "open_id"},
+                headers={"Authorization": f"Bearer {app_token}",
+                         "Content-Type": "application/json; charset=utf-8"},
+                json={"receive_id": open_id, "msg_type": "text",
+                      "content": _json.dumps({"text": text}, ensure_ascii=False)},
+            )
+    except Exception as e:
+        print(f"[feishu] send message failed: {e}")
+
+
+# ── 用用户身份创建文档（旧方案，保留备用）────────────────────────
 
 async def _upload_md(user_token: str, filename: str, content: bytes) -> str:
     files = {"file": (filename, content, "text/markdown")}
@@ -133,7 +325,12 @@ async def _upload_md(user_token: str, filename: str, content: bytes) -> str:
         )
         r = resp.json()
         if r.get("code") != 0:
-            raise RuntimeError(f"上传 md 失败: {r}")
+            code = r.get("code")
+            msg = r.get("msg", "")
+            hint = ""
+            if code in (99991663, 99991664, 230003, 99991400):
+                hint = "（可能原因：drive 文件权限未开通，请在飞书开放平台为应用申请 drive:drive:write 权限并审批）"
+            raise RuntimeError(f"上传 md 失败 code={code} {msg}{hint}")
         return r["data"]["file_token"]
 
 
@@ -194,6 +391,7 @@ async def create_doc_as_user(title: str, content: str, user_token: str) -> tuple
 # Feishu docx block_type: 4=heading2, 14=callout（高亮块）, 2=text, 12=bullet
 _BT_HEADING2 = 4
 _BT_CALLOUT = 14
+_HEADING_KEYS = ("heading1", "heading2", "heading3", "heading4", "heading5", "heading6")
 
 
 def _text_block(content: str, block_type: int = 2) -> dict:
@@ -202,6 +400,152 @@ def _text_block(content: str, block_type: int = 2) -> dict:
         "block_type": block_type,
         key: {"elements": [{"text_run": {"content": content}}], "style": {}},
     }
+
+
+def _block_text(block: dict) -> str:
+    for key in (*_HEADING_KEYS, "text", "bullet", "ordered"):
+        data = block.get(key)
+        if isinstance(data, dict):
+            return "".join(e.get("text_run", {}).get("content", "") for e in data.get("elements", []))
+    return ""
+
+
+def _heading_level(block: dict) -> int:
+    for i, key in enumerate(_HEADING_KEYS, 1):
+        if key in block:
+            return i
+    return 0
+
+
+async def _list_doc_blocks(client: httpx.AsyncClient, headers: dict, doc_token: str) -> list[dict]:
+    blocks = []
+    page_token = ""
+    while True:
+        params = {"page_size": 500}
+        if page_token:
+            params["page_token"] = page_token
+        resp = await client.get(
+            f"{FEISHU_BASE}/docx/v1/documents/{doc_token}/blocks",
+            headers=headers, params=params,
+        )
+        r = resp.json()
+        if r.get("code") != 0:
+            return []
+        blocks.extend(r["data"]["items"])
+        page_token = r["data"].get("page_token") or ""
+        if not r["data"].get("has_more"):
+            break
+    return blocks
+
+
+async def _replace_section_with_callout(
+    client: httpx.AsyncClient,
+    headers: dict,
+    doc_token: str,
+    title: str,
+    lines: list[str],
+    occurrence: int = 1,
+) -> bool:
+    blocks = await _list_doc_blocks(client, headers, doc_token)
+    if not blocks:
+        return False
+
+    start = -1
+    start_level = 0
+    seen = 0
+    for i, block in enumerate(blocks):
+        level = _heading_level(block)
+        if level and _block_text(block).strip() == title:
+            seen += 1
+            if seen == occurrence:
+                start = i
+                start_level = level
+                break
+    if start < 0:
+        return False
+
+    end = len(blocks)
+    for j in range(start + 1, len(blocks)):
+        level = _heading_level(blocks[j])
+        if level and level <= start_level:
+            end = j
+            break
+
+    section = blocks[start:end]
+    section_ids = [b["block_id"] for b in section]
+    root_id = doc_token
+    root_children = [b["block_id"] for b in blocks]
+    try:
+        insert_index = root_children.index(section_ids[0])
+        last_index = root_children.index(section_ids[-1])
+    except ValueError:
+        return False
+    contiguous = (last_index - insert_index + 1) == len(section_ids)
+
+    resp = await client.post(
+        f"{FEISHU_BASE}/docx/v1/documents/{doc_token}/blocks/{root_id}/children",
+        headers=headers,
+        json={"index": insert_index, "children": [{"block_type": _BT_CALLOUT, "callout": {}}]},
+    )
+    r = resp.json()
+    if r.get("code") != 0:
+        return False
+    callout_id = r["data"]["children"][0]["block_id"]
+
+    children = [_text_block(title)]
+    for ln in lines:
+        s = ln.strip()
+        if not s or s.startswith("#"):
+            continue
+        if s.startswith(("- ", "* ", "•")):
+            children.append(_text_block(s.lstrip("-*• ").strip(), 12))
+        else:
+            children.append(_text_block(s))
+    if len(children) == 1:
+        for block in section[1:]:
+            text = _block_text(block).strip()
+            if text:
+                children.append(_text_block(text, 12 if block.get("bullet") else 2))
+
+    await client.post(
+        f"{FEISHU_BASE}/docx/v1/documents/{doc_token}/blocks/{callout_id}/children",
+        headers=headers,
+        json={"children": children},
+    )
+
+    if contiguous:
+        await client.request(
+            "DELETE",
+            f"{FEISHU_BASE}/docx/v1/documents/{doc_token}/blocks/{root_id}/children/batch_delete",
+            headers=headers,
+            json={"start_index": insert_index + 1, "end_index": last_index + 2},
+        )
+    return True
+
+
+async def apply_callout_sections(doc_token: str, sections: list[dict]) -> bool:
+    """把指定标题段落转为飞书高亮块。best-effort，失败不影响文档可用。"""
+    if not sections:
+        return False
+    try:
+        app_token = await _app_access_token()
+        headers = {"Authorization": f"Bearer {app_token}",
+                   "Content-Type": "application/json; charset=utf-8"}
+        changed = False
+        async with httpx.AsyncClient(timeout=15) as client:
+            for section in reversed(sections):
+                changed = await _replace_section_with_callout(
+                    client,
+                    headers,
+                    doc_token,
+                    section.get("title", ""),
+                    section.get("lines", []),
+                    max(1, int(section.get("occurrence") or 1)),
+                ) or changed
+        return changed
+    except Exception as e:
+        print(f"[feishu] apply callout failed: {e}")
+        return False
 
 
 async def apply_core_callout(doc_token: str, user_token: str, core_lines: list[str]) -> bool:

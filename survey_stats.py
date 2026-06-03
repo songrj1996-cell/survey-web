@@ -64,6 +64,7 @@ def compute(
 
     cols_by_index: dict[int, dict] = {c["index"]: c for c in plan["columns"]}
     profile_cols = [c for c in plan["columns"] if c["role"] == "profile_dim"]
+    mlbb_id_cols = [c for c in plan["columns"] if c["role"] == "mlbbid"]
     id_cols = [c for c in plan["columns"] if c["role"] == "id"]
 
     md_parts: list[str] = []
@@ -124,7 +125,7 @@ def compute(
     for c in plan["columns"]:
         if c["role"] == "open_text":
             open_text[c["index"]] = _collect_open_text(
-                c["index"], body, headers, id_cols, profile_cols
+                c["index"], body, headers, mlbb_id_cols + id_cols, profile_cols
             )
 
     return "\n".join(md_parts).rstrip() + "\n", open_text
@@ -531,7 +532,9 @@ def _collect_open_text(
             i = c["index"]
             v = _format_cell(row[i]) if i < len(row) else ""
             if v.strip():
-                key = c.get("name") or _safe_header(headers, i)
+                key = "MLBB ID" if c.get("role") == "mlbbid" else (c.get("name") or _safe_header(headers, i))
+                if c.get("role") == "mlbbid":
+                    v = _format_mlbb_id(v)
                 ids[key] = v.strip()
 
         profile: dict[str, str] = {}
@@ -606,6 +609,25 @@ def _format_cell(cell: Any) -> str:
                 parts.append(str(item))
         return "".join(parts)
     return str(cell)
+
+
+def _format_mlbb_id(value: str) -> str:
+    """Normalize combined MLBB UID/server values to UID(server)."""
+    s = " ".join(str(value or "").split()).strip()
+    if not s:
+        return ""
+
+    # Already in the preferred form, possibly with extra spaces: 123456 (57001)
+    m = _re.match(r"^(\d+)\s*\(\s*(\d+)\s*\)$", s)
+    if m:
+        return f"{m.group(1)}({m.group(2)})"
+
+    # Common exports put UID and server in one cell separated by newline, spaces,
+    # slash, comma, or punctuation. Keep single-number values untouched.
+    nums = _re.findall(r"\d+", s)
+    if len(nums) >= 2:
+        return f"{nums[0]}({nums[1]})"
+    return s
 
 
 def _is_blank(cell: Any) -> bool:
