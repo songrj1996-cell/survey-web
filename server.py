@@ -1963,8 +1963,8 @@ def _make_download_response(data: bytes, mime: str, filename: str) -> StreamingR
     return StreamingResponse(io.BytesIO(data), media_type=mime, headers=headers)
 
 
-PDF_CSS = """
-@page { size: 10in 14in; margin: 0; }
+PDF_PAGE_RULE = "@page { size: 10in 14in; margin: 0; }"
+PDF_CSS = PDF_PAGE_RULE + """
 * { box-sizing: border-box; }
 html {
   margin: 0;
@@ -2073,6 +2073,11 @@ hr { border: none; border-top: 1px solid #e0e0e0; margin: 20px 0; }
 """
 
 
+def _set_pdf_page_height(doc: str, height_in: float) -> str:
+    height_in = max(6.0, min(float(height_in), 500.0))
+    return doc.replace(PDF_PAGE_RULE, f"@page {{ size: 10in {height_in:.2f}in; margin: 0; }}", 1)
+
+
 def _wrap_report_highlights(html_text: str) -> str:
     html_text = re.sub(r"<!--CORE_START-->\s*", '<div class="core-highlight-box">', html_text)
     html_text = re.sub(r"\s*<!--CORE_END-->", "</div>", html_text)
@@ -2131,6 +2136,9 @@ def _find_pdf_browser() -> str:
         "/usr/bin/chromium",
         "/usr/bin/chromium-browser",
         "/snap/bin/chromium",
+        "/usr/lib/chromium/chromium",
+        "/usr/lib/chromium-browser/chromium-browser",
+        "/opt/google/chrome/chrome",
         "/usr/bin/microsoft-edge",
     ]
     for path in candidates:
@@ -2163,6 +2171,17 @@ def _wait_for_cdp_target(port: int, timeout_seconds: float = 10.0) -> str:
 
 def _html_to_pdf_with_browser(doc: str) -> bytes:
     browser = _find_pdf_browser()
+    last_err: Exception | None = None
+    for headless_arg in ("--headless=new", "--headless"):
+        try:
+            return _html_to_pdf_with_browser_cmd(doc, browser, headless_arg)
+        except Exception as exc:
+            last_err = exc
+            print(f"[pdf] browser render failed with {headless_arg}: {exc}", flush=True)
+    raise RuntimeError(f"浏览器 PDF 生成失败：{last_err}")
+
+
+def _html_to_pdf_with_browser_cmd(doc: str, browser: str, headless_arg: str) -> bytes:
     with tempfile.TemporaryDirectory(prefix="survey_pdf_") as tmp:
         tmp_path = Path(tmp)
         html_path = tmp_path / "report.html"
@@ -2172,7 +2191,7 @@ def _html_to_pdf_with_browser(doc: str) -> bytes:
         port = _free_local_port()
         cmd = [
             browser,
-            "--headless=new",
+            headless_arg,
             f"--remote-debugging-port={port}",
             f"--user-data-dir={profile_path}",
             "--disable-gpu",
@@ -2260,18 +2279,38 @@ def html_to_pdf_bytes(doc: str) -> bytes:
     if renderer == "browser":
         try:
             return _html_to_pdf_with_browser(doc)
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[pdf] requested browser renderer failed, falling back to WeasyPrint: {exc}", flush=True)
+
     try:
-        if renderer != "weasyprint":
-            return _html_to_pdf_with_browser(doc)
-    except Exception:
-        pass
+        return _html_to_pdf_with_weasyprint(doc)
+    except Exception as exc:
+        print(f"[pdf] WeasyPrint renderer failed, retrying browser renderer: {exc}", flush=True)
+
     try:
-        from weasyprint import HTML  # type: ignore
-        return HTML(string=doc).write_pdf()
-    except Exception:
         return _html_to_pdf_with_browser(doc)
+    except Exception as exc:
+        print(f"[pdf] browser renderer failed after WeasyPrint fallback: {exc}", flush=True)
+        raise
+
+
+def _html_to_pdf_with_weasyprint(doc: str) -> bytes:
+    from weasyprint import HTML  # type: ignore
+
+    html_obj = HTML(string=doc)
+    rendered = html_obj.render()
+    pages = getattr(rendered, "pages", []) or []
+    if len(pages) <= 1:
+        print("[pdf] rendered with WeasyPrint on one page", flush=True)
+        return rendered.write_pdf()
+
+    total_height_px = sum(float(getattr(page, "height", 14 * 96) or 14 * 96) for page in pages)
+    total_height_in = min(max(total_height_px / 96 + 1.0, 14.0), 500.0)
+    print(
+        f"[pdf] WeasyPrint first pass produced {len(pages)} pages; rerendering as {total_height_in:.2f}in single page",
+        flush=True,
+    )
+    return HTML(string=_set_pdf_page_height(doc, total_height_in)).write_pdf()
 
 
 @app.get("/api/export/word/{session_id}")
