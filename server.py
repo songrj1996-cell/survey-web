@@ -1966,7 +1966,7 @@ PDF_CSS = """
 @page { margin: 0; }
 * { box-sizing: border-box; }
 body {
-  font-family: "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", Arial, sans-serif;
+  font-family: "Noto Sans CJK SC", "Noto Sans CJK", "WenQuanYi Micro Hei", "Microsoft YaHei", "PingFang SC", "Source Han Sans SC", Arial, sans-serif;
   font-size: 13px;
   line-height: 1.75;
   color: #222;
@@ -2019,6 +2019,7 @@ td { padding: 6px 10px; border: 1px solid #e0e0e0; vertical-align: top; word-bre
 tr:nth-child(even) td { background: #fafafa; }
 code { background: #f3f0ff; color: #5b21b6; padding: 1px 5px; border-radius: 3px; font-size: 12px; }
 pre { background: #f5f5f5; padding: 12px; border-radius: 4px; overflow-wrap: break-word; white-space: pre-wrap; }
+code, pre { font-family: "Noto Sans Mono CJK SC", "Noto Sans CJK SC", "WenQuanYi Micro Hei", "Microsoft YaHei", monospace; }
 strong { color: #111; font-weight: 600; }
 hr { border: none; border-top: 1px solid #e0e0e0; margin: 20px 0; }
 .core-highlight-box {

@@ -23,7 +23,8 @@ echo "▶ 部署目录：$DEPLOY_DIR"
 echo ""
 echo "==> [1/6] 安装系统依赖…"
 apt-get update -qq
-apt-get install -y python3 python3-venv python3-pip nginx
+apt-get install -y python3 python3-venv python3-pip nginx fonts-noto-cjk fonts-wqy-microhei fontconfig
+fc-cache -f >/dev/null || true
 
 # 2. 同步代码
 echo ""
