@@ -40,6 +40,7 @@ const state = {
     feishuLinkHtml: '',
     planData: null,
   },
+  auditFilters: { start: '', end: '', user: '', feature: '' },
 };
 window.__surveyState = state;
 
@@ -1234,6 +1235,8 @@ function applyPermGating() {
   // 管理员才显示权限配置 tab
   const permNav = $('stab-perms-nav');
   if (permNav) permNav.style.display = state.feishu.is_admin ? '' : 'none';
+  const auditNav = $('stab-audit-nav');
+  if (auditNav) auditNav.style.display = state.feishu.is_admin ? '' : 'none';
 }
 
 async function refreshFeishuStatus() {
@@ -1499,13 +1502,14 @@ const STAB_LOADERS = {
   texts:   loadUiTextsSettings,
   prompts: loadPrompts,
   perms:   loadPermsTab,
+  audit:   loadAuditLogsTab,
 };
 
 function switchSettingsTab(name) {
   document.querySelectorAll('.settings-nav__item').forEach(el => {
     el.classList.toggle('settings-nav__item--active', el.dataset.stab === name);
   });
-  ['texts', 'prompts', 'perms'].forEach(k => {
+  ['texts', 'prompts', 'perms', 'audit'].forEach(k => {
     const el = $(`stab-content-${k}`);
     if (el) el.style.display = k === name ? '' : 'none';
   });
@@ -1645,6 +1649,112 @@ function renderPermsTable(users) {
         loadPermsTab();
       } catch (e) { showToast(e.message, 'error'); }
     });
+  });
+}
+
+function auditFeatureLabel(features, key) {
+  const item = (features || []).find(f => f.key === key);
+  return item ? item.label : (key || '未知功能');
+}
+
+function formatAuditTime(ts) {
+  return String(ts || '').replace('T', ' ');
+}
+
+async function loadAuditLogsTab() {
+  const body = $('stab-content-audit');
+  if (!body) return;
+  body.innerHTML = `<div class="hist-empty"><div class="spinner" style="margin:0 auto"></div></div>`;
+  const params = new URLSearchParams();
+  Object.entries(state.auditFilters || {}).forEach(([key, value]) => {
+    if (value) params.set(key, value);
+  });
+  params.set('limit', '300');
+  try {
+    const resp = await fetch(`/api/admin/audit-logs?${params.toString()}`);
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || '加载失败');
+    renderAuditLogsTab(data);
+  } catch (e) {
+    body.innerHTML = `<div class="hist-empty">加载用户日志失败：${esc(e.message)}</div>`;
+  }
+}
+
+function renderAuditLogsTab(data) {
+  const body = $('stab-content-audit');
+  const filters = state.auditFilters || { start: '', end: '', user: '', feature: '' };
+  const users = (data.users || []).filter(u => u.email);
+  const features = data.features || [];
+  const logs = data.logs || [];
+  const userOptions = users.map(u => `
+    <option value="${esc(u.email)}" ${filters.user === u.email ? 'selected' : ''}>${esc(u.email)}</option>
+  `).join('');
+  const featureOptions = features.map(f => `
+    <option value="${esc(f.key)}" ${filters.feature === f.key ? 'selected' : ''}>${esc(f.label)}</option>
+  `).join('');
+  const rows = logs.map(item => `
+    <tr>
+      <td class="audit-time">${esc(formatAuditTime(item.ts))}</td>
+      <td>
+        <div class="audit-user">${esc(item.user_email || item.user_name || item.open_id || '未识别用户')}</div>
+        ${item.user_name ? `<div class="audit-sub">${esc(item.user_name)}</div>` : ''}
+      </td>
+      <td><span class="audit-feature">${esc(item.feature_label || auditFeatureLabel(features, item.feature))}</span></td>
+      <td>${esc(item.action || '')}</td>
+      <td class="audit-detail">${esc(item.detail || '')}</td>
+      <td><span class="audit-status audit-status--${esc(item.status || 'success')}">${esc(item.status || 'success')}</span></td>
+    </tr>
+  `).join('');
+
+  body.innerHTML = `
+    <div class="audit-panel">
+      <div class="audit-filters">
+        <label>开始时间<input type="datetime-local" id="audit-filter-start" value="${esc(filters.start)}" /></label>
+        <label>结束时间<input type="datetime-local" id="audit-filter-end" value="${esc(filters.end)}" /></label>
+        <label>用户
+          <select id="audit-filter-user">
+            <option value="">全部用户</option>
+            ${userOptions}
+          </select>
+        </label>
+        <label>功能
+          <select id="audit-filter-feature">
+            <option value="">全部功能</option>
+            ${featureOptions}
+          </select>
+        </label>
+        <button class="btn btn--primary btn--sm" id="audit-filter-apply">筛选</button>
+        <button class="btn btn--ghost btn--sm" id="audit-filter-reset">重置</button>
+      </div>
+      <div class="audit-summary">当前显示 ${logs.length} 条，匹配总数 ${data.total ?? logs.length} 条</div>
+      <div class="audit-table-wrap">
+        <table class="perm-table audit-table">
+          <thead><tr>
+            <th>时间</th>
+            <th>用户</th>
+            <th>功能</th>
+            <th>操作</th>
+            <th>做了什么</th>
+            <th>状态</th>
+          </tr></thead>
+          <tbody>${rows || `<tr><td colspan="6" class="audit-empty">暂无日志</td></tr>`}</tbody>
+        </table>
+      </div>
+    </div>
+  `;
+
+  $('audit-filter-apply').addEventListener('click', () => {
+    state.auditFilters = {
+      start: $('audit-filter-start').value || '',
+      end: $('audit-filter-end').value || '',
+      user: $('audit-filter-user').value || '',
+      feature: $('audit-filter-feature').value || '',
+    };
+    loadAuditLogsTab();
+  });
+  $('audit-filter-reset').addEventListener('click', () => {
+    state.auditFilters = { start: '', end: '', user: '', feature: '' };
+    loadAuditLogsTab();
   });
 }
 

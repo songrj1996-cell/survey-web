@@ -982,6 +982,72 @@ html, body {
 .perm-checkboxes label { display: flex; gap: 5px; align-items: center; font-size: 13px; color: var(--text-2); cursor: pointer; }
 .perm-toggle { cursor: pointer; width: 16px; height: 16px; }
 
+.audit-panel { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.audit-filters {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(150px, 1fr)) auto auto;
+  gap: 10px;
+  align-items: end;
+}
+.audit-filters label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-3);
+}
+.audit-filters input,
+.audit-filters select {
+  width: 100%;
+  height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--input-bg);
+  color: var(--text);
+  outline: none;
+}
+.audit-filters input:focus,
+.audit-filters select:focus { border-color: var(--accent); }
+.audit-summary { font-size: 12px; color: var(--text-3); }
+.audit-table-wrap { width: 100%; overflow: auto; border: 1px solid var(--border); border-radius: var(--radius-sm); }
+.audit-table { min-width: 860px; }
+.audit-table th { white-space: nowrap; }
+.audit-time { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.audit-user { color: var(--text); font-weight: 500; }
+.audit-sub { margin-top: 2px; color: var(--text-3); font-size: 11px; }
+.audit-feature {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border-act);
+  background: var(--accent-soft);
+  color: var(--accent);
+  white-space: nowrap;
+}
+.audit-detail { min-width: 260px; white-space: normal; word-break: break-word; }
+.audit-status {
+  display: inline-flex;
+  min-width: 54px;
+  justify-content: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  color: var(--green);
+  background: rgba(74, 222, 128, 0.1);
+}
+.audit-status--error {
+  color: var(--red);
+  background: rgba(248, 113, 113, 0.1);
+}
+.audit-empty { text-align: center; color: var(--text-3); padding: 28px 12px; }
+
+@media (max-width: 960px) {
+  .audit-filters { grid-template-columns: 1fr 1fr; }
+}
+
 /* ── Prompt cards (Settings) ────────────────────────── */
 .prompt-card {
   background: var(--glass); border: 1px solid var(--border);

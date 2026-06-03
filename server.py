@@ -102,7 +102,9 @@ PROMPTS_FILE   = os.path.join(DATA_DIR, "prompts.json")
 WHITELIST_FILE = os.path.join(DATA_DIR, "whitelist.json")
 WEB_LOGINS_FILE = os.path.join(DATA_DIR, "web_logins.json")
 HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
+AUDIT_LOG_FILE = os.path.join(DATA_DIR, "audit_logs.json")
 MAX_HISTORY  = 5
+MAX_AUDIT_LOGS = max(200, _env_int("AUDIT_LOG_MAX", 5000))
 
 # ============================================================
 # 默认 Prompts
@@ -474,6 +476,137 @@ def _trim_history_for_owner(history: list, owner_key: str) -> list:
                 continue
         kept.append(entry)
     return kept
+
+
+AUDIT_FEATURES = [
+    {"key": "auth", "label": "\u767b\u5f55\u4e0e\u8d26\u53f7"},
+    {"key": "survey", "label": "\u95ee\u5377\u5206\u6790"},
+    {"key": "quant", "label": "\u5b9a\u91cf\u5206\u6790"},
+    {"key": "annotate", "label": "\u6570\u636e\u6807\u6ce8"},
+    {"key": "report", "label": "\u62a5\u544a\u5bfc\u51fa\u4e0e\u8ffd\u95ee"},
+    {"key": "settings", "label": "\u5e73\u53f0\u8bbe\u7f6e"},
+    {"key": "admin", "label": "\u6743\u9650\u7ba1\u7406"},
+]
+AUDIT_FEATURE_LABELS = {item["key"]: item["label"] for item in AUDIT_FEATURES}
+
+
+def _load_audit_logs() -> list[dict]:
+    if not os.path.exists(AUDIT_LOG_FILE):
+        return []
+    try:
+        with open(AUDIT_LOG_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            data = data.get("logs", [])
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _save_audit_logs(logs: list[dict]) -> None:
+    with open(AUDIT_LOG_FILE, "w", encoding="utf-8") as f:
+        json.dump(logs[:MAX_AUDIT_LOGS], f, ensure_ascii=False, indent=2)
+
+
+def _client_ip(request: Request | None) -> str:
+    if not request:
+        return ""
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else ""
+
+
+def _audit_user(login: dict | None) -> dict:
+    login = login or {}
+    email = str(login.get("email", "")).strip().lower()
+    open_id = str(login.get("open_id", "")).strip()
+    user_key = f"email:{email}" if email else (f"open_id:{open_id}" if open_id else "anonymous")
+    return {
+        "user_key": user_key,
+        "user_email": email,
+        "user_name": str(login.get("name", "")).strip(),
+        "open_id": open_id,
+    }
+
+
+def _append_audit_log(entry: dict) -> None:
+    try:
+        logs = _load_audit_logs()
+        logs.insert(0, entry)
+        _save_audit_logs(logs)
+    except Exception as exc:
+        print(f"[audit] write failed: {exc}", flush=True)
+
+
+def _audit_log_from_login(
+    request: Request | None,
+    login: dict | None,
+    feature: str,
+    action: str,
+    detail: str = "",
+    *,
+    status: str = "success",
+    metadata: dict | None = None,
+) -> None:
+    entry = {
+        "id": str(uuid.uuid4()),
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "feature": feature,
+        "feature_label": AUDIT_FEATURE_LABELS.get(feature, feature),
+        "action": action,
+        "detail": str(detail or "")[:1000],
+        "status": status,
+        "ip": _client_ip(request),
+        "metadata": metadata or {},
+        **_audit_user(login),
+    }
+    _append_audit_log(entry)
+
+
+async def audit_log(
+    request: Request | None,
+    feature: str,
+    action: str,
+    detail: str = "",
+    *,
+    status: str = "success",
+    metadata: dict | None = None,
+) -> None:
+    try:
+        login = await _current_login(request) if request else None
+        _audit_log_from_login(request, login, feature, action, detail, status=status, metadata=metadata)
+    except Exception as exc:
+        print(f"[audit] collect failed: {exc}", flush=True)
+
+
+def _admin_user_rows() -> list[dict]:
+    users = _load_whitelist()
+    result = []
+    for u in users:
+        e = u.get("email", "").lower()
+        result.append({
+            "email": e,
+            "perms": u.get("perms", ["survey", "annotate"]),
+            "enabled": u.get("enabled", True),
+            "is_admin": False,
+        })
+    admin_emails = set(FEISHU_ADMIN_EMAILS) | set(FEISHU_ALLOWED_EMAILS)
+    existing = {u["email"] for u in result}
+    for e in sorted(admin_emails):
+        if e not in existing:
+            result.insert(0, {"email": e, "perms": ["survey", "annotate"], "enabled": True, "is_admin": True})
+        else:
+            for u in result:
+                if u["email"] == e:
+                    u["is_admin"] = True
+    return result
+
+
+def _short_text(value: str, limit: int = 160) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    return text if len(text) <= limit else text[: limit - 1] + "..."
+
 
 
 def _sanitize_report_title(title: str) -> str:
@@ -1666,19 +1799,27 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
     sessions[sid]["filename"] = file.filename or "upload.csv"
     _assign_session_owner(sessions[sid], await _current_login(request))
 
-    return {
+    result = {
         "session_id": sid,
         "filename": file.filename,
         "total_rows": len(rows) - 1,
         "headers": rows[0],
         "preview": rows[1: min(6, len(rows))],
     }
+    await audit_log(
+        request,
+        "survey",
+        "上传数据",
+        f"文件：{file.filename or 'unknown'}；样本行数：{len(rows) - 1}",
+        metadata={"session_id": sid, "rows": len(rows) - 1},
+    )
+    return result
 
 
 # ── 题型识别（Step 2，LLM，SSE）──────────────────────
 
 @app.get("/api/columns/{session_id}")
-async def get_columns(session_id: str):
+async def get_columns(session_id: str, request: Request):
     """LLM 识别列题型（含 Google Form 矩阵题分组、中文题名、多选选项清单）。
 
     流式返回；最终发 `columns_ready`，columns 为「逻辑题」列表（矩阵题跨多列）。
@@ -1727,6 +1868,13 @@ async def get_columns(session_id: str):
             questions = _enrich_questions(questions, rows[0], groups)
             questions = _sanitize_choice_options(rows, questions)
             sess["columns_detected"] = questions
+            await audit_log(
+                request,
+                "survey",
+                "识别题型",
+                f"会话：{session_id}；识别列数：{len(questions)}",
+                metadata={"session_id": session_id, "columns": len(questions)},
+            )
             yield sse_event({"type": "columns_ready", "columns": questions})
         except Exception as e:
             import traceback; traceback.print_exc()
@@ -1740,17 +1888,24 @@ class ColumnConfirmRequest(BaseModel):
 
 
 @app.post("/api/columns/{session_id}/confirm")
-async def confirm_columns(session_id: str, req: ColumnConfirmRequest):
+async def confirm_columns(session_id: str, req: ColumnConfirmRequest, request: Request):
     """存储用户确认（或修改）后的列题型。"""
     sess = get_session(session_id)
     sess["confirmed_columns"] = req.columns
+    await audit_log(
+        request,
+        "survey",
+        "确认数据列",
+        f"会话：{session_id}；确认列数：{len(req.columns)}",
+        metadata={"session_id": session_id, "columns": len(req.columns)},
+    )
     return {"ok": True}
 
 
 # ── Plan（SSE）────────────────────────────────────────
 
 @app.get("/api/plan/{session_id}")
-async def get_plan(session_id: str):
+async def get_plan(session_id: str, request: Request):
     sess = get_session(session_id)
     rows = sess.get("rows")
     confirmed_columns = sess.get("confirmed_columns")
@@ -1805,6 +1960,13 @@ async def get_plan(session_id: str):
             sess["plan"] = plan
             sess["planner_conv_id"] = final_conv_id
             card_text = survey_plan.render_plan_for_user(plan, headers)
+            await audit_log(
+                request,
+                "survey",
+                "生成分析方案",
+                f"会话：{session_id}；Part 数：{len(plan.get('parts', []))}",
+                metadata={"session_id": session_id, "parts": len(plan.get("parts", []))},
+            )
             yield sse_event({"type": "plan_ready", "plan": plan, "card_text": card_text, "headers": headers})
 
         except Exception as e:
@@ -1822,7 +1984,7 @@ class PlanConfirmRequest(BaseModel):
 
 
 @app.post("/api/plan/confirm")
-async def confirm_plan(req: PlanConfirmRequest):
+async def confirm_plan(req: PlanConfirmRequest, request: Request):
     sess = get_session(req.session_id)
     plan = sess.get("plan")
     rows = sess.get("rows")
@@ -1832,6 +1994,13 @@ async def confirm_plan(req: PlanConfirmRequest):
         raise HTTPException(status_code=400, detail="会话状态丢失，请重新上传文件")
 
     if survey_plan.is_user_approval(req.user_text):
+        await audit_log(
+            request,
+            "survey",
+            "确认分析方案",
+            f"会话：{req.session_id}",
+            metadata={"session_id": req.session_id},
+        )
         return JSONResponse({"approved": True})
 
     async def generate():
@@ -1889,6 +2058,13 @@ async def confirm_plan(req: PlanConfirmRequest):
             sess["plan"] = new_plan
             sess["planner_conv_id"] = new_conv_id
             card_text = survey_plan.render_plan_for_user(new_plan, headers)
+            await audit_log(
+                request,
+                "survey",
+                "修订分析方案",
+                f"会话：{req.session_id}；修改意见：{_short_text(req.user_text)}",
+                metadata={"session_id": req.session_id},
+            )
             yield sse_event({"type": "plan_ready", "plan": new_plan, "card_text": card_text, "headers": headers})
         except Exception as e:
             import traceback; traceback.print_exc()
@@ -1900,7 +2076,7 @@ async def confirm_plan(req: PlanConfirmRequest):
 # ── 统计 ────────────────────────────────────────────
 
 @app.post("/api/stats/{session_id}")
-async def compute_stats(session_id: str):
+async def compute_stats(session_id: str, request: Request):
     sess = get_session(session_id)
     plan = sess.get("plan")
     rows = sess.get("rows")
@@ -1911,6 +2087,13 @@ async def compute_stats(session_id: str):
     sess["stats_md"] = stats_md
     sess["open_text"] = open_text
     sess["rows_fed"] = False
+    await audit_log(
+        request,
+        "survey",
+        "计算统计",
+        f"会话：{session_id}；样本行数：{max(0, len(rows) - 1)}",
+        metadata={"session_id": session_id, "rows": max(0, len(rows) - 1)},
+    )
     return {"stats_md": stats_md}
 
 
@@ -1955,6 +2138,13 @@ async def generate_report(session_id: str, request: Request):
 
             # 自动保存历史
             save_to_history(session_id, sess)
+            await audit_log(
+                request,
+                "survey",
+                "生成报告",
+                f"会话：{session_id}；文件：{sess.get('filename', 'unknown')}",
+                metadata={"session_id": session_id, "filename": sess.get("filename", "unknown")},
+            )
 
             yield sse_event({"type": "report_done", "report_md": full_report})
         except Exception as e:
@@ -2013,6 +2203,13 @@ async def qa(req: QARequest, request: Request):
                 {"role": "ai", "content": answer_text, "ts": datetime.now().isoformat()},
             ])
             save_to_history(req.session_id, sess)
+            await audit_log(
+                request,
+                "report",
+                "追问当前报告",
+                f"会话：{req.session_id}；问题：{_short_text(req.question)}",
+                metadata={"session_id": req.session_id},
+            )
             yield sse_event({"type": "qa_done", "answer": answer_text})
         except Exception as e:
             import traceback; traceback.print_exc()
@@ -2067,6 +2264,13 @@ async def history_qa(req: HistoryQARequest, request: Request):
                     ])
                     break
             _save_history(history)
+            await audit_log(
+                request,
+                "report",
+                "追问历史报告",
+                f"历史报告：{entry.get('title', req.history_id)}；问题：{_short_text(req.question)}",
+                metadata={"history_id": req.history_id},
+            )
 
             yield sse_event({"type": "qa_done", "answer": answer_text})
         except Exception as e:
@@ -2439,7 +2643,7 @@ def _html_to_pdf_with_weasyprint(doc: str) -> bytes:
 
 
 @app.get("/api/export/word/{session_id}")
-async def export_word(session_id: str):
+async def export_word(session_id: str, request: Request):
     sess = get_session(session_id)
     report_md = sess.get("report_md", "")
     if not report_md:
@@ -2452,6 +2656,7 @@ async def export_word(session_id: str):
 
     loop = asyncio.get_event_loop()
     docx_bytes = await loop.run_in_executor(None, markdown_to_docx, report_md)
+    await audit_log(request, "report", "下载 Word", f"报告：{title}", metadata={"session_id": session_id})
     return _make_download_response(
         docx_bytes,
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -2460,7 +2665,7 @@ async def export_word(session_id: str):
 
 
 @app.get("/api/export/markdown/{session_id}")
-async def export_markdown(session_id: str):
+async def export_markdown(session_id: str, request: Request):
     sess = get_session(session_id)
     report_md = sess.get("report_md", "")
     if not report_md:
@@ -2470,11 +2675,12 @@ async def export_markdown(session_id: str):
     title_m = re.search(r"^#\s+(.+?)$", report_md, re.MULTILINE)
     title = title_m.group(1).strip() if title_m else "调研报告"
     safe = re.sub(r'[\\/:*?"<>|]', "_", title)
+    await audit_log(request, "report", "下载 Markdown", f"报告：{title}", metadata={"session_id": session_id})
     return _make_download_response(report_md.encode("utf-8"), "text/markdown; charset=utf-8", f"{safe}.md")
 
 
 @app.get("/api/export/pdf/{session_id}")
-async def export_pdf(session_id: str):
+async def export_pdf(session_id: str, request: Request):
     sess = get_session(session_id)
     report_md = sess.get("report_md", "")
     if not report_md:
@@ -2486,6 +2692,7 @@ async def export_pdf(session_id: str):
 
     loop = asyncio.get_event_loop()
     pdf_bytes = await loop.run_in_executor(None, report_markdown_to_pdf, report_md)
+    await audit_log(request, "report", "下载 PDF", f"报告：{title}", metadata={"session_id": session_id})
     return _make_download_response(pdf_bytes, "application/pdf", f"{safe}.pdf")
 
 
@@ -2500,6 +2707,7 @@ async def export_word_history(history_id: str, request: Request):
     safe = re.sub(r'[\\/:*?"<>|]', "_", entry.get("title", "调研报告"))
     loop = asyncio.get_event_loop()
     docx_bytes = await loop.run_in_executor(None, markdown_to_docx, report_md)
+    await audit_log(request, "report", "下载历史 Word", f"报告：{entry.get('title', history_id)}", metadata={"history_id": history_id})
     return _make_download_response(
         docx_bytes,
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -2520,6 +2728,7 @@ async def export_pdf_history(history_id: str, request: Request):
     safe = re.sub(r'[\\/:*?"<>|]', "_", entry.get("title", "调研报告"))
     loop = asyncio.get_event_loop()
     pdf_bytes = await loop.run_in_executor(None, report_markdown_to_pdf, report_md)
+    await audit_log(request, "report", "下载历史 PDF", f"报告：{entry.get('title', history_id)}", metadata={"history_id": history_id})
     return _make_download_response(pdf_bytes, "application/pdf", f"{safe}.pdf")
 
 
@@ -2654,7 +2863,7 @@ async def feishu_login(next: str = "/"):
 
 
 @app.get("/api/feishu/callback")
-async def feishu_callback(code: str = "", state: str = ""):
+async def feishu_callback(request: Request, code: str = "", state: str = ""):
     st = oauth_states.pop(state, None)
     if not st:
         raise HTTPException(status_code=400, detail="state 无效或已过期，请重新登录")
@@ -2673,6 +2882,7 @@ async def feishu_callback(code: str = "", state: str = ""):
     _sync_web_logins_from_disk()
     web_logins[sid] = login
     _save_web_logins()
+    _audit_log_from_login(request, login, "auth", "飞书登录", "飞书授权登录成功")
     resp = RedirectResponse(_safe_next_path(st.get("next") or "/"))
     secure = feishu_export.FEISHU_REDIRECT_URI.startswith("https://")
     resp.set_cookie(COOKIE_NAME, sid, httponly=True, samesite="lax", secure=secure, max_age=FEISHU_SESSION_SECONDS)
@@ -2700,10 +2910,12 @@ async def feishu_me(request: Request):
 
 @app.post("/api/feishu/logout")
 async def feishu_logout(request: Request):
+    login = await _current_login(request)
     sid = request.cookies.get(COOKIE_NAME, "")
     _sync_web_logins_from_disk()
     web_logins.pop(sid, None)
     _save_web_logins()
+    _audit_log_from_login(request, login, "auth", "退出登录", "用户主动退出飞书登录")
     resp = JSONResponse({"ok": True})
     resp.delete_cookie(COOKIE_NAME)
     return resp
@@ -2744,6 +2956,49 @@ async def admin_list_users(request: Request):
     return {"users": result}
 
 
+@app.get("/api/admin/audit-logs")
+async def admin_audit_logs(
+    request: Request,
+    start: str = "",
+    end: str = "",
+    user: str = "",
+    feature: str = "",
+    limit: int = 300,
+):
+    await _require_admin(request)
+    limit = max(20, min(int(limit or 300), 1000))
+    user = (user or "").strip().lower()
+    feature = (feature or "").strip()
+    start = (start or "").strip()
+    end = (end or "").strip()
+    if len(start) == 16:
+        start = f"{start}:00"
+    if len(end) == 16:
+        end = f"{end}:59"
+
+    logs = _load_audit_logs()
+    filtered = []
+    for item in logs:
+        ts = str(item.get("ts", ""))
+        if start and ts < start:
+            continue
+        if end and ts > end:
+            continue
+        if user and str(item.get("user_email", "")).strip().lower() != user:
+            continue
+        if feature and item.get("feature") != feature:
+            continue
+        filtered.append(item)
+
+    return {
+        "logs": filtered[:limit],
+        "users": _admin_user_rows(),
+        "features": AUDIT_FEATURES,
+        "total": len(filtered),
+        "limit": limit,
+    }
+
+
 class AdminUserRequest(BaseModel):
     email: str
     perms: list[str] = ["survey", "annotate"]
@@ -2762,6 +3017,12 @@ async def admin_add_user(req: AdminUserRequest, request: Request):
     valid_perms = [p for p in req.perms if p in ("survey", "annotate")]
     users.append({"email": identifier, "perms": valid_perms or ["survey"], "enabled": req.enabled})
     _save_whitelist(users)
+    await audit_log(
+        request,
+        "admin",
+        "添加用户",
+        f"{identifier}，权限：{', '.join(valid_perms or ['survey'])}，状态：{'启用' if req.enabled else '禁用'}",
+    )
     return {"ok": True}
 
 
@@ -2782,6 +3043,12 @@ async def admin_update_user(email: str, req: AdminUserPatch, request: Request):
             if req.enabled is not None:
                 u["enabled"] = req.enabled
             _save_whitelist(users)
+            parts = []
+            if req.perms is not None:
+                parts.append(f"权限：{', '.join(u.get('perms', []))}")
+            if req.enabled is not None:
+                parts.append(f"状态：{'启用' if req.enabled else '禁用'}")
+            await audit_log(request, "admin", "更新用户", f"{email}；" + "；".join(parts))
             return {"ok": True}
     raise HTTPException(status_code=404, detail="用户不存在")
 
@@ -2798,6 +3065,7 @@ async def admin_delete_user(email: str, request: Request):
     if len(new_users) == len(users):
         raise HTTPException(status_code=404, detail="用户不存在")
     _save_whitelist(new_users)
+    await audit_log(request, "admin", "删除用户", email)
     return {"ok": True}
 
 
@@ -2838,6 +3106,7 @@ async def export_feishu(session_id: str, request: Request):
         url = await _export_to_feishu(report_md, login)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"上传飞书 PDF 失败：{e}")
+    await audit_log(request, "report", "上传飞书 PDF", f"会话：{session_id}", metadata={"session_id": session_id})
     return {"url": url, "type": "pdf"}
 
 
@@ -2856,6 +3125,7 @@ async def export_feishu_history(history_id: str, request: Request):
         url = await _export_to_feishu(entry.get("report_md", ""), login)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"上传飞书 PDF 失败：{e}")
+    await audit_log(request, "report", "上传历史飞书 PDF", f"报告：{entry.get('title', history_id)}", metadata={"history_id": history_id})
     return {"url": url, "type": "pdf"}
 
 
@@ -2878,7 +3148,7 @@ class PromptUpdateRequest(BaseModel):
 
 
 @app.put("/api/prompts/{key}")
-async def update_prompt(key: str, req: PromptUpdateRequest):
+async def update_prompt(key: str, req: PromptUpdateRequest, request: Request):
     prompts = _load_prompts()
     if key not in prompts:
         raise HTTPException(status_code=404, detail=f"prompt '{key}' 不存在")
@@ -2895,6 +3165,7 @@ async def update_prompt(key: str, req: PromptUpdateRequest):
     p["history"] = p["history"][:20]  # 保留最近 20 条
     p["current"] = req.content
     _save_prompts(prompts)
+    await audit_log(request, "settings", "修改 Prompt", f"{key}；备注：{_short_text(req.note or '')}")
     return {"ok": True, "key": key}
 
 
@@ -2987,12 +3258,13 @@ class UiTextUpdateRequest(BaseModel):
 
 
 @app.put("/api/ui-texts/{key}")
-async def update_ui_text(key: str, req: UiTextUpdateRequest):
+async def update_ui_text(key: str, req: UiTextUpdateRequest, request: Request):
     texts = _load_ui_texts()
     if key not in texts:
         raise HTTPException(status_code=404, detail=f"ui-text '{key}' 不存在")
     texts[key]["current"] = req.content
     _save_ui_texts(texts)
+    await audit_log(request, "settings", "修改页面文案", f"{key}；内容：{_short_text(req.content)}")
     return {"ok": True, "key": key}
 
 
@@ -3004,6 +3276,7 @@ async def get_history(request: Request):
     history = _load_history()
     history = _ensure_history_report_numbers(history)
     visible_history = [h for h in history if _visible_to_owner(h, login)]
+    await audit_log(request, "report", "查看历史记录", f"历史报告数：{len(visible_history)}")
     # 列表视图不返回完整 report_md（节省带宽）
     return [
         {
@@ -3027,6 +3300,7 @@ async def get_history_item(hist_id: str, request: Request):
     entry = _find_history_for_login(history, hist_id, login)
     if not entry:
         raise HTTPException(status_code=404, detail="历史记录不存在")
+    await audit_log(request, "report", "打开历史报告", f"报告：{entry.get('title', hist_id)}", metadata={"history_id": hist_id})
     return entry
 
 
@@ -3079,22 +3353,34 @@ def _update_history_title_by_id(hist_id: str, title: str, login: dict | None = N
 
 @app.patch("/api/history-title")
 async def update_history_title_by_body(req: HistoryTitleUpdateByIdRequest, request: Request):
-    return _update_history_title_by_id(req.id, req.title, await _current_login(request))
+    login = await _current_login(request)
+    result = _update_history_title_by_id(req.id, req.title, login)
+    await audit_log(request, "report", "修改报告名称", f"{req.id} → {result.get('title', req.title)}", metadata={"history_id": req.id})
+    return result
 
 
 @app.post("/api/history-title")
 async def update_history_title_by_body_post(req: HistoryTitleUpdateByIdRequest, request: Request):
-    return _update_history_title_by_id(req.id, req.title, await _current_login(request))
+    login = await _current_login(request)
+    result = _update_history_title_by_id(req.id, req.title, login)
+    await audit_log(request, "report", "修改报告名称", f"{req.id} → {result.get('title', req.title)}", metadata={"history_id": req.id})
+    return result
 
 
 @app.patch("/api/history/{hist_id}/title")
 async def update_history_title(hist_id: str, req: HistoryTitleUpdateRequest, request: Request):
-    return _update_history_title_by_id(hist_id, req.title, await _current_login(request))
+    login = await _current_login(request)
+    result = _update_history_title_by_id(hist_id, req.title, login)
+    await audit_log(request, "report", "修改报告名称", f"{hist_id} → {result.get('title', req.title)}", metadata={"history_id": hist_id})
+    return result
 
 
 @app.post("/api/history/{hist_id}/title")
 async def update_history_title_post(hist_id: str, req: HistoryTitleUpdateRequest, request: Request):
-    return _update_history_title_by_id(hist_id, req.title, await _current_login(request))
+    login = await _current_login(request)
+    result = _update_history_title_by_id(hist_id, req.title, login)
+    await audit_log(request, "report", "修改报告名称", f"{hist_id} → {result.get('title', req.title)}", metadata={"history_id": hist_id})
+    return result
 
 
 # ============================================================
@@ -3164,7 +3450,7 @@ def _parse_string_array(text: str) -> list[str] | None:
 
 
 @app.post("/api/annotate/upload")
-async def annotate_upload(file: UploadFile = File(...)):
+async def annotate_upload(request: Request, file: UploadFile = File(...)):
     content = await file.read()
     try:
         rows = _parse_file(file.filename or "upload.csv", content)
@@ -3200,7 +3486,7 @@ async def annotate_upload(file: UploadFile = File(...)):
         "open_text_cols":  open_text_cols,
     })
 
-    return {
+    result = {
         "session_id":       sid,
         "filename":         file.filename,
         "total_rows":       len(body),
@@ -3211,6 +3497,14 @@ async def annotate_upload(file: UploadFile = File(...)):
         "matrix_col_idxs":  matrix_col_idxs,
         "preview":          rows[1: min(4, len(rows))],
     }
+    await audit_log(
+        request,
+        "annotate",
+        "上传标注数据",
+        f"文件：{file.filename or 'unknown'}；样本行数：{len(body)}",
+        metadata={"session_id": sid, "rows": len(body)},
+    )
+    return result
 
 
 # ── 确认列 + 任务选择 ────────────────────────────────────
@@ -3223,7 +3517,7 @@ class AnnotateConfirmRequest(BaseModel):
 
 
 @app.post("/api/annotate/{sid}/confirm-columns")
-async def annotate_confirm_columns(sid: str, req: AnnotateConfirmRequest):
+async def annotate_confirm_columns(sid: str, req: AnnotateConfirmRequest, request: Request):
     sess = _get_annotate_session(sid)
     sess["id_col"]        = req.id_col
     sess["open_text_cols"] = req.open_text_cols
@@ -3232,13 +3526,25 @@ async def annotate_confirm_columns(sid: str, req: AnnotateConfirmRequest):
     sess["ai_results"]    = []
     sess["confirmed_ai_ids"] = []
     sess["quality_results"]  = []
+    task_names = []
+    if req.tasks.get("ai_detect"):
+        task_names.append("AI 作答识别")
+    if req.tasks.get("quality"):
+        task_names.append("回答质量打标")
+    await audit_log(
+        request,
+        "annotate",
+        "确认标注任务",
+        f"会话：{sid}；主观题列数：{len(req.open_text_cols)}；任务：{', '.join(task_names) or '未选择'}",
+        metadata={"session_id": sid, "open_text_cols": len(req.open_text_cols), "tasks": req.tasks},
+    )
     return {"ok": True}
 
 
 # ── AI 作答识别（SSE）───────────────────────────────────
 
 @app.get("/api/annotate/{sid}/run-ai-detect")
-async def annotate_run_ai_detect(sid: str):
+async def annotate_run_ai_detect(sid: str, request: Request):
     sess = _get_annotate_session(sid)
     rows           = sess.get("rows", [])
     headers        = sess.get("headers", [])
@@ -3537,6 +3843,13 @@ async def annotate_run_ai_detect(sid: str):
 
             sess["ai_results"] = all_results
             high_prob = [r for r in all_results if r.get("ai_prob", 0) >= 80]
+            await audit_log(
+                request,
+                "annotate",
+                "完成 AI 作答识别",
+                f"会话：{sid}；结果数：{len(all_results)}；高概率数：{len(high_prob)}",
+                metadata={"session_id": sid, "results": len(all_results), "high_prob": len(high_prob)},
+            )
             yield sse_event({
                 "type":      "ai_detect_done",
                 "results":   all_results,
@@ -3555,16 +3868,23 @@ class AnnotateConfirmAIRequest(BaseModel):
 
 
 @app.post("/api/annotate/{sid}/confirm-ai")
-async def annotate_confirm_ai(sid: str, req: AnnotateConfirmAIRequest):
+async def annotate_confirm_ai(sid: str, req: AnnotateConfirmAIRequest, request: Request):
     sess = _get_annotate_session(sid)
     sess["confirmed_ai_ids"] = req.confirmed_ai_ids
+    await audit_log(
+        request,
+        "annotate",
+        "确认 AI 作答结果",
+        f"会话：{sid}；确认 AI 作答数：{len(req.confirmed_ai_ids)}",
+        metadata={"session_id": sid, "confirmed_count": len(req.confirmed_ai_ids)},
+    )
     return {"ok": True, "confirmed_count": len(req.confirmed_ai_ids)}
 
 
 # ── 质量打标（SSE）──────────────────────────────────────
 
 @app.get("/api/annotate/{sid}/run-quality")
-async def annotate_run_quality(sid: str):
+async def annotate_run_quality(sid: str, request: Request):
     sess = _get_annotate_session(sid)
     rows              = sess.get("rows", [])
     headers           = sess.get("headers", [])
@@ -3620,6 +3940,13 @@ async def annotate_run_quality(sid: str):
                     all_results.extend(results)
 
             sess["quality_results"] = all_results
+            await audit_log(
+                request,
+                "annotate",
+                "完成回答质量打标",
+                f"会话：{sid}；结果数：{len(all_results)}",
+                metadata={"session_id": sid, "results": len(all_results)},
+            )
             yield sse_event({"type": "quality_done", "count": len(all_results)})
         except Exception as e:
             import traceback; traceback.print_exc()
@@ -3631,7 +3958,7 @@ async def annotate_run_quality(sid: str):
 # ── 下载标注 Excel ───────────────────────────────────────
 
 @app.get("/api/annotate/{sid}/download")
-async def annotate_download(sid: str):
+async def annotate_download(sid: str, request: Request):
     sess = _get_annotate_session(sid)
     rows              = sess.get("rows")
     headers           = sess.get("headers")
@@ -3656,6 +3983,7 @@ async def annotate_download(sid: str):
 
     stem = re.sub(r"\.(csv|xlsx|xls)$", "", filename, flags=re.IGNORECASE)
     safe = re.sub(r'[\\/:*?"<>|]', "_", stem)
+    await audit_log(request, "annotate", "下载标注结果", f"会话：{sid}；文件：{filename}", metadata={"session_id": sid})
     return _make_download_response(
         excel_bytes,
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
