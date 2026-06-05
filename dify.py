@@ -161,3 +161,69 @@ async def complete(
 
     print(f"[dify] {log_prefix} retry exhausted")
     return ""
+
+
+async def workflow_run(
+    inputs: dict,
+    api_key: str,
+    user: str = "batch",
+    max_retries: int = 3,
+    log_prefix: str = "",
+) -> str:
+    """调用 Dify Workflow 类型应用（/workflows/run，blocking 模式）。
+
+    返回 outputs.output 字段的字符串。400 → 返回 STOP_SIGNAL；
+    429 / 5xx / 网络错误 → 指数退避重试；重试耗尽返回空串。
+    """
+    if not api_key:
+        raise RuntimeError("缺少 Dify API Key")
+
+    payload = {
+        "inputs": inputs,
+        "response_mode": "blocking",
+        "user": user,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key.strip()}",
+        "Content-Type": "application/json",
+    }
+    url = f"{DIFY_API_BASE}/workflows/run"
+
+    async with httpx.AsyncClient(timeout=300, follow_redirects=True) as client:
+        for attempt in range(max_retries):
+            try:
+                resp = await client.post(url, headers=headers, json=payload)
+                if resp.status_code == 400:
+                    snippet = resp.text[:300]
+                    print(f"[dify] {log_prefix} 400 STOP_SIGNAL: {snippet}")
+                    return STOP_SIGNAL
+                if resp.status_code == 429 or resp.status_code >= 500:
+                    wait = min(2 ** attempt, 8)
+                    print(f"[dify] {log_prefix} {resp.status_code}; retry in {wait}s")
+                    await asyncio.sleep(wait)
+                    continue
+                if resp.status_code != 200:
+                    snippet = resp.text[:200]
+                    print(f"[dify] {log_prefix} {resp.status_code} give up: {snippet}")
+                    return ""
+
+                data = resp.json()
+                output = (
+                    data.get("data", {})
+                        .get("outputs", {})
+                        .get("output", "")
+                ) or ""
+                print(f"[dify] {log_prefix} workflow done | output_len={len(output)}")
+                return output.strip()
+
+            except (httpx.TimeoutException, httpx.NetworkError) as e:
+                wait = min(2 ** attempt, 8)
+                print(f"[dify] {log_prefix} network err: {e}; retry in {wait}s")
+                await asyncio.sleep(wait)
+            except Exception as e:
+                wait = min(2 ** attempt, 8)
+                print(f"[dify] {log_prefix} exc: {e}; retry in {wait}s")
+                await asyncio.sleep(wait)
+
+    print(f"[dify] {log_prefix} retry exhausted")
+    return ""

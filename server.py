@@ -58,8 +58,17 @@ DIFY_API_BASE      = os.getenv("DIFY_API_BASE", "https://api.dify.ai/v1").rstrip
 DIFY_PLANNER_KEY   = os.getenv("DIFY_PLANNER_KEY", "")
 DIFY_ANALYST_KEY   = os.getenv("DIFY_ANALYST_KEY", "")
 DIFY_COLUMN_KEY    = os.getenv("DIFY_COLUMN_KEY", "")      # 题型识别
-DIFY_AI_DETECT_KEY = os.getenv("DIFY_AI_DETECT_KEY", "")   # AI 作答识别
-DIFY_QUALITY_KEY   = os.getenv("DIFY_QUALITY_KEY", "")     # 回答质量打标
+DIFY_AI_DETECT_KEY       = os.getenv("DIFY_AI_DETECT_KEY", "")        # AI 作答识别
+DIFY_QUALITY_KEY         = os.getenv("DIFY_QUALITY_KEY", "")          # 回答质量打标
+DIFY_THEME_EXTRACT_KEY   = os.getenv("DIFY_THEME_EXTRACT_KEY", "")    # 大样本-主题提取
+DIFY_THEME_MERGE_KEY     = os.getenv("DIFY_THEME_MERGE_KEY", "")      # 大样本-主题合并
+DIFY_CLASSIFY_KEY        = os.getenv("DIFY_CLASSIFY_KEY", "")         # 大样本-回复分类
+DIFY_LARGE_ANALYST_KEY   = os.getenv("DIFY_LARGE_ANALYST_KEY", "")    # 报告撰写助手（大样本版）
+
+# 大样本分析阈值：开放题总回复数超过此值时自动启用批处理模式
+LARGE_SAMPLE_THRESHOLD = 500
+BATCH_SIZE = 300  # 每批发给 Dify 的回复数量
+OTHER_THEME_PCT = 5.0  # 占比低于此值的主题合并入「其他声音」
 DIFY_BASE_URL      = os.getenv("DIFY_API_BASE", "https://dify.web.moontontech.net/v1")
 # 用于前端展示 Dify 后台入口（去掉 /v1 后缀）
 DIFY_CONSOLE_URL = re.sub(r"/v1$", "", DIFY_BASE_URL)
@@ -1240,6 +1249,299 @@ def _build_plan_revision_query(plan: dict, headers: list[str], confirmed_columns
     )
 
 
+async def _batch_qualitative_analysis(
+    open_text: dict,
+    plan: dict,
+    headers: list,
+    session_id: str,
+):
+    """大样本定性分析四阶段批处理。
+
+    异步生成器，yield ("progress", msg) 或 ("result", clustered_themes)。
+    clustered_themes 结构：
+    {
+        col_idx: {
+            "col_name": str,
+            "total": int,
+            "themes": [{"id","name","description","count","percentage",
+                        "positive_count","positive_pct","positive_summary",
+                        "negative_count","negative_pct","negative_summary",
+                        "quotes": [str]}],
+            "other_themes": [{"name","count","percentage"}]
+        }
+    }
+    """
+    import json as _json
+    from dify import workflow_run, STOP_SIGNAL
+
+    clustered_themes: dict = {}
+
+    for col_idx, entries in open_text.items():
+        col = next((c for c in plan["columns"] if c["index"] == col_idx), None)
+        col_name = (col and col.get("name")) or (
+            headers[col_idx] if col_idx < len(headers) else f"列{col_idx}"
+        )
+        total = len(entries)
+        yield ("progress", f"【{col_name}】开始分析（共 {total} 条）")
+
+        # ── Phase A：分批提取主题候选 ──────────────────────────────────────
+        batches = [entries[i:i + BATCH_SIZE] for i in range(0, total, BATCH_SIZE)]
+        all_candidates: list[dict] = []
+
+        for bi, batch in enumerate(batches, 1):
+            yield ("progress", f"【{col_name}】提取主题（批次 {bi}/{len(batches)}）")
+            responses_text = "\n".join(
+                f"[{i}] {e.get('text', '')}" for i, e in enumerate(batch)
+            )
+            raw = await workflow_run(
+                inputs={
+                    "question": col_name,
+                    "responses": responses_text,
+                    "count": len(batch),
+                },
+                api_key=DIFY_THEME_EXTRACT_KEY,
+                log_prefix=f"A col={col_idx} batch={bi}",
+            )
+            if raw == STOP_SIGNAL:
+                yield ("progress", f"【{col_name}】主题提取遇到错误，跳过该列")
+                break
+            try:
+                parsed = _json.loads(raw)
+                all_candidates.extend(parsed.get("themes", []))
+            except Exception:
+                pass
+
+        if not all_candidates:
+            continue
+
+        # ── Phase B：合并去重 ──────────────────────────────────────────────
+        yield ("progress", f"【{col_name}】合并主题候选（共 {len(all_candidates)} 个）")
+        candidates_text = "\n".join(
+            f"- {t.get('name', '')}：{t.get('description', '')}"
+            for t in all_candidates
+        )
+        raw_b = await workflow_run(
+            inputs={
+                "question": col_name,
+                "theme_candidates": candidates_text,
+                "total_responses": total,
+            },
+            api_key=DIFY_THEME_MERGE_KEY,
+            log_prefix=f"B col={col_idx}",
+        )
+        if raw_b == STOP_SIGNAL or not raw_b:
+            yield ("progress", f"【{col_name}】主题合并失败，跳过该列")
+            continue
+        try:
+            merged = _json.loads(raw_b)
+            final_themes: list[dict] = merged.get("themes", [])
+        except Exception:
+            yield ("progress", f"【{col_name}】主题合并结果解析失败，跳过该列")
+            continue
+
+        if not final_themes:
+            continue
+
+        theme_list_text = _json.dumps(
+            [{"id": t["id"], "name": t["name"], "description": t["description"]}
+             for t in final_themes],
+            ensure_ascii=False,
+        )
+
+        # ── Phase C：回跑分类 ──────────────────────────────────────────────
+        # counts[theme_id] = {"total": int, "pos": int, "neg": int, "neutral": int, "mixed": int}
+        counts: dict[str, dict] = {t["id"]: {"total": 0, "pos": 0, "neg": 0, "neutral": 0, "mixed": 0}
+                                    for t in final_themes}
+        counts["other"] = {"total": 0, "pos": 0, "neg": 0, "neutral": 0, "mixed": 0}
+        # quotes_pool[theme_id] = list of (sentiment, text)
+        quotes_pool: dict[str, list] = {t["id"]: [] for t in final_themes}
+
+        for bi, batch in enumerate(batches, 1):
+            yield ("progress", f"【{col_name}】分类回复（批次 {bi}/{len(batches)}）")
+            responses_text = "\n".join(
+                f"[{i}] {e.get('text', '')}" for i, e in enumerate(batch)
+            )
+            raw_c = await workflow_run(
+                inputs={
+                    "question": col_name,
+                    "theme_list": theme_list_text,
+                    "responses": responses_text,
+                },
+                api_key=DIFY_CLASSIFY_KEY,
+                log_prefix=f"C col={col_idx} batch={bi}",
+            )
+            if raw_c == STOP_SIGNAL:
+                continue
+            try:
+                cls_data = _json.loads(raw_c)
+            except Exception:
+                continue
+
+            for item in cls_data.get("classifications", []):
+                try:
+                    resp_idx = int(str(item.get("response_id", "")).strip("[]"))
+                    original_text = batch[resp_idx].get("text", "") if resp_idx < len(batch) else ""
+                except (ValueError, IndexError):
+                    continue
+
+                assignments = item.get("assignments", [])
+                for assign in assignments:
+                    tid = assign.get("theme_id", "other")
+                    sentiment = assign.get("sentiment", "neutral")
+                    if tid not in counts:
+                        tid = "other"
+                    counts[tid]["total"] += 1
+                    if sentiment == "positive":
+                        counts[tid]["pos"] += 1
+                    elif sentiment == "negative":
+                        counts[tid]["neg"] += 1
+                    elif sentiment == "mixed":
+                        counts[tid]["mixed"] += 1
+                    else:
+                        counts[tid]["neutral"] += 1
+                    if tid != "other" and len(quotes_pool[tid]) < 10 and original_text:
+                        quotes_pool[tid].append((sentiment, original_text))
+
+        # ── 统计汇总 ──────────────────────────────────────────────────────
+        total_mentions = sum(v["total"] for v in counts.values())
+        if total_mentions == 0:
+            continue
+
+        themes_out = []
+        other_themes_out = []
+
+        for t in final_themes:
+            tid = t["id"]
+            c = counts[tid]
+            cnt = c["total"]
+            pct = round(cnt / total_mentions * 100, 1)
+            pos_cnt = c["pos"]
+            neg_cnt = c["neg"]
+            pos_pct = round(pos_cnt / cnt * 100, 1) if cnt else 0.0
+            neg_pct = round(neg_cnt / cnt * 100, 1) if cnt else 0.0
+
+            # 代表性引用：每种情感最多取 1-2 条
+            pool = quotes_pool.get(tid, [])
+            pos_q = [txt for sent, txt in pool if sent == "positive"][:2]
+            neg_q = [txt for sent, txt in pool if sent == "negative"][:2]
+            quotes = pos_q[:1] + neg_q[:1] or [txt for _, txt in pool[:2]]
+
+            entry = {
+                "id": tid,
+                "name": t["name"],
+                "description": t.get("description", ""),
+                "count": cnt,
+                "percentage": pct,
+                "positive_count": pos_cnt,
+                "positive_pct": pos_pct,
+                "positive_summary": t.get("positive_summary") or "",
+                "negative_count": neg_cnt,
+                "negative_pct": neg_pct,
+                "negative_summary": t.get("negative_summary") or "",
+                "quotes": quotes,
+            }
+            if pct < OTHER_THEME_PCT:
+                other_themes_out.append({"name": t["name"], "count": cnt, "percentage": pct})
+            else:
+                themes_out.append(entry)
+
+        themes_out.sort(key=lambda x: x["count"], reverse=True)
+        other_themes_out.sort(key=lambda x: x["count"], reverse=True)
+
+        clustered_themes[col_idx] = {
+            "col_name": col_name,
+            "total": total,
+            "themes": themes_out,
+            "other_themes": other_themes_out,
+        }
+        yield ("progress", f"【{col_name}】分析完成，识别 {len(themes_out)} 个主要主题")
+
+    yield ("result", clustered_themes)
+
+
+def _build_large_sample_writer_query(
+    stats_md: str,
+    clustered_themes: dict,
+    plan: dict,
+    headers: list[str],
+) -> str:
+    parts_lines = []
+    for i, p in enumerate(plan["parts"], 1):
+        col_names = []
+        for idx in p["column_indexes"]:
+            col = next((c for c in plan["columns"] if c["index"] == idx), None)
+            name = (col and col.get("name")) or (headers[idx] if idx < len(headers) else f"列{idx}")
+            role = col["role"] if col else "?"
+            col_names.append(f"{name}({role})")
+        parts_lines.append(f"  Part {i} {p['name']}: {'; '.join(col_names)}")
+    plan_summary = "<plan>\n报告结构：\n" + "\n".join(parts_lines) + "\n</plan>"
+
+    theme_blocks = []
+    for col_idx, data in clustered_themes.items():
+        col_name = data["col_name"]
+        total = data["total"]
+        lines = [f"### 问题：{col_name}（共 {total:,} 条有效回答）\n"]
+
+        for i, t in enumerate(data["themes"], 1):
+            lines.append(f"**主题{i}：{t['name']}**（提及 {t['count']:,} 人次，占 {t['percentage']}%）")
+            if t["positive_summary"] or t["positive_count"]:
+                lines.append(f"- 正面（{t['positive_count']:,} / {t['positive_pct']}%）：{t['positive_summary']}")
+            if t["negative_summary"] or t["negative_count"]:
+                lines.append(f"- 负面（{t['negative_count']:,} / {t['negative_pct']}%）：{t['negative_summary']}")
+            if t["quotes"]:
+                quotes_str = " / ".join(f'"{q}"' for q in t["quotes"])
+                lines.append(f"- 代表引用：{quotes_str}")
+            lines.append("")
+
+        if data["other_themes"]:
+            other_parts = "、".join(
+                f"{o['name']}（{o['percentage']}%）" for o in data["other_themes"]
+            )
+            lines.append(f"**其他声音**（合计占比较低）：{other_parts}")
+
+        theme_blocks.append("\n".join(lines))
+
+    open_text_md = (
+        "<open_text_themes>\n" + "\n\n".join(theme_blocks) + "\n</open_text_themes>"
+        if theme_blocks else "<open_text_themes>（无开放题聚类结果）</open_text_themes>"
+    )
+
+    requirements = _get_large_sample_writer_requirements()
+
+    return (
+        "**任务**：基于以下大样本问卷分析结果撰写调研报告。\n\n"
+        f"{plan_summary}\n\n"
+        f"<stats>\n{stats_md}\n</stats>\n\n"
+        f"{open_text_md}\n\n"
+        f"**要求**：\n{requirements}"
+    )
+
+
+def _get_large_sample_writer_requirements() -> str:
+    return """一、结论驱动
+- 以"多少人持有什么观点"为核心叙事框架
+- 每个结论必须附具体数字（人数或占比），禁止使用"部分用户""少数玩家"等模糊表述
+- 执行摘要放在最前面，列出 3-5 条最重要的结论
+
+二、主题展开逻辑
+- 主题按提及人数从高到低排序
+- 重点展开占比 ≥ 5% 的主题，每个主题按以下结构写：
+  ① 核心结论（一句话，含具体数字）
+  ② 正负观点分布（各占多少比例，各自主要内容是什么）
+  ③ 代表性原文引用 1-2 条（用引号括起）
+- 占比 < 5% 的主题统一归入「其他声音」，列举名称和占比，不展开分析
+
+三、语言风格
+- 简洁直接，去掉冗长铺垫和过渡句
+- 结论可直接用于产品决策和优先级判断
+- 报告结尾的行动建议：3-5 条，每条必须有对应的数据依据
+
+四、报告结构
+1. 执行摘要（3-5条核心结论，每条含数字）
+2. 按报告结构逐 Part 展开
+3. 关键行动建议"""
+
+
 def _build_writer_query(stats_md: str, open_text: dict, plan: dict, headers: list[str]) -> str:
     parts_lines = []
     for i, p in enumerate(plan["parts"], 1):
@@ -2110,16 +2412,41 @@ async def generate_report(session_id: str, request: Request):
 
     if not all([plan, rows, stats_md]):
         raise HTTPException(status_code=400, detail="请先完成统计计算")
-    if not DIFY_ANALYST_KEY:
-        raise HTTPException(status_code=500, detail="未配置 DIFY_ANALYST_KEY")
+
+    total_open_text = sum(len(v) for v in open_text.values())
+    use_large_mode = total_open_text >= LARGE_SAMPLE_THRESHOLD
+
+    if use_large_mode:
+        if not DIFY_LARGE_ANALYST_KEY:
+            raise HTTPException(status_code=500, detail="未配置 DIFY_LARGE_ANALYST_KEY")
+    else:
+        if not DIFY_ANALYST_KEY:
+            raise HTTPException(status_code=500, detail="未配置 DIFY_ANALYST_KEY")
 
     async def generate():
         try:
-            writer_query = _build_writer_query(stats_md, open_text, plan, rows[0])
+            if use_large_mode:
+                # ── 大样本模式：四阶段批处理 ──────────────────────────────
+                yield sse_event({"type": "progress", "message": f"检测到大样本（{total_open_text} 条开放题回复），启用批处理模式"})
+                clustered_themes: dict = {}
+                async for item in _batch_qualitative_analysis(open_text, plan, rows[0], session_id):
+                    if item[0] == "progress":
+                        yield sse_event({"type": "progress", "message": item[1]})
+                    else:
+                        clustered_themes = item[1]
+
+                yield sse_event({"type": "progress", "message": "主题分析完成，开始生成报告..."})
+                writer_query = _build_large_sample_writer_query(stats_md, clustered_themes, plan, rows[0])
+                analyst_key = DIFY_LARGE_ANALYST_KEY
+            else:
+                # ── 标准模式（原有逻辑）─────────────────────────────────
+                writer_query = _build_writer_query(stats_md, open_text, plan, rows[0])
+                analyst_key = DIFY_ANALYST_KEY
+
             answer_chunks: list[str] = []
             final_conv_id = ""
 
-            async for chunk, conv_id in sse_dify_stream(writer_query, session_id, "", DIFY_ANALYST_KEY):
+            async for chunk, conv_id in sse_dify_stream(writer_query, session_id, "", analyst_key):
                 if chunk:
                     answer_chunks.append(chunk)
                     yield sse_event({"type": "chunk", "content": chunk})
@@ -2136,14 +2463,13 @@ async def generate_report(session_id: str, request: Request):
             sess["analyst_conv_id"] = final_conv_id
             sess["rows_fed"] = False
 
-            # 自动保存历史
             save_to_history(session_id, sess)
             await audit_log(
                 request,
                 "survey",
                 "生成报告",
-                f"会话：{session_id}；文件：{sess.get('filename', 'unknown')}",
-                metadata={"session_id": session_id, "filename": sess.get("filename", "unknown")},
+                f"会话：{session_id}；文件：{sess.get('filename', 'unknown')}；模式：{'大样本' if use_large_mode else '标准'}",
+                metadata={"session_id": session_id, "filename": sess.get("filename", "unknown"), "large_mode": use_large_mode},
             )
 
             yield sse_event({"type": "report_done", "report_md": full_report})
