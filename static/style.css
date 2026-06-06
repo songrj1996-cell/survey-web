@@ -16,6 +16,7 @@
   --border-act:  rgba(139,92,246,0.45);
 
   --accent:      #8b5cf6;
+  --accent-rgb:  139,92,246;
   --accent-2:    #6366f1;
   --accent-glow: rgba(139,92,246,0.25);
   --accent-soft: rgba(139,92,246,0.12);
@@ -638,6 +639,38 @@ html, body {
 }
 .plan-question__num { color: var(--amber); font-weight: 600; flex-shrink: 0; }
 
+/* ── Analysis Mode Bar ──────────────────────────────── */
+.analysis-mode-bar {
+  border-top: 1px solid var(--border);
+  padding: 12px 22px;
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  background: rgba(0,0,0,0.06);
+}
+.analysis-mode-bar__label {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12px; font-weight: 600; color: var(--text-2); flex-shrink: 0;
+}
+.analysis-mode-bar__note { font-weight: 400; color: var(--text-3); font-size: 11px; }
+.analysis-mode-bar__options { display: flex; gap: 8px; }
+.analysis-mode-bar__tip {
+  font-size: 11px; color: var(--text-3); width: 100%; margin-top: -4px;
+  min-height: 0; transition: opacity 0.2s;
+}
+.analysis-mode-btn {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 2px;
+  padding: 7px 14px;
+  background: var(--glass); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); cursor: pointer; transition: all var(--transition);
+}
+.analysis-mode-btn:hover { border-color: var(--accent); background: var(--accent-soft); }
+.analysis-mode-btn--active {
+  border-color: var(--accent); background: var(--accent-soft);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+.analysis-mode-btn__name { font-size: 13px; font-weight: 500; color: var(--text); }
+.analysis-mode-btn--active .analysis-mode-btn__name { color: var(--accent); }
+.analysis-mode-btn__desc { font-size: 11px; color: var(--text-3); }
+
 .plan-actions {
   border-top: 1px solid var(--border); padding: 18px 22px;
   display: flex; flex-direction: column; gap: 10px;
@@ -700,6 +733,33 @@ html, body {
   font-size: 13px; color: var(--text-2);
   font-family: 'Courier New', monospace; white-space: pre-wrap;
   word-break: break-word; line-height: 1.7;
+}
+
+/* ── Large-sample progress log ─────────────────────── */
+.report-progress-log {
+  display: flex; flex-direction: column; gap: 6px;
+  font-family: inherit; white-space: normal;
+}
+.report-progress-line {
+  font-size: 13px; color: var(--text-2);
+  padding: 7px 12px;
+  border-left: 2px solid var(--accent);
+  background: rgba(var(--accent-rgb, 99,102,241), 0.06);
+  border-radius: 0 4px 4px 0;
+  line-height: 1.5;
+}
+.report-progress-line:last-child {
+  color: var(--text);
+  border-left-color: var(--accent);
+  background: rgba(var(--accent-rgb, 99,102,241), 0.12);
+}
+
+/* ── Stage timer ────────────────────────────────────── */
+.stage-timer {
+  margin-left: 10px;
+  font-size: 11px;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
 }
 
 /* ── Report body ────────────────────────────────────── */

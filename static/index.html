@@ -206,13 +206,31 @@
         <div class="thinking-block" id="plan-thinking">
           <div class="thinking-block__icon"><div class="spinner"></div></div>
           <div class="thinking-block__content">
-            <div class="thinking-block__title">AI 正在规划分析方案，请稍候…</div>
+            <div class="thinking-block__title">AI 正在规划分析方案，请稍候…<span class="stage-timer" id="plan-timer"></span></div>
             <div class="thinking-block__stream" id="plan-stream-text"></div>
           </div>
         </div>
 
         <div class="plan-card" id="plan-card" style="display:none">
           <div class="plan-card__sections" id="plan-card-content"></div>
+          <div class="analysis-mode-bar" id="analysis-mode-bar">
+            <div class="analysis-mode-bar__label">
+              <span>分析模式</span>
+              <span class="analysis-mode-bar__note">仅影响主观题的分析方式</span>
+            </div>
+            <div class="analysis-mode-bar__options">
+              <button class="analysis-mode-btn" id="btn-mode-comprehensive" data-mode="comprehensive">
+                <span class="analysis-mode-btn__name">覆盖全面</span>
+                <span class="analysis-mode-btn__desc">逐条分析每条回复</span>
+              </button>
+              <button class="analysis-mode-btn" id="btn-mode-commonality" data-mode="commonality">
+                <span class="analysis-mode-btn__name">共性分析</span>
+                <span class="analysis-mode-btn__desc">提炼高频主题</span>
+              </button>
+            </div>
+            <div class="analysis-mode-bar__tip" id="analysis-mode-tip"></div>
+          </div>
+
           <div class="plan-actions">
             <div class="plan-actions__hint">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 8v4l3 3"/></svg>
@@ -259,7 +277,7 @@
               <div class="progress-step__dot"></div>
               <div class="progress-step__info">
                 <div class="progress-step__label">AI 撰写报告</div>
-                <div class="progress-step__sub">按章节结构生成，实时流式展示</div>
+                <div class="progress-step__sub">按章节结构生成，实时流式展示<span class="stage-timer" id="report-timer"></span></div>
               </div>
             </div>
           </div>

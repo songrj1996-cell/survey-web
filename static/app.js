@@ -41,6 +41,8 @@ const state = {
     planData: null,
   },
   auditFilters: { start: '', end: '', user: '', feature: '' },
+  analysisMode: 'commonality',   // 'comprehensive' | 'commonality'
+  totalOpenText: 0,
 };
 window.__surveyState = state;
 
@@ -65,6 +67,32 @@ const $  = id => document.getElementById(id);
 const panels   = [1,2,3,4,5].map(n => $(`panel-${n}`));
 
 // ── 工具 ──
+
+function startStageTimer(el) {
+  const start = Date.now();
+  el.textContent = '已用时 0 秒';
+  const iv = setInterval(() => {
+    const s = Math.floor((Date.now() - start) / 1000);
+    el.textContent = s < 60
+      ? `已用时 ${s} 秒`
+      : `已用时 ${Math.floor(s / 60)} 分 ${s % 60} 秒`;
+  }, 1000);
+  return () => { clearInterval(iv); el.textContent = ''; };
+}
+
+async function requestNotifyPermission() {
+  if (!('Notification' in window)) return;
+  if (Notification.permission === 'default') {
+    await Notification.requestPermission();
+  }
+}
+
+function notifyIfHidden(title, body = '') {
+  if (!document.hidden) return;
+  if (!('Notification' in window)) return;
+  if (Notification.permission !== 'granted') return;
+  new Notification(title, { body, icon: '/static/favicon.ico' });
+}
 
 function showToast(msg, type = 'info', duration = 4000) {
   const tc = $('toast-container');
@@ -316,9 +344,11 @@ async function loadColumns() {
   const list = $('col-list');
   $('col-confirm-count').textContent = '';
   list.innerHTML = `<div class="thinking-block"><div class="thinking-block__icon"><div class="spinner"></div></div>
-    <div class="thinking-block__content"><div class="thinking-block__title">AI 正在识别题型与中文题名（较慢，请稍候）…</div>
+    <div class="thinking-block__content"><div class="thinking-block__title">AI 正在识别题型与中文题名（较慢，请稍候）…<span class="stage-timer" id="col-timer"></span></div>
     <div class="thinking-block__stream" id="col-stream-text"></div></div></div>`;
   $('btn-start-plan').disabled = true;
+  requestNotifyPermission();
+  const stopColTimer = startStageTimer($('col-timer'));
 
   try {
     await consumeSSE(`/api/columns/${state.sessionId}`, ev => {
@@ -327,12 +357,15 @@ async function loadColumns() {
         if (el) { el.textContent += ev.content; el.scrollTop = el.scrollHeight; }
       }
       if (ev.type === 'columns_ready') {
+        stopColTimer();
+        notifyIfHidden('题型识别完成', `共识别 ${ev.columns?.length ?? ''} 列，请前往确认`);
         state.columns = ev.columns;
         renderColumnRows(ev.columns);
       }
     });
     $('btn-start-plan').disabled = false;
   } catch (e) {
+    stopColTimer();
     list.innerHTML = `<div class="hist-empty">题型识别失败：${esc(e.message)}</div>`;
     showToast(e.message, 'error');
   }
@@ -575,9 +608,11 @@ async function startPlan() {
   // 进入 Step 3，开始 AI 规划
   goStep(3);
   $('plan-thinking').style.display = 'flex';
-  $('plan-thinking').querySelector('.thinking-block__title').textContent = 'AI 正在规划分析方案，请稍候…';
+  const planTitleEl = $('plan-thinking').querySelector('.thinking-block__title');
+  planTitleEl.innerHTML = 'AI 正在规划分析方案，请稍候…<span class="stage-timer" id="plan-timer"></span>';
   $('plan-card').style.display = 'none';
   $('plan-stream-text').textContent = '';
+  const stopPlanTimer = startStageTimer($('plan-timer'));
 
   try {
     await consumeSSE(`/api/plan/${state.sessionId}`, ev => {
@@ -587,11 +622,14 @@ async function startPlan() {
         el.scrollTop = el.scrollHeight;
       }
       if (ev.type === 'plan_ready') {
+        stopPlanTimer();
+        notifyIfHidden('分析方案已生成', '请前往确认方案');
         state.planData = ev.plan;
-        showPlanCard(ev.plan, ev.headers);
+        showPlanCard(ev.plan, ev.headers, ev.total_open_text);
       }
     });
   } catch (e) {
+    stopPlanTimer();
     showToast(`方案生成失败：${e.message}`, 'error');
     btn.disabled = false;
   }
@@ -601,11 +639,26 @@ async function startPlan() {
 // STEP 3: Plan card
 // ============================================================
 
-function showPlanCard(plan, headers) {
+function showPlanCard(plan, headers, totalOpenText) {
   $('plan-thinking').style.display = 'none';
   $('plan-card').style.display = 'block';
   $('plan-card-content').innerHTML = buildPlanHTML(plan, headers);
   clearPlanInput();
+  if (totalOpenText !== undefined) state.totalOpenText = totalOpenText;
+  const defaultMode = state.totalOpenText < 200 ? 'comprehensive' : 'commonality';
+  setAnalysisMode(defaultMode);
+}
+
+function setAnalysisMode(mode) {
+  state.analysisMode = mode;
+  $('btn-mode-comprehensive').classList.toggle('analysis-mode-btn--active', mode === 'comprehensive');
+  $('btn-mode-commonality').classList.toggle('analysis-mode-btn--active', mode === 'commonality');
+  const tip = $('analysis-mode-tip');
+  if (tip) {
+    tip.textContent = (mode === 'commonality' && state.totalOpenText < 200)
+      ? '当前样本量较小，覆盖全面模式效果更佳'
+      : '';
+  }
 }
 
 function buildPlanHTML(plan, headers) {
@@ -693,6 +746,70 @@ function clearPlanInput() {
   syncPlanActionButtons();
 }
 
+function showAnalysisModeConfirmModal(n) {
+  return new Promise(resolve => {
+    const modal = document.createElement('div');
+    modal.style.cssText = 'position:fixed;inset:0;z-index:200;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.5);backdrop-filter:blur(4px)';
+    modal.innerHTML = `
+      <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
+                  padding:24px 28px;width:min(420px,90vw);display:flex;flex-direction:column;gap:16px;
+                  box-shadow:var(--shadow-lg)">
+        <div style="font-size:15px;font-weight:600;color:var(--text)">切换为「覆盖全面」模式？</div>
+        <div style="font-size:13px;color:var(--text-2);line-height:1.7">
+          当前主观题回复共 <strong style="color:var(--text)">${n}</strong> 条，全面分析将逐条处理每条回复，报告生成时间较长、报告篇幅也会更多，确认使用覆盖全面分析？
+        </div>
+        <div style="display:flex;gap:8px;justify-content:flex-end">
+          <button class="btn btn--ghost" id="_am-cancel">还是算了</button>
+          <button class="btn btn--primary" id="_am-confirm">确认</button>
+        </div>
+      </div>`;
+    document.body.appendChild(modal);
+    const cleanup = r => { modal.remove(); resolve(r); };
+    document.getElementById('_am-cancel').onclick = () => cleanup(false);
+    document.getElementById('_am-confirm').onclick = () => cleanup(true);
+    modal.addEventListener('click', e => { if (e.target === modal) cleanup(false); });
+  });
+}
+
+function showAnalysisModeLargeAlert() {
+  return new Promise(resolve => {
+    const modal = document.createElement('div');
+    modal.style.cssText = 'position:fixed;inset:0;z-index:200;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.5);backdrop-filter:blur(4px)';
+    modal.innerHTML = `
+      <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
+                  padding:24px 28px;width:min(380px,90vw);display:flex;flex-direction:column;gap:16px;
+                  box-shadow:var(--shadow-lg)">
+        <div style="font-size:15px;font-weight:600;color:var(--text)">无法切换分析模式</div>
+        <div style="font-size:13px;color:var(--text-2);line-height:1.7">
+          当前主观题回复共 <strong style="color:var(--text)">${state.totalOpenText}</strong> 条，样本量较大，仅支持共性分析模式。
+        </div>
+        <div style="display:flex;justify-content:flex-end">
+          <button class="btn btn--ghost" id="_am-ok">了解</button>
+        </div>
+      </div>`;
+    document.body.appendChild(modal);
+    const cleanup = () => { modal.remove(); resolve(); };
+    document.getElementById('_am-ok').onclick = cleanup;
+    modal.addEventListener('click', e => { if (e.target === modal) cleanup(); });
+  });
+}
+
+$('btn-mode-comprehensive').addEventListener('click', async () => {
+  const n = state.totalOpenText;
+  if (n > 500) {
+    await showAnalysisModeLargeAlert();
+  } else if (n >= 200) {
+    const ok = await showAnalysisModeConfirmModal(n);
+    if (ok) setAnalysisMode('comprehensive');
+  } else {
+    setAnalysisMode('comprehensive');
+  }
+});
+
+$('btn-mode-commonality').addEventListener('click', () => {
+  setAnalysisMode('commonality');
+});
+
 $('btn-plan-ok').addEventListener('click', () => {
   if (($('plan-input').value || '').trim()) return;
   confirmPlan('ok');
@@ -723,14 +840,17 @@ async function confirmPlan(text) {
     let approved = false;
     let newPlan = null;
     let newHeaders = null;
+    let newTotalOpenText = undefined;
 
     if (text.toLowerCase() === 'ok') {
       approved = true;
     } else {
       $('plan-thinking').style.display = 'flex';
-      $('plan-thinking').querySelector('.thinking-block__title').textContent = 'AI 正在修订方案…';
+      const reviseTitleEl = $('plan-thinking').querySelector('.thinking-block__title');
+      reviseTitleEl.innerHTML = 'AI 正在修订方案…<span class="stage-timer" id="plan-timer"></span>';
       $('plan-stream-text').textContent = '';
       $('plan-card').style.display = 'none';
+      const stopRevisePlanTimer = startStageTimer($('plan-timer'));
 
       await consumeSSEPost('/api/plan/confirm', {
         session_id: state.sessionId,
@@ -742,17 +862,21 @@ async function confirmPlan(text) {
           el.scrollTop = el.scrollHeight;
         }
         if (ev.type === 'plan_ready') {
+          stopRevisePlanTimer();
+          notifyIfHidden('分析方案已修订', '请前往确认方案');
           newPlan = ev.plan;
           newHeaders = ev.headers;
+          newTotalOpenText = ev.total_open_text;
         }
         if (ev.type === 'json' && ev.approved) {
           approved = true;
         }
       });
+      if (!newPlan) stopRevisePlanTimer();
 
       if (newPlan) {
         state.planData = newPlan;
-        showPlanCard(newPlan, newHeaders);
+        showPlanCard(newPlan, newHeaders, newTotalOpenText);
         showToast('方案已修订，请再次确认', 'success');
         return;
       }
@@ -783,6 +907,7 @@ async function runStats() {
   $('ps-writing').classList.remove('progress-step--active', 'progress-step--done');
   $('report-stream-container').style.display = 'none';
   $('report-stream-content').textContent = '';
+  let stopReportTimer = null;
 
   try {
     const statsResp = await fetch(`/api/stats/${state.sessionId}`, { method: 'POST' });
@@ -793,12 +918,33 @@ async function runStats() {
     $('ps-stats').classList.remove('progress-step--active');
     $('ps-stats').classList.add('progress-step--done');
     $('ps-writing').classList.add('progress-step--active');
+    stopReportTimer = startStageTimer($('report-timer'));
 
     $('report-stream-container').style.display = 'block';
     let fullReport = '';
 
-    await consumeSSE(`/api/report/${state.sessionId}`, ev => {
+    await consumeSSE(`/api/report/${state.sessionId}?analysis_mode=${encodeURIComponent(state.analysisMode)}`, ev => {
+      if (ev.type === 'progress') {
+        const el = $('report-stream-content');
+        let log = el.querySelector('.report-progress-log');
+        if (!log) {
+          el.innerHTML = '<div class="report-progress-log"></div>';
+          log = el.querySelector('.report-progress-log');
+        }
+        const line = document.createElement('div');
+        line.className = 'report-progress-line';
+        line.textContent = ev.message;
+        log.appendChild(line);
+        log.scrollTop = log.scrollHeight;
+        const sub = $('ps-writing') && $('ps-writing').querySelector('.progress-step__sub');
+        if (sub) { sub.textContent = ev.message; sub.appendChild($('report-timer')); }
+      }
       if (ev.type === 'chunk') {
+        if (!fullReport) {
+          $('report-stream-content').textContent = '';
+          const sub = $('ps-writing') && $('ps-writing').querySelector('.progress-step__sub');
+          if (sub) { sub.textContent = '按章节结构生成，实时流式展示'; sub.appendChild($('report-timer')); }
+        }
         fullReport += ev.content;
         state.sessionReport.stream = fullReport;
         if (state.viewMode === 'session') {
@@ -808,6 +954,8 @@ async function runStats() {
         }
       }
       if (ev.type === 'report_done') {
+        stopReportTimer();
+        notifyIfHidden('报告已生成', '点击查看完整报告');
         state.sessionReport.running = false;
         state.sessionReport.reportMd = ev.report_md;
         state.sessionReport.title = reportTitleFromMarkdown(ev.report_md);
@@ -822,6 +970,7 @@ async function runStats() {
     });
   } catch (e) {
     state.sessionReport.running = false;
+    if (stopReportTimer) stopReportTimer();
     showToast(`报告生成失败：${e.message}`, 'error');
   }
 }
@@ -2503,6 +2652,10 @@ async function annRunAiDetect() {
   msg.textContent = '正在连接…';
   warnLog.innerHTML = '';
   const diagnostics = [];
+  const aiTimerEl = document.createElement('span');
+  aiTimerEl.className = 'stage-timer';
+  msg.insertAdjacentElement('afterend', aiTimerEl);
+  const stopAiTimer = startStageTimer(aiTimerEl);
 
   try {
     await consumeSSE(`/api/annotate/${annState.sessionId}/run-ai-detect`, ev => {
@@ -2538,6 +2691,8 @@ async function annRunAiDetect() {
         appendAiLog(warning);
       }
       if (ev.type === 'ai_detect_done') {
+        stopAiTimer(); aiTimerEl.remove();
+        notifyIfHidden('AI 检测完成', `共 ${(ev.results || []).length} 条结果，请前往确认`);
         bar.style.width = '100%';
         const results = ev.results || [];
         msg.textContent = `AI 检测完成，共 ${results.length} 条结果`;
@@ -2565,6 +2720,7 @@ async function annRunAiDetect() {
       await annAfterAiConfirm();
     }
   } catch (e) {
+    stopAiTimer(); aiTimerEl.remove();
     msg.textContent = `AI 识别失败：${e.message}`;
     appendAiLog(e.message, 'error');
     backBtn.style.display = '';
@@ -2668,6 +2824,10 @@ async function annRunQuality() {
   bar.style.width = '0%';
   msg.textContent = '正在连接…';
   warnLog.innerHTML = '';
+  const qualityTimerEl = document.createElement('span');
+  qualityTimerEl.className = 'stage-timer';
+  msg.insertAdjacentElement('afterend', qualityTimerEl);
+  const stopQualityTimer = startStageTimer(qualityTimerEl);
 
   try {
     await consumeSSE(`/api/annotate/${annState.sessionId}/run-quality`, ev => {
@@ -2683,6 +2843,8 @@ async function annRunQuality() {
         warnLog.appendChild(div);
       }
       if (ev.type === 'quality_done') {
+        stopQualityTimer(); qualityTimerEl.remove();
+        notifyIfHidden('质量打标完成', `共 ${ev.count} 条结果`);
         bar.style.width = '100%';
         msg.textContent = `质量打标完成，共 ${ev.count} 条结果`;
         annState.qualityCount = ev.count;
@@ -2691,6 +2853,7 @@ async function annRunQuality() {
     annGoStep(6);
     annShowDone();
   } catch (e) {
+    stopQualityTimer(); qualityTimerEl.remove();
     showToast(`质量打标失败：${e.message}`, 'error');
   }
 }
