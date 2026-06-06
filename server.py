@@ -1807,6 +1807,49 @@ def sse_event(data: dict) -> str:
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+SSE_KEEPALIVE = ": keepalive\n\n"
+
+
+async def dify_stream_with_keepalive(
+    gen,
+    interval: int = 15,
+):
+    """Wrap an async generator (sse_dify_stream), yielding SSE keep-alive comments
+    whenever no item arrives within `interval` seconds.  Prevents ngrok / proxy
+    idle-timeout from dropping long-running SSE connections.
+    """
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def _producer():
+        try:
+            async for item in gen:
+                await queue.put(("item", item))
+        except Exception as exc:
+            await queue.put(("error", exc))
+        finally:
+            await queue.put(("done", None))
+
+    task = asyncio.create_task(_producer())
+    try:
+        while True:
+            try:
+                kind, value = await asyncio.wait_for(queue.get(), timeout=interval)
+            except asyncio.TimeoutError:
+                yield SSE_KEEPALIVE
+                continue
+            if kind == "done":
+                break
+            if kind == "error":
+                raise value
+            yield value
+    finally:
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
 def _annotate_ai_log(message: str, **fields) -> None:
     payload = " ".join(f"{k}={v!r}" for k, v in fields.items())
     print(f"[annotate.ai_detect] {message}" + (f" {payload}" if payload else ""), flush=True)
@@ -2196,7 +2239,13 @@ async def get_columns(session_id: str, request: Request):
 
             answer_chunks: list[str] = []
             final_conv = ""
-            async for chunk, conv_id in sse_dify_stream(query, session_id, "", DIFY_COLUMN_KEY):
+            async for item in dify_stream_with_keepalive(
+                sse_dify_stream(query, session_id, "", DIFY_COLUMN_KEY)
+            ):
+                if isinstance(item, str):   # keep-alive comment
+                    yield item
+                    continue
+                chunk, conv_id = item
                 if chunk:
                     answer_chunks.append(chunk)
                     yield sse_event({"type": "chunk", "content": chunk})
@@ -2211,7 +2260,13 @@ async def get_columns(session_id: str, request: Request):
                     "不要附加任何解释文字。"
                 )
                 retry_chunks: list[str] = []
-                async for chunk, conv_id in sse_dify_stream(retry_q, session_id, final_conv, DIFY_COLUMN_KEY):
+                async for item in dify_stream_with_keepalive(
+                    sse_dify_stream(retry_q, session_id, final_conv, DIFY_COLUMN_KEY)
+                ):
+                    if isinstance(item, str):
+                        yield item
+                        continue
+                    chunk, _ = item
                     if chunk:
                         retry_chunks.append(chunk)
                 questions, err = survey_plan.parse_columns_from_llm("".join(retry_chunks), header_count)
@@ -2284,7 +2339,13 @@ async def get_plan(session_id: str, request: Request):
             answer_chunks: list[str] = []
             final_conv_id = ""
 
-            async for chunk, conv_id in sse_dify_stream(planner_query, session_id, "", DIFY_PLANNER_KEY):
+            async for item in dify_stream_with_keepalive(
+                sse_dify_stream(planner_query, session_id, "", DIFY_PLANNER_KEY)
+            ):
+                if isinstance(item, str):
+                    yield item
+                    continue
+                chunk, conv_id = item
                 if chunk:
                     answer_chunks.append(chunk)
                     yield sse_event({"type": "chunk", "content": chunk})
@@ -2301,7 +2362,13 @@ async def get_plan(session_id: str, request: Request):
                     "用 ```json ``` 围栏，不要附加解释文字。"
                 )
                 retry_chunks: list[str] = []
-                async for chunk, conv_id in sse_dify_stream(retry_q, session_id, final_conv_id, DIFY_PLANNER_KEY):
+                async for item in dify_stream_with_keepalive(
+                    sse_dify_stream(retry_q, session_id, final_conv_id, DIFY_PLANNER_KEY)
+                ):
+                    if isinstance(item, str):
+                        yield item
+                        continue
+                    chunk, conv_id = item
                     if chunk: retry_chunks.append(chunk)
                     if conv_id: final_conv_id = conv_id
                 plan, err = survey_plan.parse_plan_from_llm("".join(retry_chunks), len(headers))
