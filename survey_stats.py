@@ -127,6 +127,13 @@ def compute(
             open_text[c["index"]] = _collect_open_text(
                 c["index"], body, headers, mlbb_id_cols + id_cols, profile_cols
             )
+        elif c["role"] in ("multi_choice", "single_choice"):
+            # 提取「其他（请填写）」选项的自由文本，追加到 open_text
+            other_texts = _collect_choice_other_texts(
+                c, body, headers, mlbb_id_cols + id_cols, profile_cols
+            )
+            if other_texts:
+                open_text[c["index"]] = other_texts
 
     return "\n".join(md_parts).rstrip() + "\n", open_text
 
@@ -190,6 +197,7 @@ def _render_column(
         body_md += _append_cross_tabs(
             col, raw_values, profile_cols, body, headers, single=True
         )
+        body_md += _append_other_fill_note(col, body, headers)
     elif role == "multi_choice":
         delimiter = col.get("delimiter") or _guess_delimiter(nonblank_raw)
         options = col.get("options")
@@ -198,6 +206,7 @@ def _render_column(
             col, raw_values, profile_cols, body, headers,
             single=False, delimiter=delimiter, options=options,
         )
+        body_md += _append_other_fill_note(col, body, headers)
     elif role == "scale":
         lo = col.get("min")
         hi = col.get("max")
@@ -217,6 +226,31 @@ def _render_column(
         body_md = "（未识别的题型）"
 
     return f"{title}\n\n{body_md}"
+
+
+def _append_other_fill_note(col: dict, body: list[list], headers: list[str]) -> str:
+    """若该选择题有「其他」填写项，在统计结果后追加说明行。"""
+    options = col.get("options") or []
+    if not any(_is_other_option(o) for o in options):
+        return ""
+    norm_fn = _make_normalizer(col.get("value_aliases"))
+    delimiter = col.get("delimiter") or ","
+    col_idx = col["index"]
+    norm_opts: set[str] = {norm_fn(o).strip().casefold() for o in options if o}
+    count = 0
+    for row in body:
+        raw = _format_cell(row[col_idx]) if col_idx < len(row) else ""
+        if not raw.strip():
+            continue
+        frags = _split_by_vocab(raw, options, delimiter, norm_fn)
+        for frag in frags:
+            fs = frag.strip()
+            if fs and fs.casefold() not in norm_opts:
+                count += 1
+                break  # 每行最多计1次
+    if count == 0:
+        return ""
+    return f"\n\n> {count} 人填写了「其他」内容，见 `<open_text>` 块（其他选项填写）"
 
 
 def _append_cross_tabs(
@@ -506,6 +540,101 @@ def _cross_tab_scale(
 # ============================================================================
 # 开放题原文池：每条带 ids + profile
 # ============================================================================
+
+
+# ============================================================================
+# 选择题「其他」填写内容抽取
+# ============================================================================
+
+_OTHER_OPTION_KEYWORDS: frozenset[str] = frozenset([
+    # Indonesian
+    "lainnya", "lain-lain", "lain", "sebutkan", "mohon sebutkan",
+    # English
+    "other", "others", "please specify", "please state", "specify",
+    # Chinese
+    "其他", "其它", "其他请填写", "其他（请填写）", "其他说明",
+    # Short catch-all suffixes (checked as substring)
+    "dll", "dsb",
+])
+
+
+def _is_other_option(name: str) -> bool:
+    """Return True if the option name looks like an 'other (fill-in)' choice."""
+    if not name:
+        return False
+    low = name.strip().casefold()
+    if low in _OTHER_OPTION_KEYWORDS:
+        return True
+    return any(kw in low for kw in _OTHER_OPTION_KEYWORDS)
+
+
+def _collect_choice_other_texts(
+    col: dict,
+    body: list[list],
+    headers: list[str],
+    id_cols: list[dict],
+    profile_cols: list[dict],
+) -> list[dict]:
+    """从单选/多选题中抽取「其他」填写的自由文本，格式与 _collect_open_text 相同。
+
+    检测逻辑：
+    1. options 列表中有含 _OTHER_OPTION_KEYWORDS 的选项名，认为该题存在「其他」填写项
+    2. 对每行回答，用 _split_by_vocab 分词，拿出不匹配任何 canonical 选项的片段
+       作为「其他」自由文本
+    """
+    options = col.get("options") or []
+    if not options or not any(_is_other_option(o) for o in options):
+        return []
+
+    norm_fn = _make_normalizer(col.get("value_aliases"))
+    delimiter = col.get("delimiter") or ","
+    col_idx = col["index"]
+
+    # 规范化后的选项集合（用于判断某值是否是已知选项）
+    norm_opts: set[str] = set()
+    for o in options:
+        nv = norm_fn(o).strip().casefold()
+        if nv:
+            norm_opts.add(nv)
+
+    out: list[dict] = []
+    for row in body:
+        raw = _format_cell(row[col_idx]) if col_idx < len(row) else ""
+        if not raw.strip():
+            continue
+
+        frags = _split_by_vocab(raw, options, delimiter, norm_fn)
+        for frag in frags:
+            frag_stripped = frag.strip()
+            if not frag_stripped:
+                continue
+            if frag_stripped.casefold() in norm_opts:
+                continue  # 是已知选项，不是自由填写
+
+            ids: dict[str, str] = {}
+            for c in id_cols:
+                i = c["index"]
+                v = _format_cell(row[i]) if i < len(row) else ""
+                if v.strip():
+                    key = "MLBB ID" if c.get("role") == "mlbbid" else (
+                        c.get("name") or _safe_header(headers, i)
+                    )
+                    if c.get("role") == "mlbbid":
+                        v = _format_mlbb_id(v)
+                    ids[key] = v.strip()
+
+            profile: dict[str, str] = {}
+            for c in profile_cols:
+                i = c["index"]
+                v = _format_cell(row[i]) if i < len(row) else ""
+                if v.strip():
+                    key = c.get("name") or _safe_header(headers, i)
+                    pnorm = _make_normalizer(c.get("value_aliases"))
+                    profile[key] = pnorm(v.strip())
+
+            out.append({"ids": ids, "profile": profile, "text": frag_stripped})
+
+    return out
 
 
 def _collect_open_text(

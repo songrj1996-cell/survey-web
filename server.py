@@ -1627,7 +1627,11 @@ def _build_writer_query(stats_md: str, open_text: dict, plan: dict, headers: lis
         joined = "\n".join(joined_lines)
         if len(joined) > 20000:
             joined = "\n".join(joined_lines[:200]) + f"\n（共 {len(texts)} 条，已截取前 200 条）"
-        open_text_blocks.append(f"### {name}（列 {col_idx}, 共 {len(texts)} 条非空回答）\n{joined}")
+        is_choice_other = col and col.get("role") in ("multi_choice", "single_choice")
+        block_suffix = "（其他选项填写）" if is_choice_other else ""
+        open_text_blocks.append(
+            f"### {name}（列 {col_idx}, 共 {len(texts)} 条）{block_suffix}\n{joined}"
+        )
 
     open_text_md = (
         "<open_text>\n" + "\n\n".join(open_text_blocks) + "\n</open_text>"
