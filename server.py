@@ -983,11 +983,9 @@ def _split_option_cell(value: str, delimiter: str | None = None) -> list[str]:
     delims += ["，", ",", ";", "；", "\n", "\r\n", "|"]
     for d in delims:
         if d and d in text:
-            parts = _split_respecting_parens(text, d)
-            if len(parts) > 1:
-                return parts
-            # paren-aware split yielded only 1 part — fall back to simple split
-            return [p.strip() for p in text.split(d) if p.strip()]
+            # Use paren-aware split; if all delimiters were inside parens,
+            # the whole text is one option — trust that result, do NOT fall back.
+            return _split_respecting_parens(text, d)
     return [text]
 
 
