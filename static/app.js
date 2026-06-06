@@ -69,6 +69,7 @@ const panels   = [1,2,3,4,5].map(n => $(`panel-${n}`));
 // ── 工具 ──
 
 function startStageTimer(el) {
+  if (!el) return () => {};
   const start = Date.now();
   el.textContent = '已用时 0 秒';
   const iv = setInterval(() => {
