@@ -947,6 +947,34 @@ def _norm_option_key(value: str) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip().casefold()
 
 
+def _split_respecting_parens(text: str, delimiter: str) -> list[str]:
+    """Split text by delimiter, ignoring delimiters inside parentheses/brackets."""
+    parts: list[str] = []
+    current: list[str] = []
+    depth = 0
+    dlen = len(delimiter)
+    i = 0
+    while i < len(text):
+        if depth == 0 and text[i:i + dlen] == delimiter:
+            part = "".join(current).strip()
+            if part:
+                parts.append(part)
+            current = []
+            i += dlen
+            continue
+        c = text[i]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth = max(0, depth - 1)
+        current.append(c)
+        i += 1
+    part = "".join(current).strip()
+    if part:
+        parts.append(part)
+    return parts if parts else [text]
+
+
 def _split_option_cell(value: str, delimiter: str | None = None) -> list[str]:
     text = str(value or "").strip()
     if not text:
@@ -955,6 +983,10 @@ def _split_option_cell(value: str, delimiter: str | None = None) -> list[str]:
     delims += ["，", ",", ";", "；", "\n", "\r\n", "|"]
     for d in delims:
         if d and d in text:
+            parts = _split_respecting_parens(text, d)
+            if len(parts) > 1:
+                return parts
+            # paren-aware split yielded only 1 part — fall back to simple split
             return [p.strip() for p in text.split(d) if p.strip()]
     return [text]
 
