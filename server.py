@@ -662,6 +662,7 @@ def save_to_history(session_id: str, sess: dict) -> None:
         "plan": sess.get("plan"),
         "stats_md": sess.get("stats_md"),
         "analyst_conv_id": sess.get("analyst_conv_id", ""),
+        "analyst_app_key": sess.get("analyst_app_key", ""),
         "qa_messages": qa_messages or [],
         "rows_fed": True,  # 历史 QA 跳过投喂 rows（对话已包含上下文）
         **owner,
@@ -2491,6 +2492,7 @@ async def generate_report(session_id: str, request: Request, analysis_mode: str 
             full_report = _inject_disclaimer(full_report)
             sess["report_md"] = full_report
             sess["analyst_conv_id"] = final_conv_id
+            sess["analyst_app_key"] = analyst_key
             sess["rows_fed"] = False
 
             save_to_history(session_id, sess)
@@ -2522,13 +2524,14 @@ async def qa(req: QARequest, request: Request):
     sess = get_session(req.session_id)
     _assign_session_owner(sess, await _current_login(request))
     analyst_conv_id = sess.get("analyst_conv_id", "")
+    qa_api_key = sess.get("analyst_app_key") or DIFY_ANALYST_KEY
     rows = sess.get("rows", [])
     plan = sess.get("plan", {})
     rows_fed = sess.get("rows_fed", False)
 
     if not analyst_conv_id:
         raise HTTPException(status_code=400, detail="请先生成报告")
-    if not DIFY_ANALYST_KEY:
+    if not qa_api_key:
         raise HTTPException(status_code=500, detail="未配置 DIFY_ANALYST_KEY")
 
     async def generate():
@@ -2543,7 +2546,7 @@ async def qa(req: QARequest, request: Request):
             new_conv_id = analyst_conv_id
 
             async for chunk, conv_id in sse_dify_stream(
-                qa_query, req.session_id, analyst_conv_id, DIFY_ANALYST_KEY
+                qa_query, req.session_id, analyst_conv_id, qa_api_key
             ):
                 if chunk:
                     answer_chunks.append(chunk)
@@ -2591,9 +2594,10 @@ async def history_qa(req: HistoryQARequest, request: Request):
         raise HTTPException(status_code=404, detail="历史记录不存在")
 
     analyst_conv_id = entry.get("analyst_conv_id", "")
+    qa_api_key = entry.get("analyst_app_key") or DIFY_ANALYST_KEY
     if not analyst_conv_id:
         raise HTTPException(status_code=400, detail="该历史记录没有可续聊的对话")
-    if not DIFY_ANALYST_KEY:
+    if not qa_api_key:
         raise HTTPException(status_code=500, detail="未配置 DIFY_ANALYST_KEY")
 
     async def generate():
@@ -2601,7 +2605,7 @@ async def history_qa(req: HistoryQARequest, request: Request):
             answer_chunks: list[str] = []
             new_conv_id = analyst_conv_id
             async for chunk, conv_id in sse_dify_stream(
-                req.question, req.history_id, analyst_conv_id, DIFY_ANALYST_KEY
+                req.question, req.history_id, analyst_conv_id, qa_api_key
             ):
                 if chunk:
                     answer_chunks.append(chunk)
