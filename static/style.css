@@ -460,6 +460,17 @@ html, body {
   border-radius: var(--radius-sm); padding: 3px 9px;
   max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
+.col-matrix-rows {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 4px;
+  width: 100%;
+}
+.col-matrix-rows .col-extra-readonly {
+  white-space: normal; overflow: visible; text-overflow: unset; max-width: none;
+  flex-shrink: 0;
+}
+.col-matrix-rows__label {
+  font-size: 11px; color: var(--text-3); white-space: nowrap; flex-shrink: 0;
+}
 
 .option-editor {
   width: 100%;

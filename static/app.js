@@ -478,7 +478,8 @@ function updateExtra(i, role) {
   const bits = [];
 
   if (MATRIX_ROLES.includes(role) && (c.rows || []).length) {
-    bits.push(`<span class="col-extra-readonly">子项：${esc(c.rows.join(' / '))}</span>`);
+    const pills = c.rows.map(r => `<span class="col-extra-readonly">${esc(r)}</span>`).join('');
+    bits.push(`<div class="col-matrix-rows"><span class="col-matrix-rows__label">子项：</span>${pills}</div>`);
   }
 
   if (role === 'multi_choice') {
