@@ -378,15 +378,36 @@ function renderColumnRows(columns) {
   columns.forEach((c, i) => updateExtra(i, c.role));
 }
 
+// 子串匹配：这些词出现在选项任意位置都意味着「其他填写」
+const _OTHER_KWS_SUB = ["lainnya","lain-lain","sebutkan","mohon sebutkan",
+  "others","please specify","please state",
+  "其他","其它","其他请填写","其他说明"];
+// 全词/边界匹配：这些词太短，只在选项末尾（去除末尾标点后）或单独出现时才算
+const _OTHER_KWS_END = ["other","specify","lain","dll","dsb"];
+function isOtherOption(name) {
+  const low = (name || '').trim().toLowerCase();
+  if (_OTHER_KWS_SUB.some(kw => low.includes(kw))) return true;
+  // 去掉末尾标点后检查结尾是否为这些短词
+  const tail = low.replace(/[\s.,;:_\-]+$/, '');
+  return _OTHER_KWS_END.some(kw => tail === kw || tail.endsWith(' ' + kw) || tail.endsWith(',' + kw));
+}
+
 function optionEditorHTML(i, c) {
   const options = c.options || [];
   const aliases = c.value_aliases || {};
-  const aliasGroups = Object.entries(aliases).filter(([canon, values]) =>
-    Array.isArray(values) && values.some(v => String(v).trim() && String(v).trim() !== canon)
-  ).length;
-  const chips = options.slice(0, 6).map(opt => `<span class="option-summary-chip">${esc(opt)}</span>`).join('');
-  const more = options.length > 6 ? `<span class="option-summary-more">+${options.length - 6}</span>` : '';
-  const mergeBadge = aliasGroups ? `<span class="option-merge-badge">已合并 ${aliasGroups} 组</span>` : '';
+  const chips = options.length
+    ? options.map(opt => {
+        const isOther = isOtherOption(opt);
+        const chipCls = 'option-summary-chip' + (isOther ? ' option-chip--other' : '');
+        const aliasVals = Array.isArray(aliases[opt]) && aliases[opt].length
+          ? aliases[opt].filter(v => String(v).trim() && String(v).trim() !== opt)
+          : [];
+        const aliasSub = aliasVals.length
+          ? `<span class="option-alias-sub" title="${esc(aliasVals.join(' / '))}">${esc(aliasVals.join(' / '))}</span>`
+          : '';
+        return `<span class="option-summary-item"><span class="${chipCls}">${esc(opt)}</span>${aliasSub}</span>`;
+      }).join('')
+    : '<span class="option-summary-empty">暂无选项</span>';
   const rows = options.map(opt => `
     <div class="option-edit-row">
       <div class="option-edit-row__main">
@@ -401,8 +422,8 @@ function optionEditorHTML(i, c) {
   return `<div class="option-editor" data-option-editor="${i}">
     <details class="option-editor__details" ${c.low_confidence ? 'open' : ''}>
       <summary class="option-editor__summary">
-        <span class="option-editor__summary-main">${chips || '<span class="option-summary-empty">暂无选项</span>'}${more}</span>
-        <span class="option-editor__summary-actions">${mergeBadge}<span class="option-edit-link">编辑</span></span>
+        <span class="option-editor__summary-main">${chips}</span>
+        <span class="option-editor__summary-actions"><span class="option-edit-link">编辑</span></span>
       </summary>
       <div class="option-editor__body">
         <div class="option-editor__head">

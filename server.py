@@ -1104,6 +1104,9 @@ def _build_column_detect_query(rows: list[list], groups: list[dict]) -> str:
         + "\n\n".join(blocks)
         + "\n</columns>\n\n"
         + "选项边界（严格执行）：options 必须由该列「去重取值」里的真实单元格取值或多选拆分值支撑；不得从题干/表头中抽取选项。若 New Medal 等词只出现在题干里、没有出现在该列取值里，不得写入 options。若多语言取值语义相同，options 请写合并后的中文标准值，并在 value_aliases 中列出支撑它的真实取值。\n\n"
+        + "⚠️ 防止选项内部逗号被误当分隔符：多选题的选项文字本身可能含有逗号（例如印尼语句子 'Saya memeriksa pengumuman resmi, patch note, atau informasi komunitas.' 是一个完整选项）。"
+        + "判断规则：拆分后若某片段是孤立的词或明显不完整的句子（如单独的 'patch note'、'atau informasi komunitas'），说明这个逗号是选项内部标点，不是选项间的分隔符。"
+        + "请以「语义最完整」为原则划定选项边界，避免把一个完整句子拆成多条 options。\n\n"
         + _COLUMN_DETECT_SCHEMA_HINT
     )
 

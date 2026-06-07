@@ -546,16 +546,14 @@ def _cross_tab_scale(
 # 选择题「其他」填写内容抽取
 # ============================================================================
 
-_OTHER_OPTION_KEYWORDS: frozenset[str] = frozenset([
-    # Indonesian
-    "lainnya", "lain-lain", "lain", "sebutkan", "mohon sebutkan",
-    # English
-    "other", "others", "please specify", "please state", "specify",
-    # Chinese
+# 子串匹配：出现在选项任意位置即视为「其他填写」
+_OTHER_KWS_SUB: frozenset[str] = frozenset([
+    "lainnya", "lain-lain", "sebutkan", "mohon sebutkan",
+    "others", "please specify", "please state",
     "其他", "其它", "其他请填写", "其他（请填写）", "其他说明",
-    # Short catch-all suffixes (checked as substring)
-    "dll", "dsb",
 ])
+# 边界匹配：这些词太短，只在末尾（去除标点后）或单独出现时才算
+_OTHER_KWS_END: frozenset[str] = frozenset(["other", "specify", "lain", "dll", "dsb"])
 
 
 def _is_other_option(name: str) -> bool:
@@ -563,9 +561,13 @@ def _is_other_option(name: str) -> bool:
     if not name:
         return False
     low = name.strip().casefold()
-    if low in _OTHER_OPTION_KEYWORDS:
+    if any(kw in low for kw in _OTHER_KWS_SUB):
         return True
-    return any(kw in low for kw in _OTHER_OPTION_KEYWORDS)
+    # 去掉末尾标点再检查
+    import re as _re
+    tail = _re.sub(r"[\s.,;:_()\-]+$", "", low)
+    return any(tail == kw or tail.endswith(" " + kw) or tail.endswith("," + kw)
+               for kw in _OTHER_KWS_END)
 
 
 def _collect_choice_other_texts(

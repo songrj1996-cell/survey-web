@@ -501,8 +501,14 @@ html, body {
   flex-wrap: wrap;
   gap: 5px;
 }
+.option-summary-item {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+}
 .option-summary-chip {
-  max-width: 180px;
+  max-width: 220px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -513,7 +519,21 @@ html, body {
   border-radius: 999px;
   padding: 2px 7px;
 }
-.option-summary-more,
+.option-chip--other {
+  border: 1.5px dashed var(--accent);
+  color: var(--accent);
+  background: rgba(var(--accent-rgb), 0.06);
+}
+.option-alias-sub {
+  font-size: 10px;
+  color: var(--text-3);
+  padding-left: 6px;
+  max-width: 220px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  line-height: 1.3;
+}
 .option-summary-empty {
   font-size: 11px;
   color: var(--text-3);
@@ -523,14 +543,6 @@ html, body {
   align-items: center;
   gap: 8px;
   flex-shrink: 0;
-}
-.option-merge-badge {
-  font-size: 11px;
-  color: var(--cyan);
-  background: rgba(34,211,238,0.1);
-  border: 1px solid rgba(34,211,238,0.25);
-  border-radius: 999px;
-  padding: 2px 7px;
 }
 .option-edit-link {
   font-size: 11px;
