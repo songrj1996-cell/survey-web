@@ -1886,3 +1886,33 @@ html, body {
 }
 
 /* 打印样式已移至 JS 动态新窗口，此处不需要 @media print */
+
+/* 跑数表模式三文件上传 */
+.crosstab-uploader {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 22px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--surface-2);
+}
+.crosstab-file-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.crosstab-file-row__label {
+  font-weight: 600;
+  font-size: 14px;
+  color: var(--text);
+}
+.crosstab-file-row input[type="file"] {
+  padding: 10px;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text-2);
+  font-size: 13px;
+}
+#btn-ct-upload { align-self: flex-start; margin-top: 4px; }

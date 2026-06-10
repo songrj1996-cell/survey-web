@@ -2093,6 +2093,8 @@ $('btn-restart').addEventListener('click', () => {
   // 回到分析类型选择层
   $('analysis-type-picker').style.display = '';
   $('upload-area').style.display = 'none';
+  const ctArea = $('crosstab-upload-area');
+  if (ctArea) ctArea.style.display = 'none';
   goStep(1);
   showToast('已重置，请重新上传文件', 'info');
 });
@@ -2109,6 +2111,52 @@ $('btn-qual-enter').addEventListener('click', () => {
       if (el && content) el.innerHTML = marked.parse(content);
     })
     .catch(() => {});
+});
+
+// ── 定量分析（跑数表模式）：三文件上传 ──
+$('btn-quant-enter').addEventListener('click', () => {
+  $('analysis-type-picker').style.display = 'none';
+  $('crosstab-upload-area').style.display = '';
+});
+
+$('btn-ct-upload').addEventListener('click', async () => {
+  const sf = $('ct-survey').files[0];
+  const df = $('ct-data').files[0];
+  const cf = $('ct-crosstab').files[0];
+  if (!sf || !df || !cf) { showToast('请把问卷、回答数据、跑数表三个文件都选上', 'error'); return; }
+  const MAX = 50 * 1024 * 1024;
+  for (const f of [sf, df, cf]) {
+    if (f.size > MAX) { showToast(`文件 ${f.name} 超过 50MB 上限`, 'error'); return; }
+  }
+  const btn = $('btn-ct-upload');
+  btn.disabled = true;
+  btn.textContent = '正在上传与解析…';
+  const fd = new FormData();
+  fd.append('survey_file', sf);
+  fd.append('data_file', df);
+  fd.append('crosstab_file', cf);
+  try {
+    const resp = await fetch('/api/upload/crosstab', { method: 'POST', body: fd });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || '上传失败');
+    state.sessionId = data.session_id;
+    state.viewMode  = 'session';
+    state.historyId = null;
+    clearPlanInput();
+    state.sessionReport = {
+      reportMd: null, title: '', reportNo: '', qaHtml: '',
+      qaMessages: [], feishuLinkHtml: '', running: false, stream: '',
+    };
+    renderPreview(data);
+    goStep(2);
+    const segInfo = (data.crosstab_segments || []).join('、');
+    showToast(`跑数表解析成功：${data.crosstab_questions} 道题、分段[${segInfo}]；回答 ${data.total_rows} 行`, 'success');
+    loadColumns();
+  } catch (e) {
+    showToast(`上传失败：${e.message}`, 'error');
+    btn.disabled = false;
+    btn.textContent = '开始分析';
+  }
 });
 
 // ── UI 文案初始化 ──

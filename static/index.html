@@ -120,17 +120,37 @@
               <div class="analysis-type-card__enter">进入 →</div>
             </div>
           </div>
-          <div class="analysis-type-card analysis-type-card--disabled">
+          <div class="analysis-type-card" id="btn-quant-enter">
             <div class="analysis-type-card__icon">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
                 <rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 9h6M9 12h6M9 15h4"/>
               </svg>
             </div>
             <div class="analysis-type-card__body">
-              <div class="analysis-type-card__title">定量分析</div>
-              <div class="analysis-type-card__desc">功能开发中</div>
-              <div class="analysis-type-card__badge">即将上线</div>
+              <div class="analysis-type-card__title">定量分析（倍市得跑数表）</div>
+              <div class="analysis-type-card__desc">上传问卷 + 回答数据 + 跑数表，平台直接用跑数表数字、并对主观题聚类，生成报告</div>
+              <div class="analysis-type-card__enter">进入 →</div>
             </div>
+          </div>
+        </div>
+
+        <!-- 跑数表模式上传区（点定量分析后显示） -->
+        <div id="crosstab-upload-area" style="display:none">
+          <div class="crosstab-uploader">
+            <p class="panel__desc">跑数表模式：三个文件均需上传。数字取自跑数表，平台不再自算统计，仅对主观题做聚类。</p>
+            <label class="crosstab-file-row">
+              <span class="crosstab-file-row__label">① 问卷文件</span>
+              <input type="file" id="ct-survey" accept=".csv,.xlsx,.xls" />
+            </label>
+            <label class="crosstab-file-row">
+              <span class="crosstab-file-row__label">② 回答数据（清数结果）</span>
+              <input type="file" id="ct-data" accept=".csv,.xlsx,.xls" />
+            </label>
+            <label class="crosstab-file-row">
+              <span class="crosstab-file-row__label">③ 跑数表（统计结果）</span>
+              <input type="file" id="ct-crosstab" accept=".csv,.xlsx,.xls" />
+            </label>
+            <button class="btn btn--primary" id="btn-ct-upload">开始分析</button>
           </div>
         </div>
 

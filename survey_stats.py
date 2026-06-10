@@ -131,6 +131,29 @@ def compute(
     return "\n".join(md_parts).rstrip() + "\n", open_text
 
 
+def collect_open_text(rows: list[list], plan: dict) -> dict[int, list[dict]]:
+    """只收集开放题原文池（不做任何数值统计）。
+
+    用于「跑数表模式」：数字来自外部跑数表，平台不再自算统计，
+    只需把开放题原文按列收集好（结构与 compute() 返回的 open_text 完全一致），
+    交给大样本聚类引擎处理。这样既复用已有收集逻辑，又避开易报错的数值计算。
+    """
+    if not rows:
+        return {}
+    headers = rows[0]
+    body = rows[1:]
+    profile_cols = [c for c in plan["columns"] if c["role"] == "profile_dim"]
+    mlbb_id_cols = [c for c in plan["columns"] if c["role"] == "mlbbid"]
+    id_cols = [c for c in plan["columns"] if c["role"] == "id"]
+    open_text: dict[int, list[dict]] = {}
+    for c in plan["columns"]:
+        if c["role"] == "open_text":
+            open_text[c["index"]] = _collect_open_text(
+                c["index"], body, headers, mlbb_id_cols + id_cols, profile_cols
+            )
+    return open_text
+
+
 # ============================================================================
 # 画像维度概览
 # ============================================================================
