@@ -183,7 +183,15 @@ function consumeSSE(url, onEvent) {
     es.onmessage = e => {
       try {
         const data = JSON.parse(e.data);
-        onEvent(data);
+        try {
+          onEvent(data);
+        } catch (callbackErr) {
+          // onEvent（如 showPlanCard）渲染时抛的 JS 错不应被吞掉
+          console.error('[SSE] onEvent error:', callbackErr);
+          es.close();
+          reject(callbackErr);
+          return;
+        }
         if (data.type === 'error') { es.close(); reject(new Error(data.message || data.msg || '服务端处理失败')); }
         if ([
           'columns_ready', 'plan_ready', 'report_done', 'qa_done',
@@ -191,7 +199,10 @@ function consumeSSE(url, onEvent) {
         ].includes(data.type)) {
           es.close(); resolve(data);
         }
-      } catch {}
+      } catch (parseErr) {
+        // JSON parse 失败：数据格式异常，记录但不中断流
+        console.warn('[SSE] JSON parse error:', parseErr, e.data?.slice(0, 100));
+      }
     };
     es.onerror = () => { es.close(); reject(new Error('连接中断，请刷新重试')); };
   });
@@ -243,6 +254,15 @@ async function consumeSSEPost(url, body, onEvent) {
       }
     }
   }
+}
+
+// ── 进度状态栏（长耗时阶段显示"最后更新时间 + 当前进度"）──
+function _updateProgressStatus(msg) {
+  const el = $('progress-status-text');
+  if (!el) return;
+  if (!msg) { el.textContent = ''; return; }
+  const t = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  el.textContent = `${t}  ${msg}`;
 }
 
 // ============================================================
@@ -628,6 +648,9 @@ function showPlanCard(plan, headers) {
   $('plan-card').style.display = 'block';
   $('plan-card-content').innerHTML = buildPlanHTML(plan, headers);
   clearPlanInput();
+  // 确保按钮状态与输入框同步（修订后面板可能处于 disabled 残留）
+  $('btn-plan-ok').disabled = false;
+  $('btn-plan-revise').disabled = true;
 }
 
 function buildPlanHTML(plan, headers) {
@@ -761,6 +784,12 @@ async function confirmPlan(text) {
         session_id: state.sessionId,
         user_text: text,
       }, ev => {
+        if (ev.type === 'progress') {
+          // 解析/重试状态——让用户知道后端还在工作
+          const el = $('plan-stream-text');
+          el.textContent = ev.message;
+          _updateProgressStatus(ev.message);
+        }
         if (ev.type === 'chunk') {
           const el = $('plan-stream-text');
           el.textContent += ev.content;
@@ -788,6 +817,11 @@ async function confirmPlan(text) {
     }
   } catch (e) {
     showToast(`操作失败：${e.message}`, 'error');
+    // 修订失败时恢复方案卡片（隐藏 thinking 区，避免用户看到空白）
+    if (state.planData) {
+      $('plan-thinking').style.display = 'none';
+      $('plan-card').style.display = 'block';
+    }
     syncPlanActionButtons();
   }
 }
@@ -823,7 +857,18 @@ async function runStats() {
     let fullReport = '';
 
     await consumeSSE(`/api/report/${state.sessionId}`, ev => {
+      if (ev.type === 'progress') {
+        // 主观题聚类阶段：后端正在处理，前端显示实时进度避免用户以为卡死
+        _updateProgressStatus(ev.message);
+        const el = $('report-stream-content');
+        if (el && !fullReport) {
+          // 正文还空时，把进度显示在流式区，有正文后进度退到状态栏
+          el.textContent = ev.message;
+        }
+      }
       if (ev.type === 'chunk') {
+        // 收到正文后清掉进度占位
+        if (!fullReport) $('report-stream-content').textContent = '';
         fullReport += ev.content;
         state.sessionReport.stream = fullReport;
         if (state.viewMode === 'session') {
@@ -833,6 +878,7 @@ async function runStats() {
         }
       }
       if (ev.type === 'report_done') {
+        _updateProgressStatus('');
         state.sessionReport.running = false;
         state.sessionReport.reportMd = ev.report_md;
         state.sessionReport.title = reportTitleFromMarkdown(ev.report_md);

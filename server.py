@@ -2487,6 +2487,7 @@ async def get_plan(session_id: str, request: Request):
                         conv = cid
                 ctp, err = survey_plan.parse_crosstab_plan("".join(ans_chunks))
                 if not ctp:
+                    yield sse_event({"type": "progress", "message": "方案格式校验中，正在修订输出…"})
                     retry_q = (
                         f"上次输出无法解析: {err}。请只输出一个 JSON 对象"
                         "(含 parts 和 open_questions)，用 ```json``` 围栏，不要解释文字。"
@@ -2543,6 +2544,7 @@ async def get_plan(session_id: str, request: Request):
             plan, err = survey_plan.parse_plan_from_llm(full_answer, len(headers))
 
             if not plan:
+                yield sse_event({"type": "progress", "message": "方案格式校验中，正在修订输出…"})
                 retry_q = (
                     f"上次输出无法解析: {err}。请严格按 JSON schema 重新输出，"
                     "用 ```json ``` 围栏，不要附加解释文字。"
@@ -2672,6 +2674,7 @@ async def confirm_plan(req: PlanConfirmRequest, request: Request):
                 )
                 retry_chunks: list[str] = []
                 retry_conv_id = new_conv_id
+                yield sse_event({"type": "progress", "message": "方案格式校验中，正在修订输出…"})
                 yield sse_event({"type": "chunk", "content": "\n\n正在按严格 JSON 格式重新修订方案...\n"})
                 async for chunk, conv_id in sse_dify_stream(
                     retry_query, req.session_id, "", DIFY_PLANNER_KEY
