@@ -23,7 +23,7 @@
 ## 二、基线继承（来自 c64f229，未改动）
 
 - 定性分析全流程（上传 → AI 识别题型 → 方案 → 写报告 → 追问）
-- 多格式导出：Word / PDF / 飞书云文档 / Markdown
+- 多格式导出：Word / PDF / 飞书文档 / Markdown
 - 数据标注模块
 - 飞书 OAuth 登录（强制）+ 邮箱白名单权限 + 操作审计日志
 
@@ -38,7 +38,7 @@
 | 1 上传 | 跑数表解析、清数解析、问卷转文本、自动建列 | 无 |
 | 2 方案确认 | 解析/校验章节 JSON、渲染卡片 | **读问卷原文 → 章节大纲 + 待确认问题**；修改 → 重出章节 |
 | 3 生成报告 | **stats_md = 跑数表直接渲染（零计算）**、收开放题原文、聚类的计数/占比汇总 | 主观题聚类语义三阶段、**写报告** |
-| 4 报告&追问 | PDF / Word / 飞书导出 | 追问问答 |
+| 4 报告&追问 | PDF / Word / 飞书文档 导出 | 追问问答 |
 
 ---
 
@@ -48,7 +48,7 @@
 1. 上传        三文件（问卷 + 清数 + 跑数表）→ 自动建列，直达方案确认
 2. 方案确认    AI 读问卷原文 → 章节大纲 + 待确认问题（非数据类）→ 人工确认/编辑
 3. 生成报告    跑数表数字 + 主观题聚类 → 大样本 Writer
-4. 报告&追问   展示 + 追问 + 导出 PDF / 飞书
+4. 报告&追问   展示 + 追问 + 导出 PDF / 飞书文档
 ```
 
 定性分析路径（5 步）保持不变，互不影响。
@@ -68,7 +68,8 @@
 ### 5.2 主观题聚类引擎（`dify.py` / `server.py`，从 c3545a4 移植）
 
 - `dify.workflow_run()`：调 Dify Workflow 应用（阻塞模式，带重试）。
-- `_batch_qualitative_analysis()`：四阶段批处理——A 分批提主题 → B 合并去重 → C 回跑分类（含情感）→ D 汇总（主题 + 计数 + 占比 + 正负摘要 + 代表原文）。
+- `_batch_qualitative_analysis()`：四阶段——A 分批提主题 → B 合并去重 → C 回跑分类（含情感）→ D 汇总（主题 + 计数 + 占比 + 正负摘要 + 代表原文）。
+- 每主题代表原文：正/负/中性各最多 2 条，总量最多 6 条；不足 3 条时从 pool 补充，保证 Writer 有足够素材。
 - `_build_large_sample_writer_query()` / `_get_large_sample_writer_requirements()`：大样本 Writer prompt 构造。
 - 4 个 Dify Workflow key：`DIFY_THEME_EXTRACT_KEY`、`DIFY_THEME_MERGE_KEY`、`DIFY_CLASSIFY_KEY`、`DIFY_LARGE_ANALYST_KEY`。
 
@@ -78,13 +79,14 @@
 - **`/api/plan`**：crosstab 分支调 `DIFY_CROSSTAB_PLANNER_KEY`，输入问卷原文 + 可用题目清单 + 开放题清单，输出 `{parts:[{name, scope}], open_questions:[]}`（章节语义化，不绑定列号；只问报告结构类问题）。
 - **`/api/plan/confirm`**：crosstab 分支支持章节大纲修订（保留问卷原文上下文重新出章节）。
 - **`/api/stats`**：crosstab 模式跳过数值计算，`stats_md` 取跑数表渲染，`open_text` 只收开放题原文。
-- **`/api/report`**：crosstab 模式恒定走聚类（不受 ≥500 阈值限制），注入问卷原文作为 Writer 意图上下文。
+- **`/api/report`**：crosstab 模式恒定走聚类（不受 ≥500 阈值限制），注入问卷原文作为 Writer 意图上下文；`analyst_app` 字段记录使用的 Dify 应用，追问和历史导出据此选正确 key。
 
 ### 5.4 辅助函数（`server.py`）
 
 - `_build_crosstab_columns()`：确定性建列，含问卷 Q#→题名映射（`_questionnaire_title_map()`）。
 - `_build_crosstab_planner_query()` / `_build_crosstab_plan_revision_query()`：planner prompt 构造。
 - `_render_crosstab_plan_card()`：章节大纲卡片渲染（name + scope，不显示列号）。
+- `_analyst_key_for_report(obj)`：追问/历史导出时根据 `analyst_app` / `mode` 选正确 Dify key，修复跨应用 conversation 404。
 
 ### 5.5 plan 解析（`survey_plan.py`）
 
@@ -94,21 +96,49 @@
 
 - 新增 `collect_open_text(rows, plan)`：只收开放题原文（带 ids/profile），不跑数值统计。
 
-### 5.7 文件持久化 session（`server.py`，fix）
+### 5.7 文件持久化 session（`server.py`）
 
-- 替换原内存 `sessions = {}` → 每个 session 存为 `data/sessions/<uuid>.json`，`tmp + os.replace` 原子写入，**多 worker 安全，重启不丢 session**（TTL 内）。
-- 所有写 session 的端点（upload / columns / plan / stats / report / QA / title rename）末尾加 `save_session()` 调用。
-- JSON 不支持 int key，`get_session()` 加载时自动恢复 `open_text` 等字段的 int key。
-- 启动时调用 `_sweep_old_sessions()` 清理过期文件（TTL = 2 小时）。
-- annotate_sessions 仍用内存（标注会话生命周期短，不跨请求保活）。
+- 替换原内存 `sessions = {}` → 每个 session 存为 `data/sessions/<uuid>.json`，`tmp + os.replace` 原子写入，**多 worker 安全，重启不丢 session**（TTL = 2 小时）。
+- 所有写 session 的端点末尾加 `save_session()` 调用；`get_session()` 加载时自动恢复 int key。
+- 启动时调用 `_sweep_old_sessions()` 清理过期文件。
+- `save_to_history()` 同步存入 `mode`、`analyst_app` 字段，供历史报告导出判断。
 
-### 5.8 前端（`static/app.js` / `index.html` / `style.css`）
+### 5.8 免责声明按模式分流（`server.py`）
 
-- 启用首页「**定量分析（倍市得跑数表）**」入口（原"即将上线"灰态改为可点击）。
-- 三文件上传区（问卷 / 回答数据 / 跑数表），上传成功后 `state.mode = 'crosstab'`，**直接跳到方案确认（Step 3），跳过题型确认（Step 2）**。
-- 步骤条按模式切换：crosstab 模式显示 4 步（隐藏「数据确认」，步骤重新编号 1-4）；定性模式仍 5 步。
-- 方案卡片按模式精简：crosstab 模式渲染 `name + scope` 语义化章节，隐藏交叉分析区块，保留待确认问题。
-- 重置流程覆盖跑数表上传区的隐藏。
+- `_inject_disclaimer(md, skip_qual=False)`：crosstab 模式只插短句，并主动清除旧定性免责声明；定性模式保留完整两段。
+- `_prep_export_md(md, skip_qual=False)`：透传 `skip_qual`。
+- 所有导出路径（PDF / Word / Markdown / 飞书文档，当前 session + 历史记录）均按 `mode`/`plan.mode` fallback 正确传参。
+
+### 5.9 飞书导出改为飞书文档（`server.py`）
+
+- `_export_to_feishu()` 改调 `feishu_export.create_doc_as_user()`，文档以 OAuth 登录用户身份创建（文档归该用户所有）。
+- 飞书文档导出走 `_prep_export_md()`，会 strip `<!--CORE_START-->` / `<!--CORE_END-->` 标记。
+- 历史报告飞书导出端点同步更新（原"上传历史飞书 PDF" → "导出历史飞书文档"，`type: "doc"`）。
+- `.env` 需要 `FEISHU_SCOPE=drive:file:upload`；已有账号需退出重新登录才能获得新权限。
+
+### 5.10 前端（`static/app.js` / `index.html` / `style.css`）
+
+- 启用首页「**定量分析（倍市得跑数表）**」入口，三文件上传后直达方案确认（Step 3），跳过题型确认（Step 2）。
+- 步骤条按模式：crosstab = 4 步（上传 / 方案确认 / 生成报告 / 报告&追问）；定性 = 5 步。
+- 方案卡片：crosstab 模式渲染 `name + scope` 语义章节，隐藏交叉分析区块，保留待确认问题。
+- 报告流式阶段：progress 事件实时展示聚类进度；用 `marked.parse` 实时渲染，消除 `**` 字面量显示。
+- 报告完成后渲染：`renderMarkdown()` 预处理 `**bold**`，修复 Unicode 序号（①②）+ 中文括号旁加粗不渲染的问题。
+- 方案修订：失败时自动恢复原方案卡片；`showPlanCard` 末尾强制同步按钮状态（防 disabled 残留）。
+- `consumeSSE` 空 catch 改为区分 JSON parse 错和 onEvent 渲染错，渲染错 reject + console.error。
+- 进度状态栏 `#progress-status-text`：长耗时阶段显示"最后更新时间 + 当前步骤"。
+- 按钮/文案同步：「上传飞书 PDF」→「导出飞书文档」；弹窗说明同步更新。
+
+### 5.11 Writer 要求（`server.py` / `_get_large_sample_writer_requirements`）
+
+- 报告结构固定顺序：核心结论 → Part 1 受访者画像（固定）→ 其余 Part → 行动建议。
+- 受访者画像用 Markdown 表格展示，后跟 1-2 句解读。
+- 主观题每观点至少引用 3 条原文，展示原语种 + 中文翻译；若可用原文不足 3 条则展示全部，不编造。
+- **满意度优先原则**：报告中若有满意度/好评率相关数据，必须作为核心结论最靠前的 1-2 条展示。
+
+### 5.12 部署修复（`deploy.sh` / `.gitattributes`）
+
+- 新增 `.gitattributes`，全仓库文本文件统一 LF，`*.sh eol=lf` 防止 Windows 把 `\r` 写入脚本导致 Bash 解析失败。
+- `deploy.sh` 转 LF，`bash -n` 验证通过。
 
 ---
 
@@ -118,13 +148,14 @@
 |------|------|
 | `crosstab_parser.py` | **新增**。跑数表解析 + `render_to_markdown()` + `question_names()` |
 | `dify.py` | 移植 `workflow_run()` |
-| `server.py` | 聚类引擎 3 函数；crosstab 上传/planner/stats/report 分支；文件 session 管理；辅助函数 |
+| `server.py` | 聚类引擎；crosstab 上传/planner/stats/report 分支；文件 session；免责声明分流；导出路径；辅助函数 |
 | `survey_stats.py` | 新增 `collect_open_text()`；`compute` 等原逻辑未改 |
 | `survey_plan.py` | 新增 `parse_crosstab_plan()`（轻校验） |
-| `static/app.js` | 定量分析入口；三文件上传；crosstab 4 步流程；方案卡片精简 |
-| `static/index.html` | 定量分析卡片；三文件上传区；步骤条 |
-| `static/style.css` | 三文件上传 UI 样式；章节(name+scope)样式 |
-| `.env.example` | 补 5 个 Dify key 说明（4 个聚类 + 1 个 crosstab planner） |
+| `static/app.js` | 定量分析入口；4 步流程；方案卡片；流式渲染；markdown bold 预处理；UX 修复 |
+| `static/index.html` | 定量分析卡片；三文件上传区；步骤条；进度状态栏 |
+| `static/style.css` | 三文件上传 UI；章节样式；进度状态栏样式 |
+| `.env.example` | 5 个 Dify key + `FEISHU_SCOPE=drive:file:upload` 说明 |
+| `.gitattributes` | **新增**。全仓库 LF 强制，防 CRLF 导致 Bash 报错 |
 
 ---
 
@@ -135,7 +166,15 @@
 | `c64f229` | 基线（6/3 云上部署版） |
 | `50de302` | Phase 1：跑数表解析器 + 聚类引擎移植 + crosstab 上传/报告接入 + 前端入口 |
 | `86b8e4e` | fix：文件持久化 session，解决多 worker 跨进程 404 |
-| _(未提交)_ | Phase 2：简化 4 步流程（crosstab planner + 自动建列 + 步骤条 + 方案卡片精简） |
+| `978d32d` | Phase 2：简化 4 步流程（crosstab planner + 自动建列 + 步骤条 + 方案卡片精简）+ CRLF fix + DEV_PROGRESS |
+| `4c0a5be` | fix：6 条 UX 修复（progress 展示/方案卡恢复/catch 改进/重试状态/按钮/时间戳） |
+| `e57953d` | feat：报告内容增强（核心结论/画像表格/原文翻译）+ 飞书文档导出 + 免责声明简化 |
+| `e0f2b19` | fix：Codex review ①②③⑤⑥（历史飞书/按钮文案/quotes 补足/免责分流/feishu _prep_export_md） |
+| `4cb563a` | fix：所有导出路径透传 skip_qual + 旧历史 mode fallback + prompt 措辞 |
+| `4c0a5be` | fix：6 条 UX 修复 |
+| `89a6a36` | fix：`renderMarkdown` 预处理 `**bold**`，修复 Unicode 序号旁加粗不渲染 |
+| `5ea1086` | fix：流式报告改用 `marked.parse` 实时渲染 |
+| `fb19f99` | feat：Writer 要求固定画像为 Part 1 + 满意度数据优先进核心结论 |
 
 ---
 
@@ -149,7 +188,7 @@ C:\Users\admin\Desktop\survey-web\.venv\Scripts\python.exe server.py   # 端口 
 
 **ngrok（固定域名）：**
 ```
-C:\Users\admin\.antigravity\ngrok.exe http --url=passing-jersey-reggae.ngrok-free.dev 8000
+C:\Users\admin\.antigravity\ngrok.exe http --url=passing-jersey-reggae.ngrok-free.dev <端口>
 ```
 
 **所需 `.env` 配置：**
@@ -159,12 +198,15 @@ C:\Users\admin\.antigravity\ngrok.exe http --url=passing-jersey-reggae.ngrok-fre
 | `DIFY_PLANNER_KEY` | 定性分析方案（原有） |
 | `DIFY_ANALYST_KEY` | 定性分析报告写手（原有） |
 | `DIFY_COLUMN_KEY` | 题型识别（原有） |
-| `DIFY_CROSSTAB_PLANNER_KEY` | **跑数表模式**章节大纲策划（新建 Dify chat 应用，system prompt 见下） |
+| `DIFY_CROSSTAB_PLANNER_KEY` | **跑数表模式**章节大纲策划（新建 Dify Chat 应用，system prompt 见下） |
 | `DIFY_THEME_EXTRACT_KEY` | 主观题聚类 - 主题提取（Workflow） |
 | `DIFY_THEME_MERGE_KEY` | 主观题聚类 - 主题合并（Workflow） |
 | `DIFY_CLASSIFY_KEY` | 主观题聚类 - 回复分类（Workflow） |
 | `DIFY_LARGE_ANALYST_KEY` | 报告写手（大样本/跑数表版） |
-| 飞书配置 | OAuth 登录、白名单 |
+| `FEISHU_SCOPE` | 必须包含 `drive:file:upload`（飞书文档导出权限） |
+| 飞书其他配置 | OAuth 登录、白名单 |
+
+> **注意**：`.env` 修改 `FEISHU_SCOPE` 后，已登录用户需退出飞书重新登录，才能获得包含 drive 权限的新 token。
 
 ---
 
@@ -192,30 +234,28 @@ C:\Users\admin\.antigravity\ngrok.exe http --url=passing-jersey-reggae.ngrok-fre
 - 只输出一个 JSON 对象，用 ```json``` 围栏包裹，无任何解释文字。
 
 【输出格式】
-```json
 {
   "parts": [{"name": "章节名", "scope": "本章覆盖的题目/主题"}],
   "open_questions": ["我计划……，请确认是否这样组织？"]
 }
-```
 ```
 
 ---
 
 ## 十、验证状态
 
-**已验证（代码层）：**
-- 跑数表解析：手感（8段）+ 卡蒂塔（6段）两版，分段/基数/占比/均分/矩阵拆分均正确
+**已验证（含真实 Dify 联调）：**
+- 跑数表解析：手感（8段）+ 卡蒂塔（6段）两版，分段/基数/占比/均分/矩阵均正确
 - `collect_open_text`：手感清数 5 个开放题列正确收集（Q8=187、Q10=431）
-- server 干净导入、路由注册、文件 session 读写
-- `POST /api/upload/crosstab` 真实 HTTP 联调通过（三文件 → session + 解析全对）
-- 文件 session：多次写/读往返正确（int key 恢复、atomic write）
+- 文件 session 读写、多 worker 路由正常（不再随机 404）
+- `POST /api/upload/crosstab` 真实 HTTP 联调通过
+- 全链路（上传 → 方案确认 → 生成报告）已真实跑通，报告质量基本符合预期
+- 报告展示：加粗正常渲染（含 Unicode 序号场景）
 
-**待全链路验证（需配齐 Dify key）：**
-- 上传 → 方案确认（AI 读问卷出章节大纲）→ 修改意见 → 确认
-- 生成报告：数字与跑数表一致、主观题主题 + 代表原文质量
-- 与参考 PDF `【用研一部】MLBB 测服手感优化调研小结 202604.pdf` 对照输出风格
-- 追问 + 导出 PDF / 飞书
+**已知遗留问题（待后续跟进）：**
+- 追问 Dify 404：可能发生于服务重启前的旧 session（新生成的报告应已修复，需持续观察）
+- 飞书文档导出需先退出重新登录一次以获得 drive scope
+- 数据表格展示：仅 markdown 表格，暂无数据条/颜色分组（评估后决定是否做）
 
 ---
 
@@ -223,11 +263,11 @@ C:\Users\admin\.antigravity\ngrok.exe http --url=passing-jersey-reggae.ngrok-fre
 
 | # | 说明 |
 |---|------|
-| 1 | 卡蒂塔旧模板（含绝对值）解析时，总计基数取百分比列导致显示为 1。非当前生产模板，仅回归用，可接受。 |
-| 2 | 主观题 profile 取的是清数里的码值（如「2」），非人类可读标签。后续可加 value_aliases 映射。 |
-| 3 | annotate_sessions 仍为内存。标注会话生命周期短，不跨 worker 保活，暂不影响使用。 |
-| 4 | 报告生成会真实调用 4 个 Dify workflow，主力主观题分批，耗时偏长（数分钟），属正常。 |
-| 5 | Phase 2 的前端 / survey_plan / crosstab_parser 改动**尚未提交**（见 git status）。 |
+| 1 | 卡蒂塔旧模板（含绝对值）解析时总计基数显示为 1。非当前生产模板，仅回归用，可接受。 |
+| 2 | 主观题 profile 取的是清数里的码值（如「2」），非可读标签。后续可加 value_aliases 映射。 |
+| 3 | annotate_sessions 仍为内存（标注会话生命周期短，不跨 worker 保活，暂不影响使用）。 |
+| 4 | 报告生成调用 4 个 Dify workflow，主力主观题分批，耗时数分钟，属正常。 |
+| 5 | 数据表格为纯 markdown，无数据条/颜色分组。实现方案已评估（中等难度），待需求确认后实施。 |
 
 ---
 
