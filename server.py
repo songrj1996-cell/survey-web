@@ -180,26 +180,45 @@ DEFAULT_WRITER_REQUIREMENTS = """\
 
 # 报告免责声明（确定性插入到标题下方，不依赖 LLM）
 REPORT_DISCLAIMER = "> 该报告使用智能调研分析工具产出，如有疑问，请联系开发者@宋润佳(Nancy)"
-QUALITATIVE_DISCLAIMER = ""  # 旧定性免责声明已废弃，保留变量避免引用报错
+# 定性模式完整免责声明（倍市得/crosstab 模式不插此段，用 skip_qual=True 跳过）
+QUALITATIVE_DISCLAIMER = "> 该调研为定性调研，报告中所有涉及打分、统计的数据仅作为参考，不具备定量意义，也无法与用研的满意度定量评分对比，同时不适用于定量分数的评价体系。请阅读者重点关注玩家的主观反馈内容。"
 # 核心结论包裹标记（writer 按要求输出，飞书导出时据此定位转高亮块）
 CORE_START = "<!--CORE_START-->"
 CORE_END = "<!--CORE_END-->"
 
 
-def _inject_disclaimer(md: str) -> str:
-    """在第一行 `# 标题` 之后插入免责声明引用行；幂等；无 H1 则插到最前。"""
+def _inject_disclaimer(md: str, skip_qual: bool = False) -> str:
+    """在第一行 `# 标题` 之后插入免责声明引用行；幂等；无 H1 则插到最前。
+
+    skip_qual=True（倍市得/crosstab 模式）：
+      - 只插短的 REPORT_DISCLAIMER
+      - 主动清除报告里若有的旧定性免责声明（历史报告兼容）
+    skip_qual=False（定性模式，默认）：
+      - 同时插 REPORT_DISCLAIMER + QUALITATIVE_DISCLAIMER
+    """
     if not md:
         return md
+
+    # crosstab 模式：主动清除旧定性免责声明（兼容历史报告）
+    if skip_qual and QUALITATIVE_DISCLAIMER in md:
+        md = md.replace("\n" + QUALITATIVE_DISCLAIMER, "").replace(QUALITATIVE_DISCLAIMER + "\n", "")
+
     has_report = REPORT_DISCLAIMER in md
     has_qual = QUALITATIVE_DISCLAIMER in md
-    if has_report and has_qual:
+
+    # 已经齐备就不再插
+    if has_report and (skip_qual or has_qual):
         return md
+
     lines = md.split("\n")
-    if has_report and not has_qual:
+
+    # 已有 REPORT_DISCLAIMER 但缺 QUALITATIVE_DISCLAIMER（仅定性模式可能触发）
+    if has_report and not has_qual and not skip_qual:
         for i, ln in enumerate(lines):
             if ln.strip() == REPORT_DISCLAIMER:
                 lines.insert(i + 1, QUALITATIVE_DISCLAIMER)
                 return "\n".join(lines)
+
     for i, ln in enumerate(lines):
         if ln.startswith("# ") and not ln.startswith("## "):
             lines.insert(i + 1, "")
@@ -207,14 +226,15 @@ def _inject_disclaimer(md: str) -> str:
             if not has_report:
                 lines.insert(insert_at, REPORT_DISCLAIMER)
                 insert_at += 1
-            if not has_qual:
+            if not has_qual and not skip_qual:
                 lines.insert(insert_at, QUALITATIVE_DISCLAIMER)
             return "\n".join(lines)
+
     # 没有 H1：插到最前
     prefix = []
     if not has_report:
         prefix.append(REPORT_DISCLAIMER)
-    if not has_qual:
+    if not has_qual and not skip_qual:
         prefix.append(QUALITATIVE_DISCLAIMER)
     return "\n".join(prefix) + "\n\n" + md
 
@@ -226,9 +246,9 @@ def _strip_core_markers(md: str) -> str:
     return "\n".join(ln for ln in md.split("\n") if ln.strip() not in (CORE_START, CORE_END))
 
 
-def _prep_export_md(md: str) -> str:
+def _prep_export_md(md: str, skip_qual: bool = False) -> str:
     """通用导出前处理：补免责声明（幂等）+ 去掉核心结论标记。"""
-    return _strip_core_markers(_inject_disclaimer(md))
+    return _strip_core_markers(_inject_disclaimer(md, skip_qual=skip_qual))
 
 DEFAULT_PLANNER_EXTRA = """\
 请按 JSON schema 输出列分类、part 划分、交叉分析建议、open_questions。
@@ -704,6 +724,7 @@ def save_to_history(session_id: str, sess: dict) -> None:
         "analyst_conv_id": sess.get("analyst_conv_id", ""),
         "qa_messages": qa_messages or [],
         "rows_fed": True,  # 历史 QA 跳过投喂 rows（对话已包含上下文）
+        "mode": sess.get("mode", ""),  # 保存模式，飞书导出时据此判断 skip_qual
         **owner,
     }
     history = [h for h in history if h["id"] != session_id]
@@ -1517,10 +1538,12 @@ async def _batch_qualitative_analysis(
             pos_q = [txt for sent, txt in pool if sent == "positive"][:2]
             neg_q = [txt for sent, txt in pool if sent == "negative"][:2]
             neu_q = [txt for sent, txt in pool if sent not in ("positive", "negative")][:2]
-            # 每主题至少 3 条原文：正面 + 负面各最多 2 条，不足时用中性/混合补齐
             quotes = (pos_q + neg_q + neu_q)[:6]
-            if not quotes:
-                quotes = [txt for _, txt in pool[:3]]
+            # 不足 3 条时从 pool 中补充未使用的原文，保证 Writer 有足够素材
+            if len(quotes) < 3:
+                used = set(quotes)
+                extras = [txt for _, txt in pool if txt not in used]
+                quotes = quotes + extras[:max(0, 3 - len(quotes))]
 
             entry = {
                 "id": tid,
@@ -2832,7 +2855,7 @@ async def generate_report(session_id: str, request: Request):
             if drifted:
                 print(f"[stats] WARN drifted numbers: {drifted[:20]}")
 
-            full_report = _inject_disclaimer(full_report)
+            full_report = _inject_disclaimer(full_report, skip_qual=(sess.get("mode") == "crosstab"))
             sess["report_md"] = full_report
             sess["analyst_conv_id"] = final_conv_id
             sess["rows_fed"] = False
@@ -3771,9 +3794,9 @@ async def admin_delete_user(email: str, request: Request):
     return {"ok": True}
 
 
-async def _export_to_feishu(report_md: str, login: dict) -> str:
+async def _export_to_feishu(report_md: str, login: dict, skip_qual: bool = False) -> str:
     """将报告上传为飞书文档（docx），文档归登录用户所有，并通过机器人发消息通知。"""
-    full = _inject_disclaimer(report_md)
+    full = _prep_export_md(report_md, skip_qual=skip_qual)  # 补免责声明 + 去掉 CORE_START/END 标记
     title_m = re.search(r"^#\s+(.+?)$", full, re.MULTILINE)
     title = title_m.group(1).strip() if title_m else "调研报告"
     open_id = login.get("open_id", "")
@@ -3802,7 +3825,7 @@ async def export_feishu(session_id: str, request: Request):
     if not report_md:
         raise HTTPException(status_code=400, detail="还没有生成报告")
     try:
-        url = await _export_to_feishu(report_md, login)
+        url = await _export_to_feishu(report_md, login, skip_qual=(sess.get("mode") == "crosstab"))
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"创建飞书文档失败：{e}")
     await audit_log(request, "report", "导出飞书文档", f"会话：{session_id}", metadata={"session_id": session_id})
@@ -3821,11 +3844,14 @@ async def export_feishu_history(history_id: str, request: Request):
     if not entry:
         raise HTTPException(status_code=404, detail="历史记录不存在")
     try:
-        url = await _export_to_feishu(entry.get("report_md", ""), login)
+        url = await _export_to_feishu(
+            entry.get("report_md", ""), login,
+            skip_qual=(entry.get("mode") == "crosstab"),
+        )
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"上传飞书 PDF 失败：{e}")
-    await audit_log(request, "report", "上传历史飞书 PDF", f"报告：{entry.get('title', history_id)}", metadata={"history_id": history_id})
-    return {"url": url, "type": "pdf"}
+        raise HTTPException(status_code=502, detail=f"创建飞书文档失败：{e}")
+    await audit_log(request, "report", "导出历史飞书文档", f"报告：{entry.get('title', history_id)}", metadata={"history_id": history_id})
+    return {"url": url, "type": "doc"}
 
 
 # ── Prompts 管理 ─────────────────────────────────────
