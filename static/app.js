@@ -873,7 +873,8 @@ async function runStats() {
         state.sessionReport.stream = fullReport;
         if (state.viewMode === 'session') {
           const el = $('report-stream-content');
-          el.textContent = fullReport;
+          // 实时用 marked 渲染，避免 ** 等 markdown 符号显示为字面量
+          el.innerHTML = renderMarkdown(fullReport);
           el.scrollTop = el.scrollHeight;
         }
       }
