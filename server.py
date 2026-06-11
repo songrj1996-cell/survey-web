@@ -1665,6 +1665,7 @@ def _get_large_sample_writer_requirements() -> str:
   > "Modelnya kurang dipoles."（模型精致度不足。）
   > "模型感觉太老了，需要 revamp。"
 - 引用的原文要能支撑该主题的核心论断，优先选择信息量最丰富的
+- 若某主题可用原文不足 3 条，则展示全部可用原文，不要编造或重复引用
 
 五、语言风格
 - 简洁直接，去掉冗长铺垫和过渡句
@@ -3151,8 +3152,8 @@ def _wrap_report_highlights(html_text: str) -> str:
     return paragraph_pat.sub(r'<div class="core-highlight-box">\1</div>', html_text)
 
 
-def report_markdown_to_pdf(md_text: str) -> bytes:
-    md_text = _inject_disclaimer(md_text or "")
+def report_markdown_to_pdf(md_text: str, skip_qual: bool = False) -> bytes:
+    md_text = _inject_disclaimer(md_text or "", skip_qual=skip_qual)
     body = markdown_lib.markdown(
         md_text,
         extensions=["extra", "sane_lists", "nl2br"],
@@ -3374,7 +3375,8 @@ async def export_word(session_id: str, request: Request):
     if not report_md:
         raise HTTPException(status_code=400, detail="还没有生成报告")
 
-    report_md = _prep_export_md(report_md)
+    skip_qual = sess.get("mode") == "crosstab"
+    report_md = _prep_export_md(report_md, skip_qual=skip_qual)
     title_m = re.search(r"^#\s+(.+?)$", report_md, re.MULTILINE)
     title = title_m.group(1).strip() if title_m else "调研报告"
     safe = re.sub(r'[\\/:*?"<>|]', "_", title)
@@ -3396,7 +3398,8 @@ async def export_markdown(session_id: str, request: Request):
     if not report_md:
         raise HTTPException(status_code=400, detail="还没有生成报告")
 
-    report_md = _prep_export_md(report_md)
+    skip_qual = sess.get("mode") == "crosstab"
+    report_md = _prep_export_md(report_md, skip_qual=skip_qual)
     title_m = re.search(r"^#\s+(.+?)$", report_md, re.MULTILINE)
     title = title_m.group(1).strip() if title_m else "调研报告"
     safe = re.sub(r'[\\/:*?"<>|]', "_", title)
@@ -3416,7 +3419,8 @@ async def export_pdf(session_id: str, request: Request):
     safe = re.sub(r'[\\/:*?"<>|]', "_", title)
 
     loop = asyncio.get_event_loop()
-    pdf_bytes = await loop.run_in_executor(None, report_markdown_to_pdf, report_md)
+    skip_qual = sess.get("mode") == "crosstab"
+    pdf_bytes = await loop.run_in_executor(None, report_markdown_to_pdf, report_md, skip_qual)
     await audit_log(request, "report", "下载 PDF", f"报告：{title}", metadata={"session_id": session_id})
     return _make_download_response(pdf_bytes, "application/pdf", f"{safe}.pdf")
 
@@ -3428,7 +3432,8 @@ async def export_word_history(history_id: str, request: Request):
     entry = _find_history_for_login(history, history_id, login)
     if not entry:
         raise HTTPException(status_code=404, detail="历史记录不存在")
-    report_md = _prep_export_md(entry.get("report_md", ""))
+    entry_mode = entry.get("mode") or entry.get("plan", {}).get("mode", "")
+    report_md = _prep_export_md(entry.get("report_md", ""), skip_qual=(entry_mode == "crosstab"))
     safe = re.sub(r'[\\/:*?"<>|]', "_", entry.get("title", "调研报告"))
     loop = asyncio.get_event_loop()
     docx_bytes = await loop.run_in_executor(None, markdown_to_docx, report_md)
@@ -3450,9 +3455,12 @@ async def export_pdf_history(history_id: str, request: Request):
     report_md = entry.get("report_md", "")
     if not report_md:
         raise HTTPException(status_code=400, detail="该历史记录没有报告内容")
+    entry_mode = entry.get("mode") or entry.get("plan", {}).get("mode", "")
     safe = re.sub(r'[\\/:*?"<>|]', "_", entry.get("title", "调研报告"))
     loop = asyncio.get_event_loop()
-    pdf_bytes = await loop.run_in_executor(None, report_markdown_to_pdf, report_md)
+    pdf_bytes = await loop.run_in_executor(
+        None, report_markdown_to_pdf, report_md, entry_mode == "crosstab"
+    )
     await audit_log(request, "report", "下载历史 PDF", f"报告：{entry.get('title', history_id)}", metadata={"history_id": history_id})
     return _make_download_response(pdf_bytes, "application/pdf", f"{safe}.pdf")
 
@@ -3844,9 +3852,10 @@ async def export_feishu_history(history_id: str, request: Request):
     if not entry:
         raise HTTPException(status_code=404, detail="历史记录不存在")
     try:
+        entry_mode = entry.get("mode") or entry.get("plan", {}).get("mode", "")
         url = await _export_to_feishu(
             entry.get("report_md", ""), login,
-            skip_qual=(entry.get("mode") == "crosstab"),
+            skip_qual=(entry_mode == "crosstab"),
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"创建飞书文档失败：{e}")
