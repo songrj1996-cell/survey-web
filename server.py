@@ -722,6 +722,7 @@ def save_to_history(session_id: str, sess: dict) -> None:
         "plan": sess.get("plan"),
         "stats_md": sess.get("stats_md"),
         "analyst_conv_id": sess.get("analyst_conv_id", ""),
+        "analyst_app": sess.get("analyst_app", ""),
         "qa_messages": qa_messages or [],
         "rows_fed": True,  # 历史 QA 跳过投喂 rows（对话已包含上下文）
         "mode": sess.get("mode", ""),  # 保存模式，飞书导出时据此判断 skip_qual
@@ -1642,22 +1643,22 @@ def _build_large_sample_writer_query(
 
 
 def _get_large_sample_writer_requirements() -> str:
-    return """一、报告结构（严格按此顺序）
+    return """一、报告结构（严格按此顺序，不得调换）
 1. **## 核心结论**（必须是第一个二级章节）
    - 列出整份报告中最重要的 5-8 条发现，每条一行，格式：「**结论标题**：具体说明（含数字）」
    - 覆盖所有 Part 的关键洞察，让读者读完此节即可掌握全部重点
-2. 按方案中的 Part 顺序逐章展开
-3. **## 行动建议**（最后一节，3-5 条，每条必须有对应数据依据）
+   - **满意度优先原则**：若报告中存在任何与满意度评分/评价相关的数据（如好评率、满意度评分、认可度等），必须将其作为核心结论中最靠前的 1-2 条展示，且须包含具体数字
+2. **## Part 1 受访者画像**（固定为第一个 Part，紧接核心结论之后）
+   - 画像分布数据用 Markdown 表格呈现（列：维度 / 选项 / 人数占比），不要纯文字罗列
+   - 表格之后用 1-2 句话解读画像特征
+3. 其余 Part 按方案顺序逐章展开
+4. **## 行动建议**（最后一节，3-5 条，每条必须有对应数据依据）
 
 二、结论驱动
 - 以"多少人持有什么观点"为核心叙事框架
 - 每个结论必须附具体数字（人数或占比），禁止使用"部分用户""少数玩家"等模糊表述
 
-三、受访者画像展示
-- 画像分布数据用 Markdown 表格呈现（列：维度 / 选项 / 人数占比），不要纯文字罗列
-- 表格之后用 1-2 句话解读画像特征
-
-四、主观题原文展示（关键）
+三、主观题原文展示（关键）
 - 每个主题/观点至少引用 3 条代表性玩家原文
 - 展示格式：先展示原始语言原文（用引号括起），下方紧跟中文翻译（若原文已是中文则免翻译）
   示例：
@@ -1667,7 +1668,7 @@ def _get_large_sample_writer_requirements() -> str:
 - 引用的原文要能支撑该主题的核心论断，优先选择信息量最丰富的
 - 若某主题可用原文不足 3 条，则展示全部可用原文，不要编造或重复引用
 
-五、语言风格
+四、语言风格
 - 简洁直接，去掉冗长铺垫和过渡句
 - 报告语言为中文；玩家原文保留原语种并附中文翻译"""
 
@@ -2859,6 +2860,7 @@ async def generate_report(session_id: str, request: Request):
             full_report = _inject_disclaimer(full_report, skip_qual=(sess.get("mode") == "crosstab"))
             sess["report_md"] = full_report
             sess["analyst_conv_id"] = final_conv_id
+            sess["analyst_app"] = "large" if use_large_mode else "standard"
             sess["rows_fed"] = False
 
             save_session(session_id, sess)
@@ -2886,6 +2888,15 @@ class QARequest(BaseModel):
     question: str
 
 
+def _analyst_key_for_report(obj: dict) -> tuple[str, str]:
+    """Return the Dify key that owns this report conversation."""
+    analyst_app = obj.get("analyst_app") or ""
+    mode = obj.get("mode") or obj.get("plan", {}).get("mode", "")
+    if analyst_app == "large" or mode == "crosstab":
+        return DIFY_LARGE_ANALYST_KEY, "DIFY_LARGE_ANALYST_KEY"
+    return DIFY_ANALYST_KEY, "DIFY_ANALYST_KEY"
+
+
 @app.post("/api/qa")
 async def qa(req: QARequest, request: Request):
     sess = get_session(req.session_id)
@@ -2897,8 +2908,9 @@ async def qa(req: QARequest, request: Request):
 
     if not analyst_conv_id:
         raise HTTPException(status_code=400, detail="请先生成报告")
-    if not DIFY_ANALYST_KEY:
-        raise HTTPException(status_code=500, detail="未配置 DIFY_ANALYST_KEY")
+    analyst_key, analyst_key_name = _analyst_key_for_report(sess)
+    if not analyst_key:
+        raise HTTPException(status_code=500, detail=f"未配置 {analyst_key_name}")
 
     async def generate():
         try:
@@ -2912,7 +2924,7 @@ async def qa(req: QARequest, request: Request):
             new_conv_id = analyst_conv_id
 
             async for chunk, conv_id in sse_dify_stream(
-                qa_query, req.session_id, analyst_conv_id, DIFY_ANALYST_KEY
+                qa_query, req.session_id, analyst_conv_id, analyst_key
             ):
                 if chunk:
                     answer_chunks.append(chunk)
@@ -2922,6 +2934,7 @@ async def qa(req: QARequest, request: Request):
 
             answer_text = "".join(answer_chunks)
             sess["analyst_conv_id"] = new_conv_id or analyst_conv_id
+            sess["analyst_app"] = "large" if analyst_key_name == "DIFY_LARGE_ANALYST_KEY" else "standard"
             sess["rows_fed"] = True
             sess.setdefault("qa_messages", []).extend([
                 {"role": "user", "content": req.question, "ts": datetime.now().isoformat()},
@@ -2963,15 +2976,16 @@ async def history_qa(req: HistoryQARequest, request: Request):
     analyst_conv_id = entry.get("analyst_conv_id", "")
     if not analyst_conv_id:
         raise HTTPException(status_code=400, detail="该历史记录没有可续聊的对话")
-    if not DIFY_ANALYST_KEY:
-        raise HTTPException(status_code=500, detail="未配置 DIFY_ANALYST_KEY")
+    analyst_key, analyst_key_name = _analyst_key_for_report(entry)
+    if not analyst_key:
+        raise HTTPException(status_code=500, detail=f"未配置 {analyst_key_name}")
 
     async def generate():
         try:
             answer_chunks: list[str] = []
             new_conv_id = analyst_conv_id
             async for chunk, conv_id in sse_dify_stream(
-                req.question, req.history_id, analyst_conv_id, DIFY_ANALYST_KEY
+                req.question, req.history_id, analyst_conv_id, analyst_key
             ):
                 if chunk:
                     answer_chunks.append(chunk)
@@ -2984,6 +2998,7 @@ async def history_qa(req: HistoryQARequest, request: Request):
             for h in history:
                 if h["id"] == req.history_id:
                     h["analyst_conv_id"] = new_conv_id or analyst_conv_id
+                    h["analyst_app"] = "large" if analyst_key_name == "DIFY_LARGE_ANALYST_KEY" else "standard"
                     h.setdefault("qa_messages", []).extend([
                         {"role": "user", "content": req.question, "ts": datetime.now().isoformat()},
                         {"role": "ai", "content": answer_text, "ts": datetime.now().isoformat()},
@@ -3821,6 +3836,19 @@ async def _export_to_feishu(report_md: str, login: dict, skip_qual: bool = False
     return url
 
 
+def _feishu_export_error(e: Exception) -> HTTPException:
+    msg = str(e)
+    if "99991679" in msg or "drive:file:upload" in msg or "Unauthorized" in msg:
+        return HTTPException(
+            status_code=403,
+            detail=(
+                "飞书授权缺少云文档上传权限。请点击左下角飞书账号退出登录，"
+                "然后重新登录授权后再导出。"
+            ),
+        )
+    return HTTPException(status_code=502, detail=f"创建飞书文档失败：{e}")
+
+
 @app.post("/api/export/feishu/{session_id}")
 async def export_feishu(session_id: str, request: Request):
     if not feishu_export.is_configured():
@@ -3835,7 +3863,7 @@ async def export_feishu(session_id: str, request: Request):
     try:
         url = await _export_to_feishu(report_md, login, skip_qual=(sess.get("mode") == "crosstab"))
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"创建飞书文档失败：{e}")
+        raise _feishu_export_error(e)
     await audit_log(request, "report", "导出飞书文档", f"会话：{session_id}", metadata={"session_id": session_id})
     return {"url": url, "type": "doc"}
 
@@ -3858,7 +3886,7 @@ async def export_feishu_history(history_id: str, request: Request):
             skip_qual=(entry_mode == "crosstab"),
         )
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"创建飞书文档失败：{e}")
+        raise _feishu_export_error(e)
     await audit_log(request, "report", "导出历史飞书文档", f"报告：{entry.get('title', history_id)}", metadata={"history_id": history_id})
     return {"url": url, "type": "doc"}
 
