@@ -180,7 +180,7 @@ DEFAULT_WRITER_REQUIREMENTS = """\
 
 # 报告免责声明（确定性插入到标题下方，不依赖 LLM）
 REPORT_DISCLAIMER = "> 该报告使用智能调研分析工具产出，如有疑问，请联系开发者@宋润佳(Nancy)"
-QUALITATIVE_DISCLAIMER = "> 该调研为定性调研，报告中所有涉及打分、统计的数据仅作为参考，不具备定量意义，也无法与用研的满意度定量评分对比，同时不适用于定量分数的评价体系。请阅读者重点关注玩家的主观反馈内容。"
+QUALITATIVE_DISCLAIMER = ""  # 旧定性免责声明已废弃，保留变量避免引用报错
 # 核心结论包裹标记（writer 按要求输出，飞书导出时据此定位转高亮块）
 CORE_START = "<!--CORE_START-->"
 CORE_END = "<!--CORE_END-->"
@@ -1516,7 +1516,11 @@ async def _batch_qualitative_analysis(
             pool = quotes_pool.get(tid, [])
             pos_q = [txt for sent, txt in pool if sent == "positive"][:2]
             neg_q = [txt for sent, txt in pool if sent == "negative"][:2]
-            quotes = pos_q[:1] + neg_q[:1] or [txt for _, txt in pool[:2]]
+            neu_q = [txt for sent, txt in pool if sent not in ("positive", "negative")][:2]
+            # 每主题至少 3 条原文：正面 + 负面各最多 2 条，不足时用中性/混合补齐
+            quotes = (pos_q + neg_q + neu_q)[:6]
+            if not quotes:
+                quotes = [txt for _, txt in pool[:3]]
 
             entry = {
                 "id": tid,
@@ -1585,8 +1589,9 @@ def _build_large_sample_writer_query(
             if t["negative_summary"] or t["negative_count"]:
                 lines.append(f"- 负面（{t['negative_count']:,} / {t['negative_pct']}%）：{t['negative_summary']}")
             if t["quotes"]:
-                quotes_str = " / ".join(f'"{q}"' for q in t["quotes"])
-                lines.append(f"- 代表引用：{quotes_str}")
+                lines.append(f"- 代表原文（请在报告中完整引用，并附中文翻译）：")
+                for q in t["quotes"]:
+                    lines.append(f'  > "{q}"')
             lines.append("")
 
         if data["other_themes"]:
@@ -1614,28 +1619,33 @@ def _build_large_sample_writer_query(
 
 
 def _get_large_sample_writer_requirements() -> str:
-    return """一、结论驱动
+    return """一、报告结构（严格按此顺序）
+1. **## 核心结论**（必须是第一个二级章节）
+   - 列出整份报告中最重要的 5-8 条发现，每条一行，格式：「**结论标题**：具体说明（含数字）」
+   - 覆盖所有 Part 的关键洞察，让读者读完此节即可掌握全部重点
+2. 按方案中的 Part 顺序逐章展开
+3. **## 行动建议**（最后一节，3-5 条，每条必须有对应数据依据）
+
+二、结论驱动
 - 以"多少人持有什么观点"为核心叙事框架
 - 每个结论必须附具体数字（人数或占比），禁止使用"部分用户""少数玩家"等模糊表述
-- 执行摘要放在最前面，列出 3-5 条最重要的结论
 
-二、主题展开逻辑
-- 主题按提及人数从高到低排序
-- 重点展开占比 ≥ 5% 的主题，每个主题按以下结构写：
-  ① 核心结论（一句话，含具体数字）
-  ② 正负观点分布（各占多少比例，各自主要内容是什么）
-  ③ 代表性原文引用 1-2 条（用引号括起）
-- 占比 < 5% 的主题统一归入「其他声音」，列举名称和占比，不展开分析
+三、受访者画像展示
+- 画像分布数据用 Markdown 表格呈现（列：维度 / 选项 / 人数占比），不要纯文字罗列
+- 表格之后用 1-2 句话解读画像特征
 
-三、语言风格
+四、主观题原文展示（关键）
+- 每个主题/观点至少引用 3 条代表性玩家原文
+- 展示格式：先展示原始语言原文（用引号括起），下方紧跟中文翻译（若原文已是中文则免翻译）
+  示例：
+  > "She's very outdated compared to other mage heroes."（该英雄与其他法师相比显得十分过时。）
+  > "Modelnya kurang dipoles."（模型精致度不足。）
+  > "模型感觉太老了，需要 revamp。"
+- 引用的原文要能支撑该主题的核心论断，优先选择信息量最丰富的
+
+五、语言风格
 - 简洁直接，去掉冗长铺垫和过渡句
-- 结论可直接用于产品决策和优先级判断
-- 报告结尾的行动建议：3-5 条，每条必须有对应的数据依据
-
-四、报告结构
-1. 执行摘要（3-5条核心结论，每条含数字）
-2. 按报告结构逐 Part 展开
-3. 关键行动建议"""
+- 报告语言为中文；玩家原文保留原语种并附中文翻译"""
 
 
 def _build_writer_query(stats_md: str, open_text: dict, plan: dict, headers: list[str]) -> str:
@@ -3762,23 +3772,20 @@ async def admin_delete_user(email: str, request: Request):
 
 
 async def _export_to_feishu(report_md: str, login: dict) -> str:
-    """生成与下载按钮一致的 PDF，上传到飞书文件，并通过机器人发消息通知。"""
+    """将报告上传为飞书文档（docx），文档归登录用户所有，并通过机器人发消息通知。"""
     full = _inject_disclaimer(report_md)
     title_m = re.search(r"^#\s+(.+?)$", full, re.MULTILINE)
     title = title_m.group(1).strip() if title_m else "调研报告"
     open_id = login.get("open_id", "")
-    loop = asyncio.get_event_loop()
-    pdf_bytes = await loop.run_in_executor(None, report_markdown_to_pdf, full)
-    url, _, _ = await feishu_export.upload_pdf_via_bot(
-        title,
-        pdf_bytes,
-        open_id or None,
-    )
-    print(f"[feishu-export] uploaded pdf title={title!r} bytes={len(pdf_bytes)} url={url}")
+    user_token = login.get("token", "")
+    if not user_token:
+        raise RuntimeError("缺少用户 access_token，请重新登录飞书后再导出")
+    url, _ = await feishu_export.create_doc_as_user(title, full, user_token)
+    print(f"[feishu-export] created doc title={title!r} url={url}")
     if open_id:
         await feishu_export.send_message_to_user(
             open_id,
-            f"您有一份调研报告《{title}》PDF 已上传到飞书，点击查看：{url}"
+            f"您的调研报告《{title}》已创建为飞书文档，点击查看：{url}"
         )
     return url
 
@@ -3797,9 +3804,9 @@ async def export_feishu(session_id: str, request: Request):
     try:
         url = await _export_to_feishu(report_md, login)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"上传飞书 PDF 失败：{e}")
-    await audit_log(request, "report", "上传飞书 PDF", f"会话：{session_id}", metadata={"session_id": session_id})
-    return {"url": url, "type": "pdf"}
+        raise HTTPException(status_code=502, detail=f"创建飞书文档失败：{e}")
+    await audit_log(request, "report", "导出飞书文档", f"会话：{session_id}", metadata={"session_id": session_id})
+    return {"url": url, "type": "doc"}
 
 
 @app.post("/api/export/feishu-history/{history_id}")

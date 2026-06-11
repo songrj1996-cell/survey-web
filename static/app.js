@@ -1365,10 +1365,10 @@ function showFeishuConfirmModal(email) {
       <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
                   padding:24px 28px;width:min(400px,90vw);display:flex;flex-direction:column;gap:16px;
                   box-shadow:var(--shadow-lg)">
-        <div style="font-size:15px;font-weight:600;color:var(--text)">上传 PDF 到飞书</div>
+        <div style="font-size:15px;font-weight:600;color:var(--text)">导出飞书文档</div>
         <div style="font-size:13px;color:var(--text-2);line-height:1.7">
-          系统会把当前报告导出为 PDF，并通过「让我看看你又在做什么调研」机器人推送给
-          <strong style="color:var(--text)">${esc(email)}</strong>
+          系统会把当前报告创建为飞书文档（docx），归属于
+          <strong style="color:var(--text)">${esc(email)}</strong>，并通过机器人发送文档链接。
         </div>
         <div style="display:flex;gap:8px;justify-content:flex-end">
           <button class="btn btn--ghost" id="feishu-modal-cancel">取消</button>
@@ -1402,7 +1402,7 @@ async function exportFeishu() {
   const btn = $('btn-export-feishu');
   const original = btn.innerHTML;
   btn.disabled = true;
-  btn.textContent = '上传中…';
+  btn.textContent = '导出中…';
 
   const url = state.viewMode === 'history' && state.historyId
     ? `/api/export/feishu-history/${state.historyId}`
@@ -1415,10 +1415,10 @@ async function exportFeishu() {
       throw new Error(data.detail || '生成失败');
     }
     showFeishuLink(data.url);
-    try { await navigator.clipboard.writeText(data.url); showToast('PDF 已上传到飞书，机器人消息已发送', 'success'); }
-    catch { showToast('PDF 已上传到飞书', 'success'); }
+    try { await navigator.clipboard.writeText(data.url); showToast('飞书文档已创建，链接已复制，机器人消息已发送', 'success'); }
+    catch { showToast('飞书文档已创建，机器人消息已发送', 'success'); }
   } catch (e) {
-    showToast(`上传 PDF 到飞书失败：${e.message}`, 'error', 10000);
+    showToast(`导出飞书文档失败：${e.message}`, 'error', 10000);
   } finally {
     btn.disabled = false;
     btn.innerHTML = original;
@@ -1437,7 +1437,7 @@ function showFeishuLink(url) {
       <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
         <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
         <polyline points="14 2 14 8 20 8"/>
-      </svg>查看飞书 PDF</a>`;
+      </svg>查看飞书文档</a>`;
     activeReportCtx().feishuLinkHtml = inline.innerHTML;
   }
 }
