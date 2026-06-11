@@ -77,7 +77,14 @@ function showToast(msg, type = 'info', duration = 4000) {
 }
 
 function renderMarkdown(md) {
-  return marked.parse(md || '');
+  if (!md) return '';
+  // marked 对 Unicode 序号（①②…）、中文标点紧邻 ** 时不产生 <strong>。
+  // 预处理：把所有 **非空内容** 先替换成 <strong>，再交给 marked（marked 会保留已有 HTML）。
+  // 不处理 *** 三星（斜体加粗）以免误替换。
+  const preprocessed = md.replace(/\*\*(?!\s)(.+?)(?<!\s)\*\*/gs,
+    (_, inner) => `<strong>${inner}</strong>`
+  );
+  return marked.parse(preprocessed);
 }
 
 function esc(str) {
