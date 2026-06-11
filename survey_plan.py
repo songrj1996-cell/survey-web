@@ -66,6 +66,44 @@ def parse_plan_from_llm(
     return data, None
 
 
+def parse_crosstab_plan(answer: str) -> tuple[dict | None, str | None]:
+    """跑数表模式专用的轻量 plan 解析（只要 parts + open_questions）。
+
+    crosstab 模式的章节是语义化的（name + scope），不绑定清数列号，
+    所以不走严格的 _validate_plan。返回 ({"parts":[...], "open_questions":[...]}, None)
+    或 (None, error)。
+    """
+    raw = _extract_json_block(answer)
+    if raw is None:
+        return None, "no JSON block found in LLM output"
+    try:
+        data = json.loads(_sanitize_json(raw))
+    except json.JSONDecodeError as e:
+        return None, f"json decode failed: {e}"
+    if not isinstance(data, dict):
+        return None, "top-level JSON is not an object"
+
+    parts_in = data.get("parts")
+    if not isinstance(parts_in, list) or not parts_in:
+        return None, "parts missing or empty"
+    parts: list[dict] = []
+    for p in parts_in:
+        if not isinstance(p, dict):
+            continue
+        name = str(p.get("name") or "").strip()
+        if not name:
+            continue
+        parts.append({"name": name, "scope": str(p.get("scope") or "").strip()})
+    if not parts:
+        return None, "no valid chapter in parts"
+
+    oqs_in = data.get("open_questions") or []
+    open_questions = [str(q).strip() for q in oqs_in if str(q).strip()] \
+        if isinstance(oqs_in, list) else []
+
+    return {"parts": parts, "open_questions": open_questions}, None
+
+
 def _extract_json_block(text: str) -> str | None:
     """优先抓 ```json...``` 围栏；没有就抓首个平衡的 {...}。"""
     fence = re.search(r"```(?:json)?\s*\n?(.*?)```", text, flags=re.DOTALL)

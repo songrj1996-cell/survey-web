@@ -11,6 +11,7 @@ marked.setOptions({ breaks: true, gfm: true });
 // ── 全局状态 ──
 const state = {
   sessionId: null,
+  mode: null,         // null=定性(5步) | 'crosstab'=倍市得跑数表(4步)
   currentStep: 1,
   viewStep: 1,        // 当前查看的步骤（可回看已完成步骤，不影响 currentStep）
   columns: null,      // Step 2 题型数据
@@ -106,6 +107,24 @@ function renderStepBars() {
       btn.classList.add('step-bar__item--done');
     }
     btn.disabled = n > state.currentStep;
+  });
+  applyStepBarForMode();
+}
+
+// 跑数表(crosstab)模式:隐藏「数据确认」(step2),可见步骤重新编号 1..4
+function applyStepBarForMode() {
+  const crosstab = state.mode === 'crosstab';
+  document.querySelectorAll('[data-survey-step="2"]').forEach(b => {
+    b.style.display = crosstab ? 'none' : '';
+  });
+  const seq = crosstab ? [1, 3, 4, 5] : [1, 2, 3, 4, 5];
+  document.querySelectorAll('.step-bar').forEach(bar => {
+    seq.forEach((step, i) => {
+      const btn = bar.querySelector(`[data-survey-step="${step}"]`);
+      if (!btn) return;
+      const num = btn.querySelector('.step-bar__num');
+      if (num) num.textContent = crosstab ? (i + 1) : step;
+    });
   });
 }
 
@@ -551,31 +570,34 @@ $('btn-start-plan').addEventListener('click', startPlan);
 
 async function startPlan() {
   const btn = $('btn-start-plan');
-  btn.disabled = true;
+  if (btn) btn.disabled = true;
   clearPlanInput();
 
-  // 先存储用户确认的题型
-  try {
-    const columns = collectConfirmedColumns();
-    const resp = await fetch(`/api/columns/${state.sessionId}/confirm`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ columns }),
-    });
-    if (!resp.ok) {
-      const d = await resp.json();
-      throw new Error(d.detail || '保存题型失败');
+  // 跑数表模式:列已在上传时确定性建好,跳过题型确认;其余模式先存用户确认的题型
+  if (state.mode !== 'crosstab') {
+    try {
+      const columns = collectConfirmedColumns();
+      const resp = await fetch(`/api/columns/${state.sessionId}/confirm`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ columns }),
+      });
+      if (!resp.ok) {
+        const d = await resp.json();
+        throw new Error(d.detail || '保存题型失败');
+      }
+    } catch (e) {
+      showToast(`保存题型失败：${e.message}`, 'error');
+      if (btn) btn.disabled = false;
+      return;
     }
-  } catch (e) {
-    showToast(`保存题型失败：${e.message}`, 'error');
-    btn.disabled = false;
-    return;
   }
 
   // 进入 Step 3，开始 AI 规划
   goStep(3);
   $('plan-thinking').style.display = 'flex';
-  $('plan-thinking').querySelector('.thinking-block__title').textContent = 'AI 正在规划分析方案，请稍候…';
+  $('plan-thinking').querySelector('.thinking-block__title').textContent =
+    state.mode === 'crosstab' ? 'AI 正在阅读问卷、规划报告章节，请稍候…' : 'AI 正在规划分析方案，请稍候…';
   $('plan-card').style.display = 'none';
   $('plan-stream-text').textContent = '';
 
@@ -624,14 +646,17 @@ function buildPlanHTML(plan, headers) {
 
   for (let i = 0; i < plan.parts.length; i++) {
     const p = plan.parts[i];
-    const colNames = p.column_indexes.map(idx => {
-      const c = colMap[idx];
-      return c ? (c.name || (headers && headers[idx]) || `列${idx}`) : `列${idx}`;
-    }).join('、');
+    // 跑数表模式:章节是语义化的(name + scope),不绑定列号
+    const detail = p.column_indexes
+      ? p.column_indexes.map(idx => {
+          const c = colMap[idx];
+          return c ? (c.name || (headers && headers[idx]) || `列${idx}`) : `列${idx}`;
+        }).join('、')
+      : (p.scope || '');
     html += `<div class="plan-part">
       <span class="plan-part__num">Part ${i+1}</span>
       <span class="plan-part__name">${esc(p.name)}</span>
-      <span class="plan-part__cols">${esc(colNames)}</span>
+      <span class="plan-part__cols">${esc(detail)}</span>
     </div>`;
   }
   html += `</div></div>`;
@@ -2091,6 +2116,7 @@ $('btn-restart').addEventListener('click', () => {
   $('qa-input').disabled = false;
   $('btn-qa-send').disabled = false;
   // 回到分析类型选择层
+  state.mode = null;
   $('analysis-type-picker').style.display = '';
   $('upload-area').style.display = 'none';
   const ctArea = $('crosstab-upload-area');
@@ -2101,6 +2127,7 @@ $('btn-restart').addEventListener('click', () => {
 
 // ── 分析类型选择器 ──
 $('btn-qual-enter').addEventListener('click', () => {
+  state.mode = null;
   $('analysis-type-picker').style.display = 'none';
   $('upload-area').style.display = '';
   // 每次进入上传区都（重新）加载说明文案，确保显示
@@ -2115,8 +2142,11 @@ $('btn-qual-enter').addEventListener('click', () => {
 
 // ── 定量分析（跑数表模式）：三文件上传 ──
 $('btn-quant-enter').addEventListener('click', () => {
+  state.mode = 'crosstab';
   $('analysis-type-picker').style.display = 'none';
   $('crosstab-upload-area').style.display = '';
+  const ctBtn = $('btn-ct-upload');
+  if (ctBtn) { ctBtn.disabled = false; ctBtn.textContent = '开始分析'; }
 });
 
 $('btn-ct-upload').addEventListener('click', async () => {
@@ -2140,6 +2170,7 @@ $('btn-ct-upload').addEventListener('click', async () => {
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.detail || '上传失败');
     state.sessionId = data.session_id;
+    state.mode      = 'crosstab';
     state.viewMode  = 'session';
     state.historyId = null;
     clearPlanInput();
@@ -2148,10 +2179,10 @@ $('btn-ct-upload').addEventListener('click', async () => {
       qaMessages: [], feishuLinkHtml: '', running: false, stream: '',
     };
     renderPreview(data);
-    goStep(2);
     const segInfo = (data.crosstab_segments || []).join('、');
     showToast(`跑数表解析成功：${data.crosstab_questions} 道题、分段[${segInfo}]；回答 ${data.total_rows} 行`, 'success');
-    loadColumns();
+    // 跑数表模式：跳过题型确认，直接进方案确认
+    startPlan();
   } catch (e) {
     showToast(`上传失败：${e.message}`, 'error');
     btn.disabled = false;

@@ -55,6 +55,27 @@ def parse(xlsx_bytes: bytes) -> dict:
     return _parse_banner(grid)
 
 
+def question_names(parsed: dict) -> list[str]:
+    """从解析结果取题目清单(给 planner 当"可用题目")。
+
+    矩阵题按"题组"去重(同一矩阵组只列一次),其余题目原样列出，保持顺序。
+    """
+    out: list[str] = []
+    seen_groups: set[str] = set()
+    for q in parsed.get("questions", []):
+        grp = q.get("matrix_group")
+        if grp:
+            if grp in seen_groups:
+                continue
+            seen_groups.add(grp)
+            out.append(grp)
+        else:
+            name = (q.get("name") or "").strip()
+            if name:
+                out.append(name)
+    return out
+
+
 def render_to_markdown(parsed: dict) -> str:
     """把解析结果渲染成 Writer <stats> 槽用的 markdown 字符串。"""
     segs = parsed["segments"]

@@ -1,0 +1,23 @@
+# 默认：文本文件统一用 LF（Linux/Mac 部署环境标准）
+* text=auto eol=lf
+
+# Shell 脚本强制 LF，否则在 Windows 上 git checkout 会写 CRLF
+# 导致 bash 运行时 "unexpected end of file" 报错
+*.sh text eol=lf
+
+# Python / JS / HTML / CSS：也保持 LF
+*.py  text eol=lf
+*.js  text eol=lf
+*.ts  text eol=lf
+*.html text eol=lf
+*.css  text eol=lf
+*.md   text eol=lf
+*.json text eol=lf
+*.env.example text eol=lf
+
+# 二进制文件不转换
+*.xlsx binary
+*.xls  binary
+*.png  binary
+*.jpg  binary
+*.pdf  binary
