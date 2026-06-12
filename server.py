@@ -4195,10 +4195,18 @@ async def update_history_title_post(hist_id: str, req: HistoryTitleUpdateRequest
 # ============================================================
 
 annotate_sessions: dict[str, dict] = {}
+_ANNOTATE_SESSION_TTL = 7200  # 2 hours
+
+
+def _clean_annotate_sessions() -> None:
+    cutoff = time.time() - _ANNOTATE_SESSION_TTL
+    expired = [k for k, v in annotate_sessions.items() if v.get("ts", 0) < cutoff]
+    for k in expired:
+        annotate_sessions.pop(k, None)
 
 
 def _new_annotate_session() -> str:
-    _clean_sessions()
+    _clean_annotate_sessions()
     sid = str(uuid.uuid4())
     annotate_sessions[sid] = {"ts": time.time()}
     return sid
@@ -4330,9 +4338,11 @@ async def annotate_confirm_columns(sid: str, req: AnnotateConfirmRequest, reques
     sess["open_text_cols"] = req.open_text_cols
     sess["tasks"]         = req.tasks
     sess["background"]    = req.background
-    sess["ai_results"]    = []
+    sess["ai_results"]       = []
     sess["confirmed_ai_ids"] = []
     sess["quality_results"]  = []
+    sess.pop("missing_ai_ids", None)
+    sess.pop("missing_quality_ids", None)
     task_names = []
     if req.tasks.get("ai_detect"):
         task_names.append("AI 作答识别")
@@ -4435,6 +4445,7 @@ async def annotate_run_ai_detect(sid: str, request: Request):
 
     async def generate():
         all_results: list[dict] = []
+        all_missing_ids: set[str] = set()
         try:
             yield sse_event({
                 "type": "started",
@@ -4635,9 +4646,39 @@ async def annotate_run_ai_detect(sid: str, request: Request):
                     if split_results:
                         all_results.extend(split_results)
                         results = split_results
+                    else:
+                        batch_ids = {_row_id(r) for r in active_batch if _row_id(r)}
+                        if batch_ids:
+                            all_missing_ids.update(batch_ids)
+                            yield sse_event({
+                                "type": "warn",
+                                "msg": f"第 {batch_num} 批所有重试均失败，{len(batch_ids)} 行计入缺失，完成后将阻断下载",
+                            })
                 else:
                     all_results.extend(results)
                     _annotate_ai_log("batch parsed", sid=sid, batch=batch_num, count=len(results))
+
+                if results:
+                    expected_ids = {_row_id(r) for r in active_batch if _row_id(r)}
+                    returned_ids = {r["id"] for r in results if r.get("id")}
+                    missing = expected_ids - returned_ids
+                    if missing:
+                        yield sse_event({
+                            "type": "warn",
+                            "msg": f"第 {batch_num} 批漏返 {len(missing)} 行，正在补发重试…",
+                        })
+                        missing_rows = [r for r in active_batch if _row_id(r) in missing]
+                        retry_results, _ = await _run_ai_direct(missing_rows, f"{batch_num}.miss")
+                        if retry_results:
+                            results = list(results) + retry_results
+                            all_results.extend(retry_results)
+                            missing -= {r["id"] for r in retry_results if r.get("id")}
+                        if missing:
+                            all_missing_ids.update(missing)
+                            yield sse_event({
+                                "type": "warn",
+                                "msg": f"第 {batch_num} 批重试后仍漏返 {len(missing)} 行（ID：{', '.join(sorted(missing)[:5])}{'…' if len(missing) > 5 else ''}），完成后将阻断下载",
+                            })
 
                 yield sse_event({
                     "type": "batch_done",
@@ -4649,18 +4690,22 @@ async def annotate_run_ai_detect(sid: str, request: Request):
                 })
 
             sess["ai_results"] = all_results
+            sess.pop("missing_ai_ids", None)
+            if all_missing_ids:
+                sess["missing_ai_ids"] = sorted(all_missing_ids)
             high_prob = [r for r in all_results if r.get("ai_prob", 0) >= 80]
             await audit_log(
                 request,
                 "annotate",
                 "完成 AI 作答识别",
-                f"会话：{sid}；结果数：{len(all_results)}；高概率数：{len(high_prob)}",
-                metadata={"session_id": sid, "results": len(all_results), "high_prob": len(high_prob)},
+                f"会话：{sid}；结果数：{len(all_results)}；高概率数：{len(high_prob)}；未回填：{len(all_missing_ids)}",
+                metadata={"session_id": sid, "results": len(all_results), "high_prob": len(high_prob), "missing": len(all_missing_ids)},
             )
             yield sse_event({
-                "type":      "ai_detect_done",
-                "results":   all_results,
-                "high_prob": high_prob,
+                "type":        "ai_detect_done",
+                "results":     all_results,
+                "high_prob":   high_prob,
+                "missing_ids": sorted(all_missing_ids),
             })
         except Exception as e:
             import traceback; traceback.print_exc()
@@ -4711,52 +4756,123 @@ async def annotate_run_quality(sid: str, request: Request):
     batches = [non_ai_body[i: i + batch_size] for i in range(0, len(non_ai_body), batch_size)]
     total_batches = len(batches)
 
+    QUALITY_CONCURRENCY = 3
+
+    async def _run_one_batch(batch_num: int, batch: list) -> tuple[int, list[dict], set[str], str]:
+        """运行单批质量打标，含解析重试和覆盖重试。永远返回结构化结果，不向外抛异常。"""
+        batch_ids = {str(r[id_col]).strip() if id_col < len(r) else "" for r in batch}
+        batch_ids.discard("")
+        try:
+            query = annotate.build_quality_label_query(batch, headers, open_text_cols, id_col, batch_num)
+            chunks: list[str] = []
+            final_conv = ""
+            async for chunk, conv_id in sse_dify_stream(query, sid, "", DIFY_QUALITY_KEY):
+                if chunk:
+                    chunks.append(chunk)
+                if conv_id:
+                    final_conv = conv_id
+
+            results, err = annotate.parse_quality_result("".join(chunks))
+            if not results:
+                retry_q = (
+                    f"上次输出无法解析（{err}）。请严格按 schema 用 ```json``` 围栏重新输出，"
+                    "不要附加任何解释文字。"
+                )
+                retry_chunks: list[str] = []
+                async for chunk, _ in sse_dify_stream(retry_q, sid, final_conv, DIFY_QUALITY_KEY):
+                    if chunk:
+                        retry_chunks.append(chunk)
+                results, err = annotate.parse_quality_result("".join(retry_chunks))
+
+            if not results:
+                return batch_num, [], batch_ids, err
+
+            # 覆盖检查 + 漏返重试
+            expected = set(batch_ids)
+            still_missing: set[str] = set()
+            if expected:
+                returned = {r["id"] for r in results if r.get("id")}
+                missing = expected - returned
+                if missing:
+                    missing_rows = [r for r in batch if (str(r[id_col]).strip() if id_col < len(r) else "") in missing]
+                    retry_miss_q = annotate.build_quality_label_query(missing_rows, headers, open_text_cols, id_col, f"{batch_num}.miss")
+                    miss_chunks: list[str] = []
+                    async for chunk, _ in sse_dify_stream(retry_miss_q, sid, "", DIFY_QUALITY_KEY):
+                        if chunk:
+                            miss_chunks.append(chunk)
+                    miss_results, _ = annotate.parse_quality_result("".join(miss_chunks))
+                    if miss_results:
+                        results.extend(miss_results)
+                        missing -= {r["id"] for r in miss_results if r.get("id")}
+                    still_missing = missing
+
+            return batch_num, results, still_missing, ""
+        except Exception as exc:
+            return batch_num, [], batch_ids, str(exc)
+
     async def generate():
         all_results: list[dict] = []
+        all_missing_ids_q: set[str] = set()
+        pending: set[asyncio.Task] = set()
         try:
-            for batch_num, batch in enumerate(batches, 1):
-                yield sse_event({"type": "progress", "done": batch_num - 1, "total": total_batches,
-                                 "msg": f"正在打标第 {batch_num}/{total_batches} 批（{len(batch)} 行）…"})
+            sem = asyncio.Semaphore(QUALITY_CONCURRENCY)
 
-                query = annotate.build_quality_label_query(
-                    batch, headers, open_text_cols, id_col, batch_num
-                )
-                answer_chunks: list[str] = []
-                final_conv = ""
-                async for chunk, conv_id in sse_dify_stream(query, sid, "", DIFY_QUALITY_KEY):
-                    if chunk:
-                        answer_chunks.append(chunk)
-                    if conv_id:
-                        final_conv = conv_id
+            async def run_with_sem(batch_num: int, batch: list):
+                async with sem:
+                    return await _run_one_batch(batch_num, batch)
 
-                results, err = annotate.parse_quality_result("".join(answer_chunks))
-                if not results:
-                    retry_q = (
-                        f"上次输出无法解析（{err}）。请严格按 schema 用 ```json``` 围栏重新输出，"
-                        "不要附加任何解释文字。"
-                    )
-                    retry_chunks: list[str] = []
-                    async for chunk, _ in sse_dify_stream(retry_q, sid, final_conv, DIFY_QUALITY_KEY):
-                        if chunk:
-                            retry_chunks.append(chunk)
-                    results, err = annotate.parse_quality_result("".join(retry_chunks))
+            pending = {
+                asyncio.create_task(run_with_sem(i, b))
+                for i, b in enumerate(batches, 1)
+            }
+            done_count = 0
+            yield sse_event({
+                "type": "progress", "done": 0, "total": total_batches,
+                "msg": f"已连接，{len(non_ai_body)} 行分 {total_batches} 批，最多 {QUALITY_CONCURRENCY} 批并行",
+            })
 
-                if not results:
-                    yield sse_event({"type": "warn", "msg": f"第 {batch_num} 批解析失败：{err}"})
-                else:
-                    all_results.extend(results)
+            while pending:
+                finished, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                for task in finished:
+                    batch_num, results, still_missing, err = await task
+                    done_count += 1
+                    if not results:
+                        all_missing_ids_q.update(still_missing)
+                        yield sse_event({
+                            "type": "warn",
+                            "msg": f"第 {batch_num} 批解析失败：{err}；{len(still_missing)} 行计入缺失，完成后将阻断下载",
+                        })
+                    else:
+                        all_results.extend(results)
+                        if still_missing:
+                            all_missing_ids_q.update(still_missing)
+                            yield sse_event({
+                                "type": "warn",
+                                "msg": f"第 {batch_num} 批重试后仍漏返 {len(still_missing)} 行（ID：{', '.join(sorted(still_missing)[:5])}{'…' if len(still_missing) > 5 else ''}），完成后将阻断下载",
+                            })
+                    yield sse_event({
+                        "type": "progress", "done": done_count, "total": total_batches,
+                        "msg": f"第 {batch_num} 批完成，获得 {len(results)} 条结果（{done_count}/{total_batches} 批已完成）",
+                    })
 
             sess["quality_results"] = all_results
+            sess.pop("missing_quality_ids", None)
+            if all_missing_ids_q:
+                sess["missing_quality_ids"] = sorted(all_missing_ids_q)
             await audit_log(
                 request,
                 "annotate",
                 "完成回答质量打标",
-                f"会话：{sid}；结果数：{len(all_results)}",
-                metadata={"session_id": sid, "results": len(all_results)},
+                f"会话：{sid}；结果数：{len(all_results)}；未回填：{len(all_missing_ids_q)}",
+                metadata={"session_id": sid, "results": len(all_results), "missing": len(all_missing_ids_q)},
             )
-            yield sse_event({"type": "quality_done", "count": len(all_results)})
+            yield sse_event({"type": "quality_done", "count": len(all_results), "missing_ids": sorted(all_missing_ids_q)})
         except Exception as e:
             import traceback; traceback.print_exc()
+            for t in pending:
+                t.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
             yield sse_event({"type": "error", "message": str(e)})
 
     return StreamingResponse(generate(), media_type="text/event-stream")
@@ -4779,6 +4895,18 @@ async def annotate_download(sid: str, request: Request):
 
     if not rows:
         raise HTTPException(status_code=400, detail="会话中没有数据")
+
+    missing_ai = sess.get("missing_ai_ids", [])
+    missing_q  = sess.get("missing_quality_ids", [])
+    if missing_ai or missing_q:
+        parts = []
+        if missing_ai:
+            ids_preview = ", ".join(missing_ai[:5]) + ("…" if len(missing_ai) > 5 else "")
+            parts.append(f"AI 检测漏返 {len(missing_ai)} 行（ID：{ids_preview}）")
+        if missing_q:
+            ids_preview = ", ".join(missing_q[:5]) + ("…" if len(missing_q) > 5 else "")
+            parts.append(f"质量打标漏返 {len(missing_q)} 行（ID：{ids_preview}）")
+        raise HTTPException(status_code=400, detail=f"结果不完整，无法下载：{'；'.join(parts)}。请返回重试对应任务。")
 
     loop = asyncio.get_event_loop()
     excel_bytes = await loop.run_in_executor(

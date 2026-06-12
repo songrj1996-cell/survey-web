@@ -2360,18 +2360,20 @@ updateQAPanelButtons();
 // ============================================================
 
 const annState = {
-  sessionId:       null,
-  currentStep:     1,
-  headers:         [],
-  headersZh:       [],
-  idCol:           1,
-  openTextCols:    [],
-  matrixColIdxs:   new Set(),
-  tasks:           { ai_detect: false, quality: false },
-  aiResults:       [],
-  highProbResults: [],
-  confirmedAiIds:  new Set(),
-  qualityCount:    0,
+  sessionId:         null,
+  currentStep:       1,
+  headers:           [],
+  headersZh:         [],
+  idCol:             1,
+  openTextCols:      [],
+  matrixColIdxs:     new Set(),
+  tasks:             { ai_detect: false, quality: false },
+  aiResults:         [],
+  highProbResults:   [],
+  confirmedAiIds:    new Set(),
+  qualityCount:      0,
+  missingAiIds:      [],
+  missingQualityIds: [],
 };
 
 function annGoStep(n) {
@@ -2570,6 +2572,9 @@ $('ann-btn-start').addEventListener('click', annStartAnnotation);
 
 async function annStartAnnotation() {
   $('ann-btn-start').disabled = true;
+  annState.missingAiIds      = [];
+  annState.missingQualityIds = [];
+  $('ann-btn-download').disabled = false;
   // 读取最新 id_col
   const idColSel = $('ann-id-col-sel');
   if (idColSel) annState.idCol = +idColSel.value;
@@ -2672,10 +2677,17 @@ async function annRunAiDetect() {
       }
       if (ev.type === 'ai_detect_done') {
         bar.style.width = '100%';
-        const results = ev.results || [];
-        msg.textContent = `AI 检测完成，共 ${results.length} 条结果`;
+        const results    = ev.results || [];
+        const missingIds = ev.missing_ids || [];
         annState.aiResults       = results;
         annState.highProbResults = ev.high_prob || [];
+        annState.missingAiIds    = missingIds;
+        if (missingIds.length > 0) {
+          msg.textContent = `AI 检测完成，共 ${results.length} 条结果（${missingIds.length} 行重试后仍未回填）`;
+          appendAiLog(`重试后仍有 ${missingIds.length} 行无法回填，下载已被阻断。涉及 ID：${missingIds.slice(0, 5).join(', ')}${missingIds.length > 5 ? '…' : ''}`, 'error');
+        } else {
+          msg.textContent = `AI 检测完成，共 ${results.length} 条结果`;
+        }
       }
     });
 
@@ -2817,8 +2829,14 @@ async function annRunQuality() {
       }
       if (ev.type === 'quality_done') {
         bar.style.width = '100%';
-        msg.textContent = `质量打标完成，共 ${ev.count} 条结果`;
-        annState.qualityCount = ev.count;
+        const missingQIds = ev.missing_ids || [];
+        annState.qualityCount      = ev.count;
+        annState.missingQualityIds = missingQIds;
+        if (missingQIds.length > 0) {
+          msg.textContent = `质量打标完成，共 ${ev.count} 条结果（${missingQIds.length} 行重试后仍未回填）`;
+        } else {
+          msg.textContent = `质量打标完成，共 ${ev.count} 条结果`;
+        }
       }
     });
     annGoStep(6);
@@ -2838,8 +2856,22 @@ function annShowDone() {
   if (annState.tasks.quality) {
     parts.push(`质量打标：${annState.qualityCount} 条`);
   }
-  $('ann-done-text').innerHTML = parts.join('<br>');
-  showToast('所有标注任务完成！', 'success');
+  const missingAi = annState.missingAiIds      || [];
+  const missingQ  = annState.missingQualityIds || [];
+  const missingParts = [];
+  if (missingAi.length) missingParts.push(`AI 检测漏返 ${missingAi.length} 行`);
+  if (missingQ.length)  missingParts.push(`质量打标漏返 ${missingQ.length} 行`);
+  if (missingParts.length) {
+    $('ann-done-text').innerHTML =
+      parts.join('<br>') +
+      `<br><span style="color:#d32f2f;font-weight:600;">⚠ 结果不完整：${missingParts.join('；')}，下载已被阻断。请返回对应任务重试。</span>`;
+    $('ann-btn-download').disabled = true;
+    showToast('部分行未能回填，下载已被阻断', 'error');
+  } else {
+    $('ann-done-text').innerHTML = parts.join('<br>');
+    $('ann-btn-download').disabled = false;
+    showToast('所有标注任务完成！', 'success');
+  }
 }
 
 $('ann-btn-download').addEventListener('click', () => {
@@ -2854,10 +2886,13 @@ $('ann-btn-restart').addEventListener('click', () => {
   annState.idCol           = 1;
   annState.openTextCols    = [];
   annState.tasks           = { ai_detect: false, quality: false };
-  annState.aiResults       = [];
-  annState.highProbResults = [];
-  annState.confirmedAiIds  = new Set();
-  annState.qualityCount    = 0;
+  annState.aiResults         = [];
+  annState.highProbResults   = [];
+  annState.confirmedAiIds    = new Set();
+  annState.qualityCount      = 0;
+  annState.missingAiIds      = [];
+  annState.missingQualityIds = [];
+  $('ann-btn-download').disabled = false;
   $('task-ai-detect').checked = false;
   $('task-quality').checked   = false;
   $('ann-background').value   = '';

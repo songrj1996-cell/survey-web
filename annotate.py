@@ -17,7 +17,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 
 # 分批大小
 AI_DETECT_BATCH = 10
-QUALITY_BATCH = 150
+QUALITY_BATCH = 15
 AI_DETECT_MAX_CELL_CHARS = 420
 
 # 标注列样式
