@@ -23,7 +23,7 @@ FEISHU_APP_ID       = os.getenv("FEISHU_APP_ID", "")
 FEISHU_APP_SECRET   = os.getenv("FEISHU_APP_SECRET", "")
 FEISHU_BASE         = os.getenv("FEISHU_BASE", "https://open.feishu.cn/open-apis").rstrip("/")
 FEISHU_REDIRECT_URI = os.getenv("FEISHU_REDIRECT_URI", "")
-FEISHU_SCOPE        = os.getenv("FEISHU_SCOPE", "")  # 可选；留空用应用默认权限
+FEISHU_SCOPE        = ""  # 留空用应用默认权限；不要用单一 drive:file:upload 覆盖授权范围
 
 
 def is_configured() -> bool:
@@ -330,7 +330,7 @@ async def _upload_md(user_token: str, filename: str, content: bytes) -> str:
             hint = ""
             if code in (99991663, 99991664, 230003, 99991400):
                 hint = "（可能原因：drive 文件权限未开通，请在飞书开放平台为应用申请 drive:drive:write 权限并审批）"
-            raise RuntimeError(f"上传 md 失败 code={code} {msg}{hint}")
+            raise RuntimeError(f"上传 md 到飞书云空间失败 code={code} msg={msg}{hint}")
         return r["data"]["file_token"]
 
 
@@ -347,7 +347,13 @@ async def _import_task(user_token: str, file_token: str, name: str) -> str:
         )
         r = resp.json()
         if r.get("code") != 0:
-            raise RuntimeError(f"创建导入任务失败: {r}")
+            code = r.get("code")
+            msg = r.get("msg", "")
+            raise RuntimeError(
+                "创建飞书云文档导入任务失败 "
+                f"code={code} msg={msg}；请确认应用已开通“查看、创建云文档导入任务”权限，"
+                "且当前用户已退出后重新登录授权"
+            )
         return r["data"]["ticket"]
 
 
@@ -361,7 +367,13 @@ async def _poll_import(user_token: str, ticket: str, timeout_seconds: int = 180)
             )
             r = resp.json()
             if r.get("code") != 0:
-                raise RuntimeError(f"查询导入任务失败: {r}")
+                code = r.get("code")
+                msg = r.get("msg", "")
+                raise RuntimeError(
+                    "查询飞书云文档导入任务失败 "
+                    f"code={code} msg={msg}；请确认应用已开通“查看、创建云文档导入任务”权限，"
+                    "且当前用户已退出后重新登录授权"
+                )
             task = r["data"]["result"]
             # 注意：job_status 0=成功、1/2=处理中、其他=错误（与直觉相反）
             status = task.get("job_status")

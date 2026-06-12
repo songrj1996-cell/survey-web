@@ -1579,14 +1579,36 @@ async def _batch_qualitative_analysis(
     yield ("result", clustered_themes)
 
 
+def _extract_satisfaction_stats(stats_md: str) -> str:
+    """Extract ## sections whose title contains '满意度' from stats markdown."""
+    lines = stats_md.split("\n")
+    sections: list[list[str]] = []
+    current: list[str] = []
+    capturing = False
+
+    for line in lines:
+        if line.startswith("## "):
+            if capturing and current:
+                sections.append(current)
+            current = [line]
+            capturing = "满意度" in line
+        elif capturing:
+            current.append(line)
+
+    if capturing and current:
+        sections.append(current)
+
+    return "\n\n".join("\n".join(s) for s in sections)
+
+
 def _build_large_sample_writer_query(
     stats_md: str,
     clustered_themes: dict,
     plan: dict,
     headers: list[str],
 ) -> str:
-    parts_lines = []
-    for i, p in enumerate(plan["parts"], 1):
+    parts_lines = ["  Part 1 受访者画像（固定）"]
+    for i, p in enumerate(plan["parts"], 2):
         if "column_indexes" in p:
             col_names = []
             for idx in p["column_indexes"]:
@@ -1631,23 +1653,34 @@ def _build_large_sample_writer_query(
         if theme_blocks else "<open_text_themes>（无开放题聚类结果）</open_text_themes>"
     )
 
-    requirements = _get_large_sample_writer_requirements()
+    satisfaction_md = _extract_satisfaction_stats(stats_md)
+    priority_block = (
+        f"<priority_metrics>\n{satisfaction_md}\n</priority_metrics>\n\n"
+        if satisfaction_md else ""
+    )
+    requirements = _get_large_sample_writer_requirements(has_satisfaction=bool(satisfaction_md))
 
     return (
         "**任务**：基于以下大样本问卷分析结果撰写调研报告。\n\n"
         f"{plan_summary}\n\n"
         f"<stats>\n{stats_md}\n</stats>\n\n"
+        f"{priority_block}"
         f"{open_text_md}\n\n"
         f"**要求**：\n{requirements}"
     )
 
 
-def _get_large_sample_writer_requirements() -> str:
-    return """一、报告结构（严格按此顺序，不得调换）
+def _get_large_sample_writer_requirements(has_satisfaction: bool = False) -> str:
+    satisfaction_rule = (
+        "   - **满意度优先原则**：`<priority_metrics>` 中已提取满意度数据，必须将其作为核心结论中最靠前的 1-2 条展示，须包含具体数字"
+        if has_satisfaction else
+        "   - **满意度优先原则**：若报告中存在任何与满意度评分/评价相关的数据（如好评率、满意度评分、认可度等），必须将其作为核心结论中最靠前的 1-2 条展示，且须包含具体数字"
+    )
+    return f"""一、报告结构（严格按此顺序，不得调换）
 1. **## 核心结论**（必须是第一个二级章节）
    - 列出整份报告中最重要的 5-8 条发现，每条一行，格式：「**结论标题**：具体说明（含数字）」
    - 覆盖所有 Part 的关键洞察，让读者读完此节即可掌握全部重点
-   - **满意度优先原则**：若报告中存在任何与满意度评分/评价相关的数据（如好评率、满意度评分、认可度等），必须将其作为核心结论中最靠前的 1-2 条展示，且须包含具体数字
+{satisfaction_rule}
 2. **## Part 1 受访者画像**（固定为第一个 Part，紧接核心结论之后）
    - 画像分布数据用 Markdown 表格呈现（列：维度 / 选项 / 人数占比），不要纯文字罗列
    - 表格之后用 1-2 句话解读画像特征
@@ -3822,11 +3855,8 @@ async def _export_to_feishu(report_md: str, login: dict, skip_qual: bool = False
     full = _prep_export_md(report_md, skip_qual=skip_qual)  # 补免责声明 + 去掉 CORE_START/END 标记
     title_m = re.search(r"^#\s+(.+?)$", full, re.MULTILINE)
     title = title_m.group(1).strip() if title_m else "调研报告"
-    open_id = login.get("open_id", "")
-    user_token = login.get("token", "")
-    if not user_token:
-        raise RuntimeError("缺少用户 access_token，请重新登录飞书后再导出")
-    url, _ = await feishu_export.create_doc_as_user(title, full, user_token)
+    open_id = login.get("open_id", "") or None
+    url, _, _ = await feishu_export.create_doc_via_bot(title, full, open_id)
     print(f"[feishu-export] created doc title={title!r} url={url}")
     if open_id:
         await feishu_export.send_message_to_user(
@@ -3838,11 +3868,18 @@ async def _export_to_feishu(report_md: str, login: dict, skip_qual: bool = False
 
 def _feishu_export_error(e: Exception) -> HTTPException:
     msg = str(e)
-    if "99991679" in msg or "drive:file:upload" in msg or "Unauthorized" in msg:
+    if (
+        "99991679" in msg
+        or "drive:file:upload" in msg
+        or "Unauthorized" in msg
+        or "创建飞书云文档导入任务失败" in msg
+        or "查询飞书云文档导入任务失败" in msg
+    ):
         return HTTPException(
             status_code=403,
             detail=(
-                "飞书授权缺少云文档上传权限。请点击左下角飞书账号退出登录，"
+                "飞书授权缺少云文档上传/导入权限。请确认飞书开放平台已开通文件上传和云文档导入任务权限，"
+                "然后点击左下角飞书账号退出登录，"
                 "然后重新登录授权后再导出。"
             ),
         )
@@ -3863,6 +3900,7 @@ async def export_feishu(session_id: str, request: Request):
     try:
         url = await _export_to_feishu(report_md, login, skip_qual=(sess.get("mode") == "crosstab"))
     except Exception as e:
+        print(f"[feishu-export][ERROR] {e!r}")
         raise _feishu_export_error(e)
     await audit_log(request, "report", "导出飞书文档", f"会话：{session_id}", metadata={"session_id": session_id})
     return {"url": url, "type": "doc"}
@@ -3886,6 +3924,7 @@ async def export_feishu_history(history_id: str, request: Request):
             skip_qual=(entry_mode == "crosstab"),
         )
     except Exception as e:
+        print(f"[feishu-export-history][ERROR] {e!r}")
         raise _feishu_export_error(e)
     await audit_log(request, "report", "导出历史飞书文档", f"报告：{entry.get('title', history_id)}", metadata={"history_id": history_id})
     return {"url": url, "type": "doc"}

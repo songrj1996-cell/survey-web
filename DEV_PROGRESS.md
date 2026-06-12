@@ -2,7 +2,7 @@
 
 > 分支：`feat/crosstab-report`
 > 基线：`c64f229`（2026-06-03 云上部署版）
-> 最后更新：2026-06-11
+> 最后更新：2026-06-12
 > 代码路径：`c:\Users\admin\Desktop\survey-web-crosstab`
 
 ---
@@ -135,6 +135,19 @@
 - 主观题每观点至少引用 3 条原文，展示原语种 + 中文翻译；若可用原文不足 3 条则展示全部，不编造。
 - **满意度优先原则**：报告中若有满意度/好评率相关数据，必须作为核心结论最靠前的 1-2 条展示。
 
+### 5.13 Writer Part 编号修复 + 满意度数据结构化注入（`server.py`）
+
+- `_build_large_sample_writer_query()`：`parts_lines` 初始化时固定写入「Part 1 受访者画像（固定）」，原方案 parts 从 Part 2 开始编号，彻底解决 Writer 收到矛盾结构信息导致出现两个 Part 1 或编号错位的问题。
+- 新增 `_extract_satisfaction_stats(stats_md)`：扫描 `<stats>` 中标题含「满意度」的 `##` 节，有则注入 `<priority_metrics>` 块。
+- `_get_large_sample_writer_requirements(has_satisfaction)` 新增参数：有满意度数据时将「满意度优先原则」由模糊描述改为明确指向 `<priority_metrics>`，无数据时保持原文。
+
+### 5.14 飞书文档导出修复（`server.py` / `feishu_export.py`）
+
+- **根本原因**：`_export_to_feishu()` 原来调 `create_doc_as_user()`（用 `user_access_token`），需要飞书开放平台「用户身份」版 `drive:drive` 和 `docs:document:import` 权限；而平台只开了「应用身份」版，导致 code=99991679。
+- **修复**：改调 `create_doc_via_bot()`（用 `app_access_token`），与已开通的「应用身份」权限完全匹配，文档建好后自动 transfer_owner 给登录用户。
+- `feishu_export.py`：`FEISHU_SCOPE` 改回硬编码 `""`（与 survey-web 保持一致），不读 env，不限制 OAuth 授权范围。`.env` 中 `FEISHU_SCOPE=` 保留但置空。
+- 两个导出端点均加 `print([feishu-export*][ERROR] ...)` 调试输出，方便排查飞书原始错误码。
+
 ### 5.12 部署修复（`deploy.sh` / `.gitattributes`）
 
 - 新增 `.gitattributes`，全仓库文本文件统一 LF，`*.sh eol=lf` 防止 Windows 把 `\r` 写入脚本导致 Bash 解析失败。
@@ -203,10 +216,10 @@ C:\Users\admin\.antigravity\ngrok.exe http --url=passing-jersey-reggae.ngrok-fre
 | `DIFY_THEME_MERGE_KEY` | 主观题聚类 - 主题合并（Workflow） |
 | `DIFY_CLASSIFY_KEY` | 主观题聚类 - 回复分类（Workflow） |
 | `DIFY_LARGE_ANALYST_KEY` | 报告写手（大样本/跑数表版） |
-| `FEISHU_SCOPE` | 必须包含 `drive:file:upload`（飞书文档导出权限） |
+| `FEISHU_SCOPE` | 置空即可（`FEISHU_SCOPE=`），代码已硬编码为空，不限制 OAuth 授权范围 |
 | 飞书其他配置 | OAuth 登录、白名单 |
 
-> **注意**：`.env` 修改 `FEISHU_SCOPE` 后，已登录用户需退出飞书重新登录，才能获得包含 drive 权限的新 token。
+> **飞书导出说明**：导出使用机器人身份（`app_access_token`），需在飞书开放平台为应用开通「应用身份」版 `drive:drive` 和 `docs:document:import` 权限。
 
 ---
 
@@ -252,9 +265,11 @@ C:\Users\admin\.antigravity\ngrok.exe http --url=passing-jersey-reggae.ngrok-fre
 - 全链路（上传 → 方案确认 → 生成报告）已真实跑通，报告质量基本符合预期
 - 报告展示：加粗正常渲染（含 Unicode 序号场景）
 
+**已验证（2026-06-12 新增）：**
+- 飞书文档导出：改用 `create_doc_via_bot` 后导出成功，文档归登录用户所有
+
 **已知遗留问题（待后续跟进）：**
 - 追问 Dify 404：可能发生于服务重启前的旧 session（新生成的报告应已修复，需持续观察）
-- 飞书文档导出需先退出重新登录一次以获得 drive scope
 - 数据表格展示：仅 markdown 表格，暂无数据条/颜色分组（评估后决定是否做）
 
 ---
