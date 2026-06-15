@@ -6,7 +6,7 @@ set -euo pipefail
 # ── 可修改配置 ────────────────────────────────────────────────
 DEPLOY_DIR="/opt/survey-web"   # 部署目录
 SERVICE_NAME="survey-web"      # systemd 服务名
-APP_PORT="8000"                # 监听端口（Nginx 反代用，不对外暴露）
+APP_PORT="18081"               # 监听端口
 SERVICE_USER="www-data"        # 运行服务的系统用户
 # ─────────────────────────────────────────────────────────────
 
@@ -81,7 +81,7 @@ User=${SERVICE_USER}
 WorkingDirectory=${DEPLOY_DIR}
 EnvironmentFile=${DEPLOY_DIR}/.env
 ExecStart=${DEPLOY_DIR}/.venv/bin/uvicorn server:app \\
-    --host 127.0.0.1 \\
+    --host 0.0.0.0 \\
     --port ${APP_PORT} \\
     --workers 2 \\
     --timeout-keep-alive 75
