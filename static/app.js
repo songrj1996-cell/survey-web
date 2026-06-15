@@ -403,9 +403,9 @@ function optionEditorHTML(i, c) {
     <div class="option-edit-row">
       <div class="option-edit-row__main">
         <input class="extra-input option-input" data-option="${i}" value="${esc(opt)}" placeholder="选项内容" />
-        ${Array.isArray(aliases[opt]) && aliases[opt].length
-          ? `<div class="option-alias-hint">${esc(aliases[opt].join(' / '))}</div>`
-          : ''}
+        <div class="option-alias-hint">${(aliases[opt] || []).map(a =>
+            `<span class="alias-chip"><span class="alias-chip__text" title="${esc(a)}">${esc(a)}</span><button class="alias-chip__remove" data-alias-col="${i}" data-alias-canon="${esc(opt)}" data-alias-val="${esc(a)}" title="移除此别名" type="button">×</button></span>`
+          ).join('')}<button class="alias-add-btn" data-alias-add-col="${i}" data-alias-add-canon="${esc(opt)}" title="添加别名" type="button">+</button></div>
       </div>
       <button class="btn-icon option-remove" data-option-remove="${i}" title="删除选项" type="button">×</button>
     </div>
@@ -445,13 +445,18 @@ function buildEditedOptionAliases(c, editedOptions) {
   const aliases = { ...(c.value_aliases || {}) };
   const original = c.options_original || c.options || [];
   const editedSet = new Set(editedOptions);
+  const norm = s => String(s || '').trim().toLocaleLowerCase();
 
-  original.forEach((oldValue, idx) => {
-    const newValue = editedOptions[idx];
-    if (!oldValue || !newValue || oldValue === newValue) return;
-    aliases[newValue] = [...new Set([...(aliases[newValue] || []), oldValue, ...((aliases[oldValue] || []))])];
-    delete aliases[oldValue];
-  });
+  // 只有长度相同时才做位置匹配推断重命名（纯重命名场景）
+  // 长度变了说明有增删，保守处理：只按名字保留既有 alias，不推断重命名，避免位移误归并
+  if (original.length === editedOptions.length) {
+    original.forEach((oldValue, idx) => {
+      const newValue = editedOptions[idx];
+      if (!oldValue || !newValue || norm(oldValue) === norm(newValue)) return;
+      aliases[newValue] = [...new Set([...(aliases[newValue] || []), oldValue, ...(aliases[oldValue] || [])])];
+      delete aliases[oldValue];
+    });
+  }
 
   Object.keys(aliases).forEach(k => {
     if (!editedSet.has(k)) delete aliases[k];
@@ -539,6 +544,7 @@ $('col-list').addEventListener('click', e => {
         <div class="option-edit-row">
           <div class="option-edit-row__main">
             <input class="extra-input option-input" data-option="${i}" value="" placeholder="选项内容" />
+            <div class="option-alias-hint"><button class="alias-add-btn" data-alias-add-col="${i}" data-alias-add-canon="" title="添加别名" type="button">+</button></div>
           </div>
           <button class="btn-icon option-remove" data-option-remove="${i}" title="删除选项" type="button">×</button>
         </div>
@@ -550,6 +556,75 @@ $('col-list').addEventListener('click', e => {
   const removeBtn = e.target.closest('[data-option-remove]');
   if (removeBtn) {
     removeBtn.closest('.option-edit-row')?.remove();
+  }
+
+  const aliasRemoveBtn = e.target.closest('.alias-chip__remove');
+  if (aliasRemoveBtn) {
+    const colIdx = +aliasRemoveBtn.dataset.aliasCol;
+    const canon = aliasRemoveBtn.dataset.aliasCanon;
+    const val = aliasRemoveBtn.dataset.aliasVal;
+    const col = state.columns[colIdx];
+    if (col?.value_aliases?.[canon]) {
+      col.value_aliases[canon] = col.value_aliases[canon].filter(a => a !== val);
+      if (!col.value_aliases[canon].length) delete col.value_aliases[canon];
+    }
+    aliasRemoveBtn.closest('.alias-chip')?.remove();
+  }
+
+  const aliasAddBtn = e.target.closest('.alias-add-btn');
+  if (aliasAddBtn) {
+    const colIdx = +aliasAddBtn.dataset.aliasAddCol;
+    // 新增选项行 canon 为空时，从同行 input 读取当前值
+    let canon = aliasAddBtn.dataset.aliasAddCanon;
+    if (!canon) {
+      canon = aliasAddBtn.closest('.option-edit-row')?.querySelector('.option-input')?.value?.trim() || '';
+    }
+    if (!canon) return;
+    const input = document.createElement('input');
+    input.className = 'alias-add-input';
+    input.placeholder = '输入别名，回车确认';
+    aliasAddBtn.replaceWith(input);
+    input.focus();
+
+    function commitAlias() {
+      const val = input.value.trim();
+      const col = state.columns[colIdx];
+      if (val && col) {
+        if (!col.value_aliases) col.value_aliases = {};
+        if (!col.value_aliases[canon]) col.value_aliases[canon] = [];
+        if (!col.value_aliases[canon].includes(val)) {
+          // 全局唯一化：从其他 canon 的 alias list 和 DOM 中移除相同值，避免同一原始值被两个标准选项覆盖映射
+          if (col.value_aliases) {
+            Object.keys(col.value_aliases).forEach(k => {
+              if (k === canon) return;
+              col.value_aliases[k] = col.value_aliases[k].filter(a => a !== val);
+              if (!col.value_aliases[k].length) delete col.value_aliases[k];
+            });
+          }
+          document.querySelectorAll(`.alias-chip__remove[data-alias-col="${colIdx}"]`).forEach(btn => {
+            if (btn.dataset.aliasCanon !== canon && btn.dataset.aliasVal === val) {
+              btn.closest('.alias-chip')?.remove();
+            }
+          });
+          col.value_aliases[canon].push(val);
+          const chip = document.createElement('span');
+          chip.className = 'alias-chip';
+          chip.innerHTML = `<span class="alias-chip__text" title="${esc(val)}">${esc(val)}</span><button class="alias-chip__remove" data-alias-col="${colIdx}" data-alias-canon="${esc(canon)}" data-alias-val="${esc(val)}" title="移除此别名" type="button">×</button>`;
+          input.parentNode.insertBefore(chip, input);
+        }
+      }
+      const newBtn = document.createElement('button');
+      newBtn.className = 'alias-add-btn';
+      newBtn.dataset.aliasAddCol = colIdx;
+      newBtn.dataset.aliasAddCanon = canon;
+      newBtn.title = '添加别名';
+      newBtn.type = 'button';
+      newBtn.textContent = '+';
+      input.replaceWith(newBtn);
+    }
+
+    input.addEventListener('keydown', ev => { if (ev.key === 'Enter') { ev.preventDefault(); commitAlias(); } });
+    input.addEventListener('blur', commitAlias);
   }
 });
 

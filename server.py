@@ -106,7 +106,7 @@ FEISHU_SESSION_SECONDS = FEISHU_SESSION_DAYS * 24 * 3600
 COOKIE_NAME = "fs_sess"
 
 # ── 数据目录 ──────────────────────────────────────────────────
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+DATA_DIR = os.getenv("DATA_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 PROMPTS_FILE   = os.path.join(DATA_DIR, "prompts.json")
@@ -967,7 +967,7 @@ _COLUMN_DETECT_SCHEMA_HINT = """\
 - 玩家ID/编号 → id；明确是 MLBB 游戏ID → mlbbid；提交时间等 → ignore
 - 年龄段/段位/地区等用于分群的 → profile_dim
 - 数值评分（如 1–5、1–10）→ scale
-- 含多个选项、可多选 → multi_choice，并尽量给出 options 清单
+- 含多个选项、可多选 → multi_choice，并尽量给出 options 清单；若多数回答为逗号分隔的短词（如 "Classic, Ranked"），即使少数回答带括号补充说明（如 "Arcade (Such as Tide Siege)"），括号内容视为该选项的描述、不影响题型判断，仍应判断为 multi_choice
 - 长文本主观回答 → open_text
 - 标注【疑似矩阵题】的，按子项判断 matrix_scale（每子项打分）或 matrix_multi（每子项可多选），rows 用给出的子项标签
 
@@ -976,6 +976,8 @@ _COLUMN_DETECT_SCHEMA_HINT = """\
 - 我已在每列附上「去重取值」。请把**语义相同但写法/语种不同**的取值（如 神话/Mythic/Mítica，中国/China/CN）归并到**同一个中文标准值**：key=中文标准值，value=该标准值对应的所有原始变体（含中文标准值本身可不必重复列出）。
 - options 使用这些合并后的中文标准值；中文标准值可以不直接出现在原始数据里，但必须能由 value_aliases 中的真实取值支撑。
 - 只有确属同义才合并；拿不准就不要合并。没有任何同义可并的列，可以省略 value_aliases 或给 {}。
+- **程度不同的选项禁止合并**：如「有点长」与「太长了」、「还好」与「很好」，虽然方向相同但程度档位不同，不是同义，必须分开。同义归并仅限写法/语种不同、语义程度完全一致的取值。
+- **同一道题内必须完整归并**：若已把某语种的某个表达归入了某标准值（如把「Lebih dari 3 tahun」归入「3年以上」），则该题内同语种所有语义相同的取值也必须全部归入，不得部分遗漏（如已识别印尼语「tahun」=年，则含相同数字区间的「1~3 tahun」也须归入「1~3年」）。
 - 这样统计表里这些取值会被合并计数，避免同义被拆开。\
 """
 
@@ -1285,6 +1287,7 @@ def _build_planner_query_with_confirmed(rows: list[list], confirmed_columns: lis
         f"{confirmed_block}\n\n"
         f"重要：以上题型和选项已由用户在界面中逐一确认；选择题选项必须以 <confirmed_column_types> 中的「选项」为权威，不得根据题干、表头或样本重新猜测选项，也不得围绕已确认选项再次提问。\n"
         f"注意：以上题型已由用户在界面中逐一确认，**不得**在 open_questions 中再次对题型进行发问。"
+        f"选项的归并方式（哪个原始值归入哪个标准选项）同样已由用户在界面中逐一确认，**不得**在 open_questions 中就选项归并或分拆方式再次提问。"
         f"矩阵题的多个列号务必整体归入同一个 part。"
         f"{profile_constraint}\n"
         f"{extra_instructions}"
@@ -2828,10 +2831,9 @@ async def generate_report(session_id: str, request: Request):
     if not all([plan, rows, stats_md]):
         raise HTTPException(status_code=400, detail="请先完成统计计算")
 
-    total_open_text = sum(len(v) for v in open_text.values())
     is_crosstab = sess.get("mode") == "crosstab"
-    # 跑数表模式恒定走聚类（不受 ≥500 阈值限制），确保主观题共性问题被发现
-    use_large_mode = is_crosstab or (total_open_text >= LARGE_SAMPLE_THRESHOLD)
+    # 跑数表模式恒定走聚类；定性模式以单列最大回答数判断（避免多开放题列加总误触发）
+    use_large_mode = is_crosstab or any(len(v) > LARGE_SAMPLE_THRESHOLD for v in open_text.values())
 
     if use_large_mode:
         if not DIFY_LARGE_ANALYST_KEY:
@@ -2844,10 +2846,11 @@ async def generate_report(session_id: str, request: Request):
         try:
             if use_large_mode:
                 # ── 大样本 / 跑数表模式：主观题四阶段批处理聚类 ──────────────
+                total_open_text = sum(len(v) for v in open_text.values())
                 start_msg = (
                     f"跑数表模式：数字取自跑数表，开始对 {total_open_text} 条主观题回复做聚类"
                     if is_crosstab
-                    else f"检测到大样本（{total_open_text} 条开放题回复），启用批处理模式"
+                    else "检测到超过500条回复，启用批量处理模式"
                 )
                 yield sse_event({"type": "progress", "message": start_msg})
                 clustered_themes: dict = {}
