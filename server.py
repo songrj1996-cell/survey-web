@@ -1709,8 +1709,9 @@ def _get_large_sample_writer_requirements(has_satisfaction: bool = False) -> str
 - 报告语言为中文；玩家原文保留原语种并附中文翻译"""
 
 
-def _build_writer_query(stats_md: str, open_text: dict, plan: dict, headers: list[str]) -> str:
-    parts_lines = []
+def _writer_parts_meta(plan: dict, headers: list[str]) -> list[dict]:
+    """返回 [{'i','name','col_desc'}]，供分轮生成时逐 Part 取标题与列说明。"""
+    meta = []
     for i, p in enumerate(plan["parts"], 1):
         col_names = []
         for idx in p["column_indexes"]:
@@ -1718,7 +1719,15 @@ def _build_writer_query(stats_md: str, open_text: dict, plan: dict, headers: lis
             name = (col and col.get("name")) or (headers[idx] if idx < len(headers) else f"列{idx}")
             role = col["role"] if col else "?"
             col_names.append(f"{name}({role})")
-        parts_lines.append(f"  Part {i} {p['name']}: {'; '.join(col_names)}")
+        meta.append({"i": i, "name": p["name"], "col_desc": "; ".join(col_names)})
+    return meta
+
+
+def _build_writer_context(stats_md: str, open_text: dict, plan: dict, headers: list[str]) -> tuple[str, str, str]:
+    """构造 Writer 的完整上下文：(plan_summary, open_text_md, requirements)。
+    plan_summary/open_text/stats 仅在多轮生成的第 1 轮发送一次，后续轮次复用会话历史。"""
+    parts_meta = _writer_parts_meta(plan, headers)
+    parts_lines = [f"  Part {m['i']} {m['name']}: {m['col_desc']}" for m in parts_meta]
     plan_summary = "<plan>\n报告结构：\n" + "\n".join(parts_lines) + "\n</plan>"
 
     open_text_blocks = []
@@ -1740,8 +1749,6 @@ def _build_writer_query(stats_md: str, open_text: dict, plan: dict, headers: lis
             text_val = entry.get("text", "")
             joined_lines.append(f"- {f'[{prefix}] ' if prefix else ''}{text_val}")
         joined = "\n".join(joined_lines)
-        if len(joined) > 20000:
-            joined = "\n".join(joined_lines[:200]) + f"\n（共 {len(texts)} 条，已截取前 200 条）"
         open_text_blocks.append(f"### {name}（列 {col_idx}, 共 {len(texts)} 条非空回答）\n{joined}")
 
     open_text_md = (
@@ -1756,13 +1763,69 @@ def _build_writer_query(stats_md: str, open_text: dict, plan: dict, headers: lis
         "如果出现 `MLBBID=123456(57001)`，括号内是区服编号，必须作为 MLBBID 的一部分展示，"
         "不得拆到「画像信息」或其它列；只有 `<open_text>` 前缀里真的存在 `画像=...` 时，才展示画像信息。"
     )
+    return plan_summary, open_text_md, requirements
 
+
+def _build_writer_first_query(stats_md: str, open_text: dict, plan: dict, headers: list[str]) -> str:
+    """多轮生成第 1 轮：发送全部上下文 + 要求，但本轮只让模型输出一级标题。"""
+    plan_summary, open_text_md, requirements = _build_writer_context(stats_md, open_text, plan, headers)
     return (
-        "**任务**：基于以下确定性统计数据撰写完整调研报告。\n\n"
+        "**协作方式**：本次报告将**分多轮**生成。下面先给你全部数据（<plan> 报告结构、<stats> 确定性统计、"
+        "<open_text> 全部开放题原文）和完整的写作要求。请通读并牢记——后续每一轮我会指定你写其中**某一个章节**，"
+        "你要从这些数据里取材，但**每轮只写我当轮指定的部分，绝不提前写其它章节**。\n\n"
         f"{plan_summary}\n\n"
         f"<stats>\n{stats_md}\n</stats>\n\n"
         f"{open_text_md}\n\n"
-        f"**要求**：\n{requirements}"
+        f"<report_spec>\n以下是整篇报告最终要满足的写作要求（供你理解全局，后续逐轮执行）：\n{requirements}\n</report_spec>\n\n"
+        "**本轮任务（第 1 轮）**：**只**输出报告的一级标题（`# 一级标题`）。"
+        "如果 <stats> 或 metadata 中存在「被排除」样本依据，可在标题下另起一行用一句话说明依据。"
+        "除此之外**什么都不要写**——不要写核心结论、不要写任何 Part、不要写 Bug 模块、不要写本节总结。"
+        "确认你已读完全部数据，本轮输出仅一级标题。"
+    )
+
+
+def _build_writer_part_query(part: dict) -> str:
+    """多轮生成中的某个 Part 轮：仅指示写这一个 Part。原文已在会话历史中。"""
+    return (
+        f"**本轮任务**：现在**只**写 `## Part {part['i']} {part['name']}` 这一个章节的完整内容"
+        f"（涉及列：{part['col_desc']}）。\n"
+        "严格按 <report_spec> 里对 Part 的写法：紧接 `## Part` 标题后先写一段详尽的「本节总结」段落（连贯文字、不用列表），"
+        "再按题目逐一展开；开放题归纳必须用 `### 题目名` 三级标题，其下用 `#### 正面观点`/`#### 负面观点`/`#### 中立 / 建议` 分组，"
+        "每个观点用 `**观点：短标题**` + `提及情况：` + `代表性原话：`（小表格）的固定结构，ID 展示规则照 <report_spec>。\n"
+        "**约束**：① 只输出这一个 Part，不要写其它 Part；② 不要写核心结论、不要写 Bug 模块；"
+        "③ 不要重复前面已经写过的标题或章节；④ 所有数字、百分比必须逐字取自 <stats>，禁止重算或编造。"
+    )
+
+
+def _build_writer_bug_query() -> str:
+    """多轮生成的 Bug 模块轮：需要则只输出该模块，否则只回 NONE。"""
+    return (
+        "**本轮任务**：现在通览 <open_text> 里的**全部**开放反馈，按 <report_spec> 第 8 条判断是否需要 "
+        "`## Bug 或待确认问题` 模块（仅当确有疑似功能 bug、体验异常、规则不明、玩家无法判断是否设计如此的问题时才需要）。\n"
+        "- 若需要：**只**输出该模块——以 `## Bug 或待确认问题` 开头，下接 Markdown 表格，字段固定为 "
+        "`问题类型`、`待确认问题`、`玩家信息`、`玩家原文翻译`，不要输出任何其它章节或解释。\n"
+        "- 若不需要：**只**回复一个词 `NONE`，不要输出任何其它内容、不要解释。"
+    )
+
+
+def _build_writer_core_query(parts_meta: list[dict], has_bug: bool) -> str:
+    """多轮生成的核心结论轮：基于已生成全部章节回写核心结论模块（放在报告顶部）。"""
+    part_titles = "、".join(f"Part {m['i']} {m['name']}" for m in parts_meta)
+    bug_clause = (
+        "正文包含 `## Bug 或待确认问题` 模块，因此核心结论**最后必须**追加 `### 待确认问题概述`，只概述问题类型、不展开原文。"
+        if has_bug else
+        "正文没有 Bug 模块，因此核心结论**不要**写任何「待确认问题」相关小节。"
+    )
+    return (
+        "**本轮任务（最后一轮）**：基于你前面已经生成的全部章节，撰写整篇报告的「核心结论」模块。"
+        "这个模块最终会被放到报告**最顶部**（一级标题之后、各 Part 之前），所以请独立、完整地写出来。\n"
+        "严格按 <report_spec> 里『核心结论』部分的格式：用 `<!--CORE_START-->` 和 `<!--CORE_END-->` 两个标记"
+        "**各自独占一行**包裹整段，内部依次写：`## 核心结论`（首行写明样本总数）、`### 总体判断`、"
+        f"逐个写 `### Part X 章节名：关键发现`（必须引用真实 Part 名：{part_titles}）、按需的 `### 高信号少数观点与风险`。\n"
+        f"{bug_clause}\n"
+        "**约束**：① 只输出从 `<!--CORE_START-->` 到 `<!--CORE_END-->` 的内容，不要重复正文章节、不要再写一级标题；"
+        "② 核心结论里不使用百分比、不使用精确人数，改用量级描述（样本总数可引用）；"
+        "③ 引用的绝对数值必须与 <stats> 一致。"
     )
 
 
@@ -2873,22 +2936,89 @@ async def generate_report(session_id: str, request: Request):
                             f"不要直接搬运）：\n{q_text}\n</questionnaire>\n\n" + writer_query
                         )
                 analyst_key = DIFY_LARGE_ANALYST_KEY
+
+                answer_chunks: list[str] = []
+                final_conv_id = ""
+                async for chunk, conv_id in sse_dify_stream(writer_query, session_id, "", analyst_key):
+                    if chunk:
+                        answer_chunks.append(chunk)
+                        yield sse_event({"type": "chunk", "content": chunk})
+                    if conv_id:
+                        final_conv_id = conv_id
+                full_report = "".join(answer_chunks)
             else:
-                # ── 标准模式（原有逻辑）─────────────────────────────────
-                writer_query = _build_writer_query(stats_md, open_text, plan, rows[0])
+                # ── 标准模式：同会话分章多轮生成（规避 Dify 单次 10 分钟超时）──
+                # 第 1 轮喂全部原文+要求、只写标题并建立会话；之后复用 conversation_id，
+                # 每轮只写一个 Part / Bug 模块 / 核心结论，原文不再重发。每轮输出短，单次不超时。
                 analyst_key = DIFY_ANALYST_KEY
+                parts_meta = _writer_parts_meta(plan, rows[0])
+                final_conv_id = ""
 
-            answer_chunks: list[str] = []
-            final_conv_id = ""
+                async def _round(query: str, conv_id: str):
+                    """跑一轮：流式 yield chunk 事件，结束后把整段文本与 conv_id 存入 _round.out。"""
+                    buf: list[str] = []
+                    cid = conv_id
+                    async for ch, c in sse_dify_stream(query, session_id, conv_id, analyst_key):
+                        if ch:
+                            buf.append(ch)
+                            yield sse_event({"type": "chunk", "content": ch})
+                        if c:
+                            cid = c
+                    _round.out = ("".join(buf), cid)
 
-            async for chunk, conv_id in sse_dify_stream(writer_query, session_id, "", analyst_key):
-                if chunk:
-                    answer_chunks.append(chunk)
-                    yield sse_event({"type": "chunk", "content": chunk})
-                if conv_id:
-                    final_conv_id = conv_id
+                total_rounds = len(parts_meta) + 3  # 标题 + N 个 Part + Bug + 核心结论
 
-            full_report = "".join(answer_chunks)
+                # 第 1 轮：全部上下文 + 只写标题
+                yield sse_event({"type": "progress",
+                                 "message": f"分章生成 1/{total_rounds}：准备数据并生成标题…"})
+                first_q = _build_writer_first_query(stats_md, open_text, plan, rows[0])
+                async for ev in _round(first_q, ""):
+                    yield ev
+                title_text, final_conv_id = _round.out
+                # 只保留标题段（首个 `## ` 之前），防止模型抢跑后续章节
+                title_lines = []
+                for ln in title_text.split("\n"):
+                    if ln.lstrip().startswith("## "):
+                        break
+                    title_lines.append(ln)
+                title_block = "\n".join(title_lines).strip() or title_text.strip()
+
+                # 第 2..N+1 轮：逐 Part
+                part_sections: list[str] = []
+                for m in parts_meta:
+                    rnd = m["i"] + 1
+                    yield sse_event({"type": "progress",
+                                     "message": f"分章生成 {rnd}/{total_rounds}：Part {m['i']} {m['name']}…"})
+                    yield sse_event({"type": "chunk", "content": "\n\n"})
+                    async for ev in _round(_build_writer_part_query(m), final_conv_id):
+                        yield ev
+                    sec, final_conv_id = _round.out
+                    part_sections.append(sec.strip())
+
+                # 倒数第 2 轮：Bug 模块（需要才写，否则模型回 NONE）
+                yield sse_event({"type": "progress",
+                                 "message": f"分章生成 {total_rounds - 1}/{total_rounds}：核查待确认问题…"})
+                async for ev in _round(_build_writer_bug_query(), final_conv_id):
+                    yield ev
+                bug_text, final_conv_id = _round.out
+                bug_clean = bug_text.strip()
+                has_bug = bool(bug_clean) and bug_clean.upper().strip(" .。`*") != "NONE" and "## Bug" in bug_clean
+                bug_section = bug_clean if has_bug else ""
+
+                # 最后一轮：核心结论（汇总全部章节，放报告顶部）
+                yield sse_event({"type": "progress",
+                                 "message": f"分章生成 {total_rounds}/{total_rounds}：汇总核心结论…"})
+                yield sse_event({"type": "chunk", "content": "\n\n"})
+                async for ev in _round(_build_writer_core_query(parts_meta, has_bug), final_conv_id):
+                    yield ev
+                core_text, final_conv_id = _round.out
+                core_block = core_text.strip()
+
+                # 组装最终报告：标题 → 核心结论 → 各 Part → Bug 模块
+                assembled = [title_block, core_block, *part_sections]
+                if bug_section:
+                    assembled.append(bug_section)
+                full_report = "\n\n".join(b for b in assembled if b)
             drifted = survey_stats.find_numbers_not_in_stats(full_report, stats_md)
             if drifted:
                 print(f"[stats] WARN drifted numbers: {drifted[:20]}")
