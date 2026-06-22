@@ -47,23 +47,23 @@ window.__surveyState = state;
 
 // ── 题型选项（与后端 ROLE_LABEL_MAP 对齐）──
 const ROLE_OPTIONS = [
-  ['id',            '用户 ID'],
-  ['mlbbid',        'MLBB ID'],
-  ['profile_dim',   '画像维度'],
+  ['id', '用户 ID'],
+  ['mlbbid', 'MLBB ID'],
+  ['profile_dim', '画像维度'],
   ['single_choice', '单选题'],
-  ['multi_choice',  '多选题'],
-  ['scale',         '量表题'],
-  ['matrix_scale',  '矩阵打分'],
-  ['matrix_multi',  '矩阵多选'],
-  ['open_text',     '开放题'],
-  ['ignore',        '忽略此列'],
+  ['multi_choice', '多选题'],
+  ['scale', '量表题'],
+  ['matrix_scale', '矩阵打分'],
+  ['matrix_multi', '矩阵多选'],
+  ['open_text', '开放题'],
+  ['ignore', '忽略此列'],
 ];
 const MATRIX_ROLES = ['matrix_scale', 'matrix_multi'];
 const CHOICE_ROLES = ['single_choice', 'profile_dim', 'multi_choice', 'matrix_multi'];
 
 // ── DOM 引用 ──
-const $  = id => document.getElementById(id);
-const panels   = [1,2,3,4,5].map(n => $(`panel-${n}`));
+const $ = id => document.getElementById(id);
+const panels = [1, 2, 3, 4, 5].map(n => $(`panel-${n}`));
 
 // ── 工具 ──
 
@@ -89,8 +89,8 @@ function renderMarkdown(md) {
 
 function esc(str) {
   return String(str ?? '')
-    .replace(/&/g,'&amp;').replace(/</g,'&lt;')
-    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
 function shortName(name, max = 20) {
@@ -168,13 +168,13 @@ function setViewStep(n) {
 
 function applyTheme(theme) {
   if (theme === 'light') document.documentElement.setAttribute('data-theme', 'light');
-  else                   document.documentElement.removeAttribute('data-theme');
-  try { localStorage.setItem('survey-theme', theme); } catch {}
+  else document.documentElement.removeAttribute('data-theme');
+  try { localStorage.setItem('survey-theme', theme); } catch { }
 }
 
 (function initTheme() {
   let saved = 'light';
-  try { saved = localStorage.getItem('survey-theme') || 'light'; } catch {}
+  try { saved = localStorage.getItem('survey-theme') || 'light'; } catch { }
   applyTheme(saved);
 })();
 
@@ -226,7 +226,7 @@ async function consumeSSEPost(url, body, onEvent) {
   if (!resp.ok) {
     const text = await resp.text();
     let detail = text;
-    try { detail = JSON.parse(text).detail || text; } catch {}
+    try { detail = JSON.parse(text).detail || text; } catch { }
     throw new Error(detail);
   }
 
@@ -277,11 +277,11 @@ function _updateProgressStatus(msg) {
 // ============================================================
 
 const uploadZone = $('upload-zone');
-const fileInput  = $('file-input');
+const fileInput = $('file-input');
 
 uploadZone.addEventListener('click', () => fileInput.click());
 uploadZone.addEventListener('dragover', e => { e.preventDefault(); uploadZone.classList.add('drag-over'); });
-uploadZone.addEventListener('dragleave', ()  => uploadZone.classList.remove('drag-over'));
+uploadZone.addEventListener('dragleave', () => uploadZone.classList.remove('drag-over'));
 uploadZone.addEventListener('drop', e => {
   e.preventDefault();
   uploadZone.classList.remove('drag-over');
@@ -311,7 +311,7 @@ async function handleUpload(file) {
     if (!resp.ok) throw new Error(data.detail || '上传失败');
 
     state.sessionId = data.session_id;
-    state.viewMode  = 'session';
+    state.viewMode = 'session';
     state.historyId = null;
     clearPlanInput();
     state.sessionReport = {
@@ -404,8 +404,8 @@ function optionEditorHTML(i, c) {
       <div class="option-edit-row__main">
         <input class="extra-input option-input" data-option="${i}" value="${esc(opt)}" placeholder="选项内容" />
         <div class="option-alias-hint">${(aliases[opt] || []).map(a =>
-            `<span class="alias-chip"><span class="alias-chip__text" title="${esc(a)}">${esc(a)}</span><button class="alias-chip__remove" data-alias-col="${i}" data-alias-canon="${esc(opt)}" data-alias-val="${esc(a)}" title="移除此别名" type="button">×</button></span>`
-          ).join('')}<button class="alias-add-btn" data-alias-add-col="${i}" data-alias-add-canon="${esc(opt)}" title="添加别名" type="button">+</button></div>
+    `<span class="alias-chip"><span class="alias-chip__text" title="${esc(a)}">${esc(a)}</span><button class="alias-chip__remove" data-alias-col="${i}" data-alias-canon="${esc(opt)}" data-alias-val="${esc(a)}" title="移除此别名" type="button">×</button></span>`
+  ).join('')}<button class="alias-add-btn" data-alias-add-col="${i}" data-alias-add-canon="${esc(opt)}" title="添加别名" type="button">+</button></div>
       </div>
       <button class="btn-icon option-remove" data-option-remove="${i}" title="删除选项" type="button">×</button>
     </div>
@@ -754,12 +754,12 @@ function buildPlanHTML(plan, headers) {
     // 跑数表模式:章节是语义化的(name + scope),不绑定列号
     const detail = p.column_indexes
       ? p.column_indexes.map(idx => {
-          const c = colMap[idx];
-          return c ? (c.name || (headers && headers[idx]) || `列${idx}`) : `列${idx}`;
-        }).join('、')
+        const c = colMap[idx];
+        return c ? (c.name || (headers && headers[idx]) || `列${idx}`) : `列${idx}`;
+      }).join('、')
       : (p.scope || '');
     html += `<div class="plan-part">
-      <span class="plan-part__num">Part ${i+1}</span>
+      <span class="plan-part__num">Part ${i + 1}</span>
       <span class="plan-part__name">${esc(p.name)}</span>
       <span class="plan-part__cols">${esc(detail)}</span>
     </div>`;
@@ -797,7 +797,7 @@ function buildPlanHTML(plan, headers) {
       <div class="plan-questions">`;
     openQs.forEach((q, i) => {
       html += `<div class="plan-question">
-        <span class="plan-question__num">Q${i+1}</span>
+        <span class="plan-question__num">Q${i + 1}</span>
         <span>${esc(q)}</span>
       </div>`;
     });
@@ -1136,7 +1136,61 @@ function renderQAMessages(messages) {
   if (!container) return;
   container.innerHTML = '';
   normalizeQAMessages(messages).forEach(m => appendQABubble(m.role, m.content));
+  updateQaBadge();
 }
+
+function updateQaBadge() {
+  const badge = $('qa-badge');
+  if (!badge) return;
+  const count = ($('qa-messages')?.querySelectorAll('.qa-message--user') || []).length;
+  badge.textContent = count;
+  badge.style.display = count > 0 ? '' : 'none';
+}
+
+function switchReportTab(name) {
+  document.querySelectorAll('[data-report-tab]').forEach(btn => {
+    btn.classList.toggle('report-tab__btn--active', btn.dataset.reportTab === name);
+  });
+  const reportPane = $('report-pane-report');
+  const qaPane = $('report-pane-qa');
+  if (reportPane) reportPane.classList.toggle('report-tab-pane--active', name === 'report');
+  if (qaPane) qaPane.classList.toggle('report-tab-pane--active', name === 'qa');
+  if (name === 'qa') {
+    updateQaBadge();
+    setTimeout(() => $('qa-input')?.focus(), 50);
+  }
+}
+
+function renderReportBreadcrumb() {
+  const el = $('report-breadcrumb');
+  if (!el) return;
+  const isCrosstab = state.mode === 'crosstab';
+  const steps = isCrosstab
+    ? [{ n: 1, label: '上传数据' }, { n: 3, label: '方案确认' }, { n: 4, label: '生成报告' }, { n: 5, label: '报告 & 追问' }]
+    : [{ n: 1, label: '上传数据' }, { n: 2, label: '数据确认' }, { n: 3, label: '方案确认' }, { n: 4, label: '生成报告' }, { n: 5, label: '报告 & 追问' }];
+  let html = '';
+  steps.forEach(({ n, label }, i) => {
+    const isActive = n === 5;
+    const isDone = n < 5;
+    let cls = 'report-toolbar__step';
+    if (isDone) cls += ' report-toolbar__step--done report-toolbar__step--clickable';
+    if (isActive) cls += ' report-toolbar__step--active';
+    const displayNum = isCrosstab ? (i + 1) : n;
+    html += `<span class="${cls}" data-step="${n}">${displayNum}. ${label}</span>`;
+    if (i < steps.length - 1) html += `<span class="report-toolbar__step-sep"> / </span>`;
+  });
+  el.innerHTML = html;
+  el.querySelectorAll('.report-toolbar__step--clickable').forEach(span => {
+    span.addEventListener('click', () => {
+      const n = +span.dataset.step;
+      if (n <= state.currentStep) setViewStep(n);
+    });
+  });
+}
+
+document.querySelectorAll('[data-report-tab]').forEach(btn => {
+  btn.addEventListener('click', () => switchReportTab(btn.dataset.reportTab));
+});
 
 function updateReportContextSwitch() {
   const bar = $('report-context-switch');
@@ -1204,11 +1258,18 @@ function renderReportWorkspace(md, { preserveQa = true } = {}) {
     $('qa-messages').innerHTML = '';
   }
   const lb = $('feishu-link-box'); if (lb) lb.remove();
-  const li = $('feishu-link-inline'); if (li) li.innerHTML = ctx.feishuLinkHtml || '';
+  const li = $('feishu-link-inline');
+  if (li) {
+    li.innerHTML = ctx.feishuLinkHtml || '';
+    li.style.display = ctx.feishuLinkHtml ? '' : 'none';
+  }
   applyQAAvailability();
   updateReportContextSwitch();
   applyCoreHighlight();
   buildTOC();
+  switchReportTab('report');
+  renderReportBreadcrumb();
+  updateQaBadge();
 }
 
 function showReport(md) {
@@ -1368,8 +1429,10 @@ $('btn-export-word').addEventListener('click', () => {
 });
 
 // ── 飞书登录状态 + 权限门控 ──
-state.feishu = { configured: false, logged_in: false, allowed: true, name: '', email: '',
-                 perms: ['survey','annotate'], is_admin: false };
+state.feishu = {
+  configured: false, logged_in: false, allowed: true, name: '', email: '',
+  perms: ['survey', 'annotate'], is_admin: false
+};
 
 function applyPermGating() {
   const perms = state.feishu.perms || [];
@@ -1391,6 +1454,10 @@ function applyPermGating() {
   if (permNav) permNav.style.display = state.feishu.is_admin ? '' : 'none';
   const auditNav = $('stab-audit-nav');
   if (auditNav) auditNav.style.display = state.feishu.is_admin ? '' : 'none';
+  const adminLabel = $('settings-nav-admin-label');
+  if (adminLabel) adminLabel.style.display = state.feishu.is_admin ? '' : 'none';
+  const adminSep = $('settings-nav-admin-sep');
+  if (adminSep) adminSep.style.display = state.feishu.is_admin ? '' : 'none';
 }
 
 async function refreshFeishuStatus() {
@@ -1401,7 +1468,7 @@ async function refreshFeishuStatus() {
   const label = $('feishu-login-label');
   if (label) {
     label.textContent = state.feishu.logged_in
-      ? `飞书：${state.feishu.email || state.feishu.name || '已登录'}`
+      ? `飞书：${state.feishu.name || state.feishu.email || '已登录'}`
       : '登录飞书';
   }
   applyPermGating();
@@ -1415,7 +1482,7 @@ $('btn-feishu-login').addEventListener('click', async () => {
   if (state.feishu.logged_in) {
     try {
       await fetch('/api/feishu/logout', { method: 'POST' });
-    } catch {}
+    } catch { }
     showToast('已退出飞书登录', 'info');
     window.location.href = '/login';
     return;
@@ -1509,21 +1576,31 @@ async function exportFeishu() {
 }
 
 function showFeishuLink(url) {
-  // 清除旧的大 box（如果存在）
   const oldBox = $('feishu-link-box');
   if (oldBox) oldBox.remove();
-  // 在按钮下方 inline 显示链接
   const inline = $('feishu-link-inline');
   if (inline) {
+    inline.style.display = '';
     inline.innerHTML = `<a href="${esc(url)}" target="_blank" rel="noopener"
-      style="color:var(--accent);text-decoration:none;display:flex;align-items:center;gap:4px">
+      style="display:flex;align-items:center;gap:6px;padding:6px 14px 8px;font-size:12px;color:var(--accent);text-decoration:none">
       <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
         <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
         <polyline points="14 2 14 8 20 8"/>
-      </svg>查看飞书文档</a>`;
+      </svg>✓ 查看飞书文档 →</a>`;
     activeReportCtx().feishuLinkHtml = inline.innerHTML;
   }
 }
+
+// Export dropdown toggle
+$('btn-export-dropdown').addEventListener('click', e => {
+  e.stopPropagation();
+  $('export-dropdown-menu').classList.toggle('open');
+});
+document.addEventListener('click', e => {
+  const dropdown = $('export-dropdown');
+  const menu = $('export-dropdown-menu');
+  if (menu && dropdown && !dropdown.contains(e.target)) menu.classList.remove('open');
+});
 $('btn-export-md').addEventListener('click', () => {
   if (state.viewMode === 'history') {
     // 历史无专用 md 导出端点，直接用浏览器下载已渲染的 md
@@ -1562,7 +1639,7 @@ async function sendQA() {
     let answer = '';
     let finalAnswer = '';
 
-    const url  = qaMode === 'history' ? '/api/history-qa' : '/api/qa';
+    const url = qaMode === 'history' ? '/api/history-qa' : '/api/qa';
     const body = qaMode === 'history'
       ? { history_id: state.historyId, question }
       : { session_id: state.sessionId, question };
@@ -1628,6 +1705,7 @@ function appendQABubble(role, text, isTyping = false) {
   msgDiv.appendChild(bubble);
   container.appendChild(msgDiv);
   container.scrollTop = container.scrollHeight;
+  if (!isTyping) updateQaBadge();
   return bubble;
 }
 
@@ -1635,7 +1713,7 @@ function appendQABubble(role, text, isTyping = false) {
 // Drawer 通用控制
 // ============================================================
 
-function openDrawer(id)  { $(id).classList.add('drawer--open'); }
+function openDrawer(id) { $(id).classList.add('drawer--open'); }
 function closeDrawer(id) { $(id).classList.remove('drawer--open'); }
 
 document.querySelectorAll('[data-drawer-close]').forEach(el => {
@@ -1653,10 +1731,10 @@ document.addEventListener('keydown', e => {
 // ============================================================
 
 const STAB_LOADERS = {
-  texts:   loadUiTextsSettings,
+  texts: loadUiTextsSettings,
   prompts: loadPrompts,
-  perms:   loadPermsTab,
-  audit:   loadAuditLogsTab,
+  perms: loadPermsTab,
+  audit: loadAuditLogsTab,
 };
 
 function switchSettingsTab(name) {
@@ -1673,6 +1751,32 @@ function switchSettingsTab(name) {
 document.querySelectorAll('.settings-nav__item[data-stab]').forEach(el => {
   el.addEventListener('click', () => switchSettingsTab(el.dataset.stab));
 });
+
+// Settings nav collapse toggle
+(function () {
+  const nav = $('settings-nav');
+  const toggleBtn = $('btn-settings-nav-toggle');
+  if (!nav || !toggleBtn) return;
+  const STORAGE_KEY = 'settings-nav-collapsed';
+  if (localStorage.getItem(STORAGE_KEY) === '1') nav.classList.add('settings-nav--collapsed');
+  toggleBtn.addEventListener('click', () => {
+    const collapsed = nav.classList.toggle('settings-nav--collapsed');
+    localStorage.setItem(STORAGE_KEY, collapsed ? '1' : '0');
+  });
+})();
+
+// Main sidebar collapse toggle
+(function () {
+  const sidebar = document.querySelector('.sidebar');
+  const toggleBtn = $('btn-sidebar-toggle');
+  if (!sidebar || !toggleBtn) return;
+  const STORAGE_KEY = 'sidebar-collapsed';
+  if (localStorage.getItem(STORAGE_KEY) === '1') sidebar.classList.add('sidebar--collapsed');
+  toggleBtn.addEventListener('click', () => {
+    const collapsed = sidebar.classList.toggle('sidebar--collapsed');
+    localStorage.setItem(STORAGE_KEY, collapsed ? '1' : '0');
+  });
+})();
 
 function loadActiveSettingsTab() {
   const active = document.querySelector('.settings-nav__item--active');
@@ -1752,7 +1856,7 @@ function renderPermsTable(users) {
     if ($('perm-new-survey').checked) perms.push('survey');
     if ($('perm-new-annotate').checked) perms.push('annotate');
     try {
-      const r = await fetch('/api/admin/users', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ email, perms }) });
+      const r = await fetch('/api/admin/users', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, perms }) });
       const d = await r.json();
       if (!r.ok) throw new Error(d.detail || '添加失败');
       showToast(`已添加 ${email}`, 'success');
@@ -1781,7 +1885,7 @@ function renderPermsTable(users) {
           patch = { perms };
         }
         const r = await fetch(`/api/admin/users/${encodeURIComponent(email)}`, {
-          method: 'PATCH', headers: {'Content-Type':'application/json'}, body: JSON.stringify(patch)
+          method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch)
         });
         const d = await r.json();
         if (!r.ok) throw new Error(d.detail || '更新失败');
@@ -1957,8 +2061,8 @@ $('stab-content-texts').addEventListener('click', async e => {
     btn.disabled = true;
     const resp = await fetch(`/api/ui-texts/${key}`, {
       method: 'PUT',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({content: textarea.value}),
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: textarea.value }),
     });
     if (!resp.ok) { const d = await resp.json(); throw new Error(d.detail || '保存失败'); }
     showToast('文案已保存', 'success');
@@ -2032,7 +2136,7 @@ $('stab-content-prompts').addEventListener('click', async e => {
   if (saveBtn) {
     const key = saveBtn.dataset.save;
     const content = document.querySelector(`[data-content="${key}"]`).value;
-    const note    = (document.querySelector(`[data-note="${key}"]`) || {}).value || '';
+    const note = (document.querySelector(`[data-note="${key}"]`) || {}).value || '';
     saveBtn.disabled = true;
     saveBtn.textContent = '保存中…';
     try {
@@ -2113,7 +2217,7 @@ function formatTime(iso) {
   try {
     const d = new Date(iso);
     const pad = n => String(n).padStart(2, '0');
-    return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
   } catch { return iso; }
 }
 
@@ -2134,7 +2238,7 @@ $('history-body').addEventListener('click', async e => {
     if (!resp.ok) throw new Error(entry.detail || '加载失败');
 
     saveActiveReportUi();
-    state.viewMode  = 'history';
+    state.viewMode = 'history';
     state.historyId = id;
     state.historyReport.id = id;
     state.historyReport.reportNo = entry.report_no || '';
@@ -2241,6 +2345,7 @@ $('btn-restart').addEventListener('click', () => {
   };
   resetUploadZone();
   fileInput.value = '';
+  resetCrosstabUploader();
   clearPlanInput();
   $('qa-input').disabled = false;
   $('btn-qa-send').disabled = false;
@@ -2266,16 +2371,124 @@ $('btn-qual-enter').addEventListener('click', () => {
       const el = $('upload-guide');
       if (el && content) el.innerHTML = marked.parse(content);
     })
-    .catch(() => {});
+    .catch(() => { });
 });
 
 // ── 定量分析（跑数表模式）：三文件上传 ──
+const CT_FILE_SLOTS = [
+  { key: 'survey', inputId: 'ct-survey', label: '问卷文件' },
+  { key: 'data', inputId: 'ct-data', label: '回答数据' },
+  { key: 'crosstab', inputId: 'ct-crosstab', label: '跑数表' },
+];
+
+function getCrosstabFile(slot) {
+  const input = $(slot.inputId);
+  return input ? input.files[0] : null;
+}
+
+function isSupportedCrosstabFile(file) {
+  return /\.(csv|xlsx|xls)$/i.test(file.name || '');
+}
+
+function updateCrosstabFileCard(slot) {
+  const file = getCrosstabFile(slot);
+  const card = document.querySelector(`[data-ct-slot="${slot.key}"]`);
+  const nameEl = document.querySelector(`[data-ct-file-name="${slot.key}"]`);
+  if (!card || !nameEl) return;
+  card.classList.toggle('crosstab-file-card--selected', !!file);
+  nameEl.textContent = file ? file.name : '未选择文件';
+}
+
+function updateCrosstabUploadState() {
+  CT_FILE_SLOTS.forEach(updateCrosstabFileCard);
+  const btn = $('btn-ct-upload');
+  if (!btn) return;
+  const ready = CT_FILE_SLOTS.every(slot => !!getCrosstabFile(slot));
+  if (!btn.dataset.loading) btn.disabled = !ready;
+}
+
+function resetCrosstabUploader() {
+  CT_FILE_SLOTS.forEach(slot => {
+    const input = $(slot.inputId);
+    if (input) input.value = '';
+  });
+  const uploader = document.querySelector('.crosstab-uploader');
+  if (uploader) uploader.classList.remove('crosstab-uploader--loading');
+  const btn = $('btn-ct-upload');
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = '上传并解析跑数表';
+    delete btn.dataset.loading;
+  }
+  updateCrosstabUploadState();
+}
+
+function setCrosstabUploadLoading(loading) {
+  const btn = $('btn-ct-upload');
+  const uploader = document.querySelector('.crosstab-uploader');
+  if (uploader) uploader.classList.toggle('crosstab-uploader--loading', loading);
+  if (!btn) return;
+  if (loading) {
+    btn.dataset.loading = '1';
+    btn.disabled = true;
+    btn.textContent = '正在上传与解析...';
+  } else {
+    delete btn.dataset.loading;
+    btn.textContent = '上传并解析跑数表';
+    updateCrosstabUploadState();
+  }
+}
+
+function assignCrosstabFile(slot, file) {
+  if (!file) return;
+  if (!isSupportedCrosstabFile(file)) {
+    showToast(`${slot.label}仅支持 CSV / Excel 文件`, 'error');
+    return;
+  }
+  const input = $(slot.inputId);
+  if (!input) return;
+  const transfer = new DataTransfer();
+  transfer.items.add(file);
+  input.files = transfer.files;
+  updateCrosstabUploadState();
+}
+
+CT_FILE_SLOTS.forEach(slot => {
+  const input = $(slot.inputId);
+  const card = document.querySelector(`[data-ct-slot="${slot.key}"]`);
+  if (!input || !card) return;
+  input.addEventListener('change', () => {
+    const file = getCrosstabFile(slot);
+    if (file && !isSupportedCrosstabFile(file)) {
+      input.value = '';
+      showToast(`${slot.label}仅支持 CSV / Excel 文件`, 'error');
+    }
+    updateCrosstabUploadState();
+  });
+  card.addEventListener('dragover', e => {
+    e.preventDefault();
+    card.classList.add('crosstab-file-card--drag');
+  });
+  card.addEventListener('dragleave', () => card.classList.remove('crosstab-file-card--drag'));
+  card.addEventListener('drop', e => {
+    e.preventDefault();
+    card.classList.remove('crosstab-file-card--drag');
+    assignCrosstabFile(slot, e.dataTransfer.files[0]);
+  });
+});
+
+$('btn-ct-back').addEventListener('click', () => {
+  state.mode = null;
+  resetCrosstabUploader();
+  $('crosstab-upload-area').style.display = 'none';
+  $('analysis-type-picker').style.display = '';
+});
+
 $('btn-quant-enter').addEventListener('click', () => {
   state.mode = 'crosstab';
   $('analysis-type-picker').style.display = 'none';
   $('crosstab-upload-area').style.display = '';
-  const ctBtn = $('btn-ct-upload');
-  if (ctBtn) { ctBtn.disabled = false; ctBtn.textContent = '开始分析'; }
+  updateCrosstabUploadState();
 });
 
 $('btn-ct-upload').addEventListener('click', async () => {
@@ -2287,9 +2500,7 @@ $('btn-ct-upload').addEventListener('click', async () => {
   for (const f of [sf, df, cf]) {
     if (f.size > MAX) { showToast(`文件 ${f.name} 超过 50MB 上限`, 'error'); return; }
   }
-  const btn = $('btn-ct-upload');
-  btn.disabled = true;
-  btn.textContent = '正在上传与解析…';
+  setCrosstabUploadLoading(true);
   const fd = new FormData();
   fd.append('survey_file', sf);
   fd.append('data_file', df);
@@ -2299,8 +2510,8 @@ $('btn-ct-upload').addEventListener('click', async () => {
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.detail || '上传失败');
     state.sessionId = data.session_id;
-    state.mode      = 'crosstab';
-    state.viewMode  = 'session';
+    state.mode = 'crosstab';
+    state.viewMode = 'session';
     state.historyId = null;
     clearPlanInput();
     state.sessionReport = {
@@ -2314,8 +2525,7 @@ $('btn-ct-upload').addEventListener('click', async () => {
     startPlan();
   } catch (e) {
     showToast(`上传失败：${e.message}`, 'error');
-    btn.disabled = false;
-    btn.textContent = '开始分析';
+    setCrosstabUploadLoading(false);
   }
 });
 
@@ -2329,7 +2539,7 @@ async function initUiTexts() {
       const el = document.querySelector(`[data-uitext="${key}"]`);
       if (el) el.textContent = item.current;
     });
-  } catch {}
+  } catch { }
 }
 
 // ── Init ──
@@ -2342,8 +2552,8 @@ initUiTexts();
 // ============================================================
 
 const surveyPanels = panels;            // panel-1 ~ panel-5
-const annPanelIds  = [1, 2, 3, 4, 5, 6];
-const annPanels    = annPanelIds.map(n => $(`ann-panel-${n}`));
+const annPanelIds = [1, 2, 3, 4, 5, 6];
+const annPanels = annPanelIds.map(n => $(`ann-panel-${n}`));
 
 let currentMode = 'survey'; // 'survey' | 'annotate'
 
@@ -2424,6 +2634,7 @@ if (btnQaCollapse) {
   btnQaCollapse.addEventListener('click', () => {
     const side = $('qa-side');
     if (!side) return;
+    side.classList.remove('qa-side--wide');
     side.classList.toggle('qa-side--collapsed');
     updateQAPanelButtons();
   });
@@ -2435,19 +2646,19 @@ updateQAPanelButtons();
 // ============================================================
 
 const annState = {
-  sessionId:         null,
-  currentStep:       1,
-  headers:           [],
-  headersZh:         [],
-  idCol:             1,
-  openTextCols:      [],
-  matrixColIdxs:     new Set(),
-  tasks:             { ai_detect: false, quality: false },
-  aiResults:         [],
-  highProbResults:   [],
-  confirmedAiIds:    new Set(),
-  qualityCount:      0,
-  missingAiIds:      [],
+  sessionId: null,
+  currentStep: 1,
+  headers: [],
+  headersZh: [],
+  idCol: 1,
+  openTextCols: [],
+  matrixColIdxs: new Set(),
+  tasks: { ai_detect: false, quality: false },
+  aiResults: [],
+  highProbResults: [],
+  confirmedAiIds: new Set(),
+  qualityCount: 0,
+  missingAiIds: [],
   missingQualityIds: [],
 };
 
@@ -2458,7 +2669,7 @@ function annGoStep(n) {
   document.querySelectorAll('[data-ann-step]').forEach(btn => {
     const i = +btn.dataset.annStep;
     btn.classList.remove('step-bar__item--active', 'step-bar__item--done');
-    if (i < n)      btn.classList.add('step-bar__item--done');
+    if (i < n) btn.classList.add('step-bar__item--done');
     else if (i === n) btn.classList.add('step-bar__item--active');
     btn.disabled = true; // 标注流程不支持回看
   });
@@ -2468,7 +2679,7 @@ function annGoStep(n) {
 // ── ANN STEP 1: 上传 ────────────────────────────────────────
 
 const annUploadZone = $('ann-upload-zone');
-const annFileInput  = $('ann-file-input');
+const annFileInput = $('ann-file-input');
 
 annUploadZone.addEventListener('click', () => annFileInput.click());
 annUploadZone.addEventListener('dragover', e => { e.preventDefault(); annUploadZone.classList.add('drag-over'); });
@@ -2497,12 +2708,12 @@ async function annHandleUpload(file) {
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.detail || '上传失败');
 
-    annState.sessionId      = data.session_id;
-    annState.headers        = data.headers;
-    annState.headersZh      = data.headers_zh || data.headers;
-    annState.idCol          = data.id_col;
-    annState.openTextCols   = data.open_text_cols;
-    annState.matrixColIdxs  = new Set(data.matrix_col_idxs || []);
+    annState.sessionId = data.session_id;
+    annState.headers = data.headers;
+    annState.headersZh = data.headers_zh || data.headers;
+    annState.idCol = data.id_col;
+    annState.openTextCols = data.open_text_cols;
+    annState.matrixColIdxs = new Set(data.matrix_col_idxs || []);
 
     $('ann-preview-meta').textContent =
       `${data.filename} · ${data.total_rows} 行数据 · ${data.headers.length} 列`;
@@ -2534,9 +2745,9 @@ function annResetUploadZone() {
 // ── ANN STEP 2: 列确认 + 任务 ──────────────────────────────
 
 function annRenderColConfig(headers, idCol, openTextCols, headersZh, matrixIdxs) {
-  const zh     = headersZh || headers;
-  const otSet  = new Set(openTextCols);
-  const mxSet  = matrixIdxs || new Set();
+  const zh = headersZh || headers;
+  const otSet = new Set(openTextCols);
+  const mxSet = matrixIdxs || new Set();
   const container = $('ann-col-config');
 
   // ID 列选择（显示中文名，排除矩阵子列）
@@ -2580,7 +2791,7 @@ function annRenderColConfig(headers, idCol, openTextCols, headersZh, matrixIdxs)
       annUpdateStartBtn();
     });
   });
-  annState.idCol        = idCol;
+  annState.idCol = idCol;
   annState.openTextCols = [...otSet];
   annUpdateStartBtn();
 }
@@ -2627,7 +2838,7 @@ function annSyncTaskCards() {
 ['task-ai-detect', 'task-quality'].forEach(id => {
   $(id).addEventListener('change', () => {
     annState.tasks.ai_detect = $('task-ai-detect').checked;
-    annState.tasks.quality   = $('task-quality').checked;
+    annState.tasks.quality = $('task-quality').checked;
     $('ann-background-block').style.display = annState.tasks.ai_detect ? '' : 'none';
     annSyncTaskCards();
     annUpdateStartBtn();
@@ -2647,7 +2858,7 @@ $('ann-btn-start').addEventListener('click', annStartAnnotation);
 
 async function annStartAnnotation() {
   $('ann-btn-start').disabled = true;
-  annState.missingAiIds      = [];
+  annState.missingAiIds = [];
   annState.missingQualityIds = [];
   $('ann-btn-download').disabled = false;
   // 读取最新 id_col
@@ -2659,20 +2870,20 @@ async function annStartAnnotation() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        id_col:         annState.idCol,
+        id_col: annState.idCol,
         open_text_cols: annState.openTextCols,
-        tasks:          annState.tasks,
-        background:     ($('ann-background').value || '').trim(),
+        tasks: annState.tasks,
+        background: ($('ann-background').value || '').trim(),
       }),
     });
     if (!resp.ok) {
       const d = await resp.json();
       throw new Error(d.detail || '保存失败');
     }
-    annState.aiResults       = [];
+    annState.aiResults = [];
     annState.highProbResults = [];
-    annState.confirmedAiIds  = new Set();
-    annState.qualityCount    = 0;
+    annState.confirmedAiIds = new Set();
+    annState.qualityCount = 0;
 
     if (annState.tasks.ai_detect) {
       annGoStep(3);
@@ -2690,8 +2901,8 @@ async function annStartAnnotation() {
 // ── ANN STEP 3: AI 检测 ────────────────────────────────────
 
 async function annRunAiDetect() {
-  const bar     = $('ann-ai-progress-bar');
-  const msg     = $('ann-ai-progress-msg');
+  const bar = $('ann-ai-progress-bar');
+  const msg = $('ann-ai-progress-msg');
   const warnLog = $('ann-ai-warn-log');
   let backBtn = $('ann-btn-ai-back');
   if (!backBtn) {
@@ -2752,11 +2963,11 @@ async function annRunAiDetect() {
       }
       if (ev.type === 'ai_detect_done') {
         bar.style.width = '100%';
-        const results    = ev.results || [];
+        const results = ev.results || [];
         const missingIds = ev.missing_ids || [];
-        annState.aiResults       = results;
+        annState.aiResults = results;
         annState.highProbResults = ev.high_prob || [];
-        annState.missingAiIds    = missingIds;
+        annState.missingAiIds = missingIds;
         if (missingIds.length > 0) {
           msg.textContent = `AI 检测完成，共 ${results.length} 条结果（${missingIds.length} 行重试后仍未回填）`;
           appendAiLog(`重试后仍有 ${missingIds.length} 行无法回填，下载已被阻断。涉及 ID：${missingIds.slice(0, 5).join(', ')}${missingIds.length > 5 ? '…' : ''}`, 'error');
@@ -2795,9 +3006,9 @@ async function annRunAiDetect() {
 // ── ANN STEP 4: AI 确认 ────────────────────────────────────
 
 function annRenderAiConfirm(highProbResults) {
-  const table   = $('ann-confirm-table');
+  const table = $('ann-confirm-table');
   const headers = annState.headers;
-  const otCols  = annState.openTextCols;
+  const otCols = annState.openTextCols;
 
   // 构建表头
   let thCells = `<th><input type="checkbox" id="ann-check-master" checked /></th>
@@ -2882,8 +3093,8 @@ async function annAfterAiConfirm() {
 // ── ANN STEP 5: 质量打标 ───────────────────────────────────
 
 async function annRunQuality() {
-  const bar     = $('ann-quality-progress-bar');
-  const msg     = $('ann-quality-progress-msg');
+  const bar = $('ann-quality-progress-bar');
+  const msg = $('ann-quality-progress-msg');
   const warnLog = $('ann-quality-warn-log');
   bar.style.width = '0%';
   msg.textContent = '正在连接…';
@@ -2905,7 +3116,7 @@ async function annRunQuality() {
       if (ev.type === 'quality_done') {
         bar.style.width = '100%';
         const missingQIds = ev.missing_ids || [];
-        annState.qualityCount      = ev.count;
+        annState.qualityCount = ev.count;
         annState.missingQualityIds = missingQIds;
         if (missingQIds.length > 0) {
           msg.textContent = `质量打标完成，共 ${ev.count} 条结果（${missingQIds.length} 行重试后仍未回填）`;
@@ -2931,11 +3142,11 @@ function annShowDone() {
   if (annState.tasks.quality) {
     parts.push(`质量打标：${annState.qualityCount} 条`);
   }
-  const missingAi = annState.missingAiIds      || [];
-  const missingQ  = annState.missingQualityIds || [];
+  const missingAi = annState.missingAiIds || [];
+  const missingQ = annState.missingQualityIds || [];
   const missingParts = [];
   if (missingAi.length) missingParts.push(`AI 检测漏返 ${missingAi.length} 行`);
-  if (missingQ.length)  missingParts.push(`质量打标漏返 ${missingQ.length} 行`);
+  if (missingQ.length) missingParts.push(`质量打标漏返 ${missingQ.length} 行`);
   if (missingParts.length) {
     $('ann-done-text').innerHTML =
       parts.join('<br>') +
@@ -2955,22 +3166,22 @@ $('ann-btn-download').addEventListener('click', () => {
 
 $('ann-btn-restart').addEventListener('click', () => {
   if (!confirm('确定要重新标注吗？当前标注数据将被清除。')) return;
-  annState.sessionId       = null;
-  annState.currentStep     = 1;
-  annState.headers         = [];
-  annState.idCol           = 1;
-  annState.openTextCols    = [];
-  annState.tasks           = { ai_detect: false, quality: false };
-  annState.aiResults         = [];
-  annState.highProbResults   = [];
-  annState.confirmedAiIds    = new Set();
-  annState.qualityCount      = 0;
-  annState.missingAiIds      = [];
+  annState.sessionId = null;
+  annState.currentStep = 1;
+  annState.headers = [];
+  annState.idCol = 1;
+  annState.openTextCols = [];
+  annState.tasks = { ai_detect: false, quality: false };
+  annState.aiResults = [];
+  annState.highProbResults = [];
+  annState.confirmedAiIds = new Set();
+  annState.qualityCount = 0;
+  annState.missingAiIds = [];
   annState.missingQualityIds = [];
   $('ann-btn-download').disabled = false;
   $('task-ai-detect').checked = false;
-  $('task-quality').checked   = false;
-  $('ann-background').value   = '';
+  $('task-quality').checked = false;
+  $('ann-background').value = '';
   $('ann-background-block').style.display = 'none';
   annSyncTaskCards();
   annResetUploadZone();
@@ -2987,4 +3198,4 @@ fetch('/api/upload-guide')
     const el = document.getElementById('upload-guide');
     if (el && content) el.innerHTML = marked.parse(content);
   })
-  .catch(() => {});
+  .catch(() => { });

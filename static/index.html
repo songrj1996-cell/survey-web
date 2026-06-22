@@ -1,15 +1,19 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
+
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>问卷分析平台 · Survey Analyst</title>
+  <title>调研分析平台</title>
   <meta name="description" content="上传问卷数据，AI 自动生成专业分析报告，支持多维交叉分析与智能追问" />
+  <link rel="icon" type="image/jpeg" href="/static/web-icon.jpg?v=1" />
+  <link rel="shortcut icon" type="image/jpeg" href="/static/web-icon.jpg?v=1" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/style.css?v=12" />
+  <link rel="stylesheet" href="/static/style.css?v=14" />
 </head>
+
 <body>
   <div class="aurora" aria-hidden="true">
     <div class="aurora__orb aurora__orb--1"></div>
@@ -22,19 +26,27 @@
     <aside class="sidebar">
       <div class="sidebar__brand">
         <div class="brand-icon">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
-            <rect x="3" y="3" width="18" height="18" rx="3"/>
-            <path d="M9 9h6M9 12h6M9 15h4"/>
-            <circle cx="18" cy="18" r="3" fill="currentColor" stroke="none"/>
-          </svg>
+          <img src="/static/web-icon.jpg?v=1" alt="" />
         </div>
         <div>
-          <div class="brand-name">问卷洞察</div>
-          <div class="brand-sub">Survey Insight · AI 分析平台</div>
+          <div class="brand-name">调研分析平台</div>
+          <div class="brand-sub">定性/定量报告工作台</div>
         </div>
         <button class="brand-toggle" id="btn-theme" title="切换深色 / 浅色主题" aria-label="切换主题">
-          <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
-          <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+          <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
+          </svg>
+          <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="5" />
+            <line x1="12" y1="1" x2="12" y2="3" />
+            <line x1="12" y1="21" x2="12" y2="23" />
+            <line x1="4.22" y1="4.22" x2="5.64" y2="5.64" />
+            <line x1="18.36" y1="18.36" x2="19.78" y2="19.78" />
+            <line x1="1" y1="12" x2="3" y2="12" />
+            <line x1="21" y1="12" x2="23" y2="12" />
+            <line x1="4.22" y1="19.78" x2="5.64" y2="18.36" />
+            <line x1="18.36" y1="5.64" x2="19.78" y2="4.22" />
+          </svg>
         </button>
       </div>
 
@@ -44,7 +56,8 @@
         <div class="nav-item nav-item--active" id="nav-survey">
           <div class="nav-item__header" id="nav-header-survey">
             <svg class="nav-item__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>
+              <path d="M9 11l3 3L22 4" />
+              <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" />
             </svg>
             <span>问卷分析</span>
           </div>
@@ -54,7 +67,8 @@
         <div class="nav-item" id="nav-annotate">
           <div class="nav-item__header" id="nav-header-annotate">
             <svg class="nav-item__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 9h6M9 12h6M9 15h4"/>
+              <rect x="3" y="3" width="18" height="18" rx="2" />
+              <path d="M9 9h6M9 12h6M9 15h4" />
             </svg>
             <span>数据标注</span>
           </div>
@@ -64,7 +78,9 @@
         <div class="nav-item" id="nav-settings">
           <div class="nav-item__header" id="nav-header-settings">
             <svg class="nav-item__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06-.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+              <circle cx="12" cy="12" r="3" />
+              <path
+                d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06-.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
             </svg>
             <span>设置</span>
           </div>
@@ -73,17 +89,34 @@
 
       <div class="sidebar__footer">
         <button class="sidebar-action" id="btn-feishu-login">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+            <polyline points="14 2 14 8 20 8" />
+          </svg>
           <span id="feishu-login-label">登录飞书</span>
         </button>
         <button class="sidebar-action" id="btn-open-history">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><path d="M12 7v5l4 2"/></svg>
-          历史记录
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M3 3v5h5" />
+            <path d="M3.05 13A9 9 0 1 0 6 5.3L3 8" />
+            <path d="M12 7v5l4 2" />
+          </svg>
+          <span>历史记录</span>
         </button>
 
         <button class="sidebar-action sidebar-action--danger" id="btn-restart">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
-          重新开始
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+            <path d="M3 3v5h5" />
+          </svg>
+          <span>重新开始</span>
+        </button>
+
+        <button class="sidebar-action" id="btn-sidebar-toggle" title="收起/展开侧边栏">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="15 18 9 12 15 6" />
+          </svg>
+          <span>收起侧边栏</span>
         </button>
       </div>
     </aside>
@@ -94,14 +127,20 @@
       <!-- STEP 1: Upload -->
       <section class="panel" id="panel-1">
         <div class="step-bar" id="step-bar-1">
-          <button class="step-bar__item step-bar__item--active" data-survey-step="1"><span class="step-bar__num">1</span><span class="step-bar__label">上传数据</span></button>
-          <button class="step-bar__item" data-survey-step="2"><span class="step-bar__num">2</span><span class="step-bar__label">数据确认</span></button>
-          <button class="step-bar__item" data-survey-step="3"><span class="step-bar__num">3</span><span class="step-bar__label">方案确认</span></button>
-          <button class="step-bar__item" data-survey-step="4"><span class="step-bar__num">4</span><span class="step-bar__label">生成报告</span></button>
-          <button class="step-bar__item" data-survey-step="5"><span class="step-bar__num">5</span><span class="step-bar__label">报告 &amp; 追问</span></button>
+          <button class="step-bar__item step-bar__item--active" data-survey-step="1"><span
+              class="step-bar__num">1</span><span class="step-bar__label">上传数据</span></button>
+          <button class="step-bar__item" data-survey-step="2"><span class="step-bar__num">2</span><span
+              class="step-bar__label">数据确认</span></button>
+          <button class="step-bar__item" data-survey-step="3"><span class="step-bar__num">3</span><span
+              class="step-bar__label">方案确认</span></button>
+          <button class="step-bar__item" data-survey-step="4"><span class="step-bar__num">4</span><span
+              class="step-bar__label">生成报告</span></button>
+          <button class="step-bar__item" data-survey-step="5"><span class="step-bar__num">5</span><span
+              class="step-bar__label">报告 &amp; 追问</span></button>
         </div>
         <div class="panel__header">
-          <h1 class="panel__title">问卷分析</h1>
+          <h1 class="panel__title">选择分析入口</h1>
+          <p class="panel__desc">按数据来源选择流程。定量入口用于倍市得跑数表，上传三类文件后直接进入报告方案确认。</p>
         </div>
 
         <!-- 分析类型选择 -->
@@ -109,27 +148,29 @@
           <div class="analysis-type-card" id="btn-qual-enter">
             <div class="analysis-type-card__icon">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-                <polyline points="14 2 14 8 20 8"/>
-                <line x1="9" y1="13" x2="15" y2="13"/><line x1="9" y1="17" x2="13" y2="17"/>
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                <polyline points="14 2 14 8 20 8" />
+                <line x1="9" y1="13" x2="15" y2="13" />
+                <line x1="9" y1="17" x2="13" y2="17" />
               </svg>
             </div>
             <div class="analysis-type-card__body">
-              <div class="analysis-type-card__title">定性分析</div>
-              <div class="analysis-type-card__desc">上传问卷数据，AI 识别题型、规划分析方案，生成完整分析报告</div>
-              <div class="analysis-type-card__enter">进入 →</div>
+              <div class="analysis-type-card__title">定性问卷分析</div>
+              <div class="analysis-type-card__desc">上传原始问卷数据，确认题型与分析方案后生成完整报告。</div>
+              <div class="analysis-type-card__enter">选择入口 →</div>
             </div>
           </div>
           <div class="analysis-type-card" id="btn-quant-enter">
             <div class="analysis-type-card__icon">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-                <rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 9h6M9 12h6M9 15h4"/>
+                <rect x="3" y="3" width="18" height="18" rx="2" />
+                <path d="M9 9h6M9 12h6M9 15h4" />
               </svg>
             </div>
             <div class="analysis-type-card__body">
               <div class="analysis-type-card__title">定量分析（倍市得跑数表）</div>
-              <div class="analysis-type-card__desc">上传问卷 + 回答数据 + 跑数表，平台直接用跑数表数字、并对主观题聚类，生成报告</div>
-              <div class="analysis-type-card__enter">进入 →</div>
+              <div class="analysis-type-card__desc">上传问卷、清数结果和跑数表。报告数字取自跑数表，主观题由平台聚类补充。</div>
+              <div class="analysis-type-card__enter">选择入口 →</div>
             </div>
           </div>
         </div>
@@ -137,20 +178,69 @@
         <!-- 跑数表模式上传区（点定量分析后显示） -->
         <div id="crosstab-upload-area" style="display:none">
           <div class="crosstab-uploader">
-            <p class="panel__desc">跑数表模式：三个文件均需上传。数字取自跑数表，平台不再自算统计，仅对主观题做聚类。</p>
-            <label class="crosstab-file-row">
-              <span class="crosstab-file-row__label">① 问卷文件</span>
-              <input type="file" id="ct-survey" accept=".csv,.xlsx,.xls" />
-            </label>
-            <label class="crosstab-file-row">
-              <span class="crosstab-file-row__label">② 回答数据（清数结果）</span>
-              <input type="file" id="ct-data" accept=".csv,.xlsx,.xls" />
-            </label>
-            <label class="crosstab-file-row">
-              <span class="crosstab-file-row__label">③ 跑数表（统计结果）</span>
-              <input type="file" id="ct-crosstab" accept=".csv,.xlsx,.xls" />
-            </label>
-            <button class="btn btn--primary" id="btn-ct-upload">开始分析</button>
+            <div class="crosstab-uploader__header">
+              <div>
+                <h2 class="crosstab-uploader__title">上传倍市得定量文件</h2>
+                <p class="crosstab-uploader__desc">请一次性准备问卷文件、回答数据和跑数表。全部选齐后，系统会解析跑数表并跳过题型确认。</p>
+              </div>
+              <span class="analysis-type-card__badge">CSV / Excel · 最大 50MB</span>
+            </div>
+
+            <div class="crosstab-file-grid">
+              <label class="crosstab-file-card" for="ct-survey" data-ct-slot="survey">
+                <input type="file" id="ct-survey" accept=".csv,.xlsx,.xls" hidden />
+                <span class="crosstab-file-card__icon">
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                    <path d="M14 2H7a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7z" />
+                    <path d="M14 2v5h5" />
+                    <path d="M8 13h8M8 17h5" />
+                  </svg>
+                </span>
+                <span class="crosstab-file-card__body">
+                  <span class="crosstab-file-card__title">问卷文件</span>
+                  <span class="crosstab-file-card__desc">题目结构与问卷原文，用于理解报告章节。</span>
+                  <span class="crosstab-file-card__filename" data-ct-file-name="survey">未选择文件</span>
+                </span>
+                <span class="crosstab-file-card__action">选择文件</span>
+              </label>
+
+              <label class="crosstab-file-card" for="ct-data" data-ct-slot="data">
+                <input type="file" id="ct-data" accept=".csv,.xlsx,.xls" hidden />
+                <span class="crosstab-file-card__icon">
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                    <path d="M4 5h16M4 12h16M4 19h16" />
+                    <path d="M8 5v14M16 5v14" />
+                  </svg>
+                </span>
+                <span class="crosstab-file-card__body">
+                  <span class="crosstab-file-card__title">回答数据（清数结果）</span>
+                  <span class="crosstab-file-card__desc">已清洗的样本明细，用于主观题聚类和样本定位。</span>
+                  <span class="crosstab-file-card__filename" data-ct-file-name="data">未选择文件</span>
+                </span>
+                <span class="crosstab-file-card__action">选择文件</span>
+              </label>
+
+              <label class="crosstab-file-card" for="ct-crosstab" data-ct-slot="crosstab">
+                <input type="file" id="ct-crosstab" accept=".csv,.xlsx,.xls" hidden />
+                <span class="crosstab-file-card__icon">
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                    <rect x="3" y="4" width="18" height="16" rx="2" />
+                    <path d="M7 9h10M7 13h10M7 17h6" />
+                  </svg>
+                </span>
+                <span class="crosstab-file-card__body">
+                  <span class="crosstab-file-card__title">跑数表（统计结果）</span>
+                  <span class="crosstab-file-card__desc">倍市得后台导出的交叉统计表，报告数字以此为准。</span>
+                  <span class="crosstab-file-card__filename" data-ct-file-name="crosstab">未选择文件</span>
+                </span>
+                <span class="crosstab-file-card__action">选择文件</span>
+              </label>
+            </div>
+
+            <div class="crosstab-actions">
+              <button class="btn btn--ghost" id="btn-ct-back" type="button">返回入口选择</button>
+              <button class="btn btn--primary" id="btn-ct-upload" type="button" disabled>上传并解析跑数表</button>
+            </div>
           </div>
         </div>
 
@@ -161,9 +251,9 @@
             <input type="file" id="file-input" accept=".csv,.xlsx,.xls" hidden />
             <div class="upload-zone__icon">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-                <polyline points="17 8 12 3 7 8"/>
-                <line x1="12" y1="3" x2="12" y2="15"/>
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                <polyline points="17 8 12 3 7 8" />
+                <line x1="12" y1="3" x2="12" y2="15" />
               </svg>
             </div>
             <div class="upload-zone__text">
@@ -177,11 +267,16 @@
       <!-- STEP 2: Data confirm (column types) -->
       <section class="panel panel--hidden" id="panel-2">
         <div class="step-bar" id="step-bar-2">
-          <button class="step-bar__item" data-survey-step="1"><span class="step-bar__num">1</span><span class="step-bar__label">上传数据</span></button>
-          <button class="step-bar__item step-bar__item--active" data-survey-step="2"><span class="step-bar__num">2</span><span class="step-bar__label">数据确认</span></button>
-          <button class="step-bar__item" data-survey-step="3"><span class="step-bar__num">3</span><span class="step-bar__label">方案确认</span></button>
-          <button class="step-bar__item" data-survey-step="4"><span class="step-bar__num">4</span><span class="step-bar__label">生成报告</span></button>
-          <button class="step-bar__item" data-survey-step="5"><span class="step-bar__num">5</span><span class="step-bar__label">报告 &amp; 追问</span></button>
+          <button class="step-bar__item" data-survey-step="1"><span class="step-bar__num">1</span><span
+              class="step-bar__label">上传数据</span></button>
+          <button class="step-bar__item step-bar__item--active" data-survey-step="2"><span
+              class="step-bar__num">2</span><span class="step-bar__label">数据确认</span></button>
+          <button class="step-bar__item" data-survey-step="3"><span class="step-bar__num">3</span><span
+              class="step-bar__label">方案确认</span></button>
+          <button class="step-bar__item" data-survey-step="4"><span class="step-bar__num">4</span><span
+              class="step-bar__label">生成报告</span></button>
+          <button class="step-bar__item" data-survey-step="5"><span class="step-bar__num">5</span><span
+              class="step-bar__label">报告 &amp; 追问</span></button>
         </div>
         <div class="panel__header">
           <h1 class="panel__title">数据确认</h1>
@@ -190,7 +285,10 @@
 
         <div class="col-confirm-header">
           <div class="plan-section__title">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M9 11l3 3L22 4" />
+              <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" />
+            </svg>
             题型确认
           </div>
           <span class="col-confirm-count" id="col-confirm-count"></span>
@@ -202,7 +300,7 @@
         <div class="col-confirm-actions">
           <button class="btn btn--primary" id="btn-start-plan">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <polygon points="5 3 19 12 5 21 5 3"/>
+              <polygon points="5 3 19 12 5 21 5 3" />
             </svg>
             确认题型，开始 AI 分析
           </button>
@@ -212,11 +310,16 @@
       <!-- STEP 3: Plan -->
       <section class="panel panel--hidden" id="panel-3">
         <div class="step-bar" id="step-bar-3">
-          <button class="step-bar__item" data-survey-step="1"><span class="step-bar__num">1</span><span class="step-bar__label">上传数据</span></button>
-          <button class="step-bar__item" data-survey-step="2"><span class="step-bar__num">2</span><span class="step-bar__label">数据确认</span></button>
-          <button class="step-bar__item step-bar__item--active" data-survey-step="3"><span class="step-bar__num">3</span><span class="step-bar__label">方案确认</span></button>
-          <button class="step-bar__item" data-survey-step="4"><span class="step-bar__num">4</span><span class="step-bar__label">生成报告</span></button>
-          <button class="step-bar__item" data-survey-step="5"><span class="step-bar__num">5</span><span class="step-bar__label">报告 &amp; 追问</span></button>
+          <button class="step-bar__item" data-survey-step="1"><span class="step-bar__num">1</span><span
+              class="step-bar__label">上传数据</span></button>
+          <button class="step-bar__item" data-survey-step="2"><span class="step-bar__num">2</span><span
+              class="step-bar__label">数据确认</span></button>
+          <button class="step-bar__item step-bar__item--active" data-survey-step="3"><span
+              class="step-bar__num">3</span><span class="step-bar__label">方案确认</span></button>
+          <button class="step-bar__item" data-survey-step="4"><span class="step-bar__num">4</span><span
+              class="step-bar__label">生成报告</span></button>
+          <button class="step-bar__item" data-survey-step="5"><span class="step-bar__num">5</span><span
+              class="step-bar__label">报告 &amp; 追问</span></button>
         </div>
         <div class="panel__header">
           <h1 class="panel__title">AI 分析方案</h1>
@@ -224,7 +327,9 @@
         </div>
 
         <div class="thinking-block" id="plan-thinking">
-          <div class="thinking-block__icon"><div class="spinner"></div></div>
+          <div class="thinking-block__icon">
+            <div class="spinner"></div>
+          </div>
           <div class="thinking-block__content">
             <div class="thinking-block__title">AI 正在规划分析方案，请稍候…</div>
             <div class="thinking-block__stream" id="plan-stream-text"></div>
@@ -235,15 +340,20 @@
           <div class="plan-card__sections" id="plan-card-content"></div>
           <div class="plan-actions">
             <div class="plan-actions__hint">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 8v4l3 3"/></svg>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="12" r="10" />
+                <path d="M12 8v4l3 3" />
+              </svg>
               确认无误请点「确认方案」；或直接描述修改意见后点「提交修改」
             </div>
             <div class="plan-actions__row">
-              <input class="plan-input" id="plan-input" type="text" autocomplete="off" autocapitalize="off" spellcheck="false"
-                placeholder="比如：Part1 中应该包括 A、B、C；XXX 需要单独做分析，因为 XXX" />
+              <input class="plan-input" id="plan-input" type="text" autocomplete="off" autocapitalize="off"
+                spellcheck="false" placeholder="比如：Part1 中应该包括 A、B、C；XXX 需要单独做分析，因为 XXX" />
               <button class="btn btn--ghost" id="btn-plan-revise">提交修改</button>
               <button class="btn btn--primary" id="btn-plan-ok">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                  <polyline points="20 6 9 17 4 12" />
+                </svg>
                 确认方案
               </button>
             </div>
@@ -254,11 +364,16 @@
       <!-- STEP 4: Generating -->
       <section class="panel panel--hidden" id="panel-4">
         <div class="step-bar" id="step-bar-4">
-          <button class="step-bar__item" data-survey-step="1"><span class="step-bar__num">1</span><span class="step-bar__label">上传数据</span></button>
-          <button class="step-bar__item" data-survey-step="2"><span class="step-bar__num">2</span><span class="step-bar__label">数据确认</span></button>
-          <button class="step-bar__item" data-survey-step="3"><span class="step-bar__num">3</span><span class="step-bar__label">方案确认</span></button>
-          <button class="step-bar__item step-bar__item--active" data-survey-step="4"><span class="step-bar__num">4</span><span class="step-bar__label">生成报告</span></button>
-          <button class="step-bar__item" data-survey-step="5"><span class="step-bar__num">5</span><span class="step-bar__label">报告 &amp; 追问</span></button>
+          <button class="step-bar__item" data-survey-step="1"><span class="step-bar__num">1</span><span
+              class="step-bar__label">上传数据</span></button>
+          <button class="step-bar__item" data-survey-step="2"><span class="step-bar__num">2</span><span
+              class="step-bar__label">数据确认</span></button>
+          <button class="step-bar__item" data-survey-step="3"><span class="step-bar__num">3</span><span
+              class="step-bar__label">方案确认</span></button>
+          <button class="step-bar__item step-bar__item--active" data-survey-step="4"><span
+              class="step-bar__num">4</span><span class="step-bar__label">生成报告</span></button>
+          <button class="step-bar__item" data-survey-step="5"><span class="step-bar__num">5</span><span
+              class="step-bar__label">报告 &amp; 追问</span></button>
         </div>
         <div class="panel__header">
           <h1 class="panel__title">生成分析报告</h1>
@@ -301,106 +416,113 @@
 
       <!-- STEP 5: Report + QA -->
       <section class="panel panel--hidden" id="panel-5">
-        <div class="step-bar" id="step-bar-5">
-          <button class="step-bar__item" data-survey-step="1"><span class="step-bar__num">1</span><span class="step-bar__label">上传数据</span></button>
-          <button class="step-bar__item" data-survey-step="2"><span class="step-bar__num">2</span><span class="step-bar__label">数据确认</span></button>
-          <button class="step-bar__item" data-survey-step="3"><span class="step-bar__num">3</span><span class="step-bar__label">方案确认</span></button>
-          <button class="step-bar__item" data-survey-step="4"><span class="step-bar__num">4</span><span class="step-bar__label">生成报告</span></button>
-          <button class="step-bar__item step-bar__item--active" data-survey-step="5"><span class="step-bar__num">5</span><span class="step-bar__label">报告 &amp; 追问</span></button>
-        </div>
-        <div class="panel__header">
-          <div class="report-context-switch" id="report-context-switch" style="display:none">
-            <button class="report-context-switch__btn report-context-switch__btn--active" id="btn-report-session" type="button">
-              当前分析
-            </button>
-            <button class="report-context-switch__btn" id="btn-report-history" type="button" style="display:none">
-              历史报告
-            </button>
+
+        <!-- Toolbar -->
+        <div class="report-toolbar" id="report-toolbar">
+          <div class="report-toolbar__left">
+            <div class="report-context-switch" id="report-context-switch" style="display:none">
+              <button class="report-context-switch__btn report-context-switch__btn--active" id="btn-report-session"
+                type="button">当前分析</button>
+              <button class="report-context-switch__btn" id="btn-report-history" type="button"
+                style="display:none">历史报告</button>
+            </div>
+            <div class="report-toolbar__steps" id="report-breadcrumb"></div>
           </div>
-          <div class="panel__header-row">
-            <div>
-              <div class="report-title-row">
-                <h1 class="panel__title" id="report-title-display">分析报告</h1>
-                <button class="btn-title-edit" id="btn-report-rename" type="button" title="修改报告名称" aria-label="修改报告名称">
+          <div class="report-toolbar__title-area">
+            <div class="report-title-row">
+              <div class="report-toolbar__title" id="report-title-display">分析报告</div>
+              <button class="btn-title-edit" id="btn-report-rename" type="button" title="修改报告名称" aria-label="修改报告名称">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M12 20h9" />
+                  <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z" />
+                </svg>
+              </button>
+            </div>
+          </div>
+          <div class="report-toolbar__actions">
+            <div class="export-dropdown" id="export-dropdown">
+              <button class="btn btn--ghost" id="btn-export-dropdown" type="button">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                  <polyline points="7 10 12 15 17 10" />
+                  <line x1="12" y1="15" x2="12" y2="3" />
+                </svg>
+                导出
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                  style="width:11px;height:11px;opacity:.6">
+                  <polyline points="6 9 12 15 18 9" />
+                </svg>
+              </button>
+              <div class="export-dropdown__menu" id="export-dropdown-menu">
+                <button class="export-dropdown__item" id="btn-export-pdf" type="button">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <path d="M12 20h9"/>
-                    <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/>
+                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                    <polyline points="14 2 14 8 20 8" />
+                    <line x1="16" y1="13" x2="8" y2="13" />
+                    <line x1="16" y1="17" x2="8" y2="17" />
+                  </svg>
+                  下载 PDF
+                </button>
+                <div class="export-dropdown__sep"></div>
+                <button class="export-dropdown__item" id="btn-export-feishu" type="button">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                    <polyline points="14 2 14 8 20 8" />
+                    <line x1="9" y1="13" x2="15" y2="13" />
+                    <line x1="9" y1="17" x2="13" y2="17" />
+                  </svg>
+                  导出飞书文档
+                </button>
+                <div id="feishu-link-inline" style="display:none"></div>
+              </div>
+            </div>
+            <button class="btn btn--ghost" id="btn-export-md" style="display:none"></button>
+            <button class="btn btn--primary" id="btn-export-word" style="display:none"></button>
+          </div>
+        </div>
+
+        <!-- Report + QA sidebar -->
+        <div id="report-pane-report">
+          <div class="report-layout">
+            <nav class="report-toc" id="report-toc">
+              <div class="report-toc__title">目录</div>
+              <ul class="report-toc__list" id="report-toc-list"></ul>
+            </nav>
+            <div class="report-body">
+              <div class="report-content markdown-body" id="report-content"></div>
+            </div>
+            <aside class="qa-side" id="qa-side">
+              <div class="qa-side__header">
+                <span class="qa-side__label">继续追问</span>
+                <button class="btn-qa-collapse" id="btn-qa-wide" title="展开追问面板">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <polyline points="15 3 21 3 21 9" />
+                    <polyline points="9 21 3 21 3 15" />
+                    <line x1="21" y1="3" x2="14" y2="10" />
+                    <line x1="3" y1="21" x2="10" y2="14" />
+                  </svg>
+                </button>
+                <button class="btn-qa-collapse" id="btn-qa-collapse" title="收起追问面板">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <polyline points="9 18 15 12 9 6" />
                   </svg>
                 </button>
               </div>
-              <p class="panel__desc" data-uitext="panel_done_desc">报告已生成完毕，可继续追问</p>
-            </div>
-            <div class="export-actions">
-              <div class="export-actions__main">
-                <div class="export-actions__buttons">
-                  <button class="btn btn--ghost" id="btn-export-pdf">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-                      <polyline points="14 2 14 8 20 8"/>
-                      <line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/>
-                    </svg>
-                    下载 PDF
-                  </button>
-                  <button class="btn btn--ghost" id="btn-export-feishu">
+              <div class="qa-messages" id="qa-messages"></div>
+              <div class="qa-input-row">
+                <textarea class="qa-input" id="qa-input" rows="2"
+                  placeholder="基于报告或原始数据继续提问…（Enter 发送，Shift+Enter 换行）"></textarea>
+                <button class="btn btn--primary btn--send" id="btn-qa-send">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-                    <polyline points="14 2 14 8 20 8"/>
-                    <line x1="9" y1="13" x2="15" y2="13"/><line x1="9" y1="17" x2="13" y2="17"/>
+                    <line x1="22" y1="2" x2="11" y2="13" />
+                    <polygon points="22 2 15 22 11 13 2 9 22 2" />
                   </svg>
-                  导出飞书文档
-                  </button>
-                </div>
-                <div id="feishu-link-inline" style="font-size:12px;color:var(--text-3)"></div>
+                </button>
               </div>
-              <!-- 下载按钮已隐藏 -->
-              <button class="btn btn--ghost" id="btn-export-md" style="display:none"></button>
-              <button class="btn btn--primary" id="btn-export-word" style="display:none"></button>
-            </div>
+            </aside>
           </div>
         </div>
 
-        <div class="report-layout">
-          <!-- 左：目录 -->
-          <nav class="report-toc" id="report-toc">
-            <div class="report-toc__title">目录</div>
-            <ul class="report-toc__list" id="report-toc-list"></ul>
-          </nav>
-
-          <!-- 中：报告正文 -->
-          <div class="report-body">
-            <div class="report-content markdown-body" id="report-content"></div>
-          </div>
-
-          <!-- 右：追问侧栏 -->
-          <aside class="qa-side" id="qa-side">
-            <div class="qa-side__header">
-              <span class="qa-side__label">继续追问</span>
-              <button class="btn-qa-collapse" id="btn-qa-wide" title="展开追问面板">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <polyline points="15 3 21 3 21 9"/>
-                  <polyline points="9 21 3 21 3 15"/>
-                  <line x1="21" y1="3" x2="14" y2="10"/>
-                  <line x1="3" y1="21" x2="10" y2="14"/>
-                </svg>
-              </button>
-              <button class="btn-qa-collapse" id="btn-qa-collapse" title="收起追问面板">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <polyline points="9 18 15 12 9 6"/>
-                </svg>
-              </button>
-            </div>
-            <div class="qa-messages" id="qa-messages"></div>
-            <div class="qa-input-row">
-              <textarea class="qa-input" id="qa-input" rows="2"
-                placeholder="基于报告或原始数据继续提问…（Enter 发送，Shift+Enter 换行）"></textarea>
-              <button class="btn btn--primary btn--send" id="btn-qa-send">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>
-                </svg>
-              </button>
-            </div>
-          </aside>
-        </div>
       </section>
 
       <!-- ======================================================
@@ -410,12 +532,18 @@
       <!-- ANN STEP 1: 上传 -->
       <section class="panel panel--hidden" id="ann-panel-1">
         <div class="step-bar" id="ann-step-bar-1">
-          <button class="step-bar__item step-bar__item--active" data-ann-step="1"><span class="step-bar__num">1</span><span class="step-bar__label">上传数据</span></button>
-          <button class="step-bar__item" data-ann-step="2"><span class="step-bar__num">2</span><span class="step-bar__label">列确认 &amp; 任务</span></button>
-          <button class="step-bar__item" data-ann-step="3"><span class="step-bar__num">3</span><span class="step-bar__label">AI 作答识别</span></button>
-          <button class="step-bar__item" data-ann-step="4"><span class="step-bar__num">4</span><span class="step-bar__label">AI 确认</span></button>
-          <button class="step-bar__item" data-ann-step="5"><span class="step-bar__num">5</span><span class="step-bar__label">质量打标</span></button>
-          <button class="step-bar__item" data-ann-step="6"><span class="step-bar__num">6</span><span class="step-bar__label">完成 &amp; 下载</span></button>
+          <button class="step-bar__item step-bar__item--active" data-ann-step="1"><span
+              class="step-bar__num">1</span><span class="step-bar__label">上传数据</span></button>
+          <button class="step-bar__item" data-ann-step="2"><span class="step-bar__num">2</span><span
+              class="step-bar__label">列确认 &amp; 任务</span></button>
+          <button class="step-bar__item" data-ann-step="3"><span class="step-bar__num">3</span><span
+              class="step-bar__label">AI 作答识别</span></button>
+          <button class="step-bar__item" data-ann-step="4"><span class="step-bar__num">4</span><span
+              class="step-bar__label">AI 确认</span></button>
+          <button class="step-bar__item" data-ann-step="5"><span class="step-bar__num">5</span><span
+              class="step-bar__label">质量打标</span></button>
+          <button class="step-bar__item" data-ann-step="6"><span class="step-bar__num">6</span><span
+              class="step-bar__label">完成 &amp; 下载</span></button>
         </div>
         <div class="panel__header">
           <h1 class="panel__title">数据标注 · 上传文件</h1>
@@ -425,9 +553,9 @@
           <input type="file" id="ann-file-input" accept=".csv,.xlsx,.xls" hidden />
           <div class="upload-zone__icon">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-              <polyline points="17 8 12 3 7 8"/>
-              <line x1="12" y1="3" x2="12" y2="15"/>
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+              <polyline points="17 8 12 3 7 8" />
+              <line x1="12" y1="3" x2="12" y2="15" />
             </svg>
           </div>
           <div class="upload-zone__text">
@@ -440,12 +568,18 @@
       <!-- ANN STEP 2: 列确认 + 任务选择 -->
       <section class="panel panel--hidden" id="ann-panel-2">
         <div class="step-bar" id="ann-step-bar-2">
-          <button class="step-bar__item" data-ann-step="1"><span class="step-bar__num">1</span><span class="step-bar__label">上传数据</span></button>
-          <button class="step-bar__item step-bar__item--active" data-ann-step="2"><span class="step-bar__num">2</span><span class="step-bar__label">列确认 &amp; 任务</span></button>
-          <button class="step-bar__item" data-ann-step="3"><span class="step-bar__num">3</span><span class="step-bar__label">AI 作答识别</span></button>
-          <button class="step-bar__item" data-ann-step="4"><span class="step-bar__num">4</span><span class="step-bar__label">AI 确认</span></button>
-          <button class="step-bar__item" data-ann-step="5"><span class="step-bar__num">5</span><span class="step-bar__label">质量打标</span></button>
-          <button class="step-bar__item" data-ann-step="6"><span class="step-bar__num">6</span><span class="step-bar__label">完成 &amp; 下载</span></button>
+          <button class="step-bar__item" data-ann-step="1"><span class="step-bar__num">1</span><span
+              class="step-bar__label">上传数据</span></button>
+          <button class="step-bar__item step-bar__item--active" data-ann-step="2"><span
+              class="step-bar__num">2</span><span class="step-bar__label">列确认 &amp; 任务</span></button>
+          <button class="step-bar__item" data-ann-step="3"><span class="step-bar__num">3</span><span
+              class="step-bar__label">AI 作答识别</span></button>
+          <button class="step-bar__item" data-ann-step="4"><span class="step-bar__num">4</span><span
+              class="step-bar__label">AI 确认</span></button>
+          <button class="step-bar__item" data-ann-step="5"><span class="step-bar__num">5</span><span
+              class="step-bar__label">质量打标</span></button>
+          <button class="step-bar__item" data-ann-step="6"><span class="step-bar__num">6</span><span
+              class="step-bar__label">完成 &amp; 下载</span></button>
         </div>
         <div class="panel__header">
           <h1 class="panel__title">列确认 &amp; 标注任务选择</h1>
@@ -455,7 +589,10 @@
         <!-- 任务选择 -->
         <div class="ann-tasks" id="ann-tasks">
           <div class="plan-section__title" style="margin-bottom:12px">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 8v4l3 3"/></svg>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="10" />
+              <path d="M12 8v4l3 3" />
+            </svg>
             选择标注任务（可多选）
           </div>
           <label class="ann-task-option">
@@ -487,7 +624,10 @@
         <!-- 列确认 -->
         <div class="col-confirm-header">
           <div class="plan-section__title">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M9 11l3 3L22 4" />
+              <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" />
+            </svg>
             列设置
           </div>
         </div>
@@ -500,7 +640,7 @@
         <div class="col-confirm-actions">
           <button class="btn btn--primary" id="ann-btn-start" disabled>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <polygon points="5 3 19 12 5 21 5 3"/>
+              <polygon points="5 3 19 12 5 21 5 3" />
             </svg>
             开始标注
           </button>
@@ -510,12 +650,18 @@
       <!-- ANN STEP 3: AI 识别进行中 -->
       <section class="panel panel--hidden" id="ann-panel-3">
         <div class="step-bar" id="ann-step-bar-3">
-          <button class="step-bar__item" data-ann-step="1"><span class="step-bar__num">1</span><span class="step-bar__label">上传数据</span></button>
-          <button class="step-bar__item" data-ann-step="2"><span class="step-bar__num">2</span><span class="step-bar__label">列确认 &amp; 任务</span></button>
-          <button class="step-bar__item step-bar__item--active" data-ann-step="3"><span class="step-bar__num">3</span><span class="step-bar__label">AI 作答识别</span></button>
-          <button class="step-bar__item" data-ann-step="4"><span class="step-bar__num">4</span><span class="step-bar__label">AI 确认</span></button>
-          <button class="step-bar__item" data-ann-step="5"><span class="step-bar__num">5</span><span class="step-bar__label">质量打标</span></button>
-          <button class="step-bar__item" data-ann-step="6"><span class="step-bar__num">6</span><span class="step-bar__label">完成 &amp; 下载</span></button>
+          <button class="step-bar__item" data-ann-step="1"><span class="step-bar__num">1</span><span
+              class="step-bar__label">上传数据</span></button>
+          <button class="step-bar__item" data-ann-step="2"><span class="step-bar__num">2</span><span
+              class="step-bar__label">列确认 &amp; 任务</span></button>
+          <button class="step-bar__item step-bar__item--active" data-ann-step="3"><span
+              class="step-bar__num">3</span><span class="step-bar__label">AI 作答识别</span></button>
+          <button class="step-bar__item" data-ann-step="4"><span class="step-bar__num">4</span><span
+              class="step-bar__label">AI 确认</span></button>
+          <button class="step-bar__item" data-ann-step="5"><span class="step-bar__num">5</span><span
+              class="step-bar__label">质量打标</span></button>
+          <button class="step-bar__item" data-ann-step="6"><span class="step-bar__num">6</span><span
+              class="step-bar__label">完成 &amp; 下载</span></button>
         </div>
         <div class="panel__header">
           <h1 class="panel__title">AI 作答识别中…</h1>
@@ -533,12 +679,18 @@
       <!-- ANN STEP 4: AI 确认 -->
       <section class="panel panel--hidden" id="ann-panel-4">
         <div class="step-bar" id="ann-step-bar-4">
-          <button class="step-bar__item" data-ann-step="1"><span class="step-bar__num">1</span><span class="step-bar__label">上传数据</span></button>
-          <button class="step-bar__item" data-ann-step="2"><span class="step-bar__num">2</span><span class="step-bar__label">列确认 &amp; 任务</span></button>
-          <button class="step-bar__item" data-ann-step="3"><span class="step-bar__num">3</span><span class="step-bar__label">AI 作答识别</span></button>
-          <button class="step-bar__item step-bar__item--active" data-ann-step="4"><span class="step-bar__num">4</span><span class="step-bar__label">AI 确认</span></button>
-          <button class="step-bar__item" data-ann-step="5"><span class="step-bar__num">5</span><span class="step-bar__label">质量打标</span></button>
-          <button class="step-bar__item" data-ann-step="6"><span class="step-bar__num">6</span><span class="step-bar__label">完成 &amp; 下载</span></button>
+          <button class="step-bar__item" data-ann-step="1"><span class="step-bar__num">1</span><span
+              class="step-bar__label">上传数据</span></button>
+          <button class="step-bar__item" data-ann-step="2"><span class="step-bar__num">2</span><span
+              class="step-bar__label">列确认 &amp; 任务</span></button>
+          <button class="step-bar__item" data-ann-step="3"><span class="step-bar__num">3</span><span
+              class="step-bar__label">AI 作答识别</span></button>
+          <button class="step-bar__item step-bar__item--active" data-ann-step="4"><span
+              class="step-bar__num">4</span><span class="step-bar__label">AI 确认</span></button>
+          <button class="step-bar__item" data-ann-step="5"><span class="step-bar__num">5</span><span
+              class="step-bar__label">质量打标</span></button>
+          <button class="step-bar__item" data-ann-step="6"><span class="step-bar__num">6</span><span
+              class="step-bar__label">完成 &amp; 下载</span></button>
         </div>
         <div class="panel__header">
           <h1 class="panel__title">AI 作答识别结果确认</h1>
@@ -556,7 +708,9 @@
         </div>
         <div class="col-confirm-actions">
           <button class="btn btn--primary" id="ann-btn-confirm-ai">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+              <polyline points="20 6 9 17 4 12" />
+            </svg>
             确认标注结果，继续下一步
           </button>
         </div>
@@ -565,12 +719,18 @@
       <!-- ANN STEP 5: 质量打标进行中 -->
       <section class="panel panel--hidden" id="ann-panel-5">
         <div class="step-bar" id="ann-step-bar-5">
-          <button class="step-bar__item" data-ann-step="1"><span class="step-bar__num">1</span><span class="step-bar__label">上传数据</span></button>
-          <button class="step-bar__item" data-ann-step="2"><span class="step-bar__num">2</span><span class="step-bar__label">列确认 &amp; 任务</span></button>
-          <button class="step-bar__item" data-ann-step="3"><span class="step-bar__num">3</span><span class="step-bar__label">AI 作答识别</span></button>
-          <button class="step-bar__item" data-ann-step="4"><span class="step-bar__num">4</span><span class="step-bar__label">AI 确认</span></button>
-          <button class="step-bar__item step-bar__item--active" data-ann-step="5"><span class="step-bar__num">5</span><span class="step-bar__label">质量打标</span></button>
-          <button class="step-bar__item" data-ann-step="6"><span class="step-bar__num">6</span><span class="step-bar__label">完成 &amp; 下载</span></button>
+          <button class="step-bar__item" data-ann-step="1"><span class="step-bar__num">1</span><span
+              class="step-bar__label">上传数据</span></button>
+          <button class="step-bar__item" data-ann-step="2"><span class="step-bar__num">2</span><span
+              class="step-bar__label">列确认 &amp; 任务</span></button>
+          <button class="step-bar__item" data-ann-step="3"><span class="step-bar__num">3</span><span
+              class="step-bar__label">AI 作答识别</span></button>
+          <button class="step-bar__item" data-ann-step="4"><span class="step-bar__num">4</span><span
+              class="step-bar__label">AI 确认</span></button>
+          <button class="step-bar__item step-bar__item--active" data-ann-step="5"><span
+              class="step-bar__num">5</span><span class="step-bar__label">质量打标</span></button>
+          <button class="step-bar__item" data-ann-step="6"><span class="step-bar__num">6</span><span
+              class="step-bar__label">完成 &amp; 下载</span></button>
         </div>
         <div class="panel__header">
           <h1 class="panel__title">回答质量打标中…</h1>
@@ -588,12 +748,18 @@
       <!-- ANN STEP 6: 完成 + 下载 -->
       <section class="panel panel--hidden" id="ann-panel-6">
         <div class="step-bar" id="ann-step-bar-6">
-          <button class="step-bar__item" data-ann-step="1"><span class="step-bar__num">1</span><span class="step-bar__label">上传数据</span></button>
-          <button class="step-bar__item" data-ann-step="2"><span class="step-bar__num">2</span><span class="step-bar__label">列确认 &amp; 任务</span></button>
-          <button class="step-bar__item" data-ann-step="3"><span class="step-bar__num">3</span><span class="step-bar__label">AI 作答识别</span></button>
-          <button class="step-bar__item" data-ann-step="4"><span class="step-bar__num">4</span><span class="step-bar__label">AI 确认</span></button>
-          <button class="step-bar__item" data-ann-step="5"><span class="step-bar__num">5</span><span class="step-bar__label">质量打标</span></button>
-          <button class="step-bar__item step-bar__item--active" data-ann-step="6"><span class="step-bar__num">6</span><span class="step-bar__label">完成 &amp; 下载</span></button>
+          <button class="step-bar__item" data-ann-step="1"><span class="step-bar__num">1</span><span
+              class="step-bar__label">上传数据</span></button>
+          <button class="step-bar__item" data-ann-step="2"><span class="step-bar__num">2</span><span
+              class="step-bar__label">列确认 &amp; 任务</span></button>
+          <button class="step-bar__item" data-ann-step="3"><span class="step-bar__num">3</span><span
+              class="step-bar__label">AI 作答识别</span></button>
+          <button class="step-bar__item" data-ann-step="4"><span class="step-bar__num">4</span><span
+              class="step-bar__label">AI 确认</span></button>
+          <button class="step-bar__item" data-ann-step="5"><span class="step-bar__num">5</span><span
+              class="step-bar__label">质量打标</span></button>
+          <button class="step-bar__item step-bar__item--active" data-ann-step="6"><span
+              class="step-bar__num">6</span><span class="step-bar__label">完成 &amp; 下载</span></button>
         </div>
         <div class="panel__header">
           <h1 class="panel__title">标注完成</h1>
@@ -602,16 +768,16 @@
         <div class="ann-done-block">
           <div class="ann-done-icon">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-              <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
-              <polyline points="22 4 12 14.01 9 11.01"/>
+              <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" />
+              <polyline points="22 4 12 14.01 9 11.01" />
             </svg>
           </div>
           <div class="ann-done-text" id="ann-done-text">标注完成</div>
           <button class="btn btn--primary btn--lg" id="ann-btn-download">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-              <polyline points="7 10 12 15 17 10"/>
-              <line x1="12" y1="15" x2="12" y2="3"/>
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+              <polyline points="7 10 12 15 17 10" />
+              <line x1="12" y1="15" x2="12" y2="3" />
             </svg>
             下载标注结果 Excel
           </button>
@@ -629,43 +795,81 @@
       <div class="drawer__header">
         <div class="drawer__title">设置</div>
         <button class="drawer__close" data-drawer-close aria-label="关闭">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="6" x2="6" y2="18" />
+            <line x1="6" y1="6" x2="18" y2="18" />
+          </svg>
         </button>
       </div>
       <div class="drawer__body" id="settings-body">
         <div class="settings-layout">
           <!-- 左导航 -->
           <nav class="settings-nav" id="settings-nav">
+            <div class="settings-nav__toggle">
+              <button class="settings-nav__toggle-btn" id="btn-settings-nav-toggle" title="折叠导航" aria-label="折叠导航">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <polyline points="15 18 9 12 15 6" />
+                </svg>
+              </button>
+            </div>
+            <div class="settings-nav__group-label">内容管理</div>
             <div class="settings-nav__item settings-nav__item--active" data-stab="texts">
-              <svg class="settings-nav__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
-              页面文案
+              <svg class="settings-nav__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
+                <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" />
+              </svg>
+              <span>页面文案</span>
             </div>
             <div class="settings-nav__item" data-stab="prompts">
-              <svg class="settings-nav__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
-              Prompt 设置
+              <svg class="settings-nav__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="12" r="3" />
+                <path
+                  d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+              </svg>
+              <span>Prompt 设置</span>
             </div>
+            <div class="settings-nav__sep" id="settings-nav-admin-sep" style="display:none"></div>
+            <div class="settings-nav__group-label" id="settings-nav-admin-label" style="display:none">管理员</div>
             <div class="settings-nav__item" data-stab="perms" id="stab-perms-nav" style="display:none">
-              <svg class="settings-nav__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
-              权限配置
+              <svg class="settings-nav__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" />
+                <circle cx="9" cy="7" r="4" />
+                <path d="M23 21v-2a4 4 0 0 0-3-3.87" />
+                <path d="M16 3.13a4 4 0 0 1 0 7.75" />
+              </svg>
+              <span>权限配置</span>
             </div>
             <div class="settings-nav__item" data-stab="audit" id="stab-audit-nav" style="display:none">
-              <svg class="settings-nav__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 7h6"/><path d="M9 12h6"/><path d="M9 17h4"/><rect x="4" y="3" width="16" height="18" rx="2"/></svg>
-              用户日志
+              <svg class="settings-nav__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M9 7h6" />
+                <path d="M9 12h6" />
+                <path d="M9 17h4" />
+                <rect x="4" y="3" width="16" height="18" rx="2" />
+              </svg>
+              <span>用户日志</span>
             </div>
           </nav>
           <!-- 右内容 -->
           <div class="settings-content" id="settings-content">
             <div id="stab-content-texts">
-              <div class="hist-empty"><div class="spinner" style="margin:0 auto"></div></div>
+              <div class="hist-empty">
+                <div class="spinner" style="margin:0 auto"></div>
+              </div>
             </div>
             <div id="stab-content-prompts" style="display:none">
-              <div class="hist-empty"><div class="spinner" style="margin:0 auto"></div></div>
+              <div class="hist-empty">
+                <div class="spinner" style="margin:0 auto"></div>
+              </div>
             </div>
             <div id="stab-content-perms" style="display:none">
-              <div class="hist-empty"><div class="spinner" style="margin:0 auto"></div></div>
+              <div class="hist-empty">
+                <div class="spinner" style="margin:0 auto"></div>
+              </div>
             </div>
             <div id="stab-content-audit" style="display:none">
-              <div class="hist-empty"><div class="spinner" style="margin:0 auto"></div></div>
+              <div class="hist-empty">
+                <div class="spinner" style="margin:0 auto"></div>
+              </div>
             </div>
           </div>
         </div>
@@ -680,11 +884,16 @@
       <div class="drawer__header">
         <div class="drawer__title">历史记录</div>
         <button class="drawer__close" data-drawer-close aria-label="关闭">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="6" x2="6" y2="18" />
+            <line x1="6" y1="6" x2="18" y2="18" />
+          </svg>
         </button>
       </div>
       <div class="drawer__body" id="history-body">
-        <div class="hist-empty"><div class="spinner" style="margin:0 auto"></div></div>
+        <div class="hist-empty">
+          <div class="spinner" style="margin:0 auto"></div>
+        </div>
       </div>
     </div>
   </div>
@@ -692,6 +901,7 @@
   <div class="toast-container" id="toast-container" aria-live="polite"></div>
 
   <script src="https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js"></script>
-  <script src="/static/app.js?v=14"></script>
+  <script src="/static/app.js?v=15"></script>
 </body>
+
 </html>

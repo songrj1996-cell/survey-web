@@ -87,6 +87,45 @@ async def chat(
 STOP_SIGNAL = "STOP_SIGNAL"
 
 
+def _stringify_workflow_output(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _pick_workflow_output(outputs: dict) -> tuple[str, str]:
+    """Return (text, source_key) from Dify workflow outputs.
+
+    Older configuration expects `output`, but workflow apps are often published
+    with variables such as `result`, `answer`, or `text`. Treat a single
+    arbitrary output variable as valid so renaming in Dify does not silently
+    erase the result.
+    """
+    if not isinstance(outputs, dict) or not outputs:
+        return "", ""
+
+    first_present: tuple[str, str] | None = None
+    for key in ("output", "result", "answer", "text"):
+        if key in outputs:
+            text = _stringify_workflow_output(outputs.get(key)).strip()
+            if first_present is None:
+                first_present = (text, key)
+            if text:
+                return text, key
+
+    if len(outputs) == 1:
+        key, value = next(iter(outputs.items()))
+        return _stringify_workflow_output(value).strip(), str(key)
+
+    for key, value in outputs.items():
+        text = _stringify_workflow_output(value).strip()
+        if text:
+            return text, str(key)
+    return first_present or ("", "")
+
+
 async def complete(
     inputs: dict,
     query: str,
@@ -208,12 +247,14 @@ async def workflow_run(
                     return ""
 
                 data = resp.json()
-                output = (
-                    data.get("data", {})
-                        .get("outputs", {})
-                        .get("output", "")
-                ) or ""
-                print(f"[dify] {log_prefix} workflow done | output_len={len(output)}")
+                outputs = data.get("data", {}).get("outputs", {}) or {}
+                output, output_key = _pick_workflow_output(outputs)
+                keys = ",".join(str(k) for k in outputs.keys()) if isinstance(outputs, dict) else ""
+                print(
+                    f"[dify] {log_prefix} workflow done | "
+                    f"output_key={output_key or '(none)'} | outputs=[{keys}] | "
+                    f"output_len={len(output)}"
+                )
                 return output.strip()
 
             except (httpx.TimeoutException, httpx.NetworkError) as e:

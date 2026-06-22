@@ -1,4 +1,4 @@
-"""问卷分析平台 Web 后端 v2
+"""调研分析平台 Web 后端 v2
 
 新增：
 - 本地题型推断 + 用户确认（Step 2）
@@ -1366,6 +1366,47 @@ def _render_crosstab_plan_card(plan: dict) -> str:
     return "\n".join(lines)
 
 
+def _json_loads_loose(raw: str) -> tuple[dict | None, str]:
+    raw = (raw or "").strip()
+    if not raw:
+        return None, "empty"
+    candidates = [raw]
+    fenced = re.search(r"```(?:json)?\s*(.*?)```", raw, re.S | re.I)
+    if fenced:
+        candidates.insert(0, fenced.group(1).strip())
+    brace_start = raw.find("{")
+    brace_end = raw.rfind("}")
+    if 0 <= brace_start < brace_end:
+        candidates.append(raw[brace_start:brace_end + 1])
+
+    for text in candidates:
+        try:
+            obj = json.loads(text)
+            if isinstance(obj, dict):
+                return obj, ""
+            return None, f"json root is {type(obj).__name__}"
+        except Exception as e:
+            last_err = str(e)
+    return None, last_err[:180] if "last_err" in locals() else "invalid json"
+
+
+def _cluster_diag_column(col_idx: int, col_name: str, total: int, batches: int) -> dict:
+    return {
+        "col_index": col_idx,
+        "col_name": col_name,
+        "total": total,
+        "batches": batches,
+        "phase_a": [],
+        "phase_b": {},
+        "phase_c": [],
+        "status": "running",
+        "reason": "",
+        "themes": 0,
+        "classifications": 0,
+        "assignments": 0,
+    }
+
+
 async def _batch_qualitative_analysis(
     open_text: dict,
     plan: dict,
@@ -1392,6 +1433,7 @@ async def _batch_qualitative_analysis(
     from dify import workflow_run, STOP_SIGNAL
 
     clustered_themes: dict = {}
+    diagnostics: dict[str, dict] = {}
 
     for col_idx, entries in open_text.items():
         col = next((c for c in plan["columns"] if c["index"] == col_idx), None)
@@ -1404,6 +1446,8 @@ async def _batch_qualitative_analysis(
         # ── Phase A：分批提取主题候选 ──────────────────────────────────────
         batches = [entries[i:i + BATCH_SIZE] for i in range(0, total, BATCH_SIZE)]
         all_candidates: list[dict] = []
+        diag = _cluster_diag_column(col_idx, col_name, total, len(batches))
+        diagnostics[str(col_idx)] = diag
 
         for bi, batch in enumerate(batches, 1):
             yield ("progress", f"【{col_name}】提取主题（批次 {bi}/{len(batches)}）")
@@ -1419,16 +1463,32 @@ async def _batch_qualitative_analysis(
                 api_key=DIFY_THEME_EXTRACT_KEY,
                 log_prefix=f"A col={col_idx} batch={bi}",
             )
+            phase_a = {"batch": bi, "raw_len": len(raw or ""), "parsed": False, "themes": 0, "error": ""}
             if raw == STOP_SIGNAL:
+                phase_a["error"] = "Dify returned 400 / STOP_SIGNAL"
+                diag["phase_a"].append(phase_a)
+                diag["status"] = "failed"
+                diag["reason"] = phase_a["error"]
                 yield ("progress", f"【{col_name}】主题提取遇到错误，跳过该列")
                 break
-            try:
-                parsed = _json.loads(raw)
-                all_candidates.extend(parsed.get("themes", []))
-            except Exception:
-                pass
+            parsed, err = _json_loads_loose(raw)
+            if parsed:
+                themes = parsed.get("themes", [])
+                if isinstance(themes, list):
+                    all_candidates.extend(themes)
+                    phase_a["parsed"] = True
+                    phase_a["themes"] = len(themes)
+                else:
+                    phase_a["error"] = "`themes` is not list"
+            else:
+                phase_a["error"] = err
+                yield ("progress", f"【{col_name}】主题提取结果解析失败（批次 {bi}），继续处理后续批次")
+            diag["phase_a"].append(phase_a)
 
         if not all_candidates:
+            diag["status"] = "failed"
+            diag["reason"] = diag["reason"] or "主题提取未返回 themes"
+            yield ("progress", f"【{col_name}】没有提取到主题，后续报告将尝试使用原文兜底")
             continue
 
         # ── Phase B：合并去重 ──────────────────────────────────────────────
@@ -1446,17 +1506,33 @@ async def _batch_qualitative_analysis(
             api_key=DIFY_THEME_MERGE_KEY,
             log_prefix=f"B col={col_idx}",
         )
+        diag["phase_b"] = {"raw_len": len(raw_b or ""), "parsed": False, "themes": 0, "error": ""}
         if raw_b == STOP_SIGNAL or not raw_b:
+            diag["phase_b"]["error"] = "Dify returned STOP_SIGNAL" if raw_b == STOP_SIGNAL else "empty response"
+            diag["status"] = "failed"
+            diag["reason"] = f"主题合并失败：{diag['phase_b']['error']}"
             yield ("progress", f"【{col_name}】主题合并失败，跳过该列")
             continue
-        try:
-            merged = _json.loads(raw_b)
-            final_themes: list[dict] = merged.get("themes", [])
-        except Exception:
+        merged, err = _json_loads_loose(raw_b)
+        if not merged:
+            diag["phase_b"]["error"] = err
+            diag["status"] = "failed"
+            diag["reason"] = f"主题合并结果解析失败：{err}"
             yield ("progress", f"【{col_name}】主题合并结果解析失败，跳过该列")
             continue
+        final_themes = merged.get("themes", [])
+        if isinstance(final_themes, list):
+            diag["phase_b"]["parsed"] = True
+            diag["phase_b"]["themes"] = len(final_themes)
+            diag["themes"] = len(final_themes)
+        else:
+            final_themes = []
+            diag["phase_b"]["error"] = "`themes` is not list"
 
         if not final_themes:
+            diag["status"] = "failed"
+            diag["reason"] = diag["reason"] or "主题合并未返回 themes"
+            yield ("progress", f"【{col_name}】主题合并为空，后续报告将尝试使用原文兜底")
             continue
 
         theme_list_text = _json.dumps(
@@ -1487,14 +1563,29 @@ async def _batch_qualitative_analysis(
                 api_key=DIFY_CLASSIFY_KEY,
                 log_prefix=f"C col={col_idx} batch={bi}",
             )
+            phase_c = {"batch": bi, "raw_len": len(raw_c or ""), "parsed": False, "classifications": 0, "assignments": 0, "error": ""}
             if raw_c == STOP_SIGNAL:
+                phase_c["error"] = "Dify returned 400 / STOP_SIGNAL"
+                diag["phase_c"].append(phase_c)
+                yield ("progress", f"【{col_name}】分类回复遇到错误（批次 {bi}），继续处理后续批次")
                 continue
-            try:
-                cls_data = _json.loads(raw_c)
-            except Exception:
+            cls_data, err = _json_loads_loose(raw_c)
+            if not cls_data:
+                phase_c["error"] = err
+                diag["phase_c"].append(phase_c)
+                yield ("progress", f"【{col_name}】分类结果解析失败（批次 {bi}），继续处理后续批次")
                 continue
 
-            for item in cls_data.get("classifications", []):
+            classifications = cls_data.get("classifications", [])
+            if not isinstance(classifications, list):
+                phase_c["error"] = "`classifications` is not list"
+                diag["phase_c"].append(phase_c)
+                continue
+            phase_c["parsed"] = True
+            phase_c["classifications"] = len(classifications)
+            diag["classifications"] += len(classifications)
+
+            for item in classifications:
                 try:
                     resp_idx = int(str(item.get("response_id", "")).strip("[]"))
                     original_text = batch[resp_idx].get("text", "") if resp_idx < len(batch) else ""
@@ -1502,6 +1593,8 @@ async def _batch_qualitative_analysis(
                     continue
 
                 assignments = item.get("assignments", [])
+                if isinstance(assignments, list):
+                    phase_c["assignments"] += len(assignments)
                 for assign in assignments:
                     tid = assign.get("theme_id", "other")
                     sentiment = assign.get("sentiment", "neutral")
@@ -1518,10 +1611,15 @@ async def _batch_qualitative_analysis(
                         counts[tid]["neutral"] += 1
                     if tid != "other" and len(quotes_pool[tid]) < 10 and original_text:
                         quotes_pool[tid].append((sentiment, original_text))
+            diag["assignments"] += phase_c["assignments"]
+            diag["phase_c"].append(phase_c)
 
         # ── 统计汇总 ──────────────────────────────────────────────────────
         total_mentions = sum(v["total"] for v in counts.values())
         if total_mentions == 0:
+            diag["status"] = "failed"
+            diag["reason"] = "分类阶段未产生任何主题归属"
+            yield ("progress", f"【{col_name}】分类未产生有效归属，后续报告将尝试使用原文兜底")
             continue
 
         themes_out = []
@@ -1577,8 +1675,11 @@ async def _batch_qualitative_analysis(
             "themes": themes_out,
             "other_themes": other_themes_out,
         }
+        diag["status"] = "ok"
+        diag["reason"] = ""
         yield ("progress", f"【{col_name}】分析完成，识别 {len(themes_out)} 个主要主题")
 
+    yield ("diagnostics", diagnostics)
     yield ("result", clustered_themes)
 
 
@@ -1604,11 +1705,100 @@ def _extract_satisfaction_stats(stats_md: str) -> str:
     return "\n\n".join("\n".join(s) for s in sections)
 
 
+def _entry_identity(entry: dict) -> str:
+    parts = []
+    ids = entry.get("ids") or {}
+    profile = entry.get("profile") or {}
+    for k, v in ids.items():
+        if str(v).strip():
+            parts.append(f"{k}={v}")
+    for k, v in profile.items():
+        if str(v).strip():
+            parts.append(f"{k}={v}")
+    return "；".join(parts)
+
+
+def _clip_text(text: str, limit: int = 420) -> str:
+    text = str(text or "").strip().replace("\r", " ").replace("\n", " ")
+    return text if len(text) <= limit else text[:limit].rstrip() + "..."
+
+
+def _sample_open_entries(entries: list[dict], limit: int = 60) -> list[dict]:
+    if len(entries) <= limit:
+        return entries
+    if limit <= 1:
+        return entries[:1]
+    step = (len(entries) - 1) / (limit - 1)
+    idxs = []
+    seen = set()
+    for i in range(limit):
+        idx = round(i * step)
+        if idx not in seen:
+            seen.add(idx)
+            idxs.append(idx)
+    return [entries[i] for i in idxs]
+
+
+def _build_open_text_fallback_md(
+    open_text: dict | None,
+    clustered_themes: dict,
+    plan: dict,
+    headers: list[str],
+) -> str:
+    """Build a deterministic raw-text fallback for open columns without themes."""
+    if not open_text:
+        return ""
+
+    clustered_keys = {str(k) for k in (clustered_themes or {}).keys()}
+    blocks = []
+    total_chars = 0
+    max_chars = 45000
+
+    for raw_idx, entries in open_text.items():
+        idx_key = str(raw_idx)
+        if idx_key in clustered_keys:
+            continue
+        if not entries:
+            continue
+        try:
+            col_idx = int(raw_idx)
+        except (TypeError, ValueError):
+            col_idx = raw_idx
+        col = next((c for c in plan.get("columns", []) if c.get("index") == col_idx), None)
+        name = (col and col.get("name")) or (
+            headers[col_idx] if isinstance(col_idx, int) and col_idx < len(headers) else f"列{raw_idx}"
+        )
+        lines = [f"### {name}（列 {raw_idx}，共 {len(entries)} 条非空回答；以下为抽样原文）"]
+        for i, entry in enumerate(_sample_open_entries(entries), 1):
+            ident = _entry_identity(entry)
+            prefix = f"{i}. "
+            if ident:
+                prefix += f"[{ident}] "
+            lines.append(prefix + _clip_text(entry.get("text", "")))
+        block = "\n".join(lines)
+        if total_chars + len(block) > max_chars:
+            blocks.append("### 其余开放题\n（原文较多，已达到兜底上下文上限，未继续展开。）")
+            break
+        blocks.append(block)
+        total_chars += len(block)
+
+    if not blocks:
+        return ""
+    return (
+        "<open_text_fallback>\n"
+        "以下开放题未能产出稳定聚类结果。请仅基于这些真实原文做定性归纳和代表性引用；"
+        "不要编造精确主题占比或人数。若内容明显属于年龄、性别、地区等画像补充项，不要当作体验观点展开。\n\n"
+        + "\n\n".join(blocks)
+        + "\n</open_text_fallback>"
+    )
+
+
 def _build_large_sample_writer_query(
     stats_md: str,
     clustered_themes: dict,
     plan: dict,
     headers: list[str],
+    open_text: dict | None = None,
 ) -> str:
     parts_lines = ["  Part 1 受访者画像（固定）"]
     for i, p in enumerate(plan["parts"], 2):
@@ -1655,6 +1845,7 @@ def _build_large_sample_writer_query(
         "<open_text_themes>\n" + "\n\n".join(theme_blocks) + "\n</open_text_themes>"
         if theme_blocks else "<open_text_themes>（无开放题聚类结果）</open_text_themes>"
     )
+    fallback_md = _build_open_text_fallback_md(open_text, clustered_themes, plan, headers)
 
     satisfaction_md = _extract_satisfaction_stats(stats_md)
     priority_block = (
@@ -1669,7 +1860,8 @@ def _build_large_sample_writer_query(
         f"<stats>\n{stats_md}\n</stats>\n\n"
         f"{priority_block}"
         f"{open_text_md}\n\n"
-        f"**要求**：\n{requirements}"
+        + (f"{fallback_md}\n\n" if fallback_md else "")
+        + f"**要求**：\n{requirements}"
     )
 
 
@@ -2138,7 +2330,7 @@ async def call_dify_compatible(
 # FastAPI
 # ============================================================
 
-app = FastAPI(title="问卷分析平台")
+app = FastAPI(title="调研分析平台")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 _sweep_old_sessions()  # 启动时清理过期 session 文件
 
@@ -2149,6 +2341,11 @@ app.mount("/static", StaticFiles(directory=static_dir), name="static")
 @app.get("/")
 async def index():
     return FileResponse(os.path.join(static_dir, "index.html"))
+
+
+@app.get("/favicon.ico")
+async def favicon():
+    return FileResponse(os.path.join(static_dir, "web-icon.jpg"), media_type="image/jpeg")
 
 
 @app.get("/login")
@@ -2917,14 +3114,29 @@ async def generate_report(session_id: str, request: Request):
                 )
                 yield sse_event({"type": "progress", "message": start_msg})
                 clustered_themes: dict = {}
+                cluster_diagnostics: dict = {}
                 async for item in _batch_qualitative_analysis(open_text, plan, rows[0], session_id):
                     if item[0] == "progress":
                         yield sse_event({"type": "progress", "message": item[1]})
-                    else:
+                    elif item[0] == "diagnostics":
+                        cluster_diagnostics = item[1]
+                    elif item[0] == "result":
                         clustered_themes = item[1]
 
+                failed_cols = [
+                    d.get("col_name", f"列{k}") for k, d in (cluster_diagnostics or {}).items()
+                    if d.get("status") != "ok"
+                ]
+                sess["open_text_cluster_diagnostics"] = cluster_diagnostics
+                save_session(session_id, sess)
+                if failed_cols:
+                    msg = "部分主观题聚类未完成，报告将使用原文兜底：" + "、".join(failed_cols[:4])
+                    if len(failed_cols) > 4:
+                        msg += f"等 {len(failed_cols)} 列"
+                    yield sse_event({"type": "progress", "message": msg})
+
                 yield sse_event({"type": "progress", "message": "主题分析完成，开始生成报告..."})
-                writer_query = _build_large_sample_writer_query(stats_md, clustered_themes, plan, rows[0])
+                writer_query = _build_large_sample_writer_query(stats_md, clustered_themes, plan, rows[0], open_text)
                 # 跑数表模式：把问卷原文作为题目意图上下文一并喂给 Writer
                 if is_crosstab:
                     q_text = (sess.get("questionnaire_text") or "").strip()
