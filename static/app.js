@@ -202,7 +202,7 @@ function consumeSSE(url, onEvent) {
         if (data.type === 'error') { es.close(); reject(new Error(data.message || data.msg || '服务端处理失败')); }
         if ([
           'columns_ready', 'plan_ready', 'report_done', 'qa_done',
-          'ai_detect_done', 'quality_done',
+          'ai_detect_done', 'quality_done', 'comment_done',
         ].includes(data.type)) {
           es.close(); resolve(data);
         }
@@ -2555,17 +2555,22 @@ const surveyPanels = panels;            // panel-1 ~ panel-5
 const annPanelIds = [1, 2, 3, 4, 5, 6];
 const annPanels = annPanelIds.map(n => $(`ann-panel-${n}`));
 
-let currentMode = 'survey'; // 'survey' | 'annotate'
+const cmPanels = [1, 2, 3].map(n => $(`cm-panel-${n}`));
+
+let currentMode = 'survey'; // 'survey' | 'annotate' | 'comment'
 
 function switchMode(mode) {
   currentMode = mode;
   const isSurvey = mode === 'survey';
+  const isAnnotate = mode === 'annotate';
+  const isComment = mode === 'comment';
 
   // 一级导航激活状态
   $('nav-survey').classList.toggle('nav-item--active', isSurvey);
   $('nav-survey').classList.toggle('nav-item--expanded', isSurvey);
-  $('nav-annotate').classList.toggle('nav-item--active', !isSurvey);
-  $('nav-annotate').classList.toggle('nav-item--expanded', !isSurvey);
+  $('nav-annotate').classList.toggle('nav-item--active', isAnnotate);
+  $('nav-annotate').classList.toggle('nav-item--expanded', isAnnotate);
+  $('nav-comment').classList.toggle('nav-item--active', isComment);
   $('nav-settings').classList.remove('nav-item--active');
 
   // 历史记录按钮仅在问卷分析时显示
@@ -2573,16 +2578,20 @@ function switchMode(mode) {
 
   surveyPanels.forEach(p => p.classList.add('panel--hidden'));
   annPanels.forEach(p => p.classList.add('panel--hidden'));
+  cmPanels.forEach(p => p && p.classList.add('panel--hidden'));
   if (isSurvey) {
     goStep(state.currentStep);
-  } else {
+  } else if (isAnnotate) {
     annGoStep(annState.currentStep);
+  } else {
+    cmGoStep(cmState.currentStep);
   }
 }
 
 // 一级导航点击
 $('nav-header-survey').addEventListener('click', () => switchMode('survey'));
 $('nav-header-annotate').addEventListener('click', () => switchMode('annotate'));
+$('nav-header-comment').addEventListener('click', () => switchMode('comment'));
 
 // 设置入口
 $('nav-header-settings').addEventListener('click', () => {
@@ -2640,6 +2649,239 @@ if (btnQaCollapse) {
   });
 }
 updateQAPanelButtons();
+
+// ============================================================
+// 评论舆情分析模块
+// ============================================================
+
+const cmState = {
+  sessionId: null,
+  file: null,
+  running: false,
+  result: null,
+};
+
+function cmGoStep(n) {
+  cmState.currentStep = n;
+  cmPanels.forEach((p, i) => p && p.classList.toggle('panel--hidden', i + 1 !== n));
+  document.querySelectorAll('[data-comment-step]').forEach(btn => {
+    const i = +btn.dataset.commentStep;
+    btn.classList.remove('step-bar__item--active', 'step-bar__item--done');
+    if (i < n) btn.classList.add('step-bar__item--done');
+    else if (i === n) btn.classList.add('step-bar__item--active');
+    btn.disabled = true; // 评论分析流程不支持步骤条回看
+  });
+  document.querySelector('.main')?.scrollTo({ top: 0, behavior: 'smooth' });
+}
+cmState.currentStep = 1;
+
+// ── 上传区交互 ──
+const cmUploadZone = $('cm-upload-zone');
+const cmFileInput = $('cm-file-input');
+
+function cmUpdateStartBtn() {
+  const ready = !!cmState.file && $('cm-post-title').value.trim().length > 0;
+  $('cm-btn-start').disabled = !ready || cmState.running;
+}
+
+function cmSetFile(file) {
+  if (!file) return;
+  if (!/\.(csv|xlsx|xls)$/i.test(file.name)) {
+    showToast('仅支持 CSV / Excel 文件', 'error');
+    return;
+  }
+  if (file.size > 50 * 1024 * 1024) {
+    showToast('文件超过 50MB 上限', 'error');
+    return;
+  }
+  cmState.file = file;
+  $('cm-upload-primary').textContent = `已选择：${shortName(file.name, 32)}`;
+  cmUploadZone.classList.add('upload-zone--filled');
+  cmUpdateStartBtn();
+}
+
+if (cmUploadZone) {
+  cmUploadZone.addEventListener('click', () => cmFileInput.click());
+  cmUploadZone.addEventListener('dragover', e => { e.preventDefault(); cmUploadZone.classList.add('drag-over'); });
+  cmUploadZone.addEventListener('dragleave', () => cmUploadZone.classList.remove('drag-over'));
+  cmUploadZone.addEventListener('drop', e => {
+    e.preventDefault();
+    cmUploadZone.classList.remove('drag-over');
+    cmSetFile(e.dataTransfer.files[0]);
+  });
+  cmFileInput.addEventListener('change', () => cmSetFile(cmFileInput.files[0]));
+  $('cm-post-title').addEventListener('input', cmUpdateStartBtn);
+}
+
+// ── 开始分析 ──
+async function cmStart() {
+  if (cmState.running || !cmState.file) return;
+  const title = $('cm-post-title').value.trim();
+  if (!title) { showToast('请填写帖子标题', 'error'); return; }
+
+  cmState.running = true;
+  cmUpdateStartBtn();
+  const fd = new FormData();
+  fd.append('file', cmState.file);
+  fd.append('post_title', title);
+  fd.append('post_content', $('cm-post-content').value.trim());
+
+  try {
+    const resp = await fetch('/api/comment-analysis/upload', { method: 'POST', body: fd });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || '上传失败');
+    cmState.sessionId = data.session_id;
+    showToast(`有效评论 ${data.valid_count} 条，抽样 ${data.sample_count} 条`, 'success');
+
+    // 进入进度面板，开始流式分析
+    cmGoStep(2);
+    $('cm-progress-log').innerHTML = '';
+    $('cm-progress-msg').textContent = '正在准备分析…';
+    await cmRun();
+  } catch (e) {
+    showToast(`分析失败：${e.message}`, 'error');
+    cmGoStep(1);
+  } finally {
+    cmState.running = false;
+    cmUpdateStartBtn();
+  }
+}
+
+async function cmRun() {
+  await consumeSSE(`/api/comment-analysis/run/${cmState.sessionId}`, ev => {
+    if (ev.type === 'progress') {
+      $('cm-progress-msg').textContent = ev.message;
+      const log = $('cm-progress-log');
+      const line = document.createElement('div');
+      line.className = 'cm-progress__line';
+      line.textContent = ev.message;
+      log.appendChild(line);
+      log.scrollTop = log.scrollHeight;
+    }
+    if (ev.type === 'comment_done') {
+      cmState.result = ev;
+      cmRenderResult(ev);
+      cmGoStep(3);
+    }
+  });
+}
+
+// ── 结果渲染 ──
+const CM_SENTI = {
+  positive: { label: '正面', color: 'var(--green)' },
+  neutral: { label: '中性', color: 'var(--text-3)' },
+  negative: { label: '负面', color: 'var(--red)' },
+};
+
+function cmRenderResult(res) {
+  const title = $('cm-post-title').value.trim();
+  $('cm-result-title').textContent = title ? `${shortName(title, 28)} · 舆情简报` : '舆情简报';
+
+  // 整体情感分布条
+  const so = res.sentiment_overall || {};
+  const segs = [
+    ['positive', so.positive_pct || 0],
+    ['neutral', so.neutral_pct || 0],
+    ['negative', so.negative_pct || 0],
+  ];
+  $('cm-sentiment-bar').innerHTML = segs.map(([k, pct]) =>
+    pct > 0 ? `<div class="cm-seg" style="width:${pct}%;background:${CM_SENTI[k].color}" title="${CM_SENTI[k].label} ${pct}%"></div>` : ''
+  ).join('');
+  $('cm-sentiment-legend').innerHTML = segs.map(([k, pct]) =>
+    `<span class="cm-legend__item"><i style="background:${CM_SENTI[k].color}"></i>${CM_SENTI[k].label} ${pct}%</span>`
+  ).join('');
+
+  // 观点卡片
+  const list = $('cm-theme-list');
+  const themes = res.themes || [];
+  if (!themes.length) {
+    list.innerHTML = '<div class="hist-empty">未提炼出有效观点</div>';
+  } else {
+    list.innerHTML = themes.map((t, idx) => {
+      const senti = [
+        ['positive', t.positive_pct || 0],
+        ['neutral', t.neutral_pct || 0],
+        ['negative', t.negative_pct || 0],
+      ];
+      const sentiBar = senti.map(([k, p]) =>
+        p > 0 ? `<div class="cm-seg" style="width:${p}%;background:${CM_SENTI[k].color}"></div>` : ''
+      ).join('');
+      const quotes = (t.quotes || []).map(q => `<li class="cm-quote">${esc(q)}</li>`).join('');
+      return `
+        <div class="cm-theme" data-cm-theme="${idx}">
+          <div class="cm-theme__head">
+            <span class="cm-theme__name">${esc(t.name)}</span>
+            <span class="cm-theme__pct">${t.percentage}%</span>
+            <svg class="cm-theme__chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+          </div>
+          <div class="cm-theme__senti">${sentiBar}</div>
+          ${t.description ? `<div class="cm-theme__desc">${esc(t.description)}</div>` : ''}
+          <div class="cm-theme__quotes" hidden>${quotes || '<li class="cm-quote cm-quote--empty">暂无代表性评论</li>'}</div>
+        </div>`;
+    }).join('');
+    list.querySelectorAll('.cm-theme__head').forEach(head => {
+      head.addEventListener('click', () => {
+        const card = head.closest('.cm-theme');
+        const q = card.querySelector('.cm-theme__quotes');
+        const open = q.hasAttribute('hidden');
+        if (open) q.removeAttribute('hidden'); else q.setAttribute('hidden', '');
+        card.classList.toggle('cm-theme--open', open);
+      });
+    });
+  }
+
+  // 其他声音
+  const others = res.other_themes || [];
+  $('cm-other').innerHTML = others.length
+    ? `<span class="cm-other__label">其他零散声音：</span>` +
+      others.map(o => `<span class="cm-other__tag">${esc(o.name)} ${o.percentage}%</span>`).join('')
+    : '';
+
+  // AI 简报
+  $('cm-report-content').innerHTML = renderMarkdown(res.report_md || '*（未生成简报）*');
+}
+
+// ── 导出 & 重置 ──
+$('cm-btn-pdf')?.addEventListener('click', () => {
+  if (cmState.sessionId) window.location.href = `/api/export/pdf/${cmState.sessionId}`;
+  else showToast('还没有生成报告', 'error');
+});
+
+$('cm-btn-feishu')?.addEventListener('click', async () => {
+  if (!cmState.sessionId) { showToast('还没有生成报告', 'error'); return; }
+  const btn = $('cm-btn-feishu');
+  btn.disabled = true;
+  const old = btn.textContent;
+  btn.textContent = '导出中…';
+  try {
+    const resp = await fetch(`/api/export/feishu/${cmState.sessionId}`, { method: 'POST' });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || '导出失败');
+    showToast('飞书文档已创建', 'success');
+    if (data.url) window.open(data.url, '_blank');
+  } catch (e) {
+    showToast(`导出飞书文档失败：${e.message}`, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = old;
+  }
+});
+
+function cmReset() {
+  cmState.sessionId = null;
+  cmState.file = null;
+  cmState.result = null;
+  cmFileInput.value = '';
+  $('cm-post-title').value = '';
+  $('cm-post-content').value = '';
+  $('cm-upload-primary').textContent = '拖放文件到这里，或点击选择';
+  cmUploadZone.classList.remove('upload-zone--filled');
+  cmUpdateStartBtn();
+  cmGoStep(1);
+}
+
+$('cm-btn-start')?.addEventListener('click', cmStart);
+$('cm-btn-restart')?.addEventListener('click', cmReset);
 
 // ============================================================
 // 数据标注状态机

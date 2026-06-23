@@ -74,6 +74,16 @@
           </div>
         </div>
 
+        <!-- 评论分析 -->
+        <div class="nav-item" id="nav-comment">
+          <div class="nav-item__header" id="nav-header-comment">
+            <svg class="nav-item__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+            </svg>
+            <span>评论分析</span>
+          </div>
+        </div>
+
         <!-- 设置 -->
         <div class="nav-item" id="nav-settings">
           <div class="nav-item__header" id="nav-header-settings">
@@ -782,6 +792,136 @@
             下载标注结果 Excel
           </button>
           <button class="btn btn--ghost" id="ann-btn-restart" style="margin-top:8px">重新标注</button>
+        </div>
+      </section>
+
+      <!-- ======================================================
+           评论舆情分析面板（独立模块，3 步）
+           ====================================================== -->
+
+      <!-- CM STEP 1: 上传 & 配置 -->
+      <section class="panel panel--hidden" id="cm-panel-1">
+        <div class="step-bar" id="cm-step-bar-1">
+          <button class="step-bar__item step-bar__item--active" data-comment-step="1"><span
+              class="step-bar__num">1</span><span class="step-bar__label">上传评论</span></button>
+          <button class="step-bar__item" data-comment-step="2"><span class="step-bar__num">2</span><span
+              class="step-bar__label">分析中</span></button>
+          <button class="step-bar__item" data-comment-step="3"><span class="step-bar__num">3</span><span
+              class="step-bar__label">舆情结果</span></button>
+        </div>
+        <div class="panel__header">
+          <h1 class="panel__title">上传帖子评论</h1>
+          <p class="panel__desc">上传社交媒体评论文件，填写帖子标题，AI 将提炼玩家观点、情感分布与代表性评论。</p>
+        </div>
+
+        <div class="upload-zone" id="cm-upload-zone">
+          <input type="file" id="cm-file-input" accept=".csv,.xlsx,.xls" hidden />
+          <div class="upload-zone__icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+              <polyline points="17 8 12 3 7 8" />
+              <line x1="12" y1="3" x2="12" y2="15" />
+            </svg>
+          </div>
+          <div class="upload-zone__text">
+            <span class="upload-zone__primary" id="cm-upload-primary">拖放文件到这里，或点击选择</span>
+            <span class="upload-zone__secondary">支持 CSV / Excel（最大 50MB），自动识别评论列</span>
+          </div>
+        </div>
+
+        <div class="cm-config">
+          <div class="cm-field">
+            <label class="cm-field__label" for="cm-post-title">帖子标题<span class="cm-field__req">必填</span></label>
+            <input type="text" class="cm-input" id="cm-post-title"
+              placeholder="例如：生存模式即将回归，你期待吗？" />
+          </div>
+          <div class="cm-field">
+            <label class="cm-field__label" for="cm-post-content">帖子原文<span class="cm-field__opt">选填</span></label>
+            <textarea class="cm-input cm-textarea" id="cm-post-content" rows="4"
+              placeholder="粘贴帖子正文（可选）。提供后会先用关键词二次过滤掉与帖子无关的评论。"></textarea>
+          </div>
+        </div>
+
+        <div class="cm-actions">
+          <button class="btn btn--primary" id="cm-btn-start" disabled>开始分析</button>
+        </div>
+      </section>
+
+      <!-- CM STEP 2: 分析进度 -->
+      <section class="panel panel--hidden" id="cm-panel-2">
+        <div class="step-bar" id="cm-step-bar-2">
+          <button class="step-bar__item step-bar__item--done" data-comment-step="1"><span
+              class="step-bar__num">1</span><span class="step-bar__label">上传评论</span></button>
+          <button class="step-bar__item step-bar__item--active" data-comment-step="2"><span
+              class="step-bar__num">2</span><span class="step-bar__label">分析中</span></button>
+          <button class="step-bar__item" data-comment-step="3"><span class="step-bar__num">3</span><span
+              class="step-bar__label">舆情结果</span></button>
+        </div>
+        <div class="panel__header">
+          <h1 class="panel__title">正在分析评论舆情</h1>
+          <p class="panel__desc">Python 并发调度 + AI 主题聚类，几千条评论约 2~3 分钟，请耐心等待。</p>
+        </div>
+
+        <div class="cm-progress">
+          <div class="cm-progress__head">
+            <div class="spinner"></div>
+            <span id="cm-progress-msg">正在准备分析…</span>
+          </div>
+          <div class="cm-progress__log" id="cm-progress-log"></div>
+        </div>
+      </section>
+
+      <!-- CM STEP 3: 舆情结果 -->
+      <section class="panel panel--hidden" id="cm-panel-3">
+        <div class="report-toolbar">
+          <div class="report-toolbar__left">
+            <div class="report-toolbar__steps"></div>
+          </div>
+          <div class="report-toolbar__title-area">
+            <div class="report-title-row">
+              <div class="report-toolbar__title" id="cm-result-title">舆情简报</div>
+            </div>
+          </div>
+          <div class="report-toolbar__actions">
+            <button class="btn btn--ghost" id="cm-btn-pdf" type="button">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                <polyline points="7 10 12 15 17 10" />
+                <line x1="12" y1="15" x2="12" y2="3" />
+              </svg>
+              下载 PDF
+            </button>
+            <button class="btn btn--ghost" id="cm-btn-feishu" type="button">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                <polyline points="14 2 14 8 20 8" />
+              </svg>
+              导出飞书文档
+            </button>
+            <button class="btn btn--primary" id="cm-btn-restart" type="button">分析新帖子</button>
+          </div>
+        </div>
+
+        <div class="cm-result">
+          <!-- 整体情感分布 -->
+          <div class="cm-section">
+            <div class="cm-section__title">整体情感分布</div>
+            <div class="cm-sentiment-bar" id="cm-sentiment-bar"></div>
+            <div class="cm-sentiment-legend" id="cm-sentiment-legend"></div>
+          </div>
+
+          <!-- 观点卡片 -->
+          <div class="cm-section">
+            <div class="cm-section__title">玩家核心观点</div>
+            <div class="cm-theme-list" id="cm-theme-list"></div>
+            <div class="cm-other" id="cm-other"></div>
+          </div>
+
+          <!-- AI 舆情简报 -->
+          <div class="cm-section">
+            <div class="cm-section__title">AI 舆情简报</div>
+            <div class="report-content markdown-body" id="cm-report-content"></div>
+          </div>
         </div>
       </section>
 
