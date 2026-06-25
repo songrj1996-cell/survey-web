@@ -81,6 +81,7 @@ WEB_LOGINS_FILE = os.path.join(DATA_DIR, "web_logins.json")
 HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
 AUDIT_LOG_FILE = os.path.join(DATA_DIR, "audit_logs.json")
 APP_SETTINGS_FILE = os.path.join(DATA_DIR, "app_settings.json")
+UI_TEXTS_FILE = os.path.join(DATA_DIR, "ui_texts.json")
 ANNOTATE_RESULT_DIR = Path(DATA_DIR) / "annotate_results"
 MAX_HISTORY  = 20
 MAX_AUDIT_LOGS = max(200, _env_int("AUDIT_LOG_MAX", 5000))

@@ -101,6 +101,13 @@ from app.storage.whitelist import (
     _migrate_whitelist_perms,
     _save_whitelist,
 )
+from app.storage.ui_texts import (
+    DEFAULT_UI_TEXTS,
+    _load_ui_texts,
+    _save_ui_texts,
+)
+from app.core.parsing import _parse_csv, _parse_excel, _parse_file
+from app.core.responses import sse_event
 
 # 配置常量、Dify/飞书参数、数据路径、阈值、默认文案统一来自 app/core/config。
 # 过渡期 server.py 仍以 import * 取回这些名字;step3 server.py 瘦身后此行移除。
@@ -675,46 +682,6 @@ def _history_effective_row_count(entry: dict) -> int:
 # ============================================================
 # 文件解析
 # ============================================================
-
-def _parse_csv(content: bytes) -> list[list]:
-    for enc in ("utf-8-sig", "utf-8", "gbk", "gb2312"):
-        try:
-            text = content.decode(enc)
-            reader = csv.reader(io.StringIO(text))
-            rows = [list(row) for row in reader]
-            while rows and all(not c.strip() for c in rows[-1]):
-                rows.pop()
-            return rows
-        except (UnicodeDecodeError, csv.Error):
-            continue
-    raise ValueError("无法解析 CSV 文件，请确认文件编码为 UTF-8 或 GBK")
-
-
-def _parse_excel(content: bytes) -> list[list]:
-    wb = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
-    ws = wb.active
-    rows = []
-    for row in ws.iter_rows(values_only=True):
-        rows.append([("" if c is None else str(c)) for c in row])
-    wb.close()
-    while rows and all(not c.strip() for c in rows[-1]):
-        rows.pop()
-    return rows
-
-
-def _parse_file(filename: str, content: bytes) -> list[list]:
-    name_lower = filename.lower()
-    if name_lower.endswith(".csv"):
-        return _parse_csv(content)
-    elif name_lower.endswith((".xlsx", ".xls")):
-        return _parse_excel(content)
-    else:
-        try:
-            return _parse_csv(content)
-        except ValueError:
-            pass
-        raise ValueError("不支持的文件格式，请上传 CSV 或 Excel 文件")
-
 
 # ============================================================
 # 本地题型推断
@@ -2108,10 +2075,6 @@ def markdown_to_docx(md_text: str) -> bytes:
 # ============================================================
 # SSE 工具
 # ============================================================
-
-def sse_event(data: dict) -> str:
-    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
-
 
 def _annotate_ai_log(message: str, **fields) -> None:
     payload = " ".join(f"{k}={v!r}" for k, v in fields.items())
@@ -5287,83 +5250,6 @@ async def update_prompt(key: str, req: PromptUpdateRequest, request: Request):
 
 
 # ── UI 文案管理 ────────────────────────────────────────
-
-UI_TEXTS_FILE = os.path.join(DATA_DIR, "ui_texts.json")
-
-DEFAULT_UI_TEXTS: dict = {
-    "panel_col_desc": {
-        "key": "panel_col_desc",
-        "label": "数据确认说明",
-        "current": "AI 已识别每道题的题型与中文题名，请逐一核对并修正。题型直接影响后续统计口径。",
-    },
-    "panel_plan_desc": {
-        "key": "panel_plan_desc",
-        "label": "分析方案说明",
-        "current": "AI 已规划以下分析方案，请确认或提出修改意见",
-    },
-    "panel_report_desc": {
-        "key": "panel_report_desc",
-        "label": "生成报告说明",
-        "current": "AI 正在基于确定性统计数据撰写完整报告",
-    },
-    "panel_done_desc": {
-        "key": "panel_done_desc",
-        "label": "报告完成说明",
-        "current": "报告已生成完毕，可下载或继续追问",
-    },
-    "qa_hint": {
-        "key": "qa_hint",
-        "label": "追问提示文字",
-        "current": "对报告有疑问？直接提问，AI 会回到原始数据找答案",
-    },
-    "ann_panel_upload_desc": {
-        "key": "ann_panel_upload_desc",
-        "label": "数据标注·上传说明",
-        "current": "上传问卷原始数据，支持 CSV / Excel（最大 50MB）",
-    },
-    "ann_panel_col_desc": {
-        "key": "ann_panel_col_desc",
-        "label": "数据标注·列确认说明",
-        "current": "AI 已自动检测 ID 列和主观题列，请核对。主观题列将用于 AI 识别和质量打标。",
-    },
-    "ann_panel_run_desc": {
-        "key": "ann_panel_run_desc",
-        "label": "数据标注·识别中说明",
-        "current": "正在分批分析受访者回答，请耐心等待",
-    },
-    "ann_panel_quality_desc": {
-        "key": "ann_panel_quality_desc",
-        "label": "数据标注·打标中说明",
-        "current": "正在分批标注每道主观题的回答质量，请耐心等待",
-    },
-    "ann_panel_done_desc": {
-        "key": "ann_panel_done_desc",
-        "label": "数据标注·完成说明",
-        "current": "所有标注任务已完成，可下载 Excel 文件",
-    },
-}
-
-
-def _load_ui_texts() -> dict:
-    if not os.path.exists(UI_TEXTS_FILE):
-        _save_ui_texts(DEFAULT_UI_TEXTS)
-        return DEFAULT_UI_TEXTS
-    with open(UI_TEXTS_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    dirty = False
-    for k, v in DEFAULT_UI_TEXTS.items():
-        if k not in data:
-            data[k] = v
-            dirty = True
-    if dirty:
-        _save_ui_texts(data)
-    return data
-
-
-def _save_ui_texts(texts: dict) -> None:
-    with open(UI_TEXTS_FILE, "w", encoding="utf-8") as f:
-        json.dump(texts, f, ensure_ascii=False, indent=2)
-
 
 @app.get("/api/ui-texts")
 async def get_ui_texts():
