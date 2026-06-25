@@ -1,10 +1,6 @@
-"""survey-web 专用配置，仅加载 Dify 相关环境变量。"""
-import os
-from dotenv import load_dotenv
+"""[过渡 shim] 配置已迁移至 app/core/config.py。
 
-load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
-
-DIFY_API_BASE = os.getenv("DIFY_API_BASE", "https://api.dify.ai/v1").rstrip("/")
-DIFY_API_KEY  = os.getenv("DIFY_API_KEY", "")         # dify.py 的 fallback 变量
-DIFY_PLANNER_KEY = os.getenv("DIFY_PLANNER_KEY", "")
-DIFY_ANALYST_KEY = os.getenv("DIFY_ANALYST_KEY", "")
+保留本文件仅为兼容 dify.py 的 `from config import DIFY_API_BASE, DIFY_API_KEY`。
+步骤2 将 dify.py 迁入 app/integrations 并改为从 app.core.config 导入后,删除本文件。
+"""
+from app.core.config import *  # noqa: F401,F403
