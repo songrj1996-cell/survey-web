@@ -71,6 +71,36 @@ from app.schemas.requests import (
     QARequest,
     UiTextUpdateRequest,
 )
+from app.storage.prompts import (
+    DEFAULT_PROMPTS,
+    _get_planner_extra,
+    _get_writer_requirements,
+    _load_prompts,
+    _save_prompts,
+)
+from app.storage.settings import (
+    DEFAULT_APP_SETTINGS,
+    _load_app_settings,
+    _save_app_settings,
+)
+from app.storage.audit_store import (
+    _append_audit_log,
+    _load_audit_logs,
+    _save_audit_logs,
+)
+from app.storage.history import (
+    _ensure_history_report_numbers,
+    _history_no_value,
+    _load_history,
+    _next_history_report_no,
+    _save_history,
+)
+from app.storage.whitelist import (
+    _PERMS_SCHEMA_VERSION,
+    _load_whitelist,
+    _migrate_whitelist_perms,
+    _save_whitelist,
+)
 
 # 配置常量、Dify/飞书参数、数据路径、阈值、默认文案统一来自 app/core/config。
 # 过渡期 server.py 仍以 import * 取回这些名字;step3 server.py 瘦身后此行移除。
@@ -149,111 +179,6 @@ def _prep_export_md(md: str, mode: str = "") -> str:
     return _strip_core_markers(_inject_disclaimer(md, mode=mode))
 
 
-DEFAULT_PROMPTS: dict = {
-    "upload_guide": {
-        "key": "upload_guide",
-        "label": "上传说明文案",
-        "description": (
-            "显示在上传文件按钮上方的说明文本，支持 Markdown 格式。"
-            "修改后刷新页面即可生效。"
-        ),
-        "dify_app": None,
-        "dify_url": None,
-        "editable": True,
-        "current": DEFAULT_UPLOAD_GUIDE,
-        "history": [],
-    },
-    "writer_requirements": {
-        "key": "writer_requirements",
-        "label": "分析师写报告要求",
-        "description": (
-            "附加在发送给 Analyst（调研分析-分析师）的 query 末尾的写报告要求。"
-            "修改后下一次分析立即生效，无需重启服务。"
-        ),
-        "dify_app": None,
-        "dify_url": None,
-        "editable": True,
-        "current": DEFAULT_WRITER_REQUIREMENTS,
-        "history": [],
-        "version": 9,  # 改了默认值就 +1：未被用户编辑过的会自动升级
-    },
-    "planner_extra": {
-        "key": "planner_extra",
-        "label": "Planner 分析指令",
-        "description": (
-            "附加在发送给 Planner（调研分析-规划器）的 query 末尾的补充指令。"
-            "影响列分类、章节划分、交叉分析的规划方式。"
-        ),
-        "dify_app": None,
-        "dify_url": None,
-        "editable": True,
-        "current": DEFAULT_PLANNER_EXTRA,
-        "history": [],
-    },
-    "dify_planner_system": {
-        "key": "dify_planner_system",
-        "label": "规划器 System Prompt（Dify 管理）",
-        "description": (
-            "配置在 Dify「调研分析-规划器」应用中的 System Prompt。"
-            "需在 Dify 后台「编排 → 提示词」中修改，此处仅供参考。"
-        ),
-        "dify_app": "调研分析-规划器",
-        "dify_url": DIFY_CONSOLE_URL,
-        "editable": False,
-        "current": "（请前往 Dify 后台查看：调研分析-规划器 → 编排 → 提示词）",
-        "history": [],
-    },
-    "dify_analyst_system": {
-        "key": "dify_analyst_system",
-        "label": "分析师 System Prompt（Dify 管理）",
-        "description": (
-            "配置在 Dify「调研分析-分析师」应用中的 System Prompt。"
-            "需在 Dify 后台「编排 → 提示词」中修改，此处仅供参考。"
-        ),
-        "dify_app": "调研分析-分析师",
-        "dify_url": DIFY_CONSOLE_URL,
-        "editable": False,
-        "current": "（请前往 Dify 后台查看：调研分析-分析师 → 编排 → 提示词）",
-        "history": [],
-    },
-}
-
-
-def _load_prompts() -> dict:
-    if not os.path.exists(PROMPTS_FILE):
-        _save_prompts(DEFAULT_PROMPTS)
-        return DEFAULT_PROMPTS
-    with open(PROMPTS_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    dirty = False
-    for k, v in DEFAULT_PROMPTS.items():
-        if k not in data:
-            data[k] = v
-            dirty = True
-            continue
-        # 默认值升级：版本落后且用户从未编辑过（history 为空）→ 用新默认覆盖 current
-        default_ver = v.get("version", 1)
-        if data[k].get("version", 1) < default_ver:
-            if not data[k].get("history"):
-                data[k]["current"] = v["current"]
-            data[k]["version"] = default_ver
-            dirty = True
-    if dirty:
-        _save_prompts(data)
-    return data
-
-
-def _save_prompts(prompts: dict) -> None:
-    with open(PROMPTS_FILE, "w", encoding="utf-8") as f:
-        json.dump(prompts, f, ensure_ascii=False, indent=2)
-
-
-def _get_writer_requirements() -> str:
-    return _load_prompts()["writer_requirements"]["current"]
-
-
-def _get_planner_extra() -> str:
-    return _load_prompts()["planner_extra"]["current"]
 
 
 # ============================================================
@@ -335,78 +260,6 @@ def _write_session(sid: str, sess: dict) -> None:
 # ============================================================
 # 历史记录
 # ============================================================
-
-def _load_history() -> list:
-    if not os.path.exists(HISTORY_FILE):
-        return []
-    with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def _save_history(history: list) -> None:
-    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-        json.dump(history, f, ensure_ascii=False, indent=2)
-
-
-DEFAULT_APP_SETTINGS = {
-    "comment_duplicate_reminder_enabled": True,
-}
-
-
-def _load_app_settings() -> dict:
-    if not os.path.exists(APP_SETTINGS_FILE):
-        _save_app_settings(DEFAULT_APP_SETTINGS)
-        return dict(DEFAULT_APP_SETTINGS)
-    try:
-        with open(APP_SETTINGS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except json.JSONDecodeError:
-        data = {}
-    dirty = False
-    for key, value in DEFAULT_APP_SETTINGS.items():
-        if key not in data:
-            data[key] = value
-            dirty = True
-    if dirty:
-        _save_app_settings(data)
-    return data
-
-
-def _save_app_settings(settings: dict) -> None:
-    with open(APP_SETTINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(settings, f, ensure_ascii=False, indent=2)
-
-
-def _history_no_value(report_no: str) -> int:
-    m = re.match(r"^R-(\d+)$", str(report_no or "").strip())
-    return int(m.group(1)) if m else 0
-
-
-def _ensure_history_report_numbers(history: list, *, save: bool = True) -> list:
-    if not history:
-        return history
-    dirty = False
-    used = {_history_no_value(h.get("report_no", "")) for h in history}
-    used.discard(0)
-    next_no = max(used or {0}) + 1
-    missing = [h for h in history if not h.get("report_no")]
-    missing.sort(key=lambda h: h.get("created_at", ""))
-    for h in missing:
-        while next_no in used:
-            next_no += 1
-        h["report_no"] = f"R-{next_no:03d}"
-        used.add(next_no)
-        dirty = True
-    if dirty and save:
-        _save_history(history)
-    return history
-
-
-def _next_history_report_no(history: list) -> str:
-    _ensure_history_report_numbers(history, save=False)
-    max_no = max((_history_no_value(h.get("report_no", "")) for h in history), default=0)
-    return f"R-{max_no + 1:03d}"
-
 
 def _qa_user_count(entry: dict) -> int:
     return sum(1 for m in entry.get("qa_messages", []) if m.get("role") == "user")
@@ -491,24 +344,6 @@ AUDIT_FEATURES = [
 AUDIT_FEATURE_LABELS = {item["key"]: item["label"] for item in AUDIT_FEATURES}
 
 
-def _load_audit_logs() -> list[dict]:
-    if not os.path.exists(AUDIT_LOG_FILE):
-        return []
-    try:
-        with open(AUDIT_LOG_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict):
-            data = data.get("logs", [])
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
-
-
-def _save_audit_logs(logs: list[dict]) -> None:
-    with open(AUDIT_LOG_FILE, "w", encoding="utf-8") as f:
-        json.dump(logs[:MAX_AUDIT_LOGS], f, ensure_ascii=False, indent=2)
-
-
 def _client_ip(request: Request | None) -> str:
     if not request:
         return ""
@@ -529,15 +364,6 @@ def _audit_user(login: dict | None) -> dict:
         "user_name": str(login.get("name", "")).strip(),
         "open_id": open_id,
     }
-
-
-def _append_audit_log(entry: dict) -> None:
-    try:
-        logs = _load_audit_logs()
-        logs.insert(0, entry)
-        _save_audit_logs(logs)
-    except Exception as exc:
-        print(f"[audit] write failed: {exc}", flush=True)
 
 
 def _audit_log_from_login(
@@ -3290,42 +3116,6 @@ def _wants_api_response(request: Request) -> bool:
 # 权限项全集（顺序即管理页展示顺序）
 ALL_PERMS = ["survey", "annotate", "comment"]
 # 白名单 perms 结构版本：v2 引入 comment 权限，对历史用户默认授予
-_PERMS_SCHEMA_VERSION = 2
-
-
-def _migrate_whitelist_perms(users: list[dict]) -> bool:
-    """一次性升级历史白名单：给已有访问权限(survey/annotate)的用户补 comment。
-    用 perms_v 标记已迁移，迁移后管理员再取消 comment 也不会被重新加上。
-    返回是否发生改动（需要回写）。"""
-    changed = False
-    for u in users:
-        if u.get("perms_v", 1) < _PERMS_SCHEMA_VERSION:
-            perms = list(u.get("perms", ["survey", "annotate"]))
-            if perms and "comment" not in perms:
-                perms.append("comment")
-            u["perms"] = perms
-            u["perms_v"] = _PERMS_SCHEMA_VERSION
-            changed = True
-    return changed
-
-
-def _load_whitelist() -> list[dict]:
-    try:
-        with open(WHITELIST_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        users = data.get("users", []) if isinstance(data, dict) else []
-    except (FileNotFoundError, json.JSONDecodeError):
-        return []
-    if _migrate_whitelist_perms(users):
-        _save_whitelist(users)
-    return users
-
-
-def _save_whitelist(users: list[dict]) -> None:
-    with open(WHITELIST_FILE, "w", encoding="utf-8") as f:
-        json.dump({"users": users}, f, ensure_ascii=False, indent=2)
-
-
 def _email(login: dict | None) -> str:
     return str((login or {}).get("email", "")).strip().lower()
 
