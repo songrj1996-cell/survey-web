@@ -202,7 +202,8 @@ function consumeSSE(url, onEvent) {
         if (data.type === 'error') { es.close(); reject(new Error(data.message || data.msg || '服务端处理失败')); }
         if ([
           'columns_ready', 'plan_ready', 'report_done', 'qa_done',
-          'ai_detect_done', 'quality_done', 'comment_done',
+          'ai_detect_done', 'quality_done', 'comment_preprocess_done',
+          'comment_quotes_done', 'comment_quotes_error',
         ].includes(data.type)) {
           es.close(); resolve(data);
         }
@@ -1431,27 +1432,36 @@ $('btn-export-word').addEventListener('click', () => {
 // ── 飞书登录状态 + 权限门控 ──
 state.feishu = {
   configured: false, logged_in: false, allowed: true, name: '', email: '',
-  perms: ['survey', 'annotate'], is_admin: false
+  perms: ['survey', 'annotate', 'comment'], is_admin: false
 };
 
 function applyPermGating() {
   const perms = state.feishu.perms || [];
   const hasSurvey = perms.includes('survey');
   const hasAnnotate = perms.includes('annotate');
+  const hasComment = perms.includes('comment');
   // 侧边栏：无权限则隐藏入口
   const navSurvey = $('nav-survey');
   const navAnnotate = $('nav-annotate');
+  const navComment = $('nav-comment');
   if (navSurvey) navSurvey.style.display = hasSurvey ? '' : 'none';
   if (navAnnotate) navAnnotate.style.display = hasAnnotate ? '' : 'none';
-  // 如果当前模式无权限，切换到有权限的模式
-  if (currentMode === 'survey' && !hasSurvey && hasAnnotate) switchMode('annotate');
-  if (currentMode === 'annotate' && !hasAnnotate && hasSurvey) switchMode('survey');
+  if (navComment) navComment.style.display = hasComment ? '' : 'none';
+  // 如果当前模式无权限，切换到第一个有权限的模式
+  const allowedModes = [
+    ['survey', hasSurvey], ['annotate', hasAnnotate], ['comment', hasComment],
+  ].filter(([, ok]) => ok).map(([m]) => m);
+  if (!allowedModes.includes(currentMode) && allowedModes.length) {
+    switchMode(allowedModes[0]);
+  }
   // 非管理员隐藏整个「设置」入口
   const navSettings = $('nav-settings');
   if (navSettings) navSettings.style.display = state.feishu.is_admin ? '' : 'none';
   // 管理员才显示权限配置 tab
   const permNav = $('stab-perms-nav');
   if (permNav) permNav.style.display = state.feishu.is_admin ? '' : 'none';
+  const systemNav = $('stab-system-nav');
+  if (systemNav) systemNav.style.display = state.feishu.is_admin ? '' : 'none';
   const auditNav = $('stab-audit-nav');
   if (auditNav) auditNav.style.display = state.feishu.is_admin ? '' : 'none';
   const adminLabel = $('settings-nav-admin-label');
@@ -1733,6 +1743,7 @@ document.addEventListener('keydown', e => {
 const STAB_LOADERS = {
   texts: loadUiTextsSettings,
   prompts: loadPrompts,
+  system: loadSystemSettings,
   perms: loadPermsTab,
   audit: loadAuditLogsTab,
 };
@@ -1741,7 +1752,7 @@ function switchSettingsTab(name) {
   document.querySelectorAll('.settings-nav__item').forEach(el => {
     el.classList.toggle('settings-nav__item--active', el.dataset.stab === name);
   });
-  ['texts', 'prompts', 'perms', 'audit'].forEach(k => {
+  ['texts', 'prompts', 'system', 'perms', 'audit'].forEach(k => {
     const el = $(`stab-content-${k}`);
     if (el) el.style.display = k === name ? '' : 'none';
   });
@@ -1807,6 +1818,7 @@ function renderPermsTable(users) {
       <div class="perm-checkboxes">
         <label><input type="checkbox" id="perm-new-survey" checked class="perm-toggle" /> 问卷分析</label>
         <label><input type="checkbox" id="perm-new-annotate" checked class="perm-toggle" /> 数据标注</label>
+        <label><input type="checkbox" id="perm-new-comment" checked class="perm-toggle" /> 评论分析</label>
       </div>
       <button class="btn btn--primary btn--sm" id="perm-add-btn">添加成员</button>
     </div>`;
@@ -1815,6 +1827,7 @@ function renderPermsTable(users) {
     const isAdmin = u.is_admin;
     const hasSurvey = u.perms.includes('survey');
     const hasAnnotate = u.perms.includes('annotate');
+    const hasComment = u.perms.includes('comment');
     const adminBadge = isAdmin ? `<span class="perm-badge">管理员</span>` : '';
     const surveyCell = isAdmin
       ? `<span style="color:var(--green)">✓</span>`
@@ -1822,6 +1835,9 @@ function renderPermsTable(users) {
     const annotateCell = isAdmin
       ? `<span style="color:var(--green)">✓</span>`
       : `<input type="checkbox" class="perm-toggle" ${hasAnnotate ? 'checked' : ''} data-perm-email="${esc(u.email)}" data-perm-type="annotate" />`;
+    const commentCell = isAdmin
+      ? `<span style="color:var(--green)">✓</span>`
+      : `<input type="checkbox" class="perm-toggle" ${hasComment ? 'checked' : ''} data-perm-email="${esc(u.email)}" data-perm-type="comment" />`;
     const deleteBtn = isAdmin ? `<span style="color:var(--text-3);font-size:12px">—</span>`
       : `<button class="btn btn--ghost btn--sm" data-perm-delete="${esc(u.email)}">删除</button>`;
     const enabledToggle = isAdmin ? '' : `
@@ -1831,6 +1847,7 @@ function renderPermsTable(users) {
       <td>${esc(u.email)} ${adminBadge}</td>
       <td style="text-align:center">${surveyCell}</td>
       <td style="text-align:center">${annotateCell}</td>
+      <td style="text-align:center">${commentCell}</td>
       <td style="text-align:center">${enabledToggle}</td>
       <td style="text-align:center">${deleteBtn}</td>
     </tr>`;
@@ -1842,6 +1859,7 @@ function renderPermsTable(users) {
         <th>飞书邮箱</th>
         <th style="text-align:center">问卷分析</th>
         <th style="text-align:center">数据标注</th>
+        <th style="text-align:center">评论分析</th>
         <th style="text-align:center">启用</th>
         <th style="text-align:center">操作</th>
       </tr></thead>
@@ -1855,6 +1873,7 @@ function renderPermsTable(users) {
     const perms = [];
     if ($('perm-new-survey').checked) perms.push('survey');
     if ($('perm-new-annotate').checked) perms.push('annotate');
+    if ($('perm-new-comment').checked) perms.push('comment');
     try {
       const r = await fetch('/api/admin/users', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, perms }) });
       const d = await r.json();
@@ -1879,9 +1898,11 @@ function renderPermsTable(users) {
           const row = cb.closest('tr');
           const surveyEl = row.querySelector('[data-perm-type="survey"]');
           const annotateEl = row.querySelector('[data-perm-type="annotate"]');
+          const commentEl = row.querySelector('[data-perm-type="comment"]');
           const perms = [];
           if ((type === 'survey' ? checked : surveyEl?.checked)) perms.push('survey');
           if ((type === 'annotate' ? checked : annotateEl?.checked)) perms.push('annotate');
+          if ((type === 'comment' ? checked : commentEl?.checked)) perms.push('comment');
           patch = { perms };
         }
         const r = await fetch(`/api/admin/users/${encodeURIComponent(email)}`, {
@@ -1950,19 +1971,36 @@ function renderAuditLogsTab(data) {
   const featureOptions = features.map(f => `
     <option value="${esc(f.key)}" ${filters.feature === f.key ? 'selected' : ''}>${esc(f.label)}</option>
   `).join('');
-  const rows = logs.map(item => `
-    <tr>
-      <td class="audit-time">${esc(formatAuditTime(item.ts))}</td>
+  const rows = logs.map((item, idx) => {
+    const userText = item.user_email || item.user_name || item.open_id || '未识别用户';
+    const featureText = item.feature_label || auditFeatureLabel(features, item.feature);
+    const actionText = item.action || '';
+    const detailText = item.detail || '';
+    const statusText = item.status || 'success';
+    return `
+    <tr class="audit-row" data-audit-row="${idx}">
+      <td class="audit-time" title="${esc(formatAuditTime(item.ts))}">${esc(formatAuditTime(item.ts))}</td>
       <td>
-        <div class="audit-user">${esc(item.user_email || item.user_name || item.open_id || '未识别用户')}</div>
+        <div class="audit-user" title="${esc(userText)}">${esc(userText)}</div>
         ${item.user_name ? `<div class="audit-sub">${esc(item.user_name)}</div>` : ''}
       </td>
-      <td><span class="audit-feature">${esc(item.feature_label || auditFeatureLabel(features, item.feature))}</span></td>
-      <td>${esc(item.action || '')}</td>
-      <td class="audit-detail">${esc(item.detail || '')}</td>
-      <td><span class="audit-status audit-status--${esc(item.status || 'success')}">${esc(item.status || 'success')}</span></td>
+      <td title="${esc(featureText)}"><span class="audit-feature">${esc(featureText)}</span></td>
+      <td class="audit-action" title="${esc(actionText)}">${esc(actionText)}</td>
+      <td class="audit-detail" title="${esc(detailText)}">${esc(detailText)}</td>
+      <td><span class="audit-status audit-status--${esc(statusText)}">${esc(statusText)}</span></td>
     </tr>
-  `).join('');
+    <tr class="audit-detail-row" data-audit-detail="${idx}" hidden>
+      <td colspan="6">
+        <div class="audit-detail-card">
+          <div><strong>用户</strong><span>${esc(userText)}${item.user_name ? `（${esc(item.user_name)}）` : ''}</span></div>
+          <div><strong>功能</strong><span>${esc(featureText)}</span></div>
+          <div><strong>操作</strong><span>${esc(actionText || '无')}</span></div>
+          <div><strong>详情</strong><span>${esc(detailText || '无')}</span></div>
+        </div>
+      </td>
+    </tr>
+  `;
+  }).join('');
 
   body.innerHTML = `
     <div class="audit-panel">
@@ -2013,6 +2051,23 @@ function renderAuditLogsTab(data) {
   $('audit-filter-reset').addEventListener('click', () => {
     state.auditFilters = { start: '', end: '', user: '', feature: '' };
     loadAuditLogsTab();
+  });
+  body.querySelectorAll('[data-audit-row]').forEach(row => {
+    row.addEventListener('click', () => {
+      const detail = body.querySelector(`[data-audit-detail="${row.dataset.auditRow}"]`);
+      if (!detail) return;
+      const open = detail.hasAttribute('hidden');
+      body.querySelectorAll('.audit-detail-row').forEach(r => {
+        if (r !== detail) r.setAttribute('hidden', '');
+      });
+      body.querySelectorAll('.audit-row--open').forEach(r => r.classList.remove('audit-row--open'));
+      if (open) {
+        detail.removeAttribute('hidden');
+        row.classList.add('audit-row--open');
+      } else {
+        detail.setAttribute('hidden', '');
+      }
+    });
   });
 }
 
@@ -2073,6 +2128,50 @@ $('stab-content-texts').addEventListener('click', async e => {
   } finally {
     btn.textContent = '保存';
     btn.disabled = false;
+  }
+});
+
+async function loadSystemSettings() {
+  const body = $('stab-content-system');
+  body.innerHTML = `<div class="hist-empty"><div class="spinner" style="margin:0 auto"></div></div>`;
+  try {
+    const resp = await fetch('/api/app-settings');
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || '加载失败');
+    body.innerHTML = `
+      <div class="uitext-card">
+        <div class="uitext-card__label">评论分析·重复文件提醒</div>
+        <div class="prompt-card__desc">开启后，用户上传已生成过历史报告的同一文件时，会先提示可查看历史报告或继续重新分析。</div>
+        <label class="setting-toggle">
+          <input type="checkbox" id="setting-comment-duplicate" ${data.comment_duplicate_reminder_enabled ? 'checked' : ''} />
+          <span>开启重复文件提醒</span>
+        </label>
+      </div>
+    `;
+  } catch (e) {
+    body.innerHTML = `<div class="hist-empty">加载平台设置失败：${esc(e.message)}</div>`;
+  }
+}
+
+$('stab-content-system')?.addEventListener('change', async e => {
+  const input = e.target.closest('#setting-comment-duplicate');
+  if (!input) return;
+  input.disabled = true;
+  try {
+    const resp = await fetch('/api/app-settings', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ comment_duplicate_reminder_enabled: input.checked }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || '保存失败');
+    input.checked = !!data.comment_duplicate_reminder_enabled;
+    showToast('平台设置已保存', 'success');
+  } catch (err) {
+    input.checked = !input.checked;
+    showToast(`保存失败：${err.message}`, 'error');
+  } finally {
+    input.disabled = false;
   }
 });
 
@@ -2161,6 +2260,15 @@ $('stab-content-prompts').addEventListener('click', async e => {
 // 历史记录抽屉
 // ============================================================
 
+const historyState = {
+  all: [],
+  filters: {
+    type: 'all',
+    from: '',
+    to: '',
+  },
+};
+
 $('btn-open-history').addEventListener('click', () => {
   openDrawer('history-drawer');
   loadHistory();
@@ -2173,43 +2281,193 @@ async function loadHistory() {
     const resp = await fetch('/api/history');
     const list = await resp.json();
     if (!resp.ok) throw new Error((list && list.detail) || '加载失败');
-
-    if (!list.length) {
-      body.innerHTML = `<div class="hist-empty">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/></svg>
-        暂无历史记录，生成报告后会自动保存最近 5 份
-      </div>`;
-      return;
-    }
-
-    body.innerHTML = `<div class="hist-list">` + list.map(renderHistoryCard).join('') + `</div>`;
+    historyState.all = Array.isArray(list) ? list : [];
+    renderHistoryPanel();
   } catch (e) {
     body.innerHTML = `<div class="hist-empty">加载历史失败：${esc(e.message)}</div>`;
   }
+}
+
+function renderHistoryPanel() {
+  const body = $('history-body');
+  const list = historyState.all || [];
+  if (!list.length) {
+    body.innerHTML = `<div class="hist-empty">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/></svg>
+        暂无历史记录，生成报告后会自动保存最近 20 份
+      </div>`;
+    return;
+  }
+
+  const filtered = filterHistoryList(list);
+  body.innerHTML = `
+    ${renderHistoryFilters(filtered.length, list.length)}
+    ${filtered.length
+      ? `<div class="hist-list">` + filtered.map(renderHistoryCard).join('') + `</div>`
+      : `<div class="hist-empty">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/></svg>
+          没有符合筛选条件的历史记录
+        </div>`}`;
+  bindHistoryFilters();
+}
+
+function renderHistoryFilters(count, total) {
+  const f = historyState.filters;
+  return `
+    <div class="hist-filters">
+      <div class="hist-filter hist-filter--type">
+        <span>报告类型</span>
+        <div class="hist-type-filter" role="group" aria-label="报告类型筛选">
+          <button type="button" class="${f.type === 'all' ? 'active' : ''}" data-hist-filter-type="all">全部类型</button>
+          <button type="button" class="${f.type === 'survey' ? 'active' : ''}" data-hist-filter-type="survey">问卷分析</button>
+          <button type="button" class="${f.type === 'comment' ? 'active' : ''}" data-hist-filter-type="comment">评论分析</button>
+          <button type="button" class="${f.type === 'annotate' ? 'active' : ''}" data-hist-filter-type="annotate">数据标注</button>
+        </div>
+      </div>
+      <label class="hist-filter">
+        <span>生成时间</span>
+        <input type="date" data-hist-filter-from value="${esc(f.from)}">
+      </label>
+      <label class="hist-filter hist-filter--compact">
+        <span>至</span>
+        <input type="date" data-hist-filter-to value="${esc(f.to)}">
+      </label>
+      <button class="hist-filter__clear" type="button" data-hist-filter-clear>重置</button>
+      <div class="hist-filter__count">显示 ${esc(count)} / ${esc(total)} 份</div>
+    </div>`;
+}
+
+function bindHistoryFilters() {
+  const types = document.querySelectorAll('[data-hist-filter-type]');
+  const from = document.querySelector('[data-hist-filter-from]');
+  const to = document.querySelector('[data-hist-filter-to]');
+  const clear = document.querySelector('[data-hist-filter-clear]');
+  types.forEach(btn => btn.addEventListener('click', e => {
+    e.stopPropagation();
+    historyState.filters.type = btn.dataset.histFilterType || 'all';
+    renderHistoryPanel();
+  }));
+  if (from) from.addEventListener('change', () => {
+    historyState.filters.from = from.value;
+    renderHistoryPanel();
+  });
+  if (to) to.addEventListener('change', () => {
+    historyState.filters.to = to.value;
+    renderHistoryPanel();
+  });
+  if (clear) clear.addEventListener('click', e => {
+    e.stopPropagation();
+    historyState.filters = { type: 'all', from: '', to: '' };
+    renderHistoryPanel();
+  });
+}
+
+function filterHistoryList(list) {
+  const { type, from, to } = historyState.filters;
+  return list.filter(item => {
+    const itemType = historyTypeKey(item.mode);
+    if (type !== 'all' && itemType !== type) return false;
+    const date = historyDateKey(item.created_at);
+    if ((from || to) && !date) return false;
+    if (from && date && date < from) return false;
+    if (to && date && date > to) return false;
+    return true;
+  });
+}
+
+function historyDateKey(value) {
+  if (!value) return '';
+  const d = new Date(value);
+  if (!Number.isNaN(d.getTime())) {
+    const pad = n => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  }
+  return String(value).slice(0, 10);
+}
+
+function historyTypeKey(mode) {
+  if (mode === 'comment') return 'comment';
+  if (mode === 'annotate') return 'annotate';
+  return 'survey';
 }
 
 function renderHistoryCard(h) {
   const isActive = state.viewMode === 'history' && state.historyId === h.id;
   const reportNo = String(h.report_no || '').trim()
     || (h.id ? `R-${String(h.id).slice(0, 4).toUpperCase()}` : 'R-?');
-  return `
-    <div class="hist-card${isActive ? ' hist-card--active' : ''}" data-hist-id="${esc(h.id)}">
-      <div class="hist-card__top">
-        <span class="hist-card__no">${esc(reportNo)}</span>
-        ${h.qa_count > 0 ? `<span class="hist-card__qa-badge">已追问</span>` : ''}
-        <span class="hist-card__time">${esc(formatTime(h.created_at))}</span>
-      </div>
-      <div class="hist-card__title-row">
-        <div class="hist-card__title" data-hist-title>${esc(h.title)}</div>
-        <button class="hist-card__edit" type="button" data-hist-edit title="修改报告名称" aria-label="修改报告名称">
+  const source = historySourceMeta(h.mode);
+  const qa = historyQaMeta(h);
+  const quantity = historyQuantityText(h);
+  const action = h.mode === 'annotate'
+    ? `<button class="hist-card__edit hist-card__download" type="button" data-hist-download title="下载标注结果" aria-label="下载标注结果">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="7 10 12 15 17 10"/>
+            <line x1="12" y1="15" x2="12" y2="3"/>
+          </svg>
+          <span>下载</span>
+        </button>`
+    : `<button class="hist-card__edit" type="button" data-hist-edit title="修改报告名称" aria-label="修改报告名称">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <path d="M12 20h9"/>
             <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/>
           </svg>
-        </button>
+          <span>改名</span>
+        </button>`;
+  return `
+    <div class="hist-card hist-card--${esc(source.key)}${isActive ? ' hist-card--active' : ''}" data-hist-id="${esc(h.id)}" data-hist-mode="${esc(h.mode || '')}">
+      <div class="hist-card__top">
+        <span class="hist-card__no">${esc(reportNo)}</span>
+        <span class="hist-card__source hist-card__source--${esc(source.key)}">${esc(source.label)}</span>
       </div>
-      <div class="hist-card__file">${esc(h.filename || '')}</div>
+      <div class="hist-card__title-row">
+        <div class="hist-card__title" data-hist-title>${esc(h.title)}</div>
+      </div>
+      <div class="hist-card__meta-list">
+        <div class="hist-card__meta" title="${esc(h.filename || '文件未记录')}">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>
+          <span>${esc(h.filename || '文件未记录')}</span>
+        </div>
+        <div class="hist-card__meta">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 3v18h18"/><path d="M7 15l4-4 3 3 5-7"/></svg>
+          <span>${esc(quantity)}</span>
+        </div>
+        <div class="hist-card__meta">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+          <span>${esc(formatTime(h.created_at))}</span>
+        </div>
+      </div>
+      <div class="hist-card__foot">
+        <span class="hist-card__qa hist-card__qa--${esc(qa.key)}">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg>
+          ${esc(qa.label)}
+        </span>
+        ${action}
+      </div>
     </div>`;
+}
+
+function historySourceMeta(mode) {
+  if (mode === 'comment') return { key: 'comment', label: '评论分析' };
+  if (mode === 'annotate') return { key: 'annotate', label: '数据标注' };
+  if (mode === 'crosstab') return { key: 'survey', label: '问卷分析' };
+  return { key: 'survey', label: '问卷分析' };
+}
+
+function historyQaMeta(h) {
+  if (h.mode === 'comment') return { key: 'disabled', label: '无追问功能' };
+  if (h.mode === 'annotate') return { key: 'disabled', label: '无追问功能' };
+  if (Number(h.qa_count || 0) > 0) return { key: 'done', label: '已追问' };
+  return { key: 'pending', label: '未追问' };
+}
+
+function historyQuantityText(h) {
+  if (h.mode === 'comment') {
+    return `有效 ${h.comment_valid_count || 0} 条`;
+  }
+  const rowCount = Number(h.row_count || h.total_rows || 0);
+  if (h.mode === 'annotate') return rowCount > 0 ? `标注 ${rowCount} 行样本` : '数量未记录';
+  return rowCount > 0 ? `有效样本 ${rowCount} 份` : '有效样本未记录';
 }
 
 function formatTime(iso) {
@@ -2222,6 +2480,15 @@ function formatTime(iso) {
 }
 
 $('history-body').addEventListener('click', async e => {
+  const downloadBtn = e.target.closest('[data-hist-download]');
+  if (downloadBtn) {
+    e.stopPropagation();
+    const card = downloadBtn.closest('[data-hist-id]');
+    if (card?.dataset.histId) {
+      window.location.href = `/api/annotate-history/${card.dataset.histId}/download`;
+    }
+    return;
+  }
   const editBtn = e.target.closest('[data-hist-edit]');
   if (editBtn) {
     e.stopPropagation();
@@ -2231,11 +2498,42 @@ $('history-body').addEventListener('click', async e => {
   if (e.target.closest('.hist-card-title-edit, .hist-card-title-action')) return;
   const card = e.target.closest('[data-hist-id]');
   if (!card) return;
+  if (card.dataset.histMode === 'annotate') {
+    showToast('数据标注记录没有预览，请点击下载按钮获取 Excel', 'info');
+    return;
+  }
   const id = card.dataset.histId;
+  await openHistoryEntry(id);
+});
+
+async function openHistoryEntry(id) {
   try {
     const resp = await fetch(`/api/history/${id}`);
     const entry = await resp.json();
     if (!resp.ok) throw new Error(entry.detail || '加载失败');
+
+    if (entry.mode === 'comment') {
+      switchMode('comment');
+      cmState.sessionId = id;
+      cmState.historyId = id;
+      cmState.result = entry.comment_result || {
+        report_md: entry.report_md,
+        title: entry.title,
+        post_title: entry.comment_post_title || '',
+        themes: [],
+        other_themes: [],
+        sentiment_overall: {},
+        sample_meta: entry.comment_sample_meta || {},
+      };
+      cmState.result.title = cmState.result.title || entry.title;
+      cmState.result.post_title = cmState.result.post_title || entry.comment_post_title || '';
+      cmState.preprocess = entry.comment_sample_meta || null;
+      closeDrawer('history-drawer');
+      cmRenderResult(cmState.result);
+      cmGoStep(3);
+      showToast('已载入评论历史报告', 'success');
+      return;
+    }
 
     saveActiveReportUi();
     state.viewMode = 'history';
@@ -2256,7 +2554,7 @@ $('history-body').addEventListener('click', async e => {
   } catch (err) {
     showToast(`载入失败：${err.message}`, 'error');
   }
-});
+}
 
 function startHistoryTitleEdit(card) {
   if (!card || card.querySelector('.hist-card-title-edit')) return;
@@ -2573,8 +2871,8 @@ function switchMode(mode) {
   $('nav-comment').classList.toggle('nav-item--active', isComment);
   $('nav-settings').classList.remove('nav-item--active');
 
-  // 历史记录按钮仅在问卷分析时显示
-  $('btn-open-history').style.display = isSurvey ? '' : 'none';
+  // 历史记录是全局入口，不随当前功能模块切换
+  $('btn-open-history').style.display = '';
 
   surveyPanels.forEach(p => p.classList.add('panel--hidden'));
   annPanels.forEach(p => p.classList.add('panel--hidden'));
@@ -2656,9 +2954,11 @@ updateQAPanelButtons();
 
 const cmState = {
   sessionId: null,
+  historyId: null,
   file: null,
   running: false,
   result: null,
+  preprocess: null,
 };
 
 function cmGoStep(n) {
@@ -2714,29 +3014,89 @@ if (cmUploadZone) {
 }
 
 // ── 开始分析 ──
+function cmAppendProgress(message) {
+  if (!message) return;
+  $('cm-progress-msg').textContent = message;
+  const log = $('cm-progress-log');
+  const line = document.createElement('div');
+  line.className = 'cm-progress__line';
+  line.textContent = message;
+  log.appendChild(line);
+  log.scrollTop = log.scrollHeight;
+}
+
+function showCommentDuplicateModal(report) {
+  return new Promise(resolve => {
+    let existing = $('comment-duplicate-modal');
+    if (existing) existing.remove();
+    const modal = document.createElement('div');
+    modal.id = 'comment-duplicate-modal';
+    modal.style.cssText = 'position:fixed;inset:0;z-index:220;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.48);backdrop-filter:blur(4px);';
+    modal.innerHTML = `
+      <div style="width:min(520px,92vw);background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:22px;box-shadow:var(--shadow-lg);">
+        <div style="font-size:18px;font-weight:700;color:var(--text);margin-bottom:8px">检测到历史报告</div>
+        <div style="font-size:14px;color:var(--text-2);line-height:1.7;margin-bottom:16px">
+          这个文件之前已经生成过评论分析报告：<br>
+          <strong style="color:var(--text)">${esc(report.title || '评论分析报告')}</strong><br>
+          ${esc(formatTime(report.created_at))} · 有效 ${esc(report.valid_count || 0)} 条 · 抽样 ${esc(report.sample_count || 0)} 条
+        </div>
+        <div style="display:flex;gap:10px;justify-content:flex-end;flex-wrap:wrap">
+          <button class="btn btn--ghost" id="comment-dup-cancel">取消</button>
+          <button class="btn btn--ghost" id="comment-dup-history">查看历史报告</button>
+          <button class="btn btn--primary" id="comment-dup-rerun">仍然重新分析</button>
+        </div>
+      </div>`;
+    document.body.appendChild(modal);
+    const cleanup = result => { modal.remove(); resolve(result); };
+    $('comment-dup-cancel').onclick = () => cleanup('cancel');
+    $('comment-dup-history').onclick = () => cleanup('history');
+    $('comment-dup-rerun').onclick = () => cleanup('rerun');
+  });
+}
+
 async function cmStart() {
   if (cmState.running || !cmState.file) return;
   const title = $('cm-post-title').value.trim();
+  const content = $('cm-post-content').value.trim();
   if (!title) { showToast('请填写帖子标题', 'error'); return; }
+  if (!content) { showToast('请填写帖子原文', 'error'); return; }
 
   cmState.running = true;
   cmUpdateStartBtn();
   const fd = new FormData();
   fd.append('file', cmState.file);
   fd.append('post_title', title);
-  fd.append('post_content', $('cm-post-content').value.trim());
+  fd.append('post_content', content);
 
   try {
     const resp = await fetch('/api/comment-analysis/upload', { method: 'POST', body: fd });
-    const data = await resp.json();
+    const raw = await resp.text();
+    let data = {};
+    try {
+      data = raw ? JSON.parse(raw) : {};
+    } catch {
+      data = { detail: raw || '服务端没有返回可解析的错误信息' };
+    }
     if (!resp.ok) throw new Error(data.detail || '上传失败');
     cmState.sessionId = data.session_id;
-    showToast(`有效评论 ${data.valid_count} 条，抽样 ${data.sample_count} 条`, 'success');
+    cmState.historyId = null;
+    if (data.duplicate_report) {
+      const action = await showCommentDuplicateModal(data.duplicate_report);
+      if (action === 'history') {
+        await openHistoryEntry(data.duplicate_report.id);
+        return;
+      }
+      if (action !== 'rerun') {
+        cmGoStep(1);
+        return;
+      }
+    }
 
-    // 进入进度面板，开始流式分析
+    // 进入进度面板，先预处理大文件，再开始流式 AI 分析
     cmGoStep(2);
     $('cm-progress-log').innerHTML = '';
-    $('cm-progress-msg').textContent = '正在准备分析…';
+    cmAppendProgress('上传完成，正在准备预处理…');
+    await cmPreprocess();
     await cmRun();
   } catch (e) {
     showToast(`分析失败：${e.message}`, 'error');
@@ -2747,103 +3107,95 @@ async function cmStart() {
   }
 }
 
-async function cmRun() {
-  await consumeSSE(`/api/comment-analysis/run/${cmState.sessionId}`, ev => {
+async function cmPreprocess() {
+  await consumeSSE(`/api/comment-analysis/preprocess/${cmState.sessionId}`, ev => {
     if (ev.type === 'progress') {
-      $('cm-progress-msg').textContent = ev.message;
-      const log = $('cm-progress-log');
-      const line = document.createElement('div');
-      line.className = 'cm-progress__line';
-      line.textContent = ev.message;
-      log.appendChild(line);
-      log.scrollTop = log.scrollHeight;
+      cmAppendProgress(ev.message);
     }
-    if (ev.type === 'comment_done') {
-      cmState.result = ev;
-      cmRenderResult(ev);
-      cmGoStep(3);
+    if (ev.warning) {
+      cmAppendProgress(ev.warning);
+    }
+    if (ev.type === 'comment_preprocess_done') {
+      cmState.preprocess = ev.sample_meta || ev;
+      const scanned = ev.scan_rows ?? ev.sample_meta?.scan_rows ?? 0;
+      const valid = ev.valid_count ?? ev.sample_meta?.valid_count ?? 0;
+      const sample = ev.sample_count ?? ev.sample_meta?.sample_count ?? 0;
+      cmAppendProgress(`预处理完成：扫描 ${scanned} 行，有效评论 ${valid} 条，抽样 ${sample} 条。`);
+      showToast(`有效评论 ${valid} 条，抽样 ${sample} 条`, 'success');
     }
   });
 }
 
-// ── 结果渲染 ──
-const CM_SENTI = {
-  positive: { label: '正面', color: 'var(--green)' },
-  neutral: { label: '中性', color: 'var(--text-3)' },
-  negative: { label: '负面', color: 'var(--red)' },
-};
-
-function cmRenderResult(res) {
-  const title = $('cm-post-title').value.trim();
-  $('cm-result-title').textContent = title ? `${shortName(title, 28)} · 舆情简报` : '舆情简报';
-
-  // 整体情感分布条
-  const so = res.sentiment_overall || {};
-  const segs = [
-    ['positive', so.positive_pct || 0],
-    ['neutral', so.neutral_pct || 0],
-    ['negative', so.negative_pct || 0],
-  ];
-  $('cm-sentiment-bar').innerHTML = segs.map(([k, pct]) =>
-    pct > 0 ? `<div class="cm-seg" style="width:${pct}%;background:${CM_SENTI[k].color}" title="${CM_SENTI[k].label} ${pct}%"></div>` : ''
-  ).join('');
-  $('cm-sentiment-legend').innerHTML = segs.map(([k, pct]) =>
-    `<span class="cm-legend__item"><i style="background:${CM_SENTI[k].color}"></i>${CM_SENTI[k].label} ${pct}%</span>`
-  ).join('');
-
-  // 观点卡片
-  const list = $('cm-theme-list');
-  const themes = res.themes || [];
-  if (!themes.length) {
-    list.innerHTML = '<div class="hist-empty">未提炼出有效观点</div>';
-  } else {
-    list.innerHTML = themes.map((t, idx) => {
-      const senti = [
-        ['positive', t.positive_pct || 0],
-        ['neutral', t.neutral_pct || 0],
-        ['negative', t.negative_pct || 0],
-      ];
-      const sentiBar = senti.map(([k, p]) =>
-        p > 0 ? `<div class="cm-seg" style="width:${p}%;background:${CM_SENTI[k].color}"></div>` : ''
-      ).join('');
-      const quotes = (t.quotes || []).map(q => `<li class="cm-quote">${esc(q)}</li>`).join('');
-      return `
-        <div class="cm-theme" data-cm-theme="${idx}">
-          <div class="cm-theme__head">
-            <span class="cm-theme__name">${esc(t.name)}</span>
-            <span class="cm-theme__pct">${t.percentage}%</span>
-            <svg class="cm-theme__chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
-          </div>
-          <div class="cm-theme__senti">${sentiBar}</div>
-          ${t.description ? `<div class="cm-theme__desc">${esc(t.description)}</div>` : ''}
-          <div class="cm-theme__quotes" hidden>${quotes || '<li class="cm-quote cm-quote--empty">暂无代表性评论</li>'}</div>
-        </div>`;
-    }).join('');
-    list.querySelectorAll('.cm-theme__head').forEach(head => {
-      head.addEventListener('click', () => {
-        const card = head.closest('.cm-theme');
-        const q = card.querySelector('.cm-theme__quotes');
-        const open = q.hasAttribute('hidden');
-        if (open) q.removeAttribute('hidden'); else q.setAttribute('hidden', '');
-        card.classList.toggle('cm-theme--open', open);
-      });
+async function cmRun() {
+  let mainReportDone = false;
+  try {
+    await consumeSSE(`/api/comment-analysis/run/${cmState.sessionId}`, ev => {
+      if (ev.type === 'progress') {
+        cmAppendProgress(ev.message);
+      }
+      if (ev.type === 'comment_done') {
+        mainReportDone = true;
+        cmState.result = ev;
+        cmRenderResult(ev, { quotesPending: true });
+        cmGoStep(3);
+        showToast('舆情报告已生成，玩家评论原文精选继续后台生成中', 'success');
+      }
+      if (ev.type === 'comment_quotes_done') {
+        cmState.result = { ...(cmState.result || {}), ...ev };
+        cmRenderResult(cmState.result);
+        cmAppendProgress('玩家评论原文精选已更新到报告。');
+        if ((ev.selected_raw_comments || []).length) {
+          showToast('玩家评论原文精选已生成', 'success');
+        }
+      }
+      if (ev.type === 'comment_quotes_error') {
+        cmAppendProgress(ev.message || '玩家评论原文精选生成失败，舆情报告已完成。');
+        if (cmState.result) cmRenderResult(cmState.result);
+        showToast(ev.message || '精选评论生成失败，舆情报告已完成', 'info');
+      }
     });
+  } catch (err) {
+    if (mainReportDone) {
+      cmAppendProgress(`玩家评论原文精选连接中断：${err.message}`);
+      if (cmState.result) cmRenderResult(cmState.result);
+      showToast('舆情报告已生成，精选评论连接中断', 'info');
+      return;
+    }
+    throw err;
   }
+}
 
-  // 其他声音
-  const others = res.other_themes || [];
-  $('cm-other').innerHTML = others.length
-    ? `<span class="cm-other__label">其他零散声音：</span>` +
-      others.map(o => `<span class="cm-other__tag">${esc(o.name)} ${o.percentage}%</span>`).join('')
-    : '';
+// ── 结果渲染 ──
+function cmRenderResult(res, opts = {}) {
+  const title = String(res.title || '').trim();
+  const postTitle = String(res.post_title || $('cm-post-title').value || '').trim();
+  const displayTitle = title || (postTitle ? `${postTitle}·舆情简报` : '舆情简报');
+  $('cm-result-title').textContent = shortName(displayTitle, 36);
 
   // AI 简报
-  $('cm-report-content').innerHTML = renderMarkdown(res.report_md || '*（未生成简报）*');
+  let reportMd = cmNormalizeReportMarkdown(res.report_md || '*（未生成简报）*');
+  if (opts.quotesPending && !reportMd.includes('## 玩家评论原文精选')) {
+    reportMd = `${reportMd}\n\n## 玩家评论原文精选\n\n> 玩家评论原文精选生成中…`;
+  }
+  $('cm-report-content').innerHTML = renderMarkdown(reportMd);
+}
+
+function cmNormalizeReportMarkdown(md) {
+  let text = String(md || '').trim();
+  const sampleIdx = text.indexOf('> 样本口径');
+  if (sampleIdx > 0) {
+    text = text.slice(sampleIdx).trim();
+  }
+  return text
+    .replace(/^#\s+.*(?:\r?\n)+/g, '')
+    .replace(/^##\s*(?:AI\s*)?舆情简报\s*(?:\r?\n)+/g, '')
+    .trim();
 }
 
 // ── 导出 & 重置 ──
 $('cm-btn-pdf')?.addEventListener('click', () => {
-  if (cmState.sessionId) window.location.href = `/api/export/pdf/${cmState.sessionId}`;
+  if (cmState.historyId) window.location.href = `/api/export/pdf-history/${cmState.historyId}`;
+  else if (cmState.sessionId) window.location.href = `/api/export/pdf/${cmState.sessionId}`;
   else showToast('还没有生成报告', 'error');
 });
 
@@ -2854,7 +3206,10 @@ $('cm-btn-feishu')?.addEventListener('click', async () => {
   const old = btn.textContent;
   btn.textContent = '导出中…';
   try {
-    const resp = await fetch(`/api/export/feishu/${cmState.sessionId}`, { method: 'POST' });
+    const url = cmState.historyId
+      ? `/api/export/feishu-history/${cmState.historyId}`
+      : `/api/export/feishu/${cmState.sessionId}`;
+    const resp = await fetch(url, { method: 'POST' });
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.detail || '导出失败');
     showToast('飞书文档已创建', 'success');
@@ -2869,8 +3224,10 @@ $('cm-btn-feishu')?.addEventListener('click', async () => {
 
 function cmReset() {
   cmState.sessionId = null;
+  cmState.historyId = null;
   cmState.file = null;
   cmState.result = null;
+  cmState.preprocess = null;
   cmFileInput.value = '';
   $('cm-post-title').value = '';
   $('cm-post-content').value = '';
@@ -3253,11 +3610,11 @@ function annRenderAiConfirm(highProbResults) {
   const otCols = annState.openTextCols;
 
   // 构建表头
-  let thCells = `<th><input type="checkbox" id="ann-check-master" checked /></th>
-    <th>玩家 ID</th><th>AI 概率</th><th>润色程度</th><th>判断理由</th><th>关键证据</th>`;
+  let thCells = `<th class="ann-th-check"><input type="checkbox" id="ann-check-master" checked /></th>
+    <th class="ann-th-id">玩家 ID</th><th class="ann-th-prob">AI 概率</th><th class="ann-th-polish">润色程度</th><th class="ann-th-fixed">判断理由</th><th class="ann-th-fixed">关键证据</th>`;
   for (const ci of otCols) {
     const hdr = headers[ci] || `列${ci}`;
-    thCells += `<th>${esc(hdr)}（原文）</th><th>${esc(hdr)}（中文译）</th>`;
+    thCells += `<th class="ann-th-fixed">${esc(hdr)}（原文）</th><th class="ann-th-fixed">${esc(hdr)}（中文译）</th>`;
   }
 
   let rows = '';
@@ -3266,19 +3623,18 @@ function annRenderAiConfirm(highProbResults) {
     let tdCols = '';
     for (const ci of otCols) {
       const key = `col_${ci}`;
+      const original = (r.originals || {})[key] || '';
       const trans = (r.translations || {})[key] || '';
-      // 找原文：需要从原始行中取，但这里只有 translations，用原文 evidence 作示意
-      // 实际上我们没有把原文存在 highProbResults 里，用 evidence 代替
-      tdCols += `<td class="ann-cell-text">${esc(trans || '')}</td>
-                 <td class="ann-cell-text ann-cell-trans">${esc(trans)}</td>`;
+      tdCols += `<td class="ann-cell-text ann-cell-fixed">${esc(original)}</td>
+                 <td class="ann-cell-text ann-cell-trans ann-cell-fixed">${esc(trans)}</td>`;
     }
     rows += `<tr data-row="${i}">
       <td><input type="checkbox" class="ann-ai-check" data-id="${esc(r.id)}" ${checked} /></td>
       <td class="ann-cell-id">${esc(r.id)}</td>
       <td class="ann-cell-prob">${r.ai_prob}%</td>
       <td class="ann-cell-polish">${esc(r.is_polished || '')}</td>
-      <td class="ann-cell-reason">${esc(r.reason || '')}</td>
-      <td class="ann-cell-evidence">${esc(r.evidence || '')}</td>
+      <td class="ann-cell-reason ann-cell-fixed">${esc(r.reason || '')}</td>
+      <td class="ann-cell-evidence ann-cell-fixed">${esc(r.evidence || '')}</td>
       ${tdCols}
     </tr>`;
   });

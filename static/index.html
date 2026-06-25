@@ -11,7 +11,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/style.css?v=14" />
+  <link rel="stylesheet" href="/static/style.css?v=22" />
 </head>
 
 <body>
@@ -32,6 +32,14 @@
           <div class="brand-name">调研分析平台</div>
           <div class="brand-sub">定性/定量报告工作台</div>
         </div>
+      </div>
+
+      <div class="sidebar__quick-actions">
+        <button class="brand-toggle" id="btn-sidebar-toggle" title="收起/展开侧边栏" aria-label="收起/展开侧边栏">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="15 18 9 12 15 6" />
+          </svg>
+        </button>
         <button class="brand-toggle" id="btn-theme" title="切换深色 / 浅色主题" aria-label="切换主题">
           <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
@@ -98,13 +106,14 @@
       </nav>
 
       <div class="sidebar__footer">
-        <button class="sidebar-action" id="btn-feishu-login">
+        <button class="sidebar-action sidebar-action--danger" id="btn-restart">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-            <polyline points="14 2 14 8 20 8" />
+            <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+            <path d="M3 3v5h5" />
           </svg>
-          <span id="feishu-login-label">登录飞书</span>
+          <span>重新开始</span>
         </button>
+
         <button class="sidebar-action" id="btn-open-history">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <path d="M3 3v5h5" />
@@ -114,19 +123,14 @@
           <span>历史记录</span>
         </button>
 
-        <button class="sidebar-action sidebar-action--danger" id="btn-restart">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
-            <path d="M3 3v5h5" />
-          </svg>
-          <span>重新开始</span>
-        </button>
+        <div class="sidebar__account-divider"></div>
 
-        <button class="sidebar-action" id="btn-sidebar-toggle" title="收起/展开侧边栏">
+        <button class="sidebar-action" id="btn-feishu-login">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <polyline points="15 18 9 12 15 6" />
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+            <polyline points="14 2 14 8 20 8" />
           </svg>
-          <span>收起侧边栏</span>
+          <span id="feishu-login-label">登录飞书</span>
         </button>
       </div>
     </aside>
@@ -811,34 +815,35 @@
         </div>
         <div class="panel__header">
           <h1 class="panel__title">上传帖子评论</h1>
-          <p class="panel__desc">上传社交媒体评论文件，填写帖子标题，AI 将提炼玩家观点、情感分布与代表性评论。</p>
+          <p class="panel__desc">上传社交媒体评论文件，填写帖子标题和正文，AI 将先筛选与帖子相关的评论，再提炼玩家观点、情感分布与代表性评论。</p>
         </div>
 
-        <div class="upload-zone" id="cm-upload-zone">
-          <input type="file" id="cm-file-input" accept=".csv,.xlsx,.xls" hidden />
-          <div class="upload-zone__icon">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-              <polyline points="17 8 12 3 7 8" />
-              <line x1="12" y1="3" x2="12" y2="15" />
-            </svg>
+        <div class="cm-upload-layout">
+          <div class="upload-zone cm-upload-zone" id="cm-upload-zone">
+            <input type="file" id="cm-file-input" accept=".csv,.xlsx,.xls" hidden />
+            <div class="upload-zone__icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                <polyline points="17 8 12 3 7 8" />
+                <line x1="12" y1="3" x2="12" y2="15" />
+              </svg>
+            </div>
+            <div class="upload-zone__text">
+              <span class="upload-zone__primary" id="cm-upload-primary">拖放文件到这里，或点击选择</span>
+              <span class="upload-zone__secondary">支持 CSV / Excel（最大 50MB），自动识别评论列</span>
+            </div>
           </div>
-          <div class="upload-zone__text">
-            <span class="upload-zone__primary" id="cm-upload-primary">拖放文件到这里，或点击选择</span>
-            <span class="upload-zone__secondary">支持 CSV / Excel（最大 50MB），自动识别评论列</span>
-          </div>
-        </div>
 
-        <div class="cm-config">
-          <div class="cm-field">
-            <label class="cm-field__label" for="cm-post-title">帖子标题<span class="cm-field__req">必填</span></label>
-            <input type="text" class="cm-input" id="cm-post-title"
-              placeholder="例如：生存模式即将回归，你期待吗？" />
-          </div>
-          <div class="cm-field">
-            <label class="cm-field__label" for="cm-post-content">帖子原文<span class="cm-field__opt">选填</span></label>
-            <textarea class="cm-input cm-textarea" id="cm-post-content" rows="4"
-              placeholder="粘贴帖子正文（可选）。提供后会先用关键词二次过滤掉与帖子无关的评论。"></textarea>
+          <div class="cm-config">
+            <div class="cm-field cm-field--title">
+              <label class="cm-field__label" for="cm-post-title">帖子标题<span class="cm-field__req">必填</span></label>
+              <input type="text" class="cm-input" id="cm-post-title" required placeholder="" />
+            </div>
+            <div class="cm-field cm-field--content">
+              <label class="cm-field__label" for="cm-post-content">帖子原文<span class="cm-field__req">必填</span></label>
+              <textarea class="cm-input cm-textarea" id="cm-post-content" rows="4" required
+                placeholder="粘贴完整帖子正文。系统会先判断评论是否与帖子主题或正文相关，只有相关评论进入后续分析。"></textarea>
+            </div>
           </div>
         </div>
 
@@ -859,7 +864,7 @@
         </div>
         <div class="panel__header">
           <h1 class="panel__title">正在分析评论舆情</h1>
-          <p class="panel__desc">Python 并发调度 + AI 主题聚类，几千条评论约 2~3 分钟，请耐心等待。</p>
+          <p class="panel__desc">python并发调整+AI主题聚类，文本量内容大，需要较长时间，请耐心等待。</p>
         </div>
 
         <div class="cm-progress">
@@ -903,23 +908,7 @@
         </div>
 
         <div class="cm-result">
-          <!-- 整体情感分布 -->
-          <div class="cm-section">
-            <div class="cm-section__title">整体情感分布</div>
-            <div class="cm-sentiment-bar" id="cm-sentiment-bar"></div>
-            <div class="cm-sentiment-legend" id="cm-sentiment-legend"></div>
-          </div>
-
-          <!-- 观点卡片 -->
-          <div class="cm-section">
-            <div class="cm-section__title">玩家核心观点</div>
-            <div class="cm-theme-list" id="cm-theme-list"></div>
-            <div class="cm-other" id="cm-other"></div>
-          </div>
-
-          <!-- AI 舆情简报 -->
-          <div class="cm-section">
-            <div class="cm-section__title">AI 舆情简报</div>
+          <div class="cm-report-body">
             <div class="report-content markdown-body" id="cm-report-content"></div>
           </div>
         </div>
@@ -970,6 +959,16 @@
             </div>
             <div class="settings-nav__sep" id="settings-nav-admin-sep" style="display:none"></div>
             <div class="settings-nav__group-label" id="settings-nav-admin-label" style="display:none">管理员</div>
+            <div class="settings-nav__item" data-stab="system" id="stab-system-nav" style="display:none">
+              <svg class="settings-nav__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="12" r="3" />
+                <path d="M3 12h3" />
+                <path d="M18 12h3" />
+                <path d="M12 3v3" />
+                <path d="M12 18v3" />
+              </svg>
+              <span>平台设置</span>
+            </div>
             <div class="settings-nav__item" data-stab="perms" id="stab-perms-nav" style="display:none">
               <svg class="settings-nav__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" />
@@ -997,6 +996,11 @@
               </div>
             </div>
             <div id="stab-content-prompts" style="display:none">
+              <div class="hist-empty">
+                <div class="spinner" style="margin:0 auto"></div>
+              </div>
+            </div>
+            <div id="stab-content-system" style="display:none">
               <div class="hist-empty">
                 <div class="spinner" style="margin:0 auto"></div>
               </div>
@@ -1041,7 +1045,7 @@
   <div class="toast-container" id="toast-container" aria-live="polite"></div>
 
   <script src="https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js"></script>
-  <script src="/static/app.js?v=15"></script>
+  <script src="/static/app.js?v=27"></script>
 </body>
 
 </html>
