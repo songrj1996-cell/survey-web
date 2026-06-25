@@ -18,6 +18,10 @@ import time
 from urllib.parse import urlencode
 
 import httpx
+from dotenv import load_dotenv
+
+# 自包含:确保 .env 已加载后再读取下方环境变量(不依赖被谁先 import)
+load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), ".env"))
 
 FEISHU_APP_ID       = os.getenv("FEISHU_APP_ID", "")
 FEISHU_APP_SECRET   = os.getenv("FEISHU_APP_SECRET", "")

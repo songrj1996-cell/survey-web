@@ -6,8 +6,9 @@
 import time
 from urllib.parse import quote
 
-import feishu_export
 from fastapi import HTTPException, Request
+
+from app.integrations import feishu_client as feishu_export
 from fastapi.responses import JSONResponse, RedirectResponse
 
 from app.core.config import (

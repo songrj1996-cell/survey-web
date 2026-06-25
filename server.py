@@ -52,10 +52,10 @@ import secrets
 import annotate
 import comment_analysis
 import crosstab_parser
-import feishu_export
 import survey_plan
 import survey_stats
-from dify import chat as dify_chat  # noqa: F401 (kept for compatibility)
+from app.integrations import feishu_client as feishu_export
+from app.integrations.dify_client import chat as dify_chat  # noqa: F401 (kept for compatibility)
 from app.schemas.requests import (
     AdminUserPatch,
     AdminUserRequest,
@@ -1152,7 +1152,7 @@ async def _batch_qualitative_analysis(
     }
     """
     import json as _json
-    from dify import workflow_run, STOP_SIGNAL
+    from app.integrations.dify_client import workflow_run, STOP_SIGNAL
 
     clustered_themes: dict = {}
     diagnostics: dict[str, dict] = {}
@@ -2102,7 +2102,7 @@ def _comment_append_selected_raw_comments(report_md: str, selected_raw_comments:
 async def _select_comment_raw_quotes(sess: dict) -> list[dict]:
     """从清洗后的长评论候选中精选最多 50 条原文评论。失败由调用方隔离。"""
     import json as _json
-    from dify import workflow_run, STOP_SIGNAL
+    from app.integrations.dify_client import workflow_run, STOP_SIGNAL
 
     if not DIFY_COMMENT_ANALYSIS_KEY:
         raise RuntimeError("未配置 DIFY_COMMENT_ANALYSIS_KEY")
@@ -2408,7 +2408,7 @@ async def _comment_analysis_pipeline(sess: dict):
     所有 Dify 调用走同一个 Workflow，靠 mode 路由；并发用 Semaphore 限流。
     """
     import json as _json
-    from dify import workflow_run, STOP_SIGNAL
+    from app.integrations.dify_client import workflow_run, STOP_SIGNAL
 
     if not DIFY_COMMENT_ANALYSIS_KEY:
         raise RuntimeError("未配置 DIFY_COMMENT_ANALYSIS_KEY")

@@ -3,7 +3,7 @@ import json
 
 import httpx
 
-from config import DIFY_API_BASE, DIFY_API_KEY
+from app.core.config import DIFY_API_BASE, DIFY_API_KEY
 
 
 async def chat(
