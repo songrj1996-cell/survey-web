@@ -288,6 +288,17 @@ survey-web/
 
 ---
 
+## 十一、已知债务(待专门清理,勿遗忘)
+
+实施过程中为快速落地暂时接受、需后续专门处理的边界违例:
+
+1. **core → storage 反向依赖**(step1d 引入):
+   - `app/core/security.py` 直接 `import` 了 `app/storage/logins.py`、`app/storage/whitelist.py`;
+   - `app/core/audit.py` 直接 `import` 了 `app/storage/audit_store.py`。
+   - 这违反"core 是最底层叶子、不 import storage"的约定,会让 core 重新变厚。
+   - **清理方向**:把纯判断逻辑(`_is_admin`/`_login_allowed`/`_whitelist_match`/owner 判断/响应构造)留在 core;真正读写 whitelist/logins/audit 的部分上移(由中间件 / service 读出数据后注入,或将 `_current_login`/`_admin_user_rows`/`audit_log` 等"会触达存储"的函数迁出 core 到 service 层)。
+   - **时机**:全部 router 迁完、services 稳定后,做一次专门的"core 提纯"子步骤(步骤 6 前)。
+
 ## 十、确认清单
 
 - [ ] 同意 core / storage / integrations / services / schemas / routers 六部分的边界与职责

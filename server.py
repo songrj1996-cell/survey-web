@@ -109,6 +109,12 @@ from app.storage.ui_texts import (
 from app.core.parsing import _parse_csv, _parse_excel, _parse_file
 from app.core.responses import sse_event
 from app.core.text import _short_text
+from app.services.report_history import (
+    _comment_report_title,
+    _find_comment_duplicate_report,
+    save_annotate_to_history,
+    save_to_history,
+)
 from app.storage.sessions import (
     SESSION_TTL,
     _COMMENT_UPLOAD_DIR,
@@ -251,141 +257,6 @@ def _prep_export_md(md: str, mode: str = "") -> str:
 # 历史记录
 # ============================================================
 
-def _qa_user_count(entry: dict) -> int:
-    return sum(1 for m in entry.get("qa_messages", []) if m.get("role") == "user")
-
-
-def _sanitize_report_title(title: str) -> str:
-    cleaned = re.sub(r"[\r\n\t]+", " ", str(title or "")).strip()
-    cleaned = re.sub(r'[\\/:*?"<>|]', "_", cleaned)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    if not cleaned:
-        raise HTTPException(status_code=400, detail="报告名称不能为空")
-    return cleaned[:120]
-
-
-def _replace_report_h1(report_md: str, title: str) -> str:
-    report_md = report_md or ""
-    if re.search(r"^#\s+.+?$", report_md, re.MULTILINE):
-        return re.sub(r"^#\s+.+?$", f"# {title}", report_md, count=1, flags=re.MULTILINE)
-    return f"# {title}\n\n{report_md.lstrip()}"
-
-
-def _comment_report_title(sess: dict) -> str:
-    post_title = re.sub(r"\s+", " ", str(sess.get("comment_post_title") or "").strip())
-    if post_title:
-        suffix = "·舆情简报"
-        max_post_len = max(1, 120 - len(suffix))
-        if len(post_title) > max_post_len:
-            post_title = post_title[: max_post_len - 1] + "…"
-        return f"{post_title}{suffix}"
-    return "评论分析·舆情简报"
-
-
-def save_to_history(session_id: str, sess: dict) -> None:
-    report_md = sess.get("report_md", "")
-    if not report_md:
-        return
-    history = _load_history()
-    _ensure_history_report_numbers(history, save=False)
-    old_entry = next((h for h in history if h.get("id") == session_id), None)
-    qa_messages = sess.get("qa_messages")
-    if qa_messages is None and old_entry:
-        qa_messages = old_entry.get("qa_messages", [])
-    if sess.get("mode") == "comment":
-        title = sess.get("comment_report_title") or _comment_report_title(sess)
-    else:
-        title_m = re.search(r"^#\s+(.+?)$", report_md, re.MULTILINE)
-        title = title_m.group(1).strip() if title_m else "未命名报告"
-    owner = {
-        "owner_key": sess.get("owner_key") or (old_entry or {}).get("owner_key", ""),
-        "owner_email": sess.get("owner_email") or (old_entry or {}).get("owner_email", ""),
-        "owner_open_id": sess.get("owner_open_id") or (old_entry or {}).get("owner_open_id", ""),
-        "owner_name": sess.get("owner_name") or (old_entry or {}).get("owner_name", ""),
-    }
-    entry = {
-        "id": session_id,
-        "report_no": old_entry.get("report_no") if old_entry else _next_history_report_no(history),
-        "filename": sess.get("filename", "unknown"),
-        "title": title,
-        "created_at": old_entry.get("created_at") if old_entry else datetime.now().isoformat(),
-        "report_md": report_md,
-        "plan": sess.get("plan"),
-        "stats_md": sess.get("stats_md"),
-        "analyst_conv_id": sess.get("analyst_conv_id", ""),
-        "analyst_app": sess.get("analyst_app", ""),
-        "qa_messages": qa_messages or [],
-        "rows_fed": True,  # 历史 QA 跳过投喂 rows（对话已包含上下文）
-        "mode": sess.get("mode", ""),  # 保存模式，导出时据此选择免责声明（定性/crosstab/comment）
-        "row_count": max(0, len(sess.get("rows") or []) - 1) or (old_entry or {}).get("row_count", 0),
-        **owner,
-    }
-    if sess.get("mode") == "comment":
-        entry.update({
-            "comment_file_hash": sess.get("comment_file_hash", ""),
-            "comment_source_filename": sess.get("filename", "unknown"),
-            "comment_post_title": sess.get("comment_post_title", ""),
-            "comment_report_title": title,
-            "comment_result": sess.get("comment_result"),
-            "comment_sample_meta": sess.get("comment_sample_meta", {}),
-            "comment_relevance_stats": sess.get("comment_relevance_stats", {}),
-            "comment_selected_raw_comments": sess.get("comment_selected_raw_comments", []),
-            "comment_valid_count": sess.get("comment_valid_count", 0),
-            "comment_sample_count": sess.get("comment_sample_count", 0),
-            "comment_scan_rows": sess.get("comment_scan_rows", 0),
-            "comment_nonempty_count": sess.get("comment_nonempty_count", 0),
-        })
-    history = [h for h in history if h["id"] != session_id]
-    history.insert(0, entry)
-    history = _trim_history_for_owner(history, owner.get("owner_key", ""))
-    _save_history(history)
-
-
-def save_annotate_to_history(sid: str, sess: dict, result_path: str, download_name: str) -> None:
-    history = _load_history()
-    _ensure_history_report_numbers(history, save=False)
-    old_entry = next((h for h in history if h.get("id") == sid), None)
-    filename = sess.get("filename", "annotated")
-    stem = re.sub(r"\.(csv|xlsx|xls)$", "", filename, flags=re.IGNORECASE).strip() or "标注结果"
-    owner = {
-        "owner_key": sess.get("owner_key") or (old_entry or {}).get("owner_key", ""),
-        "owner_email": sess.get("owner_email") or (old_entry or {}).get("owner_email", ""),
-        "owner_open_id": sess.get("owner_open_id") or (old_entry or {}).get("owner_open_id", ""),
-        "owner_name": sess.get("owner_name") or (old_entry or {}).get("owner_name", ""),
-    }
-    tasks = sess.get("tasks", {}) or {}
-    entry = {
-        "id": sid,
-        "report_no": old_entry.get("report_no") if old_entry else _next_history_report_no(history),
-        "filename": filename,
-        "title": (old_entry or {}).get("title") or f"数据标注结果 - {stem}",
-        "created_at": old_entry.get("created_at") if old_entry else datetime.now().isoformat(),
-        "report_md": "",
-        "plan": None,
-        "stats_md": "",
-        "analyst_conv_id": "",
-        "analyst_app": "",
-        "qa_messages": [],
-        "rows_fed": False,
-        "mode": "annotate",
-        "row_count": max(0, len(sess.get("rows") or []) - 1),
-        "annotate_result_path": result_path,
-        "annotate_download_name": download_name,
-        "annotate_ai_count": len(sess.get("ai_results") or []),
-        "annotate_confirmed_ai_count": len(sess.get("confirmed_ai_ids") or []),
-        "annotate_quality_count": len(sess.get("quality_results") or []),
-        "annotate_tasks": {
-            "ai_detect": bool(tasks.get("ai_detect")),
-            "quality": bool(tasks.get("quality")),
-        },
-        **owner,
-    }
-    history = [h for h in history if h.get("id") != sid]
-    history.insert(0, entry)
-    history = _trim_history_for_owner(history, owner.get("owner_key", ""))
-    _save_history(history)
-
-
 def _annotate_download_filename(filename: str) -> str:
     stem = re.sub(r"\.(csv|xlsx|xls)$", "", filename or "annotated", flags=re.IGNORECASE)
     safe = re.sub(r'[\\/:*?"<>|]', "_", stem).strip() or "annotated"
@@ -447,48 +318,6 @@ async def _save_annotate_result_history(sid: str, sess: dict, request: Request) 
     result_path = _annotate_result_path(sid)
     result_path.write_bytes(excel_bytes)
     save_annotate_to_history(sid, sess, str(result_path), download_name)
-
-
-def _find_comment_duplicate_report(file_hash: str, login: dict | None) -> dict | None:
-    if not file_hash:
-        return None
-    history = _ensure_history_report_numbers(_load_history())
-    for entry in history:
-        if (
-            entry.get("mode") == "comment"
-            and entry.get("comment_file_hash") == file_hash
-            and _visible_to_owner(entry, login)
-        ):
-            return {
-                "id": entry.get("id", ""),
-                "report_no": entry.get("report_no", ""),
-                "title": entry.get("title", "评论分析报告"),
-                "filename": entry.get("filename", ""),
-                "created_at": entry.get("created_at", ""),
-                "valid_count": entry.get("comment_valid_count", 0),
-                "sample_count": entry.get("comment_sample_count", 0),
-            }
-    return None
-
-
-def _history_effective_row_count(entry: dict) -> int:
-    try:
-        row_count = int(entry.get("row_count") or 0)
-    except (TypeError, ValueError):
-        row_count = 0
-    if row_count > 0:
-        return row_count
-    text = f"{entry.get('stats_md') or ''}\n{entry.get('report_md') or ''}"
-    for pattern in (
-        r"有效样本\(总计\):总体=(\d+)",
-        r"有效样本（总计）:总体=(\d+)",
-        r"有效样本[^\n]*总体=(\d+)",
-        r"(\d+)\s*名受访者",
-    ):
-        m = re.search(pattern, text)
-        if m:
-            return int(m.group(1))
-    return 0
 
 
 # ============================================================
@@ -4589,126 +4418,6 @@ async def export_feishu_history(history_id: str, request: Request):
 # ── Prompts 管理 ─────────────────────────────────────
 
 # ── 历史记录 ──────────────────────────────────────────
-
-@app.get("/api/history")
-async def get_history(request: Request, mode: str = ""):
-    login = await _current_login(request)
-    history = _load_history()
-    history = _ensure_history_report_numbers(history)
-    visible_history = [h for h in history if _visible_to_owner(h, login)]
-    if mode:
-        visible_history = [h for h in visible_history if (h.get("mode") or "") == mode]
-    await audit_log(request, "report", "查看历史记录", f"历史报告数：{len(visible_history)}")
-    # 列表视图不返回完整 report_md（节省带宽）
-    return [
-        {
-            "id": h["id"],
-            "report_no": h.get("report_no", ""),
-            "filename": h["filename"],
-            "title": h["title"],
-            "created_at": h["created_at"],
-            "has_qa": bool(h.get("analyst_conv_id")),
-            "qa_count": _qa_user_count(h),
-            "mode": h.get("mode", ""),
-            "row_count": _history_effective_row_count(h),
-            "comment_valid_count": h.get("comment_valid_count", 0),
-            "comment_sample_count": h.get("comment_sample_count", 0),
-            "annotate_ai_count": h.get("annotate_ai_count", 0),
-            "annotate_confirmed_ai_count": h.get("annotate_confirmed_ai_count", 0),
-            "annotate_quality_count": h.get("annotate_quality_count", 0),
-            "annotate_has_download": bool(h.get("annotate_result_path")),
-        }
-        for h in visible_history
-    ]
-
-
-@app.get("/api/history/{hist_id}")
-async def get_history_item(hist_id: str, request: Request):
-    login = await _current_login(request)
-    history = _load_history()
-    history = _ensure_history_report_numbers(history)
-    entry = _find_history_for_login(history, hist_id, login)
-    if not entry:
-        raise HTTPException(status_code=404, detail="历史记录不存在")
-    await audit_log(request, "report", "打开历史报告", f"报告：{entry.get('title', hist_id)}", metadata={"history_id": hist_id})
-    return entry
-
-
-def _update_history_title_by_id(hist_id: str, title: str, login: dict | None = None) -> dict:
-    hist_id = str(hist_id or "").strip()
-    new_title = _sanitize_report_title(title)
-    history = _load_history()
-    history = _ensure_history_report_numbers(history, save=False)
-    entry = _find_history_for_login(history, hist_id, login)
-    if not entry:
-        try:
-            sess = get_session(hist_id)
-            if sess.get("report_md") and _visible_to_owner(sess, login):
-                _assign_session_owner(sess, login)
-                sess["report_md"] = _replace_report_h1(sess.get("report_md", ""), new_title)
-                save_session(hist_id, sess)
-                save_to_history(hist_id, sess)
-                history = _load_history()
-                history = _ensure_history_report_numbers(history, save=False)
-                entry = _find_history_for_login(history, hist_id, login)
-        except HTTPException:
-            pass
-    if not entry:
-        print(f"[history-title] not found id={hist_id!r} existing={[h.get('id') for h in history]}")
-        raise HTTPException(status_code=404, detail="未找到这份报告，请刷新历史记录后重试")
-
-    entry["title"] = new_title
-    entry["report_md"] = _replace_report_h1(entry.get("report_md", ""), new_title)
-
-    try:
-        sess = get_session(hist_id)
-        if sess.get("report_md"):
-            sess["report_md"] = _replace_report_h1(sess.get("report_md", ""), new_title)
-            save_session(hist_id, sess)
-    except HTTPException:
-        pass  # session 已过期，只更新历史记录即可
-
-    _save_history(history)
-    return {
-        "ok": True,
-        "id": hist_id,
-        "report_no": entry.get("report_no", ""),
-        "title": new_title,
-        "report_md": entry.get("report_md", ""),
-    }
-
-
-@app.patch("/api/history-title")
-async def update_history_title_by_body(req: HistoryTitleUpdateByIdRequest, request: Request):
-    login = await _current_login(request)
-    result = _update_history_title_by_id(req.id, req.title, login)
-    await audit_log(request, "report", "修改报告名称", f"{req.id} → {result.get('title', req.title)}", metadata={"history_id": req.id})
-    return result
-
-
-@app.post("/api/history-title")
-async def update_history_title_by_body_post(req: HistoryTitleUpdateByIdRequest, request: Request):
-    login = await _current_login(request)
-    result = _update_history_title_by_id(req.id, req.title, login)
-    await audit_log(request, "report", "修改报告名称", f"{req.id} → {result.get('title', req.title)}", metadata={"history_id": req.id})
-    return result
-
-
-@app.patch("/api/history/{hist_id}/title")
-async def update_history_title(hist_id: str, req: HistoryTitleUpdateRequest, request: Request):
-    login = await _current_login(request)
-    result = _update_history_title_by_id(hist_id, req.title, login)
-    await audit_log(request, "report", "修改报告名称", f"{hist_id} → {result.get('title', req.title)}", metadata={"history_id": hist_id})
-    return result
-
-
-@app.post("/api/history/{hist_id}/title")
-async def update_history_title_post(hist_id: str, req: HistoryTitleUpdateRequest, request: Request):
-    login = await _current_login(request)
-    result = _update_history_title_by_id(hist_id, req.title, login)
-    await audit_log(request, "report", "修改报告名称", f"{hist_id} → {result.get('title', req.title)}", metadata={"history_id": hist_id})
-    return result
-
 
 # ============================================================
 # 数据标注模块
