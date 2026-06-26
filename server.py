@@ -2829,50 +2829,12 @@ async def _comment_analysis_pipeline(sess: dict):
 
 
 # ============================================================
-# FastAPI
+# FastAPI:app 实例 / 中间件 / 静态 / 首页·登录 均在 app/main.py。
+# 过渡期 server.py 仍 import 该 app,并在下方继续注册尚未迁出的路由;
+# 步骤3 迁完后本文件仅剩 `from app.main import app` 一行。
 # ============================================================
 
-app = FastAPI(title="调研分析平台")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-_sweep_old_sessions()  # 启动时清理过期 session 文件
-
-static_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
-app.mount("/static", StaticFiles(directory=static_dir), name="static")
-
-
-@app.get("/")
-async def index():
-    return FileResponse(os.path.join(static_dir, "index.html"))
-
-
-@app.get("/favicon.ico")
-async def favicon():
-    return FileResponse(os.path.join(static_dir, "web-icon.jpg"), media_type="image/jpeg")
-
-
-@app.get("/login")
-async def login_page(request: Request, next: str = "/"):
-    safe_next = _safe_next_path(next)
-    login = await _current_login(request)
-    if login and _login_allowed(login):
-        return RedirectResponse(safe_next)
-    return FileResponse(os.path.join(static_dir, "login.html"))
-
-
-@app.middleware("http")
-async def feishu_auth_middleware(request: Request, call_next):
-    if not FEISHU_LOGIN_REQUIRED or _is_public_path(request.url.path):
-        return await call_next(request)
-
-    login = await _current_login(request)
-    if not login:
-        resp = _unauthorized_response(request)
-        resp.delete_cookie(COOKIE_NAME)
-        return resp
-    if not _login_allowed(login):
-        return _forbidden_response(request, login)
-    return await call_next(request)
-
+from app.main import app  # noqa: E402
 
 # ── 上传 ──────────────────────────────────────────────
 
