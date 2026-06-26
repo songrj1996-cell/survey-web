@@ -1,5 +1,6 @@
 import asyncio
 import json
+from typing import AsyncGenerator
 
 import httpx
 
@@ -268,3 +269,149 @@ async def workflow_run(
 
     print(f"[dify] {log_prefix} retry exhausted")
     return ""
+
+
+async def sse_dify_stream(
+    query: str,
+    user_id: str,
+    conversation_id: str,
+    api_key: str,
+) -> AsyncGenerator[tuple[str, str], None]:
+    import httpx
+
+    payload = {
+        "inputs": {},
+        "query": query,
+        "response_mode": "streaming",
+        "user": user_id,
+        "conversation_id": conversation_id,
+    }
+    req_headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    final_conv_id = conversation_id
+
+    async with httpx.AsyncClient(timeout=1800, follow_redirects=True) as client:
+        async with client.stream(
+            "POST", f"{DIFY_API_BASE}/chat-messages",
+            headers=req_headers, json=payload,
+        ) as resp:
+            if resp.status_code >= 400:
+                err = await resp.aread()
+                raise RuntimeError(f"Dify {resp.status_code}: {err.decode('utf-8', errors='replace')}")
+            async for line in resp.aiter_lines():
+                if not line or not line.startswith("data:"):
+                    continue
+                raw = line[5:].strip()
+                if not raw:
+                    continue
+                try:
+                    data = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                event = data.get("event")
+                if event in ("message", "agent_message"):
+                    yield data.get("answer", ""), ""
+                if data.get("conversation_id"):
+                    final_conv_id = data["conversation_id"]
+                if event == "error":
+                    raise RuntimeError(f"Dify error: {data.get('code')} {data.get('message')}")
+                if event in ("message_end", "workflow_finished", "agent_message_end"):
+                    break
+
+    yield "", final_conv_id
+
+
+async def sse_dify_completion_stream(
+    query: str,
+    user_id: str,
+    api_key: str,
+    input_var: str = "survey_batch",
+) -> AsyncGenerator[str, None]:
+    """调用 Dify completion-messages 端点（文本生成应用）。"""
+    import httpx
+
+    inputs = {input_var: query}
+    for fallback_key in ("query", "text", "content"):
+        inputs.setdefault(fallback_key, query)
+
+    payload = {
+        "inputs": inputs,
+        "response_mode": "streaming",
+        "user": user_id,
+    }
+    req_headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    async with httpx.AsyncClient(timeout=1800, follow_redirects=True) as client:
+        async with client.stream(
+            "POST", f"{DIFY_API_BASE}/completion-messages",
+            headers=req_headers, json=payload,
+        ) as resp:
+            if resp.status_code >= 400:
+                err = await resp.aread()
+                raise RuntimeError(f"Dify {resp.status_code}: {err.decode('utf-8', errors='replace')}")
+            async for line in resp.aiter_lines():
+                if not line or not line.startswith("data:"):
+                    continue
+                raw = line[5:].strip()
+                if not raw:
+                    continue
+                try:
+                    data = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                event = data.get("event")
+                if event == "message":
+                    yield data.get("answer", "")
+                if event == "error":
+                    raise RuntimeError(f"Dify error: {data.get('code')} {data.get('message')}")
+                if event in ("message_end", "workflow_finished"):
+                    break
+
+
+def _looks_like_dify_endpoint_mismatch(err: Exception) -> bool:
+    text = str(err).lower()
+    return any(k in text for k in [
+        "completion-messages",
+        "chat-messages",
+        "app mode",
+        "app_mode",
+        "not support",
+        "not supported",
+        "invalid_param",
+        "endpoint",
+        "completion app",
+        "chat app",
+    ])
+
+
+async def call_dify_compatible(
+    query: str,
+    user_id: str,
+    api_key: str,
+    conversation_id: str = "",
+) -> tuple[str, str, str, str]:
+    """优先按 chat 应用调用；若疑似端点/应用类型不匹配，自动改用 completion 应用。"""
+    try:
+        chunks: list[str] = []
+        final_conv = conversation_id
+        async for chunk, conv_id in sse_dify_stream(query, user_id, conversation_id, api_key):
+            if chunk:
+                chunks.append(chunk)
+            if conv_id:
+                final_conv = conv_id
+        return "".join(chunks), final_conv, "chat", ""
+    except Exception as e:
+        if not _looks_like_dify_endpoint_mismatch(e):
+            raise
+        fallback_reason = str(e)
+
+    chunks: list[str] = []
+    async for chunk in sse_dify_completion_stream(query, user_id, api_key):
+        if chunk:
+            chunks.append(chunk)
+    return "".join(chunks), "", "completion", fallback_reason
