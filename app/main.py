@@ -73,8 +73,10 @@ from app.routers import (
     feishu,
     history,
     settings_api,
+    survey,
 )
 
+app.include_router(survey.router)
 app.include_router(settings_api.router)
 app.include_router(admin.router)
 app.include_router(feishu.router)
