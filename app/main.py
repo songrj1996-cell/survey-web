@@ -64,10 +64,11 @@ async def feishu_auth_middleware(request: Request, call_next):
 
 
 # ── 业务路由(随步骤3逐组迁入后在此 include)───────────────────
-from app.routers import admin, crosstab, feishu, history, settings_api
+from app.routers import admin, crosstab, export, feishu, history, settings_api
 
 app.include_router(settings_api.router)
 app.include_router(admin.router)
 app.include_router(feishu.router)
 app.include_router(history.router)
 app.include_router(crosstab.router)
+app.include_router(export.router)

@@ -107,7 +107,7 @@ from app.storage.ui_texts import (
     _save_ui_texts,
 )
 from app.core.parsing import _parse_csv, _parse_excel, _parse_file
-from app.core.responses import sse_event
+from app.core.responses import _make_download_response, sse_event
 from app.core.text import _short_text
 from app.services.report_history import (
     _comment_report_title,
@@ -115,12 +115,7 @@ from app.services.report_history import (
     save_annotate_to_history,
     save_to_history,
 )
-from app.services.report_render import (
-    _inject_disclaimer,
-    _prep_export_md,
-    markdown_to_docx,
-    report_markdown_to_pdf,
-)
+from app.services.report_render import _inject_disclaimer
 from app.storage.sessions import (
     SESSION_TTL,
     _COMMENT_UPLOAD_DIR,
@@ -3540,14 +3535,6 @@ async def history_qa(req: HistoryQARequest, request: Request):
 
 # ── 导出 ────────────────────────────────────────────
 
-def _make_download_response(data: bytes, mime: str, filename: str) -> StreamingResponse:
-    """构建带 RFC 5987 编码文件名的下载响应。"""
-    encoded = quote(filename)
-    headers = {
-        "Content-Disposition": f"attachment; filename*=UTF-8''{encoded}",
-        "Content-Length": str(len(data)),
-    }
-    return StreamingResponse(io.BytesIO(data), media_type=mime, headers=headers)
 
 
 
@@ -3572,98 +3559,14 @@ def _make_download_response(data: bytes, mime: str, filename: str) -> StreamingR
 
 
 
-@app.get("/api/export/word/{session_id}")
-async def export_word(session_id: str, request: Request):
-    sess = get_session(session_id)
-    report_md = sess.get("report_md", "")
-    if not report_md:
-        raise HTTPException(status_code=400, detail="还没有生成报告")
-
-    report_md = _prep_export_md(report_md, mode=sess.get("mode") or "")
-    title_m = re.search(r"^#\s+(.+?)$", report_md, re.MULTILINE)
-    title = title_m.group(1).strip() if title_m else "调研报告"
-    safe = re.sub(r'[\\/:*?"<>|]', "_", title)
-
-    loop = asyncio.get_event_loop()
-    docx_bytes = await loop.run_in_executor(None, markdown_to_docx, report_md)
-    await audit_log(request, "report", "下载 Word", f"报告：{title}", metadata={"session_id": session_id})
-    return _make_download_response(
-        docx_bytes,
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        f"{safe}.docx",
-    )
 
 
-@app.get("/api/export/markdown/{session_id}")
-async def export_markdown(session_id: str, request: Request):
-    sess = get_session(session_id)
-    report_md = sess.get("report_md", "")
-    if not report_md:
-        raise HTTPException(status_code=400, detail="还没有生成报告")
-
-    report_md = _prep_export_md(report_md, mode=sess.get("mode") or "")
-    title_m = re.search(r"^#\s+(.+?)$", report_md, re.MULTILINE)
-    title = title_m.group(1).strip() if title_m else "调研报告"
-    safe = re.sub(r'[\\/:*?"<>|]', "_", title)
-    await audit_log(request, "report", "下载 Markdown", f"报告：{title}", metadata={"session_id": session_id})
-    return _make_download_response(report_md.encode("utf-8"), "text/markdown; charset=utf-8", f"{safe}.md")
 
 
-@app.get("/api/export/pdf/{session_id}")
-async def export_pdf(session_id: str, request: Request):
-    sess = get_session(session_id)
-    report_md = sess.get("report_md", "")
-    if not report_md:
-        raise HTTPException(status_code=400, detail="还没有生成报告")
-
-    title_m = re.search(r"^#\s+(.+?)$", report_md, re.MULTILINE)
-    title = title_m.group(1).strip() if title_m else "调研报告"
-    safe = re.sub(r'[\\/:*?"<>|]', "_", title)
-
-    loop = asyncio.get_event_loop()
-    pdf_bytes = await loop.run_in_executor(None, report_markdown_to_pdf, report_md, sess.get("mode") or "")
-    await audit_log(request, "report", "下载 PDF", f"报告：{title}", metadata={"session_id": session_id})
-    return _make_download_response(pdf_bytes, "application/pdf", f"{safe}.pdf")
 
 
-@app.get("/api/export/word-history/{history_id}")
-async def export_word_history(history_id: str, request: Request):
-    login = await _current_login(request)
-    history = _load_history()
-    entry = _find_history_for_login(history, history_id, login)
-    if not entry:
-        raise HTTPException(status_code=404, detail="历史记录不存在")
-    entry_mode = entry.get("mode") or entry.get("plan", {}).get("mode", "")
-    report_md = _prep_export_md(entry.get("report_md", ""), mode=entry_mode)
-    safe = re.sub(r'[\\/:*?"<>|]', "_", entry.get("title", "调研报告"))
-    loop = asyncio.get_event_loop()
-    docx_bytes = await loop.run_in_executor(None, markdown_to_docx, report_md)
-    await audit_log(request, "report", "下载历史 Word", f"报告：{entry.get('title', history_id)}", metadata={"history_id": history_id})
-    return _make_download_response(
-        docx_bytes,
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        f"{safe}.docx",
-    )
 
 
-@app.get("/api/export/pdf-history/{history_id}")
-async def export_pdf_history(history_id: str, request: Request):
-    login = await _current_login(request)
-    history = _load_history()
-    entry = _find_history_for_login(history, history_id, login)
-    if not entry:
-        raise HTTPException(status_code=404, detail="历史记录不存在")
-    report_md = entry.get("report_md", "")
-    if not report_md:
-        raise HTTPException(status_code=400, detail="该历史记录没有报告内容")
-    entry_mode = entry.get("mode") or entry.get("plan", {}).get("mode", "")
-    safe = re.sub(r'[\\/:*?"<>|]', "_", entry.get("title", "调研报告"))
-    loop = asyncio.get_event_loop()
-    pdf_bytes = await loop.run_in_executor(
-        None, report_markdown_to_pdf, report_md, entry_mode
-    )
-    await audit_log(request, "report", "下载历史 PDF", f"报告：{entry.get('title', history_id)}", metadata={"history_id": history_id})
-    return _make_download_response(pdf_bytes, "application/pdf", f"{safe}.pdf")
 
 
 # ── 飞书 OAuth 登录 + 文档导出 ────────────────────────
@@ -3675,84 +3578,12 @@ async def export_pdf_history(history_id: str, request: Request):
 
 
 
-async def _export_to_feishu(report_md: str, login: dict, mode: str = "") -> str:
-    """将报告上传为飞书文档（docx），文档归登录用户所有，并通过机器人发消息通知。"""
-    full = _prep_export_md(report_md, mode=mode)  # 补免责声明 + 去掉 CORE_START/END 标记
-    title_m = re.search(r"^#\s+(.+?)$", full, re.MULTILINE)
-    title = title_m.group(1).strip() if title_m else "调研报告"
-    open_id = login.get("open_id", "") or None
-    url, _, _ = await feishu_export.create_doc_via_bot(title, full, open_id)
-    print(f"[feishu-export] created doc title={title!r} url={url}")
-    if open_id:
-        await feishu_export.send_message_to_user(
-            open_id,
-            f"您的调研报告《{title}》已创建为飞书文档，点击查看：{url}"
-        )
-    return url
 
 
-def _feishu_export_error(e: Exception) -> HTTPException:
-    msg = str(e)
-    if (
-        "99991679" in msg
-        or "drive:file:upload" in msg
-        or "Unauthorized" in msg
-        or "创建飞书云文档导入任务失败" in msg
-        or "查询飞书云文档导入任务失败" in msg
-    ):
-        return HTTPException(
-            status_code=403,
-            detail=(
-                "飞书授权缺少云文档上传/导入权限。请确认飞书开放平台已开通文件上传和云文档导入任务权限，"
-                "然后点击左下角飞书账号退出登录，"
-                "然后重新登录授权后再导出。"
-            ),
-        )
-    return HTTPException(status_code=502, detail=f"创建飞书文档失败：{e}")
 
 
-@app.post("/api/export/feishu/{session_id}")
-async def export_feishu(session_id: str, request: Request):
-    if not feishu_export.is_configured():
-        raise HTTPException(status_code=500, detail="未配置飞书应用")
-    login = await _current_login(request)
-    if not login:
-        raise HTTPException(status_code=401, detail="请先登录飞书")
-    sess = get_session(session_id)
-    report_md = sess.get("report_md", "")
-    if not report_md:
-        raise HTTPException(status_code=400, detail="还没有生成报告")
-    try:
-        url = await _export_to_feishu(report_md, login, mode=sess.get("mode") or "")
-    except Exception as e:
-        print(f"[feishu-export][ERROR] {e!r}")
-        raise _feishu_export_error(e)
-    await audit_log(request, "report", "导出飞书文档", f"会话：{session_id}", metadata={"session_id": session_id})
-    return {"url": url, "type": "doc"}
 
 
-@app.post("/api/export/feishu-history/{history_id}")
-async def export_feishu_history(history_id: str, request: Request):
-    if not feishu_export.is_configured():
-        raise HTTPException(status_code=500, detail="未配置飞书应用")
-    login = await _current_login(request)
-    if not login:
-        raise HTTPException(status_code=401, detail="请先登录飞书")
-    history = _load_history()
-    entry = _find_history_for_login(history, history_id, login)
-    if not entry:
-        raise HTTPException(status_code=404, detail="历史记录不存在")
-    try:
-        entry_mode = entry.get("mode") or entry.get("plan", {}).get("mode", "")
-        url = await _export_to_feishu(
-            entry.get("report_md", ""), login,
-            mode=entry_mode,
-        )
-    except Exception as e:
-        print(f"[feishu-export-history][ERROR] {e!r}")
-        raise _feishu_export_error(e)
-    await audit_log(request, "report", "导出历史飞书文档", f"报告：{entry.get('title', history_id)}", metadata={"history_id": history_id})
-    return {"url": url, "type": "doc"}
 
 
 # ── Prompts 管理 ─────────────────────────────────────
