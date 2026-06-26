@@ -2548,6 +2548,8 @@ async function openHistoryEntry(id) {
     state.historyReport.qaHtml = '';
     state.historyReport.feishuLinkHtml = '';
 
+    // 切回问卷/报告模式：隐藏可能残留的评论分析/标注面板，避免与报告工作区叠加显示
+    switchMode('survey');
     closeDrawer('history-drawer');
     renderReportWorkspace(entry.report_md, { preserveQa: true });
     showToast('已载入历史报告', 'success');
