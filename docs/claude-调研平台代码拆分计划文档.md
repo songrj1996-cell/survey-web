@@ -299,6 +299,12 @@ survey-web/
    - **清理方向**:把纯判断逻辑(`_is_admin`/`_login_allowed`/`_whitelist_match`/owner 判断/响应构造)留在 core;真正读写 whitelist/logins/audit 的部分上移(由中间件 / service 读出数据后注入,或将 `_current_login`/`_admin_user_rows`/`audit_log` 等"会触达存储"的函数迁出 core 到 service 层)。
    - **时机**:全部 router 迁完、services 稳定后,做一次专门的"core 提纯"子步骤(步骤 6 前)。
 
+2. **PDF 导出:Chrome fallback 在无 WeasyPrint 环境下会生成超长单页**(渲染缺陷,非重构引入):
+   - `report_render.html_to_pdf_bytes` 优先用 WeasyPrint;当 WeasyPrint 不可用(如本地 Windows 缺 GTK3)时回退到无头浏览器(Chrome/Edge CDP),其逻辑把整篇渲染成单张超长页(实测 `MediaBox 720×18595`),导致大片空白/分页异常。
+   - **线上不受影响**:云端 Linux 有 GTK + 字体,走 WeasyPrint,产出正常 PDF-1.7。
+   - **本地处理**:已为本机 venv 装 GTK3 Runtime(`C:\Users\admin\gtk3-runtime`)+ `sitecustomize.py` 注册 DLL 目录,本地现也走 WeasyPrint;此为本机环境配置,**不进仓库、不影响线上**。
+   - **清理方向**(可选,低优先):改进 Chrome fallback,让其正常分页而非生成超长单页,使任何无 WeasyPrint 环境也能得到合理 PDF;或在文档中明确"PDF 验收以 WeasyPrint 为准"。
+
 ## 十、确认清单
 
 - [ ] 同意 core / storage / integrations / services / schemas / routers 六部分的边界与职责
