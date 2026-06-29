@@ -1,7 +1,4 @@
-"""所有 FastAPI 请求体模型(Pydantic)。
-
-由 server.py / 各 router 共用。此处只定义数据结构,不含任何业务逻辑。
-"""
+"""所有 FastAPI 请求体模型(Pydantic)。由各 router 共用,只定义数据结构,不含业务逻辑。"""
 from pydantic import BaseModel
 
 

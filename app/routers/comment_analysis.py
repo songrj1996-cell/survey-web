@@ -9,9 +9,10 @@ import comment_analysis
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 
-from app.core.audit import audit_log
 from app.core.responses import sse_event
-from app.core.security import _assign_session_owner, _current_login
+from app.core.security import _assign_session_owner
+from app.services.audit import audit_log
+from app.services.auth import _current_login
 from app.services.comment_pipeline import (
     _comment_analysis_pipeline,
     _comment_append_selected_raw_comments,

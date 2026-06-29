@@ -5,17 +5,10 @@ import time
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 
-from app.core.audit import _audit_log_from_login
 from app.core.config import COOKIE_NAME, FEISHU_LOGIN_REQUIRED, FEISHU_SESSION_SECONDS
-from app.core.security import (
-    _current_login,
-    _get_user_perms,
-    _is_admin,
-    _login_allowed,
-    _login_denied_reason,
-    _login_url,
-    _safe_next_path,
-)
+from app.core.security import _is_admin, _login_denied_reason, _login_url, _safe_next_path
+from app.services.audit import _audit_log_from_login
+from app.services.auth import _current_login, _get_user_perms, _login_allowed
 from app.integrations import feishu_client as feishu_export
 from app.storage.logins import _save_web_logins, _sync_web_logins_from_disk, web_logins
 

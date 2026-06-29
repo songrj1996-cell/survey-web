@@ -1,29 +1,21 @@
-"""core/security:认证与权限的纯逻辑 + 登录态解析 + 鉴权响应构造。
+"""core/security:认证与权限的纯逻辑 + 鉴权响应构造。
 
-边界:本模块不直接读写数据文件——白名单经 storage.whitelist、登录态经 storage.logins;
-外部令牌刷新经 feishu_export(集成层)。不在此读写 JSON 文件,保持 core 不反向依赖。
+不依赖 storage / integrations 的纯函数放在此层。
+登录态解析 (_current_login)、白名单访问控制 (_login_allowed / _get_user_perms)、
+管理员鉴权 (_require_admin / _admin_user_rows) 等需要读写 storage 或调用飞书 API
+的函数已移至 services/auth。
 """
-import time
 from urllib.parse import quote
 
-from fastapi import HTTPException, Request
-
-from app.integrations import feishu_client as feishu_export
+from fastapi import Request
 from fastapi.responses import JSONResponse, RedirectResponse
 
 from app.core.config import (
-    COOKIE_NAME,
     FEISHU_ADMIN_EMAILS,
     FEISHU_ALLOWED_EMAILS,
     FEISHU_LOGIN_REQUIRED,
     MAX_HISTORY,
 )
-from app.storage.logins import (
-    _save_web_logins,
-    _sync_web_logins_from_disk,
-    web_logins,
-)
-from app.storage.whitelist import _load_whitelist
 
 # 权限项全集（顺序即管理页展示顺序）
 ALL_PERMS = ["survey", "annotate", "comment"]
@@ -55,35 +47,6 @@ def _is_admin(login: dict | None) -> bool:
         return True
     # FEISHU_ALLOWED_EMAILS 里的人也视为管理员（向下兼容）
     if FEISHU_ALLOWED_EMAILS and e in FEISHU_ALLOWED_EMAILS:
-        return True
-    return False
-
-
-def _get_user_perms(login: dict | None) -> list[str]:
-    if not FEISHU_LOGIN_REQUIRED:
-        return list(ALL_PERMS)
-    if not login:
-        return []
-    if _is_admin(login):
-        return list(ALL_PERMS)
-    for u in _load_whitelist():
-        if _whitelist_match(u, login):
-            return list(u.get("perms", list(ALL_PERMS)))
-    return []
-
-
-def _login_allowed(login: dict | None) -> bool:
-    if not FEISHU_LOGIN_REQUIRED:
-        return True
-    if not login:
-        return False
-    if _is_admin(login):
-        return True
-    for u in _load_whitelist():
-        if _whitelist_match(u, login):
-            return True
-    # 没有任何白名单配置时，允许所有已登录用户（开放模式）
-    if not FEISHU_ADMIN_EMAILS and not FEISHU_ALLOWED_EMAILS and not _load_whitelist():
         return True
     return False
 
@@ -216,57 +179,3 @@ def _trim_history_for_owner(history: list, owner_key: str) -> list:
                 continue
         kept.append(entry)
     return kept
-
-
-async def _current_login(request: Request) -> dict | None:
-    """从 cookie 取登录态；token 临过期则尝试刷新。返回 None 表示未登录。"""
-    sid = request.cookies.get(COOKIE_NAME, "")
-    _sync_web_logins_from_disk()
-    login = web_logins.get(sid)
-    if not login:
-        return None
-    now = time.time()
-    if login.get("expires_at", 0) and login["expires_at"] < now:
-        web_logins.pop(sid, None)
-        _save_web_logins()
-        return None
-    if login.get("exp", 0) < time.time() + 120 and login.get("refresh"):
-        try:
-            fresh = await feishu_export.refresh_token(login["refresh"])
-            login.update(fresh)
-            _save_web_logins()
-        except Exception:
-            web_logins.pop(sid, None)
-            _save_web_logins()
-            return None
-    return login
-
-
-async def _require_admin(request: Request):
-    login = await _current_login(request)
-    if not _is_admin(login):
-        raise HTTPException(status_code=403, detail="需要管理员权限")
-    return login
-
-
-def _admin_user_rows() -> list[dict]:
-    users = _load_whitelist()
-    result = []
-    for u in users:
-        e = u.get("email", "").lower()
-        result.append({
-            "email": e,
-            "perms": u.get("perms", list(ALL_PERMS)),
-            "enabled": u.get("enabled", True),
-            "is_admin": False,
-        })
-    admin_emails = set(FEISHU_ADMIN_EMAILS) | set(FEISHU_ALLOWED_EMAILS)
-    existing = {u["email"] for u in result}
-    for e in sorted(admin_emails):
-        if e not in existing:
-            result.insert(0, {"email": e, "perms": list(ALL_PERMS), "enabled": True, "is_admin": True})
-        else:
-            for u in result:
-                if u["email"] == e:
-                    u["is_admin"] = True
-    return result

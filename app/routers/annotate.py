@@ -6,11 +6,12 @@ import annotate
 from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 
-from app.core.audit import audit_log
 from app.core.config import ANNOTATE_RESULT_DIR, DIFY_AI_DETECT_KEY, DIFY_QUALITY_KEY
 from app.core.parsing import _parse_file
 from app.core.responses import _make_download_response, sse_event
-from app.core.security import _assign_session_owner, _current_login, _find_history_for_login
+from app.core.security import _assign_session_owner, _find_history_for_login
+from app.services.audit import audit_log
+from app.services.auth import _current_login
 from app.integrations.dify_client import call_dify_compatible, sse_dify_stream
 from app.schemas.requests import AnnotateConfirmAIRequest, AnnotateConfirmRequest
 from app.services.annotate_workflow import (
@@ -43,7 +44,7 @@ async def annotate_upload(request: Request, file: UploadFile = File(...)):
     headers = rows[0]
     body    = rows[1:]
 
-    # 自动检测列（用 server.py 现有逻辑，含矩阵题过滤）
+    # 自动检测列（含矩阵题过滤）
     id_col         = annotate.detect_id_column(headers, rows)
     open_text_cols = _detect_open_text_cols(rows, headers)
 

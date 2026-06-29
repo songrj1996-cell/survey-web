@@ -3,8 +3,8 @@ from datetime import datetime
 
 from fastapi import APIRouter, HTTPException, Request
 
-from app.core.audit import audit_log
-from app.core.security import _require_admin
+from app.services.audit import audit_log
+from app.services.auth import _require_admin
 from app.core.text import _short_text
 from app.schemas.requests import (
     AppSettingsPatch,

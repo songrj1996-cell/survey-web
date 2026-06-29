@@ -10,7 +10,6 @@ import survey_stats
 from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from app.core.audit import audit_log
 from app.core.config import (
     DIFY_ANALYST_KEY,
     DIFY_COLUMN_KEY,
@@ -21,7 +20,9 @@ from app.core.config import (
 )
 from app.core.parsing import _parse_file
 from app.core.responses import sse_event
-from app.core.security import _assign_session_owner, _current_login, _find_history_for_login
+from app.core.security import _assign_session_owner, _find_history_for_login
+from app.services.audit import audit_log
+from app.services.auth import _current_login
 from app.core.text import _short_text
 from app.integrations.dify_client import sse_dify_stream
 from app.schemas.requests import (

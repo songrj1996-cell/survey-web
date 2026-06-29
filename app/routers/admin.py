@@ -1,9 +1,11 @@
 """routers/admin:白名单用户 CRUD + 审计日志查询。"""
 from fastapi import APIRouter, HTTPException, Request
 
-from app.core.audit import AUDIT_FEATURES, audit_log
+from app.core.audit import AUDIT_FEATURES
 from app.core.config import FEISHU_ADMIN_EMAILS, FEISHU_ALLOWED_EMAILS
-from app.core.security import ALL_PERMS, _admin_user_rows, _require_admin
+from app.core.security import ALL_PERMS
+from app.services.audit import audit_log
+from app.services.auth import _admin_user_rows, _require_admin
 from app.schemas.requests import AdminUserPatch, AdminUserRequest
 from app.storage.audit_store import _load_audit_logs
 from app.storage.whitelist import _PERMS_SCHEMA_VERSION, _load_whitelist, _save_whitelist

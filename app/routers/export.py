@@ -4,9 +4,10 @@ import re
 
 from fastapi import APIRouter, HTTPException, Request
 
-from app.core.audit import audit_log
 from app.core.responses import _make_download_response
-from app.core.security import _current_login, _find_history_for_login
+from app.core.security import _find_history_for_login
+from app.services.audit import audit_log
+from app.services.auth import _current_login
 from app.integrations import feishu_client as feishu_export
 from app.services.export_service import _export_to_feishu, _feishu_export_error
 from app.services.report_render import _prep_export_md, markdown_to_docx, report_markdown_to_pdf

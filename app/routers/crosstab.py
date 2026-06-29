@@ -7,9 +7,10 @@ import re
 import crosstab_parser
 from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 
-from app.core.audit import audit_log
 from app.core.parsing import _parse_file
-from app.core.security import _assign_session_owner, _current_login
+from app.core.security import _assign_session_owner
+from app.services.audit import audit_log
+from app.services.auth import _current_login
 from app.storage.sessions import get_session, new_session, save_session
 
 router = APIRouter()

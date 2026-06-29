@@ -1,15 +1,8 @@
-"""core/audit:审计事件的构造入口。
+"""core/audit:审计事件的纯工具——特征列表、IP 取值、用户信息拼装。
 
-负责拼装审计事件(取 IP、组装 user、组装 entry)并交 storage.audit_store 落盘;
-不负责文件读写本身。audit_log 会解析当前登录态(经 core.security)。
+落盘入口(audit_log / _audit_log_from_login)需要 storage + 登录态,已移至 services/audit。
 """
-import uuid
-from datetime import datetime
-
 from fastapi import Request
-
-from app.core.security import _current_login
-from app.storage.audit_store import _append_audit_log
 
 AUDIT_FEATURES = [
     {"key": "auth", "label": "登录与账号"},
@@ -44,44 +37,3 @@ def _audit_user(login: dict | None) -> dict:
         "user_name": str(login.get("name", "")).strip(),
         "open_id": open_id,
     }
-
-
-def _audit_log_from_login(
-    request: Request | None,
-    login: dict | None,
-    feature: str,
-    action: str,
-    detail: str = "",
-    *,
-    status: str = "success",
-    metadata: dict | None = None,
-) -> None:
-    entry = {
-        "id": str(uuid.uuid4()),
-        "ts": datetime.now().isoformat(timespec="seconds"),
-        "feature": feature,
-        "feature_label": AUDIT_FEATURE_LABELS.get(feature, feature),
-        "action": action,
-        "detail": str(detail or "")[:1000],
-        "status": status,
-        "ip": _client_ip(request),
-        "metadata": metadata or {},
-        **_audit_user(login),
-    }
-    _append_audit_log(entry)
-
-
-async def audit_log(
-    request: Request | None,
-    feature: str,
-    action: str,
-    detail: str = "",
-    *,
-    status: str = "success",
-    metadata: dict | None = None,
-) -> None:
-    try:
-        login = await _current_login(request) if request else None
-        _audit_log_from_login(request, login, feature, action, detail, status=status, metadata=metadata)
-    except Exception as exc:
-        print(f"[audit] collect failed: {exc}", flush=True)

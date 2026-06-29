@@ -1,8 +1,9 @@
 """routers/history:历史记录列表 / 详情 / 改名。"""
 from fastapi import APIRouter, HTTPException, Request
 
-from app.core.audit import audit_log
-from app.core.security import _current_login, _find_history_for_login, _visible_to_owner
+from app.core.security import _find_history_for_login, _visible_to_owner
+from app.services.audit import audit_log
+from app.services.auth import _current_login
 from app.schemas.requests import HistoryTitleUpdateByIdRequest, HistoryTitleUpdateRequest
 from app.services.report_history import (
     _history_effective_row_count,

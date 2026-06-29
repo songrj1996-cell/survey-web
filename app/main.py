@@ -1,7 +1,6 @@
 """应用入口装配:创建 FastAPI、中间件、静态资源、登录门控、挂载各业务 router。
 
-过渡期(步骤3进行中):尚未迁出的路由仍在 server.py 中通过 `from app.main import app`
-注册到这里创建的同一个 app 上。迁移完成后,所有路由都在 app/routers/* 里、由本文件 include。
+所有路由均在 app/routers/* 里定义,由本文件 include。
 """
 import os
 
@@ -11,14 +10,8 @@ from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.core.config import COOKIE_NAME, FEISHU_LOGIN_REQUIRED
-from app.core.security import (
-    _current_login,
-    _forbidden_response,
-    _is_public_path,
-    _login_allowed,
-    _safe_next_path,
-    _unauthorized_response,
-)
+from app.core.security import _forbidden_response, _is_public_path, _safe_next_path, _unauthorized_response
+from app.services.auth import _current_login, _login_allowed
 from app.storage.sessions import _sweep_old_sessions
 
 app = FastAPI(title="调研分析平台")

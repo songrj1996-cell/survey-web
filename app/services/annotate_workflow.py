@@ -14,7 +14,8 @@ import annotate
 from fastapi import HTTPException, Request
 
 from app.core.config import ANNOTATE_RESULT_DIR, DIFY_AI_DETECT_KEY
-from app.core.security import _assign_session_owner, _current_login
+from app.core.security import _assign_session_owner
+from app.services.auth import _current_login
 from app.integrations.dify_client import sse_dify_stream
 from app.services.report_history import save_annotate_to_history
 
