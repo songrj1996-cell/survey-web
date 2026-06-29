@@ -1,16 +1,14 @@
-"""routers/history:历史记录列表 / 详情 / 改名。"""
+"""routers/history:历史记录列表 / 详情 / 改名（HTTP 壳）。
+
+列表查询与详情在 services/history_service，改名在 services/report_history。
+"""
 from fastapi import APIRouter, HTTPException, Request
 
-from app.core.security import _find_history_for_login, _visible_to_owner
+from app.schemas.requests import HistoryTitleUpdateByIdRequest, HistoryTitleUpdateRequest
 from app.services.audit import audit_log
 from app.services.auth import _current_login
-from app.schemas.requests import HistoryTitleUpdateByIdRequest, HistoryTitleUpdateRequest
-from app.services.report_history import (
-    _history_effective_row_count,
-    _qa_user_count,
-    _update_history_title_by_id,
-)
-from app.storage.history import _ensure_history_report_numbers, _load_history
+from app.services.history_service import get_history_entry, get_history_list
+from app.services.report_history import _update_history_title_by_id
 
 router = APIRouter()
 
@@ -18,41 +16,15 @@ router = APIRouter()
 @router.get("/api/history")
 async def get_history(request: Request, mode: str = ""):
     login = await _current_login(request)
-    history = _load_history()
-    history = _ensure_history_report_numbers(history)
-    visible_history = [h for h in history if _visible_to_owner(h, login)]
-    if mode:
-        visible_history = [h for h in visible_history if (h.get("mode") or "") == mode]
-    await audit_log(request, "report", "查看历史记录", f"历史报告数：{len(visible_history)}")
-    # 列表视图不返回完整 report_md（节省带宽）
-    return [
-        {
-            "id": h["id"],
-            "report_no": h.get("report_no", ""),
-            "filename": h["filename"],
-            "title": h["title"],
-            "created_at": h["created_at"],
-            "has_qa": bool(h.get("analyst_conv_id")),
-            "qa_count": _qa_user_count(h),
-            "mode": h.get("mode", ""),
-            "row_count": _history_effective_row_count(h),
-            "comment_valid_count": h.get("comment_valid_count", 0),
-            "comment_sample_count": h.get("comment_sample_count", 0),
-            "annotate_ai_count": h.get("annotate_ai_count", 0),
-            "annotate_confirmed_ai_count": h.get("annotate_confirmed_ai_count", 0),
-            "annotate_quality_count": h.get("annotate_quality_count", 0),
-            "annotate_has_download": bool(h.get("annotate_result_path")),
-        }
-        for h in visible_history
-    ]
+    result = get_history_list(login, mode)
+    await audit_log(request, "report", "查看历史记录", f"历史报告数：{len(result)}")
+    return result
 
 
 @router.get("/api/history/{hist_id}")
 async def get_history_item(hist_id: str, request: Request):
     login = await _current_login(request)
-    history = _load_history()
-    history = _ensure_history_report_numbers(history)
-    entry = _find_history_for_login(history, hist_id, login)
+    entry = get_history_entry(hist_id, login)
     if not entry:
         raise HTTPException(status_code=404, detail="历史记录不存在")
     await audit_log(request, "report", "打开历史报告", f"报告：{entry.get('title', hist_id)}", metadata={"history_id": hist_id})
