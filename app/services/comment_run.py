@@ -1,9 +1,17 @@
 """services/comment_run:评论舆情分析 SSE 流程——流水线、精选原文、保存历史。"""
 import asyncio
 
-from fastapi import Request
+from fastapi import HTTPException, Request
 
 from app.core.responses import sse_event
+
+
+def validate_comment_session_for_run(session_id: str) -> None:
+    """校验评论 session 是否具备运行分析的条件，不满足则 raise HTTPException。"""
+    from app.storage.sessions import get_session
+    sess = get_session(session_id)
+    if sess.get("kind") != "comment" or not sess.get("comment_preprocess_done") or not sess.get("comment_sample"):
+        raise HTTPException(status_code=400, detail="该会话尚未完成评论预处理，请重新上传并等待预处理完成")
 from app.services.comment_pipeline import (
     _comment_analysis_pipeline,
     _comment_append_selected_raw_comments,

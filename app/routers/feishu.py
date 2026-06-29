@@ -7,10 +7,15 @@ from fastapi.responses import JSONResponse, RedirectResponse
 
 from app.core.config import COOKIE_NAME, FEISHU_LOGIN_REQUIRED, FEISHU_SESSION_SECONDS
 from app.core.security import _is_admin, _login_denied_reason, _login_url, _safe_next_path
-from app.integrations import feishu_client as feishu_export
 from app.services.audit import _audit_log_from_login
 from app.services.auth import _current_login, _get_user_perms, _login_allowed
-from app.services.feishu_auth import do_logout, new_oauth_state, process_oauth_callback, require_feishu_configured
+from app.services.feishu_auth import (
+    do_logout,
+    get_feishu_authorize_url,
+    is_feishu_configured,
+    process_oauth_callback,
+    require_feishu_configured,
+)
 
 router = APIRouter()
 
@@ -18,8 +23,7 @@ router = APIRouter()
 @router.get("/api/feishu/login")
 async def feishu_login(next: str = "/"):
     require_feishu_configured()
-    state = new_oauth_state(_safe_next_path(next))
-    return RedirectResponse(feishu_export.build_authorize_url(state))
+    return RedirectResponse(get_feishu_authorize_url(_safe_next_path(next)))
 
 
 @router.get("/api/feishu/callback")
@@ -42,7 +46,7 @@ async def feishu_me(request: Request):
     login = await _current_login(request)
     allowed = _login_allowed(login)
     return {
-        "configured": feishu_export.is_configured(),
+        "configured": is_feishu_configured(),
         "login_required": FEISHU_LOGIN_REQUIRED,
         "logged_in": bool(login),
         "allowed": allowed,

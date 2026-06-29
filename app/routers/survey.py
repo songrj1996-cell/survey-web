@@ -12,9 +12,7 @@ from app.core.config import (
     DIFY_CROSSTAB_PLANNER_KEY,
     DIFY_LARGE_ANALYST_KEY,
     DIFY_PLANNER_KEY,
-    LARGE_SAMPLE_THRESHOLD,
 )
-from app.core.security import _find_history_for_login
 from app.schemas.requests import (
     ColumnConfirmRequest,
     HistoryQARequest,
@@ -23,7 +21,6 @@ from app.schemas.requests import (
 )
 from app.services.audit import audit_log
 from app.services.auth import _current_login
-from app.services.report_engine import _analyst_key_for_report
 from app.services.survey_service import (
     columns_stream,
     compute_survey_stats,
@@ -32,12 +29,16 @@ from app.services.survey_service import (
     is_survey_plan_approval,
     plan_revision_stream,
     plan_stream,
+    prepare_history_qa_context,
     qa_stream,
     report_stream,
     set_survey_columns,
+    validate_columns_ready,
+    validate_plan_confirm_ready,
+    validate_plan_ready,
+    validate_qa_ready,
+    validate_report_ready,
 )
-from app.storage.history import _load_history
-from app.storage.sessions import get_session
 
 router = APIRouter()
 
@@ -57,9 +58,7 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
 
 @router.get("/api/columns/{session_id}")
 async def get_columns(session_id: str, request: Request):
-    sess = get_session(session_id)
-    if not sess.get("rows"):
-        raise HTTPException(status_code=400, detail="会话中没有数据")
+    validate_columns_ready(session_id)
     if not DIFY_COLUMN_KEY:
         raise HTTPException(status_code=500, detail="未配置 DIFY_COLUMN_KEY（题型识别应用）")
     return StreamingResponse(columns_stream(session_id, request), media_type="text/event-stream")
@@ -78,22 +77,17 @@ async def confirm_columns(session_id: str, req: ColumnConfirmRequest, request: R
 
 @router.get("/api/plan/{session_id}")
 async def get_plan(session_id: str, request: Request):
-    sess = get_session(session_id)
-    if not sess.get("rows"):
-        raise HTTPException(status_code=400, detail="会话中没有数据，请先上传文件")
-    is_crosstab = sess.get("mode") == "crosstab"
-    if is_crosstab and not DIFY_CROSSTAB_PLANNER_KEY:
+    mode = validate_plan_ready(session_id)
+    if mode == "crosstab" and not DIFY_CROSSTAB_PLANNER_KEY:
         raise HTTPException(status_code=500, detail="未配置 DIFY_CROSSTAB_PLANNER_KEY")
-    elif not is_crosstab and not DIFY_PLANNER_KEY:
+    elif mode != "crosstab" and not DIFY_PLANNER_KEY:
         raise HTTPException(status_code=500, detail="未配置 DIFY_PLANNER_KEY")
     return StreamingResponse(plan_stream(session_id, request), media_type="text/event-stream")
 
 
 @router.post("/api/plan/confirm")
 async def confirm_plan(req: PlanConfirmRequest, request: Request):
-    sess = get_session(req.session_id)
-    if not sess.get("plan") or not sess.get("rows"):
-        raise HTTPException(status_code=400, detail="会话状态丢失，请重新上传文件")
+    validate_plan_confirm_ready(req.session_id)
     if is_survey_plan_approval(req.user_text):
         await audit_log(
             request, "survey", "确认分析方案",
@@ -114,12 +108,7 @@ async def compute_stats(session_id: str, request: Request):
 
 @router.get("/api/report/{session_id}")
 async def generate_report(session_id: str, request: Request):
-    sess = get_session(session_id)
-    if not all([sess.get("plan"), sess.get("rows"), sess.get("stats_md")]):
-        raise HTTPException(status_code=400, detail="请先完成统计计算")
-    use_large = sess.get("mode") == "crosstab" or any(
-        len(v) > LARGE_SAMPLE_THRESHOLD for v in sess.get("open_text", {}).values()
-    )
+    use_large = validate_report_ready(session_id)
     if use_large and not DIFY_LARGE_ANALYST_KEY:
         raise HTTPException(status_code=500, detail="未配置 DIFY_LARGE_ANALYST_KEY")
     elif not use_large and not DIFY_ANALYST_KEY:
@@ -129,28 +118,16 @@ async def generate_report(session_id: str, request: Request):
 
 @router.post("/api/qa")
 async def qa(req: QARequest, request: Request):
-    sess = get_session(req.session_id)
-    if not sess.get("analyst_conv_id"):
-        raise HTTPException(status_code=400, detail="请先生成报告")
-    analyst_key, analyst_key_name = _analyst_key_for_report(sess)
-    if not analyst_key:
-        raise HTTPException(status_code=500, detail=f"未配置 {analyst_key_name}")
+    validate_qa_ready(req.session_id)
     return StreamingResponse(qa_stream(req.session_id, req.question, request), media_type="text/event-stream")
 
 
 @router.post("/api/history-qa")
 async def history_qa(req: HistoryQARequest, request: Request):
     login = await _current_login(request)
-    history = _load_history()
-    entry = _find_history_for_login(history, req.history_id, login)
-    if not entry:
-        raise HTTPException(status_code=404, detail="历史记录不存在")
-    analyst_conv_id = entry.get("analyst_conv_id", "")
-    if not analyst_conv_id:
-        raise HTTPException(status_code=400, detail="该历史记录没有可续聊的对话")
-    analyst_key, analyst_key_name = _analyst_key_for_report(entry)
-    if not analyst_key:
-        raise HTTPException(status_code=500, detail=f"未配置 {analyst_key_name}")
+    history, analyst_conv_id, analyst_key, analyst_key_name = prepare_history_qa_context(
+        req.history_id, login
+    )
     return StreamingResponse(
         history_qa_stream(req.history_id, req.question, history, analyst_conv_id, analyst_key, analyst_key_name, request),
         media_type="text/event-stream",

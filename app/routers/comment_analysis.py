@@ -3,17 +3,17 @@
 业务编排、SSE 流程、session 推进、历史落库全部在:
   services/comment_upload / comment_preprocess / comment_run
 """
-import os
-
-from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, File, Form, Request, UploadFile
 from fastapi.responses import StreamingResponse
 
 from app.services.audit import audit_log
 from app.services.auth import _current_login
-from app.services.comment_preprocess import comment_preprocess_stream
-from app.services.comment_run import comment_run_stream
+from app.services.comment_preprocess import (
+    comment_preprocess_stream,
+    validate_comment_session_for_preprocess,
+)
+from app.services.comment_run import comment_run_stream, validate_comment_session_for_run
 from app.services.comment_upload import handle_comment_upload
-from app.storage.sessions import get_session
 
 router = APIRouter()
 
@@ -40,18 +40,11 @@ async def comment_analysis_upload(
 
 @router.get("/api/comment-analysis/preprocess/{session_id}")
 async def comment_analysis_preprocess(session_id: str, request: Request):
-    sess = get_session(session_id)
-    if sess.get("kind") != "comment":
-        raise HTTPException(status_code=400, detail="该会话不是评论分析任务")
-    upload_path = sess.get("comment_upload_path")
-    if not upload_path or not os.path.exists(upload_path):
-        raise HTTPException(status_code=400, detail="评论文件不存在或已过期，请重新上传")
+    validate_comment_session_for_preprocess(session_id)
     return StreamingResponse(comment_preprocess_stream(session_id, request), media_type="text/event-stream")
 
 
 @router.get("/api/comment-analysis/run/{session_id}")
 async def comment_analysis_run(session_id: str, request: Request):
-    sess = get_session(session_id)
-    if sess.get("kind") != "comment" or not sess.get("comment_preprocess_done") or not sess.get("comment_sample"):
-        raise HTTPException(status_code=400, detail="该会话尚未完成评论预处理，请重新上传并等待预处理完成")
+    validate_comment_session_for_run(session_id)
     return StreamingResponse(comment_run_stream(session_id, request), media_type="text/event-stream")

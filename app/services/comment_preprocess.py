@@ -5,9 +5,23 @@ import time
 import comment_analysis
 from fastapi import Request
 
+import os
+
+from fastapi import HTTPException
+
 from app.core.responses import sse_event
 from app.services.audit import audit_log
 from app.storage.sessions import get_session, save_session
+
+
+def validate_comment_session_for_preprocess(session_id: str) -> None:
+    """校验评论 session 是否具备预处理条件，不满足则 raise HTTPException。"""
+    sess = get_session(session_id)
+    if sess.get("kind") != "comment":
+        raise HTTPException(status_code=400, detail="该会话不是评论分析任务")
+    upload_path = sess.get("comment_upload_path")
+    if not upload_path or not os.path.exists(upload_path):
+        raise HTTPException(status_code=400, detail="评论文件不存在或已过期，请重新上传")
 
 
 async def comment_preprocess_stream(session_id: str, request: Request):

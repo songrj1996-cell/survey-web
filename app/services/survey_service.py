@@ -26,7 +26,7 @@ from app.core.config import (
 )
 from app.core.parsing import _parse_file
 from app.core.responses import sse_event
-from app.core.security import _assign_session_owner
+from app.core.security import _assign_session_owner, _find_history_for_login
 from app.core.text import _short_text
 from app.integrations.dify_client import sse_dify_stream
 from app.services.audit import audit_log
@@ -57,7 +57,7 @@ from app.services.report_engine import (
 )
 from app.services.report_history import save_to_history
 from app.services.report_render import _inject_disclaimer
-from app.storage.history import _save_history
+from app.storage.history import _load_history, _save_history
 from app.storage.prompts import _get_planner_extra
 from app.storage.sessions import get_session, new_session, save_session
 
@@ -643,3 +643,67 @@ async def history_qa_stream(
     except Exception as e:
         import traceback; traceback.print_exc()
         yield sse_event({"type": "error", "message": str(e)})
+
+
+# ── Router 前置校验函数 ──────────────────────────────────────────
+
+
+def validate_columns_ready(session_id: str) -> None:
+    """校验列识别前置条件（rows 存在），不满足则 raise HTTPException。"""
+    sess = get_session(session_id)
+    if not sess.get("rows"):
+        raise HTTPException(status_code=400, detail="会话中没有数据")
+
+
+def validate_plan_ready(session_id: str) -> str:
+    """校验方案生成前置条件，返回 mode 供 router 选择正确的 planner key。"""
+    sess = get_session(session_id)
+    if not sess.get("rows"):
+        raise HTTPException(status_code=400, detail="会话中没有数据，请先上传文件")
+    return sess.get("mode", "")
+
+
+def validate_plan_confirm_ready(session_id: str) -> None:
+    """校验方案确认/修订前置条件，不满足则 raise HTTPException。"""
+    sess = get_session(session_id)
+    if not sess.get("plan") or not sess.get("rows"):
+        raise HTTPException(status_code=400, detail="会话状态丢失，请重新上传文件")
+
+
+def validate_report_ready(session_id: str) -> bool:
+    """校验报告生成前置条件，返回 use_large_mode 供 router 选择正确的 analyst key。"""
+    sess = get_session(session_id)
+    if not all([sess.get("plan"), sess.get("rows"), sess.get("stats_md")]):
+        raise HTTPException(status_code=400, detail="请先完成统计计算")
+    return sess.get("mode") == "crosstab" or any(
+        len(v) > LARGE_SAMPLE_THRESHOLD for v in sess.get("open_text", {}).values()
+    )
+
+
+def validate_qa_ready(session_id: str) -> None:
+    """校验 QA 前置条件（analyst_conv_id + analyst_key），不满足则 raise HTTPException。"""
+    sess = get_session(session_id)
+    if not sess.get("analyst_conv_id"):
+        raise HTTPException(status_code=400, detail="请先生成报告")
+    analyst_key, analyst_key_name = _analyst_key_for_report(sess)
+    if not analyst_key:
+        raise HTTPException(status_code=500, detail=f"未配置 {analyst_key_name}")
+
+
+def prepare_history_qa_context(
+    history_id: str, login: dict | None
+) -> tuple[list, str, str, str]:
+    """加载历史记录，校验续聊前置条件。
+    返回 (history, analyst_conv_id, analyst_key, analyst_key_name)。
+    """
+    history = _load_history()
+    entry = _find_history_for_login(history, history_id, login)
+    if not entry:
+        raise HTTPException(status_code=404, detail="历史记录不存在")
+    analyst_conv_id = entry.get("analyst_conv_id", "")
+    if not analyst_conv_id:
+        raise HTTPException(status_code=400, detail="该历史记录没有可续聊的对话")
+    analyst_key, analyst_key_name = _analyst_key_for_report(entry)
+    if not analyst_key:
+        raise HTTPException(status_code=500, detail=f"未配置 {analyst_key_name}")
+    return history, analyst_conv_id, analyst_key, analyst_key_name

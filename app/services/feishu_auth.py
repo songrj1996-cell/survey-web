@@ -11,6 +11,16 @@ from app.services.audit import _audit_log_from_login
 from app.services.auth import _login_allowed
 from app.storage.logins import _save_web_logins, _sync_web_logins_from_disk, web_logins
 
+def is_feishu_configured() -> bool:
+    return feishu_client.is_configured()
+
+
+def get_feishu_authorize_url(next_path: str) -> str:
+    """创建 OAuth state 并返回飞书授权跳转 URL。"""
+    state = new_oauth_state(next_path)
+    return feishu_client.build_authorize_url(state)
+
+
 def require_feishu_configured() -> None:
     """飞书应用未配置时 raise HTTP 500，供 router 做前置校验。"""
     if not feishu_client.is_configured():
