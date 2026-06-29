@@ -11,6 +11,13 @@ from app.services.audit import _audit_log_from_login
 from app.services.auth import _login_allowed
 from app.storage.logins import _save_web_logins, _sync_web_logins_from_disk, web_logins
 
+def require_feishu_configured() -> None:
+    """飞书应用未配置时 raise HTTP 500，供 router 做前置校验。"""
+    if not feishu_client.is_configured():
+        from fastapi import HTTPException
+        raise HTTPException(status_code=500, detail="未配置飞书应用（FEISHU_APP_ID/SECRET/REDIRECT_URI）")
+
+
 # OAuth state 暂存（进程内内存，短期有效；仅登录/回调使用）
 oauth_states: dict[str, dict] = {}
 

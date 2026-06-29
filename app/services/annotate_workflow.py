@@ -100,12 +100,26 @@ def _annotate_ai_log(message: str, **fields) -> None:
     print(f"[annotate.ai_detect] {message}" + (f" {payload}" if payload else ""), flush=True)
 
 
-def _get_annotate_session(sid: str) -> dict:
+def get_annotate_session(sid: str) -> dict:
     sess = annotate_sessions.get(sid)
     if not sess:
         raise HTTPException(status_code=404, detail="标注会话不存在或已过期，请重新上传文件")
     sess["ts"] = time.time()
     return sess
+
+
+def validate_annotate_session_for_ai(sid: str) -> None:
+    """校验 session 是否具备运行 AI 检测的前置条件，不满足则 raise HTTPException。"""
+    sess = get_annotate_session(sid)
+    if not sess.get("rows") or not sess.get("open_text_cols"):
+        raise HTTPException(status_code=400, detail="会话状态不完整，请重新上传")
+
+
+def validate_annotate_session_for_quality(sid: str) -> None:
+    """校验 session 是否具备运行质量打标的前置条件，不满足则 raise HTTPException。"""
+    sess = get_annotate_session(sid)
+    if not sess.get("rows") or not sess.get("open_text_cols"):
+        raise HTTPException(status_code=400, detail="会话状态不完整，请重新上传")
 
 
 _ANNOTATE_SESSION_TTL = 7200  # 2 hours
@@ -227,7 +241,7 @@ def annotate_set_column_config(
     background: str,
 ) -> list[str]:
     """更新会话的列配置，返回任务名称列表（用于审计）。"""
-    sess = _get_annotate_session(sid)
+    sess = get_annotate_session(sid)
     sess["id_col"] = id_col
     sess["open_text_cols"] = open_text_cols
     sess["tasks"] = tasks
@@ -339,7 +353,7 @@ async def _run_ai_direct_batch(
 
 async def ai_detect_stream(sid: str, request: Request):
     """AI 作答识别 SSE 流程（async generator）。"""
-    sess = _get_annotate_session(sid)
+    sess = get_annotate_session(sid)
     rows = sess.get("rows", [])
     headers = sess.get("headers", [])
     id_col = sess.get("id_col", 1)
@@ -587,7 +601,7 @@ async def ai_detect_stream(sid: str, request: Request):
 
 async def annotate_set_confirmed_ai(sid: str, confirmed_ai_ids: list[str], request: Request) -> None:
     """存储用户确认的 AI 作答 ID，必要时自动保存历史。"""
-    sess = _get_annotate_session(sid)
+    sess = get_annotate_session(sid)
     sess["confirmed_ai_ids"] = confirmed_ai_ids
     if not (sess.get("tasks") or {}).get("quality"):
         await _save_annotate_result_history(sid, sess, request)
@@ -663,7 +677,7 @@ async def _run_one_quality_batch(
 
 async def quality_stream(sid: str, request: Request):
     """质量打标 SSE 流程（async generator）。"""
-    sess = _get_annotate_session(sid)
+    sess = get_annotate_session(sid)
     rows = sess.get("rows", [])
     headers = sess.get("headers", [])
     id_col = sess.get("id_col", 1)
@@ -757,7 +771,7 @@ async def quality_stream(sid: str, request: Request):
 
 async def build_and_save_annotate_download(sid: str, request: Request) -> tuple[bytes, str]:
     """生成标注 Excel、落盘历史、返回 (bytes, download_name)。"""
-    sess = _get_annotate_session(sid)
+    sess = get_annotate_session(sid)
     loop = asyncio.get_event_loop()
     excel_bytes, download_name = await loop.run_in_executor(
         None, _build_annotate_excel_from_session, sess

@@ -3,7 +3,6 @@
 业务编排、SSE 流程、session 推进、历史落库全部在 services/survey_service。
 跑数表(crosstab)模式复用本组的 plan/stats/report/qa 流程，仅上传入口在 routers/crosstab。
 """
-import survey_plan
 from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -30,6 +29,7 @@ from app.services.survey_service import (
     compute_survey_stats,
     handle_survey_upload,
     history_qa_stream,
+    is_survey_plan_approval,
     plan_revision_stream,
     plan_stream,
     qa_stream,
@@ -94,7 +94,7 @@ async def confirm_plan(req: PlanConfirmRequest, request: Request):
     sess = get_session(req.session_id)
     if not sess.get("plan") or not sess.get("rows"):
         raise HTTPException(status_code=400, detail="会话状态丢失，请重新上传文件")
-    if survey_plan.is_user_approval(req.user_text):
+    if is_survey_plan_approval(req.user_text):
         await audit_log(
             request, "survey", "确认分析方案",
             f"会话：{req.session_id}", metadata={"session_id": req.session_id},

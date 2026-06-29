@@ -10,16 +10,14 @@ from app.core.security import _is_admin, _login_denied_reason, _login_url, _safe
 from app.integrations import feishu_client as feishu_export
 from app.services.audit import _audit_log_from_login
 from app.services.auth import _current_login, _get_user_perms, _login_allowed
-from app.services.feishu_auth import do_logout, new_oauth_state, process_oauth_callback
+from app.services.feishu_auth import do_logout, new_oauth_state, process_oauth_callback, require_feishu_configured
 
 router = APIRouter()
 
 
 @router.get("/api/feishu/login")
 async def feishu_login(next: str = "/"):
-    if not feishu_export.is_configured():
-        from fastapi import HTTPException
-        raise HTTPException(status_code=500, detail="未配置飞书应用（FEISHU_APP_ID/SECRET/REDIRECT_URI）")
+    require_feishu_configured()
     state = new_oauth_state(_safe_next_path(next))
     return RedirectResponse(feishu_export.build_authorize_url(state))
 

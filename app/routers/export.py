@@ -6,7 +6,6 @@
 from fastapi import APIRouter, HTTPException, Request
 
 from app.core.responses import _make_download_response
-from app.integrations import feishu_client as feishu_export
 from app.services.audit import audit_log
 from app.services.auth import _current_login
 from app.services.export_download import (
@@ -21,6 +20,7 @@ from app.services.export_history import (
     prepare_word_history_download,
 )
 from app.services.export_service import _export_to_feishu, _feishu_export_error
+from app.services.feishu_auth import require_feishu_configured
 
 router = APIRouter()
 
@@ -72,8 +72,7 @@ async def export_pdf_history(history_id: str, request: Request):
 
 @router.post("/api/export/feishu/{session_id}")
 async def export_feishu(session_id: str, request: Request):
-    if not feishu_export.is_configured():
-        raise HTTPException(status_code=500, detail="未配置飞书应用")
+    require_feishu_configured()
     login = await _current_login(request)
     if not login:
         raise HTTPException(status_code=401, detail="请先登录飞书")
@@ -89,8 +88,7 @@ async def export_feishu(session_id: str, request: Request):
 
 @router.post("/api/export/feishu-history/{history_id}")
 async def export_feishu_history(history_id: str, request: Request):
-    if not feishu_export.is_configured():
-        raise HTTPException(status_code=500, detail="未配置飞书应用")
+    require_feishu_configured()
     login = await _current_login(request)
     if not login:
         raise HTTPException(status_code=401, detail="请先登录飞书")

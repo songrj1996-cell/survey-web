@@ -56,7 +56,7 @@ async def feishu_auth_middleware(request: Request, call_next):
     return await call_next(request)
 
 
-# ── 业务路由(随步骤3逐组迁入后在此 include)───────────────────
+# ── 业务路由 ────────────────────────────────────────────────
 from app.routers import (
     admin,
     annotate,

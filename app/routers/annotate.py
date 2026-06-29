@@ -15,7 +15,8 @@ from app.services.annotate_workflow import (
     build_and_save_annotate_download,
     get_annotate_history_file,
     handle_annotate_upload,
-    _get_annotate_session,
+    validate_annotate_session_for_ai,
+    validate_annotate_session_for_quality,
 )
 from app.services.audit import audit_log
 from app.services.auth import _current_login
@@ -49,9 +50,7 @@ async def annotate_confirm_columns(sid: str, req: AnnotateConfirmRequest, reques
 
 @router.get("/api/annotate/{sid}/run-ai-detect")
 async def annotate_run_ai_detect(sid: str, request: Request):
-    sess = _get_annotate_session(sid)
-    if not sess.get("rows") or not sess.get("open_text_cols"):
-        raise HTTPException(status_code=400, detail="会话状态不完整，请重新上传")
+    validate_annotate_session_for_ai(sid)
     if not DIFY_AI_DETECT_KEY:
         raise HTTPException(status_code=500, detail="未配置 DIFY_AI_DETECT_KEY")
     return StreamingResponse(ai_detect_stream(sid, request), media_type="text/event-stream")
@@ -71,9 +70,7 @@ async def annotate_confirm_ai(sid: str, req: AnnotateConfirmAIRequest, request: 
 @router.get("/api/annotate/{sid}/run-quality")
 async def annotate_run_quality(sid: str, request: Request):
     from app.services.annotate_workflow import quality_stream
-    sess = _get_annotate_session(sid)
-    if not sess.get("rows") or not sess.get("open_text_cols"):
-        raise HTTPException(status_code=400, detail="会话状态不完整，请重新上传")
+    validate_annotate_session_for_quality(sid)
     if not DIFY_QUALITY_KEY:
         raise HTTPException(status_code=500, detail="未配置 DIFY_QUALITY_KEY")
     return StreamingResponse(quality_stream(sid, request), media_type="text/event-stream")

@@ -9,6 +9,11 @@ from datetime import datetime
 
 import survey_plan
 import survey_stats
+
+
+def is_survey_plan_approval(user_text: str) -> bool:
+    """用户意见是否表示直接确认方案（不修订）。"""
+    return survey_plan.is_user_approval(user_text)
 from fastapi import HTTPException, Request
 
 from app.core.config import (
