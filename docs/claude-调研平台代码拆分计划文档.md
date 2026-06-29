@@ -305,6 +305,31 @@ survey-web/
    - **本地处理**:已为本机 venv 装 GTK3 Runtime(`C:\Users\admin\gtk3-runtime`)+ `sitecustomize.py` 注册 DLL 目录,本地现也走 WeasyPrint;此为本机环境配置,**不进仓库、不影响线上**。
    - **清理方向**(可选,低优先):改进 Chrome fallback,让其正常分页而非生成超长单页,使任何无 WeasyPrint 环境也能得到合理 PDF;或在文档中明确"PDF 验收以 WeasyPrint 为准"。
 
+## 十二、根目录保留算法模块说明
+
+以下五个模块仍位于项目根目录，**不是冗余代码，不可删除**：
+
+| 模块 | 职责 | 被引用方 |
+|---|---|---|
+| `survey_stats.py` | 问卷统计计算（选题分布、均值、交叉等） | `services/survey_service.py` |
+| `survey_plan.py` | 分析方案解析 / 合并 / 渲染 | `services/survey_service.py` |
+| `comment_analysis.py` | 评论预处理（清洗、抽样、列检测） | `services/comment_preprocess.py` |
+| `annotate.py` | 标注算法（AI 检测解析、质量标签解析、Excel 生成） | `services/annotate_workflow.py` |
+| `crosstab_parser.py` | 跑数表解析与 Markdown 渲染 | `services/crosstab_service.py` |
+
+**定性**：这些是「领域算法模块」——只有纯计算逻辑，无 HTTP、无存储、无外部 API 调用。它们与 `app/` 包是**有意隔离**的：`app/services/` 作为编排层负责调用它们，但算法本身不属于 web 应用分层。
+
+**为何现在不搬入 `app/`**：
+- 搬移需要重命名包路径（所有 `import survey_plan` → `from app.engines.survey_plan import ...`），改动点多，回归风险高于收益。
+- 没有完整的单元测试覆盖，搬移后无法快速验证行为等价。
+- 当前调用方（`services/`）已正确封装这些调用，外部无感知，分层目标已达到。
+
+**后续规划**（可选，无优先级约束）：
+- 若未来要迁移，建议目标路径为 `app/domain/` 或 `app/engines/`，整体一次性搬移，配合完整回归测试。
+- 迁移前**先补单元测试**，不建议在无测试保护下搬移算法模块。
+
+---
+
 ## 十、确认清单
 
 - [ ] 同意 core / storage / integrations / services / schemas / routers 六部分的边界与职责
