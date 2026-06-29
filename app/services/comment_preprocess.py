@@ -1,13 +1,10 @@
 """services/comment_preprocess:评论文件预处理 SSE 流程。"""
 import asyncio
+import os
 import time
 
 import comment_analysis
-from fastapi import Request
-
-import os
-
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 
 from app.core.responses import sse_event
 from app.services.audit import audit_log

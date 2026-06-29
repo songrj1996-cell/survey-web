@@ -41,11 +41,12 @@ RULES = [
 ]
 
 
-def collect_imports(src: str) -> list[str]:
+def collect_imports(src: str, path: pathlib.Path) -> list[str]:
     try:
         tree = ast.parse(src)
-    except SyntaxError:
-        return []
+    except SyntaxError as e:
+        print(f"FAIL: syntax error in {path}: {e}")
+        sys.exit(1)
     mods: list[str] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module:
@@ -60,7 +61,7 @@ violations: list[str] = []
 for glob_pat, forbidden, desc in RULES:
     for path in sorted(APP.glob(glob_pat)):
         src = path.read_text(encoding="utf-8")
-        for mod in collect_imports(src):
+        for mod in collect_imports(src, path):
             for prefix in forbidden:
                 if mod == prefix or mod.startswith(prefix + "."):
                     rel = path.relative_to(APP.parent)
