@@ -1,61 +1,41 @@
-"""routers/feishu:飞书 OAuth 登录 / 回调 / 当前身份 / 登出。"""
-import secrets
-import time
+"""routers/feishu:飞书 OAuth 登录 / 回调 / 当前身份 / 登出（HTTP 壳）。
 
-from fastapi import APIRouter, HTTPException, Request
+OAuth state 管理、code 兑换、web_logins 读写全部在 services/feishu_auth。
+"""
+from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 
 from app.core.config import COOKIE_NAME, FEISHU_LOGIN_REQUIRED, FEISHU_SESSION_SECONDS
 from app.core.security import _is_admin, _login_denied_reason, _login_url, _safe_next_path
+from app.integrations import feishu_client as feishu_export
 from app.services.audit import _audit_log_from_login
 from app.services.auth import _current_login, _get_user_perms, _login_allowed
-from app.integrations import feishu_client as feishu_export
-from app.storage.logins import _save_web_logins, _sync_web_logins_from_disk, web_logins
+from app.services.feishu_auth import do_logout, new_oauth_state, process_oauth_callback
 
 router = APIRouter()
-
-# OAuth state 暂存(进程内内存,短期有效;仅登录/回调使用)
-oauth_states: dict[str, dict] = {}
 
 
 @router.get("/api/feishu/login")
 async def feishu_login(next: str = "/"):
     if not feishu_export.is_configured():
+        from fastapi import HTTPException
         raise HTTPException(status_code=500, detail="未配置飞书应用（FEISHU_APP_ID/SECRET/REDIRECT_URI）")
-    state = secrets.token_urlsafe(16)
-    oauth_states[state] = {"next": _safe_next_path(next), "ts": time.time()}
-    # 清理过期 state
-    now = time.time()
-    for k in list(oauth_states.keys()):
-        if oauth_states[k]["ts"] + 600 < now:
-            del oauth_states[k]
+    state = new_oauth_state(_safe_next_path(next))
     return RedirectResponse(feishu_export.build_authorize_url(state))
 
 
 @router.get("/api/feishu/callback")
 async def feishu_callback(request: Request, code: str = "", state: str = ""):
-    st = oauth_states.pop(state, None)
-    if not st:
-        raise HTTPException(status_code=400, detail="state 无效或已过期，请重新登录")
-    if not code:
-        raise HTTPException(status_code=400, detail="缺少授权 code")
-    try:
-        login = await feishu_export.exchange_code(code)
-    except Exception as e:
-        return RedirectResponse(_login_url(st.get("next") or "/", f"飞书授权失败：{e}"))
-    if FEISHU_LOGIN_REQUIRED and not _login_allowed(login):
-        return RedirectResponse(_login_url(st.get("next") or "/", _login_denied_reason(login)))
-    now = time.time()
-    login["created_at"] = now
-    login["expires_at"] = now + FEISHU_SESSION_SECONDS
-    sid = secrets.token_urlsafe(24)
-    _sync_web_logins_from_disk()
-    web_logins[sid] = login
-    _save_web_logins()
-    _audit_log_from_login(request, login, "auth", "飞书登录", "飞书授权登录成功")
-    resp = RedirectResponse(_safe_next_path(st.get("next") or "/"))
-    secure = feishu_export.FEISHU_REDIRECT_URI.startswith("https://")
-    resp.set_cookie(COOKIE_NAME, sid, httponly=True, samesite="lax", secure=secure, max_age=FEISHU_SESSION_SECONDS)
+    result = await process_oauth_callback(code, state, request)
+    if not result["success"]:
+        return RedirectResponse(_login_url(result["next_path"], result.get("error", "")))
+    resp = RedirectResponse(_safe_next_path(result["next_path"]))
+    resp.set_cookie(
+        COOKIE_NAME, result["sid"],
+        httponly=True, samesite="lax",
+        secure=result["secure"],
+        max_age=FEISHU_SESSION_SECONDS,
+    )
     return resp
 
 
@@ -82,9 +62,7 @@ async def feishu_me(request: Request):
 async def feishu_logout(request: Request):
     login = await _current_login(request)
     sid = request.cookies.get(COOKIE_NAME, "")
-    _sync_web_logins_from_disk()
-    web_logins.pop(sid, None)
-    _save_web_logins()
+    do_logout(sid)
     _audit_log_from_login(request, login, "auth", "退出登录", "用户主动退出飞书登录")
     resp = JSONResponse({"ok": True})
     resp.delete_cookie(COOKIE_NAME)
