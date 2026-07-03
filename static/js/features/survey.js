@@ -153,6 +153,36 @@ function optionEditorHTML(i, c) {
   </div>`;
 }
 
+function matrixEditorHTML(i, c) {
+  const colIndexes = c.column_indexes || [];
+  const rows = c.rows || [];
+  const rowCount = Math.max(colIndexes.length, rows.length);
+  const summaryRows = rows.length ? rows : colIndexes.map((_, idx) => `子项${idx + 1}`);
+  const chips = summaryRows.slice(0, 5).map(row => `<span class="matrix-summary-chip">${esc(row)}</span>`).join('');
+  const more = summaryRows.length > 5 ? `<span class="matrix-summary-more">+${summaryRows.length - 5}</span>` : '';
+  const bodyRows = Array.from({ length: rowCount }).map((_, idx) => {
+    const colNo = colIndexes[idx] != null ? `列 ${colIndexes[idx]}` : `子项 ${idx + 1}`;
+    const value = rows[idx] || '';
+    return `<div class="matrix-edit-row">
+      <span class="matrix-edit-row__col">${esc(colNo)}</span>
+      <input class="extra-input matrix-row-input" data-matrix-row="${i}" data-matrix-row-idx="${idx}" value="${esc(value)}" placeholder="子项名称" />
+    </div>`;
+  }).join('');
+
+  return `<div class="matrix-editor" data-matrix-editor="${i}">
+    <details class="matrix-editor__details" ${c.low_confidence ? 'open' : ''}>
+      <summary class="matrix-editor__summary">
+        <span class="matrix-editor__summary-main">${chips || '<span class="matrix-summary-empty">暂无子项</span>'}${more}</span>
+        <span class="matrix-edit-link">编辑子项</span>
+      </summary>
+      <div class="matrix-editor__body">
+        <div class="matrix-editor__head">矩阵子项</div>
+        <div class="matrix-editor__rows">${bodyRows}</div>
+      </div>
+    </details>
+  </div>`;
+}
+
 function collectOptionsForColumn(i) {
   const seen = new Set();
   const values = [];
@@ -165,6 +195,16 @@ function collectOptionsForColumn(i) {
     }
   });
   return values;
+}
+
+function collectMatrixRowsForColumn(i, c) {
+  const inputs = Array.from(document.querySelectorAll(`.matrix-row-input[data-matrix-row="${i}"]`));
+  if (!inputs.length) return c.rows || [];
+
+  return inputs.map((input, idx) => {
+    const value = input.value.trim();
+    return value || (c.rows || [])[idx] || `子项${idx + 1}`;
+  });
 }
 
 function buildEditedOptionAliases(c, editedOptions) {
@@ -220,8 +260,8 @@ function updateExtra(i, role) {
   const c = state.columns[i] || {};
   const bits = [];
 
-  if (MATRIX_ROLES.includes(role) && (c.rows || []).length) {
-    bits.push(`<span class="col-extra-readonly">子项：${esc(c.rows.join(' / '))}</span>`);
+  if (MATRIX_ROLES.includes(role)) {
+    bits.push(matrixEditorHTML(i, c));
   }
 
   if (role === 'multi_choice') {
@@ -386,7 +426,10 @@ function collectConfirmedColumns() {
       out.scale_min = mnEl ? Number(mnEl.value) : (c.scale_min ?? 1);
       out.scale_max = mxEl ? Number(mxEl.value) : (c.scale_max ?? 5);
     }
-    if (MATRIX_ROLES.includes(role) && c.rows) out.rows = c.rows;
+    if (MATRIX_ROLES.includes(role)) {
+      const rows = collectMatrixRowsForColumn(i, c);
+      if (rows.length) out.rows = rows;
+    }
     if (!out.value_aliases && c.value_aliases && CHOICE_ROLES.includes(role)) {
       out.value_aliases = c.value_aliases;
     }
@@ -633,4 +676,3 @@ async function confirmPlan(text) {
     syncPlanActionButtons();
   }
 }
-
