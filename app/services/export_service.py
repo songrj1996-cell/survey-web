@@ -7,16 +7,24 @@ import re
 from fastapi import HTTPException
 
 from app.integrations import feishu_client as feishu_export
-from app.services.report_render import _prep_export_md
+from app.services.report_render import _prep_export_md, _prep_feishu_export_md
 
 
-async def _export_to_feishu(report_md: str, login: dict, mode: str = "") -> str:
+def _clean_feishu_title(title: str | None) -> str:
+    clean = re.sub(r"[\r\n\t]+", " ", str(title or "")).strip()
+    clean = re.sub(r'[\\/:*?"<>|]', "_", clean)
+    clean = re.sub(r"\s+", " ", clean).strip()
+    return clean[:120] or "调研报告"
+
+
+async def _export_to_feishu(report_md: str, login: dict, mode: str = "", title: str | None = None) -> str:
     """将报告上传为飞书文档（docx），文档归登录用户所有，并通过机器人发消息通知。"""
     full = _prep_export_md(report_md, mode=mode)  # 补免责声明 + 去掉 CORE_START/END 标记
     title_m = re.search(r"^#\s+(.+?)$", full, re.MULTILINE)
-    title = title_m.group(1).strip() if title_m else "调研报告"
+    title = _clean_feishu_title(title or (title_m.group(1).strip() if title_m else "调研报告"))
+    body = _prep_feishu_export_md(report_md, mode=mode)
     open_id = login.get("open_id", "") or None
-    url, _, _ = await feishu_export.create_doc_via_bot(title, full, open_id)
+    url, _, _ = await feishu_export.create_doc_via_bot(title, body, open_id)
     print(f"[feishu-export] created doc title={title!r} url={url}")
     if open_id:
         await feishu_export.send_message_to_user(

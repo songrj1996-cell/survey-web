@@ -126,6 +126,35 @@ def _drop_first_h1(md: str) -> str:
     return md
 
 
+def _drop_all_h1(md: str) -> str:
+    """Remove all top-level Markdown headings before Feishu import."""
+    lines = md.split("\n")
+    kept: list[str] = []
+    i = 0
+    in_fence = False
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        if stripped.startswith(("```", "~~~")):
+            in_fence = not in_fence
+            kept.append(line)
+            i += 1
+            continue
+        if not in_fence and re.match(r"^\s{0,3}#(?!#)\s+", line):
+            i += 1
+            while i < len(lines) and not lines[i].strip():
+                i += 1
+            continue
+        kept.append(line)
+        i += 1
+    return "\n".join(kept).lstrip()
+
+
+def _prep_feishu_export_md(md: str, mode: str = "") -> str:
+    """Feishu export uses document title separately, so body must not contain H1."""
+    return _drop_all_h1(_prep_export_md(md, mode=mode))
+
+
 def _extract_feishu_callout_sections(md: str) -> list[dict]:
     sections: list[dict] = []
     core_lines = _extract_core_lines(md)

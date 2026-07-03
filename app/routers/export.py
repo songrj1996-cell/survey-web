@@ -95,7 +95,12 @@ async def export_feishu_history(history_id: str, request: Request):
     entry = get_history_export_entry(history_id, login)
     entry_mode = entry.get("mode") or entry.get("plan", {}).get("mode", "")
     try:
-        url = await _export_to_feishu(entry.get("report_md", ""), login, mode=entry_mode)
+        url = await _export_to_feishu(
+            entry.get("report_md", ""),
+            login,
+            mode=entry_mode,
+            title=entry.get("title", history_id),
+        )
     except Exception as e:
         print(f"[feishu-export-history][ERROR] {e!r}")
         raise _feishu_export_error(e)
