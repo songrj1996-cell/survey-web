@@ -1,10 +1,10 @@
 # Survey-Web 开发进度文档
 
 > 分支：`main`（原 `feat/crosstab-report` 已于 2026-06-22 合并为主干）
-> 本地最新版本：`v3.2-dev`（基于 `8063bda` 后的本地未提交改造）
+> 本地最新版本：`v3.2-dev` + 代码架构重构完成（`app/` 六层包）
 > 分支起步基线：`c64f229`（2026-06-03）
-> **当前云上部署版本：`4c8f4fd`（2026-06-15）** —— v3.0 / v3.1 及端口改动尚未部署到云端
-> 最后更新：2026-06-25
+> **当前云上部署版本：`4c8f4fd`（2026-06-15）** —— v3.0 / v3.1 / v3.2-dev / 架构重构均尚未部署到云端
+> 最后更新：2026-07-03
 > 代码路径：`c:\Users\admin\Desktop\survey-web`
 > 旧主干已归档为远端分支 `legacy-main-v2.5`
 
@@ -21,7 +21,36 @@
 - v3.2-dev 本地新增「评论分析」链路：大文件流式预处理、**主题相关性筛选 + 动态补样**、抽样分析、Dify 评论主题/分类/简报、**玩家评论原文精选（后台并行）**、评论历史报告、重复文件提醒开关。
 - v3.2-dev 同时落地三项跨模块改造：**新增「评论分析」独立权限**（survey/annotate/comment 三权限，老用户自动迁移）、**历史记录改版**（最近 20 条、类型/日期筛选、数据标注结果可下载、评论报告可回看）、**数据标注结果落历史**（完成即落盘 Excel，历史卡片直接下载）。
 
-> ⚠️ **部署落后提醒**：云端当前运行 `4c8f4fd`（6/15）。本地包含未部署的 v3.0 / v3.1，以及 2026-06-25 的评论分析 v3.2-dev 改造。下次部署需一并回归：标准模式分章多轮、前端改版、评论分析上传/预处理/相关性筛选/原文精选/历史报告/重复提醒、comment 权限迁移、历史记录改版、标注结果落历史。
+> ⚠️ **部署落后提醒**：云端当前运行 `4c8f4fd`（6/15）。本地包含未部署的 v3.0 / v3.1 / v3.2-dev，以及代码架构重构（`app/` 六层包）。下次部署需一并回归：标准模式分章多轮、前端改版、评论分析全链路、comment 权限迁移、历史记录改版、标注结果落历史、新包结构。
+
+---
+
+## 〇.1 代码架构重构（2026-07-03，`f92968f`）
+
+> **背景**：v3.2-dev 完成后，`server.py` 已增长至 **6696 行**，`static/app.js` 也超过 2000 行，单文件维护难度极高，边界检查无法自动化。本次重构将全部业务拆入 `app/` 六层包，`server.py` 降为 2 行入口。
+
+### 重构结果
+
+| 层 | 路径 | 模块数 | 职责 |
+|----|------|--------|------|
+| 接口层 | `app/routers/` | 9 个 | HTTP 路由、参数校验、权限检查 |
+| 业务层 | `app/services/` | 22 个 | 全流程业务编排、AI 调用协调 |
+| 存储层 | `app/storage/` | 7 个 | JSON 文件读写（sessions / history / whitelist 等） |
+| 核心工具 | `app/core/` | 6 个 | config / security / parsing / responses / audit / text |
+| 外部集成 | `app/integrations/` | 2 个 | dify_client / feishu_client |
+| 数据结构 | `app/schemas/` | 1 个 | Pydantic 请求体定义 |
+| 前端 | `static/js/core/` + `static/js/features/` | 8 个 | core.js 底层工具 + 7 个功能模块 |
+
+- 根目录算法模块（`crosstab_parser.py` / `survey_stats.py` / `survey_plan.py` / `comment_analysis.py` / `annotate.py`）保留在根目录，不纳入 `app/` 包。
+- 新增边界检查脚本 `scripts/check_boundaries.py`，每次后端改动后可运行验证分层是否合规。
+- 重构严格等价：所有接口行为、数据格式、Dify 调用逻辑均未改变，仅做代码搬迁与瘦身。
+
+### 配套文档
+
+- `harness-workbench/ARCHITECTURE.md`：系统全景图（面向所有团队成员）
+- `harness-workbench/RULES.md`：代码改动行为准则（13 条，适用于 AI 与人类开发者）
+- `CLAUDE.md`（项目根）：Claude Code 自动加载的规则摘要，指向 RULES.md
+- `AGENTS.md`（项目根）：Codex 行为约束
 
 ---
 
@@ -304,26 +333,104 @@
 
 ## 六、文件职责汇总
 
+> ⚠️ v3.2-dev 完成后进行了整包重构（`f92968f`），原 `server.py` / `dify.py` / `static/app.js` 已拆解，下表反映重构后现状。
+
+### 根目录算法模块（保留在根目录，未纳入 app/）
+
 | 文件 | 说明 |
 |------|------|
-| `crosstab_parser.py` | **新增**。跑数表解析 + `render_to_markdown()` + `question_names()` |
-| `dify.py` | 移植 `workflow_run()`；v3.1 新增 workflow 输出变量名兼容 `_pick_workflow_output()` |
-| `server.py` | 聚类引擎；crosstab 上传/planner/stats/report 分支；标准模式分章多轮 Writer（v3.0）；评论分析流水线（相关性筛选+动态补样+分类+原文精选，v3.2）；文件 session；免责声明按 mode 分流；导出路径；comment 权限与白名单迁移；历史改版与标注结果落历史；开放题兜底/宽松解析；辅助函数 |
-| `survey_stats.py` | 新增 `collect_open_text()`；`compute` 等原逻辑未改 |
-| `survey_plan.py` | 新增 `parse_crosstab_plan()`（轻校验） |
-| `comment_analysis.py` | **新增/扩展**。评论分析预处理：CSV/XLSX 评论列识别、流式清洗、分层 reservoir 抽样、长评论候选堆、本地统计聚合 |
-| `static/app.js` | 选择分析入口；定量 4 步流程；评论分析上传/预处理/运行/原文精选异步刷新；comment 权限门控；历史改版（类型/日期筛选+标注下载）；设置页平台开关；审计日志展开；流式渲染；UX 修复 |
-| `static/index.html` | 选择分析入口；三文件上传区；评论分析面板；设置页「平台设置」；步骤条；进度状态栏；品牌 logo |
-| `static/style.css` | 三文件上传 UI；评论分析 UI；章节样式；进度状态栏样式；v3.1 工作台风格重构 |
-| `static/login.html` | 登录页，v3.1 品牌化同步 |
-| `static/web-icon.jpg` | **新增**。favicon / 顶部 logo |
-| `docs/用研定量报告撰写规则与模板.md` | **新增**。定量报告写作规则与模板（核心判断优先、结论三要素、可回溯证据等），供 Writer prompt 与人工对齐参考 |
-| `data/app_settings.json` | **运行时生成**。平台设置，目前包含评论分析重复文件提醒开关 |
-| `data/annotate_results/` | **运行时生成**。数据标注完成后落盘的结果 Excel，供历史记录下载 |
-| `skills/survey-analysis-workflow/SKILL.md` | **新增**。调研分析业务流程规范（业务怎么走：流程步骤、Python/LLM 分工、数据边界） |
-| `skills/survey-web-frontend-development/SKILL.md` | **新增**。前端设计与交互规范（界面长什么样：工作台风格、组件、布局一致性） |
-| `.env.example` | Dify key + `FEISHU_SCOPE=` 说明 |
-| `.gitattributes` | **新增**。全仓库 LF 强制，防 CRLF 导致 Bash 报错 |
+| `server.py` | **重构后仅 2 行**：`from app.main import app`，供 uvicorn 入口用 |
+| `crosstab_parser.py` | 跑数表解析 + `render_to_markdown()` + `question_names()` |
+| `survey_stats.py` | 统计计算（频数/占比/交叉表）+ `collect_open_text()` |
+| `survey_plan.py` | 方案数据结构定义、LLM 输出解析、卡片渲染、`parse_crosstab_plan()` |
+| `comment_analysis.py` | 评论预处理工具库：列识别、流式清洗、分层抽样、长评论候选堆 |
+| `annotate.py` | 数据标注工具库 |
+
+### app/ 包（重构后主要代码所在位置）
+
+| 路径 | 说明 |
+|------|------|
+| `app/main.py` | FastAPI 应用装配：中间件、静态资源、所有路由 include |
+| `app/routers/survey.py` | 问卷分析端点（upload / columns / plan / stats / report / qa） |
+| `app/routers/crosstab.py` | 跑数表三文件上传端点 |
+| `app/routers/comment_analysis.py` | 评论分析端点（upload / preprocess / run） |
+| `app/routers/annotate.py` | 数据标注端点（upload / confirm / detect / quality / download） |
+| `app/routers/export.py` | 导出端点（Word / PDF / Markdown / 飞书，当前+历史） |
+| `app/routers/history.py` | 历史记录端点（列表 / 详情 / 标题修改） |
+| `app/routers/admin.py` | 管理后台端点（用户管理 / 审计日志） |
+| `app/routers/settings_api.py` | 设置管理端点（提示词 / 文案 / 系统开关） |
+| `app/routers/feishu.py` | 飞书 OAuth 端点（login / callback / me / logout） |
+| `app/services/survey_service.py` | 问卷分析五步流程总指挥 |
+| `app/services/report_engine.py` | 报告生成引擎：prompt 构造 + 多轮分章调用 |
+| `app/services/report_render.py` | 报告渲染：Markdown → Word / PDF / 飞书文档 |
+| `app/services/report_history.py` | 报告归档：生成完成后自动写入 history |
+| `app/services/comment_pipeline.py` | 评论分析完整流水线（相关性筛选→提主题→合并→分类→原文精选） |
+| `app/services/comment_preprocess.py` | 评论流式预处理（列识别、清洗、抽样） |
+| `app/services/comment_upload.py` | 评论上传与 session 创建 |
+| `app/services/comment_run.py` | 评论分析运行驱动 |
+| `app/services/annotate_workflow.py` | 数据标注三步流程（AI 检测→确认→质量打标） |
+| `app/services/crosstab_service.py` | 跑数表模式上传解析 |
+| `app/services/history_service.py` | 历史列表查询与筛选 |
+| `app/services/settings_service.py` | 提示词 / 文案 / 系统开关读写 |
+| `app/services/auth.py` | 登录态验证与权限判断辅助 |
+| `app/services/feishu_auth.py` | 飞书 OAuth state 管理 |
+| `app/services/export_service.py` | 飞书导出 |
+| `app/services/export_download.py` | 导出内容准备（Word / PDF / Markdown） |
+| `app/services/export_history.py` | 历史报告导出 |
+| `app/services/admin_users.py` | 白名单用户 CRUD |
+| `app/services/admin_audit.py` | 审计日志查询过滤 |
+| `app/services/question_detect.py` | 题型识别辅助函数 |
+| `app/storage/sessions.py` | session 文件读写（data/sessions/，TTL 2h） |
+| `app/storage/history.py` | history.json 读写（上限 20 条/用户） |
+| `app/storage/whitelist.py` | whitelist.json + 权限版本迁移 |
+| `app/storage/prompts.py` | prompts.json 读写 |
+| `app/storage/audit_store.py` | audit_logs.json 读写 |
+| `app/storage/logins.py` | web_logins.json 读写 |
+| `app/storage/settings.py` | app_settings.json 读写 |
+| `app/storage/ui_texts.py` | ui_texts.json 读写 |
+| `app/core/config.py` | 统一配置入口（读 .env，定义所有路径/密钥/阈值） |
+| `app/core/security.py` | 权限检查与鉴权响应构造 |
+| `app/core/parsing.py` | CSV / Excel 解析为二维表 |
+| `app/core/responses.py` | 标准化响应格式（SSE / 下载） |
+| `app/core/audit.py` | 审计日志构造 |
+| `app/core/text.py` | 文本处理工具 |
+| `app/integrations/dify_client.py` | Dify Chat / Workflow API 调用（SSE streaming） |
+| `app/integrations/feishu_client.py` | 飞书 OAuth + 文档创建 |
+| `app/schemas/requests.py` | 所有 API 入参 Pydantic 模型 |
+
+### 前端
+
+| 文件 | 说明 |
+|------|------|
+| `static/index.html` | 唯一主页面（三种分析模式、工作区、设置页） |
+| `static/login.html` | 飞书登录页 |
+| `static/style.css` | 全站样式（工作台风格，v3.1 改版） |
+| `static/web-icon.jpg` | favicon / 顶部 logo |
+| `static/js/core/core.js` | 底层工具：API 调用、SSE 消费、工具函数 |
+| `static/js/features/survey.js` | 问卷分析 UI |
+| `static/js/features/comment.js` | 评论分析 UI |
+| `static/js/features/annotate.js` | 数据标注 UI |
+| `static/js/features/report.js` | 报告工作区 UI |
+| `static/js/features/history.js` | 历史记录 UI |
+| `static/js/features/settings.js` | 设置页 UI |
+| `static/js/features/nav.js` | 导航与权限门控 |
+
+### 其他
+
+| 文件 | 说明 |
+|------|------|
+| `scripts/check_boundaries.py` | **新增**。分层边界检查脚本，验证各层模块无跳层 import |
+| `harness-workbench/ARCHITECTURE.md` | **新增**。系统全景图（面向所有团队成员） |
+| `harness-workbench/RULES.md` | **新增**。代码改动行为准则（13 条） |
+| `CLAUDE.md` | **新增**。Claude Code 自动加载的项目规则摘要 |
+| `AGENTS.md` | **新增**。Codex 行为约束 |
+| `docs/用研定量报告撰写规则与模板.md` | 定量报告写作规则与模板 |
+| `data/app_settings.json` | 运行时生成。平台设置（评论重复文件提醒开关等） |
+| `data/annotate_results/` | 运行时生成。标注完成后落盘的 Excel 结果文件 |
+| `skills/survey-analysis-workflow/SKILL.md` | 调研分析业务流程规范 |
+| `skills/survey-web-frontend-development/SKILL.md` | 前端设计与交互规范 |
+| `.env.example` | 环境变量模板 |
+| `.gitattributes` | 全仓库 LF 强制，防 CRLF 导致 Bash 报错 |
 
 ---
 
@@ -352,6 +459,11 @@
 | —— | 2026-06-22：`feat/crosstab-report` 合并为 `main`，旧 main 归档为 `legacy-main-v2.5` |
 | —— | 2026-06-24：评论分析大文件链路初版（预处理/抽样/classify idx 协议/重复提醒，本地） |
 | —— | 2026-06-25：**v3.2-dev 本次提交**：评论分析相关性筛选+动态补样、玩家评论原文精选（后台并行）、comment 独立权限+白名单迁移、历史记录改版、数据标注结果落历史可下载、免责声明按 mode 分流、清理评论流水线遗留死代码 |
+| `f61b42f` | fix: 修复两处小问题 |
+| `f92968f` | **架构重构**：server.py 6696 行 → 6 层 app/ 包（routers × 9 / services × 22 / storage × 7 / core × 6 / integrations × 2 / schemas × 1）+ 前端 static/app.js → core.js + 7 功能模块；新增 `scripts/check_boundaries.py` 分层校验 |
+| `b84cc87` | docs: 新增 harness-workbench 文档目录（ARCHITECTURE.md + RULES.md） |
+| `2066836` | docs: 新增项目级 CLAUDE.md，绑定 Claude Code 行为规则 |
+| `45ab2ce` | docs: 新增 AGENTS.md，配置 Codex 行为规则 |
 
 ---
 
@@ -360,8 +472,7 @@
 **本地开发：**
 ```
 cd C:\Users\admin\Desktop\survey-web
-C:\Users\admin\Desktop\survey-web\.venv\Scripts\python.exe server.py
-# 或指定端口：python -m uvicorn server:app --host 127.0.0.1 --port 8020
+uvicorn server:app --host 0.0.0.0 --port 18081 --reload
 ```
 
 **ngrok（固定域名）：**

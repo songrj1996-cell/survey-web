@@ -43,3 +43,24 @@
 ### 6. 验证和说明
 
 改动完成后，必须说明做了哪些验证；如果没有运行验证，必须说明原因。
+
+---
+
+## Python 环境与验证
+
+本机可用的 Python 环境：
+
+- `python`：可用，当前为 Python 3.14.3。
+- `uv`：可用。
+
+不要使用：
+
+- `python3`
+- `conda`
+- `.venv/`：该虚拟环境已废弃，指向的 Python 3.10 已不存在。
+
+验证约定：
+
+- 后端边界检查命令固定为：`python scripts/check_boundaries.py`
+- Python 语法检查优先使用：`python -m compileall app`
+- 如果 Codex 沙箱里 `python` 无法运行，不要反复尝试 `.venv`、`python3`、`conda` 或下载新的解释器；改为做静态检查（例如 diff/read-back/语法层面的人工检查），并在最终说明中明确写出“未运行 Python 验证”的原因。
