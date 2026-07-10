@@ -22,6 +22,14 @@ class HistoryQARequest(BaseModel):
     question: str
 
 
+class QualitativeContextRequest(BaseModel):
+    problem: str = ""
+    background: str = ""
+    target_users: str = ""
+    key_concerns: str = ""
+    report_usage: str = ""
+
+
 # ── 管理后台 ────────────────────────────────────────────────
 class AdminUserRequest(BaseModel):
     email: str

@@ -21,6 +21,7 @@ fileInput.addEventListener('change', () => {
 async function handleUpload(file) {
   const MAX = 50 * 1024 * 1024;
   if (file.size > MAX) { showToast('文件超过 50MB 上限', 'error'); return; }
+  const uploadSignature = contextFileSignature(file);
 
   uploadZone.innerHTML = `
     <div class="upload-zone__icon"><div class="spinner" style="width:40px;height:40px;border-width:3px"></div></div>
@@ -40,6 +41,17 @@ async function handleUpload(file) {
     state.viewMode = 'session';
     state.historyId = null;
     clearPlanInput();
+    currentContextFileSignature = uploadSignature;
+    const draft = loadContextDraft();
+    const restoreContext = preserveContextDraftOnNextUpload ||
+      (draft && draft.fileSignature && draft.fileSignature === uploadSignature);
+    if (restoreContext) {
+      writeContextForm(draft.fields || {});
+      preserveContextDraftOnNextUpload = false;
+    } else {
+      clearContextDraft();
+      clearContextForm();
+    }
     state.sessionReport = {
       reportMd: null,
       title: '',
@@ -114,6 +126,134 @@ function renderColumnRows(columns) {
   $('col-confirm-count').textContent = `共 ${columns.length} 道题`;
   $('col-list').innerHTML = columns.map((c, i) => columnRowHTML(c, i)).join('');
   columns.forEach((c, i) => updateExtra(i, c.role));
+  refreshContextFormVisibility();
+}
+
+// ── 可选业务上下文（本地草稿自动暂存 + 提交）────────────────────
+
+const CONTEXT_DRAFT_KEY = 'survey_context_draft';
+const CONTEXT_FIELD_IDS = {
+  problem: 'ctx-problem',
+  background: 'ctx-background',
+  target_users: 'ctx-target-users',
+  key_concerns: 'ctx-key-concerns',
+  report_usage: 'ctx-report-usage',
+};
+let currentContextFileSignature = '';
+
+function contextFileSignature(file) {
+  if (!file) return '';
+  return `${file.name || ''}|${file.size || 0}|${file.lastModified || 0}`;
+}
+
+function readContextForm() {
+  const out = {};
+  for (const [key, id] of Object.entries(CONTEXT_FIELD_IDS)) {
+    const el = $(id);
+    out[key] = el ? el.value.trim() : '';
+  }
+  return out;
+}
+
+function writeContextForm(data) {
+  if (!data) return;
+  for (const [key, id] of Object.entries(CONTEXT_FIELD_IDS)) {
+    const el = $(id);
+    if (el && data[key] != null) el.value = data[key];
+  }
+}
+
+function loadContextDraft() {
+  try {
+    const raw = localStorage.getItem(CONTEXT_DRAFT_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (parsed && parsed.fields) return parsed;
+    return { fileSignature: '', fields: parsed || {} };
+  } catch (e) {
+    return null;
+  }
+}
+
+function saveContextDraft() {
+  try {
+    localStorage.setItem(CONTEXT_DRAFT_KEY, JSON.stringify({
+      fileSignature: currentContextFileSignature,
+      fields: readContextForm(),
+    }));
+  } catch (e) { /* localStorage 不可用时静默忽略 */ }
+}
+
+function loadContextDraftForCurrentFile() {
+  const draft = loadContextDraft();
+  if (!draft || !draft.fileSignature || draft.fileSignature !== currentContextFileSignature) return null;
+  return draft.fields || {};
+}
+
+function clearContextDraft() {
+  try { localStorage.removeItem(CONTEXT_DRAFT_KEY); } catch (e) { /* 忽略 */ }
+}
+
+let contextDraftSaveTimer = null;
+let preserveContextDraftOnNextUpload = false;
+function scheduleContextDraftSave() {
+  clearTimeout(contextDraftSaveTimer);
+  contextDraftSaveTimer = setTimeout(saveContextDraft, 400);
+}
+
+function clearContextForm() {
+  for (const id of Object.values(CONTEXT_FIELD_IDS)) {
+    const el = $(id);
+    if (el) el.value = '';
+  }
+}
+
+function showBlockingFlowError(title, message) {
+  const existing = $('blocking-flow-error-modal');
+  if (existing) existing.remove();
+  const modal = document.createElement('div');
+  modal.id = 'blocking-flow-error-modal';
+  modal.style.cssText = 'position:fixed;inset:0;z-index:260;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.48);backdrop-filter:blur(4px);';
+  modal.innerHTML = `
+    <div style="width:min(520px,92vw);background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:22px;box-shadow:var(--shadow-lg);">
+      <div style="font-size:18px;font-weight:700;margin-bottom:10px;color:var(--red);">${esc(title || '流程失败')}</div>
+      <div style="font-size:14px;line-height:1.7;color:var(--text-2);white-space:pre-wrap;word-break:break-word;">${esc(message || '服务端处理失败，请重新开始后再试。')}</div>
+      <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:22px;">
+        <button class="btn btn--ghost" id="blocking-error-stay" type="button">留在当前页</button>
+        <button class="btn btn--primary" id="blocking-error-restart" type="button">重新开始</button>
+      </div>
+    </div>`;
+  document.body.appendChild(modal);
+  const close = () => modal.remove();
+  $('blocking-error-stay').onclick = close;
+  $('blocking-error-restart').onclick = () => {
+    saveContextDraft();
+    close();
+    const restart = $('btn-restart');
+    if (restart) restart.click();
+  };
+  modal.addEventListener('click', e => {
+    if (e.target === modal) close();
+  });
+}
+
+(function initContextForm() {
+  Object.values(CONTEXT_FIELD_IDS).forEach(id => {
+    const el = $(id);
+    if (el) el.addEventListener('input', scheduleContextDraftSave);
+  });
+})();
+
+function refreshContextFormVisibility() {
+  const wrap = $('context-form-wrap');
+  if (!wrap) return;
+  if (state.mode === 'crosstab') {
+    wrap.style.display = 'none';
+    return;
+  }
+  wrap.style.display = '';
+  const draft = loadContextDraftForCurrentFile();
+  if (draft) writeContextForm(draft);
 }
 
 function optionEditorHTML(i, c) {
@@ -122,13 +262,13 @@ function optionEditorHTML(i, c) {
   const aliasGroups = Object.entries(aliases).filter(([canon, values]) =>
     Array.isArray(values) && values.some(v => String(v).trim() && String(v).trim() !== canon)
   ).length;
-  const chips = options.slice(0, 6).map(opt => `<span class="option-summary-chip">${esc(opt)}</span>`).join('');
-  const more = options.length > 6 ? `<span class="option-summary-more">+${options.length - 6}</span>` : '';
+  const chips = options.map(opt => `<span class="option-summary-chip" title="${esc(opt)}">${esc(opt)}</span>`).join('');
+  const more = '';
   const mergeBadge = aliasGroups ? `<span class="option-merge-badge">已合并 ${aliasGroups} 组</span>` : '';
   const rows = options.map(opt => `
     <div class="option-edit-row">
       <div class="option-edit-row__main">
-        <input class="extra-input option-input" data-option="${i}" value="${esc(opt)}" placeholder="选项内容" />
+        <textarea class="extra-input option-input" data-option="${i}" rows="2" placeholder="选项内容">${esc(opt)}</textarea>
         <div class="option-alias-hint">${(aliases[opt] || []).map(a =>
     `<span class="alias-chip"><span class="alias-chip__text" title="${esc(a)}">${esc(a)}</span><button class="alias-chip__remove" data-alias-col="${i}" data-alias-canon="${esc(opt)}" data-alias-val="${esc(a)}" title="移除此别名" type="button">×</button></span>`
   ).join('')}<button class="alias-add-btn" data-alias-add-col="${i}" data-alias-add-canon="${esc(opt)}" title="添加别名" type="button">+</button></div>
@@ -151,6 +291,35 @@ function optionEditorHTML(i, c) {
       </div>
     </details>
   </div>`;
+}
+
+function otherTextHTML(i, c) {
+  const meta = c.other_text || {};
+  if (!meta || meta.enabled === false) return '';
+  const examples = Array.isArray(meta.examples) ? meta.examples.slice(0, 5) : [];
+  const count = Number(meta.count || examples.length || 0);
+  const option = meta.option || 'Other / 其他';
+  const exampleHTML = examples.length
+    ? `<div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px;">${examples.map(v =>
+        `<span class="option-summary-chip" title="${esc(v)}">${esc(v)}</span>`
+      ).join('')}</div>`
+    : '';
+  return `<div class="option-editor" data-other-text="${i}">
+    <div style="border:1px dashed var(--border);border-radius:8px;padding:10px 12px;background:rgba(255,255,255,.54);">
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:var(--text-2);">
+        <input type="checkbox" data-other-text-enabled="${i}" ${meta.enabled !== false ? 'checked' : ''} />
+        <span>其他填空补充：检测到 ${count} 条；统计时计入「${esc(option)}」，报告中作为本题补充反馈</span>
+      </label>
+      ${exampleHTML}
+    </div>
+  </div>`;
+}
+
+function autosizeOptionTextareas(root = document) {
+  root.querySelectorAll('textarea.option-input').forEach(el => {
+    el.style.height = 'auto';
+    el.style.height = `${el.scrollHeight}px`;
+  });
 }
 
 function matrixEditorHTML(i, c) {
@@ -272,6 +441,9 @@ function updateExtra(i, role) {
 
   if (CHOICE_ROLES.includes(role)) {
     bits.push(optionEditorHTML(i, c));
+    if ((role === 'single_choice' || role === 'multi_choice') && c.other_text) {
+      bits.push(otherTextHTML(i, c));
+    }
   } else if (role === 'scale' || role === 'matrix_scale') {
     const mn = (c.scale_min ?? 1), mx = (c.scale_max ?? 5);
     bits.push(`<span class="q-extra-inline">量程
@@ -282,6 +454,7 @@ function updateExtra(i, role) {
 
   box.innerHTML = bits.join('');
   box.style.display = bits.length ? 'flex' : 'none';
+  autosizeOptionTextareas(box);
 }
 
 $('col-list').addEventListener('change', e => {
@@ -300,6 +473,13 @@ $('col-list').addEventListener('change', e => {
   }
 });
 
+$('col-list').addEventListener('input', e => {
+  const textarea = e.target.closest('textarea.option-input');
+  if (textarea) {
+    autosizeOptionTextareas(textarea.closest('.option-edit-row') || document);
+  }
+});
+
 $('col-list').addEventListener('click', e => {
   const addBtn = e.target.closest('[data-option-add]');
   if (addBtn) {
@@ -309,12 +489,13 @@ $('col-list').addEventListener('click', e => {
       rows.insertAdjacentHTML('beforeend', `
         <div class="option-edit-row">
           <div class="option-edit-row__main">
-            <input class="extra-input option-input" data-option="${i}" value="" placeholder="选项内容" />
+            <textarea class="extra-input option-input" data-option="${i}" rows="2" placeholder="选项内容"></textarea>
             <div class="option-alias-hint"><button class="alias-add-btn" data-alias-add-col="${i}" data-alias-add-canon="" title="添加别名" type="button">+</button></div>
           </div>
           <button class="btn-icon option-remove" data-option-remove="${i}" title="删除选项" type="button">×</button>
         </div>
       `);
+      autosizeOptionTextareas(rows);
       rows.querySelector('.option-edit-row:last-child .option-input')?.focus();
     }
   }
@@ -433,6 +614,13 @@ function collectConfirmedColumns() {
     if (!out.value_aliases && c.value_aliases && CHOICE_ROLES.includes(role)) {
       out.value_aliases = c.value_aliases;
     }
+    if ((role === 'single_choice' || role === 'multi_choice') && c.other_text) {
+      const enabledEl = document.querySelector(`[data-other-text-enabled="${i}"]`);
+      out.other_text = {
+        ...c.other_text,
+        enabled: enabledEl ? enabledEl.checked : c.other_text.enabled !== false,
+      };
+    }
     return out;
   });
 }
@@ -462,6 +650,34 @@ async function startPlan() {
       if (btn) btn.disabled = false;
       return;
     }
+
+    try {
+      const ctx = readContextForm();
+      state.contextForm = ctx;
+      const ctxResp = await fetch(`/api/survey-context/${state.sessionId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(ctx),
+      });
+      if (!ctxResp.ok) {
+        if (ctxResp.status === 404) {
+          saveContextDraft();
+          preserveContextDraftOnNextUpload = true;
+          showToast(
+            '当前会话已过期，请点击上方步骤条的"上传数据"重新上传文件；已填写的补充分析目标不会丢失',
+            'error', 6000,
+          );
+        } else {
+          showToast('保存补充分析目标失败，请重试', 'error');
+        }
+        if (btn) btn.disabled = false;
+        return;
+      }
+    } catch (e) {
+      showToast(`保存补充分析目标失败：${e.message}`, 'error');
+      if (btn) btn.disabled = false;
+      return;
+    }
   }
 
   // 进入 Step 3，开始 AI 规划
@@ -485,7 +701,8 @@ async function startPlan() {
       }
     });
   } catch (e) {
-    showToast(`方案生成失败：${e.message}`, 'error');
+    $('plan-thinking').style.display = 'none';
+    showBlockingFlowError('方案生成失败', e.message);
     btn.disabled = false;
   }
 }
@@ -667,7 +884,7 @@ async function confirmPlan(text) {
       await runStats();
     }
   } catch (e) {
-    showToast(`操作失败：${e.message}`, 'error');
+    showBlockingFlowError('方案修订失败', e.message);
     // 修订失败时恢复方案卡片（隐藏 thinking 区，避免用户看到空白）
     if (state.planData) {
       $('plan-thinking').style.display = 'none';

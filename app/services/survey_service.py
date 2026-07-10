@@ -29,6 +29,7 @@ from app.core.responses import sse_event
 from app.core.security import _assign_session_owner, _find_history_for_login
 from app.core.text import _short_text
 from app.integrations.dify_client import sse_dify_stream
+from app.schemas.requests import QualitativeContextRequest
 from app.services.audit import audit_log
 from app.services.auth import _current_login
 from app.services.question_detect import (
@@ -47,6 +48,7 @@ from app.services.report_engine import (
     _build_plan_revision_query,
     _build_planner_query_with_confirmed,
     _build_planner_sample,
+    _build_writer_action_query,
     _build_writer_bug_query,
     _build_writer_core_query,
     _build_writer_first_query,
@@ -161,6 +163,13 @@ def set_survey_columns(session_id: str, columns: list) -> None:
     """存储用户确认后的列题型配置。"""
     sess = get_session(session_id)
     sess["confirmed_columns"] = columns
+    save_session(session_id, sess)
+
+
+def save_qualitative_context(session_id: str, ctx: QualitativeContextRequest) -> None:
+    """存储用户可选填写的定性报告业务上下文。"""
+    sess = get_session(session_id)
+    sess["qualitative_context"] = ctx.model_dump() if hasattr(ctx, "model_dump") else ctx.dict()
     save_session(session_id, sess)
 
 
@@ -411,6 +420,7 @@ async def report_stream(session_id: str, request: Request):
     stats_md = sess.get("stats_md")
     open_text = sess.get("open_text", {})
     is_crosstab = sess.get("mode") == "crosstab"
+    qualitative_context = None if is_crosstab else sess.get("qualitative_context")
     use_large_mode = is_crosstab or any(len(v) > LARGE_SAMPLE_THRESHOLD for v in open_text.values())
 
     try:
@@ -445,7 +455,10 @@ async def report_stream(session_id: str, request: Request):
                 yield sse_event({"type": "progress", "message": msg})
 
             yield sse_event({"type": "progress", "message": "主题分析完成，开始生成报告..."})
-            writer_query = _build_large_sample_writer_query(stats_md, clustered_themes, plan, rows[0], open_text)
+            writer_query = _build_large_sample_writer_query(
+                stats_md, clustered_themes, plan, rows[0], open_text,
+                qualitative_context=qualitative_context,
+            )
             if is_crosstab:
                 q_text = (sess.get("questionnaire_text") or "").strip()
                 if q_text:
@@ -481,10 +494,12 @@ async def report_stream(session_id: str, request: Request):
                         cid = c
                 _round.out = ("".join(buf), cid)
 
-            total_rounds = len(parts_meta) + 3
+            total_rounds = len(parts_meta) + 4
             yield sse_event({"type": "progress",
                              "message": f"分章生成 1/{total_rounds}：准备数据并生成标题…"})
-            first_q = _build_writer_first_query(stats_md, open_text, plan, rows[0])
+            first_q = _build_writer_first_query(
+                stats_md, open_text, plan, rows[0], qualitative_context=qualitative_context
+            )
             async for ev in _round(first_q, ""):
                 yield ev
             title_text, final_conv_id = _round.out
@@ -507,7 +522,7 @@ async def report_stream(session_id: str, request: Request):
                 part_sections.append(sec.strip())
 
             yield sse_event({"type": "progress",
-                             "message": f"分章生成 {total_rounds - 1}/{total_rounds}：核查待确认问题…"})
+                             "message": f"分章生成 {total_rounds - 2}/{total_rounds}：核查待确认问题…"})
             async for ev in _round(_build_writer_bug_query(), final_conv_id):
                 yield ev
             bug_text, final_conv_id = _round.out
@@ -516,16 +531,29 @@ async def report_stream(session_id: str, request: Request):
             bug_section = bug_clean if has_bug else ""
 
             yield sse_event({"type": "progress",
-                             "message": f"分章生成 {total_rounds}/{total_rounds}：汇总核心结论…"})
+                             "message": f"分章生成 {total_rounds - 1}/{total_rounds}：汇总核心结论…"})
             yield sse_event({"type": "chunk", "content": "\n\n"})
-            async for ev in _round(_build_writer_core_query(parts_meta, has_bug), final_conv_id):
+            async for ev in _round(_build_writer_core_query(parts_meta, has_bug, qualitative_context), final_conv_id):
                 yield ev
             core_text, final_conv_id = _round.out
             core_block = core_text.strip()
 
-            assembled = [title_block, core_block, *part_sections]
+            yield sse_event({"type": "progress",
+                             "message": f"分章生成 {total_rounds}/{total_rounds}：生成行动建议…"})
+            yield sse_event({"type": "chunk", "content": "\n\n"})
+            async for ev in _round(_build_writer_action_query(parts_meta, has_bug, qualitative_context), final_conv_id):
+                yield ev
+            action_text, final_conv_id = _round.out
+            action_clean = action_text.strip()
+            has_action = bool(action_clean) and "## 行动建议" in action_clean
+            action_section = action_clean if has_action else ""
+
+            details_divider = "---------------- 以下为详细信息，各位可以按需查看 ----------------"
+            assembled = [title_block, core_block, details_divider, *part_sections]
             if bug_section:
                 assembled.append(bug_section)
+            if action_section:
+                assembled.append(action_section)
             full_report = "\n\n".join(b for b in assembled if b)
 
         drifted = survey_stats.find_numbers_not_in_stats(full_report, stats_md)

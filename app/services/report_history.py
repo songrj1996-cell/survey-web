@@ -84,6 +84,7 @@ def save_to_history(session_id: str, sess: dict) -> None:
         "report_md": report_md,
         "plan": sess.get("plan"),
         "stats_md": sess.get("stats_md"),
+        "qualitative_context": sess.get("qualitative_context", {}),
         "analyst_conv_id": sess.get("analyst_conv_id", ""),
         "analyst_app": sess.get("analyst_app", ""),
         "qa_messages": qa_messages or [],

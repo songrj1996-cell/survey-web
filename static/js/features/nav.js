@@ -4,6 +4,7 @@
 
 $('btn-restart').addEventListener('click', () => {
   if (!confirm('确定要重新开始吗？当前会话数据将被清除。')) return;
+  if (typeof saveContextDraft === 'function') saveContextDraft();
   state.sessionId = null;
   state.columns = null;
   state.planData = null;
@@ -327,4 +328,3 @@ if (btnQaCollapse) {
   });
 }
 updateQAPanelButtons();
-

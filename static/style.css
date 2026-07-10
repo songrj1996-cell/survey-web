@@ -1075,7 +1075,7 @@ body {
 
 .option-editor__summary {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
   gap: 10px;
   padding: 8px 10px;
@@ -1090,16 +1090,16 @@ body {
 .option-editor__summary-main {
   min-width: 0;
   display: flex;
-  align-items: center;
-  flex-wrap: wrap;
+  align-items: stretch;
+  flex-direction: column;
   gap: 5px;
 }
 
 .option-summary-chip {
-  max-width: 180px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.4;
   font-size: 11px;
   color: var(--text-2);
   background: var(--surface-2);
@@ -1155,7 +1155,7 @@ body {
 
 .option-editor__rows {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  grid-template-columns: minmax(0, 1fr);
   gap: 8px;
 }
 
@@ -1172,6 +1172,10 @@ body {
 
 .option-edit-row .option-input {
   min-width: 0;
+  min-height: 38px;
+  line-height: 1.45;
+  overflow: hidden;
+  resize: vertical;
 }
 
 .matrix-editor {
@@ -1278,6 +1282,74 @@ body {
   min-width: 0;
 }
 
+.context-form-wrap {
+  width: 100%;
+  margin-top: 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.context-form__details {
+  width: 100%;
+}
+
+.context-form__summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.context-form__summary::-webkit-details-marker {
+  display: none;
+}
+
+.context-form__summary-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.context-form__summary-hint {
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.context-form__body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 0 12px 12px;
+}
+
+.context-form__field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.context-form__field label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+
+.context-form__field textarea {
+  width: 100%;
+  resize: vertical;
+  font: inherit;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  color: inherit;
+}
+
 .option-alias-hint {
   margin-top: 4px;
   display: flex;
@@ -1287,7 +1359,7 @@ body {
 
 .alias-chip {
   display: inline-flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 2px;
   padding: 1px 4px 1px 5px;
   background: var(--bg-2, #f3f4f6);
@@ -1295,14 +1367,14 @@ body {
   font-size: 10px;
   color: var(--text-3);
   line-height: 1.4;
-  max-width: 200px;
-  overflow: hidden;
+  max-width: 100%;
+  overflow: visible;
 }
 
 .alias-chip__text {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow: visible;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .alias-chip__remove {

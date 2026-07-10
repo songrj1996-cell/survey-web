@@ -3,6 +3,7 @@
 纯逻辑:给定 rows/headers,推断每列题型、构建发给 LLM 的题型识别 query。被 survey 与 annotate 共用。
 """
 import re
+from collections import Counter
 
 
 ROLE_LABEL_MAP = {
@@ -227,13 +228,57 @@ def _fmt_distinct(body: list[list], idx: int, n: int = 60) -> str:
 
 
 CHOICE_ROLES = {"single_choice", "profile_dim", "multi_choice", "matrix_multi"}
+OTHER_OPTION_LABEL = "Other / 其他"
+OTHER_TEXT_EXAMPLE_LIMIT = 5
 
 
 def _norm_option_key(value: str) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip().casefold()
 
 
-def _split_option_cell(value: str, delimiter: str | None = None) -> list[str]:
+def _is_other_option_label(value: str) -> bool:
+    key = _norm_option_key(value)
+    return key in {"other", "others", "其他", "其它", "other / 其他", "其他 / other"}
+
+
+def _looks_like_other_text_candidate(value: str, count: int, total: int) -> bool:
+    text = str(value or "").strip()
+    if not text or _is_other_option_label(text):
+        return False
+    return count <= max(2, int(total * 0.03))
+
+
+def _looks_like_delimiter_fragment(value: str) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    if text[0].islower() or text[0] in ")]}":
+        return True
+    if text.endswith("(") or text.count(")") > text.count("("):
+        return True
+    words = re.findall(r"[\w]+", text, flags=re.UNICODE)
+    return 0 < len(words) <= 3 and len(text) < 36
+
+
+def _known_option_values(q: dict) -> list[str]:
+    values: list[str] = []
+    for opt in q.get("options") or []:
+        if str(opt or "").strip():
+            values.append(str(opt).strip())
+    aliases = q.get("value_aliases") if isinstance(q.get("value_aliases"), dict) else {}
+    for canon, vals in aliases.items():
+        if str(canon or "").strip():
+            values.append(str(canon).strip())
+        if isinstance(vals, (list, tuple)):
+            values.extend(str(v).strip() for v in vals if str(v or "").strip())
+    return values
+
+
+def _split_option_cell(
+    value: str,
+    delimiter: str | None = None,
+    known_values: list[str] | None = None,
+) -> list[str]:
     text = str(value or "").strip()
     if not text:
         return []
@@ -241,7 +286,29 @@ def _split_option_cell(value: str, delimiter: str | None = None) -> list[str]:
     delims += ["，", ",", ";", "；", "\n", "\r\n", "|"]
     for d in delims:
         if d and d in text:
-            return [p.strip() for p in text.split(d) if p.strip()]
+            parts = [p for p in text.split(d)]
+            known = {_norm_option_key(v) for v in (known_values or []) if str(v or "").strip()}
+            if not known:
+                return [p.strip() for p in parts if p.strip()]
+
+            out: list[str] = []
+            i = 0
+            while i < len(parts):
+                if not parts[i].strip():
+                    i += 1
+                    continue
+                matched = False
+                for j in range(len(parts), i, -1):
+                    candidate = d.join(parts[i:j]).strip()
+                    if _norm_option_key(candidate) in known:
+                        out.append(candidate)
+                        i = j
+                        matched = True
+                        break
+                if not matched:
+                    out.append(parts[i].strip())
+                    i += 1
+            return out
     return [text]
 
 
@@ -250,18 +317,45 @@ def _real_options_for_question(rows: list[list], q: dict) -> list[str]:
     role = q.get("role")
     cis = q.get("column_indexes") or []
     delimiter = q.get("delimiter")
+    known_values = _known_option_values(q)
     out: list[str] = []
     seen: set[str] = set()
     for idx in cis:
         for r in body:
             raw = str(r[idx]) if idx < len(r) else ""
-            parts = _split_option_cell(raw, delimiter) if role in ("multi_choice", "matrix_multi") else [raw.strip()]
+            parts = (
+                _split_option_cell(raw, delimiter, known_values)
+                if role in ("multi_choice", "matrix_multi")
+                else [raw.strip()]
+            )
             for part in parts:
                 key = _norm_option_key(part)
                 if key and key not in seen:
                     seen.add(key)
                     out.append(part)
     return out
+
+
+def _real_option_counts_for_question(rows: list[list], q: dict) -> Counter:
+    body = rows[1:]
+    role = q.get("role")
+    cis = q.get("column_indexes") or []
+    delimiter = q.get("delimiter")
+    known_values = _known_option_values(q)
+    counts: Counter = Counter()
+    for idx in cis:
+        for r in body:
+            raw = str(r[idx]) if idx < len(r) else ""
+            parts = (
+                _split_option_cell(raw, delimiter, known_values)
+                if role in ("multi_choice", "matrix_multi")
+                else [raw.strip()]
+            )
+            for part in parts:
+                key = _norm_option_key(part)
+                if key:
+                    counts[key] += 1
+    return counts
 
 
 def _sanitize_choice_options(rows: list[list], questions: list[dict]) -> list[dict]:
@@ -272,10 +366,16 @@ def _sanitize_choice_options(rows: list[list], questions: list[dict]) -> list[di
     value_aliases proves they are backed by real cell values.
     """
     for q in questions:
+        confidence = str(q.get("confidence") or "").strip().lower()
+        if confidence in {"low", "medium"}:
+            q["low_confidence"] = True
+
         role = q.get("role")
         if role not in CHOICE_ROLES:
             continue
         real_options = _real_options_for_question(rows, q)
+        real_counts = _real_option_counts_for_question(rows, q)
+        total_real_values = sum(real_counts.values())
         real_by_key = {_norm_option_key(o): o for o in real_options}
         if not real_by_key:
             continue
@@ -286,6 +386,26 @@ def _sanitize_choice_options(rows: list[list], questions: list[dict]) -> list[di
         cleaned_aliases: dict[str, list[str]] = {}
         seen_canonical: set[str] = set()
         covered_real: set[str] = set()
+        other_text_values: list[str] = []
+        other_text_seen: set[str] = set()
+        declared_canonicals: list[str] = []
+        declared_seen: set[str] = set()
+        for value in list(q.get("options") or []) + list(raw_aliases.keys()):
+            text = str(value or "").strip()
+            key = _norm_option_key(text)
+            if text and key not in declared_seen:
+                declared_seen.add(key)
+                declared_canonicals.append(text)
+        had_declared_options = bool(q.get("options") or raw_aliases)
+
+        def add_other_text(values: list[str]) -> None:
+            for value in values:
+                text = str(value or "").strip()
+                key = _norm_option_key(text)
+                if not text or _is_other_option_label(text) or key in other_text_seen:
+                    continue
+                other_text_seen.add(key)
+                other_text_values.append(text)
 
         def real_values_for(canonical: str, aliases: list | tuple | None = None) -> list[str]:
             values = [canonical]
@@ -301,6 +421,19 @@ def _sanitize_choice_options(rows: list[list], questions: list[dict]) -> list[di
                     out.append(real)
             return out
 
+        strong_threshold = max(3, int(total_real_values * 0.05))
+        strong_declared_count = 0
+        for canonical in declared_canonicals:
+            aliases = raw_aliases.get(canonical)
+            if not isinstance(aliases, (list, tuple)):
+                aliases = []
+            count = sum(
+                real_counts.get(_norm_option_key(v), 0)
+                for v in real_values_for(canonical, aliases)
+            )
+            if count >= strong_threshold:
+                strong_declared_count += 1
+
         def add_canonical(canonical: str, aliases: list | tuple | None = None) -> None:
             canonical = str(canonical or "").strip()
             ckey = _norm_option_key(canonical)
@@ -308,6 +441,21 @@ def _sanitize_choice_options(rows: list[list], questions: list[dict]) -> list[di
                 return
             matched = [v for v in real_values_for(canonical, aliases) if _norm_option_key(v) not in covered_real]
             if not matched:
+                return
+            if (
+                had_declared_options
+                and aliases
+                and strong_declared_count >= 2
+                and matched
+                and all(
+                    _looks_like_other_text_candidate(v, real_counts.get(_norm_option_key(v), 0), total_real_values)
+                    for v in matched
+                )
+            ):
+                seen_canonical.add(ckey)
+                add_other_text(matched)
+                for value in matched:
+                    covered_real.add(_norm_option_key(value))
                 return
             seen_canonical.add(ckey)
             cleaned_options.append(canonical)
@@ -324,12 +472,47 @@ def _sanitize_choice_options(rows: list[list], questions: list[dict]) -> list[di
         for canonical, aliases in raw_aliases.items():
             add_canonical(str(canonical), aliases if isinstance(aliases, (list, tuple)) else [])
 
-        for opt in real_options:
-            add_canonical(opt, [])
+        if not had_declared_options:
+            for opt in real_options:
+                add_canonical(opt, [])
+        else:
+            missing_declared = []
+            for canonical in declared_canonicals:
+                ckey = _norm_option_key(canonical)
+                if ckey not in seen_canonical:
+                    seen_canonical.add(ckey)
+                    cleaned_options.append(canonical)
+                    cleaned_originals.append(canonical)
+                    missing_declared.append(canonical)
+            if missing_declared:
+                q["low_confidence"] = True
+
+            uncovered = [
+                opt for opt in real_options
+                if _norm_option_key(opt) not in covered_real
+                and _norm_option_key(opt) not in seen_canonical
+            ]
+            suspicious = [opt for opt in uncovered if _looks_like_delimiter_fragment(opt)]
+            add_other_text(uncovered)
+            if uncovered and (suspicious or len(uncovered) >= max(3, len(cleaned_options) // 2)):
+                q["low_confidence"] = True
 
         if cleaned_options:
+            if other_text_values and not any(_is_other_option_label(o) for o in cleaned_options):
+                cleaned_options.append(OTHER_OPTION_LABEL)
+                cleaned_originals.append(OTHER_OPTION_LABEL)
             q["options"] = cleaned_options
             q["options_original"] = cleaned_originals
+            if other_text_values:
+                q["other_text"] = {
+                    "enabled": True,
+                    "option": next((o for o in cleaned_options if _is_other_option_label(o)), OTHER_OPTION_LABEL),
+                    "count": sum(real_counts.get(_norm_option_key(v), 1) for v in other_text_values),
+                    "examples": other_text_values[:OTHER_TEXT_EXAMPLE_LIMIT],
+                }
+                q["low_confidence"] = True
+            else:
+                q.pop("other_text", None)
             if cleaned_aliases:
                 q["value_aliases"] = cleaned_aliases
             else:

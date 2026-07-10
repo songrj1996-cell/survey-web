@@ -297,6 +297,37 @@
           <p class="panel__desc" id="preview-meta">已读取文件</p>
         </div>
 
+        <div class="context-form-wrap" id="context-form-wrap">
+          <details class="context-form__details" id="context-form-details" open>
+            <summary class="context-form__summary">
+              <span class="context-form__summary-title">可选：补充分析目标</span>
+              <span class="context-form__summary-hint">填写后报告会更贴近你的产品决策，不填不影响生成</span>
+            </summary>
+            <div class="context-form__body">
+              <div class="context-form__field">
+                <label for="ctx-problem">这次想解决什么问题</label>
+                <textarea id="ctx-problem" rows="2" placeholder="例如：想了解新版本改动是否得到玩家认可"></textarea>
+              </div>
+              <div class="context-form__field">
+                <label for="ctx-background">当前产品/功能背景</label>
+                <textarea id="ctx-background" rows="2" placeholder="例如：上个月刚上线了赛季匹配机制调整"></textarea>
+              </div>
+              <div class="context-form__field">
+                <label for="ctx-target-users">目标用户</label>
+                <textarea id="ctx-target-users" rows="2" placeholder="例如：钻石段位以上的核心玩家"></textarea>
+              </div>
+              <div class="context-form__field">
+                <label for="ctx-key-concerns">最关心的问题</label>
+                <textarea id="ctx-key-concerns" rows="2" placeholder="例如：新机制是否影响了这部分玩家的留存意愿"></textarea>
+              </div>
+              <div class="context-form__field">
+                <label for="ctx-report-usage">报告准备用在哪里</label>
+                <textarea id="ctx-report-usage" rows="2" placeholder="例如：下周的版本复盘会，需要给出是否继续推广的建议"></textarea>
+              </div>
+            </div>
+          </details>
+        </div>
+
         <div class="col-confirm-header">
           <div class="plan-section__title">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -1047,11 +1078,11 @@
   <script src="https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js"></script>
   <!-- app.js 已按业务线拆分;顺序固定:core 最先,各 feature 居中(均含原顺序的初始化代码) -->
   <script src="/static/js/core/core.js?v=29"></script>
-  <script src="/static/js/features/survey.js?v=29"></script>
+  <script src="/static/js/features/survey.js?v=30"></script>
   <script src="/static/js/features/report.js?v=29"></script>
   <script src="/static/js/features/settings.js?v=29"></script>
   <script src="/static/js/features/history.js?v=29"></script>
-  <script src="/static/js/features/nav.js?v=29"></script>
+  <script src="/static/js/features/nav.js?v=30"></script>
   <script src="/static/js/features/comment.js?v=29"></script>
   <script src="/static/js/features/annotate.js?v=29"></script>
 </body>

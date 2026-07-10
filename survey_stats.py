@@ -40,6 +40,44 @@ from collections import Counter
 from typing import Any, Callable
 
 _MATRIX_ROLES = ("matrix_scale", "matrix_multi")
+_OTHER_OPTION_LABEL = "Other / 其他"
+
+
+def _norm_choice_key(value: str) -> str:
+    return " ".join(str(value or "").split()).casefold()
+
+
+def _is_other_option_label(value: str) -> bool:
+    return _norm_choice_key(value) in {"other", "others", "其他", "其它", "other / 其他", "其他 / other"}
+
+
+def _choice_other_meta(col: dict) -> dict | None:
+    meta = col.get("other_text")
+    if not isinstance(meta, dict):
+        return None
+    return meta
+
+
+def _choice_other_label(col: dict) -> str | None:
+    meta = _choice_other_meta(col)
+    option = str((meta or {}).get("option") or "").strip()
+    if option:
+        return option
+    for opt in col.get("options") or []:
+        if _is_other_option_label(opt):
+            return str(opt).strip()
+    return _OTHER_OPTION_LABEL if meta else None
+
+
+def _choice_norm_options(
+    options: list[str] | None,
+    norm: Callable[[str], str],
+    other_label: str | None = None,
+) -> set[str]:
+    known = {norm((o or "").strip()) for o in (options or []) if str(o or "").strip()}
+    if other_label:
+        known.add(norm(other_label))
+    return {v for v in known if v}
 
 
 # ============================================================================
@@ -127,6 +165,13 @@ def compute(
             open_text[c["index"]] = _collect_open_text(
                 c["index"], body, headers, mlbb_id_cols + id_cols, profile_cols
             )
+    for c in plan["columns"]:
+        if c["role"] in ("single_choice", "multi_choice"):
+            entries = _collect_choice_other_text(
+                c, body, headers, mlbb_id_cols + id_cols, profile_cols
+            )
+            if entries:
+                open_text.setdefault(c["index"], []).extend(entries)
 
     return "\n".join(md_parts).rstrip() + "\n", open_text
 
@@ -208,18 +253,26 @@ def _render_column(
     norm = _make_normalizer(aliases)
 
     if role == "single_choice":
-        nonblank_norm = [norm(v) for v in nonblank_raw]
+        other_label = _choice_other_label(col)
+        options = col.get("options")
+        known_options = _choice_norm_options(options, norm, other_label)
+        nonblank_norm = [
+            other_label if other_label and options and norm(v) not in known_options else norm(v)
+            for v in nonblank_raw
+        ]
         body_md = _render_single_choice(nonblank_norm)
         body_md += _append_cross_tabs(
-            col, raw_values, profile_cols, body, headers, single=True
+            col, raw_values, profile_cols, body, headers,
+            single=True, options=options, other_label=other_label
         )
     elif role == "multi_choice":
         delimiter = col.get("delimiter") or _guess_delimiter(nonblank_raw)
         options = col.get("options")
-        body_md = _render_multi_choice(nonblank_raw, delimiter, norm, options)
+        other_label = _choice_other_label(col)
+        body_md = _render_multi_choice(nonblank_raw, delimiter, norm, options, other_label)
         body_md += _append_cross_tabs(
             col, raw_values, profile_cols, body, headers,
-            single=False, delimiter=delimiter, options=options,
+            single=False, delimiter=delimiter, options=options, other_label=other_label,
         )
     elif role == "scale":
         lo = col.get("min")
@@ -252,6 +305,7 @@ def _append_cross_tabs(
     single: bool,
     delimiter: str = ",",
     options: list[str] | None = None,
+    other_label: str | None = None,
 ) -> str:
     """单选/多选题：跟每个 profile_dim 配交叉表。"""
     if not profile_cols:
@@ -266,7 +320,7 @@ def _append_cross_tabs(
         p_norm_fn = _make_normalizer(p_col.get("value_aliases"))
         ct_md = _cross_tab_categorical(
             p_raw, q_raw, p_norm=p_norm_fn, q_norm=q_norm_fn,
-            single=single, delimiter=delimiter, options=options,
+            single=single, delimiter=delimiter, options=options, other_label=other_label,
         )
         if ct_md:
             out.append(f"\n\n**按「{p_name}」分组**\n\n{ct_md}")
@@ -312,10 +366,11 @@ def _render_multi_choice(
     delimiter: str,
     norm: Callable[[str], str],
     options: list[str] | None = None,
+    other_label: str | None = None,
 ) -> str:
     counts: Counter = Counter()
     for v in values:
-        opts = set(_split_by_vocab(v, options, delimiter, norm))
+        opts = set(_split_by_vocab(v, options, delimiter, norm, other_label=other_label))
         for opt in opts:
             if opt:
                 counts[opt] += 1
@@ -412,6 +467,7 @@ def _cross_tab_categorical(
     single: bool,
     delimiter: str = ",",
     options: list[str] | None = None,
+    other_label: str | None = None,
 ) -> str:
     """画像 × 类目题。每格 'n (xx%)'，每格 < 5 加 *。
 
@@ -427,13 +483,21 @@ def _cross_tab_categorical(
     pairs_norm = [(p_norm(p), q) for p, q in pairs]
 
     p_options = list(dict.fromkeys(p for p, _ in pairs_norm))
+    known_options = _choice_norm_options(options, q_norm, other_label)
+
+    def normalize_q(q: str) -> str:
+        qn = q_norm(q)
+        if other_label and options and qn not in known_options:
+            return other_label
+        return qn
+
     if single:
-        q_options = list(dict.fromkeys(q_norm(q) for _, q in pairs_norm))
+        q_options = list(dict.fromkeys(normalize_q(q) for _, q in pairs_norm))
     else:
         q_set: list[str] = []
         seen: set[str] = set()
         for _, q in pairs_norm:
-            for normo in _split_by_vocab(q, options, delimiter, q_norm):
+            for normo in _split_by_vocab(q, options, delimiter, q_norm, other_label=other_label):
                 if normo and normo not in seen:
                     seen.add(normo)
                     q_set.append(normo)
@@ -446,10 +510,10 @@ def _cross_tab_categorical(
     grid: dict[tuple[str, str], int] = {}
     for p, q in pairs_norm:
         if single:
-            qn = q_norm(q)
+            qn = normalize_q(q)
             grid[(p, qn)] = grid.get((p, qn), 0) + 1
         else:
-            opts = set(_split_by_vocab(q, options, delimiter, q_norm))
+            opts = set(_split_by_vocab(q, options, delimiter, q_norm, other_label=other_label))
             for o in opts:
                 if o:
                     grid[(p, o)] = grid.get((p, o), 0) + 1
@@ -531,6 +595,125 @@ def _cross_tab_scale(
 # ============================================================================
 
 
+def _choice_parts_with_match(
+    cell: str,
+    options: list[str] | None,
+    delimiter: str,
+    norm: Callable[[str], str],
+) -> list[tuple[str | None, str]]:
+    cell = (cell or "").strip()
+    if not cell:
+        return []
+    if not options:
+        return [(norm(x.strip()), x.strip()) for x in cell.split(delimiter) if x.strip()]
+
+    norm_opts = _choice_norm_options(options, norm)
+    frags = cell.split(delimiter)
+    result: list[tuple[str | None, str]] = []
+    i = 0
+    while i < len(frags):
+        if not frags[i].strip():
+            i += 1
+            continue
+        matched = False
+        for j in range(len(frags), i, -1):
+            raw = delimiter.join(frags[i:j]).strip()
+            cand = norm(raw)
+            if cand in norm_opts:
+                result.append((cand, raw))
+                i = j
+                matched = True
+                break
+        if not matched:
+            raw = frags[i].strip()
+            result.append((None, raw))
+            i += 1
+    return result
+
+
+def _collect_choice_other_text(
+    col: dict,
+    body: list[list],
+    headers: list[str],
+    id_cols: list[dict],
+    profile_cols: list[dict],
+) -> list[dict]:
+    other_label = _choice_other_label(col)
+    meta = _choice_other_meta(col)
+    options = col.get("options")
+    if (meta and meta.get("enabled") is False) or not other_label or not options:
+        return []
+
+    idx = col["index"]
+    role = col["role"]
+    norm = _make_normalizer(col.get("value_aliases"))
+    known_options = _choice_norm_options(options, norm, other_label)
+    delimiter = col.get("delimiter") or ","
+    out: list[dict] = []
+    seen_rows: set[tuple[int, str]] = set()
+
+    for row_no, row in enumerate(body):
+        raw = _format_cell(row[idx]) if idx < len(row) else ""
+        if not raw.strip():
+            continue
+
+        unknown_texts: list[str] = []
+        if role == "single_choice":
+            normalized = norm(raw.strip())
+            if normalized not in known_options:
+                unknown_texts.append(raw.strip())
+        elif role == "multi_choice":
+            for matched, raw_part in _choice_parts_with_match(raw, options, delimiter, norm):
+                if matched is None and raw_part and not _is_other_option_label(raw_part):
+                    unknown_texts.append(raw_part)
+
+        for text in unknown_texts:
+            key = (row_no, _norm_choice_key(text))
+            if key in seen_rows:
+                continue
+            seen_rows.add(key)
+            entry = _build_open_text_entry(row, text, headers, id_cols, profile_cols)
+            entry["source"] = "choice_other_text"
+            entry["parent_question"] = col.get("name") or _safe_header(headers, idx)
+            entry["parent_index"] = idx
+            entry["other_option"] = other_label
+            out.append(entry)
+    return out
+
+
+def _build_open_text_entry(
+    row: list,
+    text: str,
+    headers: list[str],
+    id_cols: list[dict],
+    profile_cols: list[dict],
+) -> dict:
+    ids: dict[str, str] = {}
+    for c in id_cols:
+        i = c["index"]
+        v = _format_cell(row[i]) if i < len(row) else ""
+        if v.strip():
+            key = "MLBB ID" if c.get("role") == "mlbbid" else (c.get("name") or _safe_header(headers, i))
+            if c.get("role") == "mlbbid":
+                v = _format_mlbb_id(v)
+            ids[key] = v.strip()
+
+    profile: dict[str, str] = {}
+    for c in profile_cols:
+        i = c["index"]
+        v = _format_cell(row[i]) if i < len(row) else ""
+        if v.strip():
+            key = c.get("name") or _safe_header(headers, i)
+            norm = _make_normalizer(c.get("value_aliases"))
+            profile[key] = norm(v.strip())
+
+    return {
+        "ids": ids,
+        "profile": profile,
+        "text": text.strip(),
+    }
+
+
 def _collect_open_text(
     col_idx: int,
     body: list[list],
@@ -549,31 +732,7 @@ def _collect_open_text(
         text = _format_cell(row[col_idx]) if col_idx < len(row) else ""
         if not text.strip():
             continue
-
-        ids: dict[str, str] = {}
-        for c in id_cols:
-            i = c["index"]
-            v = _format_cell(row[i]) if i < len(row) else ""
-            if v.strip():
-                key = "MLBB ID" if c.get("role") == "mlbbid" else (c.get("name") or _safe_header(headers, i))
-                if c.get("role") == "mlbbid":
-                    v = _format_mlbb_id(v)
-                ids[key] = v.strip()
-
-        profile: dict[str, str] = {}
-        for c in profile_cols:
-            i = c["index"]
-            v = _format_cell(row[i]) if i < len(row) else ""
-            if v.strip():
-                key = c.get("name") or _safe_header(headers, i)
-                norm = _make_normalizer(c.get("value_aliases"))
-                profile[key] = norm(v.strip())
-
-        out.append({
-            "ids": ids,
-            "profile": profile,
-            "text": text.strip(),
-        })
+        out.append(_build_open_text_entry(row, text.strip(), headers, id_cols, profile_cols))
     return out
 
 
@@ -695,6 +854,8 @@ def _split_by_vocab(
     options: list[str] | None,
     delimiter: str,
     norm: Callable[[str], str],
+    *,
+    other_label: str | None = None,
 ) -> list[str]:
     """把一个多选单元格切成 normalized 选项列表。
 
@@ -733,7 +894,8 @@ def _split_by_vocab(
                 matched = True
                 break
         if not matched:
-            result.append(norm(frags[i].strip()))
+            fallback = norm(frags[i].strip())
+            result.append(other_label if other_label else fallback)
             i += 1
     return result
 

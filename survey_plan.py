@@ -664,6 +664,8 @@ def expand_confirmed_to_columns(confirmed: list[dict]) -> list[dict]:
             # single_choice / profile_dim / multi_choice 都可带同义归并
             if aliases and role in ("single_choice", "profile_dim", "multi_choice"):
                 col["value_aliases"] = aliases
+            if role in ("single_choice", "multi_choice") and isinstance(q.get("other_text"), dict):
+                col["other_text"] = dict(q["other_text"])
             out.append(col)
     return out
 

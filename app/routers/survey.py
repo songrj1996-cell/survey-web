@@ -18,6 +18,7 @@ from app.schemas.requests import (
     HistoryQARequest,
     PlanConfirmRequest,
     QARequest,
+    QualitativeContextRequest,
 )
 from app.services.audit import audit_log
 from app.services.auth import _current_login
@@ -32,6 +33,7 @@ from app.services.survey_service import (
     prepare_history_qa_context,
     qa_stream,
     report_stream,
+    save_qualitative_context,
     set_survey_columns,
     validate_columns_ready,
     validate_plan_confirm_ready,
@@ -71,6 +73,17 @@ async def confirm_columns(session_id: str, req: ColumnConfirmRequest, request: R
         request, "survey", "确认数据列",
         f"会话：{session_id}；确认列数：{len(req.columns)}",
         metadata={"session_id": session_id, "columns": len(req.columns)},
+    )
+    return {"ok": True}
+
+
+@router.post("/api/survey-context/{session_id}")
+async def submit_survey_context(session_id: str, req: QualitativeContextRequest, request: Request):
+    save_qualitative_context(session_id, req)
+    await audit_log(
+        request, "survey", "提交业务上下文",
+        f"会话：{session_id}",
+        metadata={"session_id": session_id},
     )
     return {"ok": True}
 

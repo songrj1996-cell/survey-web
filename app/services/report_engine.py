@@ -17,6 +17,45 @@ from app.core.config import (
 from app.services.question_detect import ROLE_LABEL_MAP
 from app.storage.prompts import _get_planner_extra, _get_writer_requirements
 
+_QUALITATIVE_CONTEXT_LABELS = [
+    ("problem", "这次想解决什么问题"),
+    ("background", "当前产品/功能背景"),
+    ("target_users", "目标用户"),
+    ("key_concerns", "最关心的问题"),
+    ("report_usage", "报告准备用在哪里"),
+]
+
+
+def _build_business_context_block(qualitative_context: dict | None, extra_note: str = "") -> str:
+    """构造 <business_context> block；无有效字段时返回空字符串（不注入，行为不变）。"""
+    if not qualitative_context:
+        return ""
+    lines = []
+    for key, label in _QUALITATIVE_CONTEXT_LABELS:
+        val = str(qualitative_context.get(key, "") or "").strip()
+        if val:
+            lines.append(f"- {label}：{val}")
+    if not lines:
+        return ""
+    note = f"（{extra_note}）" if extra_note else ""
+    return (
+        "\n\n<business_context>\n"
+        f"用户提供的业务背景信息{note}：\n"
+        + "\n".join(lines)
+        + "\n\n使用规则：若存在这些信息，核心结论与行动建议必须优先围绕其中的核心问题、目标用户、"
+        "最关心问题和报告用途组织；但不得把业务背景中没有明示的内容写成事实。"
+        "凡是基于问卷结构、玩家反馈或上下文做出的判断，必须明确写出依据；"
+        "凡是推测或猜测，必须标注为「推测」或「可能」。"
+        + "\n</business_context>"
+    )
+
+
+def _has_business_context(qualitative_context: dict | None) -> bool:
+    """判断用户是否填写了有效业务上下文。"""
+    if not qualitative_context:
+        return False
+    return any(str(qualitative_context.get(key, "") or "").strip() for key, _ in _QUALITATIVE_CONTEXT_LABELS)
+
 
 def _build_planner_sample(rows: list[list], sample_n: int = 5) -> str:
     if not rows:
@@ -43,7 +82,11 @@ def _build_planner_sample(rows: list[list], sample_n: int = 5) -> str:
     )
 
 
-def _build_planner_query_with_confirmed(rows: list[list], confirmed_columns: list[dict]) -> str:
+def _build_planner_query_with_confirmed(
+    rows: list[list],
+    confirmed_columns: list[dict],
+    qualitative_context: dict | None = None,
+) -> str:
     """构建给 Planner 的完整 query，含用户确认的题型（逻辑题，矩阵题跨多列）。"""
     sample_md = _build_planner_sample(rows)
 
@@ -103,10 +146,17 @@ def _build_planner_query_with_confirmed(rows: list[list], confirmed_columns: lis
         f"矩阵题的多个列号务必整体归入同一个 part。"
         f"{profile_constraint}\n"
         f"{extra_instructions}"
+        f"{_build_business_context_block(qualitative_context, '用于辅助规划章节结构和分析重点')}"
     )
 
 
-def _build_plan_revision_query(plan: dict, headers: list[str], confirmed_columns: list[dict], user_text: str) -> str:
+def _build_plan_revision_query(
+    plan: dict,
+    headers: list[str],
+    confirmed_columns: list[dict],
+    user_text: str,
+    qualitative_context: dict | None = None,
+) -> str:
     header_lines = "\n".join(f"- 列{i}: {h}" for i, h in enumerate(headers))
     confirmed_json = json.dumps(confirmed_columns or [], ensure_ascii=False, indent=2)
     plan_json = json.dumps(plan or {}, ensure_ascii=False, indent=2)
@@ -121,7 +171,8 @@ def _build_plan_revision_query(plan: dict, headers: list[str], confirmed_columns
         f"<headers>\n{header_lines}\n</headers>\n\n"
         f"<confirmed_columns_json>\n{confirmed_json}\n</confirmed_columns_json>\n\n"
         f"<current_plan_json>\n{plan_json}\n</current_plan_json>\n\n"
-        f"<user_revision_request>\n{user_text.strip()}\n</user_revision_request>\n\n"
+        f"<user_revision_request>\n{user_text.strip()}\n</user_revision_request>"
+        f"{_build_business_context_block(qualitative_context, '用于辅助判断调整章节/分析重点')}\n\n"
         "请现在返回修订后的完整 JSON 对象。"
     )
 
@@ -252,6 +303,7 @@ async def _batch_qualitative_analysis(
         col_name = (col and col.get("name")) or (
             headers[col_idx] if col_idx < len(headers) else f"列{col_idx}"
         )
+        col_name = f"{col_name}{_open_text_source_note(entries)}"
         total = len(entries)
         yield ("progress", f"【{col_name}】开始分析（共 {total} 条）")
 
@@ -551,6 +603,12 @@ def _sample_open_entries(entries: list[dict], limit: int = 60) -> list[dict]:
     return [entries[i] for i in idxs]
 
 
+def _open_text_source_note(entries: list[dict]) -> str:
+    if any(e.get("source") == "choice_other_text" for e in entries or []):
+        return "（选择题 Other 填空补充）"
+    return ""
+
+
 def _build_open_text_fallback_md(
     open_text: dict | None,
     clustered_themes: dict,
@@ -581,6 +639,8 @@ def _build_open_text_fallback_md(
             headers[col_idx] if isinstance(col_idx, int) and col_idx < len(headers) else f"列{raw_idx}"
         )
         lines = [f"### {name}（列 {raw_idx}，共 {len(entries)} 条非空回答；以下为抽样原文）"]
+        name = f"{name}{_open_text_source_note(entries)}"
+        lines[0] = f"### {name} (col {raw_idx}, {len(entries)} responses; sampled raw text)"
         for i, entry in enumerate(_sample_open_entries(entries), 1):
             ident = _entry_identity(entry)
             prefix = f"{i}. "
@@ -611,6 +671,7 @@ def _build_large_sample_writer_query(
     plan: dict,
     headers: list[str],
     open_text: dict | None = None,
+    qualitative_context: dict | None = None,
 ) -> str:
     parts_lines = ["  Part 1 受访者画像（固定）"]
     for i, p in enumerate(plan["parts"], 2):
@@ -664,7 +725,11 @@ def _build_large_sample_writer_query(
         f"<priority_metrics>\n{satisfaction_md}\n</priority_metrics>\n\n"
         if satisfaction_md else ""
     )
-    requirements = _get_large_sample_writer_requirements(has_satisfaction=bool(satisfaction_md))
+    has_context = _has_business_context(qualitative_context)
+    requirements = _get_large_sample_writer_requirements(
+        has_satisfaction=bool(satisfaction_md),
+        has_business_context=has_context,
+    )
 
     return (
         "**任务**：基于以下大样本问卷分析结果撰写调研报告。\n\n"
@@ -674,20 +739,30 @@ def _build_large_sample_writer_query(
         f"{open_text_md}\n\n"
         + (f"{fallback_md}\n\n" if fallback_md else "")
         + f"**要求**：\n{requirements}"
+        + _build_business_context_block(qualitative_context, "用于辅助分析重点和建议方向")
     )
 
 
-def _get_large_sample_writer_requirements(has_satisfaction: bool = False) -> str:
+def _get_large_sample_writer_requirements(
+    has_satisfaction: bool = False,
+    has_business_context: bool = False,
+) -> str:
     satisfaction_rule = (
         "   - **满意度优先原则**：`<priority_metrics>` 中已提取满意度数据，必须将其作为核心结论中最靠前的 1-2 条展示，须包含具体数字"
         if has_satisfaction else
         "   - **满意度优先原则**：若报告中存在任何与满意度评分/评价相关的数据（如好评率、满意度评分、认可度等），必须将其作为核心结论中最靠前的 1-2 条展示，且须包含具体数字"
+    )
+    context_rule = (
+        "- 用户已提供 `<business_context>` 时，核心结论必须优先回答其中的核心问题，并纳入会影响决策的相关 topic、风险、样本限制；不要按 Part 机械复述。\n"
+        if has_business_context else
+        "- 用户未提供 `<business_context>` 时，不得编造业务目标；只能根据问卷题目、统计结果和玩家反馈归纳基础发现。如需判断调研意图，必须写成「从问卷内容推测/看起来」。\n"
     )
     return f"""一、报告结构（严格按此顺序，不得调换）
 1. **## 核心结论**（必须是第一个二级章节）
    - 列出整份报告中最重要的 5-8 条发现，每条一行，格式：「**结论标题**：具体说明（含数字）」
    - 覆盖所有 Part 的关键洞察，让读者读完此节即可掌握全部重点
 {satisfaction_rule}
+{context_rule}   - 只把 `<stats>` 中存在的数字写成事实；只把 `<open_text_themes>` 或 `<open_text_fallback>` 中存在的玩家反馈写成玩家观点；推测必须明确标注。
 2. **## Part 1 受访者画像**（固定为第一个 Part，紧接核心结论之后）
    - 画像分布数据用 Markdown 表格呈现（列：维度 / 选项 / 人数占比），不要纯文字罗列
    - 表格之后用 1-2 句话解读画像特征
@@ -738,6 +813,7 @@ def _build_writer_context(stats_md: str, open_text: dict, plan: dict, headers: l
     for col_idx, texts in open_text.items():
         col = next((c for c in plan["columns"] if c["index"] == col_idx), None)
         name = (col and col.get("name")) or (headers[col_idx] if col_idx < len(headers) else f"列{col_idx}")
+        name = f"{name}{_open_text_source_note(texts)}"
         joined_lines = []
         for entry in texts:
             ids = entry.get("ids", {})
@@ -770,7 +846,13 @@ def _build_writer_context(stats_md: str, open_text: dict, plan: dict, headers: l
     return plan_summary, open_text_md, requirements
 
 
-def _build_writer_first_query(stats_md: str, open_text: dict, plan: dict, headers: list[str]) -> str:
+def _build_writer_first_query(
+    stats_md: str,
+    open_text: dict,
+    plan: dict,
+    headers: list[str],
+    qualitative_context: dict | None = None,
+) -> str:
     """多轮生成第 1 轮：发送全部上下文 + 要求，但本轮只让模型输出一级标题。"""
     plan_summary, open_text_md, requirements = _build_writer_context(stats_md, open_text, plan, headers)
     return (
@@ -780,7 +862,8 @@ def _build_writer_first_query(stats_md: str, open_text: dict, plan: dict, header
         f"{plan_summary}\n\n"
         f"<stats>\n{stats_md}\n</stats>\n\n"
         f"{open_text_md}\n\n"
-        f"<report_spec>\n以下是整篇报告最终要满足的写作要求（供你理解全局，后续逐轮执行）：\n{requirements}\n</report_spec>\n\n"
+        f"<report_spec>\n以下是整篇报告最终要满足的写作要求（供你理解全局，后续逐轮执行）：\n{requirements}\n</report_spec>"
+        f"{_build_business_context_block(qualitative_context, '仅本轮注入，后续 part/bug/core 轮次请依赖本会话历史，不会重复提供')}\n\n"
         "**本轮任务（第 1 轮）**：**只**输出报告的一级标题（`# 一级标题`）。"
         "如果 <stats> 或 metadata 中存在「被排除」样本依据，可在标题下另起一行用一句话说明依据。"
         "除此之外**什么都不要写**——不要写核心结论、不要写任何 Part、不要写 Bug 模块、不要写本节总结。"
@@ -812,24 +895,72 @@ def _build_writer_bug_query() -> str:
     )
 
 
-def _build_writer_core_query(parts_meta: list[dict], has_bug: bool) -> str:
+def _build_writer_core_query(
+    parts_meta: list[dict],
+    has_bug: bool,
+    qualitative_context: dict | None = None,
+) -> str:
     """多轮生成的核心结论轮：基于已生成全部章节回写核心结论模块（放在报告顶部）。"""
     part_titles = "、".join(f"Part {m['i']} {m['name']}" for m in parts_meta)
+    has_context = _has_business_context(qualitative_context)
     bug_clause = (
         "正文包含 `## Bug 或待确认问题` 模块，因此核心结论**最后必须**追加 `### 待确认问题概述`，只概述问题类型、不展开原文。"
         if has_bug else
         "正文没有 Bug 模块，因此核心结论**不要**写任何「待确认问题」相关小节。"
     )
+    mode_clause = (
+        "用户已提供 `<business_context>`：本模块是「业务判断层」，必须优先围绕用户填写的核心问题、目标用户、最关心问题和报告用途组织，"
+        "直接回答这次调研要支持的业务判断；同时上提会影响决策的相关 topic（例如玩家痛点、明确不希望修改的部分、少数但高风险反馈、样本限制）。"
+        "不要按 Part 机械复述，也不要只做资料摘要。\n"
+        if has_context else
+        "用户未提供 `<business_context>`：本模块是「基础发现层」，不得编造业务目标或假装知道产品决策背景。"
+        "只能根据问卷题目、<stats>、<open_text> 和已生成章节归纳主要发现；如果需要判断这份调研可能关注什么，必须写成「从问卷内容推测/看起来」，并说明推测依据。\n"
+    )
     return (
-        "**本轮任务（最后一轮）**：基于你前面已经生成的全部章节，撰写整篇报告的「核心结论」模块。"
+        "**本轮任务**：基于你前面已经生成的全部章节，撰写整篇报告的「核心结论」模块。"
         "这个模块最终会被放到报告**最顶部**（一级标题之后、各 Part 之前），所以请独立、完整地写出来。\n"
+        f"{mode_clause}"
         "严格按 <report_spec> 里『核心结论』部分的格式：用 `<!--CORE_START-->` 和 `<!--CORE_END-->` 两个标记"
         "**各自独占一行**包裹整段，内部依次写：`## 核心结论`（首行写明样本总数）、`### 总体判断`、"
-        f"逐个写 `### Part X 章节名：关键发现`（必须引用真实 Part 名：{part_titles}）、按需的 `### 高信号少数观点与风险`。\n"
+        f"若用户提供了业务问题，可按业务问题组织小节；否则逐个写 `### Part X 章节名：关键发现`（必须引用真实 Part 名：{part_titles}）；"
+        "按需写 `### 高信号少数观点与风险`。\n"
         f"{bug_clause}\n"
-        "**约束**：① 只输出从 `<!--CORE_START-->` 到 `<!--CORE_END-->` 的内容，不要重复正文章节、不要再写一级标题；"
+        "**约束**：① 只输出从 `<!--CORE_START-->` 到 `<!--CORE_END-->` 的内容，不要重复正文章节、不要再写一级标题、不要写行动建议；"
         "② 核心结论里不使用百分比、不使用精确人数，改用量级描述（样本总数可引用）；"
-        "③ 引用的绝对数值必须与 <stats> 一致。"
+        "③ 引用的绝对数值必须与 <stats> 一致；"
+        "④ 玩家观点必须来自 <open_text> 或已生成章节，不得编造；"
+        "⑤ 业务判断可以基于证据推断，但必须写清楚依据，凡是推测或猜测必须显式标注。"
+    )
+
+
+def _build_writer_action_query(
+    parts_meta: list[dict],
+    has_bug: bool,
+    qualitative_context: dict | None = None,
+) -> str:
+    """多轮生成的行动建议轮（最后一轮）：基于已生成全部章节给出可执行的产品建议。"""
+    part_titles = "、".join(f"Part {m['i']} {m['name']}" for m in parts_meta)
+    has_context = _has_business_context(qualitative_context)
+    bug_clause = (
+        "正文包含 `## Bug 或待确认问题` 模块，行动建议里不要重复该模块已列出的具体问题项，必要时可提及但不展开。"
+        if has_bug else ""
+    )
+    context_clause = (
+        "若用户提供了 `<business_context>`，建议必须优先服务其中的核心问题和报告用途；"
+        if has_context else
+        "用户未提供 `<business_context>`，建议只能基于本报告中已经出现的证据提出，不要假设产品团队的具体目标；"
+    )
+    return (
+        "**本轮任务（最后一轮）**：基于你前面已经生成的全部章节（"
+        f"{part_titles}），撰写 `## 行动建议` 模块，这是整篇报告的最后一节。\n"
+        "要求：\n"
+        "1. 只输出这一个模块，以 `## 行动建议` 开头，不要重复或重写其它章节。\n"
+        "2. 给出 3-5 条建议，每条使用固定结构：`**短标题**`，下面分别写「产品动作：」「优先级：」（高/中/低）"
+        "「验证方式：」（说明需要什么数据、用户调研或实验来验证该建议）「依据：」（引用 <stats> 或 <open_text> 中的具体证据）"
+        "「不确定性/前提：」（说明该建议的假设或局限）。\n"
+        f"3. {context_clause}每条建议必须能在 <stats> 或 <open_text> 中找到对应依据，不得凭空提出。\n"
+        "4. 如果建议依赖推测、猜测或样本外假设，必须在「不确定性/前提」里明确写出，不能包装成事实。\n"
+        f"{bug_clause}"
     )
 
 
