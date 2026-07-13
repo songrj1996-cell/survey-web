@@ -60,13 +60,17 @@ def _choice_other_meta(col: dict) -> dict | None:
 
 def _choice_other_label(col: dict) -> str | None:
     meta = _choice_other_meta(col)
+    # 用户在题型确认页取消 Other 后，不能再把未知值归并为 Other；
+    # 否则复选框只影响开放文本收集，客观题统计仍然会被错误改写。
+    if not meta or meta.get("enabled") is False:
+        return None
     option = str((meta or {}).get("option") or "").strip()
     if option:
         return option
     for opt in col.get("options") or []:
         if _is_other_option_label(opt):
             return str(opt).strip()
-    return _OTHER_OPTION_LABEL if meta else None
+    return _OTHER_OPTION_LABEL
 
 
 def _choice_norm_options(

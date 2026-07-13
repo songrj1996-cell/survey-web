@@ -295,7 +295,7 @@ function optionEditorHTML(i, c) {
 
 function otherTextHTML(i, c) {
   const meta = c.other_text || {};
-  if (!meta || meta.enabled === false) return '';
+  if (!meta) return '';
   const examples = Array.isArray(meta.examples) ? meta.examples.slice(0, 5) : [];
   const count = Number(meta.count || examples.length || 0);
   const option = meta.option || 'Other / 其他';
@@ -311,6 +311,44 @@ function otherTextHTML(i, c) {
         <span>其他填空补充：检测到 ${count} 条；统计时计入「${esc(option)}」，报告中作为本题补充反馈</span>
       </label>
       ${exampleHTML}
+    </div>
+  </div>`;
+}
+
+function unmatchedValuesHTML(i, c) {
+  const values = Array.isArray(c.unmatched_values) ? c.unmatched_values : [];
+  if (!values.length) return '';
+  const standardValues = values.filter(item => item?.suggested_handling === 'standard_option');
+  const reviewValues = values.filter(item => item?.suggested_handling !== 'standard_option');
+  const chips = list => list.slice(0, 8).map(item =>
+    `<span class="option-summary-chip" title="${esc(item.value)}">${esc(item.value)} · ${Number(item.count || 0)} 条</span>`
+  ).join('');
+  const more = list => list.length > 8 ? `<span class="option-summary-more">+${list.length - 8}</span>` : '';
+  const defaultHandling = reviewValues.length && reviewValues.every(item => item.suggested_handling === 'other_text')
+    ? 'as_other'
+    : 'keep_raw';
+  const standardHTML = standardValues.length ? `
+    <div style="margin-bottom:${reviewValues.length ? '10px' : '0'};">
+      <div style="font-size:13px;color:var(--text-2);margin-bottom:6px;">以下值符合当前题目的数值/结构选项体系，将作为标准选项保留：</div>
+      <div style="display:flex;flex-wrap:wrap;gap:6px;">${chips(standardValues)}${more(standardValues)}</div>
+    </div>` : '';
+  const reviewHTML = reviewValues.length ? `
+    <div>
+      <div style="font-size:13px;color:var(--text-2);margin-bottom:6px;">以下值无法仅凭导出数据判断是漏识别选项还是 Google Form Other 填空：</div>
+      <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px;">${chips(reviewValues)}${more(reviewValues)}</div>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:var(--text-2);">
+        <span>处理方式</span>
+        <select class="extra-input extra-input--sm" data-unmatched-handling="${i}">
+          <option value="keep_raw" ${defaultHandling === 'keep_raw' ? 'selected' : ''}>暂不归并，按原始值统计</option>
+          <option value="as_other" ${defaultHandling === 'as_other' ? 'selected' : ''}>按 Other 填空处理</option>
+          <option value="as_option">作为标准选项保留</option>
+        </select>
+      </label>
+    </div>` : '';
+  return `<div class="option-editor" data-unmatched-values="${i}">
+    <div style="border:1px dashed var(--border);border-radius:8px;padding:10px 12px;background:rgba(255,255,255,.54);">
+      <div style="font-size:13px;font-weight:600;color:var(--text);margin-bottom:8px;">待确认值（不会自动加入 Other）</div>
+      ${standardHTML}${reviewHTML}
     </div>
   </div>`;
 }
@@ -441,7 +479,9 @@ function updateExtra(i, role) {
 
   if (CHOICE_ROLES.includes(role)) {
     bits.push(optionEditorHTML(i, c));
-    if ((role === 'single_choice' || role === 'multi_choice') && c.other_text) {
+    if ((role === 'single_choice' || role === 'multi_choice') && c.unmatched_values?.length) {
+      bits.push(unmatchedValuesHTML(i, c));
+    } else if ((role === 'single_choice' || role === 'multi_choice') && c.other_text) {
       bits.push(otherTextHTML(i, c));
     }
   } else if (role === 'scale' || role === 'matrix_scale') {
@@ -589,11 +629,51 @@ function collectConfirmedColumns() {
       out.delimiter = el ? el.value : (c.delimiter || '，');
     }
 
+    const otherEnabledEl = document.querySelector(`[data-other-text-enabled="${i}"]`);
+    const otherTextEnabled = otherEnabledEl
+      ? otherEnabledEl.checked
+      : c.other_text?.enabled !== false;
+
     if (CHOICE_ROLES.includes(role)) {
-      const options = collectOptionsForColumn(i);
+      let options = collectOptionsForColumn(i);
+      let optionsOriginal = [...(c.options_original || c.options || [])];
+      const unmatchedValues = Array.isArray(c.unmatched_values) ? c.unmatched_values : [];
+      const addOption = value => {
+        const text = String(value || '').trim();
+        if (!text) return;
+        const exists = options.some(option => option.trim().toLocaleLowerCase() === text.toLocaleLowerCase());
+        if (!exists) options.push(text);
+        const originalExists = optionsOriginal.some(option => String(option || '').trim().toLocaleLowerCase() === text.toLocaleLowerCase());
+        if (!originalExists) optionsOriginal.push(text);
+      };
+      const standardResiduals = unmatchedValues.filter(item => item?.suggested_handling === 'standard_option');
+      const reviewResiduals = unmatchedValues.filter(item => item?.suggested_handling !== 'standard_option');
+      standardResiduals.forEach(item => addOption(item.value));
+      if (reviewResiduals.length) {
+        const handlingEl = document.querySelector(`[data-unmatched-handling="${i}"]`);
+        const handling = handlingEl?.value || 'keep_raw';
+        if (handling === 'as_option') {
+          reviewResiduals.forEach(item => addOption(item.value));
+        } else if (handling === 'as_other') {
+          const otherOption = 'Other / 其他';
+          addOption(otherOption);
+          out.other_text = {
+            enabled: true,
+            option: otherOption,
+            count: reviewResiduals.reduce((sum, item) => sum + Number(item.count || 0), 0),
+            examples: reviewResiduals.slice(0, 5).map(item => item.value),
+          };
+        }
+      }
+      // 关闭 Other 填空时移除系统补入的 Other 选项，避免后续统计仍把它
+      // 当作该题的标准选项；原始未识别值会按其真实值保留。
+      if (c.other_text && !otherTextEnabled) {
+        const otherOption = String(c.other_text.option || 'Other / 其他').trim().toLocaleLowerCase();
+        options = options.filter(option => option.trim().toLocaleLowerCase() !== otherOption);
+      }
       if (options.length) {
         out.options = options;
-        out.options_original = c.options_original || c.options || [];
+        out.options_original = optionsOriginal;
         const aliases = buildEditedOptionAliases(c, options);
         if (Object.keys(aliases).length) out.value_aliases = aliases;
       }
@@ -614,11 +694,10 @@ function collectConfirmedColumns() {
     if (!out.value_aliases && c.value_aliases && CHOICE_ROLES.includes(role)) {
       out.value_aliases = c.value_aliases;
     }
-    if ((role === 'single_choice' || role === 'multi_choice') && c.other_text) {
-      const enabledEl = document.querySelector(`[data-other-text-enabled="${i}"]`);
+    if ((role === 'single_choice' || role === 'multi_choice') && !out.other_text && c.other_text) {
       out.other_text = {
         ...c.other_text,
-        enabled: enabledEl ? enabledEl.checked : c.other_text.enabled !== false,
+        enabled: otherTextEnabled,
       };
     }
     return out;
