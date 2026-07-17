@@ -877,15 +877,10 @@ def _build_writer_context(stats_md: str, open_text: dict, plan: dict, headers: l
         joined_lines = []
         for entry in texts:
             ids = entry.get("ids", {})
-            mlbb_vals = [str(v).strip() for k, v in ids.items() if "mlbb" in str(k).casefold() and str(v).strip()]
-            player_vals = [str(v).strip() for k, v in ids.items() if "mlbb" not in str(k).casefold() and str(v).strip()]
-            id_parts = []
-            if player_vals:
-                id_parts.append(f"玩家ID={' / '.join(player_vals)}")
-            if mlbb_vals:
-                id_parts.append(f"MLBBID={' / '.join(mlbb_vals)}")
+            player_vals = [str(v).strip() for v in ids.values() if str(v).strip()]
+            player_id = f"玩家ID={' / '.join(player_vals)}" if player_vals else ""
             profile_str = " / ".join(f"{k}={v}" for k, v in entry.get("profile", {}).items())
-            prefix = " | ".join(filter(None, [" | ".join(id_parts), f"画像={profile_str}" if profile_str else ""]))
+            prefix = " | ".join(filter(None, [player_id, f"画像={profile_str}" if profile_str else ""]))
             text_val = entry.get("text", "")
             joined_lines.append(f"- {f'[{prefix}] ' if prefix else ''}{text_val}")
         joined = "\n".join(joined_lines)
@@ -904,10 +899,11 @@ def _build_writer_context(stats_md: str, open_text: dict, plan: dict, headers: l
             "不得使用问卷总样本替代。不同题干、不同使用程度人群的主观反馈不得直接比较高低。"
         )
     requirements += (
-        "\n\n补充：引用玩家原文时必须沿用 `<open_text>` 前缀里的玩家身份信息。"
-        "`玩家ID=...` 和 `MLBBID=...` 是两个独立身份字段，报告表格中要拆成 `玩家ID`、`MLBBID` 两列，单元格只放值。"
-        "如果出现 `MLBBID=123456(57001)`，括号内是区服编号，必须作为 MLBBID 的一部分展示，"
-        "不得拆到「画像信息」或其它列；只有 `<open_text>` 前缀里真的存在 `画像=...` 时，才展示画像信息。"
+        "\n\n补充：展示代表性玩家反馈时必须沿用 `<open_text>` 前缀里的玩家身份信息。"
+        "所有 Discord、WhatsApp、MLBBID 或其它来源的身份值都已统一放在 `玩家ID=...` 中，"
+        "报告表格只能使用一个 `玩家ID` 列，不得按来源拆列或改写表头。"
+        "只有 `<open_text>` 前缀里真的存在 `画像=...` 时才可填写画像；没有画像时使用 `—`，不得编造。"
+        "反馈表只能展示中文内容：中文回答原样展示，非中文回答翻译为中文，不得展示原始语言文本。"
     )
     return plan_summary, open_text_md, requirements
 
@@ -943,8 +939,11 @@ def _build_writer_part_query(part: dict) -> str:
         f"**本轮任务**：现在**只**写 `## Part {part['i']} {part['name']}` 这一个章节的完整内容"
         f"（涉及列：{part['col_desc']}）。\n"
         "严格按 <report_spec> 里对 Part 的写法：紧接 `## Part` 标题后先写一段详尽的「本节总结」段落（连贯文字、不用列表），"
-        "再按题目逐一展开；开放题归纳必须用 `### 题目名` 三级标题，其下用 `#### 正面观点`/`#### 负面观点`/`#### 中立 / 建议` 分组，"
-        "每个观点用 `**观点：短标题**` + `提及情况：` + `代表性原话：`（小表格）的固定结构，ID 展示规则照 <report_spec>。\n"
+        "再围绕本 Part 的业务 Topic 综合展开。同一 Topic 下的客观题与相关开放题必须结合分析，客观统计作为人群背景和判断依据，"
+        "主观反馈用于完整解释原因、情境、分歧与产品含义；不要按问卷题目逐题复述，也不要按正面/负面/中立机械拆分。"
+        "本章内部禁止使用任何 `###` 或 `####` 标题，内部分析维度和观点名称一律使用加粗正文。"
+        "每个观点使用 `**观点：短标题**`、完整观点说明、`提及情况：`、`**代表性玩家反馈：**` 的固定结构，"
+        "并附 1–5 条 `玩家ID | 画像信息 | 中文翻译` 表格证据；只展示中文翻译，不保留原始语言文本。\n"
         "**约束**：① 只输出这一个 Part，不要写其它 Part；② 不要写核心结论、不要写 Bug 模块；"
         "③ 不要重复前面已经写过的标题或章节；④ 所有数字、百分比必须逐字取自 <stats>，禁止重算或编造。"
     )
