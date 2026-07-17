@@ -151,38 +151,120 @@ def _drop_all_h1(md: str) -> str:
 
 
 def _prep_feishu_export_md(md: str, mode: str = "") -> str:
-    """Feishu export uses document title separately, so body must not contain H1."""
-    return _drop_all_h1(_prep_export_md(md, mode=mode))
+    """准备飞书专用 Markdown，不影响网页、Word、PDF 或 Markdown 下载。
+
+    飞书文档标题栏已经展示 H1，因此正文移除所有 H1；免责声明使用斜体引用，
+    核心结论的样本量单独使用引用，核心结论内部标题降为普通加粗文本，详细章节
+    则保留标题层级但去掉 ``Part X`` 这类实现性序号。
+    """
+    if not md:
+        return md
+
+    prepared = _inject_disclaimer(md, mode=mode)
+    has_core_markers = CORE_START in prepared and CORE_END in prepared
+    in_core = False
+    output: list[str] = []
+    disclaimer_texts = {
+        REPORT_DISCLAIMER.removeprefix("> ").strip(),
+        QUALITATIVE_DISCLAIMER.removeprefix("> ").strip(),
+        COMMENT_DISCLAIMER.removeprefix("> ").strip(),
+    }
+    sample_re = re.compile(r"^\s*>?\s*(本次调研共收集\s+\d+\s+份有效(?:回复|回答)。?)\s*$")
+    part_heading_re = re.compile(
+        r"^(#{2,6})\s+Part\s*\d+\s*[:：.、-]?\s*(.+?)\s*$",
+        re.IGNORECASE,
+    )
+
+    for line in prepared.splitlines():
+        stripped = line.strip()
+        if stripped == CORE_START:
+            in_core = True
+            continue
+        if stripped == CORE_END:
+            in_core = False
+            continue
+
+        if not has_core_markers:
+            if re.match(r"^##\s+核心结论\s*$", stripped):
+                in_core = True
+            elif in_core and re.match(r"^##\s+", stripped):
+                in_core = False
+
+        quote_text = stripped.removeprefix(">").strip()
+        if quote_text in disclaimer_texts:
+            output.append(f"> *{quote_text}*")
+            continue
+
+        if in_core:
+            sample_match = sample_re.match(stripped)
+            if sample_match:
+                output.append(f"> {sample_match.group(1)}")
+                continue
+            if stripped == "---":
+                continue
+            heading = re.match(r"^#{3,6}\s+(.+?)\s*$", stripped)
+            if heading:
+                title = heading.group(1).strip()
+                if title == "总体判断":
+                    continue
+                title = _clean_core_group_title(title)
+                output.append(f"**{title}**")
+                continue
+
+        part_heading = part_heading_re.match(stripped)
+        if part_heading and not in_core:
+            output.append(f"{part_heading.group(1)} {part_heading.group(2).strip()}")
+            continue
+        output.append(line)
+
+    return _drop_all_h1("\n".join(output))
+
+
+def _clean_core_group_title(title: str) -> str:
+    """把核心结论内的 ``Part X 标题：关键发现`` 清理为业务标题。"""
+    clean = re.sub(
+        r"^Part\s*\d+\s*[:：.、-]?\s*",
+        "",
+        str(title or "").strip(),
+        flags=re.IGNORECASE,
+    )
+    clean = re.sub(r"\s*[:：]\s*关键发现\s*$", "", clean)
+    return clean.strip() or str(title or "").strip()
 
 
 def _extract_feishu_callout_sections(md: str) -> list[dict]:
-    sections: list[dict] = []
-    core_lines = _extract_core_lines(md)
-    if core_lines:
-        sections.append({"title": "核心结论", "lines": core_lines, "occurrence": 1})
+    """提取核心结论正文，供导入后替换为飞书高亮块。
 
-    occurrence_counts: dict[str, int] = {}
-    lines = md.split("\n")
-    summary_re = re.compile(r"^(#{3,4})\s+(本章总结|本节总结|章节总结|本部分总结)\s*[:：]?\s*$")
-    i = 0
-    while i < len(lines):
-        match = summary_re.match(lines[i].strip())
-        if not match:
-            i += 1
-            continue
-        title = match.group(2)
-        level = len(match.group(1))
-        body: list[str] = []
-        i += 1
-        while i < len(lines):
-            heading = re.match(r"^(#{1,6})\s+", lines[i].strip())
-            if heading and len(heading.group(1)) <= level:
-                break
-            body.append(lines[i])
-            i += 1
-        occurrence_counts[title] = occurrence_counts.get(title, 0) + 1
-        sections.append({"title": title, "lines": body, "occurrence": occurrence_counts[title]})
-    return sections
+    样本量保留在高亮块外，因此这里不返回核心标题和样本量行；章节内的普通
+    ``本节总结`` 不属于用户要求的核心结论高亮范围，也不会被转换。
+    """
+    core_lines = _extract_core_lines(md)
+    if not core_lines:
+        lines = md.splitlines()
+        start = next(
+            (i for i, line in enumerate(lines) if re.match(r"^##\s+核心结论\s*$", line.strip())),
+            -1,
+        )
+        if start >= 0:
+            end = len(lines)
+            for i in range(start + 1, len(lines)):
+                if re.match(r"^##\s+", lines[i].strip()):
+                    end = i
+                    break
+            core_lines = [line for line in lines[start:end] if line.strip()]
+    if not core_lines:
+        return []
+
+    sample_re = re.compile(r"^\s*>?\s*本次调研共收集\s+\d+\s+份有效(?:回复|回答)。?\s*$")
+    body = [
+        line
+        for line in core_lines
+        if not re.match(r"^##\s+核心结论\s*$", line.strip())
+        and not sample_re.match(line.strip())
+    ]
+    if not any(line.strip() and line.strip() != "---" for line in body):
+        return []
+    return [{"title": "核心结论", "lines": body, "occurrence": 1}]
 
 
 def _add_formatted_run(paragraph, text: str):

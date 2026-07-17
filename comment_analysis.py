@@ -344,16 +344,16 @@ def _parse_excel_comments(content: bytes) -> tuple[list[str], str]:
 def parse_comment_file(file_bytes: bytes, filename: str) -> tuple[list[str], str]:
     """解析上传的评论文件，返回 (评论文本列表, 命中的列名)。
 
-    仅支持 .csv / .xlsx / .xls。自动定位评论列，提取文本并去首尾空白，
+    仅支持 .csv / .xlsx。自动定位评论列，提取文本并去首尾空白，
     跳过空单元格。不在此处做清洗（清洗交给 filter_comments）。
     """
     name_low = (filename or "").lower()
     if name_low.endswith(".csv"):
         return _parse_csv_comments(file_bytes)
-    elif name_low.endswith((".xlsx", ".xls")):
+    elif name_low.endswith(".xlsx"):
         return _parse_excel_comments(file_bytes)
     else:
-        raise ValueError("仅支持 CSV / Excel（.csv / .xlsx / .xls）文件")
+        raise ValueError("仅支持 CSV / Excel（.csv / .xlsx）文件")
 
 
 # ── 规则清洗 ──────────────────────────────────────────────
@@ -776,10 +776,10 @@ def preprocess_comment_file(path: str, filename: str, max_scan_rows: int = COMME
     name_low = (filename or "").lower()
     if name_low.endswith(".csv"):
         yield from _preprocess_csv_file(path, filename, max_scan_rows)
-    elif name_low.endswith((".xlsx", ".xls")):
+    elif name_low.endswith(".xlsx"):
         yield from _preprocess_excel_file(path, filename, max_scan_rows)
     else:
-        raise ValueError("仅支持 CSV / Excel（.csv / .xlsx / .xls）文件")
+        raise ValueError("仅支持 CSV / Excel（.csv / .xlsx）文件")
 
 
 # ── 分层随机抽样 ──────────────────────────────────────────

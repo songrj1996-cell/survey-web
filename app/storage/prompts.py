@@ -53,7 +53,7 @@ DEFAULT_PROMPTS: dict = {
         "editable": True,
         "current": DEFAULT_PLANNER_EXTRA,
         "history": [],
-        "version": 2,  # 改了默认值就 +1：未被用户编辑过的会自动升级
+        "version": 3,  # 改了默认值就 +1：未被用户编辑过的会自动升级
     },
     "dify_planner_system": {
         "key": "dify_planner_system",

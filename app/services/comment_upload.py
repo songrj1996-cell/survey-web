@@ -19,8 +19,8 @@ async def handle_comment_upload(
 ) -> dict:
     """校验上传文件、保存临时文件、创建 comment session，返回前端所需 result dict。"""
     suffix = Path(filename).suffix.lower()
-    if suffix not in {".csv", ".xlsx", ".xls"}:
-        raise HTTPException(status_code=400, detail="仅支持 CSV / Excel（.csv / .xlsx / .xls）文件")
+    if suffix not in {".csv", ".xlsx"}:
+        raise HTTPException(status_code=400, detail="仅支持 CSV / Excel（.csv / .xlsx）文件")
     if not content:
         raise HTTPException(status_code=400, detail="文件为空")
     post_title = (post_title or "").strip()

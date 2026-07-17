@@ -10,13 +10,20 @@ const annState = {
   idCol: 1,
   openTextCols: [],
   matrixColIdxs: new Set(),
+  emptyColIdxs: new Set(),
   tasks: { ai_detect: false, quality: false },
   aiResults: [],
   highProbResults: [],
+  reviewAiResults: [],
+  aiReviewThreshold: 60,
+  aiHighThreshold: 80,
+  aiConfirmationComplete: false,
   confirmedAiIds: new Set(),
+  qualityResults: [],
   qualityCount: 0,
   missingAiIds: [],
   missingQualityIds: [],
+  missingTranslationIds: [],
 };
 
 function annGoStep(n) {
@@ -71,13 +78,25 @@ async function annHandleUpload(file) {
     annState.idCol = data.id_col;
     annState.openTextCols = data.open_text_cols;
     annState.matrixColIdxs = new Set(data.matrix_col_idxs || []);
+    annState.emptyColIdxs = new Set(data.empty_col_idxs || []);
 
     $('ann-preview-meta').textContent =
       `${data.filename} · ${data.total_rows} 行数据 · ${data.headers.length} 列`;
 
-    annRenderColConfig(data.headers, data.id_col, data.open_text_cols, data.headers_zh || data.headers, new Set(data.matrix_col_idxs || []));
+    annRenderColConfig(
+      data.headers,
+      data.id_col,
+      data.open_text_cols,
+      data.headers_zh || data.headers,
+      new Set(data.matrix_col_idxs || []),
+      new Set(data.empty_col_idxs || []),
+    );
     annGoStep(2);
-    showToast(`成功读取 ${data.total_rows} 行数据`, 'success');
+    if (data.header_translation_warning) {
+      showToast(data.header_translation_warning, 'error');
+    } else {
+      showToast(`成功读取 ${data.total_rows} 行数据`, 'success');
+    }
   } catch (e) {
     showToast(`上传失败：${e.message}`, 'error');
     annResetUploadZone();
@@ -101,20 +120,22 @@ function annResetUploadZone() {
 
 // ── ANN STEP 2: 列确认 + 任务 ──────────────────────────────
 
-function annRenderColConfig(headers, idCol, openTextCols, headersZh, matrixIdxs) {
+function annRenderColConfig(headers, idCol, openTextCols, headersZh, matrixIdxs, emptyColIdxs) {
   const zh = headersZh || headers;
   const otSet = new Set(openTextCols);
   const mxSet = matrixIdxs || new Set();
+  const emptySet = emptyColIdxs || new Set();
   const container = $('ann-col-config');
 
   // ID 列选择（显示中文名，排除矩阵子列）
-  const idOpts = headers.map((h, i) =>
-    `<option value="${i}" ${i === idCol ? 'selected' : ''}>${i}: ${esc(zh[i] || h)}</option>`
-  ).join('');
+  const idOpts = headers.map((h, i) => {
+    if (emptySet.has(i)) return '';
+    return `<option value="${i}" ${i === idCol ? 'selected' : ''}>${i}: ${esc(zh[i] || h)}</option>`;
+  }).join('');
 
   // 主观题列多选——每行一题，矩阵子列隐藏
   const otRows = headers.map((h, i) => {
-    if (mxSet.has(i)) return '';   // 矩阵子列不显示
+    if (mxSet.has(i) || emptySet.has(i)) return '';
     const zhName = zh[i] || h;
     const hasDiff = zhName !== h;
     return `
@@ -217,7 +238,8 @@ async function annStartAnnotation() {
   $('ann-btn-start').disabled = true;
   annState.missingAiIds = [];
   annState.missingQualityIds = [];
-  $('ann-btn-download').disabled = false;
+  annState.missingTranslationIds = [];
+  $('ann-btn-download').disabled = true;
   // 读取最新 id_col
   const idColSel = $('ann-id-col-sel');
   if (idColSel) annState.idCol = +idColSel.value;
@@ -239,7 +261,10 @@ async function annStartAnnotation() {
     }
     annState.aiResults = [];
     annState.highProbResults = [];
+    annState.reviewAiResults = [];
+    annState.aiConfirmationComplete = false;
     annState.confirmedAiIds = new Set();
+    annState.qualityResults = [];
     annState.qualityCount = 0;
 
     if (annState.tasks.ai_detect) {
@@ -266,14 +291,11 @@ async function annRunAiDetect() {
     backBtn = document.createElement('button');
     backBtn.id = 'ann-btn-ai-back';
     backBtn.className = 'btn btn--ghost';
-    backBtn.textContent = '返回任务选择';
+    backBtn.textContent = '重试 AI 识别';
     warnLog.insertAdjacentElement('afterend', backBtn);
   }
   backBtn.style.display = 'none';
-  backBtn.onclick = () => {
-    $('ann-btn-start').disabled = false;
-    annGoStep(2);
-  };
+  backBtn.onclick = () => annRunAiDetect();
   const appendAiLog = (text, type = 'warn') => {
     const div = document.createElement('div');
     div.className = `ann-warn-item ann-warn-item--${type}`;
@@ -283,6 +305,7 @@ async function annRunAiDetect() {
   bar.style.width = '0%';
   msg.textContent = '正在连接…';
   warnLog.innerHTML = '';
+  annState.missingTranslationIds = [];
   const diagnostics = [];
 
   try {
@@ -322,17 +345,34 @@ async function annRunAiDetect() {
         bar.style.width = '100%';
         const results = ev.results || [];
         const missingIds = ev.missing_ids || [];
+        const missingTranslationIds = ev.missing_translation_ids || [];
         annState.aiResults = results;
         annState.highProbResults = ev.high_prob || [];
+        annState.reviewAiResults = ev.review_results || annState.highProbResults;
+        annState.aiReviewThreshold = ev.review_threshold ?? annState.aiReviewThreshold;
+        annState.aiHighThreshold = ev.high_threshold ?? annState.aiHighThreshold;
+        annState.aiConfirmationComplete = !!ev.confirmation_complete;
         annState.missingAiIds = missingIds;
+        annState.missingTranslationIds = missingTranslationIds;
         if (missingIds.length > 0) {
-          msg.textContent = `AI 检测完成，共 ${results.length} 条结果（${missingIds.length} 行重试后仍未回填）`;
-          appendAiLog(`重试后仍有 ${missingIds.length} 行无法回填，下载已被阻断。涉及 ID：${missingIds.slice(0, 5).join(', ')}${missingIds.length > 5 ? '…' : ''}`, 'error');
+          msg.textContent = `AI 识别未完成：${results.length} 条有效结果，仍有 ${missingIds.length} 行未回填`;
+          appendAiLog(`仍有 ${missingIds.length} 行没有得到完整结果，已停止后续质量打标。请重试 AI 识别。`, 'error');
+        } else if (missingTranslationIds.length > 0) {
+          msg.textContent = `AI 识别完成，共 ${results.length} 条结果；${missingTranslationIds.length} 行中文翻译待补齐`;
+          appendAiLog(
+            `AI 判断结果均已保留，仍有 ${missingTranslationIds.length} 行译文待补齐。后续质量打标会继续尝试修复。`,
+          );
         } else {
           msg.textContent = `AI 检测完成，共 ${results.length} 条结果`;
         }
       }
     });
+
+    if (annState.missingAiIds.length > 0) {
+      backBtn.style.display = '';
+      showToast('AI 识别结果不完整，已停止后续任务', 'error');
+      return;
+    }
 
     // 有高概率结果 → 跳到确认步
     if (annState.aiResults.length === 0) {
@@ -345,11 +385,11 @@ async function annRunAiDetect() {
       return;
     }
 
-    if (annState.highProbResults.length > 0) {
-      annRenderAiConfirm(annState.highProbResults);
+    if (annState.reviewAiResults.length > 0 && !annState.aiConfirmationComplete) {
+      annRenderAiConfirm(annState.reviewAiResults);
       annGoStep(4);
     } else {
-      showToast('未发现高概率 AI 作答（≥ 80%），自动跳过确认步骤', 'info');
+      showToast(`未发现需要复核的 AI 作答（≥ ${annState.aiReviewThreshold}%），自动跳过确认步骤`, 'info');
       await annAfterAiConfirm();
     }
   } catch (e) {
@@ -362,22 +402,22 @@ async function annRunAiDetect() {
 
 // ── ANN STEP 4: AI 确认 ────────────────────────────────────
 
-function annRenderAiConfirm(highProbResults) {
+function annRenderAiConfirm(reviewResults) {
   const table = $('ann-confirm-table');
   const headers = annState.headers;
   const otCols = annState.openTextCols;
 
   // 构建表头
-  let thCells = `<th class="ann-th-check"><input type="checkbox" id="ann-check-master" checked /></th>
-    <th class="ann-th-id">玩家 ID</th><th class="ann-th-prob">AI 概率</th><th class="ann-th-polish">润色程度</th><th class="ann-th-fixed">判断理由</th><th class="ann-th-fixed">关键证据</th>`;
+  let thCells = `<th class="ann-th-check"><input type="checkbox" id="ann-check-master" /></th>
+    <th class="ann-th-id">玩家 ID</th><th class="ann-th-prob">内容生成概率</th><th class="ann-th-polish">润色概率</th><th class="ann-th-fixed">判断理由</th><th class="ann-th-fixed">AI 支持证据</th><th class="ann-th-fixed">反向证据</th>`;
   for (const ci of otCols) {
     const hdr = headers[ci] || `列${ci}`;
     thCells += `<th class="ann-th-fixed">${esc(hdr)}（原文）</th><th class="ann-th-fixed">${esc(hdr)}（中文译）</th>`;
   }
 
   let rows = '';
-  highProbResults.forEach((r, i) => {
-    const checked = 'checked';
+  reviewResults.forEach((r, i) => {
+    const checked = r.ai_prob >= annState.aiHighThreshold ? 'checked' : '';
     let tdCols = '';
     for (const ci of otCols) {
       const key = `col_${ci}`;
@@ -390,9 +430,10 @@ function annRenderAiConfirm(highProbResults) {
       <td><input type="checkbox" class="ann-ai-check" data-id="${esc(r.id)}" ${checked} /></td>
       <td class="ann-cell-id">${esc(r.id)}</td>
       <td class="ann-cell-prob">${r.ai_prob}%</td>
-      <td class="ann-cell-polish">${esc(r.is_polished || '')}</td>
+      <td class="ann-cell-polish">${r.polish_prob}%</td>
       <td class="ann-cell-reason ann-cell-fixed">${esc(r.reason || '')}</td>
       <td class="ann-cell-evidence ann-cell-fixed">${esc(r.evidence || '')}</td>
+      <td class="ann-cell-evidence ann-cell-fixed">${esc(r.counter_evidence || '')}</td>
       ${tdCols}
     </tr>`;
   });
@@ -405,7 +446,7 @@ function annRenderAiConfirm(highProbResults) {
   });
 
   $('ann-confirm-desc').textContent =
-    `以下 ${highProbResults.length} 位受访者 AI 作答概率 ≥ 80%，请逐行确认是否标注为 AI 作答`;
+    `以下 ${reviewResults.length} 位玩家的内容生成概率 ≥ ${annState.aiReviewThreshold}%。达到 ${annState.aiHighThreshold}% 的已默认勾选；润色概率不参与违规判断。`;
 }
 
 $('ann-btn-check-all').addEventListener('click', () => {
@@ -429,6 +470,7 @@ $('ann-btn-confirm-ai').addEventListener('click', async () => {
       const d = await resp.json();
       throw new Error(d.detail || '保存失败');
     }
+    annState.aiConfirmationComplete = true;
     showToast(`已确认 ${checked.length} 位 AI 作答受访者`, 'success');
     await annAfterAiConfirm();
   } catch (e) {
@@ -440,6 +482,11 @@ async function annAfterAiConfirm() {
   if (annState.tasks.quality) {
     annGoStep(5);
     await annRunQuality();
+  } else if (annState.missingTranslationIds.length > 0) {
+    annGoStep(3);
+    const retryBtn = $('ann-btn-ai-back');
+    if (retryBtn) retryBtn.style.display = '';
+    showToast('AI 判断已完成，但中文翻译仍不完整，请重试补齐后再下载', 'error');
   } else {
     annGoStep(6);
     annShowDone();
@@ -452,6 +499,16 @@ async function annRunQuality() {
   const bar = $('ann-quality-progress-bar');
   const msg = $('ann-quality-progress-msg');
   const warnLog = $('ann-quality-warn-log');
+  let retryBtn = $('ann-btn-quality-retry');
+  if (!retryBtn) {
+    retryBtn = document.createElement('button');
+    retryBtn.id = 'ann-btn-quality-retry';
+    retryBtn.className = 'btn btn--ghost';
+    retryBtn.textContent = '重试质量打标';
+    retryBtn.onclick = () => annRunQuality();
+    warnLog.insertAdjacentElement('afterend', retryBtn);
+  }
+  retryBtn.style.display = 'none';
   bar.style.width = '0%';
   msg.textContent = '正在连接…';
   warnLog.innerHTML = '';
@@ -472,15 +529,30 @@ async function annRunQuality() {
       if (ev.type === 'quality_done') {
         bar.style.width = '100%';
         const missingQIds = ev.missing_ids || [];
+        const missingTranslationIds = ev.missing_translation_ids || [];
         annState.qualityCount = ev.count;
+        annState.qualityResults = ev.results || [];
         annState.missingQualityIds = missingQIds;
+        annState.missingTranslationIds = missingTranslationIds;
         if (missingQIds.length > 0) {
           msg.textContent = `质量打标完成，共 ${ev.count} 条结果（${missingQIds.length} 行重试后仍未回填）`;
+        } else if (missingTranslationIds.length > 0) {
+          msg.textContent = `质量打标完成，共 ${ev.count} 条结果；${missingTranslationIds.length} 行中文翻译仍待补齐`;
         } else {
           msg.textContent = `质量打标完成，共 ${ev.count} 条结果`;
         }
       }
     });
+    if (annState.missingQualityIds.length > 0 || annState.missingTranslationIds.length > 0) {
+      retryBtn.style.display = '';
+      showToast(
+        annState.missingQualityIds.length > 0
+          ? '质量打标结果不完整，已停留在当前步骤'
+          : '中文翻译仍不完整，请重试补齐后再下载',
+        'error',
+      );
+      return;
+    }
     annGoStep(6);
     annShowDone();
   } catch (e) {
@@ -490,31 +562,91 @@ async function annRunQuality() {
 
 // ── ANN STEP 6: 完成 ─────────────────────────────────────
 
-function annShowDone() {
-  const parts = [];
+function annBuildDoneSummary() {
+  const totalCount = annState.tasks.ai_detect
+    ? annState.aiResults.length
+    : annState.qualityCount;
+  const lines = [
+    `<div class="ann-summary-title">完成共 ${totalCount} 条反馈的标注</div>`,
+  ];
   if (annState.tasks.ai_detect) {
-    parts.push(`AI 作答识别：${annState.aiResults.length} 条，${annState.confirmedAiIds.size} 位确认为 AI 作答`);
+    lines.push(
+      `<div class="ann-summary-line">AI 识别结果：${annState.reviewAiResults.length} 条进入人工复核，${annState.confirmedAiIds.size} 位确认高概率 AI</div>`
+    );
   }
   if (annState.tasks.quality) {
-    parts.push(`质量打标：${annState.qualityCount} 条`);
+    const counts = { '优秀反馈': 0, '普通反馈': 0, '无效反馈': 0 };
+    annState.qualityResults.forEach(result => {
+      if (Object.hasOwn(counts, result.overall)) counts[result.overall] += 1;
+    });
+    lines.push(
+      `<div class="ann-summary-line">质量打标结果：优秀反馈 ${counts['优秀反馈']} 条，普通反馈 ${counts['普通反馈']} 条，无效反馈 ${counts['无效反馈']} 条</div>`
+    );
   }
+  return lines.join('');
+}
+
+function annShowDone() {
+  const summary = annBuildDoneSummary();
   const missingAi = annState.missingAiIds || [];
   const missingQ = annState.missingQualityIds || [];
+  const missingTranslations = annState.missingTranslationIds || [];
   const missingParts = [];
   if (missingAi.length) missingParts.push(`AI 检测漏返 ${missingAi.length} 行`);
   if (missingQ.length) missingParts.push(`质量打标漏返 ${missingQ.length} 行`);
+  if (missingTranslations.length) missingParts.push(`中文翻译缺失 ${missingTranslations.length} 行`);
   if (missingParts.length) {
     $('ann-done-text').innerHTML =
-      parts.join('<br>') +
-      `<br><span style="color:#d32f2f;font-weight:600;">⚠ 结果不完整：${missingParts.join('；')}，下载已被阻断。请返回对应任务重试。</span>`;
+      summary +
+      `<div class="ann-summary-error">结果不完整：${missingParts.join('；')}，下载已被阻断。请返回对应任务重试。</div>`;
     $('ann-btn-download').disabled = true;
     showToast('部分行未能回填，下载已被阻断', 'error');
   } else {
-    $('ann-done-text').innerHTML = parts.join('<br>');
+    $('ann-done-text').innerHTML = summary;
     $('ann-btn-download').disabled = false;
-    showToast('所有标注任务完成！', 'success');
+    annRenderQualityPreview();
+    showToast('标注完成，请预览结果后下载', 'success');
   }
 }
+
+function annRenderQualityPreview() {
+  const block = $('ann-quality-preview-block');
+  const table = $('ann-quality-preview-table');
+  if (!annState.tasks.quality || annState.qualityResults.length === 0) {
+    block.hidden = true;
+    return;
+  }
+  block.hidden = false;
+  const filter = $('ann-quality-filter').value;
+  const results = annState.qualityResults.filter(result => filter === 'all' || result.overall === filter);
+  $('ann-quality-filter-count').textContent = `${results.length} 位玩家`;
+
+  let headers = '<th class="ann-th-id">玩家 ID</th><th class="ann-col-overall">整体质量</th><th class="ann-col-reason">整体原因</th>';
+  for (const col of annState.openTextCols) {
+    const title = annState.headersZh[col] || annState.headers[col] || `列${col}`;
+    headers += `<th class="ann-col-label">${esc(title)} · 标签</th><th class="ann-col-reason">判断依据</th><th class="ann-col-response">回答原文 / 中文</th>`;
+  }
+  const rows = results.map(result => {
+    let cells = `<td class="ann-cell-id">${esc(result.id)}</td><td class="ann-quality-overall ann-col-overall">${esc(result.overall || '')}</td><td class="ann-col-reason">${esc(result.overall_reason || '')}</td>`;
+    for (const col of annState.openTextCols) {
+      const key = `col_${col}`;
+      const label = (result.q_labels || {})[key] || 'N/A';
+      const reason = (result.q_reasons || {})[key] || '';
+      const evidence = (result.q_evidence || {})[key] || '';
+      const original = (result.originals || {})[key] || '';
+      const translated = (result.translations || {})[key] || '';
+      cells += `<td class="ann-col-label"><span class="ann-quality-label-readonly">${esc(label)}</span></td>
+        <td class="ann-col-reason"><div class="ann-reason-text">${esc(reason)}</div>${evidence ? `<div class="ann-review-evidence"><span>证据</span>${esc(evidence)}</div>` : ''}</td>
+        <td class="ann-col-response"><div class="ann-response-original">${esc(original)}</div>${translated && translated !== original ? `<div class="ann-cell-trans"><span>中文</span>${esc(translated)}</div>` : ''}</td>`;
+    }
+    return `<tr data-id="${esc(result.id)}">${cells}</tr>`;
+  }).join('');
+  table.innerHTML = `<thead><tr>${headers}</tr></thead><tbody>${rows || '<tr><td>当前筛选没有结果</td></tr>'}</tbody>`;
+}
+
+$('ann-quality-filter').addEventListener('change', () => {
+  annRenderQualityPreview();
+});
 
 $('ann-btn-download').addEventListener('click', () => {
   window.location.href = `/api/annotate/${annState.sessionId}/download`;
@@ -530,11 +662,15 @@ $('ann-btn-restart').addEventListener('click', () => {
   annState.tasks = { ai_detect: false, quality: false };
   annState.aiResults = [];
   annState.highProbResults = [];
+  annState.reviewAiResults = [];
+  annState.aiConfirmationComplete = false;
   annState.confirmedAiIds = new Set();
+  annState.qualityResults = [];
   annState.qualityCount = 0;
   annState.missingAiIds = [];
   annState.missingQualityIds = [];
-  $('ann-btn-download').disabled = false;
+  annState.missingTranslationIds = [];
+  $('ann-btn-download').disabled = true;
   $('task-ai-detect').checked = false;
   $('task-quality').checked = false;
   $('ann-background').value = '';

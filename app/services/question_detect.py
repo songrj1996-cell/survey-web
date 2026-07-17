@@ -21,6 +21,114 @@ ROLE_LABEL_MAP = {
 
 LABEL_ROLE_MAP = {v: k for k, v in ROLE_LABEL_MAP.items()}
 
+_LIST_DELIMITERS = (",", "，", ";", "；", "、", "|")
+
+
+def _choice_key(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip().casefold()
+
+
+def _split_short_choice_list(value: str) -> tuple[str | None, list[str]]:
+    """拆分疑似多选单元格，只接受由短选项组成的列表。"""
+    text = str(value or "").strip()
+    for delimiter in _LIST_DELIMITERS:
+        if delimiter not in text:
+            continue
+        parts = [part.strip() for part in text.split(delimiter) if part.strip()]
+        if len(parts) >= 2 and all(len(part) < 50 for part in parts):
+            return delimiter, parts
+    return None, []
+
+
+def _choice_structure(values: list[str]) -> dict | None:
+    """从答卷结构中识别有足够证据的单选或多选题。
+
+    只有多个回答共享至少两个短选项时，才把带分隔符的文本当作多选，
+    避免将开放题里的逗号列举误判为选择题。
+    """
+    non_empty = [str(value).strip() for value in values if str(value).strip()]
+    total = len(non_empty)
+    if total < 5:
+        return None
+
+    delimiter_counts: Counter = Counter()
+    part_counts: Counter = Counter()
+    part_originals: dict[str, str] = {}
+    row_part_keys: list[list[str]] = []
+    for value in non_empty:
+        delimiter, parts = _split_short_choice_list(value)
+        if not parts:
+            continue
+        delimiter_counts[delimiter] += 1
+        keys: list[str] = []
+        for part in parts:
+            key = _choice_key(part)
+            if not key:
+                continue
+            part_counts[key] += 1
+            part_originals.setdefault(key, part)
+            keys.append(key)
+        if keys:
+            row_part_keys.append(keys)
+
+    if row_part_keys:
+        repeated_keys = {key for key, count in part_counts.items() if count >= 2}
+        repeated_rows = sum(
+            1 for keys in row_part_keys if any(key in repeated_keys for key in keys)
+        )
+        list_ratio = len(row_part_keys) / total
+        repeated_ratio = repeated_rows / len(row_part_keys)
+        if list_ratio >= 0.45 and len(repeated_keys) >= 2 and repeated_ratio >= 0.65:
+            options: list[str] = []
+            seen: set[str] = set()
+            for keys in row_part_keys:
+                for key in keys:
+                    if key in repeated_keys and key not in seen:
+                        seen.add(key)
+                        options.append(part_originals[key])
+            return {
+                "role": "multi_choice",
+                "options": options,
+                "delimiter": delimiter_counts.most_common(1)[0][0],
+            }
+
+    value_counts: Counter = Counter(_choice_key(value) for value in non_empty)
+    repeated_values = {key for key, count in value_counts.items() if count >= 2}
+    repeated_coverage = sum(value_counts[key] for key in repeated_values) / total
+    if len(repeated_values) >= 2 and repeated_coverage >= 0.65:
+        options: list[str] = []
+        seen: set[str] = set()
+        for value in non_empty:
+            key = _choice_key(value)
+            if key in repeated_values and key not in seen:
+                seen.add(key)
+                options.append(value)
+        return {"role": "single_choice", "options": options}
+
+    return None
+
+
+def _reconcile_question_roles(rows: list[list], questions: list[dict]) -> list[dict]:
+    """用强结构证据校正 LLM 把选择题误判为开放题的结果。"""
+    body = rows[1:]
+    for question in questions:
+        if question.get("role") != "open_text":
+            continue
+        indexes = question.get("column_indexes") or []
+        if len(indexes) != 1 or not isinstance(indexes[0], int):
+            continue
+        index = indexes[0]
+        values = [str(row[index]) if index < len(row) else "" for row in body]
+        structure = _choice_structure(values)
+        if not structure:
+            continue
+        question["role"] = structure["role"]
+        question["options"] = structure["options"]
+        question["low_confidence"] = True
+        if structure["role"] == "multi_choice":
+            question["delimiter"] = structure["delimiter"]
+    return questions
+
 
 def _heuristic_type(header: str, values: list[str]) -> str:
     h = header.lower().strip()
@@ -50,23 +158,15 @@ def _heuristic_type(header: str, values: list[str]) -> str:
         if mx - mn <= 15 and mn >= 0:
             return "scale"
 
-    # ── 长文本优先判断（避免后续规则误伤）──
+    # ── 有重复选项结构时，优先于文本长度判定 ──
+    structure = _choice_structure(non_empty)
+    if structure:
+        return structure["role"]
+
+    # ── 长文本主观回答 ──
     avg_len = sum(len(v) for v in non_empty) / total
     if avg_len > 25:
         return "open_text"
-
-    # ── 多选（分隔符检测：只认短片段列表，排除句子中的标点）──
-    delimiters = [",", "，", ";", "；", "、", "|"]
-    def _is_list(v: str) -> bool:
-        for d in delimiters:
-            if d in v:
-                parts = [p.strip() for p in v.split(d) if p.strip()]
-                if len(parts) >= 2 and all(len(p) < 30 for p in parts):
-                    return True
-        return False
-    delim_count = sum(1 for v in non_empty if _is_list(v))
-    if delim_count / total > 0.25:
-        return "multi_choice"
 
     # ── 唯一值数量 ──
     unique_vals = set(non_empty)
@@ -288,23 +388,32 @@ def _split_option_cell(
             if not known:
                 return [p.strip() for p in parts if p.strip()]
 
+            def match_at(start: int) -> tuple[str, int] | None:
+                for end in range(len(parts), start, -1):
+                    candidate = d.join(parts[start:end]).strip()
+                    if _norm_option_key(candidate) in known:
+                        return candidate, end
+                return None
+
             out: list[str] = []
             i = 0
             while i < len(parts):
                 if not parts[i].strip():
                     i += 1
                     continue
-                matched = False
-                for j in range(len(parts), i, -1):
-                    candidate = d.join(parts[i:j]).strip()
-                    if _norm_option_key(candidate) in known:
-                        out.append(candidate)
-                        i = j
-                        matched = True
-                        break
-                if not matched:
-                    out.append(parts[i].strip())
-                    i += 1
+                matched = match_at(i)
+                if matched:
+                    candidate, i = matched
+                    out.append(candidate)
+                    continue
+
+                end = i + 1
+                while end < len(parts) and match_at(end) is None:
+                    end += 1
+                unknown = d.join(parts[i:end]).strip()
+                if unknown:
+                    out.append(unknown)
+                i = end
             return out
     return [text]
 

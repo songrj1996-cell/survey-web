@@ -14,6 +14,7 @@ from app.core.config import (
     DIFY_THEME_MERGE_KEY,
     OTHER_THEME_PCT,
 )
+from app.services.branch_logic import branch_rule_for_column, branch_rule_label
 from app.services.question_detect import ROLE_LABEL_MAP
 from app.storage.prompts import _get_planner_extra, _get_writer_requirements
 
@@ -57,6 +58,47 @@ def _has_business_context(qualitative_context: dict | None) -> bool:
     return any(str(qualitative_context.get(key, "") or "").strip() for key, _ in _QUALITATIVE_CONTEXT_LABELS)
 
 
+def _build_branch_logic_block(branch_rules: list[dict] | None) -> str:
+    """构造供 Planner/Writer 共用的精简跳转关系上下文。"""
+    if not branch_rules:
+        return ""
+    lines = []
+    for rule in branch_rules:
+        confidence = "高置信度跳转" if rule.get("confidence") == "high" else "疑似条件关系"
+        options = " / ".join(str(option) for option in rule.get("allowed_options") or [])
+        targets = []
+        for target in rule.get("targets") or []:
+            answered = target.get("answered_count")
+            suffix = f"（{answered} 条有效回答）" if isinstance(answered, int) else ""
+            targets.append(f"「{target.get('name') or '未命名题目'}」{suffix}")
+        lines.append(
+            f"- [{confidence}]「{rule.get('parent_name') or '前置题'}」选择「{options}」"
+            f"（进入分支 {rule.get('eligible_count', '?')} 人）→ {'、'.join(targets)}"
+        )
+    return (
+        "<question_branch_logic>\n"
+        "以下关系由全量回答的非空分布与题目结构共同推断：\n"
+        + "\n".join(lines)
+        + "\n\n严格使用规则：\n"
+        "1. 同一父题及其[高置信度跳转]后续题应优先放在同一 Part，形成清晰的父题—分支大纲；不同分支必须分开分析，不得合并回答池或混用分母。只有报告结构确有需要时才拆到不同 Part。\n"
+        "2. 分支题结论必须写明适用人群；人数/占比以进入该分支人数或该题有效回答数为分母，不得使用问卷总样本。\n"
+        "3. 不得把不同题干、不同使用程度人群的主观反馈直接比较为高低；总体使用程度优先依据父级选择题。\n"
+        "4. 对[疑似条件关系]不得声称原表单配置了跳转，只能表述为“当前回答分布主要来自该人群”，但仍应与其他人群分开归纳。\n"
+        "5. 未列入此块的题目不要自行猜测跳转关系。\n"
+        "</question_branch_logic>"
+    )
+
+
+def _branch_note_for_column(plan: dict, column_index: int) -> str:
+    rule = branch_rule_for_column(plan.get("branch_rules"), column_index)
+    return branch_rule_label(rule, column_index) if rule else ""
+
+
+def _question_name_with_branch(name: str, plan: dict, column_index: int) -> str:
+    note = _branch_note_for_column(plan, column_index)
+    return f"{name}【{note}】" if note else name
+
+
 def _build_planner_sample(rows: list[list], sample_n: int = 5) -> str:
     if not rows:
         return ""
@@ -86,6 +128,7 @@ def _build_planner_query_with_confirmed(
     rows: list[list],
     confirmed_columns: list[dict],
     qualitative_context: dict | None = None,
+    branch_rules: list[dict] | None = None,
 ) -> str:
     """构建给 Planner 的完整 query，含用户确认的题型（逻辑题，矩阵题跨多列）。"""
     sample_md = _build_planner_sample(rows)
@@ -145,6 +188,7 @@ def _build_planner_query_with_confirmed(
         f"选项的归并方式（哪个原始值归入哪个标准选项）同样已由用户在界面中逐一确认，**不得**在 open_questions 中就选项归并或分拆方式再次提问。"
         f"矩阵题的多个列号务必整体归入同一个 part。"
         f"{profile_constraint}\n"
+        f"{_build_branch_logic_block(branch_rules)}\n"
         f"{extra_instructions}"
         f"{_build_business_context_block(qualitative_context, '用于辅助规划章节结构和分析重点')}"
     )
@@ -156,6 +200,7 @@ def _build_plan_revision_query(
     confirmed_columns: list[dict],
     user_text: str,
     qualitative_context: dict | None = None,
+    branch_rules: list[dict] | None = None,
 ) -> str:
     header_lines = "\n".join(f"- 列{i}: {h}" for i, h in enumerate(headers))
     confirmed_json = json.dumps(confirmed_columns or [], ensure_ascii=False, indent=2)
@@ -171,6 +216,7 @@ def _build_plan_revision_query(
         f"<headers>\n{header_lines}\n</headers>\n\n"
         f"<confirmed_columns_json>\n{confirmed_json}\n</confirmed_columns_json>\n\n"
         f"<current_plan_json>\n{plan_json}\n</current_plan_json>\n\n"
+        f"{_build_branch_logic_block(branch_rules)}\n\n"
         f"<user_revision_request>\n{user_text.strip()}\n</user_revision_request>"
         f"{_build_business_context_block(qualitative_context, '用于辅助判断调整章节/分析重点')}\n\n"
         "请现在返回修订后的完整 JSON 对象。"
@@ -304,6 +350,7 @@ async def _batch_qualitative_analysis(
             headers[col_idx] if col_idx < len(headers) else f"列{col_idx}"
         )
         col_name = f"{col_name}{_open_text_source_note(entries)}"
+        col_name = _question_name_with_branch(col_name, plan, col_idx)
         total = len(entries)
         yield ("progress", f"【{col_name}】开始分析（共 {total} 条）")
 
@@ -638,6 +685,8 @@ def _build_open_text_fallback_md(
         name = (col and col.get("name")) or (
             headers[col_idx] if isinstance(col_idx, int) and col_idx < len(headers) else f"列{raw_idx}"
         )
+        if isinstance(col_idx, int):
+            name = _question_name_with_branch(name, plan, col_idx)
         lines = [f"### {name}（列 {raw_idx}，共 {len(entries)} 条非空回答；以下为抽样原文）"]
         name = f"{name}{_open_text_source_note(entries)}"
         lines[0] = f"### {name} (col {raw_idx}, {len(entries)} responses; sampled raw text)"
@@ -687,6 +736,7 @@ def _build_large_sample_writer_query(
             scope = p.get("scope", "")
             parts_lines.append(f"  Part {i} {p['name']}" + (f": {scope}" if scope else ""))
     plan_summary = "<plan>\n报告结构：\n" + "\n".join(parts_lines) + "\n</plan>"
+    branch_logic_block = _build_branch_logic_block(plan.get("branch_rules"))
 
     theme_blocks = []
     for col_idx, data in clustered_themes.items():
@@ -733,12 +783,18 @@ def _build_large_sample_writer_query(
 
     return (
         "**任务**：基于以下大样本问卷分析结果撰写调研报告。\n\n"
-        f"{plan_summary}\n\n"
-        f"<stats>\n{stats_md}\n</stats>\n\n"
-        f"{priority_block}"
-        f"{open_text_md}\n\n"
+        + f"{plan_summary}\n\n"
+        + (f"{branch_logic_block}\n\n" if branch_logic_block else "")
+        + f"<stats>\n{stats_md}\n</stats>\n\n"
+        + f"{priority_block}"
+        + f"{open_text_md}\n\n"
         + (f"{fallback_md}\n\n" if fallback_md else "")
         + f"**要求**：\n{requirements}"
+        + (
+            "\n- 必须执行 `<question_branch_logic>`：分支题按适用人群分别归纳，"
+            "不得合并不同分支的回答池或使用问卷总样本作为分母。"
+            if branch_logic_block else ""
+        )
         + _build_business_context_block(qualitative_context, "用于辅助分析重点和建议方向")
     )
 
@@ -808,12 +864,16 @@ def _build_writer_context(stats_md: str, open_text: dict, plan: dict, headers: l
     parts_meta = _writer_parts_meta(plan, headers)
     parts_lines = [f"  Part {m['i']} {m['name']}: {m['col_desc']}" for m in parts_meta]
     plan_summary = "<plan>\n报告结构：\n" + "\n".join(parts_lines) + "\n</plan>"
+    branch_logic_block = _build_branch_logic_block(plan.get("branch_rules"))
+    if branch_logic_block:
+        plan_summary += "\n\n" + branch_logic_block
 
     open_text_blocks = []
     for col_idx, texts in open_text.items():
         col = next((c for c in plan["columns"] if c["index"] == col_idx), None)
         name = (col and col.get("name")) or (headers[col_idx] if col_idx < len(headers) else f"列{col_idx}")
         name = f"{name}{_open_text_source_note(texts)}"
+        name = _question_name_with_branch(name, plan, col_idx)
         joined_lines = []
         for entry in texts:
             ids = entry.get("ids", {})
@@ -837,6 +897,12 @@ def _build_writer_context(stats_md: str, open_text: dict, plan: dict, headers: l
     )
 
     requirements = _get_writer_requirements()
+    if branch_logic_block:
+        requirements += (
+            "\n\n跳转题强制规则：必须执行 `<question_branch_logic>`；同一章节内的不同分支必须分别归纳，"
+            "不得合并回答池。每条分支结论都要说明适用人群，并使用进入该分支人数或该题有效回答数作为分母，"
+            "不得使用问卷总样本替代。不同题干、不同使用程度人群的主观反馈不得直接比较高低。"
+        )
     requirements += (
         "\n\n补充：引用玩家原文时必须沿用 `<open_text>` 前缀里的玩家身份信息。"
         "`玩家ID=...` 和 `MLBBID=...` 是两个独立身份字段，报告表格中要拆成 `玩家ID`、`MLBBID` 两列，单元格只放值。"

@@ -2,7 +2,47 @@
 // STEP 4: Stats + Report
 // ============================================================
 
+function resetReportFailureUi() {
+  state.sessionReport.error = '';
+  const box = $('report-error');
+  if (box) box.hidden = true;
+  $('ps-writing')?.classList.remove('progress-step--failed');
+  const indicator = $('report-stream-container')?.querySelector('.stream-indicator');
+  indicator?.classList.remove('stream-indicator--failed');
+  const label = indicator?.querySelector('span');
+  if (label) label.textContent = '报告生成中，请耐心等待…';
+}
+
+function showReportFailureUi(message) {
+  const rawMessage = String(message || '服务暂时不可用，请稍后重试');
+  let cleanMessage = rawMessage;
+  if (/Dify\s+503/i.test(rawMessage)) {
+    cleanMessage = 'Dify 服务暂时不可用（503），自动重试后仍未恢复，请稍后重新生成。';
+  } else if (/Dify\s+(?:502|504)/i.test(rawMessage)) {
+    cleanMessage = 'Dify 网关暂时无法完成请求，自动重试后仍未恢复，请稍后重新生成。';
+  } else if (cleanMessage.length > 300) {
+    cleanMessage = `${cleanMessage.slice(0, 300)}…`;
+  }
+  state.sessionReport.error = cleanMessage;
+  $('ps-writing')?.classList.remove('progress-step--active', 'progress-step--done');
+  $('ps-writing')?.classList.add('progress-step--failed');
+
+  const box = $('report-error');
+  const messageEl = $('report-error-message');
+  if (messageEl) messageEl.textContent = cleanMessage;
+  if (box) box.hidden = false;
+
+  const stream = $('report-stream-container');
+  if (stream) stream.style.display = 'block';
+  const indicator = stream?.querySelector('.stream-indicator');
+  indicator?.classList.add('stream-indicator--failed');
+  const label = indicator?.querySelector('span');
+  if (label) label.textContent = '报告生成已中断';
+  _updateProgressStatus('报告生成已中断，可查看已输出内容或从头重新生成');
+}
+
 async function runStats() {
+  if (state.sessionReport.running) return;
   state.viewMode = 'session';
   state.historyId = null;
   state.sessionReport.running = true;
@@ -10,10 +50,13 @@ async function runStats() {
   state.sessionReport.reportMd = null;
   state.sessionReport.title = '';
   goStep(4);
+  resetReportFailureUi();
+  $('ps-stats').classList.remove('progress-step--done', 'progress-step--failed');
   $('ps-stats').classList.add('progress-step--active');
-  $('ps-writing').classList.remove('progress-step--active', 'progress-step--done');
+  $('ps-writing').classList.remove('progress-step--active', 'progress-step--done', 'progress-step--failed');
   $('report-stream-container').style.display = 'none';
   $('report-stream-content').textContent = '';
+  _updateProgressStatus('');
 
   try {
     const statsResp = await fetch(`/api/stats/${state.sessionId}`, { method: 'POST' });
@@ -39,20 +82,24 @@ async function runStats() {
         }
       }
       if (ev.type === 'chunk') {
-        // 收到正文后清掉进度占位
-        if (!fullReport) $('report-stream-content').textContent = '';
-        fullReport += ev.content;
+        const chunk = ev.content || '';
+        const isFirstChunk = !fullReport;
+        fullReport += chunk;
         state.sessionReport.stream = fullReport;
         if (state.viewMode === 'session') {
           const el = $('report-stream-content');
-          // 实时用 marked 渲染，避免 ** 等 markdown 符号显示为字面量
-          el.innerHTML = renderMarkdown(fullReport);
-          el.scrollTop = el.scrollHeight;
+          if (el) {
+            // 流式阶段只追加新文本，避免每个分片都重新解析整份 Markdown。
+            if (isFirstChunk) el.textContent = '';
+            el.append(document.createTextNode(chunk));
+            el.scrollTop = el.scrollHeight;
+          }
         }
       }
       if (ev.type === 'report_done') {
         _updateProgressStatus('');
         state.sessionReport.running = false;
+        resetReportFailureUi();
         state.sessionReport.reportMd = ev.report_md;
         state.sessionReport.title = reportTitleFromMarkdown(ev.report_md);
         if (state.viewMode === 'session') {
@@ -66,9 +113,15 @@ async function runStats() {
     });
   } catch (e) {
     state.sessionReport.running = false;
-    showToast(`报告生成失败：${e.message}`, 'error');
+    showReportFailureUi(e.message);
+    showToast(`报告生成失败：${state.sessionReport.error}`, 'error', 7000);
   }
 }
+
+$('btn-report-retry')?.addEventListener('click', () => {
+  if (state.sessionReport.running) return;
+  runStats();
+});
 
 function applyCoreHighlight() {
   const content = $('report-content');
@@ -125,6 +178,68 @@ function applyCoreHighlight() {
       el = el.nextElementSibling;
     }
     wrapElements(items, 'chapter-summary-box');
+  });
+}
+
+function enhanceReportTables() {
+  const content = $('report-content');
+  if (!content) return;
+
+  const percentValue = text => {
+    const match = String(text || '').match(/(-?\d+(?:\.\d+)?)\s*%/);
+    if (!match) return null;
+    return Math.min(100, Math.max(0, Number(match[1])));
+  };
+  const leadingNumber = text => {
+    const match = String(text || '').trim().match(/^(\d+(?:\.\d+)?)/);
+    return match ? Number(match[1]) : null;
+  };
+  const markLowSample = (cell, showBadge = false) => {
+    if (!cell) return;
+    cell.classList.add('report-cell--low-sample');
+    cell.title = '样本不足，仅供参考';
+    if (showBadge && !cell.querySelector('.report-low-sample-note')) {
+      const note = document.createElement('span');
+      note.className = 'report-low-sample-note';
+      note.textContent = '样本不足，仅供参考';
+      cell.appendChild(note);
+    }
+  };
+
+  content.querySelectorAll('table').forEach(table => {
+    const headers = Array.from(table.querySelectorAll('thead th'));
+    if (!headers.length) return;
+    const percentIndexes = headers
+      .map((th, index) => /占比|比例|百分比/.test(th.textContent) ? index : -1)
+      .filter(index => index >= 0);
+    const sampleIndex = headers.findIndex(th =>
+      /样本量|有效样本|回答人数|该画像总计/.test(th.textContent)
+    );
+
+    table.querySelectorAll('tbody tr').forEach(row => {
+      const cells = Array.from(row.cells);
+      percentIndexes.forEach(index => {
+        const cell = cells[index];
+        const percent = percentValue(cell?.textContent);
+        if (cell && percent !== null) {
+          cell.classList.add('report-data-bar');
+          cell.style.setProperty('--report-data-percent', `${percent}%`);
+        }
+      });
+
+      cells.forEach(cell => {
+        if (/\d+\s*\*/.test(cell.textContent || '')) markLowSample(cell, true);
+      });
+
+      if (sampleIndex >= 0) {
+        const sampleCell = cells[sampleIndex];
+        const sampleN = leadingNumber(sampleCell?.textContent);
+        if (sampleN !== null && sampleN < 5) {
+          cells.forEach(cell => markLowSample(cell));
+          markLowSample(sampleCell, true);
+        }
+      }
+    });
   });
 }
 
@@ -339,7 +454,13 @@ function renderReportWorkspace(md, { preserveQa = true } = {}) {
     renameBtn.disabled = !reportId;
   }
 
-  $('report-content').innerHTML = renderMarkdown(md);
+  const reportContent = $('report-content');
+  try {
+    reportContent.innerHTML = renderMarkdown(md);
+  } catch (error) {
+    console.error('[report] Markdown render failed, falling back to plain text:', error);
+    reportContent.textContent = md || '';
+  }
   if (preserveQa && ctx.qaHtml) {
     $('qa-messages').innerHTML = ctx.qaHtml;
   } else if (preserveQa && normalizeQAMessages(ctx.qaMessages).length) {
@@ -356,6 +477,7 @@ function renderReportWorkspace(md, { preserveQa = true } = {}) {
   applyQAAvailability();
   updateReportContextSwitch();
   applyCoreHighlight();
+  enhanceReportTables();
   buildTOC();
   switchReportTab('report');
   renderReportBreadcrumb();
@@ -391,6 +513,10 @@ function switchReportContext(mode) {
     $('ps-stats').classList.remove('progress-step--active');
     $('ps-stats').classList.add('progress-step--done');
     $('ps-writing').classList.add('progress-step--active');
+  } else if (state.sessionReport.error) {
+    goStep(4);
+    $('report-stream-content').textContent = state.sessionReport.stream || '';
+    showReportFailureUi(state.sessionReport.error);
   } else {
     setViewStep(Math.min(state.currentStep, 4));
   }
@@ -807,4 +933,3 @@ function appendQABubble(role, text, isTyping = false) {
   if (!isTyping) updateQaBadge();
   return bubble;
 }
-

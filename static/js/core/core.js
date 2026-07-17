@@ -135,7 +135,13 @@ function applyStepBarForMode() {
   });
 }
 
+function clearTransientSelection() {
+  const selection = window.getSelection?.();
+  if (selection?.rangeCount) selection.removeAllRanges();
+}
+
 function goStep(n) {
+  clearTransientSelection();
   state.currentStep = n;
   state.viewStep = n;
   panels.forEach((p, i) => {
@@ -144,11 +150,12 @@ function goStep(n) {
     p.classList.remove('panel--readonly');
   });
   renderStepBars();
-  document.querySelector('.main').scrollTo({ top: 0, behavior: 'smooth' });
+  document.querySelector('.main').scrollTo({ top: 0, behavior: 'auto' });
 }
 
 function setViewStep(n) {
   if (n > state.currentStep) return;
+  clearTransientSelection();
   state.viewStep = n;
   panels.forEach((p, i) => {
     const showing = i + 1 === n;
@@ -161,7 +168,7 @@ function setViewStep(n) {
     }
   });
   renderStepBars();
-  document.querySelector('.main').scrollTo({ top: 0, behavior: 'smooth' });
+  document.querySelector('.main').scrollTo({ top: 0, behavior: 'auto' });
 }
 
 // ── 主题切换 ──
@@ -272,4 +279,3 @@ function _updateProgressStatus(msg) {
   const t = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
   el.textContent = `${t}  ${msg}`;
 }
-

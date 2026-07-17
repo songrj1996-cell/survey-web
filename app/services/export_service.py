@@ -7,7 +7,11 @@ import re
 from fastapi import HTTPException
 
 from app.integrations import feishu_client as feishu_export
-from app.services.report_render import _prep_export_md, _prep_feishu_export_md
+from app.services.report_render import (
+    _extract_feishu_callout_sections,
+    _prep_export_md,
+    _prep_feishu_export_md,
+)
 
 
 def _clean_feishu_title(title: str | None) -> str:
@@ -23,8 +27,15 @@ async def _export_to_feishu(report_md: str, login: dict, mode: str = "", title: 
     title_m = re.search(r"^#\s+(.+?)$", full, re.MULTILINE)
     title = _clean_feishu_title(title or (title_m.group(1).strip() if title_m else "调研报告"))
     body = _prep_feishu_export_md(report_md, mode=mode)
+    callout_sections = _extract_feishu_callout_sections(report_md)
     open_id = login.get("open_id", "") or None
-    url, _, _ = await feishu_export.create_doc_via_bot(title, body, open_id)
+    url, _, _ = await feishu_export.create_doc_via_bot(
+        title,
+        body,
+        open_id,
+        callout_sections=callout_sections,
+        apply_report_format=True,
+    )
     print(f"[feishu-export] created doc title={title!r} url={url}")
     if open_id:
         await feishu_export.send_message_to_user(

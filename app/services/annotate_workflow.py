@@ -14,11 +14,23 @@ from pathlib import Path
 import annotate
 from fastapi import HTTPException, Request
 
-from app.core.config import ANNOTATE_RESULT_DIR, DIFY_AI_DETECT_KEY, DIFY_QUALITY_KEY
+from app.core.config import (
+    ANNOTATE_AI_BATCH_SIZE,
+    ANNOTATE_AI_CONCURRENCY,
+    ANNOTATE_AI_HIGH_THRESHOLD,
+    ANNOTATE_AI_MAX_QUERY_CHARS,
+    ANNOTATE_AI_REVIEW_THRESHOLD,
+    ANNOTATE_QUALITY_BATCH_SIZE,
+    ANNOTATE_QUALITY_CONCURRENCY,
+    ANNOTATE_QUALITY_MAX_QUERY_CHARS,
+    ANNOTATE_RESULT_DIR,
+    DIFY_AI_DETECT_KEY,
+    DIFY_QUALITY_KEY,
+)
 from app.core.parsing import _parse_file
 from app.core.responses import sse_event
 from app.core.security import _assign_session_owner, _find_history_for_login
-from app.integrations.dify_client import call_dify_compatible, sse_dify_stream
+from app.integrations.dify_client import workflow_run
 from app.services.audit import audit_log
 from app.services.auth import _current_login
 from app.services.question_detect import _detect_open_text_cols, _group_googleform_matrix
@@ -27,13 +39,14 @@ from app.storage.history import _ensure_history_report_numbers, _load_history
 
 # 标注会话用内存(生命周期短,不跨请求长期保活)
 annotate_sessions: dict[str, dict] = {}
+_ANNOTATE_SSE_HEARTBEAT_SECONDS = 15
 
 
 # ── 会话辅助 ────────────────────────────────────────────────────
 
 
 def _annotate_download_filename(filename: str) -> str:
-    stem = re.sub(r"\.(csv|xlsx|xls)$", "", filename or "annotated", flags=re.IGNORECASE)
+    stem = re.sub(r"\.(csv|xlsx)$", "", filename or "annotated", flags=re.IGNORECASE)
     safe = re.sub(r'[\\/:*?"<>|]', "_", stem).strip() or "annotated"
     return f"{safe}_标注结果.xlsx"
 
@@ -44,15 +57,48 @@ def _annotate_result_path(sid: str) -> Path:
 
 
 def _annotate_incomplete_detail(sess: dict) -> str:
-    missing_ai = sess.get("missing_ai_ids", []) or []
-    missing_q = sess.get("missing_quality_ids", []) or []
+    rows = (sess.get("rows") or [])[1:]
+    id_col = sess.get("id_col", 1)
+    tasks = sess.get("tasks") or {}
+    expected_ids = {_row_id(row, id_col) for row in rows if _row_id(row, id_col)}
+    confirmed_ai_ids = set(sess.get("confirmed_ai_ids") or [])
+    ai_result_ids = {
+        str(result.get("id", "")).strip()
+        for result in sess.get("ai_results", [])
+        if str(result.get("id", "")).strip()
+    }
+    quality_result_ids = {
+        str(result.get("id", "")).strip()
+        for result in sess.get("quality_results", [])
+        if str(result.get("id", "")).strip()
+    }
+    missing_ai = set(sess.get("missing_ai_ids", []) or [])
+    missing_q = set(sess.get("missing_quality_ids", []) or [])
+    missing_translations = sess.get("missing_translation_ids", []) or []
     parts = []
+    if tasks.get("ai_detect"):
+        missing_ai.update(expected_ids - ai_result_ids)
+        if sess.get("ai_status") != "complete":
+            parts.append("AI 检测尚未完成")
+        if sess.get("ai_status") == "complete" and not sess.get("ai_confirmation_complete"):
+            parts.append("AI 作答结果尚未人工确认")
+    if tasks.get("quality"):
+        missing_q.update((expected_ids - confirmed_ai_ids) - quality_result_ids)
+        if sess.get("quality_status") != "complete":
+            parts.append("质量打标尚未完成")
     if missing_ai:
-        ids_preview = ", ".join(missing_ai[:5]) + ("…" if len(missing_ai) > 5 else "")
+        ordered = sorted(missing_ai)
+        ids_preview = ", ".join(ordered[:5]) + ("…" if len(ordered) > 5 else "")
         parts.append(f"AI 检测漏返 {len(missing_ai)} 行（ID：{ids_preview}）")
     if missing_q:
-        ids_preview = ", ".join(missing_q[:5]) + ("…" if len(missing_q) > 5 else "")
+        ordered = sorted(missing_q)
+        ids_preview = ", ".join(ordered[:5]) + ("…" if len(ordered) > 5 else "")
         parts.append(f"质量打标漏返 {len(missing_q)} 行（ID：{ids_preview}）")
+    if missing_translations:
+        ids_preview = ", ".join(missing_translations[:5]) + (
+            "…" if len(missing_translations) > 5 else ""
+        )
+        parts.append(f"中文翻译缺失 {len(missing_translations)} 行（ID：{ids_preview}）")
     return "；".join(parts)
 
 
@@ -113,6 +159,17 @@ def validate_annotate_session_for_ai(sid: str) -> None:
     sess = get_annotate_session(sid)
     if not sess.get("rows") or not sess.get("open_text_cols"):
         raise HTTPException(status_code=400, detail="会话状态不完整，请重新上传")
+    if not (sess.get("tasks") or {}).get("ai_detect"):
+        raise HTTPException(status_code=400, detail="当前任务未启用 AI 作答识别")
+    if sess.get("ai_status") == "running":
+        raise HTTPException(status_code=409, detail="AI 作答识别正在运行，请勿重复启动")
+    if (
+        sess.get("ai_status") == "complete"
+        and not sess.get("missing_translation_ids")
+        and not sess.get("missing_ai_ids")
+    ):
+        raise HTTPException(status_code=409, detail="AI 作答识别已经完成，无需重复运行")
+    sess["ai_status"] = "running"
 
 
 def validate_annotate_session_for_quality(sid: str) -> None:
@@ -120,6 +177,23 @@ def validate_annotate_session_for_quality(sid: str) -> None:
     sess = get_annotate_session(sid)
     if not sess.get("rows") or not sess.get("open_text_cols"):
         raise HTTPException(status_code=400, detail="会话状态不完整，请重新上传")
+    tasks = sess.get("tasks") or {}
+    if not tasks.get("quality"):
+        raise HTTPException(status_code=400, detail="当前任务未启用质量打标")
+    if tasks.get("ai_detect"):
+        if sess.get("ai_status") != "complete":
+            raise HTTPException(status_code=400, detail="请先完成 AI 作答识别")
+        if not sess.get("ai_confirmation_complete"):
+            raise HTTPException(status_code=400, detail="请先确认 AI 作答结果")
+    if sess.get("quality_status") == "running":
+        raise HTTPException(status_code=409, detail="质量打标正在运行，请勿重复启动")
+    if (
+        sess.get("quality_status") == "complete"
+        and not sess.get("missing_translation_ids")
+        and not sess.get("missing_quality_ids")
+    ):
+        raise HTTPException(status_code=409, detail="质量打标已经完成，无需重复运行")
+    sess["quality_status"] = "running"
 
 
 _ANNOTATE_SESSION_TTL = 7200  # 2 hours
@@ -159,24 +233,100 @@ def _new_annotate_session() -> str:
     return sid
 
 
-async def _translate_headers(headers: list) -> list:
-    """将表头翻译为中文简体，失败时原样返回。"""
+_UPLOAD_HEADER_RE = re.compile(
+    r"(?:\bupload\b|\battach(?:ment)?\b|\bscreenshot\b|上传|截图|附件|图片|照片)",
+    re.IGNORECASE,
+)
+_FILE_VALUE_RE = re.compile(
+    r"^(?:https?://|www\.|data:image/)|\.(?:png|jpe?g|gif|webp|bmp|pdf)(?:\?.*)?$",
+    re.IGNORECASE,
+)
+
+
+def _empty_annotate_column_indexes(rows: list[list], headers: list) -> list[int]:
+    """返回表头和全部数据行均为空的列，供标注确认页隐藏。"""
+    return [
+        index
+        for index in range(len(headers))
+        if all(not (str(row[index]) if index < len(row) else "").strip() for row in rows)
+    ]
+
+
+def _filter_annotate_open_text_cols(
+    rows: list[list],
+    headers: list,
+    candidates: list[int],
+) -> list[int]:
+    """排除空表头、全空列和文件上传列，避免它们被默认当作主观题。"""
+    body = rows[1:]
+    filtered: list[int] = []
+    for index in candidates:
+        header = str(headers[index]).strip() if index < len(headers) else ""
+        values = [
+            (str(row[index]) if index < len(row) else "").strip()
+            for row in body
+        ]
+        non_empty = [value for value in values if value]
+        if not header or not non_empty or _UPLOAD_HEADER_RE.search(header):
+            continue
+        file_like = sum(bool(_FILE_VALUE_RE.search(value)) for value in non_empty)
+        if file_like / len(non_empty) >= 0.8:
+            continue
+        filtered.append(index)
+    return filtered
+
+
+async def _translate_headers(headers: list) -> tuple[list, str]:
+    """将表头翻译为中文简体；只补发缺失项，最终失败时返回明确警告。"""
     if not DIFY_AI_DETECT_KEY:
-        return headers
-    query = (
-        "将以下问卷列名按顺序翻译为中文简体，只输出 JSON 数组，不加其他任何内容：\n"
-        + json.dumps(headers, ensure_ascii=False)
-    )
-    full_text = ""
-    try:
-        async for chunk, _ in sse_dify_stream(query, "hdr-translate", "", DIFY_AI_DETECT_KEY):
-            full_text += chunk
-        result = _parse_string_array(full_text)
-        if result and len(result) == len(headers):
-            return result
-    except Exception:
-        pass
-    return headers
+        return list(headers), "未配置 AI 识别应用，列名未翻译"
+    translated = list(headers)
+    pending: dict[str, dict] = {}
+    for index, header in enumerate(headers):
+        original = str(header).strip()
+        if (
+            original
+            and not _is_likely_chinese(original)
+            and re.search(r"[A-Za-z\u3040-\u30ff\uac00-\ud7af]", original)
+        ):
+            key = f"col_{index}"
+            pending[key] = {"id": "__headers__", "key": key, "text": original}
+    if not pending:
+        return translated, ""
+
+    for attempt in range(1, 3):
+        repair_items = list(pending.values())
+        try:
+            output = await workflow_run(
+                inputs={
+                    "mode": "translation_repair",
+                    "query": annotate.build_translation_repair_query(repair_items),
+                },
+                api_key=DIFY_AI_DETECT_KEY,
+                user=f"hdr-translate-{attempt}",
+                max_retries=3,
+                log_prefix=f"annotate.header.translate.{attempt}",
+            )
+            repaired, _ = annotate.parse_translation_repair_result(output)
+        except Exception as exc:
+            _annotate_ai_log("header translation failed", attempt=attempt, error=str(exc)[:500])
+            repaired = []
+        for item in repaired:
+            key = str(item.get("key", ""))
+            source = pending.get(key)
+            translation = str(item.get("translation", "")).strip()
+            if (
+                item.get("id") == "__headers__"
+                and source
+                and _translation_is_usable(source["text"], translation)
+            ):
+                translated[int(key.removeprefix("col_"))] = translation
+                pending.pop(key, None)
+        if not pending:
+            break
+
+    warning = f"{len(pending)} 个列名翻译失败，已保留原文" if pending else ""
+    return translated, warning
 
 
 # ── 上传 ────────────────────────────────────────────────────────
@@ -196,14 +346,18 @@ async def handle_annotate_upload(filename: str, content: bytes, login: dict | No
     body = rows[1:]
 
     id_col = annotate.detect_id_column(headers, rows)
-    open_text_cols = _detect_open_text_cols(rows, headers)
+    detected_open_text_cols = _detect_open_text_cols(rows, headers)
+    open_text_cols = _filter_annotate_open_text_cols(
+        rows, headers, detected_open_text_cols,
+    )
+    empty_col_idxs = _empty_annotate_column_indexes(rows, headers)
 
     matrix_col_idxs: list[int] = []
     for g in _group_googleform_matrix(headers):
         if g["type"] == "matrix":
             matrix_col_idxs.extend(g["member_indexes"])
 
-    headers_zh = await _translate_headers(headers)
+    headers_zh, header_translation_warning = await _translate_headers(headers)
 
     sid = _new_annotate_session()
     sess = {
@@ -226,6 +380,8 @@ async def handle_annotate_upload(filename: str, content: bytes, login: dict | No
         "id_col": id_col,
         "open_text_cols": open_text_cols,
         "matrix_col_idxs": matrix_col_idxs,
+        "empty_col_idxs": empty_col_idxs,
+        "header_translation_warning": header_translation_warning,
         "preview": rows[1: min(4, len(rows))],
     }
 
@@ -242,15 +398,52 @@ def annotate_set_column_config(
 ) -> list[str]:
     """更新会话的列配置，返回任务名称列表（用于审计）。"""
     sess = get_annotate_session(sid)
+    headers = sess.get("headers") or []
+    body = (sess.get("rows") or [])[1:]
+    if not isinstance(id_col, int) or not 0 <= id_col < len(headers):
+        raise HTTPException(status_code=400, detail="玩家 ID 列无效，请重新选择")
+    normalized_open_cols = list(dict.fromkeys(open_text_cols))
+    if not normalized_open_cols or any(
+        not isinstance(col, int) or not 0 <= col < len(headers) or col == id_col
+        for col in normalized_open_cols
+    ):
+        raise HTTPException(status_code=400, detail="主观题列无效，请重新选择")
+    if not any(bool(tasks.get(key)) for key in ("ai_detect", "quality")):
+        raise HTTPException(status_code=400, detail="请至少选择一项标注任务")
+
+    ids = [_row_id(row, id_col) for row in body]
+    empty_rows = [index + 2 for index, row_id in enumerate(ids) if not row_id]
+    if empty_rows:
+        preview = "、".join(str(index) for index in empty_rows[:8])
+        suffix = "等" if len(empty_rows) > 8 else ""
+        raise HTTPException(status_code=400, detail=f"玩家 ID 不能为空：Excel 第 {preview}{suffix} 行缺少 ID")
+    seen: set[str] = set()
+    duplicate_ids: list[str] = []
+    for row_id in ids:
+        if row_id in seen and row_id not in duplicate_ids:
+            duplicate_ids.append(row_id)
+        seen.add(row_id)
+    if duplicate_ids:
+        preview = "、".join(duplicate_ids[:8])
+        suffix = "等" if len(duplicate_ids) > 8 else ""
+        raise HTTPException(status_code=400, detail=f"玩家 ID 必须唯一，以下 ID 重复：{preview}{suffix}")
+
     sess["id_col"] = id_col
-    sess["open_text_cols"] = open_text_cols
-    sess["tasks"] = tasks
+    sess["open_text_cols"] = normalized_open_cols
+    sess["tasks"] = {
+        "ai_detect": bool(tasks.get("ai_detect")),
+        "quality": bool(tasks.get("quality")),
+    }
     sess["background"] = background
     sess["ai_results"] = []
     sess["confirmed_ai_ids"] = []
     sess["quality_results"] = []
+    sess["ai_status"] = "pending" if tasks.get("ai_detect") else "skipped"
+    sess["ai_confirmation_complete"] = not bool(tasks.get("ai_detect"))
+    sess["quality_status"] = "pending" if tasks.get("quality") else "skipped"
     sess.pop("missing_ai_ids", None)
     sess.pop("missing_quality_ids", None)
+    sess.pop("missing_translation_ids", None)
     task_names = []
     if tasks.get("ai_detect"):
         task_names.append("AI 作答识别")
@@ -262,8 +455,24 @@ def annotate_set_column_config(
 # ── AI 检测 SSE ─────────────────────────────────────────────────
 
 
+_EMPTY_ANSWER_RE = re.compile(
+    r"^(?:n/?a|none|null|nil|no\.?|nothing|no\s+(?:feedback|comment)|"
+    r"not\s+applicable|tidak|无|没有|暂无|无意见|没了|なし|없음)[.!。！]?$",
+    re.IGNORECASE,
+)
+
+
+def _is_effectively_empty_answer(value: object) -> bool:
+    """Treat explicit no-answer placeholders as empty while preserving source text."""
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    return not text or bool(_EMPTY_ANSWER_RE.fullmatch(text))
+
+
 def _has_open_text(row: list, open_text_cols: list[int]) -> bool:
-    return any((str(row[c]) if c < len(row) else "").strip() for c in open_text_cols)
+    return any(
+        not _is_effectively_empty_answer(row[c] if c < len(row) else "")
+        for c in open_text_cols
+    )
 
 
 def _row_id(row: list, id_col: int) -> str:
@@ -272,6 +481,130 @@ def _row_id(row: list, id_col: int) -> str:
 
 def _chunks(items: list, size: int) -> list[list]:
     return [items[i: i + size] for i in range(0, len(items), size)]
+
+
+def _chunk_rows_by_query_budget(
+    rows: list[list],
+    max_rows: int,
+    max_chars: int,
+    build_query,
+) -> list[list[list]]:
+    """Keep normal batch limits while splitting early when source text is large."""
+    batches: list[list[list]] = []
+    current: list[list] = []
+    for row in rows:
+        candidate = current + [row]
+        if current and (
+            len(candidate) > max_rows
+            or len(build_query(candidate)) > max_chars
+        ):
+            batches.append(current)
+            current = [row]
+        else:
+            current = candidate
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _fit_rows_to_query_budget(
+    rows: list[list],
+    text_cols: list[int],
+    max_chars: int,
+    build_query,
+) -> tuple[list[list], str]:
+    """Trim only the model copy of oversized cells; originals stay untouched in session."""
+    query = build_query(rows)
+    if len(query) <= max_chars or not rows or not text_cols:
+        return rows, query
+
+    cell_count = max(1, len(rows) * len(text_cols))
+    cap = max(0, (max_chars - 500) // cell_count)
+    model_rows = [list(row) for row in rows]
+    while True:
+        for model_row, source_row in zip(model_rows, rows):
+            for col in text_cols:
+                if col >= len(model_row) or col >= len(source_row):
+                    continue
+                text = str(source_row[col])
+                model_row[col] = text if len(text) <= cap else text[:cap]
+        query = build_query(model_rows)
+        if len(query) <= max_chars:
+            return model_rows, query
+        if cap == 0:
+            raise ValueError("查询固定内容超过字符预算，请缩短列名或调研背景")
+        cap = max(0, int(cap * 0.75) - 1)
+
+
+def _effective_batch_size(configured_size: int, open_text_cols: list[int], cell_budget: int) -> int:
+    """按每批主观题单元格数量限制输出规模，配置值仍作为上限。"""
+    question_count = max(1, len(open_text_cols))
+    return max(1, min(configured_size, max(3, cell_budget // question_count)))
+
+
+def _contains_cjk(text: str) -> bool:
+    return bool(re.search(r"[\u3400-\u9fff]", str(text or "")))
+
+
+def _is_likely_chinese(text: str) -> bool:
+    value = str(text or "")
+    return _contains_cjk(value) and not re.search(r"[\u3040-\u30ff]", value)
+
+
+def _translation_is_usable(original: str, translation: str) -> bool:
+    original = str(original or "").strip()
+    translation = str(translation or "").strip()
+    if _is_effectively_empty_answer(original):
+        return True
+    if not translation:
+        return False
+    if _is_likely_chinese(original) or _contains_cjk(translation):
+        return True
+    if not re.search(r"[A-Za-z\u3040-\u30ff\uac00-\ud7af]", original):
+        return True
+    if translation != original:
+        return False
+    if re.fullmatch(r"(?:https?://|www\.)\S+", original, re.IGNORECASE):
+        return True
+    if original.upper() in {"N/A", "NA", "NONE", "NULL"}:
+        return True
+    if re.fullmatch(r"[A-Z0-9][A-Z0-9._+/#-]{1,19}", original):
+        return True
+    return bool(
+        len(original) <= 40
+        and re.fullmatch(r"(?:[A-Z][A-Za-z0-9'._-]*)(?: [A-Z][A-Za-z0-9'._-]*){0,3}", original)
+    )
+
+
+def _public_dify_error(error: str) -> str:
+    lowered = str(error or "").lower()
+    if any(token in lowered for token in (
+        "modelunavailable", "model unavailable", "apiconnectionerror",
+        "temporarily unavailable", "bedrockexception",
+    )):
+        return "模型服务暂时不可用，自动重试后仍未恢复"
+    if "timeout" in lowered or "timed out" in lowered:
+        return "模型服务响应超时"
+    if error:
+        return "模型返回内容无法完成校验"
+    return ""
+
+
+def _validation_error_summary(errors: list[str]) -> str:
+    categories: list[str] = []
+    joined = " ".join(str(error) for error in errors)
+    for token, label in (
+        ("中文翻译", "中文翻译缺失"),
+        ("非空回答不能为 N/A", "非空回答被错误标为 N/A"),
+        ("标签非法", "标签格式错误"),
+        ("缺少原因", "判断原因缺失"),
+        ("原文证据", "AI 原文证据无效"),
+        ("Dify", "模型调用失败"),
+        ("模型服务", "模型服务暂时不可用"),
+    ):
+        if token in joined and label not in categories:
+            categories.append(label)
+    return "、".join(categories[:3]) or ("模型结果仍不完整" if errors else "")
 
 
 def _open_text_originals(row: list, open_text_cols: list[int]) -> dict[str, str]:
@@ -286,9 +619,10 @@ def _empty_ai_result(row: list, id_col: int, open_text_cols: list[int], reason: 
     return {
         "id": _row_id(row, id_col),
         "ai_prob": 0,
-        "is_polished": "low",
+        "polish_prob": 0,
         "reason": reason,
         "evidence": "",
+        "counter_evidence": "",
         "originals": _open_text_originals(row, open_text_cols),
         "translations": {},
     }
@@ -308,6 +642,206 @@ def _attach_originals(
     return results
 
 
+def _canonical_text_with_spans(text: str) -> tuple[str, list[tuple[int, int]]]:
+    """Normalize prompt-only escaping/whitespace and retain source spans."""
+    source = str(text or "")
+    chars: list[str] = []
+    spans: list[tuple[int, int]] = []
+    index = 0
+    while index < len(source):
+        if source[index] == "\\" and index + 1 < len(source) and source[index + 1] == "|":
+            chars.append("|")
+            spans.append((index, index + 2))
+            index += 2
+            continue
+        if source[index].isspace():
+            start = index
+            while index < len(source) and source[index].isspace():
+                index += 1
+            if chars and chars[-1] != " ":
+                chars.append(" ")
+                spans.append((start, index))
+            continue
+        chars.append(source[index])
+        spans.append((index, index + 1))
+        index += 1
+    while chars and chars[-1] == " ":
+        chars.pop()
+        spans.pop()
+    return "".join(chars), spans
+
+
+def _exact_original_evidence(evidence: str, originals: dict[str, str]) -> str | None:
+    """Return the exact source slice represented by evidence, or None when rewritten."""
+    evidence = str(evidence or "").strip()
+    if not evidence:
+        return ""
+    for original in originals.values():
+        if evidence in original:
+            return evidence
+        normalized_original, spans = _canonical_text_with_spans(original)
+        normalized_evidence, _ = _canonical_text_with_spans(evidence)
+        start = normalized_original.find(normalized_evidence)
+        if start >= 0 and normalized_evidence:
+            end = start + len(normalized_evidence)
+            return original[spans[start][0]:spans[end - 1][1]].strip()
+    return None
+
+
+def _evidence_in_originals(evidence: str, originals: dict[str, str]) -> bool:
+    return _exact_original_evidence(evidence, originals) is not None
+
+
+def _validated_ai_results(
+    results: list[dict],
+    batch_rows: list[list],
+    id_col: int,
+    open_text_cols: list[int],
+) -> tuple[list[dict], set[str], list[str]]:
+    rows_by_id = {_row_id(row, id_col): row for row in batch_rows}
+    valid: list[dict] = []
+    seen: set[str] = set()
+    errors: list[str] = []
+    for result in _attach_originals(results, batch_rows, id_col, open_text_cols):
+        row_id = str(result.get("id", "")).strip()
+        if row_id not in rows_by_id or row_id in seen:
+            errors.append(f"ID {row_id or '(空)'} 无法唯一匹配输入")
+            continue
+        originals = result.get("originals") or {}
+        review_risk = result.get("ai_prob", 0) >= ANNOTATE_AI_REVIEW_THRESHOLD
+        if review_risk and not str(
+            result.get("evidence", "")
+        ).strip():
+            errors.append(f"ID {row_id} 的中高风险 AI 判断缺少原文证据")
+            continue
+        exact_evidence = _exact_original_evidence(result.get("evidence", ""), originals)
+        if exact_evidence is None:
+            if review_risk:
+                errors.append(f"ID {row_id} 的 AI 原文证据不是连续原文")
+                continue
+            result["evidence"] = ""
+        else:
+            result["evidence"] = exact_evidence
+        exact_counter = _exact_original_evidence(
+            result.get("counter_evidence", ""), originals,
+        )
+        if exact_counter is None:
+            result["counter_evidence"] = ""
+        else:
+            result["counter_evidence"] = exact_counter
+        seen.add(row_id)
+        valid.append(result)
+    missing = set(rows_by_id) - seen
+    return valid, missing, errors
+
+
+def _empty_quality_result(row: list, id_col: int, open_text_cols: list[int]) -> dict:
+    q_labels = {f"col_{col}": "N/A" for col in open_text_cols}
+    q_reasons = {f"col_{col}": "回答为空，按 N/A 处理" for col in open_text_cols}
+    q_evidence = {f"col_{col}": "" for col in open_text_cols}
+    overall, overall_reason = annotate.calculate_overall_quality(q_labels, open_text_cols)
+    return {
+        "id": _row_id(row, id_col),
+        "q_labels": q_labels,
+        "q_reasons": q_reasons,
+        "q_evidence": q_evidence,
+        "translations": {},
+        "originals": {},
+        "overall": overall,
+        "overall_reason": overall_reason,
+    }
+
+
+def _validated_quality_results(
+    results: list[dict],
+    batch_rows: list[list],
+    id_col: int,
+    open_text_cols: list[int],
+    include_translations: bool,
+) -> tuple[list[dict], set[str], list[str]]:
+    rows_by_id = {_row_id(row, id_col): row for row in batch_rows}
+    valid: list[dict] = []
+    seen: set[str] = set()
+    errors: list[str] = []
+    expected_keys = {f"col_{col}" for col in open_text_cols}
+    for result in results:
+        row_id = str(result.get("id", "")).strip()
+        row = rows_by_id.get(row_id)
+        if row is None or row_id in seen:
+            errors.append(f"ID {row_id or '(空)'} 无法唯一匹配输入")
+            continue
+        labels = result.get("q_labels") or {}
+        reasons = result.get("q_reasons") or {}
+        evidence_map = result.get("q_evidence") or {}
+        translations = result.get("translations") or {}
+        result["q_evidence"] = evidence_map
+        result["translations"] = translations
+        row_errors: list[str] = []
+        for col in open_text_cols:
+            key = f"col_{col}"
+            original = str(row[col]).strip() if col < len(row) else ""
+            label = str(labels.get(key, ""))
+            reason = str(reasons.get(key, "")).strip()
+            evidence = str(evidence_map.get(key, "")).strip()
+            if _is_effectively_empty_answer(original):
+                labels[key] = "N/A"
+                reasons[key] = "回答为无内容占位表达，按 N/A 处理"
+                evidence_map[key] = ""
+                continue
+            if label not in annotate.QUALITY_LABELS:
+                row_errors.append(f"{key} 标签非法")
+            elif not original and label != "N/A":
+                row_errors.append(f"{key} 空回答必须为 N/A")
+            elif original and label == "N/A":
+                row_errors.append(f"{key} 非空回答不能为 N/A")
+            if not reason:
+                row_errors.append(f"{key} 缺少原因")
+            if label != "N/A" and (not evidence or evidence not in original):
+                evidence_map[key] = original
+            elif label == "N/A":
+                evidence_map[key] = ""
+        if not expected_keys.issubset(labels):
+            row_errors.append("逐题标签列不完整")
+        if row_errors:
+            errors.append(f"ID {row_id}：{'；'.join(row_errors[:4])}")
+            continue
+        result["originals"] = _open_text_originals(row, open_text_cols)
+        result["overall"], result["overall_reason"] = annotate.calculate_overall_quality(
+            labels, open_text_cols,
+        )
+        seen.add(row_id)
+        valid.append(result)
+    return valid, set(rows_by_id) - seen, errors
+
+
+def _quality_invalid_cols(
+    result: dict | None,
+    row: list,
+    open_text_cols: list[int],
+) -> set[int]:
+    """返回需要模型重新判断的题目列；证据和翻译由独立流程修复。"""
+    if result is None:
+        return set(open_text_cols)
+    labels = result.get("q_labels") or {}
+    reasons = result.get("q_reasons") or {}
+    invalid: set[int] = set()
+    for col in open_text_cols:
+        key = f"col_{col}"
+        original = str(row[col]).strip() if col < len(row) else ""
+        if _is_effectively_empty_answer(original):
+            continue
+        label = str(labels.get(key, ""))
+        reason = str(reasons.get(key, "")).strip()
+        if (
+            label not in annotate.QUALITY_LABELS
+            or (not original and label != "N/A")
+            or (original and label == "N/A")
+            or not reason
+        ):
+            invalid.add(col)
+    return invalid
+
+
 async def _run_ai_direct_batch(
     sid: str,
     batch_rows: list[list],
@@ -319,281 +853,231 @@ async def _run_ai_direct_batch(
     label: str,
 ) -> tuple[list[dict], str]:
     """单个子批次的 Dify 调用 + 解析 + 一次重试。"""
-    query = annotate.build_ai_detect_query(batch_rows, headers, open_text_cols, id_col, label, background)
-    _annotate_ai_log("subbatch start", sid=sid, batch=label, rows=len(batch_rows), query_len=len(query))
     try:
-        text, final_conv, mode, fallback_reason = await call_dify_compatible(
-            query, f"{sid}-split-{label}", api_key
+        _, query = _fit_rows_to_query_budget(
+            batch_rows,
+            open_text_cols,
+            ANNOTATE_AI_MAX_QUERY_CHARS - 500,
+            lambda model_rows: annotate.build_ai_detect_query(
+                model_rows, headers, open_text_cols, id_col, label, background,
+            ),
         )
-        _annotate_ai_log("subbatch dify done", sid=sid, batch=label, mode=mode,
-                         answer_len=len(text or ""), fallback=bool(fallback_reason))
+        _annotate_ai_log(
+            "subbatch start", sid=sid, batch=label,
+            rows=len(batch_rows), query_len=len(query),
+        )
+        text = await workflow_run(
+            inputs={"mode": "ai_detect", "query": query},
+            api_key=api_key,
+            user=f"{sid}-split-{label}",
+            max_retries=3,
+            log_prefix=f"annotate.ai_detect.{label}",
+        )
+        _annotate_ai_log(
+            "subbatch dify done", sid=sid, batch=label, mode="workflow",
+            answer_len=len(text or ""), fallback=False,
+        )
         if not (text or "").strip():
             return [], "Dify 返回空内容"
         results, err = annotate.parse_ai_detect_result(text)
         if results:
             return _attach_originals(results, batch_rows, id_col, open_text_cols), ""
         retry_q = (
-            f"上次输出无法解析（{err}）。请重新处理下面这批数据，并严格按 schema 用 ```json``` 围栏输出，"
-            "不要附加任何解释文字。\n\n"
+            f"上次输出无法解析（{err}）。请重新处理下面这批数据，严格返回系统提示词指定的"
+            "顶层 JSON 数组，不要附加解释文字。\n\n"
             f"{query}"
         )
-        retry_text, _, retry_mode, retry_fallback = await call_dify_compatible(
-            retry_q, f"{sid}-split-retry-{label}", api_key, final_conv
+        retry_text = await workflow_run(
+            inputs={"mode": "ai_detect", "query": retry_q},
+            api_key=api_key,
+            user=f"{sid}-split-retry-{label}",
+            max_retries=3,
+            log_prefix=f"annotate.ai_detect.{label}.retry",
         )
-        _annotate_ai_log("subbatch retry done", sid=sid, batch=label, mode=retry_mode,
-                         answer_len=len(retry_text or ""), fallback=bool(retry_fallback))
+        _annotate_ai_log(
+            "subbatch retry done", sid=sid, batch=label, mode="workflow",
+            answer_len=len(retry_text or ""), fallback=False,
+        )
         results, retry_err = annotate.parse_ai_detect_result(retry_text)
         if results:
             return _attach_originals(results, batch_rows, id_col, open_text_cols), ""
         return results, retry_err
     except Exception as exc:
         _annotate_ai_log("subbatch failed", sid=sid, batch=label, error=str(exc)[:1000])
-        return [], str(exc)
+        return [], _public_dify_error(str(exc))
 
 
-async def ai_detect_stream(sid: str, request: Request):
-    """AI 作答识别 SSE 流程（async generator）。"""
-    sess = get_annotate_session(sid)
-    rows = sess.get("rows", [])
-    headers = sess.get("headers", [])
-    id_col = sess.get("id_col", 1)
-    open_text_cols = sess.get("open_text_cols", [])
-    background = sess.get("background", "")
+async def _repair_missing_translations(
+    sid: str,
+    results: list[dict],
+    batch_rows: list[list],
+    id_col: int,
+    open_text_cols: list[int],
+    api_key: str,
+    stage: str,
+    fallback_api_key: str = "",
+) -> tuple[set[str], str]:
+    """只翻译缺失单元格；定向重试后可切换另一工作流兜底。"""
+    rows_by_id = {_row_id(row, id_col): row for row in batch_rows}
+    results_by_id = {str(result.get("id", "")): result for result in results}
 
-    body = rows[1:]
-    batch_size = annotate.AI_DETECT_BATCH
-    batches = [body[i: i + batch_size] for i in range(0, len(body), batch_size)]
-    total_batches = len(batches)
-
-    all_results: list[dict] = []
-    all_missing_ids: set[str] = set()
-    try:
-        yield sse_event({
-            "type": "started",
-            "rows": len(body),
-            "total_batches": total_batches,
-            "batch_size": batch_size,
-            "msg": f"已连接，准备分析 {len(body)} 行，约 {total_batches} 批",
-        })
-
-        for batch_num, batch in enumerate(batches, 1):
-            empty_rows = [r for r in batch if not _has_open_text(r, open_text_cols)]
-            active_batch = [r for r in batch if _has_open_text(r, open_text_cols)]
-            missing_ids = sum(1 for r in active_batch if not _row_id(r, id_col))
-            yield sse_event({
-                "type": "batch_started",
-                "batch": batch_num,
-                "done": batch_num - 1,
-                "total": total_batches,
-                "rows": len(active_batch),
-                "skipped": len(empty_rows),
-                "missing_ids": missing_ids,
-                "msg": f"正在分析第 {batch_num}/{total_batches} 批（{len(active_batch)} 行，跳过 {len(empty_rows)} 行空主观题）",
-            })
-            if empty_rows:
-                all_results.extend(
-                    _empty_ai_result(r, id_col, open_text_cols, "主观题为空，系统自动判定为非 AI 作答")
-                    for r in empty_rows
-                )
-            if missing_ids:
-                msg = f"第 {batch_num} 批有 {missing_ids} 行缺少玩家唯一 ID，结果可能无法正确回填"
-                _annotate_ai_log("missing ids", sid=sid, batch=batch_num, count=missing_ids)
-                yield sse_event({"type": "warn", "msg": msg})
-            if not active_batch:
-                msg = f"第 {batch_num} 批没有可分析的主观题内容，已跳过 AI 调用"
-                _annotate_ai_log("skip empty batch", sid=sid, batch=batch_num, rows=len(batch))
-                yield sse_event({"type": "warn", "msg": msg})
-                yield sse_event({
-                    "type": "batch_done",
-                    "batch": batch_num,
-                    "done": batch_num,
-                    "total": total_batches,
-                    "count": len(empty_rows),
-                    "msg": f"第 {batch_num}/{total_batches} 批完成，空主观题 {len(empty_rows)} 行已自动跳过",
-                })
+    for row_id, result in results_by_id.items():
+        row = rows_by_id.get(row_id)
+        if row is None:
+            continue
+        translations = result.setdefault("translations", {})
+        for col in open_text_cols:
+            key = f"col_{col}"
+            original = str(row[col]).strip() if col < len(row) else ""
+            existing = str(translations.get(key, "")).strip()
+            if not original or _translation_is_usable(original, existing):
                 continue
+            if _is_likely_chinese(original) or not re.search(
+                r"[A-Za-z\u3040-\u30ff\uac00-\ud7af]", original
+            ):
+                translations[key] = original
 
-            query = annotate.build_ai_detect_query(
-                active_batch, headers, open_text_cols, id_col, batch_num, background
-            )
-            _annotate_ai_log("batch start", sid=sid, batch=batch_num, rows=len(active_batch),
-                             skipped=len(empty_rows), missing_ids=missing_ids, query_len=len(query))
-            try:
-                dify_task = asyncio.create_task(call_dify_compatible(query, sid, DIFY_AI_DETECT_KEY))
-                while not dify_task.done():
-                    yield sse_event({
-                        "type": "dify_waiting", "batch": batch_num, "total": total_batches,
-                        "msg": "正在等待 AI 返回，请勿关闭页面",
-                    })
-                    await asyncio.sleep(12)
-                answer_text, final_conv, mode, fallback_reason = await dify_task
-                _annotate_ai_log("dify done", sid=sid, batch=batch_num, mode=mode,
-                                 answer_len=len(answer_text or ""), fallback=bool(fallback_reason))
-                yield sse_event({
-                    "type": "dify_done", "batch": batch_num, "mode": mode,
-                    "answer_len": len(answer_text or ""),
-                    "msg": f"第 {batch_num} 批 AI 返回完成（{mode}，{len(answer_text or '')} 字符）",
-                })
-                if fallback_reason:
-                    _annotate_ai_log("fallback", sid=sid, batch=batch_num, reason=fallback_reason[:500])
-                    yield sse_event({
-                        "type": "warn",
-                        "msg": f"第 {batch_num} 批 chat 调用不匹配，已自动改用 completion 调用：{fallback_reason[:240]}",
-                    })
-            except Exception as e:
-                _annotate_ai_log("dify failed", sid=sid, batch=batch_num, error=str(e)[:1000])
-                yield sse_event({"type": "warn", "msg": f"第 {batch_num} 批 Dify 调用失败：{e}"})
-                split_results: list[dict] = []
-                if len(active_batch) > 1:
-                    yield sse_event({
-                        "type": "warn",
-                        "msg": f"第 {batch_num} 批已自动拆成更小子批次重试，避免 Dify 插件/模型超时",
-                    })
-                    for sub_idx, sub_batch in enumerate(_chunks(active_batch, 2), 1):
-                        sub_label = f"{batch_num}.{sub_idx}"
-                        sub_results, sub_err = await _run_ai_direct_batch(
-                            sid, sub_batch, headers, open_text_cols, id_col, background,
-                            DIFY_AI_DETECT_KEY, sub_label,
-                        )
-                        if sub_results:
-                            split_results.extend(sub_results)
-                            all_results.extend(sub_results)
-                            yield sse_event({
-                                "type": "warn",
-                                "msg": f"第 {sub_label} 子批次重试成功，获得 {len(sub_results)} 条结果",
-                            })
-                        else:
-                            yield sse_event({"type": "warn", "msg": f"第 {sub_label} 子批次仍失败：{sub_err}"})
-                yield sse_event({
-                    "type": "batch_done", "batch": batch_num, "done": batch_num,
-                    "total": total_batches, "count": len(split_results),
-                    "msg": f"第 {batch_num}/{total_batches} 批完成，拆分重试获得 {len(split_results)} 条结果，跳过 {len(empty_rows)} 行空主观题",
-                })
+    def pending_items() -> list[dict]:
+        pending: list[dict] = []
+        for row_id, result in results_by_id.items():
+            row = rows_by_id.get(row_id)
+            if row is None:
                 continue
+            translations = result.setdefault("translations", {})
+            for col in open_text_cols:
+                key = f"col_{col}"
+                original = str(row[col]).strip() if col < len(row) else ""
+                if original and not _translation_is_usable(original, translations.get(key, "")):
+                    pending.append({"id": row_id, "key": key, "text": original})
+        return pending
 
-            results, err = annotate.parse_ai_detect_result(answer_text)
-            if not results:
-                snippet = (answer_text or "")[:500].replace("\n", " ")
-                _annotate_ai_log("parse failed", sid=sid, batch=batch_num,
-                                 answer_len=len(answer_text or ""), error=err, snippet=snippet)
-                retry_q = (
-                    f"上次输出无法解析（{err}）。请重新处理下面这批数据，并严格按 schema 用 ```json``` 围栏输出，"
-                    "不要附加任何解释文字。\n\n"
-                    f"{query}"
-                )
-                yield sse_event({
-                    "type": "warn",
-                    "msg": f"第 {batch_num} 批首次解析失败，正在自动重试：{err}；返回长度 {len(answer_text or '')}；片段：{snippet[:180]}",
-                })
+    async def run_repair_pass(
+        repair_api_key: str,
+        items: list[dict],
+        chunk_size: int,
+        pass_name: str,
+    ) -> None:
+        if not repair_api_key:
+            return
+        single_text_limit = max(1000, ANNOTATE_QUALITY_MAX_QUERY_CHARS - 1500)
+        long_items = [
+            item for item in items if len(str(item.get("text", ""))) > single_text_limit
+        ]
+        normal_items = [item for item in items if item not in long_items]
+
+        for long_index, item in enumerate(long_items, 1):
+            source = str(item["text"])
+            segments = [
+                source[start:start + single_text_limit]
+                for start in range(0, len(source), single_text_limit)
+            ]
+            translated_segments: list[str] = []
+            for part_index, segment in enumerate(segments, 1):
+                query = annotate.build_translation_repair_query([{
+                    "id": item["id"], "key": item["key"], "text": segment,
+                }])
                 try:
-                    retry_task = asyncio.create_task(call_dify_compatible(
-                        retry_q, sid, DIFY_AI_DETECT_KEY, final_conv
-                    ))
-                    while not retry_task.done():
-                        yield sse_event({
-                            "type": "dify_waiting", "batch": batch_num, "total": total_batches,
-                            "msg": "正在等待 AI 重试返回，请勿关闭页面",
-                        })
-                        await asyncio.sleep(12)
-                    retry_text, _, retry_mode, retry_fallback = await retry_task
-                    _annotate_ai_log("retry done", sid=sid, batch=batch_num, mode=retry_mode,
-                                     answer_len=len(retry_text or ""), fallback=bool(retry_fallback))
-                    results, err = annotate.parse_ai_detect_result(retry_text)
-                except Exception as e:
-                    _annotate_ai_log("retry failed", sid=sid, batch=batch_num, error=str(e)[:1000])
-                    results, err = [], str(e)
-
-            if results:
-                results = _attach_originals(results, active_batch, id_col, open_text_cols)
-
-            if not results:
-                _annotate_ai_log("batch no results", sid=sid, batch=batch_num, error=err)
-                yield sse_event({"type": "warn", "msg": f"第 {batch_num} 批解析失败：{err}"})
-                split_results = []
-                if len(active_batch) > 1:
-                    yield sse_event({"type": "warn", "msg": f"第 {batch_num} 批将拆成更小子批次继续重试"})
-                    for sub_idx, sub_batch in enumerate(_chunks(active_batch, 2), 1):
-                        sub_label = f"{batch_num}.{sub_idx}"
-                        sub_results, sub_err = await _run_ai_direct_batch(
-                            sid, sub_batch, headers, open_text_cols, id_col, background,
-                            DIFY_AI_DETECT_KEY, sub_label,
-                        )
-                        if sub_results:
-                            split_results.extend(sub_results)
-                            yield sse_event({
-                                "type": "warn",
-                                "msg": f"第 {sub_label} 子批次重试成功，获得 {len(sub_results)} 条结果",
-                            })
-                        else:
-                            yield sse_event({"type": "warn", "msg": f"第 {sub_label} 子批次仍失败：{sub_err}"})
-                if split_results:
-                    all_results.extend(split_results)
-                    results = split_results
-                else:
-                    batch_ids = {_row_id(r, id_col) for r in active_batch if _row_id(r, id_col)}
-                    if batch_ids:
-                        all_missing_ids.update(batch_ids)
-                        yield sse_event({
-                            "type": "warn",
-                            "msg": f"第 {batch_num} 批所有重试均失败，{len(batch_ids)} 行计入缺失，完成后将阻断下载",
-                        })
-            else:
-                all_results.extend(results)
-                _annotate_ai_log("batch parsed", sid=sid, batch=batch_num, count=len(results))
-
-            if results:
-                expected_ids = {_row_id(r, id_col) for r in active_batch if _row_id(r, id_col)}
-                returned_ids = {r["id"] for r in results if r.get("id")}
-                missing = expected_ids - returned_ids
-                if missing:
-                    yield sse_event({"type": "warn", "msg": f"第 {batch_num} 批漏返 {len(missing)} 行，正在补发重试…"})
-                    missing_rows = [r for r in active_batch if _row_id(r, id_col) in missing]
-                    retry_results, _ = await _run_ai_direct_batch(
-                        sid, missing_rows, headers, open_text_cols, id_col, background,
-                        DIFY_AI_DETECT_KEY, f"{batch_num}.miss",
+                    text = await workflow_run(
+                        inputs={"mode": "translation_repair", "query": query},
+                        api_key=repair_api_key,
+                        user=f"{sid}-{stage}-translate-{pass_name}-long-{long_index}-{part_index}",
+                        max_retries=3,
+                        log_prefix=(
+                            f"annotate.{stage}.translate.{pass_name}."
+                            f"long-{long_index}-{part_index}"
+                        ),
                     )
-                    if retry_results:
-                        results = list(results) + retry_results
-                        all_results.extend(retry_results)
-                        missing -= {r["id"] for r in retry_results if r.get("id")}
-                    if missing:
-                        all_missing_ids.update(missing)
-                        yield sse_event({
-                            "type": "warn",
-                            "msg": (
-                                f"第 {batch_num} 批重试后仍漏返 {len(missing)} 行"
-                                f"（ID：{', '.join(sorted(missing)[:5])}{'…' if len(missing) > 5 else ''}），完成后将阻断下载"
-                            ),
-                        })
+                    repaired, _ = annotate.parse_translation_repair_result(text)
+                except Exception as exc:
+                    _annotate_ai_log(
+                        "translation repair failed", sid=sid, stage=stage,
+                        pass_name=pass_name, chunk=f"long-{long_index}-{part_index}",
+                        error=str(exc)[:1000],
+                    )
+                    repaired = []
+                translation = next((
+                    str(repaired_item.get("translation", "")).strip()
+                    for repaired_item in repaired
+                    if repaired_item.get("id") == item["id"]
+                    and repaired_item.get("key") == item["key"]
+                ), "")
+                if not _translation_is_usable(segment, translation):
+                    translated_segments = []
+                    break
+                translated_segments.append(translation)
+            if len(translated_segments) == len(segments):
+                results_by_id[item["id"]].setdefault("translations", {})[
+                    item["key"]
+                ] = "\n".join(translated_segments)
 
-            yield sse_event({
-                "type": "batch_done", "batch": batch_num, "done": batch_num,
-                "total": total_batches, "count": len(results),
-                "msg": f"第 {batch_num}/{total_batches} 批完成，获得 {len(results)} 条 AI 结果，跳过 {len(empty_rows)} 行空主观题",
-            })
+        repair_chunks: list[list[dict]] = []
+        current: list[dict] = []
+        for item in normal_items:
+            candidate = current + [item]
+            candidate_query = annotate.build_translation_repair_query(candidate)
+            if current and (
+                len(candidate) > chunk_size
+                or len(candidate_query) > ANNOTATE_QUALITY_MAX_QUERY_CHARS
+            ):
+                repair_chunks.append(current)
+                current = [item]
+            else:
+                current = candidate
+        if current:
+            repair_chunks.append(current)
 
-        sess["ai_results"] = all_results
-        sess.pop("missing_ai_ids", None)
-        if all_missing_ids:
-            sess["missing_ai_ids"] = sorted(all_missing_ids)
-        high_prob = [r for r in all_results if r.get("ai_prob", 0) >= 80]
-        if not all_missing_ids and not high_prob and not (sess.get("tasks") or {}).get("quality"):
-            await _save_annotate_result_history(sid, sess, request)
-        await audit_log(
-            request, "annotate", "完成 AI 作答识别",
-            f"会话：{sid}；结果数：{len(all_results)}；高概率数：{len(high_prob)}；未回填：{len(all_missing_ids)}",
-            metadata={"session_id": sid, "results": len(all_results),
-                      "high_prob": len(high_prob), "missing": len(all_missing_ids)},
-        )
-        yield sse_event({
-            "type": "ai_detect_done",
-            "results": all_results,
-            "high_prob": high_prob,
-            "missing_ids": sorted(all_missing_ids),
-        })
-    except Exception as e:
-        import traceback; traceback.print_exc()
-        yield sse_event({"type": "error", "message": str(e)})
+        for index, repair_items in enumerate(repair_chunks, 1):
+            query = annotate.build_translation_repair_query(repair_items)
+            try:
+                text = await workflow_run(
+                    inputs={"mode": "translation_repair", "query": query},
+                    api_key=repair_api_key,
+                    user=f"{sid}-{stage}-translate-{pass_name}-{index}",
+                    max_retries=3,
+                    log_prefix=f"annotate.{stage}.translate.{pass_name}.{index}",
+                )
+                repaired, _ = annotate.parse_translation_repair_result(text)
+            except Exception as exc:
+                _annotate_ai_log(
+                    "translation repair failed", sid=sid, stage=stage,
+                    pass_name=pass_name, chunk=index, error=str(exc)[:1000],
+                )
+                repaired = []
+            expected = {
+                (item["id"], item["key"]): item["text"] for item in repair_items
+            }
+            for item in repaired:
+                pair = (item["id"], item["key"])
+                translation = str(item.get("translation", "")).strip()
+                if pair in expected and _translation_is_usable(expected[pair], translation):
+                    results_by_id[item["id"]].setdefault("translations", {})[
+                        item["key"]
+                    ] = translation
+
+    pending = pending_items()
+    await run_repair_pass(api_key, pending, 20, "primary")
+    pending = pending_items()
+    if pending:
+        await run_repair_pass(api_key, pending, 5, "retry")
+    pending = pending_items()
+    if pending and fallback_api_key and fallback_api_key != api_key:
+        await run_repair_pass(fallback_api_key, pending, 5, "fallback")
+
+    missing_ids: set[str] = set()
+    for row_id, result in results_by_id.items():
+        row = rows_by_id.get(row_id)
+        if row is None:
+            continue
+        translations = result.get("translations") or {}
+        if any(
+            str(row[col]).strip() and not _translation_is_usable(
+                str(row[col]).strip(), translations.get(f"col_{col}", "")
+            )
+            for col in open_text_cols if col < len(row)
+        ):
+            missing_ids.add(row_id)
+    return missing_ids, ("中文翻译缺失" if missing_ids else "")
+
 
 
 # ── confirm-ai ──────────────────────────────────────────────────
@@ -602,168 +1086,25 @@ async def ai_detect_stream(sid: str, request: Request):
 async def annotate_set_confirmed_ai(sid: str, confirmed_ai_ids: list[str], request: Request) -> None:
     """存储用户确认的 AI 作答 ID，必要时自动保存历史。"""
     sess = get_annotate_session(sid)
-    sess["confirmed_ai_ids"] = confirmed_ai_ids
+    if sess.get("ai_status") != "complete" or sess.get("missing_ai_ids"):
+        raise HTTPException(status_code=400, detail="AI 作答识别尚未完整完成")
+    reviewable_ids = {
+        str(result.get("id", ""))
+        for result in sess.get("ai_results", [])
+        if result.get("ai_prob", 0) >= ANNOTATE_AI_REVIEW_THRESHOLD
+    }
+    normalized = list(dict.fromkeys(str(row_id).strip() for row_id in confirmed_ai_ids if str(row_id).strip()))
+    invalid = set(normalized) - reviewable_ids
+    if invalid:
+        raise HTTPException(status_code=400, detail="只能确认已进入人工复核范围的玩家")
+    sess["confirmed_ai_ids"] = normalized
+    sess["ai_confirmation_complete"] = True
     if not (sess.get("tasks") or {}).get("quality"):
         await _save_annotate_result_history(sid, sess, request)
 
 
 # ── 质量打标 SSE ────────────────────────────────────────────────
 
-
-async def _run_one_quality_batch(
-    sid: str,
-    batch_num: int,
-    batch: list,
-    headers: list,
-    open_text_cols: list[int],
-    id_col: int,
-    api_key: str,
-) -> tuple[int, list[dict], set[str], str]:
-    """运行单批质量打标，含解析重试和覆盖重试。永远返回结构化结果，不向外抛异常。"""
-    batch_ids = {str(r[id_col]).strip() if id_col < len(r) else "" for r in batch}
-    batch_ids.discard("")
-    try:
-        query = annotate.build_quality_label_query(batch, headers, open_text_cols, id_col, batch_num)
-        chunks: list[str] = []
-        final_conv = ""
-        async for chunk, conv_id in sse_dify_stream(query, sid, "", api_key):
-            if chunk:
-                chunks.append(chunk)
-            if conv_id:
-                final_conv = conv_id
-
-        results, err = annotate.parse_quality_result("".join(chunks))
-        if not results:
-            retry_q = (
-                f"上次输出无法解析（{err}）。请严格按 schema 用 ```json``` 围栏重新输出，"
-                "不要附加任何解释文字。"
-            )
-            retry_chunks: list[str] = []
-            async for chunk, _ in sse_dify_stream(retry_q, sid, final_conv, api_key):
-                if chunk:
-                    retry_chunks.append(chunk)
-            results, err = annotate.parse_quality_result("".join(retry_chunks))
-
-        if not results:
-            return batch_num, [], batch_ids, err
-
-        expected = set(batch_ids)
-        still_missing: set[str] = set()
-        if expected:
-            returned = {r["id"] for r in results if r.get("id")}
-            missing = expected - returned
-            if missing:
-                missing_rows = [
-                    r for r in batch
-                    if (str(r[id_col]).strip() if id_col < len(r) else "") in missing
-                ]
-                retry_miss_q = annotate.build_quality_label_query(
-                    missing_rows, headers, open_text_cols, id_col, f"{batch_num}.miss"
-                )
-                miss_chunks: list[str] = []
-                async for chunk, _ in sse_dify_stream(retry_miss_q, sid, "", api_key):
-                    if chunk:
-                        miss_chunks.append(chunk)
-                miss_results, _ = annotate.parse_quality_result("".join(miss_chunks))
-                if miss_results:
-                    results.extend(miss_results)
-                    missing -= {r["id"] for r in miss_results if r.get("id")}
-                still_missing = missing
-
-        return batch_num, results, still_missing, ""
-    except Exception as exc:
-        return batch_num, [], batch_ids, str(exc)
-
-
-async def quality_stream(sid: str, request: Request):
-    """质量打标 SSE 流程（async generator）。"""
-    sess = get_annotate_session(sid)
-    rows = sess.get("rows", [])
-    headers = sess.get("headers", [])
-    id_col = sess.get("id_col", 1)
-    open_text_cols = sess.get("open_text_cols", [])
-    confirmed_ai_ids = set(sess.get("confirmed_ai_ids", []))
-
-    body = rows[1:]
-    non_ai_body = (
-        [r for r in body if str(r[id_col]).strip() not in confirmed_ai_ids]
-        if body and id_col < len(headers)
-        else body
-    )
-    batch_size = annotate.QUALITY_BATCH
-    batches = [non_ai_body[i: i + batch_size] for i in range(0, len(non_ai_body), batch_size)]
-    total_batches = len(batches)
-    QUALITY_CONCURRENCY = 3
-
-    all_results: list[dict] = []
-    all_missing_ids_q: set[str] = set()
-    pending: set[asyncio.Task] = set()
-    try:
-        sem = asyncio.Semaphore(QUALITY_CONCURRENCY)
-
-        async def run_with_sem(batch_num: int, batch: list):
-            async with sem:
-                return await _run_one_quality_batch(
-                    sid, batch_num, batch, headers, open_text_cols, id_col, DIFY_QUALITY_KEY
-                )
-
-        pending = {asyncio.create_task(run_with_sem(i, b)) for i, b in enumerate(batches, 1)}
-        done_count = 0
-        yield sse_event({
-            "type": "progress", "done": 0, "total": total_batches,
-            "msg": f"已连接，{len(non_ai_body)} 行分 {total_batches} 批，最多 {QUALITY_CONCURRENCY} 批并行",
-        })
-
-        while pending:
-            finished, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-            for task in finished:
-                batch_num, results, still_missing, err = await task
-                done_count += 1
-                if not results:
-                    all_missing_ids_q.update(still_missing)
-                    yield sse_event({
-                        "type": "warn",
-                        "msg": f"第 {batch_num} 批解析失败：{err}；{len(still_missing)} 行计入缺失，完成后将阻断下载",
-                    })
-                else:
-                    all_results.extend(results)
-                    if still_missing:
-                        all_missing_ids_q.update(still_missing)
-                        yield sse_event({
-                            "type": "warn",
-                            "msg": (
-                                f"第 {batch_num} 批重试后仍漏返 {len(still_missing)} 行"
-                                f"（ID：{', '.join(sorted(still_missing)[:5])}{'…' if len(still_missing) > 5 else ''}），完成后将阻断下载"
-                            ),
-                        })
-                yield sse_event({
-                    "type": "progress", "done": done_count, "total": total_batches,
-                    "msg": f"第 {batch_num} 批完成，获得 {len(results)} 条结果（{done_count}/{total_batches} 批已完成）",
-                })
-
-        sess["quality_results"] = all_results
-        sess.pop("missing_quality_ids", None)
-        if all_missing_ids_q:
-            sess["missing_quality_ids"] = sorted(all_missing_ids_q)
-        if not all_missing_ids_q:
-            await _save_annotate_result_history(sid, sess, request)
-        await audit_log(
-            request, "annotate", "完成回答质量打标",
-            f"会话：{sid}；结果数：{len(all_results)}；未回填：{len(all_missing_ids_q)}",
-            metadata={"session_id": sid, "results": len(all_results), "missing": len(all_missing_ids_q)},
-        )
-        yield sse_event({
-            "type": "quality_done",
-            "count": len(all_results),
-            "missing_ids": sorted(all_missing_ids_q),
-        })
-    except Exception as e:
-        import traceback; traceback.print_exc()
-        for t in pending:
-            t.cancel()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-        yield sse_event({"type": "error", "message": str(e)})
 
 
 # ── 下载 ────────────────────────────────────────────────────────
@@ -807,3 +1148,505 @@ def get_annotate_history_file(history_id: str, login: dict | None) -> tuple[byte
         or _annotate_download_filename(entry.get("filename", "annotated"))
     )
     return result_resolved.read_bytes(), download_name
+
+
+# ── 严格标注流程 ───────────────────────────────────────────────
+
+
+async def _run_ai_batch_checked(
+    sid: str,
+    batch_num: int,
+    batch: list,
+    headers: list,
+    open_text_cols: list[int],
+    id_col: int,
+    background: str,
+) -> tuple[int, list[dict], set[str], set[str], str]:
+    results, err = await _run_ai_direct_batch(
+        sid, batch, headers, open_text_cols, id_col, background,
+        DIFY_AI_DETECT_KEY, str(batch_num),
+    )
+    valid, missing, errors = _validated_ai_results(results, batch, id_col, open_text_cols)
+    if missing:
+        missing_rows = [row for row in batch if _row_id(row, id_col) in missing]
+        retry_results, retry_err = await _run_ai_direct_batch(
+            sid, missing_rows, headers, open_text_cols, id_col, background,
+            DIFY_AI_DETECT_KEY, f"{batch_num}.miss",
+        )
+        retry_valid, retry_missing, retry_errors = _validated_ai_results(
+            retry_results, missing_rows, id_col, open_text_cols,
+        )
+        valid.extend(retry_valid)
+        missing = retry_missing
+        errors = retry_errors
+        if retry_err and missing:
+            errors.append(retry_err)
+    else:
+        errors = []
+
+    translation_missing, translation_error = await _repair_missing_translations(
+        sid, valid, batch, id_col, open_text_cols, DIFY_AI_DETECT_KEY, f"ai-{batch_num}",
+        fallback_api_key=DIFY_QUALITY_KEY,
+    )
+    if err and missing and not errors:
+        errors.append(err)
+    detail = _validation_error_summary(errors)
+    if translation_missing and not detail:
+        detail = translation_error
+    return batch_num, valid, missing, translation_missing, detail
+
+
+async def ai_detect_stream(sid: str, request: Request):
+    """Run only missing AI rows, retain prior trusted results, and repair translations."""
+    sess = get_annotate_session(sid)
+    if sess.get("ai_status") != "running":
+        sess["ai_status"] = "running"
+    rows = sess.get("rows", [])
+    headers = sess.get("headers", [])
+    id_col = sess.get("id_col", 1)
+    open_text_cols = sess.get("open_text_cols", [])
+    background = sess.get("background", "")
+    body = rows[1:]
+    expected_ids = {_row_id(row, id_col) for row in body}
+    order = {_row_id(row, id_col): index for index, row in enumerate(body)}
+    results_by_id = {
+        str(result.get("id", "")).strip(): result
+        for result in sess.get("ai_results", [])
+        if str(result.get("id", "")).strip() in expected_ids
+    }
+    target_ids = expected_ids - set(results_by_id)
+    target_ids.update(sess.get("missing_ai_ids") or [])
+    for row_id in target_ids:
+        results_by_id.pop(row_id, None)
+
+    empty_rows = [
+        row for row in body
+        if _row_id(row, id_col) in target_ids
+        and not _has_open_text(row, open_text_cols)
+    ]
+    for row in empty_rows:
+        result = _empty_ai_result(
+            row, id_col, open_text_cols,
+            "主观题均为空，无法构成 AI 内容生成证据",
+        )
+        results_by_id[result["id"]] = result
+    active_rows = [
+        row for row in body
+        if _row_id(row, id_col) in target_ids
+        and _has_open_text(row, open_text_cols)
+    ]
+    max_rows = _effective_batch_size(ANNOTATE_AI_BATCH_SIZE, open_text_cols, 48)
+    batches = _chunk_rows_by_query_budget(
+        active_rows,
+        max_rows,
+        ANNOTATE_AI_MAX_QUERY_CHARS,
+        lambda batch: annotate.build_ai_detect_query(
+            batch, headers, open_text_cols, id_col, "budget", background,
+        ),
+    )
+    pending: set[asyncio.Task] = set()
+    try:
+        yield sse_event({
+            "type": "started",
+            "rows": len(body),
+            "target_rows": len(target_ids),
+            "total_batches": len(batches),
+            "batch_size": max_rows,
+            "msg": (
+                f"已连接，本次仅处理 {len(target_ids)} 行待补结果，分 {len(batches)} 批；"
+                f"已保留 {len(results_by_id)} 行可信结果"
+            ),
+        })
+        sem = asyncio.Semaphore(ANNOTATE_AI_CONCURRENCY)
+
+        async def run_with_sem(batch_num: int, batch: list):
+            async with sem:
+                return await _run_ai_batch_checked(
+                    sid, batch_num, batch, headers, open_text_cols, id_col, background,
+                )
+
+        pending = {
+            asyncio.create_task(run_with_sem(index, batch))
+            for index, batch in enumerate(batches, 1)
+        }
+        done_count = 0
+        while pending:
+            finished, pending = await asyncio.wait(
+                pending,
+                timeout=_ANNOTATE_SSE_HEARTBEAT_SECONDS,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not finished:
+                yield sse_event({"type": "heartbeat"})
+                continue
+            for task in finished:
+                batch_num, batch_results, missing, translation_missing, err = await task
+                done_count += 1
+                for result in batch_results:
+                    results_by_id[str(result.get("id", "")).strip()] = result
+                if missing:
+                    yield sse_event({
+                        "type": "warn",
+                        "msg": (
+                            f"第 {batch_num} 批有 {len(missing)} 行未通过完整性校验"
+                            + (f"：{err}" if err else "")
+                        ),
+                    })
+                if translation_missing:
+                    yield sse_event({
+                        "type": "warn",
+                        "msg": (
+                            f"第 {batch_num} 批的 AI 判断已保留，但仍有 "
+                            f"{len(translation_missing)} 行中文翻译待补齐"
+                        ),
+                    })
+                yield sse_event({
+                    "type": "progress", "done": done_count, "total": len(batches),
+                    "msg": f"第 {batch_num} 批完成，补回 {len(batch_results)} 条可信结果（{done_count}/{len(batches)}）",
+                })
+
+        all_missing_ids = expected_ids - set(results_by_id)
+        all_results = sorted(
+            results_by_id.values(),
+            key=lambda result: order.get(str(result.get("id", "")), len(order)),
+        )
+        all_missing_translation_ids, _ = await _repair_missing_translations(
+            sid,
+            all_results,
+            body,
+            id_col,
+            open_text_cols,
+            DIFY_AI_DETECT_KEY,
+            "ai-final",
+            fallback_api_key=DIFY_QUALITY_KEY,
+        )
+        sess["ai_results"] = all_results
+        sess["ai_status"] = "complete" if not all_missing_ids else "incomplete"
+        sess.pop("missing_ai_ids", None)
+        if all_missing_ids:
+            sess["missing_ai_ids"] = sorted(all_missing_ids)
+        sess.pop("missing_translation_ids", None)
+        if all_missing_translation_ids:
+            sess["missing_translation_ids"] = sorted(all_missing_translation_ids)
+        high_prob = [
+            result for result in all_results
+            if result.get("ai_prob", 0) >= ANNOTATE_AI_HIGH_THRESHOLD
+        ]
+        review_results = [
+            result for result in all_results
+            if result.get("ai_prob", 0) >= ANNOTATE_AI_REVIEW_THRESHOLD
+        ]
+        if not all_missing_ids:
+            if not review_results:
+                sess["ai_confirmation_complete"] = True
+                sess["confirmed_ai_ids"] = []
+            elif not sess.get("ai_confirmation_complete"):
+                sess["confirmed_ai_ids"] = []
+        if (
+            not _annotate_incomplete_detail(sess)
+            and not (sess.get("tasks") or {}).get("quality")
+        ):
+            await _save_annotate_result_history(sid, sess, request)
+        await audit_log(
+            request, "annotate", "完成 AI 作答识别",
+            f"会话：{sid}；结果数：{len(all_results)}；高风险数：{len(high_prob)}；待复核数：{len(review_results)}",
+            metadata={
+                "session_id": sid, "results": len(all_results),
+                "high_prob": len(high_prob), "review": len(review_results),
+                "missing": len(all_missing_ids),
+                "missing_translations": len(all_missing_translation_ids),
+            },
+        )
+        yield sse_event({
+            "type": "ai_detect_done",
+            "results": all_results,
+            "high_prob": high_prob,
+            "review_results": review_results,
+            "review_threshold": ANNOTATE_AI_REVIEW_THRESHOLD,
+            "high_threshold": ANNOTATE_AI_HIGH_THRESHOLD,
+            "confirmation_complete": bool(sess.get("ai_confirmation_complete")),
+            "missing_ids": sorted(all_missing_ids),
+            "missing_translation_ids": sorted(all_missing_translation_ids),
+        })
+    except asyncio.CancelledError:
+        sess["ai_status"] = "incomplete"
+        raise
+    except Exception as exc:
+        sess["ai_status"] = "incomplete"
+        yield sse_event({"type": "error", "message": str(exc)})
+    finally:
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+
+async def _run_one_quality_batch_strict(
+    sid: str,
+    batch_num: int,
+    batch: list,
+    headers: list,
+    open_text_cols: list[int],
+    id_col: int,
+    include_translations: bool,
+) -> tuple[int, list[dict], set[str], str]:
+    async def call(current_query: str) -> tuple[list[dict], str]:
+        output = await workflow_run(
+            inputs={"mode": "quality_label", "query": current_query},
+            api_key=DIFY_QUALITY_KEY,
+            user=f"{sid}-quality-{batch_num}",
+            max_retries=3,
+            log_prefix=f"annotate.quality.{batch_num}",
+        )
+        if not output.strip():
+            return [], "Dify Workflow 返回空内容"
+        return annotate.parse_quality_result(output)
+
+    try:
+        _, query = _fit_rows_to_query_budget(
+            batch,
+            open_text_cols,
+            ANNOTATE_QUALITY_MAX_QUERY_CHARS - 500,
+            lambda model_rows: annotate.build_quality_label_query(
+                model_rows, headers, open_text_cols, id_col, batch_num,
+                include_translations=include_translations,
+            ),
+        )
+        parsed, conv_or_error = await call(query)
+        if not parsed:
+            retry_query = (
+                f"上次输出无法解析（{conv_or_error}）。请重新处理并严格返回指定 JSON。\n\n{query}"
+            )
+            parsed, conv_or_error = await call(retry_query)
+        parsed_by_id = {
+            str(result.get("id", "")).strip(): result
+            for result in parsed if str(result.get("id", "")).strip()
+        }
+        invalid_cols_by_id: dict[str, set[int]] = {}
+        rows_by_id = {_row_id(row, id_col): row for row in batch}
+        for row_id, row in rows_by_id.items():
+            invalid_cols = _quality_invalid_cols(
+                parsed_by_id.get(row_id), row, open_text_cols,
+            )
+            if invalid_cols:
+                invalid_cols_by_id[row_id] = invalid_cols
+
+        repair_error = ""
+        if invalid_cols_by_id:
+            repair_rows = [
+                row for row in batch if _row_id(row, id_col) in invalid_cols_by_id
+            ]
+            repair_cols = sorted({
+                col for cols in invalid_cols_by_id.values() for col in cols
+            })
+            _, repair_query = _fit_rows_to_query_budget(
+                repair_rows,
+                repair_cols,
+                ANNOTATE_QUALITY_MAX_QUERY_CHARS,
+                lambda model_rows: annotate.build_quality_label_query(
+                    model_rows, headers, repair_cols, id_col, f"{batch_num}.miss",
+                    include_translations=include_translations,
+                ),
+            )
+            try:
+                repair_parsed, repair_context = await call(repair_query)
+                repair_error = "" if repair_parsed else repair_context
+            except Exception as exc:
+                repair_parsed = []
+                repair_error = _public_dify_error(str(exc))
+
+            for repaired in repair_parsed:
+                row_id = str(repaired.get("id", "")).strip()
+                invalid_cols = invalid_cols_by_id.get(row_id)
+                if not invalid_cols:
+                    continue
+                base = parsed_by_id.setdefault(row_id, {
+                    "id": row_id,
+                    "q_labels": {},
+                    "q_reasons": {},
+                    "q_evidence": {},
+                    "translations": {},
+                })
+                for field in ("q_labels", "q_reasons", "q_evidence", "translations"):
+                    source = repaired.get(field) or {}
+                    target = base.setdefault(field, {})
+                    for col in invalid_cols:
+                        key = f"col_{col}"
+                        if key in source:
+                            target[key] = source[key]
+
+        valid, missing, errors = _validated_quality_results(
+            list(parsed_by_id.values()), batch, id_col, open_text_cols, include_translations,
+        )
+        if missing and repair_error:
+            errors.append(repair_error)
+
+        return batch_num, valid, missing, _validation_error_summary(errors)
+    except Exception as exc:
+        return (
+            batch_num,
+            [],
+            {_row_id(row, id_col) for row in batch},
+            _public_dify_error(str(exc)),
+        )
+
+
+async def quality_stream(sid: str, request: Request):
+    """Run only missing quality rows and retain prior trusted labels."""
+    sess = get_annotate_session(sid)
+    if sess.get("quality_status") != "running":
+        sess["quality_status"] = "running"
+    rows = sess.get("rows", [])
+    headers = sess.get("headers", [])
+    id_col = sess.get("id_col", 1)
+    open_text_cols = sess.get("open_text_cols", [])
+    confirmed_ai_ids = set(sess.get("confirmed_ai_ids", []))
+    body = [row for row in rows[1:] if _row_id(row, id_col) not in confirmed_ai_ids]
+    expected_ids = {_row_id(row, id_col) for row in body}
+    results_by_id = {
+        str(result.get("id", "")).strip(): result
+        for result in sess.get("quality_results", [])
+        if str(result.get("id", "")).strip() in expected_ids
+    }
+    target_ids = expected_ids - set(results_by_id)
+    target_ids.update(sess.get("missing_quality_ids") or [])
+    for row_id in target_ids:
+        results_by_id.pop(row_id, None)
+
+    empty_rows = [
+        row for row in body
+        if _row_id(row, id_col) in target_ids
+        and not _has_open_text(row, open_text_cols)
+    ]
+    for row in empty_rows:
+        result = _empty_quality_result(row, id_col, open_text_cols)
+        results_by_id[result["id"]] = result
+    active_rows = [
+        row for row in body
+        if _row_id(row, id_col) in target_ids
+        and _has_open_text(row, open_text_cols)
+    ]
+    max_rows = _effective_batch_size(ANNOTATE_QUALITY_BATCH_SIZE, open_text_cols, 36)
+    include_translations = not bool((sess.get("tasks") or {}).get("ai_detect"))
+    batches = _chunk_rows_by_query_budget(
+        active_rows,
+        max_rows,
+        ANNOTATE_QUALITY_MAX_QUERY_CHARS,
+        lambda batch: annotate.build_quality_label_query(
+            batch, headers, open_text_cols, id_col, "budget",
+            include_translations=include_translations,
+        ),
+    )
+    pending: set[asyncio.Task] = set()
+    try:
+        yield sse_event({
+            "type": "progress", "done": 0, "total": len(batches),
+            "msg": (
+                f"本次仅处理 {len(target_ids)} 行待补质量结果，分 {len(batches)} 批；"
+                f"已保留 {len(results_by_id)} 行可信结果"
+            ),
+        })
+        sem = asyncio.Semaphore(ANNOTATE_QUALITY_CONCURRENCY)
+
+        async def run_with_sem(batch_num: int, batch: list):
+            async with sem:
+                return await _run_one_quality_batch_strict(
+                    sid, batch_num, batch, headers, open_text_cols, id_col, include_translations,
+                )
+
+        pending = {
+            asyncio.create_task(run_with_sem(index, batch))
+            for index, batch in enumerate(batches, 1)
+        }
+        done_count = 0
+        while pending:
+            finished, pending = await asyncio.wait(
+                pending,
+                timeout=_ANNOTATE_SSE_HEARTBEAT_SECONDS,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not finished:
+                yield sse_event({"type": "heartbeat"})
+                continue
+            for task in finished:
+                batch_num, batch_results, missing, err = await task
+                done_count += 1
+                for result in batch_results:
+                    results_by_id[str(result.get("id", "")).strip()] = result
+                if missing or err:
+                    yield sse_event({
+                        "type": "warn",
+                        "msg": f"第 {batch_num} 批有 {len(missing)} 行未通过完整性校验" + (f"：{err}" if err else ""),
+                    })
+                yield sse_event({
+                    "type": "progress", "done": done_count, "total": len(batches),
+                    "msg": f"第 {batch_num} 批完成，补回 {len(batch_results)} 条可信结果（{done_count}/{len(batches)}）",
+                })
+
+        all_missing_ids = expected_ids - set(results_by_id)
+        ai_by_id = {
+            str(result.get("id", "")): result
+            for result in sess.get("ai_results", [])
+        }
+        all_results = list(results_by_id.values())
+        for result in all_results:
+            ai_translations = (
+                ai_by_id.get(str(result.get("id", "")), {}).get("translations") or {}
+            )
+            merged = dict(ai_translations)
+            merged.update(result.get("translations") or {})
+            result["translations"] = merged
+
+        translation_targets = dict(ai_by_id)
+        translation_targets.update({
+            str(result.get("id", "")): result
+            for result in all_results if str(result.get("id", ""))
+        })
+        missing_translation_ids, _ = await _repair_missing_translations(
+            sid,
+            list(translation_targets.values()),
+            rows[1:],
+            id_col,
+            open_text_cols,
+            DIFY_QUALITY_KEY,
+            "quality-final",
+            fallback_api_key=DIFY_AI_DETECT_KEY,
+        )
+        order = {_row_id(row, id_col): index for index, row in enumerate(rows[1:])}
+        all_results.sort(key=lambda result: order.get(str(result.get("id", "")), len(order)))
+        sess["quality_results"] = all_results
+        sess["quality_status"] = "complete" if not all_missing_ids else "incomplete"
+        sess.pop("missing_quality_ids", None)
+        if all_missing_ids:
+            sess["missing_quality_ids"] = sorted(all_missing_ids)
+        sess.pop("missing_translation_ids", None)
+        if missing_translation_ids:
+            sess["missing_translation_ids"] = sorted(missing_translation_ids)
+        if not _annotate_incomplete_detail(sess):
+            await _save_annotate_result_history(sid, sess, request)
+        await audit_log(
+            request, "annotate", "完成回答质量打标",
+            f"会话：{sid}；结果数：{len(all_results)}；未回填：{len(all_missing_ids)}",
+            metadata={
+                "session_id": sid,
+                "results": len(all_results),
+                "missing": len(all_missing_ids),
+                "missing_translations": len(missing_translation_ids),
+            },
+        )
+        yield sse_event({
+            "type": "quality_done", "count": len(all_results),
+            "results": all_results, "missing_ids": sorted(all_missing_ids),
+            "missing_translation_ids": sorted(missing_translation_ids),
+        })
+    except asyncio.CancelledError:
+        sess["quality_status"] = "incomplete"
+        raise
+    except Exception as exc:
+        sess["quality_status"] = "incomplete"
+        yield sse_event({"type": "error", "message": str(exc)})
+    finally:
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)

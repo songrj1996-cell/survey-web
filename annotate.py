@@ -15,10 +15,7 @@ from typing import Optional
 import openpyxl
 from openpyxl.styles import Alignment, Font, PatternFill
 
-# 分批大小
-AI_DETECT_BATCH = 10
-QUALITY_BATCH = 15
-AI_DETECT_MAX_CELL_CHARS = 420
+QUALITY_LABELS = {"无效反馈", "普通反馈", "优秀反馈", "N/A"}
 
 # 标注列样式
 _YELLOW_FILL  = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
@@ -119,81 +116,24 @@ def _rows_to_md_table(
 # Query 构建
 # ============================================================
 
-_AI_DETECT_TMPL = """\
-你是一名专业的用研分析师，负责帮 MLBB 游戏用户运营团队识别问卷中疑似由 AI 代为填写的玩家回答。
-
-{background_block}以下是第 {batch_num} 批次（共 {total} 名玩家）的主观题回答数据。\
-表格第一列为玩家唯一标识 ID，后续各列为主观题内容（列名后括号内为本系统的列编号）：
+_AI_DETECT_INPUT_TMPL = """\
+任务模式：AI 内容生成识别
+批次：{batch_num}
+玩家数量：{total}
+{background_block}输入数据如下。第一列是玩家唯一 ID，其余列是该玩家的全部主观题回答：
 
 {table}
-
-**分析任务**：
-1. 以单个玩家为单位，综合其所有主观题回答判断 AI 作答概率（0–100 整数）。
-2. AI 作答概率核心判断标准：
-   - 观点是自己的、仅用 AI 润色结构 → ai_prob 低，is_polished = "high"
-   - 内容有大量个人游戏细节、但结构明显被 AI 整理 → ai_prob 低，is_polished = "high"
-   - 语法纠正软件 → ai_prob 低，is_polished = "high"
-   - 观点和内容均由 AI 生成（无个人细节，泛泛而谈）→ ai_prob 高
-3. 必须对全部 {total} 名玩家进行判断，不可跳过任何一行。
-4. 将每位玩家的每道主观题回答翻译为中文（原文已是中文则原样返回，不加任何提示前缀）。
-
-**输出要求**：只输出一段 ```json``` 围栏，数组顺序必须与输入数据行顺序完全一致：
-```json
-[
-  {{
-    "id": "玩家唯一标识（与输入第一列值完全一致）",
-    "ai_prob": 85,
-    "is_polished": "high",
-    "reason": "判断理由（不超过 100 字）",
-    "evidence": "最具代表性的原文摘录（不超过 150 字）",
-    "translations": {{
-      {col_keys_example}: "该列回答的中文译文"
-    }}
-  }}
-]
-```
-`is_polished` 只取 `"high"` / `"medium"` / `"low"` 三个值。\
-`translations` 的 key 格式为 `"col_列号"`（示例：`"col_3"`）。\
 """
 
-_QUALITY_TMPL = """\
-你是一名专业的用研分析师，负责帮 MLBB 游戏用户运营团队对问卷主观题回答进行质量打标。
+_QUALITY_INPUT_TMPL = """\
+任务模式：逐题反馈质量打标
+批次：{batch_num}
+玩家数量：{total}
+需要逐题返回的列：{col_desc}
 
-以下是第 {batch_num} 批次（共 {total} 名玩家）的主观题回答数据。\
-表格第一列为玩家唯一标识 ID，后续各列为主观题（{col_desc}）：
+输入数据如下。第一列是玩家唯一 ID，其余列是需要独立判断的主观题回答：
 
 {table}
-
-**质量打标标准**：
-- **无效反馈**：仅提供观点没有原因；简短一句话喜欢/不喜欢；纯抱怨或纯夸奖。
-- **优秀反馈**：提供了观点、得出观点的原因，并佐以具体实际案例。
-- **普通反馈**：不属于以上两类，通常包含观点和原因但描述不详细，或没有具体案例。
-- 某道题回答为空 → 标为 `"N/A"`。
-
-**整体打标规则（overall）**：
-- 无效反馈超过一半 → `"无效反馈"`
-- 优秀反馈超过一半 → `"优秀反馈"`
-- 其他 → `"普通反馈"`
-
-**翻译要求**：将每位玩家每道主观题回答翻译为中文（原文已是中文则原样返回，不加任何提示前缀）。
-
-**输出要求**：只输出一段 ```json``` 围栏，数组顺序必须与输入数据行顺序完全一致：
-```json
-[
-  {{
-    "id": "玩家唯一标识（与输入第一列值完全一致）",
-    "q_labels": {{
-      {col_keys_example}: "无效反馈"
-    }},
-    "overall": "普通反馈",
-    "translations": {{
-      {col_keys_example}: "该列回答的中文译文"
-    }}
-  }}
-]
-```
-`q_labels` 和 `translations` 的 key 格式为 `"col_列号"`（示例：`"col_3"`）。\
-`q_labels` 的值只取 `"无效反馈"` / `"普通反馈"` / `"优秀反馈"` / `"N/A"` 四种。\
 """
 
 
@@ -207,17 +147,13 @@ def build_ai_detect_query(
 ) -> str:
     """构建 AI 检测 Dify 查询。"""
     cols = [id_col] + [c for c in open_text_cols if c != id_col]
-    table = _rows_to_md_table(batch_rows, headers, cols, max_cell_chars=AI_DETECT_MAX_CELL_CHARS)
-    col_keys_example = ", ".join(f'"col_{c}": "..."' for c in open_text_cols[:3])
-    if len(open_text_cols) > 3:
-        col_keys_example += ", ..."
-    bg_block = f"**调研背景参考**：{background.strip()}\n\n" if background.strip() else ""
-    return _AI_DETECT_TMPL.format(
+    table = _rows_to_md_table(batch_rows, headers, cols)
+    bg_block = f"调研背景参考：{background.strip()}\n" if background.strip() else ""
+    return _AI_DETECT_INPUT_TMPL.format(
         background_block=bg_block,
         batch_num=batch_num,
         total=len(batch_rows),
         table=table,
-        col_keys_example=col_keys_example,
     )
 
 
@@ -226,7 +162,8 @@ def build_quality_label_query(
     headers: list[str],
     open_text_cols: list[int],
     id_col: int,
-    batch_num: int = 1,
+    batch_num: int | str = 1,
+    include_translations: bool = True,
 ) -> str:
     """构建质量打标 Dify 查询。"""
     cols = [id_col] + [c for c in open_text_cols if c != id_col]
@@ -235,16 +172,25 @@ def build_quality_label_query(
         f"「{headers[c] if c < len(headers) else f'列{c}'}」(col_{c})"
         for c in open_text_cols
     )
-    col_keys_example = ", ".join(f'"col_{c}": "..."' for c in open_text_cols[:3])
-    if len(open_text_cols) > 3:
-        col_keys_example += ", ..."
-    return _QUALITY_TMPL.format(
+    return _QUALITY_INPUT_TMPL.format(
         batch_num=batch_num,
         total=len(batch_rows),
         col_desc=col_desc,
         table=table,
-        col_keys_example=col_keys_example,
     )
+
+
+def build_translation_repair_query(items: list[dict]) -> str:
+    """构建只修复缺失中文翻译的紧凑查询。"""
+    payload = [
+        {
+            "id": str(item.get("id", "")),
+            "key": str(item.get("key", "")),
+            "text": str(item.get("text", "")),
+        }
+        for item in items
+    ]
+    return json.dumps(payload, ensure_ascii=False)
 
 
 # ============================================================
@@ -319,7 +265,7 @@ def _extract_json_array(text: str) -> Optional[list]:
 def parse_ai_detect_result(llm_output: str) -> tuple[list[dict], str]:
     """解析 AI 检测结果。
     Returns: (results, error_msg) — results 为空列表表示解析失败。
-    每条结果：{id, ai_prob, is_polished, reason, evidence, translations}
+    每条结果：{id, ai_prob, polish_prob, reason, evidence, counter_evidence, translations}
     """
     arr = _extract_json_array(llm_output)
     if arr is None:
@@ -328,21 +274,31 @@ def parse_ai_detect_result(llm_output: str) -> tuple[list[dict], str]:
     for item in arr:
         if not isinstance(item, dict):
             continue
+        row_id = str(item.get("id", "")).strip()
+        ai_prob = _strict_probability(item.get("ai_prob"))
+        polish_prob = _strict_probability(item.get("polish_prob"))
+        reason = str(item.get("reason", "")).strip()
+        translations = item.get("translations") or {}
+        if not row_id or ai_prob is None or polish_prob is None or not reason:
+            continue
+        if not isinstance(translations, dict):
+            continue
         results.append({
-            "id":           str(item.get("id", "")),
-            "ai_prob":      _safe_int(item.get("ai_prob", 0), 0, 100),
-            "is_polished":  str(item.get("is_polished", "low")),
-            "reason":       str(item.get("reason", "")),
-            "evidence":     str(item.get("evidence", "")),
-            "translations": dict(item.get("translations") or {}),
+            "id": row_id,
+            "ai_prob": ai_prob,
+            "polish_prob": polish_prob,
+            "reason": reason,
+            "evidence": str(item.get("evidence", "")).strip(),
+            "counter_evidence": str(item.get("counter_evidence", "")).strip(),
+            "translations": dict(translations),
         })
-    return results, ""
+    return (results, "") if results else ([], "JSON 数组内没有符合 AI schema 的结果")
 
 
 def parse_quality_result(llm_output: str) -> tuple[list[dict], str]:
     """解析质量打标结果。
     Returns: (results, error_msg)
-    每条结果：{id, q_labels, overall, translations}
+    每条结果：{id, q_labels, q_reasons, q_evidence, translations}
     """
     arr = _extract_json_array(llm_output)
     if arr is None:
@@ -351,25 +307,77 @@ def parse_quality_result(llm_output: str) -> tuple[list[dict], str]:
     for item in arr:
         if not isinstance(item, dict):
             continue
+        row_id = str(item.get("id", "")).strip()
+        q_labels = item.get("q_labels") or {}
+        q_reasons = item.get("q_reasons") or {}
+        q_evidence = item.get("q_evidence") or {}
+        translations = item.get("translations") or {}
+        if not row_id or not all(isinstance(value, dict) for value in (
+            q_labels, q_reasons, q_evidence, translations,
+        )):
+            continue
         results.append({
-            "id":           str(item.get("id", "")),
-            "q_labels":     dict(item.get("q_labels") or {}),
-            "overall":      str(item.get("overall", "")),
-            "translations": dict(item.get("translations") or {}),
+            "id": row_id,
+            "q_labels": dict(q_labels),
+            "q_reasons": dict(q_reasons),
+            "q_evidence": dict(q_evidence),
+            "translations": dict(translations),
         })
-    return results, ""
+    return (results, "") if results else ([], "JSON 数组内没有符合质量 schema 的结果")
 
 
-def _safe_int(val, lo: int, hi: int) -> int:
+def parse_translation_repair_result(llm_output: str) -> tuple[list[dict], str]:
+    """解析逐单元格中文翻译修复结果。"""
+    arr = _extract_json_array(llm_output)
+    if arr is None:
+        return [], "无法从输出中提取翻译 JSON 数组"
+    results = []
+    for item in arr:
+        if not isinstance(item, dict):
+            continue
+        row_id = str(item.get("id", "")).strip()
+        key = str(item.get("key", "")).strip()
+        translation = str(item.get("translation", "")).strip()
+        if row_id and key.startswith("col_") and translation:
+            results.append({"id": row_id, "key": key, "translation": translation})
+    return (results, "") if results else ([], "翻译 JSON 数组内没有有效结果")
+
+
+def _strict_probability(val) -> int | None:
     try:
-        return max(lo, min(hi, int(val)))
+        parsed = int(val)
     except (TypeError, ValueError):
-        return lo
+        return None
+    return parsed if 0 <= parsed <= 100 else None
+
+
+def calculate_overall_quality(q_labels: dict[str, str], open_text_cols: list[int]) -> tuple[str, str]:
+    """按非 N/A 题目计算整体质量，并返回可复核的计数说明。"""
+    labels = [str(q_labels.get(f"col_{col}", "N/A")) for col in open_text_cols]
+    assessed = [label for label in labels if label != "N/A"]
+    if not assessed:
+        return "N/A", "所有主观题均为 N/A，无可评估回答"
+
+    invalid_count = assessed.count("无效反馈")
+    ordinary_count = assessed.count("普通反馈")
+    excellent_count = assessed.count("优秀反馈")
+    if invalid_count > len(assessed) / 2:
+        overall = "无效反馈"
+    elif excellent_count > len(assessed) / 2:
+        overall = "优秀反馈"
+    else:
+        overall = "普通反馈"
+    reason = (
+        f"非N/A题目{len(assessed)}道：无效{invalid_count}、普通{ordinary_count}、"
+        f"优秀{excellent_count}；按多数规则判为{overall}"
+    )
+    return overall, reason
 
 
 # ============================================================
 # Excel 生成
 # ============================================================
+
 
 def generate_annotated_excel(
     rows: list[list],
@@ -381,148 +389,117 @@ def generate_annotated_excel(
     id_col: int,
     tasks: dict,
 ) -> bytes:
-    """生成标注后的 Excel 文件。
-
-    列顺序：
-    - AI 检测时：[AI作答标注, AI作答概率, AI润色程度, 整体回答质量(可选), ...原始列]
-    - 质量打标时：[整体回答质量, ...原始列（每道主观题前插入该题质量标注列）]
-    - 组合：[AI作答标注, AI作答概率, AI润色程度, 整体回答质量, ...原始列（主观题前有质量标注）]
-
-    所有单元格使用翻译后的中文内容（仅主观题列有翻译）。
-    """
-    do_ai = tasks.get("ai_detect", False)
-    do_quality = tasks.get("quality", False)
-
-    # 建立 ID → 标注结果 的快速查找
-    id_to_ai:      dict[str, dict] = {r["id"]: r for r in ai_results}
-    id_to_quality: dict[str, dict] = {r["id"]: r for r in quality_results}
+    """保留原表并追加可复核的 AI、质量、原文证据和中文翻译列。"""
+    do_ai = bool(tasks.get("ai_detect"))
+    do_quality = bool(tasks.get("quality"))
+    id_to_ai = {str(result.get("id", "")): result for result in ai_results}
+    id_to_quality = {str(result.get("id", "")): result for result in quality_results}
     open_text_set = set(open_text_cols)
 
-    # ── 构建表头 ──────────────────────────────────────────────
-    # 前置标注列
     prefix_headers: list[str] = []
     if do_ai:
-        prefix_headers += ["AI作答标注", "AI作答概率", "AI润色程度"]
+        prefix_headers.extend([
+            "AI作答标签", "AI内容生成概率", "AI润色概率", "AI判断原因",
+            "AI原文证据", "AI反向证据",
+        ])
     if do_quality:
-        prefix_headers.append("整体回答质量")
+        prefix_headers.extend(["整体反馈质量", "整体质量原因"])
 
-    # 原始列规格（list of dict: {header, original_col_idx, is_label_col, label_for_col}）
     col_spec: list[dict] = []
-    for i, h in enumerate(headers):
-        if do_quality and i in open_text_set:
-            # 主观题前插入质量标注列
+    for col_idx, header in enumerate(headers):
+        if do_quality and col_idx in open_text_set:
+            col_spec.extend([
+                {"type": "quality_label", "header": f"[{header}]质量标注", "index": col_idx},
+                {"type": "quality_reason", "header": f"[{header}]质量原因", "index": col_idx},
+                {"type": "quality_evidence", "header": f"[{header}]原文证据", "index": col_idx},
+            ])
+        col_spec.append({"type": "original", "header": header, "index": col_idx})
+        if col_idx in open_text_set and (do_ai or do_quality):
             col_spec.append({
-                "type": "quality_label",
-                "header": f"[{h}]质量标注",
-                "original_col_idx": i,
+                "type": "translation", "header": f"[{header}]中文翻译", "index": col_idx,
             })
-        col_spec.append({
-            "type": "original",
-            "header": h,
-            "original_col_idx": i,
-        })
 
-    full_headers = prefix_headers + [s["header"] for s in col_spec]
-
-    # ── 创建工作簿 ─────────────────────────────────────────────
+    full_headers = prefix_headers + [spec["header"] for spec in col_spec]
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "标注结果"
-
-    # 写表头
     ws.append(full_headers)
-    header_row = ws[1]
-    for cell in header_row:
-        val = cell.value or ""
-        is_annotation = (
-            val in ("AI作答标注", "AI作答概率", "AI润色程度", "整体回答质量")
-            or val.endswith("质量标注")
-        )
-        if is_annotation:
+
+    annotation_suffixes = ("质量标注", "质量原因", "原文证据", "中文翻译")
+    for cell in ws[1]:
+        value = str(cell.value or "")
+        if value in prefix_headers or value.endswith(annotation_suffixes):
             cell.fill = _HEADER_FILL
-            cell.font = _BOLD_FONT
-        else:
-            cell.font = _BOLD_FONT
+        cell.font = _BOLD_FONT
+        cell.alignment = Alignment(vertical="top", wrap_text=True)
 
-    # ── 写数据行 ───────────────────────────────────────────────
-    body = rows[1:] if len(rows) > 1 else []
-    for row_data in body:
+    for row_data in rows[1:]:
         row_id = str(row_data[id_col]).strip() if id_col < len(row_data) else ""
-        ai_info      = id_to_ai.get(row_id, {})
+        ai_info = id_to_ai.get(row_id, {})
         quality_info = id_to_quality.get(row_id, {})
-        is_ai        = row_id in confirmed_ai_ids
-
-        # 合并翻译（优先 quality，回退 ai）
+        is_ai = row_id in confirmed_ai_ids
         translations: dict[str, str] = {}
-        if ai_info.get("translations"):
-            translations.update(ai_info["translations"])
-        if quality_info.get("translations"):
-            translations.update(quality_info["translations"])
+        translations.update(ai_info.get("translations") or {})
+        translations.update(quality_info.get("translations") or {})
 
-        new_row: list = []
-
-        # 前置标注列
+        output_row: list = []
         if do_ai:
-            if is_ai:
-                new_row.append("AI作答")
-                new_row.append(ai_info.get("ai_prob", ""))
-            else:
-                prob = ai_info.get("ai_prob", "")
-                new_row.append(f"{prob}%" if prob != "" else "")
-                new_row.append(prob)
-            new_row.append(ai_info.get("is_polished", "") if ai_info else "")
-
+            output_row.extend([
+                "高概率AI作答" if is_ai else "非高概率AI作答",
+                ai_info.get("ai_prob", ""),
+                ai_info.get("polish_prob", ""),
+                ai_info.get("reason", ""),
+                ai_info.get("evidence", ""),
+                ai_info.get("counter_evidence", ""),
+            ])
         if do_quality:
-            if is_ai:
-                new_row.append("")
-            else:
-                new_row.append(quality_info.get("overall", ""))
+            output_row.extend([
+                "高概率AI作答" if is_ai else quality_info.get("overall", ""),
+                "已确认高概率AI作答，不进入质量打标" if is_ai else quality_info.get("overall_reason", ""),
+            ])
 
-        # 原始列（含插入的质量标注列）
         for spec in col_spec:
-            col_idx = spec["original_col_idx"]
-            if spec["type"] == "quality_label":
-                if is_ai:
-                    new_row.append("")
-                else:
-                    new_row.append(quality_info.get("q_labels", {}).get(f"col_{col_idx}", ""))
+            col_idx = spec["index"]
+            key = f"col_{col_idx}"
+            spec_type = spec["type"]
+            if spec_type == "quality_label":
+                value = "-" if is_ai else (quality_info.get("q_labels") or {}).get(key, "")
+            elif spec_type == "quality_reason":
+                value = "-" if is_ai else (quality_info.get("q_reasons") or {}).get(key, "")
+            elif spec_type == "quality_evidence":
+                value = "-" if is_ai else (quality_info.get("q_evidence") or {}).get(key, "")
+            elif spec_type == "translation":
+                value = translations.get(key, "")
             else:
-                orig_val = str(row_data[col_idx]) if col_idx < len(row_data) else ""
-                translated = translations.get(f"col_{col_idx}", "")
-                new_row.append(translated if translated else orig_val)
+                value = row_data[col_idx] if col_idx < len(row_data) else ""
+            output_row.append(value)
 
-        ws.append(new_row)
+        ws.append(output_row)
         row_num = ws.max_row
-
-        # 标注列 → 黄色背景
-        n_prefix = len(prefix_headers)
-        for j in range(1, n_prefix + 1):
-            ws.cell(row=row_num, column=j).fill = _YELLOW_FILL
-
-        # 质量标注插入列 → 黄色背景
-        col_cursor = n_prefix + 1
-        for spec in col_spec:
-            cell = ws.cell(row=row_num, column=col_cursor)
-            if spec["type"] == "quality_label":
-                cell.fill = _YELLOW_FILL
-            col_cursor += 1
-
-        # AI 作答行 → 整行灰色
+        for cell in ws[row_num]:
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+        for column in range(1, len(prefix_headers) + 1):
+            ws.cell(row=row_num, column=column).fill = _YELLOW_FILL
+        for offset, spec in enumerate(col_spec, len(prefix_headers) + 1):
+            if spec["type"] != "original":
+                ws.cell(row=row_num, column=offset).fill = _YELLOW_FILL
         if is_ai:
-            for j in range(1, len(full_headers) + 1):
-                ws.cell(row=row_num, column=j).fill = _GRAY_FILL
+            for column in range(1, len(full_headers) + 1):
+                ws.cell(row=row_num, column=column).fill = _GRAY_FILL
 
-    # ── 列宽 ──────────────────────────────────────────────────
-    for col_num, h in enumerate(full_headers, 1):
-        col_letter = openpyxl.utils.get_column_letter(col_num)
-        if h in ("AI作答标注", "AI作答概率", "AI润色程度", "整体回答质量"):
-            ws.column_dimensions[col_letter].width = 14
-        elif h.endswith("质量标注"):
-            ws.column_dimensions[col_letter].width = 14
+    compact_headers = {"AI作答标签", "AI内容生成概率", "AI润色概率", "整体反馈质量"}
+    wide_headers = {"AI判断原因", "AI原文证据", "AI反向证据", "整体质量原因"}
+    for col_num, header in enumerate(full_headers, 1):
+        letter = openpyxl.utils.get_column_letter(col_num)
+        if header in compact_headers or header.endswith("质量标注"):
+            width = 16
+        elif header in wide_headers or header.endswith(("质量原因", "原文证据", "中文翻译")):
+            width = 32
         else:
-            ws.column_dimensions[col_letter].width = 28
+            width = 28
+        ws.column_dimensions[letter].width = width
 
+    ws.freeze_panes = "A2"
     buf = io.BytesIO()
     wb.save(buf)
-    buf.seek(0)
-    return buf.read()
+    return buf.getvalue()

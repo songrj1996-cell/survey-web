@@ -55,6 +55,13 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)).strip())
+    except (TypeError, ValueError):
+        return default
+
+
 def _env_csv_set(name: str, *, lower: bool = False) -> set[str]:
     vals = []
     for item in os.getenv(name, "").replace(";", ",").split(","):
@@ -62,6 +69,38 @@ def _env_csv_set(name: str, *, lower: bool = False) -> set[str]:
         if item:
             vals.append(item.lower() if lower else item)
     return set(vals)
+
+
+# Google Form Responses 不含原表单跳转配置。小样本要求完全吻合；只有达到此回答量后，
+# 才允许按比例容忍少量分支外异常数据。样本量本身不作为拒绝识别跳转的条件。
+BRANCH_ANOMALY_MIN_ANSWERS = max(1, _env_int("BRANCH_ANOMALY_MIN_ANSWERS", 20))
+BRANCH_MAX_LEAKAGE_RATE = min(
+    0.5,
+    max(0.0, _env_float("BRANCH_MAX_LEAKAGE_RATE", 0.05)),
+)
+
+# 数据标注：AI 内容生成风险阈值与批处理参数。
+# 润色概率仅用于展示，不参与 AI 作答确认。
+ANNOTATE_AI_REVIEW_THRESHOLD = min(
+    100,
+    max(0, _env_int("ANNOTATE_AI_REVIEW_THRESHOLD", 60)),
+)
+ANNOTATE_AI_HIGH_THRESHOLD = min(
+    100,
+    max(ANNOTATE_AI_REVIEW_THRESHOLD, _env_int("ANNOTATE_AI_HIGH_THRESHOLD", 80)),
+)
+ANNOTATE_AI_BATCH_SIZE = max(1, _env_int("ANNOTATE_AI_BATCH_SIZE", 10))
+ANNOTATE_QUALITY_BATCH_SIZE = max(1, _env_int("ANNOTATE_QUALITY_BATCH_SIZE", 15))
+ANNOTATE_AI_CONCURRENCY = max(1, _env_int("ANNOTATE_AI_CONCURRENCY", 3))
+ANNOTATE_QUALITY_CONCURRENCY = max(1, _env_int("ANNOTATE_QUALITY_CONCURRENCY", 3))
+ANNOTATE_AI_MAX_QUERY_CHARS = max(
+    4000,
+    _env_int("ANNOTATE_AI_MAX_QUERY_CHARS", 45000),
+)
+ANNOTATE_QUALITY_MAX_QUERY_CHARS = max(
+    4000,
+    _env_int("ANNOTATE_QUALITY_MAX_QUERY_CHARS", 40000),
+)
 
 
 FEISHU_LOGIN_REQUIRED = _env_bool("FEISHU_LOGIN_REQUIRED", False)
@@ -96,7 +135,7 @@ DEFAULT_UPLOAD_GUIDE = """\
 1. 支持直接传入 googleform 及倍市得平台导出的问卷回答。
    - 倍市得平台导出时请筛选成功完成的回复，**导出设置选择"excel-可读数据"，勾选多选题同一列**，其他默认即可。
    - google form 链接的 google sheet 可以直接下载对应格式并上传。
-2. 支持 CSV 和 Excel (.xlsx/.xls) 格式，请确保表格的第一行为**题目名称**，从第二行开始为**答卷数据**。
+2. 支持 CSV 和 Excel (.xlsx) 格式，请确保表格的第一行为**题目名称**，从第二行开始为**答卷数据**。
 3. 上传的 excel 文件中可以有多个 sheet，但**只会读取放置在第一位的 sheet 内容**进行分析。
 
 **【题型及分析方案】**
@@ -162,6 +201,8 @@ CORE_END = "<!--CORE_END-->"
 
 DEFAULT_PLANNER_EXTRA = """\
 请按 JSON schema 输出列分类、part 划分、交叉分析建议、open_questions。
-open_questions 中的问题请以「我计划…，请确认是否这样做？」的格式提出，不要对已由用户确认的列类型再次提问。
+open_questions 仅用于请用户确认会实质影响报告结论的分析思路，不要对已由用户确认的列类型、选项或归并方式再次提问。
+每条 open_questions 必须使用面向普通用户的自然语言，同时说明：①为什么需要这样分析（依据问卷内容、题目关系或业务目标）；②计划采用什么分析方式；③请用户确认。不得只写“我计划……”，不得出现“列N”、column、index、字段名等内部实现信息，应使用用户能理解的题目名称或业务主题。
+示例：由于问卷同时询问使用情况和未使用原因，为避免将不同人群混在一起，我计划先按使用状态分组，再分别分析主要原因。请确认是否按此方式分析。
 若上文存在 `<business_context>`：请优先围绕其中的分析目标、目标用户和最关心的问题来规划报告章节与分析重点（可适当调整 parts 顺序、cross_tabs 或 open_questions，使其更贴合该业务目标），但仍需遵守已确认的题型/选项等既有约束，不因业务目标而改变 columns。\
 """

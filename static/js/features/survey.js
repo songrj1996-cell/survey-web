@@ -5,16 +5,30 @@
 const uploadZone = $('upload-zone');
 const fileInput = $('file-input');
 
-uploadZone.addEventListener('click', () => fileInput.click());
-uploadZone.addEventListener('dragover', e => { e.preventDefault(); uploadZone.classList.add('drag-over'); });
+function surveyUploadIsLocked() {
+  return !!state.sessionId && state.currentStep > 1;
+}
+
+uploadZone.addEventListener('click', () => {
+  if (!surveyUploadIsLocked()) fileInput.click();
+});
+uploadZone.addEventListener('dragover', e => {
+  e.preventDefault();
+  if (!surveyUploadIsLocked()) uploadZone.classList.add('drag-over');
+});
 uploadZone.addEventListener('dragleave', () => uploadZone.classList.remove('drag-over'));
 uploadZone.addEventListener('drop', e => {
   e.preventDefault();
   uploadZone.classList.remove('drag-over');
+  if (surveyUploadIsLocked()) return;
   const file = e.dataTransfer.files[0];
   if (file) handleUpload(file);
 });
 fileInput.addEventListener('change', () => {
+  if (surveyUploadIsLocked()) {
+    fileInput.value = '';
+    return;
+  }
   if (fileInput.files[0]) handleUpload(fileInput.files[0]);
 });
 
@@ -62,6 +76,7 @@ async function handleUpload(file) {
       running: false,
       stream: '',
     };
+    renderUploadedFileState(data.filename);
     renderPreview(data);
     goStep(2);
     showToast(`成功读取 ${data.total_rows} 行数据`, 'success');
@@ -72,7 +87,31 @@ async function handleUpload(file) {
   }
 }
 
+function renderUploadedFileState(filename) {
+  state.uploadedFilename = String(filename || '').trim();
+  fileInput.disabled = true;
+  uploadZone.classList.remove('drag-over');
+  uploadZone.classList.add('upload-zone--readonly');
+  uploadZone.setAttribute('aria-disabled', 'true');
+  uploadZone.innerHTML = `
+    <div class="upload-zone__icon upload-zone__icon--complete">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+        <polyline points="14 2 14 8 20 8"/>
+        <polyline points="9 15 11 17 15 13"/>
+      </svg>
+    </div>
+    <div class="upload-zone__text">
+      <span class="upload-zone__primary">已上传文件：${esc(state.uploadedFilename || '未记录文件名')}</span>
+      <span class="upload-zone__secondary">当前流程已开始，回看时不可重新上传</span>
+    </div>`;
+}
+
 function resetUploadZone() {
+  state.uploadedFilename = '';
+  fileInput.disabled = false;
+  uploadZone.classList.remove('upload-zone--readonly', 'drag-over');
+  uploadZone.removeAttribute('aria-disabled');
   uploadZone.innerHTML = `
     <div class="upload-zone__icon">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
@@ -257,7 +296,15 @@ function refreshContextFormVisibility() {
 }
 
 function optionEditorHTML(i, c) {
-  const options = c.options || [];
+  const options = [...(c.options || [])];
+  (c.unmatched_values || [])
+    .filter(item => item?.suggested_handling === 'standard_option')
+    .forEach(item => {
+      const value = String(item?.value || '').trim();
+      if (value && !options.some(option => option.trim().toLocaleLowerCase() === value.toLocaleLowerCase())) {
+        options.push(value);
+      }
+    });
   const aliases = c.value_aliases || {};
   const aliasGroups = Object.entries(aliases).filter(([canon, values]) =>
     Array.isArray(values) && values.some(v => String(v).trim() && String(v).trim() !== canon)
@@ -316,39 +363,30 @@ function otherTextHTML(i, c) {
 }
 
 function unmatchedValuesHTML(i, c) {
-  const values = Array.isArray(c.unmatched_values) ? c.unmatched_values : [];
+  const values = Array.isArray(c.unmatched_values)
+    ? c.unmatched_values.filter(item => item?.suggested_handling !== 'standard_option')
+    : [];
   if (!values.length) return '';
-  const standardValues = values.filter(item => item?.suggested_handling === 'standard_option');
-  const reviewValues = values.filter(item => item?.suggested_handling !== 'standard_option');
-  const chips = list => list.slice(0, 8).map(item =>
-    `<span class="option-summary-chip" title="${esc(item.value)}">${esc(item.value)} · ${Number(item.count || 0)} 条</span>`
-  ).join('');
-  const more = list => list.length > 8 ? `<span class="option-summary-more">+${list.length - 8}</span>` : '';
-  const defaultHandling = reviewValues.length && reviewValues.every(item => item.suggested_handling === 'other_text')
-    ? 'as_other'
-    : 'keep_raw';
-  const standardHTML = standardValues.length ? `
-    <div style="margin-bottom:${reviewValues.length ? '10px' : '0'};">
-      <div style="font-size:13px;color:var(--text-2);margin-bottom:6px;">以下值符合当前题目的数值/结构选项体系，将作为标准选项保留：</div>
-      <div style="display:flex;flex-wrap:wrap;gap:6px;">${chips(standardValues)}${more(standardValues)}</div>
-    </div>` : '';
-  const reviewHTML = reviewValues.length ? `
-    <div>
-      <div style="font-size:13px;color:var(--text-2);margin-bottom:6px;">以下值无法仅凭导出数据判断是漏识别选项还是 Google Form Other 填空：</div>
-      <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px;">${chips(reviewValues)}${more(reviewValues)}</div>
-      <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:var(--text-2);">
-        <span>处理方式</span>
-        <select class="extra-input extra-input--sm" data-unmatched-handling="${i}">
-          <option value="keep_raw" ${defaultHandling === 'keep_raw' ? 'selected' : ''}>暂不归并，按原始值统计</option>
-          <option value="as_other" ${defaultHandling === 'as_other' ? 'selected' : ''}>按 Other 填空处理</option>
-          <option value="as_option">作为标准选项保留</option>
-        </select>
-      </label>
-    </div>` : '';
+  const totalCount = values.reduce((sum, item) => sum + Number(item?.count || 0), 0);
+  const previewRows = values.map(item => `<div class="unmatched-value-row">
+    <span class="unmatched-value-row__text">${esc(item.value)}</span>
+    <span class="unmatched-value-row__count">${Number(item.count || 0)} 条</span>
+  </div>`).join('');
   return `<div class="option-editor" data-unmatched-values="${i}">
     <div style="border:1px dashed var(--border);border-radius:8px;padding:10px 12px;background:rgba(255,255,255,.54);">
-      <div style="font-size:13px;font-weight:600;color:var(--text);margin-bottom:8px;">待确认值（不会自动加入 Other）</div>
-      ${standardHTML}${reviewHTML}
+      <div style="font-size:13px;font-weight:600;color:var(--text);margin-bottom:6px;">未匹配内容</div>
+      <div class="unmatched-help">请先确认上方标准选项。与标准选项或别名匹配的内容会自动按选项统计，剩余内容再按下方方式统一处理。</div>
+      <label class="unmatched-bulk-row">
+        <span>批量处理</span>
+        <select class="extra-input unmatched-handling-select" data-unmatched-handling="${i}">
+          <option value="as_other" selected>剩余内容按 Other 填空处理</option>
+          <option value="keep_raw">剩余内容保留原值统计</option>
+        </select>
+      </label>
+      <details class="unmatched-preview" open>
+        <summary>逐条预览：${values.length} 种未匹配内容，共 ${totalCount} 条</summary>
+        <div class="unmatched-value-list">${previewRows}</div>
+      </details>
     </div>
   </div>`;
 }
@@ -511,6 +549,7 @@ $('col-list').addEventListener('change', e => {
       if (newRole) row.classList.add(`col-row--role-${newRole}`);
     }
   }
+
 });
 
 $('col-list').addEventListener('input', e => {
@@ -646,15 +685,11 @@ function collectConfirmedColumns() {
         const originalExists = optionsOriginal.some(option => String(option || '').trim().toLocaleLowerCase() === text.toLocaleLowerCase());
         if (!originalExists) optionsOriginal.push(text);
       };
-      const standardResiduals = unmatchedValues.filter(item => item?.suggested_handling === 'standard_option');
       const reviewResiduals = unmatchedValues.filter(item => item?.suggested_handling !== 'standard_option');
-      standardResiduals.forEach(item => addOption(item.value));
       if (reviewResiduals.length) {
         const handlingEl = document.querySelector(`[data-unmatched-handling="${i}"]`);
-        const handling = handlingEl?.value || 'keep_raw';
-        if (handling === 'as_option') {
-          reviewResiduals.forEach(item => addOption(item.value));
-        } else if (handling === 'as_other') {
+        const handling = handlingEl?.value || 'as_other';
+        if (handling === 'as_other') {
           const otherOption = 'Other / 其他';
           addOption(otherOption);
           out.other_text = {
@@ -694,7 +729,12 @@ function collectConfirmedColumns() {
     if (!out.value_aliases && c.value_aliases && CHOICE_ROLES.includes(role)) {
       out.value_aliases = c.value_aliases;
     }
-    if ((role === 'single_choice' || role === 'multi_choice') && !out.other_text && c.other_text) {
+    if (
+      (role === 'single_choice' || role === 'multi_choice')
+      && !out.other_text
+      && c.other_text
+      && !c.unmatched_values?.length
+    ) {
       out.other_text = {
         ...c.other_text,
         enabled: otherTextEnabled,
@@ -805,65 +845,217 @@ function buildPlanHTML(plan, headers) {
 
   const colMap = {};
   for (const c of plan.columns) colMap[c.index] = c;
+  const columnDisplayName = idx => {
+    const c = colMap[idx];
+    const candidates = [c?.name_zh, c?.name, headers && headers[idx]];
+    return candidates
+      .map(value => String(value || '').trim())
+      .find(value => value && !/^(?:列|column|col)\s*\d+$/i.test(value)) || '';
+  };
+  const humanizePlanText = text => String(text || '')
+    .replace(/列\s*(\d+)/g, (_, rawIdx) => {
+      const name = columnDisplayName(Number(rawIdx));
+      return name ? `「${name}」` : '相关题目';
+    })
+    .replace(/\b(?:column|col|index)\s*[:#]?\s*(\d+)/gi, (_, rawIdx) => {
+      const name = columnDisplayName(Number(rawIdx));
+      return name ? `「${name}」` : '相关题目';
+    });
 
-  // 1. 报告章节（列分类已在 Step 2 由用户确认，此处不再展示）
+  const branchRules = Array.isArray(plan.branch_rules) ? plan.branch_rules : [];
+  const cross = Array.isArray(plan.cross_tabs) ? plan.cross_tabs : [];
+  const rulesByParent = new Map();
+  const ruleByTargetIndex = new Map();
+  branchRules.forEach(rule => {
+    if (!rulesByParent.has(rule.parent_index)) rulesByParent.set(rule.parent_index, []);
+    rulesByParent.get(rule.parent_index).push(rule);
+    (rule.targets || []).forEach(target => {
+      (target.indexes || []).forEach(idx => ruleByTargetIndex.set(idx, { rule, target }));
+    });
+  });
+
+  const rolePresentation = role => ({
+    profile_dim: ['画像题', '统计各选项人数与占比'],
+    single_choice: ['单选题', '统计各选项人数与占比'],
+    multi_choice: ['多选题', '统计各选项选择人数与占比'],
+    scale: ['量表题', '分析评分分布与集中趋势'],
+    open_text: ['开放题', '归纳主要主题、原因与体验反馈'],
+    matrix_scale: ['矩阵量表', '按矩阵子项比较评分表现'],
+    matrix_multi: ['矩阵多选', '按矩阵子项比较选择分布'],
+  }[role] || ['分析题', '结合本题有效回答进行分析']);
+
+  const logicalIndexesFor = (idx, partSet) => {
+    const col = colMap[idx];
+    if (!col || !['matrix_scale', 'matrix_multi'].includes(col.role) || !col.matrix_group) return [idx];
+    return [...partSet].filter(otherIdx => {
+      const other = colMap[otherIdx];
+      return other?.role === col.role && other?.matrix_group === col.matrix_group;
+    });
+  };
+
+  const logicalQuestionCount = indexes => {
+    const keys = new Set();
+    indexes.forEach(idx => {
+      const col = colMap[idx];
+      const key = col?.matrix_group && ['matrix_scale', 'matrix_multi'].includes(col.role)
+        ? `${col.role}:${col.matrix_group}`
+        : `column:${idx}`;
+      keys.add(key);
+    });
+    return keys.size;
+  };
+
+  const renderQuestion = (idx, number, partSet, visited, nested = false) => {
+    if (visited.has(idx) || !partSet.has(idx)) return '';
+    const col = colMap[idx] || {};
+    const logicalIndexes = logicalIndexesFor(idx, partSet);
+    logicalIndexes.forEach(itemIdx => visited.add(itemIdx));
+    const name = col.matrix_group || columnDisplayName(idx) || '未命名题目';
+    const [roleLabel, method] = rolePresentation(col.role);
+    const applicability = ruleByTargetIndex.get(idx);
+    let itemHTML = `<div class="plan-outline__question${nested ? ' plan-outline__question--nested' : ''}">
+      <div class="plan-outline__question-head">
+        <span class="plan-outline__number">${esc(number)}</span>
+        <span class="plan-outline__question-name">${esc(name)}</span>
+        <span class="plan-outline__role">${esc(roleLabel)}</span>
+      </div>
+      <div class="plan-outline__method">${esc(method)}</div>`;
+
+    if (applicability && !nested) {
+      const { rule, target } = applicability;
+      const options = (rule.allowed_options || []).map(option => `「${option}」`).join(' / ');
+      const prefix = rule.confidence === 'medium' ? '疑似条件关系' : '适用范围';
+      itemHTML += `<div class="plan-outline__applicability${rule.confidence === 'medium' ? ' is-medium' : ''}">
+        <span>${esc(prefix)}</span>
+        ${esc(`「${rule.parent_name || '前置题目'}」选择 ${options} · 进入 ${Number(rule.eligible_count || 0)} 人 · 本题 ${Number(target.answered_count || 0)} 条有效回答`)}
+      </div>`;
+    }
+
+    const childRules = rulesByParent.get(idx) || [];
+    if (childRules.length) {
+      itemHTML += '<div class="plan-outline__branches">';
+      let childCounter = 0;
+      childRules.forEach(rule => {
+        const options = (rule.allowed_options || []).map(option => `「${option}」`).join(' / ');
+        const confidenceLabel = rule.confidence === 'medium' ? '疑似' : '已识别';
+        const confidenceClass = rule.confidence === 'medium' ? ' is-medium' : '';
+        itemHTML += `<div class="plan-outline__branch">
+          <div class="plan-outline__branch-condition">
+            <span class="plan-outline__confidence${confidenceClass}">${esc(confidenceLabel)}</span>
+            <span>选择 ${esc(options)}</span>
+            <span class="plan-outline__sample">进入该分支 ${Number(rule.eligible_count || 0)} 人</span>
+          </div>
+          <div class="plan-outline__branch-children">`;
+        const externalTargets = [];
+        (rule.targets || []).forEach(target => {
+          const targetIdx = (target.indexes || []).find(targetIndex => partSet.has(targetIndex));
+          if (targetIdx == null) {
+            externalTargets.push(target.name || '后续题目');
+            return;
+          }
+          childCounter += 1;
+          itemHTML += renderQuestion(targetIdx, `${number}.${childCounter}`, partSet, visited, true);
+        });
+        if (externalTargets.length) {
+          itemHTML += `<div class="plan-outline__external">其他章节继续分析：${esc(externalTargets.join('、'))}</div>`;
+        }
+        itemHTML += '</div></div>';
+      });
+      itemHTML += '</div>';
+    }
+    itemHTML += '</div>';
+    return itemHTML;
+  };
+
+  // 1. 报告章节大纲
   html += `<div class="plan-section">
     <div class="plan-section__title">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
-      报告章节
+      报告分析大纲
     </div>
-    <div class="plan-parts">`;
+    <div class="plan-outline">`;
 
   for (let i = 0; i < plan.parts.length; i++) {
     const p = plan.parts[i];
-    // 跑数表模式:章节是语义化的(name + scope),不绑定列号
-    const detail = p.column_indexes
-      ? p.column_indexes.map(idx => {
-        const c = colMap[idx];
-        return c ? (c.name || (headers && headers[idx]) || `列${idx}`) : `列${idx}`;
-      }).join('、')
-      : (p.scope || '');
-    html += `<div class="plan-part">
-      <span class="plan-part__num">Part ${i + 1}</span>
-      <span class="plan-part__name">${esc(p.name)}</span>
-      <span class="plan-part__cols">${esc(detail)}</span>
-    </div>`;
+    const indexes = Array.isArray(p.column_indexes) ? p.column_indexes : [];
+    const partSet = new Set(indexes);
+    const partBranchRules = branchRules.filter(rule =>
+      partSet.has(rule.parent_index)
+      || (rule.targets || []).some(target => (target.indexes || []).some(idx => partSet.has(idx)))
+    );
+    const summaryParts = [];
+    if (indexes.length) summaryParts.push(`${logicalQuestionCount(indexes)} 道题`);
+    if (partBranchRules.length) summaryParts.push(`${partBranchRules.length} 组条件关系`);
+    if (!summaryParts.length && p.scope) summaryParts.push(p.scope);
+
+    html += `<details class="plan-outline__part" open>
+      <summary class="plan-outline__part-summary">
+        <span class="plan-outline__part-num">Part ${i + 1}</span>
+        <span class="plan-outline__part-title">${esc(p.name)}</span>
+        <span class="plan-outline__part-meta">${esc(summaryParts.join(' · '))}</span>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+      </summary>
+      <div class="plan-outline__part-body">`;
+
+    if (!indexes.length) {
+      html += `<div class="plan-outline__scope">${esc(p.scope || '按本章节主题进行综合分析')}</div>`;
+    } else {
+      const nestedIndexes = new Set();
+      branchRules.forEach(rule => {
+        if (!partSet.has(rule.parent_index)) return;
+        (rule.targets || []).forEach(target => {
+          (target.indexes || []).forEach(targetIdx => {
+            if (partSet.has(targetIdx)) nestedIndexes.add(targetIdx);
+          });
+        });
+      });
+      const visited = new Set();
+      let rootCounter = 0;
+      indexes.forEach(idx => {
+        if (nestedIndexes.has(idx) || visited.has(idx)) return;
+        rootCounter += 1;
+        html += renderQuestion(idx, `${i + 1}.${rootCounter}`, partSet, visited);
+      });
+      // 容错：若父题在其他 Part，仍展示未渲染的问题及其适用条件。
+      indexes.forEach(idx => {
+        if (visited.has(idx)) return;
+        rootCounter += 1;
+        html += renderQuestion(idx, `${i + 1}.${rootCounter}`, partSet, visited);
+      });
+    }
+
+    const partCross = cross.filter(item => partSet.has(item.question_index));
+    if (partCross.length) {
+      html += `<div class="plan-outline__supplement">
+        <div class="plan-outline__supplement-title">补充分析</div>
+        <div class="plan-cross">`;
+      partCross.forEach(item => {
+        const profileName = columnDisplayName(item.profile_index) || '相关画像题目';
+        const questionName = columnDisplayName(item.question_index) || '相关分析题目';
+        html += `<div class="plan-cross-item">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          ${esc(profileName)} × ${esc(questionName)}
+        </div>`;
+      });
+      html += '</div></div>';
+    }
+    html += '</div></details>';
   }
   html += `</div></div>`;
 
-  // 2. 交叉分析
-  const cross = plan.cross_tabs || [];
-  if (cross.length) {
-    html += `<div class="plan-section">
-      <div class="plan-section__title">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-        交叉分析
-      </div>
-      <div class="plan-cross">`;
-    for (const ct of cross) {
-      const pName = (colMap[ct.profile_index]?.name) || (headers && headers[ct.profile_index]) || `列${ct.profile_index}`;
-      const qName = (colMap[ct.question_index]?.name) || (headers && headers[ct.question_index]) || `列${ct.question_index}`;
-      html += `<div class="plan-cross-item">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-        ${esc(pName)} × ${esc(qName)}
-      </div>`;
-    }
-    html += `</div></div>`;
-  }
-
-  // 3. 待确认问题
+  // 2. 待确认的分析思路
   const openQs = plan.open_questions || [];
   if (openQs.length) {
     html += `<div class="plan-section">
       <div class="plan-section__title">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
-        待确认问题
+        待确认的分析思路
       </div>
       <div class="plan-questions">`;
     openQs.forEach((q, i) => {
       html += `<div class="plan-question">
         <span class="plan-question__num">Q${i + 1}</span>
-        <span>${esc(q)}</span>
+        <span>${esc(humanizePlanText(q))}</span>
       </div>`;
     });
     html += `</div></div>`;

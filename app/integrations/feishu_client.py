@@ -167,6 +167,7 @@ async def create_doc_via_bot(
     content: str,
     open_id: str | None = None,
     callout_sections: list[dict] | None = None,
+    apply_report_format: bool = False,
 ) -> tuple[str, str, str]:
     """用 tenant_access_token 创建文档，返回 (URL, doc_token, doc_type)。
     若提供 open_id，文档创建后转移所有权给该用户（文档移入用户我的空间）。
@@ -230,6 +231,8 @@ async def create_doc_via_bot(
     # 4. 高亮块处理（best-effort，必须在转移所有权前做，确保机器人仍有编辑权限）
     if callout_sections:
         await apply_callout_sections(doc_token, callout_sections)
+    if apply_report_format:
+        await apply_report_styles(doc_token)
 
     # 5. 转移所有权给用户（best-effort）
     if open_id:
@@ -403,23 +406,134 @@ async def create_doc_as_user(title: str, content: str, user_token: str) -> tuple
     return url, doc_token
 
 
-# ── 核心结论高亮块（best-effort）──────────────────────────────
-# Feishu docx block_type: 4=heading2, 14=callout（高亮块）, 2=text, 12=bullet
+# ── 报告飞书样式（best-effort）─────────────────────────────────
+# Feishu docx block_type: 2=text, 4=heading2, 12=bullet, 13=ordered,
+# 15=quote, 19=callout。颜色枚举：2=橙色，6=紫色。
+_BT_TEXT = 2
 _BT_HEADING2 = 4
-_BT_CALLOUT = 14
-_HEADING_KEYS = ("heading1", "heading2", "heading3", "heading4", "heading5", "heading6")
+_BT_BULLET = 12
+_BT_ORDERED = 13
+_BT_QUOTE = 15
+_BT_CALLOUT = 19
+_FONT_ORANGE = 2
+_FONT_PURPLE = 6
+_CALLOUT_LIGHT_ORANGE = 2
+_HEADING_KEYS = tuple(f"heading{i}" for i in range(1, 10))
+_DETAIL_DIVIDER_TEXT = "以下为详细信息，各位可以按需查看"
 
 
-def _text_block(content: str, block_type: int = 2) -> dict:
-    key = {2: "text", 12: "bullet"}.get(block_type, "text")
+def _text_element(content: str, **style) -> dict:
+    run: dict = {"content": content}
+    clean_style = {key: value for key, value in style.items() if value is not None}
+    if clean_style:
+        run["text_element_style"] = clean_style
+    return {"text_run": run}
+
+
+def _markdown_inline_elements(text: str, base_style: dict | None = None) -> list[dict]:
+    """把报告中常见的 Markdown 行内加粗/斜体转成飞书富文本元素。"""
+    base = dict(base_style or {})
+    elements: list[dict] = []
+    pattern = re.compile(r"(\*\*.+?\*\*|__.+?__|(?<!\*)\*[^*]+?\*(?!\*)|`[^`]+`)")
+    cursor = 0
+    for match in pattern.finditer(str(text or "")):
+        if match.start() > cursor:
+            elements.append(_text_element(text[cursor:match.start()], **base))
+        token = match.group(0)
+        style = dict(base)
+        if token.startswith(("**", "__")):
+            content = token[2:-2]
+            style["bold"] = True
+        elif token.startswith("*"):
+            content = token[1:-1]
+            style["italic"] = True
+        else:
+            content = token[1:-1]
+            style["inline_code"] = True
+        elements.append(_text_element(content, **style))
+        cursor = match.end()
+    if cursor < len(text):
+        elements.append(_text_element(text[cursor:], **base))
+    return elements or [_text_element("", **base)]
+
+
+def _text_block(
+    content: str,
+    block_type: int = _BT_TEXT,
+    *,
+    element_style: dict | None = None,
+    block_style: dict | None = None,
+) -> dict:
+    key = {
+        _BT_TEXT: "text",
+        _BT_BULLET: "bullet",
+        _BT_ORDERED: "ordered",
+        _BT_QUOTE: "quote",
+    }.get(block_type, "text")
     return {
         "block_type": block_type,
-        key: {"elements": [{"text_run": {"content": content}}], "style": {}},
+        key: {
+            "elements": _markdown_inline_elements(content, element_style),
+            "style": dict(block_style or {}),
+        },
     }
 
 
+def _clean_core_group_title(title: str) -> str:
+    clean = re.sub(
+        r"^Part\s*\d+\s*[:：.、-]?\s*",
+        "",
+        str(title or "").strip(),
+        flags=re.IGNORECASE,
+    )
+    clean = re.sub(r"\s*[:：]\s*关键发现\s*$", "", clean)
+    return clean.strip() or str(title or "").strip()
+
+
+def _core_callout_children(lines: list[str]) -> list[dict]:
+    """核心结论全部降为正文块，仅分组标题使用紫色加粗。"""
+    children: list[dict] = []
+    for raw in lines:
+        text = str(raw or "").strip()
+        if not text or text == "---" or text.startswith("<!--"):
+            continue
+        if re.match(r"^##\s+核心结论\s*$", text):
+            continue
+        if re.match(r"^>?\s*本次调研共收集\s+\d+\s+份有效(?:回复|回答)", text):
+            continue
+        heading = re.match(r"^#{1,6}\s+(.+?)\s*$", text)
+        if heading:
+            title = heading.group(1).strip()
+            if title == "总体判断":
+                continue
+            title = _clean_core_group_title(title)
+            children.append(_text_block(
+                title,
+                element_style={"bold": True, "text_color": _FONT_PURPLE},
+            ))
+            continue
+        bullet = re.match(r"^(?:[-*•])\s+(.+)$", text)
+        if bullet:
+            children.append(_text_block(bullet.group(1), _BT_BULLET))
+            continue
+        ordered = re.match(r"^\d+[.)、]\s*(.+)$", text)
+        if ordered:
+            children.append(_text_block(ordered.group(1), _BT_ORDERED))
+            continue
+        children.append(_text_block(text))
+    return children
+
+
+def _divider_block(content: str) -> dict:
+    return _text_block(
+        content,
+        element_style={"bold": True, "text_color": _FONT_ORANGE},
+        block_style={"align": 2},
+    )
+
+
 def _block_text(block: dict) -> str:
-    for key in (*_HEADING_KEYS, "text", "bullet", "ordered"):
+    for key in (*_HEADING_KEYS, "text", "bullet", "ordered", "quote"):
         data = block.get(key)
         if isinstance(data, dict):
             return "".join(e.get("text_run", {}).get("content", "") for e in data.get("elements", []))
@@ -454,6 +568,32 @@ async def _list_doc_blocks(client: httpx.AsyncClient, headers: dict, doc_token: 
     return blocks
 
 
+def _root_doc_blocks(blocks: list[dict], doc_token: str) -> list[dict]:
+    root = [block for block in blocks if block.get("parent_id") == doc_token]
+    return root or [block for block in blocks if block.get("block_id") != doc_token]
+
+
+async def _doc_edit(
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    headers: dict,
+    payload: dict,
+) -> dict:
+    """执行飞书文档编辑并对官方限频错误做短暂退避。"""
+    last: dict = {}
+    for attempt in range(4):
+        response = await client.request(method, url, headers=headers, json=payload)
+        try:
+            last = response.json()
+        except Exception:
+            last = {"code": response.status_code, "msg": response.text[:200]}
+        if response.status_code != 429 and last.get("code") != 99991400:
+            return last
+        await asyncio.sleep(0.5 * (2 ** attempt))
+    return last
+
+
 async def _replace_section_with_callout(
     client: httpx.AsyncClient,
     headers: dict,
@@ -462,7 +602,8 @@ async def _replace_section_with_callout(
     lines: list[str],
     occurrence: int = 1,
 ) -> bool:
-    blocks = await _list_doc_blocks(client, headers, doc_token)
+    all_blocks = await _list_doc_blocks(client, headers, doc_token)
+    blocks = _root_doc_blocks(all_blocks, doc_token)
     if not blocks:
         return False
 
@@ -483,60 +624,73 @@ async def _replace_section_with_callout(
     end = len(blocks)
     for j in range(start + 1, len(blocks)):
         level = _heading_level(blocks[j])
+        if _DETAIL_DIVIDER_TEXT in _block_text(blocks[j]):
+            end = j
+            break
         if level and level <= start_level:
             end = j
             break
 
-    section = blocks[start:end]
-    section_ids = [b["block_id"] for b in section]
+    insert_index = start + 1
+    if insert_index < end and re.match(
+        r"^本次调研共收集\s+\d+\s+份有效(?:回复|回答)",
+        _block_text(blocks[insert_index]).strip(),
+    ):
+        insert_index += 1
+    original = blocks[insert_index:end]
+    if not original:
+        return False
+    original_ids = [block["block_id"] for block in original]
     root_id = doc_token
-    root_children = [b["block_id"] for b in blocks]
-    try:
-        insert_index = root_children.index(section_ids[0])
-        last_index = root_children.index(section_ids[-1])
-    except ValueError:
-        return False
-    contiguous = (last_index - insert_index + 1) == len(section_ids)
+    contiguous = [block["block_id"] for block in blocks[insert_index:end]] == original_ids
 
-    resp = await client.post(
+    result = await _doc_edit(
+        client,
+        "POST",
         f"{FEISHU_BASE}/docx/v1/documents/{doc_token}/blocks/{root_id}/children",
-        headers=headers,
-        json={"index": insert_index, "children": [{"block_type": _BT_CALLOUT, "callout": {}}]},
+        headers,
+        {
+            "index": insert_index,
+            "children": [{
+                "block_type": _BT_CALLOUT,
+                "callout": {
+                    "background_color": _CALLOUT_LIGHT_ORANGE,
+                    "border_color": _FONT_ORANGE,
+                },
+            }],
+        },
     )
-    r = resp.json()
-    if r.get("code") != 0:
+    if result.get("code") != 0:
         return False
-    callout_id = r["data"]["children"][0]["block_id"]
+    callout_id = result["data"]["children"][0]["block_id"]
 
-    children = [_text_block(title)]
-    for ln in lines:
-        s = ln.strip()
-        if not s or s.startswith("#"):
-            continue
-        if s.startswith(("- ", "* ", "•")):
-            children.append(_text_block(s.lstrip("-*• ").strip(), 12))
-        else:
-            children.append(_text_block(s))
-    if len(children) == 1:
-        for block in section[1:]:
-            text = _block_text(block).strip()
-            if text:
-                children.append(_text_block(text, 12 if block.get("bullet") else 2))
-
-    await client.post(
-        f"{FEISHU_BASE}/docx/v1/documents/{doc_token}/blocks/{callout_id}/children",
-        headers=headers,
-        json={"children": children},
-    )
+    children = _core_callout_children(lines)
+    if not children:
+        return False
+    created = 0
+    for offset in range(0, len(children), 40):
+        chunk = children[offset:offset + 40]
+        result = await _doc_edit(
+            client,
+            "POST",
+            f"{FEISHU_BASE}/docx/v1/documents/{doc_token}/blocks/{callout_id}/children",
+            headers,
+            {"index": created, "children": chunk},
+        )
+        if result.get("code") != 0:
+            return False
+        created += len(chunk)
 
     if contiguous:
-        await client.request(
+        result = await _doc_edit(
+            client,
             "DELETE",
             f"{FEISHU_BASE}/docx/v1/documents/{doc_token}/blocks/{root_id}/children/batch_delete",
-            headers=headers,
-            json={"start_index": insert_index + 1, "end_index": last_index + 2},
+            headers,
+            {"start_index": insert_index + 1, "end_index": end + 1},
         )
-    return True
+        return result.get("code") == 0
+    return False
 
 
 async def apply_callout_sections(doc_token: str, sections: list[dict]) -> bool:
@@ -561,6 +715,51 @@ async def apply_callout_sections(doc_token: str, sections: list[dict]) -> bool:
         return changed
     except Exception as e:
         print(f"[feishu] apply callout failed: {e}")
+        return False
+
+
+async def _replace_report_divider(
+    client: httpx.AsyncClient,
+    headers: dict,
+    doc_token: str,
+) -> bool:
+    blocks = _root_doc_blocks(await _list_doc_blocks(client, headers, doc_token), doc_token)
+    for index, block in enumerate(blocks):
+        content = _block_text(block).strip()
+        if _DETAIL_DIVIDER_TEXT not in content:
+            continue
+        result = await _doc_edit(
+            client,
+            "POST",
+            f"{FEISHU_BASE}/docx/v1/documents/{doc_token}/blocks/{doc_token}/children",
+            headers,
+            {"index": index, "children": [_divider_block(content)]},
+        )
+        if result.get("code") != 0:
+            return False
+        result = await _doc_edit(
+            client,
+            "DELETE",
+            f"{FEISHU_BASE}/docx/v1/documents/{doc_token}/blocks/{doc_token}/children/batch_delete",
+            headers,
+            {"start_index": index + 1, "end_index": index + 2},
+        )
+        return result.get("code") == 0
+    return False
+
+
+async def apply_report_styles(doc_token: str) -> bool:
+    """补齐 Markdown 导入无法直接表达的飞书报告样式。"""
+    try:
+        app_token = await _app_access_token()
+        headers = {
+            "Authorization": f"Bearer {app_token}",
+            "Content-Type": "application/json; charset=utf-8",
+        }
+        async with httpx.AsyncClient(timeout=20) as client:
+            return await _replace_report_divider(client, headers, doc_token)
+    except Exception as exc:
+        print(f"[feishu] apply report styles failed: {exc}")
         return False
 
 

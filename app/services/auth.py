@@ -71,6 +71,14 @@ def _get_user_perms(login: dict | None) -> list[str]:
     return []
 
 
+async def _require_feature(request: Request, feature: str) -> dict | None:
+    """Require one backend feature permission; UI visibility is not an auth boundary."""
+    login = await _current_login(request)
+    if feature not in _get_user_perms(login):
+        raise HTTPException(status_code=403, detail="当前账号没有此功能权限")
+    return login
+
+
 async def _require_admin(request: Request):
     login = await _current_login(request)
     if not _is_admin(login):

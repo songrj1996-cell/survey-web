@@ -88,6 +88,26 @@ async def chat(
 STOP_SIGNAL = "STOP_SIGNAL"
 
 
+def _is_retryable_stream_error(code, message) -> bool:
+    text = f"{code or ''} {message or ''}".lower()
+    return any(token in text for token in (
+        "modelunavailable",
+        "model unavailable",
+        "apiconnectionerror",
+        "bedrockexception",
+        "temporarily unavailable",
+        "service unavailable",
+        "internal server error",
+        "'code': '500'",
+        '"code":"500"',
+        '"code": "500"',
+        " 500",
+        " 502",
+        " 503",
+        " 504",
+    ))
+
+
 def _stringify_workflow_output(value) -> str:
     if value is None:
         return ""
@@ -276,9 +296,8 @@ async def sse_dify_stream(
     user_id: str,
     conversation_id: str,
     api_key: str,
+    max_attempts: int = 1,
 ) -> AsyncGenerator[tuple[str, str], None]:
-    import httpx
-
     payload = {
         "inputs": {},
         "query": query,
@@ -291,36 +310,88 @@ async def sse_dify_stream(
         "Content-Type": "application/json",
     }
     final_conv_id = conversation_id
+    max_attempts = max(1, max_attempts)
 
     async with httpx.AsyncClient(timeout=1800, follow_redirects=True) as client:
-        async with client.stream(
-            "POST", f"{DIFY_API_BASE}/chat-messages",
-            headers=req_headers, json=payload,
-        ) as resp:
-            if resp.status_code >= 400:
-                err = await resp.aread()
-                raise RuntimeError(f"Dify {resp.status_code}: {err.decode('utf-8', errors='replace')}")
-            async for line in resp.aiter_lines():
-                if not line or not line.startswith("data:"):
-                    continue
-                raw = line[5:].strip()
-                if not raw:
-                    continue
-                try:
-                    data = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue
-                event = data.get("event")
-                if event in ("message", "agent_message"):
-                    yield data.get("answer", ""), ""
-                if data.get("conversation_id"):
-                    final_conv_id = data["conversation_id"]
-                if event == "error":
-                    raise RuntimeError(f"Dify error: {data.get('code')} {data.get('message')}")
-                if event in ("message_end", "workflow_finished", "agent_message_end"):
-                    break
+        for attempt in range(1, max_attempts + 1):
+            received_answer = False
+            retry_delay: float | None = None
+            try:
+                async with client.stream(
+                    "POST", f"{DIFY_API_BASE}/chat-messages",
+                    headers=req_headers, json=payload,
+                ) as resp:
+                    if resp.status_code >= 400:
+                        err = await resp.aread()
+                        err_text = err.decode("utf-8", errors="replace")
+                        retryable = resp.status_code == 429 or resp.status_code >= 500
+                        if retryable and attempt < max_attempts:
+                            retry_after = resp.headers.get("Retry-After", "").strip()
+                            try:
+                                retry_delay = min(max(float(retry_after), 0), 30)
+                            except ValueError:
+                                retry_delay = min(2 ** attempt, 30)
+                            print(
+                                f"[dify] stream {resp.status_code}; "
+                                f"retry {attempt + 1}/{max_attempts} in {retry_delay:g}s"
+                            )
+                        else:
+                            raise RuntimeError(f"Dify {resp.status_code}: {err_text}")
+                    else:
+                        async for line in resp.aiter_lines():
+                            if not line or not line.startswith("data:"):
+                                continue
+                            raw = line[5:].strip()
+                            if not raw:
+                                continue
+                            try:
+                                data = json.loads(raw)
+                            except json.JSONDecodeError:
+                                continue
+                            event = data.get("event")
+                            if event in ("message", "agent_message"):
+                                answer = data.get("answer", "")
+                                if answer:
+                                    received_answer = True
+                                yield answer, ""
+                            if data.get("conversation_id"):
+                                final_conv_id = data["conversation_id"]
+                            if event == "error":
+                                if (
+                                    not received_answer
+                                    and attempt < max_attempts
+                                    and _is_retryable_stream_error(
+                                        data.get("code"), data.get("message")
+                                    )
+                                ):
+                                    retry_delay = min(2 ** attempt, 30)
+                                    print(
+                                        f"[dify] stream transient model error; "
+                                        f"retry {attempt + 1}/{max_attempts} in {retry_delay:g}s"
+                                    )
+                                    break
+                                raise RuntimeError(
+                                    f"Dify error: {data.get('code')} {data.get('message')}"
+                                )
+                            if event in (
+                                "message_end", "workflow_finished", "agent_message_end"
+                            ):
+                                break
+            except httpx.TransportError as exc:
+                if received_answer or attempt >= max_attempts:
+                    raise
+                retry_delay = min(2 ** attempt, 30)
+                print(
+                    f"[dify] stream transport error: {exc}; "
+                    f"retry {attempt + 1}/{max_attempts} in {retry_delay:g}s"
+                )
 
-    yield "", final_conv_id
+            if retry_delay is not None:
+                await asyncio.sleep(retry_delay)
+                continue
+
+            yield "", final_conv_id
+            return
 
 
 async def sse_dify_completion_stream(
@@ -394,12 +465,15 @@ async def call_dify_compatible(
     user_id: str,
     api_key: str,
     conversation_id: str = "",
+    max_attempts: int = 1,
 ) -> tuple[str, str, str, str]:
     """优先按 chat 应用调用；若疑似端点/应用类型不匹配，自动改用 completion 应用。"""
     try:
         chunks: list[str] = []
         final_conv = conversation_id
-        async for chunk, conv_id in sse_dify_stream(query, user_id, conversation_id, api_key):
+        async for chunk, conv_id in sse_dify_stream(
+            query, user_id, conversation_id, api_key, max_attempts=max_attempts
+        ):
             if chunk:
                 chunks.append(chunk)
             if conv_id:

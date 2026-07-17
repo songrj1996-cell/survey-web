@@ -83,7 +83,7 @@ EnvironmentFile=${DEPLOY_DIR}/.env
 ExecStart=${DEPLOY_DIR}/.venv/bin/uvicorn server:app \\
     --host 0.0.0.0 \\
     --port ${APP_PORT} \\
-    --workers 2 \\
+    --workers 1 \\
     --timeout-keep-alive 75
 Restart=always
 RestartSec=5

@@ -73,6 +73,40 @@ def _choice_other_label(col: dict) -> str | None:
     return _OTHER_OPTION_LABEL
 
 
+def _choice_other_values(
+    col: dict,
+    norm: Callable[[str], str],
+) -> set[str] | None:
+    """返回用户明确选为 Other 的原始值；None 表示兼容旧 session 的全量未知值。"""
+    meta = _choice_other_meta(col)
+    if not meta or "values" not in meta:
+        return None
+    values = meta.get("values")
+    if not isinstance(values, list):
+        return set()
+    return {
+        norm(str(value).strip())
+        for value in values
+        if str(value or "").strip()
+    }
+
+
+def _should_map_to_other(
+    value: str,
+    *,
+    norm: Callable[[str], str],
+    known_options: set[str],
+    other_label: str | None,
+    other_values: set[str] | None,
+) -> bool:
+    normalized = norm(value)
+    return bool(
+        other_label
+        and normalized not in known_options
+        and (other_values is None or normalized in other_values)
+    )
+
+
 def _choice_norm_options(
     options: list[str] | None,
     norm: Callable[[str], str],
@@ -260,23 +294,37 @@ def _render_column(
         other_label = _choice_other_label(col)
         options = col.get("options")
         known_options = _choice_norm_options(options, norm, other_label)
+        other_values = _choice_other_values(col, norm)
         nonblank_norm = [
-            other_label if other_label and options and norm(v) not in known_options else norm(v)
+            other_label
+            if options and _should_map_to_other(
+                v,
+                norm=norm,
+                known_options=known_options,
+                other_label=other_label,
+                other_values=other_values,
+            )
+            else norm(v)
             for v in nonblank_raw
         ]
         body_md = _render_single_choice(nonblank_norm)
         body_md += _append_cross_tabs(
             col, raw_values, profile_cols, body, headers,
-            single=True, options=options, other_label=other_label
+            single=True, options=options, other_label=other_label,
+            other_values=other_values,
         )
     elif role == "multi_choice":
         delimiter = col.get("delimiter") or _guess_delimiter(nonblank_raw)
         options = col.get("options")
         other_label = _choice_other_label(col)
-        body_md = _render_multi_choice(nonblank_raw, delimiter, norm, options, other_label)
+        other_values = _choice_other_values(col, norm)
+        body_md = _render_multi_choice(
+            nonblank_raw, delimiter, norm, options, other_label, other_values,
+        )
         body_md += _append_cross_tabs(
             col, raw_values, profile_cols, body, headers,
             single=False, delimiter=delimiter, options=options, other_label=other_label,
+            other_values=other_values,
         )
     elif role == "scale":
         lo = col.get("min")
@@ -310,6 +358,7 @@ def _append_cross_tabs(
     delimiter: str = ",",
     options: list[str] | None = None,
     other_label: str | None = None,
+    other_values: set[str] | None = None,
 ) -> str:
     """单选/多选题：跟每个 profile_dim 配交叉表。"""
     if not profile_cols:
@@ -325,6 +374,7 @@ def _append_cross_tabs(
         ct_md = _cross_tab_categorical(
             p_raw, q_raw, p_norm=p_norm_fn, q_norm=q_norm_fn,
             single=single, delimiter=delimiter, options=options, other_label=other_label,
+            other_values=other_values,
         )
         if ct_md:
             out.append(f"\n\n**按「{p_name}」分组**\n\n{ct_md}")
@@ -371,10 +421,15 @@ def _render_multi_choice(
     norm: Callable[[str], str],
     options: list[str] | None = None,
     other_label: str | None = None,
+    other_values: set[str] | None = None,
 ) -> str:
     counts: Counter = Counter()
     for v in values:
-        opts = set(_split_by_vocab(v, options, delimiter, norm, other_label=other_label))
+        opts = set(_split_by_vocab(
+            v, options, delimiter, norm,
+            other_label=other_label,
+            other_values=other_values,
+        ))
         for opt in opts:
             if opt:
                 counts[opt] += 1
@@ -472,6 +527,7 @@ def _cross_tab_categorical(
     delimiter: str = ",",
     options: list[str] | None = None,
     other_label: str | None = None,
+    other_values: set[str] | None = None,
 ) -> str:
     """画像 × 类目题。每格 'n (xx%)'，每格 < 5 加 *。
 
@@ -491,7 +547,13 @@ def _cross_tab_categorical(
 
     def normalize_q(q: str) -> str:
         qn = q_norm(q)
-        if other_label and options and qn not in known_options:
+        if options and _should_map_to_other(
+            q,
+            norm=q_norm,
+            known_options=known_options,
+            other_label=other_label,
+            other_values=other_values,
+        ):
             return other_label
         return qn
 
@@ -501,7 +563,11 @@ def _cross_tab_categorical(
         q_set: list[str] = []
         seen: set[str] = set()
         for _, q in pairs_norm:
-            for normo in _split_by_vocab(q, options, delimiter, q_norm, other_label=other_label):
+            for normo in _split_by_vocab(
+                q, options, delimiter, q_norm,
+                other_label=other_label,
+                other_values=other_values,
+            ):
                 if normo and normo not in seen:
                     seen.add(normo)
                     q_set.append(normo)
@@ -517,7 +583,11 @@ def _cross_tab_categorical(
             qn = normalize_q(q)
             grid[(p, qn)] = grid.get((p, qn), 0) + 1
         else:
-            opts = set(_split_by_vocab(q, options, delimiter, q_norm, other_label=other_label))
+            opts = set(_split_by_vocab(
+                q, options, delimiter, q_norm,
+                other_label=other_label,
+                other_values=other_values,
+            ))
             for o in opts:
                 if o:
                     grid[(p, o)] = grid.get((p, o), 0) + 1
@@ -604,6 +674,8 @@ def _choice_parts_with_match(
     options: list[str] | None,
     delimiter: str,
     norm: Callable[[str], str],
+    *,
+    other_values: set[str] | None = None,
 ) -> list[tuple[str | None, str]]:
     cell = (cell or "").strip()
     if not cell:
@@ -613,25 +685,40 @@ def _choice_parts_with_match(
 
     norm_opts = _choice_norm_options(options, norm)
     frags = cell.split(delimiter)
+
+    def match_at(start: int) -> tuple[str, str, int] | None:
+        for end in range(len(frags), start, -1):
+            raw = delimiter.join(frags[start:end]).strip()
+            cand = norm(raw)
+            if cand in norm_opts:
+                return cand, raw, end
+        return None
+
     result: list[tuple[str | None, str]] = []
     i = 0
     while i < len(frags):
         if not frags[i].strip():
             i += 1
             continue
-        matched = False
-        for j in range(len(frags), i, -1):
-            raw = delimiter.join(frags[i:j]).strip()
-            cand = norm(raw)
-            if cand in norm_opts:
-                result.append((cand, raw))
-                i = j
-                matched = True
-                break
-        if not matched:
+        matched = match_at(i)
+        if matched:
+            cand, raw, i = matched
+            result.append((cand, raw))
+            continue
+
+        if other_values is not None:
             raw = frags[i].strip()
             result.append((None, raw))
             i += 1
+            continue
+
+        end = i + 1
+        while end < len(frags) and match_at(end) is None:
+            end += 1
+        raw = delimiter.join(frags[i:end]).strip()
+        if raw:
+            result.append((None, raw))
+        i = end
     return result
 
 
@@ -652,6 +739,7 @@ def _collect_choice_other_text(
     role = col["role"]
     norm = _make_normalizer(col.get("value_aliases"))
     known_options = _choice_norm_options(options, norm, other_label)
+    other_values = _choice_other_values(col, norm)
     delimiter = col.get("delimiter") or ","
     out: list[dict] = []
     seen_rows: set[tuple[int, str]] = set()
@@ -663,12 +751,30 @@ def _collect_choice_other_text(
 
         unknown_texts: list[str] = []
         if role == "single_choice":
-            normalized = norm(raw.strip())
-            if normalized not in known_options:
+            if _should_map_to_other(
+                raw.strip(),
+                norm=norm,
+                known_options=known_options,
+                other_label=other_label,
+                other_values=other_values,
+            ):
                 unknown_texts.append(raw.strip())
         elif role == "multi_choice":
-            for matched, raw_part in _choice_parts_with_match(raw, options, delimiter, norm):
-                if matched is None and raw_part and not _is_other_option_label(raw_part):
+            for matched, raw_part in _choice_parts_with_match(
+                raw, options, delimiter, norm, other_values=other_values,
+            ):
+                if (
+                    matched is None
+                    and raw_part
+                    and not _is_other_option_label(raw_part)
+                    and _should_map_to_other(
+                        raw_part,
+                        norm=norm,
+                        known_options=known_options,
+                        other_label=other_label,
+                        other_values=other_values,
+                    )
+                ):
                     unknown_texts.append(raw_part)
 
         for text in unknown_texts:
@@ -860,6 +966,7 @@ def _split_by_vocab(
     norm: Callable[[str], str],
     *,
     other_label: str | None = None,
+    other_values: set[str] | None = None,
 ) -> list[str]:
     """把一个多选单元格切成 normalized 选项列表。
 
@@ -882,25 +989,39 @@ def _split_by_vocab(
 
     frags = cell.split(delimiter)  # 不 strip：重组时用同一 delimiter join 可还原原串
     n = len(frags)
+
+    def match_at(start: int) -> tuple[str, int] | None:
+        for end in range(n, start, -1):
+            cand = norm(delimiter.join(frags[start:end]).strip())
+            if cand in norm_opts:
+                return cand, end
+        return None
+
     result: list[str] = []
     i = 0
     while i < n:
         if not frags[i].strip():
             i += 1
             continue
-        matched = False
-        # 优先匹配最长连续片段
-        for j in range(n, i, -1):
-            cand = norm(delimiter.join(frags[i:j]).strip())
-            if cand in norm_opts:
-                result.append(cand)
-                i = j
-                matched = True
-                break
-        if not matched:
+        matched = match_at(i)
+        if matched:
+            cand, i = matched
+            result.append(cand)
+            continue
+
+        if other_values is not None:
             fallback = norm(frags[i].strip())
-            result.append(other_label if other_label else fallback)
+            map_to_other = bool(other_label and fallback in other_values)
+            result.append(other_label if map_to_other else fallback)
             i += 1
+            continue
+
+        end = i + 1
+        while end < n and match_at(end) is None:
+            end += 1
+        fallback = norm(delimiter.join(frags[i:end]).strip())
+        result.append(other_label if other_label else fallback)
+        i = end
     return result
 
 

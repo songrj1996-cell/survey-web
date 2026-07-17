@@ -32,11 +32,13 @@ from app.integrations.dify_client import sse_dify_stream
 from app.schemas.requests import QualitativeContextRequest
 from app.services.audit import audit_log
 from app.services.auth import _current_login
+from app.services.branch_logic import infer_branch_rules
 from app.services.question_detect import (
     _build_column_detect_query,
     _enrich_questions,
     _group_googleform_matrix,
     _heuristic_questions,
+    _reconcile_question_roles,
     _sanitize_choice_options,
 )
 from app.services.report_engine import (
@@ -135,6 +137,7 @@ async def columns_stream(session_id: str, request: Request):
             yield sse_event({"type": "chunk", "content": "\n（题型识别解析失败，已回退本地推断，请仔细核对）\n"})
 
         questions = _enrich_questions(questions, rows[0], groups)
+        questions = _reconcile_question_roles(rows, questions)
         questions = _sanitize_choice_options(rows, questions)
         if sess.get("mode") == "crosstab":
             hdrs = rows[0]
@@ -163,7 +166,25 @@ def set_survey_columns(session_id: str, columns: list) -> None:
     """存储用户确认后的列题型配置。"""
     sess = get_session(session_id)
     sess["confirmed_columns"] = columns
+    sess["branch_rules"] = infer_branch_rules(sess.get("rows") or [], columns)
     save_session(session_id, sess)
+
+
+def _ensure_branch_rules(sess: dict) -> list[dict]:
+    """兼容功能上线前已创建的 session，并确保 plan 始终携带确定性跳转关系。"""
+    if sess.get("mode") == "crosstab":
+        return []
+    branch_rules = sess.get("branch_rules")
+    if not isinstance(branch_rules, list):
+        branch_rules = infer_branch_rules(
+            sess.get("rows") or [],
+            sess.get("confirmed_columns") or [],
+        )
+        sess["branch_rules"] = branch_rules
+    plan = sess.get("plan")
+    if isinstance(plan, dict):
+        plan["branch_rules"] = branch_rules
+    return branch_rules
 
 
 def save_qualitative_context(session_id: str, ctx: QualitativeContextRequest) -> None:
@@ -181,6 +202,7 @@ async def plan_stream(session_id: str, request: Request):
     sess = get_session(session_id)
     rows = sess.get("rows")
     confirmed_columns = sess.get("confirmed_columns")
+    branch_rules = _ensure_branch_rules(sess)
     is_crosstab = sess.get("mode") == "crosstab"
     try:
         if is_crosstab:
@@ -234,7 +256,11 @@ async def plan_stream(session_id: str, request: Request):
             return
 
         if confirmed_columns:
-            planner_query = _build_planner_query_with_confirmed(rows, confirmed_columns)
+            planner_query = _build_planner_query_with_confirmed(
+                rows,
+                confirmed_columns,
+                branch_rules=branch_rules,
+            )
         else:
             planner_query = _build_planner_sample(rows) + "\n\n" + _get_planner_extra()
 
@@ -268,6 +294,7 @@ async def plan_stream(session_id: str, request: Request):
 
         if confirmed_columns:
             plan = survey_plan.merge_confirmed_into_plan(plan, confirmed_columns)
+        plan["branch_rules"] = branch_rules
 
         sess["plan"] = plan
         sess["planner_conv_id"] = final_conv_id
@@ -290,6 +317,7 @@ async def plan_stream(session_id: str, request: Request):
 async def plan_revision_stream(session_id: str, user_text: str, request: Request):
     """方案修订 SSE 流程（async generator）。"""
     sess = get_session(session_id)
+    branch_rules = _ensure_branch_rules(sess)
     plan = sess.get("plan")
     rows = sess.get("rows")
     planner_conv_id = sess.get("planner_conv_id", "")
@@ -328,7 +356,11 @@ async def plan_revision_stream(session_id: str, user_text: str, request: Request
         answer_chunks: list[str] = []
         headers = rows[0]
         revision_query = _build_plan_revision_query(
-            plan, headers, sess.get("confirmed_columns", []), user_text
+            plan,
+            headers,
+            sess.get("confirmed_columns", []),
+            user_text,
+            branch_rules=branch_rules,
         )
         async for chunk, conv_id in sse_dify_stream(revision_query, session_id, "", DIFY_PLANNER_KEY):
             if chunk:
@@ -364,6 +396,7 @@ async def plan_revision_stream(session_id: str, user_text: str, request: Request
 
         if sess.get("confirmed_columns"):
             new_plan = survey_plan.merge_confirmed_into_plan(new_plan, sess["confirmed_columns"])
+        new_plan["branch_rules"] = branch_rules
 
         sess["plan"] = new_plan
         sess["planner_conv_id"] = new_conv_id
@@ -386,6 +419,7 @@ async def plan_revision_stream(session_id: str, user_text: str, request: Request
 async def compute_survey_stats(session_id: str, request: Request) -> str:
     """计算统计数据，写入 session，返回 stats_md。"""
     sess = get_session(session_id)
+    _ensure_branch_rules(sess)
     plan = sess.get("plan")
     rows = sess.get("rows")
     if not plan or not rows:
@@ -415,6 +449,7 @@ async def report_stream(session_id: str, request: Request):
     """报告生成 SSE 流程（大样本/标准两路，async generator）。"""
     sess = get_session(session_id)
     _assign_session_owner(sess, await _current_login(request))
+    _ensure_branch_rules(sess)
     plan = sess.get("plan")
     rows = sess.get("rows")
     stats_md = sess.get("stats_md")
@@ -471,7 +506,9 @@ async def report_stream(session_id: str, request: Request):
             analyst_key = DIFY_LARGE_ANALYST_KEY
             answer_chunks: list[str] = []
             final_conv_id = ""
-            async for chunk, conv_id in sse_dify_stream(writer_query, session_id, "", analyst_key):
+            async for chunk, conv_id in sse_dify_stream(
+                writer_query, session_id, "", analyst_key, max_attempts=4
+            ):
                 if chunk:
                     answer_chunks.append(chunk)
                     yield sse_event({"type": "chunk", "content": chunk})
@@ -486,7 +523,9 @@ async def report_stream(session_id: str, request: Request):
             async def _round(query: str, conv_id: str):
                 buf: list[str] = []
                 cid = conv_id
-                async for ch, c in sse_dify_stream(query, session_id, conv_id, analyst_key):
+                async for ch, c in sse_dify_stream(
+                    query, session_id, conv_id, analyst_key, max_attempts=4
+                ):
                     if ch:
                         buf.append(ch)
                         yield sse_event({"type": "chunk", "content": ch})
