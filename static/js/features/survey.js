@@ -173,10 +173,8 @@ function renderColumnRows(columns) {
 const CONTEXT_DRAFT_KEY = 'survey_context_draft';
 const CONTEXT_FIELD_IDS = {
   problem: 'ctx-problem',
-  background: 'ctx-background',
-  target_users: 'ctx-target-users',
   key_concerns: 'ctx-key-concerns',
-  report_usage: 'ctx-report-usage',
+  target_users: 'ctx-target-users',
 };
 let currentContextFileSignature = '';
 
@@ -783,17 +781,17 @@ async function startPlan() {
           saveContextDraft();
           preserveContextDraftOnNextUpload = true;
           showToast(
-            '当前会话已过期，请点击上方步骤条的"上传数据"重新上传文件；已填写的补充分析目标不会丢失',
+            '当前会话已过期，请点击上方步骤条的"上传数据"重新上传文件；已填写的调研背景不会丢失',
             'error', 6000,
           );
         } else {
-          showToast('保存补充分析目标失败，请重试', 'error');
+          showToast('保存调研背景失败，请重试', 'error');
         }
         if (btn) btn.disabled = false;
         return;
       }
     } catch (e) {
-      showToast(`保存补充分析目标失败：${e.message}`, 'error');
+      showToast(`保存调研背景失败：${e.message}`, 'error');
       if (btn) btn.disabled = false;
       return;
     }

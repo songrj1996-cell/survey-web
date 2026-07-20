@@ -5,6 +5,7 @@
 HTTP 参数解析与响应包装在 routers/survey。
 """
 import asyncio
+from contextlib import suppress
 from datetime import datetime
 
 import survey_plan
@@ -17,18 +18,20 @@ def is_survey_plan_approval(user_text: str) -> bool:
 from fastapi import HTTPException, Request
 
 from app.core.config import (
-    DIFY_ANALYST_KEY,
     DIFY_COLUMN_KEY,
     DIFY_CROSSTAB_PLANNER_KEY,
-    DIFY_LARGE_ANALYST_KEY,
     DIFY_PLANNER_KEY,
     LARGE_SAMPLE_THRESHOLD,
+    LLM_API_KEY,
+    LLM_REPORT_MODEL,
+    LLM_STREAM_HEARTBEAT_SECONDS,
 )
 from app.core.parsing import _parse_file
 from app.core.responses import sse_event
 from app.core.security import _assign_session_owner, _find_history_for_login
 from app.core.text import _short_text
 from app.integrations.dify_client import sse_dify_stream
+from app.integrations.llm_client import collect_chat_completion
 from app.schemas.requests import QualitativeContextRequest
 from app.services.audit import audit_log
 from app.services.auth import _current_login
@@ -50,17 +53,21 @@ from app.services.report_engine import (
     _build_plan_revision_query,
     _build_planner_query_with_confirmed,
     _build_planner_sample,
+    _build_qa_context,
+    _build_qa_seed_query,
     _build_writer_action_query,
+    _build_writer_action_repair_query,
     _build_writer_bug_query,
     _build_writer_core_query,
     _build_writer_first_query,
     _build_writer_part_query,
-    _format_rows_for_qa,
+    _normalize_action_section,
     _render_crosstab_plan_card,
     _writer_parts_meta,
+    REPORT_WRITER_SYSTEM_PROMPT,
 )
 from app.services.report_history import save_to_history
-from app.services.report_render import _inject_disclaimer
+from app.services.report_render import _inject_disclaimer, _inject_research_background
 from app.storage.history import _load_history, _save_history
 from app.storage.prompts import _get_planner_extra
 from app.storage.sessions import get_session, new_session, save_session
@@ -445,6 +452,79 @@ async def compute_survey_stats(session_id: str, request: Request) -> str:
 # ── 报告生成 SSE ────────────────────────────────────────────────
 
 
+def _content_events(text: str, chunk_size: int = 1200):
+    """把已完整生成的原子结果分块推给前端，避免单个 SSE 事件过大。"""
+    for start in range(0, len(text), chunk_size):
+        yield sse_event({"type": "chunk", "content": text[start:start + chunk_size]})
+
+
+async def _direct_writer_round(
+    messages: list[dict],
+    query: str,
+) -> tuple[str, str]:
+    """直连 LLM 完成一轮写作；成功后才把本轮加入本地对话历史。"""
+    user_message = {"role": "user", "content": query}
+    answer, model = await collect_chat_completion([*messages, user_message])
+    messages.extend([
+        user_message,
+        {"role": "assistant", "content": answer},
+    ])
+    return answer, model
+
+
+async def _collect_dify_answer(
+    query: str,
+    user_id: str,
+    conversation_id: str,
+    api_key: str,
+) -> tuple[str, str]:
+    """完整缓冲一次 Dify 回答，供追问断流后安全重建会话。"""
+    chunks: list[str] = []
+    final_conv_id = conversation_id
+    async for chunk, conv_id in sse_dify_stream(
+        query, user_id, conversation_id, api_key, max_attempts=4
+    ):
+        if chunk:
+            chunks.append(chunk)
+        if conv_id:
+            final_conv_id = conv_id
+    answer = "".join(chunks).strip()
+    if not answer:
+        raise RuntimeError("Dify 追问返回空内容")
+    return answer, final_conv_id
+
+
+async def _answer_qa_with_recovery(
+    source: dict,
+    question: str,
+    user_id: str,
+    conversation_id: str,
+    api_key: str,
+) -> tuple[str, str, str]:
+    """优先续聊；无会话或续聊失败时，用完整报告上下文新建 Dify 会话。"""
+    qa_context = str(source.get("qa_context_md") or "").strip()
+    if not qa_context:
+        qa_context = _build_qa_context(source)
+    seed_query = _build_qa_seed_query(
+        qa_context,
+        source.get("qa_messages") or [],
+        question,
+    )
+    should_seed = not conversation_id or not source.get("rows_fed", False)
+    first_query = seed_query if should_seed else question
+
+    try:
+        answer, new_conv_id = await _collect_dify_answer(
+            first_query, user_id, conversation_id, api_key
+        )
+    except Exception:
+        # 缓冲模式下尚未向前端输出内容，可以安全地舍弃失败会话并从完整上下文重建。
+        answer, new_conv_id = await _collect_dify_answer(
+            seed_query, user_id, "", api_key
+        )
+    return answer, new_conv_id, qa_context
+
+
 async def report_stream(session_id: str, request: Request):
     """报告生成 SSE 流程（大样本/标准两路，async generator）。"""
     sess = get_session(session_id)
@@ -457,8 +537,28 @@ async def report_stream(session_id: str, request: Request):
     is_crosstab = sess.get("mode") == "crosstab"
     qualitative_context = None if is_crosstab else sess.get("qualitative_context")
     use_large_mode = is_crosstab or any(len(v) > LARGE_SAMPLE_THRESHOLD for v in open_text.values())
+    writer_messages = [{"role": "system", "content": REPORT_WRITER_SYSTEM_PROMPT}]
+    writer_models_used: list[str] = []
 
     try:
+        async def _writer_call(query: str):
+            """等待完整写作轮次时发送轻量心跳，避免 SSE 代理空闲超时。"""
+            task = asyncio.create_task(_direct_writer_round(writer_messages, query))
+            try:
+                while True:
+                    done, _ = await asyncio.wait(
+                        {task}, timeout=LLM_STREAM_HEARTBEAT_SECONDS
+                    )
+                    if task in done:
+                        _writer_call.out = task.result()
+                        return
+                    yield sse_event({"type": "heartbeat"})
+            finally:
+                if not task.done():
+                    task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await task
+
         if use_large_mode:
             total_open_text = sum(len(v) for v in open_text.values())
             start_msg = (
@@ -503,35 +603,23 @@ async def report_stream(session_id: str, request: Request):
                         f"<questionnaire>\n以下是问卷原文（仅供理解题目意图与背景，"
                         f"不要直接搬运）：\n{q_text}\n</questionnaire>\n\n" + writer_query
                     )
-            analyst_key = DIFY_LARGE_ANALYST_KEY
-            answer_chunks: list[str] = []
-            final_conv_id = ""
-            async for chunk, conv_id in sse_dify_stream(
-                writer_query, session_id, "", analyst_key, max_attempts=4
-            ):
-                if chunk:
-                    answer_chunks.append(chunk)
-                    yield sse_event({"type": "chunk", "content": chunk})
-                if conv_id:
-                    final_conv_id = conv_id
-            full_report = "".join(answer_chunks)
+            async for heartbeat in _writer_call(writer_query):
+                yield heartbeat
+            full_report, model_used = _writer_call.out
+            writer_models_used.append(model_used)
+            for event in _content_events(full_report):
+                yield event
         else:
-            analyst_key = DIFY_ANALYST_KEY
             parts_meta = _writer_parts_meta(plan, rows[0])
-            final_conv_id = ""
 
-            async def _round(query: str, conv_id: str):
-                buf: list[str] = []
-                cid = conv_id
-                async for ch, c in sse_dify_stream(
-                    query, session_id, conv_id, analyst_key, max_attempts=4
-                ):
-                    if ch:
-                        buf.append(ch)
-                        yield sse_event({"type": "chunk", "content": ch})
-                    if c:
-                        cid = c
-                _round.out = ("".join(buf), cid)
+            async def _round(query: str):
+                async for heartbeat in _writer_call(query):
+                    yield heartbeat
+                text, model = _writer_call.out
+                writer_models_used.append(model)
+                for event in _content_events(text):
+                    yield event
+                _round.out = text
 
             total_rounds = len(parts_meta) + 4
             yield sse_event({"type": "progress",
@@ -539,9 +627,9 @@ async def report_stream(session_id: str, request: Request):
             first_q = _build_writer_first_query(
                 stats_md, open_text, plan, rows[0], qualitative_context=qualitative_context
             )
-            async for ev in _round(first_q, ""):
+            async for ev in _round(first_q):
                 yield ev
-            title_text, final_conv_id = _round.out
+            title_text = _round.out
             title_lines = []
             for ln in title_text.split("\n"):
                 if ln.lstrip().startswith("## "):
@@ -555,16 +643,16 @@ async def report_stream(session_id: str, request: Request):
                 yield sse_event({"type": "progress",
                                  "message": f"分章生成 {rnd}/{total_rounds}：Part {m['i']} {m['name']}…"})
                 yield sse_event({"type": "chunk", "content": "\n\n"})
-                async for ev in _round(_build_writer_part_query(m), final_conv_id):
+                async for ev in _round(_build_writer_part_query(m)):
                     yield ev
-                sec, final_conv_id = _round.out
+                sec = _round.out
                 part_sections.append(sec.strip())
 
             yield sse_event({"type": "progress",
                              "message": f"分章生成 {total_rounds - 2}/{total_rounds}：核查待确认问题…"})
-            async for ev in _round(_build_writer_bug_query(), final_conv_id):
+            async for ev in _round(_build_writer_bug_query()):
                 yield ev
-            bug_text, final_conv_id = _round.out
+            bug_text = _round.out
             bug_clean = bug_text.strip()
             has_bug = bool(bug_clean) and bug_clean.upper().strip(" .。`*") != "NONE" and "## Bug" in bug_clean
             bug_section = bug_clean if has_bug else ""
@@ -572,27 +660,45 @@ async def report_stream(session_id: str, request: Request):
             yield sse_event({"type": "progress",
                              "message": f"分章生成 {total_rounds - 1}/{total_rounds}：汇总核心结论…"})
             yield sse_event({"type": "chunk", "content": "\n\n"})
-            async for ev in _round(_build_writer_core_query(parts_meta, has_bug, qualitative_context), final_conv_id):
+            async for ev in _round(_build_writer_core_query(parts_meta, has_bug, qualitative_context)):
                 yield ev
-            core_text, final_conv_id = _round.out
+            core_text = _round.out
             core_block = core_text.strip()
 
             yield sse_event({"type": "progress",
                              "message": f"分章生成 {total_rounds}/{total_rounds}：生成行动建议…"})
             yield sse_event({"type": "chunk", "content": "\n\n"})
-            async for ev in _round(_build_writer_action_query(parts_meta, has_bug, qualitative_context), final_conv_id):
-                yield ev
-            action_text, final_conv_id = _round.out
-            action_clean = action_text.strip()
-            has_action = bool(action_clean) and "## 行动建议" in action_clean
-            action_section = action_clean if has_action else ""
+            async for heartbeat in _writer_call(
+                _build_writer_action_query(parts_meta, has_bug, qualitative_context)
+            ):
+                yield heartbeat
+            action_text, action_model = _writer_call.out
+            writer_models_used.append(action_model)
+            action_section = _normalize_action_section(action_text)
+            if not action_section:
+                yield sse_event({
+                    "type": "progress",
+                    "message": "行动建议格式校验中，正在修正 Markdown 结构…",
+                })
+                async for heartbeat in _writer_call(_build_writer_action_repair_query()):
+                    yield heartbeat
+                repaired_text, repaired_model = _writer_call.out
+                writer_models_used.append(repaired_model)
+                action_section = _normalize_action_section(repaired_text)
+                if not action_section:
+                    fallback_body = repaired_text.strip() or action_text.strip()
+                    if not fallback_body:
+                        raise RuntimeError("行动建议生成结果为空")
+                    # 内容已经由行动建议专用轮生成；这里只补齐固定标题，不改任何分析内容。
+                    action_section = f"## 行动建议\n\n{fallback_body}"
+            for event in _content_events(action_section):
+                yield event
 
             details_divider = "---------------- 以下为详细信息，各位可以按需查看 ----------------"
             assembled = [title_block, core_block, details_divider, *part_sections]
             if bug_section:
                 assembled.append(bug_section)
-            if action_section:
-                assembled.append(action_section)
+            assembled.append(action_section)
             full_report = "\n\n".join(b for b in assembled if b)
 
         drifted = survey_stats.find_numbers_not_in_stats(full_report, stats_md)
@@ -600,9 +706,13 @@ async def report_stream(session_id: str, request: Request):
             print(f"[stats] WARN drifted numbers: {drifted[:20]}")
 
         full_report = _inject_disclaimer(full_report, mode=sess.get("mode") or "")
+        full_report = _inject_research_background(full_report, qualitative_context)
         sess["report_md"] = full_report
-        sess["analyst_conv_id"] = final_conv_id
+        sess["qa_context_md"] = _build_qa_context(sess, full_report)
+        sess["analyst_conv_id"] = ""
         sess["analyst_app"] = "large" if use_large_mode else "standard"
+        sess["report_writer_provider"] = "direct_llm"
+        sess["report_writer_model"] = ",".join(dict.fromkeys(writer_models_used))
         sess["rows_fed"] = False
         save_session(session_id, sess)
         save_to_history(session_id, sess)
@@ -626,29 +736,16 @@ async def qa_stream(session_id: str, question: str, request: Request):
     sess = get_session(session_id)
     _assign_session_owner(sess, await _current_login(request))
     analyst_conv_id = sess.get("analyst_conv_id", "")
-    rows = sess.get("rows", [])
-    plan = sess.get("plan", {})
-    rows_fed = sess.get("rows_fed", False)
     analyst_key, analyst_key_name = _analyst_key_for_report(sess)
     try:
-        if not rows_fed and rows:
-            rows_block = _format_rows_for_qa(rows, plan)
-            qa_query = f"<rows>\n{rows_block}\n</rows>\n\n用户问题: {question}"
-        else:
-            qa_query = question
-
-        answer_chunks: list[str] = []
-        new_conv_id = analyst_conv_id
-        async for chunk, conv_id in sse_dify_stream(qa_query, session_id, analyst_conv_id, analyst_key):
-            if chunk:
-                answer_chunks.append(chunk)
-                yield sse_event({"type": "chunk", "content": chunk})
-            if conv_id:
-                new_conv_id = conv_id
-
-        answer_text = "".join(answer_chunks)
+        answer_text, new_conv_id, qa_context = await _answer_qa_with_recovery(
+            sess, question, session_id, analyst_conv_id, analyst_key
+        )
+        for event in _content_events(answer_text):
+            yield event
         sess["analyst_conv_id"] = new_conv_id or analyst_conv_id
         sess["analyst_app"] = "large" if analyst_key_name == "DIFY_LARGE_ANALYST_KEY" else "standard"
+        sess["qa_context_md"] = qa_context
         sess["rows_fed"] = True
         sess.setdefault("qa_messages", []).extend([
             {"role": "user", "content": question, "ts": datetime.now().isoformat()},
@@ -681,25 +778,20 @@ async def history_qa_stream(
 ):
     """历史报告续聊 QA SSE 流程（async generator）。"""
     try:
-        answer_chunks: list[str] = []
-        new_conv_id = analyst_conv_id
-        async for chunk, conv_id in sse_dify_stream(question, history_id, analyst_conv_id, analyst_key):
-            if chunk:
-                answer_chunks.append(chunk)
-                yield sse_event({"type": "chunk", "content": chunk})
-            if conv_id:
-                new_conv_id = conv_id
-
-        answer_text = "".join(answer_chunks)
-        for h in history:
-            if h["id"] == history_id:
-                h["analyst_conv_id"] = new_conv_id or analyst_conv_id
-                h["analyst_app"] = "large" if analyst_key_name == "DIFY_LARGE_ANALYST_KEY" else "standard"
-                h.setdefault("qa_messages", []).extend([
+        entry = next(h for h in history if h["id"] == history_id)
+        answer_text, new_conv_id, qa_context = await _answer_qa_with_recovery(
+            entry, question, history_id, analyst_conv_id, analyst_key
+        )
+        for event in _content_events(answer_text):
+            yield event
+        entry["analyst_conv_id"] = new_conv_id or analyst_conv_id
+        entry["analyst_app"] = "large" if analyst_key_name == "DIFY_LARGE_ANALYST_KEY" else "standard"
+        entry["qa_context_md"] = qa_context
+        entry["rows_fed"] = True
+        entry.setdefault("qa_messages", []).extend([
                     {"role": "user", "content": question, "ts": datetime.now().isoformat()},
                     {"role": "ai", "content": answer_text, "ts": datetime.now().isoformat()},
                 ])
-                break
         _save_history(history)
         await audit_log(
             request, "report", "追问历史报告",
@@ -742,15 +834,19 @@ def validate_report_ready(session_id: str) -> bool:
     sess = get_session(session_id)
     if not all([sess.get("plan"), sess.get("rows"), sess.get("stats_md")]):
         raise HTTPException(status_code=400, detail="请先完成统计计算")
+    if not LLM_API_KEY:
+        raise HTTPException(status_code=500, detail="未配置 LLM_API_KEY")
+    if not LLM_REPORT_MODEL:
+        raise HTTPException(status_code=500, detail="未配置 LLM_REPORT_MODEL")
     return sess.get("mode") == "crosstab" or any(
         len(v) > LARGE_SAMPLE_THRESHOLD for v in sess.get("open_text", {}).values()
     )
 
 
 def validate_qa_ready(session_id: str) -> None:
-    """校验 QA 前置条件（analyst_conv_id + analyst_key），不满足则 raise HTTPException。"""
+    """校验 QA 前置条件；直连写作后允许没有 Dify conversation_id。"""
     sess = get_session(session_id)
-    if not sess.get("analyst_conv_id"):
+    if not sess.get("report_md"):
         raise HTTPException(status_code=400, detail="请先生成报告")
     analyst_key, analyst_key_name = _analyst_key_for_report(sess)
     if not analyst_key:
@@ -767,9 +863,9 @@ def prepare_history_qa_context(
     entry = _find_history_for_login(history, history_id, login)
     if not entry:
         raise HTTPException(status_code=404, detail="历史记录不存在")
+    if not entry.get("report_md"):
+        raise HTTPException(status_code=400, detail="该历史记录没有可追问的报告")
     analyst_conv_id = entry.get("analyst_conv_id", "")
-    if not analyst_conv_id:
-        raise HTTPException(status_code=400, detail="该历史记录没有可续聊的对话")
     analyst_key, analyst_key_name = _analyst_key_for_report(entry)
     if not analyst_key:
         raise HTTPException(status_code=500, detail=f"未配置 {analyst_key_name}")

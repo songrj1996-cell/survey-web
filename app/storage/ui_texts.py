@@ -18,7 +18,7 @@ DEFAULT_UI_TEXTS: dict = {
     "panel_report_desc": {
         "key": "panel_report_desc",
         "label": "生成报告说明",
-        "current": "AI 正在基于确定性统计数据撰写完整报告",
+        "current": "AI 正在基于确定性统计结果与开放题反馈逐章撰写报告，章节完成并校验后将自动展示。",
     },
     "panel_done_desc": {
         "key": "panel_done_desc",

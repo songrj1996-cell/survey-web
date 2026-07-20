@@ -26,6 +26,13 @@ _QUALITATIVE_CONTEXT_LABELS = [
     ("report_usage", "报告准备用在哪里"),
 ]
 
+REPORT_WRITER_SYSTEM_PROMPT = (
+    "你是资深定性研究报告撰写者。必须严格执行用户消息中的 <report_spec>、<plan>、"
+    "<question_branch_logic> 和分轮任务；只能使用用户提供的统计、问卷回答、聚类结果与业务背景。"
+    "不得重新计算、改写或编造任何数字，不得补造玩家观点、身份或画像。"
+    "每轮只输出当轮指定内容，并保持 Markdown 结构要求。"
+)
+
 
 def _build_business_context_block(qualitative_context: dict | None, extra_note: str = "") -> str:
     """构造 <business_context> block；无有效字段时返回空字符串（不注入，行为不变）。"""
@@ -899,7 +906,7 @@ def _build_writer_context(stats_md: str, open_text: dict, plan: dict, headers: l
             "不得使用问卷总样本替代。不同题干、不同使用程度人群的主观反馈不得直接比较高低。"
         )
     requirements += (
-        "\n\n补充：展示代表性玩家反馈时必须沿用 `<open_text>` 前缀里的玩家身份信息。"
+        "\n\n补充：在「相关具体信息引用」中展示玩家反馈时，必须沿用 `<open_text>` 前缀里的玩家身份信息。"
         "所有 Discord、WhatsApp、MLBBID 或其它来源的身份值都已统一放在 `玩家ID=...` 中，"
         "报告表格只能使用一个 `玩家ID` 列，不得按来源拆列或改写表头。"
         "只有 `<open_text>` 前缀里真的存在 `画像=...` 时才可填写画像；没有画像时使用 `—`，不得编造。"
@@ -938,12 +945,15 @@ def _build_writer_part_query(part: dict) -> str:
     return (
         f"**本轮任务**：现在**只**写 `## Part {part['i']} {part['name']}` 这一个章节的完整内容"
         f"（涉及列：{part['col_desc']}）。\n"
-        "严格按 <report_spec> 里对 Part 的写法：紧接 `## Part` 标题后先写一段详尽的「本节总结」段落（连贯文字、不用列表），"
+        "严格按 <report_spec> 里对 Part 的写法：紧接 `## Part` 标题后写 `**本节总结：**`，并用 3–6 条带加粗短标题的 Markdown 编号列表归纳关键结论，"
+        "不得把全部数字和中文说明塞进一个超长段落；"
         "再围绕本 Part 的业务 Topic 综合展开。同一 Topic 下的客观题与相关开放题必须结合分析，客观统计作为人群背景和判断依据，"
         "主观反馈用于完整解释原因、情境、分歧与产品含义；不要按问卷题目逐题复述，也不要按正面/负面/中立机械拆分。"
         "本章内部禁止使用任何 `###` 或 `####` 标题，内部分析维度和观点名称一律使用加粗正文。"
-        "每个观点使用 `**观点：短标题**`、完整观点说明、`提及情况：`、`**代表性玩家反馈：**` 的固定结构，"
-        "并附 1–5 条 `玩家ID | 画像信息 | 中文翻译` 表格证据；只展示中文翻译，不保留原始语言文本。\n"
+        "每个观点使用 `**观点：短标题**`，并将主要发现、原因与情境、分歧或例外、产品含义拆成 2–4 条简短项目，"
+        "再写 `**提及情况：**`。统计数据优先直接写进对应内容；需要单独列数据表或玩家反馈表时，表格前统一使用"
+        " `**相关具体信息引用：**`，不得使用「代表性玩家反馈」，也不得留下空标题。玩家反馈表附 1–5 条"
+        " `玩家ID | 画像信息 | 中文翻译` 证据，只展示中文翻译，不保留原始语言文本。\n"
         "**约束**：① 只输出这一个 Part，不要写其它 Part；② 不要写核心结论、不要写 Bug 模块；"
         "③ 不要重复前面已经写过的标题或章节；④ 所有数字、百分比必须逐字取自 <stats>，禁止重算或编造。"
     )
@@ -1020,13 +1030,40 @@ def _build_writer_action_query(
         f"{part_titles}），撰写 `## 行动建议` 模块，这是整篇报告的最后一节。\n"
         "要求：\n"
         "1. 只输出这一个模块，以 `## 行动建议` 开头，不要重复或重写其它章节。\n"
-        "2. 给出 3-5 条建议，每条使用固定结构：`**短标题**`，下面分别写「产品动作：」「优先级：」（高/中/低）"
-        "「验证方式：」（说明需要什么数据、用户调研或实验来验证该建议）「依据：」（引用 <stats> 或 <open_text> 中的具体证据）"
-        "「不确定性/前提：」（说明该建议的假设或局限）。\n"
+        "2. 给出 3-5 条建议，并只使用一张 Markdown 表格呈现。表头和顺序必须逐字为："
+        "`建议内容 | 优先级 | 产品动作 | 验证方式 | 依据 | 不确定性/前提`。"
+        "`建议内容` 使用加粗短标题加一句核心判断；`优先级` 只能写高/中/低；"
+        "其余列分别说明具体动作、所需数据/用户调研/实验、<stats> 或 <open_text> 中的具体证据、假设或局限。\n"
         f"3. {context_clause}每条建议必须能在 <stats> 或 <open_text> 中找到对应依据，不得凭空提出。\n"
         "4. 如果建议依赖推测、猜测或样本外假设，必须在「不确定性/前提」里明确写出，不能包装成事实。\n"
         f"{bug_clause}"
     )
+
+
+def _build_writer_action_repair_query() -> str:
+    """行动建议内容已生成但标题不合规时，仅修复 Markdown 结构。"""
+    return (
+        "上一轮已经完成行动建议内容，但输出没有使用规定的 Markdown 结构。"
+        "请只重新整理上一轮内容的格式，不要改变建议、依据、优先级、验证方式或任何分析结论，"
+        "也不要新增内容。输出必须从独占一行的 `## 行动建议` 开始，后面将原有 3-5 条建议整理为一张表格，"
+        "表头和顺序逐字使用 `建议内容 | 优先级 | 产品动作 | 验证方式 | 依据 | 不确定性/前提`；"
+        "不要输出解释、前言、其它章节或代码围栏。"
+    )
+
+
+def _normalize_action_section(text: str) -> str:
+    """把常见的行动建议标题变体规范为固定二级标题；不改正文内容。"""
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return ""
+    heading = re.search(
+        r"(?mi)^[ \t]*(?:#{1,6}[ \t]+)?(?:\*\*)?行动建议(?:\*\*)?[^\r\n]*$",
+        cleaned,
+    )
+    if not heading:
+        return ""
+    body = cleaned[heading.end():].lstrip("\r\n ")
+    return "## 行动建议" + (f"\n\n{body}" if body else "")
 
 
 def _format_rows_for_qa(rows: list[list], plan: dict) -> str:
@@ -1050,6 +1087,61 @@ def _format_rows_for_qa(rows: list[list], plan: dict) -> str:
         )
         dump = note + "\n".join(json.dumps(row_obj(r), ensure_ascii=False) for r in sampled)
     return dump
+
+
+def _build_qa_context(source: dict, report_md: str | None = None) -> str:
+    """构造可持久化的追问上下文，同时覆盖问卷、确定性分析结果和最终报告。"""
+    plan = source.get("plan") or {}
+    rows_block = _format_rows_for_qa(source.get("rows") or [], plan)
+    questionnaire_text = str(source.get("questionnaire_text") or "").strip()
+    qualitative_context = source.get("qualitative_context") or {}
+    report = str(report_md if report_md is not None else source.get("report_md") or "").strip()
+    stats_md = str(source.get("stats_md") or "").strip()
+
+    blocks = [
+        "<qa_context>",
+        "你正在回答用户对一份调研报告的追问。下面同时提供最终报告、问卷结构、"
+        "确定性统计、业务背景和原始回答上下文。回答时必须理解用户是在询问这份报告中的内容与逻辑；"
+        "如报告表述与确定性统计或原始回答冲突，以确定性统计和原始回答为准，并明确指出冲突。",
+        f"<report>\n{report or '（报告正文缺失）'}\n</report>",
+        "<analysis_plan>\n"
+        + json.dumps(plan, ensure_ascii=False, indent=2)
+        + "\n</analysis_plan>",
+        f"<stats>\n{stats_md or '（无统计结果）'}\n</stats>",
+        "<business_context>\n"
+        + json.dumps(qualitative_context, ensure_ascii=False, indent=2)
+        + "\n</business_context>",
+    ]
+    if questionnaire_text:
+        blocks.append(f"<questionnaire>\n{questionnaire_text}\n</questionnaire>")
+    blocks.append(f"<rows>\n{rows_block}\n</rows>")
+    blocks.append("</qa_context>")
+    return "\n\n".join(blocks)
+
+
+def _build_qa_seed_query(
+    qa_context: str,
+    qa_messages: list[dict] | None,
+    question: str,
+) -> str:
+    """新建/重建 Dify 追问会话时，把报告上下文和既往问答一次性投喂。"""
+    history_lines = []
+    for message in qa_messages or []:
+        role = "用户" if message.get("role") == "user" else "AI"
+        content = str(message.get("content") or "").strip()
+        if content:
+            history_lines.append(f"{role}：{content}")
+    history_block = (
+        "<previous_qa>\n" + "\n\n".join(history_lines) + "\n</previous_qa>\n\n"
+        if history_lines else ""
+    )
+    return (
+        f"{qa_context.strip()}\n\n"
+        f"{history_block}"
+        "请基于以上完整上下文回答下面的问题。不要声称自己看不到报告或问卷；"
+        "引用数字时必须与 <stats> 一致，解释报告逻辑时要指出所依据的报告章节、统计或玩家反馈。\n\n"
+        f"用户问题：{question}"
+    )
 
 
 def _stratified_sample(body: list[list], profile_indexes: list[int], target: int = 100):

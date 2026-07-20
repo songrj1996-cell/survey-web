@@ -11,10 +11,12 @@ const historyState = {
   },
 };
 
-$('btn-open-history').addEventListener('click', () => {
+function openHistoryDrawer() {
   openDrawer('history-drawer');
   loadHistory();
-});
+}
+
+$('btn-open-history').addEventListener('click', openHistoryDrawer);
 
 async function loadHistory() {
   const body = $('history-body');
@@ -284,6 +286,8 @@ async function openHistoryEntry(id) {
     state.historyReport.reportNo = entry.report_no || '';
     state.historyReport.reportMd = entry.report_md;
     state.historyReport.title = entry.title || reportTitleFromMarkdown(entry.report_md);
+    state.historyReport.createdAt = entry.created_at || '';
+    state.historyReport.mode = entry.mode || 'survey';
     state.historyReport.analystConvId = entry.analyst_conv_id || null;
     state.historyReport.planData = entry.plan || null;
     state.historyReport.qaMessages = normalizeQAMessages(entry.qa_messages);
@@ -361,4 +365,3 @@ function startHistoryTitleEdit(card) {
     if (e.key === 'Escape') { e.preventDefault(); finish(); }
   });
 }
-

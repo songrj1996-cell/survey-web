@@ -9,8 +9,16 @@ function resetReportFailureUi() {
   $('ps-writing')?.classList.remove('progress-step--failed');
   const indicator = $('report-stream-container')?.querySelector('.stream-indicator');
   indicator?.classList.remove('stream-indicator--failed');
-  const label = indicator?.querySelector('span');
-  if (label) label.textContent = '报告生成中，请耐心等待…';
+  const title = $('report-stream-status-title');
+  const meta = $('report-stream-status-meta');
+  const count = $('report-stream-count');
+  const progress = $('report-generation-progress');
+  const progressBar = $('report-generation-progress-bar');
+  if (title) title.textContent = '正在准备报告内容';
+  if (meta) meta.textContent = '每个章节完成并校验后会自动显示';
+  if (count) count.textContent = '正在准备生成步骤';
+  if (progress) progress.setAttribute('aria-valuenow', '0');
+  if (progressBar) progressBar.style.width = '0%';
 }
 
 function showReportFailureUi(message) {
@@ -36,9 +44,27 @@ function showReportFailureUi(message) {
   if (stream) stream.style.display = 'block';
   const indicator = stream?.querySelector('.stream-indicator');
   indicator?.classList.add('stream-indicator--failed');
-  const label = indicator?.querySelector('span');
-  if (label) label.textContent = '报告生成已中断';
-  _updateProgressStatus('报告生成已中断，可查看已输出内容或从头重新生成');
+  const title = $('report-stream-status-title');
+  const meta = $('report-stream-status-meta');
+  if (title) title.textContent = '报告生成已中断';
+  if (meta) meta.textContent = '已完成的章节保留在下方，重新生成将从第一章开始';
+}
+
+function _formatReportWaitTime(ms) {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+}
+
+function _parseReportProgress(message) {
+  const match = String(message || '').match(/分章生成\s+(\d+)\/(\d+)[：:]\s*(.+)/);
+  if (!match) return null;
+  return {
+    current: Number(match[1]),
+    total: Number(match[2]),
+    task: match[3].replace(/[.…]+$/, '').trim(),
+  };
 }
 
 async function runStats() {
@@ -56,7 +82,8 @@ async function runStats() {
   $('ps-writing').classList.remove('progress-step--active', 'progress-step--done', 'progress-step--failed');
   $('report-stream-container').style.display = 'none';
   $('report-stream-content').textContent = '';
-  _updateProgressStatus('');
+
+  let generationStatusTimer = null;
 
   try {
     const statsResp = await fetch(`/api/stats/${state.sessionId}`, { method: 'POST' });
@@ -70,17 +97,68 @@ async function runStats() {
 
     $('report-stream-container').style.display = 'block';
     let fullReport = '';
+    let currentStep = 0;
+    let totalSteps = 0;
+    let currentTask = '正在准备报告内容';
+    let completedSteps = 0;
+    let stepStartedAt = Date.now();
+    let lastSignalAt = Date.now();
+
+    const renderGenerationStatus = () => {
+      const now = Date.now();
+      const waitedMs = now - stepStartedAt;
+      const connectionText = now - lastSignalAt < 45000 ? '连接正常' : '正在等待服务响应';
+      const waitingText = waitedMs >= 60000
+        ? '本步骤内容较多，AI 仍在生成和校验'
+        : '本步骤完成并校验后会一次性显示';
+      const title = $('report-stream-status-title');
+      const meta = $('report-stream-status-meta');
+      const count = $('report-stream-count');
+      const progress = $('report-generation-progress');
+      const progressBar = $('report-generation-progress-bar');
+      const titleText = currentStep && totalSteps
+        ? `正在生成 ${currentStep}/${totalSteps}：${currentTask}`
+        : currentTask;
+      const percent = totalSteps ? Math.round((completedSteps / totalSteps) * 100) : 0;
+
+      if (title) title.textContent = titleText;
+      if (meta) {
+        meta.textContent = `${waitingText} · ${connectionText} · 已等待 ${_formatReportWaitTime(waitedMs)}`;
+      }
+      if (count) {
+        count.textContent = totalSteps
+          ? `已完成 ${completedSteps}/${totalSteps} 个生成步骤`
+          : '正在准备生成步骤';
+      }
+      if (progress) progress.setAttribute('aria-valuenow', String(percent));
+      if (progressBar) progressBar.style.width = `${percent}%`;
+    };
+
+    renderGenerationStatus();
+    generationStatusTimer = window.setInterval(renderGenerationStatus, 1000);
 
     await consumeSSE(`/api/report/${state.sessionId}`, ev => {
+      lastSignalAt = Date.now();
       if (ev.type === 'progress') {
-        // 主观题聚类阶段：后端正在处理，前端显示实时进度避免用户以为卡死
-        _updateProgressStatus(ev.message);
+        // 服务端按完整章节输出；状态区持续说明当前步骤，避免等待期间像卡死。
+        const parsed = _parseReportProgress(ev.message);
+        if (parsed) {
+          currentStep = parsed.current;
+          totalSteps = parsed.total;
+          completedSteps = Math.max(0, currentStep - 1);
+          currentTask = parsed.task;
+        } else {
+          currentTask = ev.message || currentTask;
+        }
+        stepStartedAt = Date.now();
+        renderGenerationStatus();
         const el = $('report-stream-content');
         if (el && !fullReport) {
-          // 正文还空时，把进度显示在流式区，有正文后进度退到状态栏
-          el.textContent = ev.message;
+          el.textContent = '当前章节或模块完成并校验后，将在这里显示。';
+          el.classList.add('report-stream-content--waiting');
         }
       }
+      if (ev.type === 'heartbeat') renderGenerationStatus();
       if (ev.type === 'chunk') {
         const chunk = ev.content || '';
         const isFirstChunk = !fullReport;
@@ -90,14 +168,18 @@ async function runStats() {
           const el = $('report-stream-content');
           if (el) {
             // 流式阶段只追加新文本，避免每个分片都重新解析整份 Markdown。
-            if (isFirstChunk) el.textContent = '';
+            if (isFirstChunk) {
+              el.textContent = '';
+              el.classList.remove('report-stream-content--waiting');
+            }
             el.append(document.createTextNode(chunk));
             el.scrollTop = el.scrollHeight;
           }
         }
       }
       if (ev.type === 'report_done') {
-        _updateProgressStatus('');
+        completedSteps = totalSteps || completedSteps;
+        renderGenerationStatus();
         state.sessionReport.running = false;
         resetReportFailureUi();
         state.sessionReport.reportMd = ev.report_md;
@@ -115,6 +197,8 @@ async function runStats() {
     state.sessionReport.running = false;
     showReportFailureUi(e.message);
     showToast(`报告生成失败：${state.sessionReport.error}`, 'error', 7000);
+  } finally {
+    if (generationStatusTimer) window.clearInterval(generationStatusTimer);
   }
 }
 
@@ -126,6 +210,20 @@ $('btn-report-retry')?.addEventListener('click', () => {
 function applyCoreHighlight() {
   const content = $('report-content');
   if (!content) return;
+
+  const detailDividerText = '以下为详细信息，各位可以按需查看';
+  const isDetailDivider = el => {
+    if (!el || el.tagName !== 'P') return false;
+    const text = el.textContent.trim();
+    return text === detailDividerText
+      || /^-{3,}\s*以下为详细信息，各位可以按需查看\s*-{3,}$/.test(text);
+  };
+
+  const detailDivider = Array.from(content.querySelectorAll('p')).find(isDetailDivider) || null;
+  if (detailDivider) {
+    detailDivider.textContent = detailDividerText;
+    detailDivider.classList.add('report-detail-divider');
+  }
 
   const wrapElements = (items, extraClass = '') => {
     const cleanItems = items.filter(Boolean);
@@ -146,6 +244,10 @@ function applyCoreHighlight() {
     const toWrap = [coreH2];
     let el = coreH2.nextElementSibling;
     while (el && el.tagName !== 'H1' && el.tagName !== 'H2') {
+      if (isDetailDivider(el)) break;
+      if (el.tagName === 'H3') {
+        el.textContent = el.textContent.replace(/\s*[:：]\s*关键发现\s*$/, '').trim();
+      }
       toWrap.push(el);
       el = el.nextElementSibling;
     }
@@ -156,12 +258,8 @@ function applyCoreHighlight() {
   const summaryHeadings = Array.from(content.querySelectorAll('h3, h4')).filter(h => isSummaryTitle(h.textContent));
   summaryHeadings.forEach(heading => {
     const items = [heading];
-    let el = heading.nextElementSibling;
-    while (el) {
-      if (/^H[1-6]$/.test(el.tagName)) break;
-      items.push(el);
-      el = el.nextElementSibling;
-    }
+    const summaryBody = heading.nextElementSibling;
+    if (summaryBody?.tagName === 'P') items.push(summaryBody);
     wrapElements(items, 'chapter-summary-box');
   });
 
@@ -171,14 +269,14 @@ function applyCoreHighlight() {
   });
   inlineSummaries.forEach(p => {
     const items = [p];
-    let el = p.nextElementSibling;
-    while (el && !/^H[1-6]$/.test(el.tagName)) {
-      if (!['P', 'UL', 'OL', 'BLOCKQUOTE'].includes(el.tagName)) break;
-      items.push(el);
-      el = el.nextElementSibling;
-    }
+    const summaryList = p.nextElementSibling;
+    if (summaryList && ['OL', 'UL'].includes(summaryList.tagName)) items.push(summaryList);
     wrapElements(items, 'chapter-summary-box');
   });
+}
+
+function prepareReportMarkdownForPreview(md) {
+  return String(md || '').replace(/(\d)~(?=\d)/g, (_, digit) => `${digit}\\~`);
 }
 
 function enhanceReportTables() {
@@ -209,6 +307,19 @@ function enhanceReportTables() {
   content.querySelectorAll('table').forEach(table => {
     const headers = Array.from(table.querySelectorAll('thead th'));
     if (!headers.length) return;
+    const headerLabels = headers.map(th => th.textContent.trim());
+    const actionHeaders = ['建议内容', '优先级', '产品动作', '验证方式', '依据', '不确定性/前提'];
+    const isActionTable = headerLabels.length === actionHeaders.length
+      && actionHeaders.every((label, index) => headerLabels[index] === label);
+    if (isActionTable) {
+      table.classList.add('report-action-table');
+      if (!table.parentElement?.classList.contains('report-table-scroll')) {
+        const wrapper = document.createElement('div');
+        wrapper.className = 'report-table-scroll report-action-table-scroll';
+        table.parentNode.insertBefore(wrapper, table);
+        wrapper.appendChild(table);
+      }
+    }
     const percentIndexes = headers
       .map((th, index) => /占比|比例|百分比/.test(th.textContent) ? index : -1)
       .filter(index => index >= 0);
@@ -243,6 +354,8 @@ function enhanceReportTables() {
   });
 }
 
+let _reportTocScrollHandler = null;
+
 function buildTOC() {
   const tocList = $('report-toc-list');
   if (!tocList) return;
@@ -255,36 +368,58 @@ function buildTOC() {
     if (h.closest('.core-summary-box') && h.tagName !== 'H2') return false;
     return true;
   });
+  const reportBody = document.querySelector('#panel-5 .report-document .report-body');
+  if (_reportTocScrollHandler && reportBody) {
+    reportBody.removeEventListener('scroll', _reportTocScrollHandler);
+    _reportTocScrollHandler = null;
+  }
   if (!filtered.length) { $('report-toc').style.display = 'none'; return; }
   $('report-toc').style.display = '';
   tocList.innerHTML = '';
+  const links = [];
   filtered.forEach((h, idx) => {
     if (!h.id) h.id = `toc-h-${idx}`;
     const li = document.createElement('li');
     const a = document.createElement('a');
     a.href = `#${h.id}`;
     a.textContent = h.textContent;
-    if (h.tagName === 'H2') {
-      a.style.paddingLeft = '10px';
-      a.style.fontSize = '12px';
-    } else if (h.tagName === 'H3') {
-      a.style.paddingLeft = '20px';
-      a.style.fontSize = '11px';
-      a.style.color = 'var(--text-3)';
-    }
+    a.title = h.textContent;
+    a.setAttribute('aria-label', h.textContent);
+    a.classList.add(`report-toc__link--${h.tagName.toLowerCase()}`);
     a.addEventListener('click', e => {
       e.preventDefault();
-      const reportBody = document.querySelector('#panel-5 .report-layout .report-body');
       if (reportBody) {
-        const top = h.offsetTop - reportBody.offsetTop;
+        const top = h.getBoundingClientRect().top - reportBody.getBoundingClientRect().top + reportBody.scrollTop - 24;
         reportBody.scrollTo({ top, behavior: 'smooth' });
       } else {
         h.scrollIntoView({ behavior: 'smooth', block: 'start' });
       }
     });
+    links.push(a);
     li.appendChild(a);
     tocList.appendChild(li);
   });
+
+  if (reportBody) {
+    const updateActiveToc = () => {
+      const marker = reportBody.scrollTop + 72;
+      let activeIndex = 0;
+      filtered.forEach((heading, index) => {
+        const top = heading.getBoundingClientRect().top
+          - reportBody.getBoundingClientRect().top
+          + reportBody.scrollTop;
+        if (top <= marker) activeIndex = index;
+      });
+      links.forEach((link, index) => link.classList.toggle('toc-active', index === activeIndex));
+    };
+    let activeFrame = null;
+    _reportTocScrollHandler = () => {
+      if (activeFrame) cancelAnimationFrame(activeFrame);
+      activeFrame = requestAnimationFrame(updateActiveToc);
+    };
+    reportBody.addEventListener('scroll', _reportTocScrollHandler, { passive: true });
+    updateActiveToc();
+  }
 }
 
 let _tocDebounce = null;
@@ -403,13 +538,36 @@ function updateReportContextSwitch() {
   const historyBtn = $('btn-report-history');
   if (!bar || !sessionBtn || !historyBtn) return;
   const hasSession = !!(state.sessionId || state.sessionReport.reportMd || state.sessionReport.running);
-  const hasHistory = !!state.historyReport.reportMd;
-  bar.style.display = hasSession || hasHistory ? '' : 'none';
+  const isHistory = state.viewMode === 'history' && !!state.historyReport.reportMd;
+  const historyMeta = $('report-history-meta');
+  const historyInfo = $('report-history-info');
+  const breadcrumb = $('report-breadcrumb');
+  const backBtn = $('btn-report-back-session');
+
+  bar.style.display = '';
   sessionBtn.classList.toggle('report-context-switch__btn--active', state.viewMode === 'session');
   sessionBtn.disabled = !hasSession;
-  historyBtn.style.display = hasHistory ? '' : 'none';
-  historyBtn.classList.toggle('report-context-switch__btn--active', state.viewMode === 'history');
-  historyBtn.textContent = hasHistory ? `历史报告：${shortName(state.historyReport.title || '历史报告', 18)}` : '历史报告';
+  historyBtn.style.display = '';
+  historyBtn.classList.toggle('report-context-switch__btn--active', isHistory);
+  historyBtn.textContent = '历史报告';
+  historyBtn.title = '打开历史记录';
+
+  if (breadcrumb) breadcrumb.hidden = isHistory;
+  if (historyMeta) historyMeta.hidden = !isHistory;
+  if (backBtn) backBtn.hidden = !hasSession;
+  if (historyInfo && isHistory) {
+    const ctx = state.historyReport;
+    const modeLabel = ctx.mode === 'comment' ? '评论分析' : ctx.mode === 'annotate' ? '数据标注' : '问卷分析';
+    let createdText = '';
+    if (ctx.createdAt) {
+      const created = new Date(ctx.createdAt);
+      if (!Number.isNaN(created.getTime())) {
+        const pad = value => String(value).padStart(2, '0');
+        createdText = `${created.getFullYear()}-${pad(created.getMonth() + 1)}-${pad(created.getDate())} ${pad(created.getHours())}:${pad(created.getMinutes())}`;
+      }
+    }
+    historyInfo.textContent = [ctx.reportNo, createdText, modeLabel].filter(Boolean).join(' · ');
+  }
 }
 
 function applyQAAvailability() {
@@ -456,7 +614,7 @@ function renderReportWorkspace(md, { preserveQa = true } = {}) {
 
   const reportContent = $('report-content');
   try {
-    reportContent.innerHTML = renderMarkdown(md);
+    reportContent.innerHTML = renderMarkdown(prepareReportMarkdownForPreview(md));
   } catch (error) {
     console.error('[report] Markdown render failed, falling back to plain text:', error);
     reportContent.textContent = md || '';
@@ -524,7 +682,15 @@ function switchReportContext(mode) {
 }
 
 $('btn-report-session')?.addEventListener('click', () => switchReportContext('session'));
-$('btn-report-history')?.addEventListener('click', () => switchReportContext('history'));
+$('btn-report-history')?.addEventListener('click', () => {
+  if (typeof openHistoryDrawer === 'function') {
+    openHistoryDrawer();
+    return;
+  }
+  openDrawer('history-drawer');
+  loadHistory();
+});
+$('btn-report-back-session')?.addEventListener('click', () => switchReportContext('session'));
 
 async function updateReportTitle(historyId, title) {
   const cleanTitle = String(title || '').trim();
@@ -699,12 +865,57 @@ async function refreshFeishuStatus() {
   applyPermGating();
 }
 
+function showFeishuLogoutConfirmModal(account) {
+  return new Promise(resolve => {
+    const existing = $('feishu-logout-modal');
+    if (existing) existing.remove();
+
+    const modal = document.createElement('div');
+    modal.id = 'feishu-logout-modal';
+    modal.style.cssText = 'position:fixed;inset:0;z-index:200;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.5);backdrop-filter:blur(4px);';
+    modal.innerHTML = `
+      <div role="dialog" aria-modal="true" aria-labelledby="feishu-logout-title"
+           style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
+                  padding:24px 28px;width:min(400px,90vw);display:flex;flex-direction:column;gap:16px;
+                  box-shadow:var(--shadow-lg)">
+        <div id="feishu-logout-title" style="font-size:15px;font-weight:600;color:var(--text)">退出飞书登录？</div>
+        <div style="font-size:13px;color:var(--text-2);line-height:1.7">
+          当前账号为 <strong style="color:var(--text)">${esc(account)}</strong>。退出后，如需继续使用飞书相关功能，需要重新登录授权。
+        </div>
+        <div style="display:flex;gap:8px;justify-content:flex-end">
+          <button class="btn btn--ghost" id="feishu-logout-cancel" type="button">取消</button>
+          <button class="btn btn--primary" id="feishu-logout-confirm" type="button">确认退出</button>
+        </div>
+      </div>`;
+    document.body.appendChild(modal);
+
+    const onKeydown = event => {
+      if (event.key === 'Escape') cleanup(false);
+    };
+    const cleanup = result => {
+      document.removeEventListener('keydown', onKeydown);
+      modal.remove();
+      resolve(result);
+    };
+    $('feishu-logout-cancel').onclick = () => cleanup(false);
+    $('feishu-logout-confirm').onclick = () => cleanup(true);
+    modal.addEventListener('click', event => {
+      if (event.target === modal) cleanup(false);
+    });
+    document.addEventListener('keydown', onKeydown);
+    $('feishu-logout-cancel').focus();
+  });
+}
+
 $('btn-feishu-login').addEventListener('click', async () => {
   if (!state.feishu.configured) {
     showToast('服务端未配置飞书应用（FEISHU_APP_ID/SECRET/REDIRECT_URI）', 'error');
     return;
   }
   if (state.feishu.logged_in) {
+    const account = state.feishu.email || state.feishu.name || '当前账号';
+    const confirmed = await showFeishuLogoutConfirmModal(account);
+    if (!confirmed) return;
     try {
       await fetch('/api/feishu/logout', { method: 'POST' });
     } catch { }

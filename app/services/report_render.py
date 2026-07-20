@@ -31,6 +31,57 @@ from app.core.config import (
 )
 
 
+_RESEARCH_BACKGROUND_FIELDS = (
+    ("problem", "业务问题/业务痛点/业务规划"),
+    ("key_concerns", "本次调研最关心的问题"),
+    ("target_users", "产品/功能的目标用户"),
+)
+
+
+def _escape_research_background_text(value: object) -> str:
+    """把用户输入转成可安全直接展示的单段 Markdown 文本。"""
+    normalized = " ".join(str(value or "").split())
+    escaped = html.escape(normalized, quote=False)
+    return re.sub(r"([\\`*_{}\[\]#|])", r"\\\1", escaped)
+
+
+def _inject_research_background(md: str, qualitative_context: dict | None) -> str:
+    """在报告顶部插入用户填写的调研背景；无有效输入时保持报告不变。"""
+    fields = []
+    for key, label in _RESEARCH_BACKGROUND_FIELDS:
+        value = _escape_research_background_text((qualitative_context or {}).get(key, ""))
+        if value:
+            fields.append(f"**{label}**：{value}")
+    if not fields:
+        return md
+
+    section = "\n\n".join(["## 调研背景", *fields])
+    cleaned = re.sub(
+        r"(?ms)^##[ \t]+调研背景[ \t]*\r?\n.*?(?=^##[ \t]+|\Z)",
+        "",
+        str(md or ""),
+    ).strip()
+    if not cleaned:
+        return section
+
+    lines = cleaned.split("\n")
+    insert_at = 0
+    for index, line in enumerate(lines):
+        if line.startswith("# ") and not line.startswith("## "):
+            insert_at = index + 1
+            while insert_at < len(lines):
+                stripped = lines[insert_at].strip()
+                if not stripped or stripped.startswith(">"):
+                    insert_at += 1
+                    continue
+                break
+            break
+
+    before = "\n".join(lines[:insert_at]).rstrip()
+    after = "\n".join(lines[insert_at:]).lstrip()
+    return "\n\n".join(part for part in (before, section, after) if part)
+
+
 def _inject_disclaimer(md: str, mode: str = "") -> str:
     """在第一行 `# 标题` 之后插入免责声明引用行；幂等；无 H1 则插到最前。
 

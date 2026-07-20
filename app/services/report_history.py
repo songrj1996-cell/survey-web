@@ -85,10 +85,13 @@ def save_to_history(session_id: str, sess: dict) -> None:
         "plan": sess.get("plan"),
         "stats_md": sess.get("stats_md"),
         "qualitative_context": sess.get("qualitative_context", {}),
+        "qa_context_md": sess.get("qa_context_md", ""),
         "analyst_conv_id": sess.get("analyst_conv_id", ""),
         "analyst_app": sess.get("analyst_app", ""),
+        "report_writer_provider": sess.get("report_writer_provider", ""),
+        "report_writer_model": sess.get("report_writer_model", ""),
         "qa_messages": qa_messages or [],
-        "rows_fed": True,  # 历史 QA 跳过投喂 rows（对话已包含上下文）
+        "rows_fed": bool(sess.get("rows_fed", False)),
         "mode": sess.get("mode", ""),  # 保存模式，导出时据此选择免责声明（定性/crosstab/comment）
         "row_count": max(0, len(sess.get("rows") or []) - 1) or (old_entry or {}).get("row_count", 0),
         **owner,
