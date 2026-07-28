@@ -55,6 +55,7 @@ from app.services.report_engine import (
     _build_planner_sample,
     _build_qa_context,
     _build_qa_seed_query,
+    _describe_qa_context_scope,
     _build_writer_action_query,
     _build_writer_action_repair_query,
     _build_writer_bug_query,
@@ -738,6 +739,8 @@ async def qa_stream(session_id: str, question: str, request: Request):
     analyst_conv_id = sess.get("analyst_conv_id", "")
     analyst_key, analyst_key_name = _analyst_key_for_report(sess)
     try:
+        qa_context = str(sess.get("qa_context_md") or "").strip() or _build_qa_context(sess)
+        yield sse_event({"type": "qa_scope", "message": _describe_qa_context_scope(qa_context)})
         answer_text, new_conv_id, qa_context = await _answer_qa_with_recovery(
             sess, question, session_id, analyst_conv_id, analyst_key
         )
@@ -779,6 +782,8 @@ async def history_qa_stream(
     """历史报告续聊 QA SSE 流程（async generator）。"""
     try:
         entry = next(h for h in history if h["id"] == history_id)
+        qa_context = str(entry.get("qa_context_md") or "").strip() or _build_qa_context(entry)
+        yield sse_event({"type": "qa_scope", "message": _describe_qa_context_scope(qa_context)})
         answer_text, new_conv_id, qa_context = await _answer_qa_with_recovery(
             entry, question, history_id, analyst_conv_id, analyst_key
         )

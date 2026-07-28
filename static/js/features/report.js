@@ -575,8 +575,8 @@ function applyQAAvailability() {
   const btn = $('btn-qa-send');
   if (!input || !btn) return;
   if (state.viewMode === 'history') {
-    const canChat = !!state.historyReport.analystConvId;
-    input.placeholder = canChat ? '可基于该历史报告继续追问（Enter 发送）' : '该历史记录无可续聊的对话，仅供查看';
+    const canChat = !!state.historyReport.reportMd;
+    input.placeholder = canChat ? '可基于该历史报告发起或继续追问（Enter 发送）' : '该历史记录没有可追问的报告';
     input.disabled = !canChat;
     btn.disabled = !canChat || state.qaLoading;
   } else {
@@ -1069,7 +1069,12 @@ async function sendQA() {
   const qaMode = state.viewMode;
   const qaCtx = activeReportCtx();
   appendQABubble('user', question);
-  const typingBubble = appendQABubble('ai', null, true);
+  let typingBubble = null;
+
+  const ensureTypingBubble = () => {
+    if (!typingBubble) typingBubble = appendQABubble('ai', null, true);
+    return typingBubble;
+  };
 
   try {
     let answer = '';
@@ -1081,14 +1086,17 @@ async function sendQA() {
       : { session_id: state.sessionId, question };
 
     await consumeSSEPost(url, body, ev => {
+      if (ev.type === 'qa_scope') {
+        appendQABubble('ai', `本次追问的信息范围：${ev.message}`);
+      }
       if (ev.type === 'chunk') {
         answer += ev.content;
-        typingBubble.innerHTML = renderMarkdown(answer);
+        ensureTypingBubble().innerHTML = renderMarkdown(answer);
         typingBubble.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
       }
       if (ev.type === 'qa_done') {
         finalAnswer = ev.answer || answer;
-        typingBubble.innerHTML = renderMarkdown(finalAnswer);
+        ensureTypingBubble().innerHTML = renderMarkdown(finalAnswer);
       }
     });
     finalAnswer = finalAnswer || answer;
@@ -1103,10 +1111,10 @@ async function sendQA() {
     if (String(e.message || '').includes('请先登录飞书')) {
       await refreshFeishuStatus();
       const loginUrl = (state.feishu && state.feishu.login_url) || `/api/feishu/login?next=${encodeURIComponent(location.pathname)}`;
-      typingBubble.innerHTML = `❌ 飞书登录态已失效，请<a href="${esc(loginUrl)}" style="color:var(--accent)">重新登录</a>后再追问`;
+      ensureTypingBubble().innerHTML = `❌ 飞书登录态已失效，请<a href="${esc(loginUrl)}" style="color:var(--accent)">重新登录</a>后再追问`;
       showToast('飞书登录态已失效，请重新登录', 'error', 8000);
     } else {
-      typingBubble.textContent = `❌ ${e.message}`;
+      ensureTypingBubble().textContent = `❌ ${e.message}`;
       showToast(`追问失败：${e.message}`, 'error');
     }
   } finally {

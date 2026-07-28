@@ -3,9 +3,49 @@ from unittest.mock import AsyncMock, patch
 
 from app.services import report_history
 from app.services import survey_service
+from app.services.report_engine import _describe_qa_context_scope
 
 
 class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
+    def test_qa_context_scope_reports_full_sampled_and_missing_feedback(self):
+        full_context = '<qa_context><rows>\n{"id": "p-1"}\n{"id": "p-2"}\n</rows></qa_context>'
+        sampled_context = (
+            '<qa_context><rows>\n# 原始数据共 2418 行，超出上下文上限，已按画像维度分层抽样到 100 行。\n'
+            '{"id": "p-1"}\n</rows></qa_context>'
+        )
+        missing_context = '<qa_context><rows>（无数据）</rows></qa_context>'
+
+        self.assertIn('全部 2 条原始玩家反馈', _describe_qa_context_scope(full_context))
+        self.assertIn('抽样的 100 条原始玩家反馈（原始共 2418 条）', _describe_qa_context_scope(sampled_context))
+        self.assertIn('未保留可用的原始玩家反馈', _describe_qa_context_scope(missing_context))
+
+    async def test_qa_stream_emits_scope_before_answer(self):
+        qa_context = '<qa_context><rows>\n{"id": "p-1"}\n</rows></qa_context>'
+        sess = {
+            "report_md": "# 报告",
+            "qa_context_md": qa_context,
+            "analyst_conv_id": "",
+            "qa_messages": [],
+        }
+        with (
+            patch.object(survey_service, "get_session", return_value=sess),
+            patch.object(survey_service, "_current_login", new=AsyncMock(return_value=None)),
+            patch.object(survey_service, "_analyst_key_for_report", return_value=("dify-key", "DIFY_ANALYST_KEY")),
+            patch.object(
+                survey_service,
+                "_answer_qa_with_recovery",
+                new=AsyncMock(return_value=("回答内容", "conv-1", qa_context)),
+            ),
+            patch.object(survey_service, "save_session"),
+            patch.object(survey_service, "save_to_history"),
+            patch.object(survey_service, "audit_log", new=AsyncMock()),
+        ):
+            events = [event async for event in survey_service.qa_stream("sid", "问题", object())]
+
+        self.assertIn('"type": "qa_scope"', events[0])
+        self.assertIn('全部 1 条原始玩家反馈', events[0])
+        self.assertIn('"type": "chunk"', events[1])
+
     async def test_standard_report_uses_direct_writer_and_builds_qa_context(self):
         sess = {
             "filename": "responses.xlsx",

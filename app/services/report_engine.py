@@ -212,6 +212,21 @@ def _build_plan_revision_query(
     header_lines = "\n".join(f"- 列{i}: {h}" for i, h in enumerate(headers))
     confirmed_json = json.dumps(confirmed_columns or [], ensure_ascii=False, indent=2)
     plan_json = json.dumps(plan or {}, ensure_ascii=False, indent=2)
+    profile_indexes = sorted({
+        col["index"]
+        for col in (plan or {}).get("columns", [])
+        if col.get("role") == "profile_dim" and isinstance(col.get("index"), int)
+    })
+    if profile_indexes:
+        profile_constraint = (
+            "6. 交叉分析约束：cross_tabs 中每一项的 profile_index 必须是以下画像维度列号之一："
+            f"{profile_indexes}；不得为 null，不能使用其他题目列号。\n"
+        )
+    else:
+        profile_constraint = (
+            "6. 交叉分析约束：当前方案没有画像维度列，cross_tabs 必须为 []；"
+            "不得输出 profile_index 为 null 的交叉分析项。\n"
+        )
     return (
         "你正在修订一份问卷分析方案。请根据用户的修改意见，在当前方案基础上输出一份完整的新 plan JSON。\n\n"
         "严格要求：\n"
@@ -219,7 +234,8 @@ def _build_plan_revision_query(
         "2. JSON 必须包含 columns、parts、cross_tabs、open_questions 字段，并通过既有 schema 校验。\n"
         "3. columns 必须保留用户已确认的题型、列号、选项、矩阵题分组等权威信息；不要重新猜测题型或选项。\n"
         "4. parts 必须使用实际存在的列号；矩阵题成员列必须整体归入同一个 part。\n"
-        "5. 若用户意见只要求调整章节/分析重点，只改 parts、cross_tabs 或 open_questions，不要无故改 columns。\n\n"
+        "5. 若用户意见只要求调整章节/分析重点，只改 parts、cross_tabs 或 open_questions，不要无故改 columns。\n"
+        f"{profile_constraint}\n"
         f"<headers>\n{header_lines}\n</headers>\n\n"
         f"<confirmed_columns_json>\n{confirmed_json}\n</confirmed_columns_json>\n\n"
         f"<current_plan_json>\n{plan_json}\n</current_plan_json>\n\n"
@@ -1087,6 +1103,30 @@ def _format_rows_for_qa(rows: list[list], plan: dict) -> str:
         )
         dump = note + "\n".join(json.dumps(row_obj(r), ensure_ascii=False) for r in sampled)
     return dump
+
+
+def _describe_qa_context_scope(qa_context: str) -> str:
+    """Return a user-facing summary of the raw-feedback coverage in QA context."""
+    rows_match = re.search(r"<rows>\s*(.*?)\s*</rows>", qa_context or "", re.DOTALL)
+    rows_block = rows_match.group(1).strip() if rows_match else ""
+    base = "报告正文、分析方案、统计结果和业务背景"
+    if not rows_block or rows_block == "（无数据）":
+        return f"{base}；该记录未保留可用的原始玩家反馈。"
+
+    sampled = re.search(
+        r"# 原始数据共\s*(\d+)\s*行，超出上下文上限，已按画像维度分层抽样到\s*(\d+)\s*行。",
+        rows_block,
+    )
+    if sampled:
+        return (
+            f"{base}及按画像维度分层抽样的 {sampled.group(2)} 条原始玩家反馈"
+            f"（原始共 {sampled.group(1)} 条）。"
+        )
+
+    row_count = sum(1 for line in rows_block.splitlines() if line.strip())
+    if row_count:
+        return f"{base}及全部 {row_count} 条原始玩家反馈。"
+    return f"{base}；该记录未保留可用的原始玩家反馈。"
 
 
 def _build_qa_context(source: dict, report_md: str | None = None) -> str:
