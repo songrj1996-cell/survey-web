@@ -11,7 +11,9 @@ def add_whitelist_user(identifier: str, perms: list[str], enabled: bool) -> str:
     users = _load_whitelist()
     if any(u.get("email", "").lower() == identifier for u in users):
         raise HTTPException(status_code=409, detail="该账号已存在")
-    valid_perms = [p for p in perms if p in ALL_PERMS] or ["survey"]
+    valid_perms = [p for p in perms if p in ALL_PERMS]
+    if enabled and not valid_perms:
+        raise HTTPException(status_code=400, detail="启用成员至少需要一个功能权限")
     users.append({
         "email": identifier,
         "perms": valid_perms,
@@ -27,8 +29,16 @@ def update_whitelist_user(email: str, perms: list[str] | None, enabled: bool | N
     users = _load_whitelist()
     for u in users:
         if u.get("email", "").lower() == email:
+            next_perms = (
+                [p for p in perms if p in ALL_PERMS]
+                if perms is not None
+                else list(u.get("perms", []))
+            )
+            next_enabled = enabled if enabled is not None else u.get("enabled", True)
+            if next_enabled and not next_perms:
+                raise HTTPException(status_code=400, detail="启用成员至少需要一个功能权限")
             if perms is not None:
-                u["perms"] = [p for p in perms if p in ALL_PERMS]
+                u["perms"] = next_perms
                 u["perms_v"] = _PERMS_SCHEMA_VERSION
             if enabled is not None:
                 u["enabled"] = enabled

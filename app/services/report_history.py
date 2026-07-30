@@ -54,10 +54,10 @@ def _comment_report_title(sess: dict) -> str:
     return "评论分析·舆情简报"
 
 
-def save_to_history(session_id: str, sess: dict) -> None:
+def save_to_history(session_id: str, sess: dict) -> dict | None:
     report_md = sess.get("report_md", "")
     if not report_md:
-        return
+        return None
     history = _load_history()
     _ensure_history_report_numbers(history, save=False)
     old_entry = next((h for h in history if h.get("id") == session_id), None)
@@ -111,10 +111,66 @@ def save_to_history(session_id: str, sess: dict) -> None:
             "comment_scan_rows": sess.get("comment_scan_rows", 0),
             "comment_nonempty_count": sess.get("comment_nonempty_count", 0),
         })
+    elif sess.get("mode") == "interview":
+        entry.update({
+            "interview_sheet_count": len(
+                (sess.get("interview_workbook") or {}).get("sheets") or []
+            ),
+            "interview_player_count": sess.get("interview_player_count", 0),
+            "interview_module_count": sess.get("interview_module_count", 0),
+            "interview_research_focus": sess.get("interview_research_focus", ""),
+            "interview_models_used": sess.get("interview_models_used", {}),
+            "interview_audit": sess.get("interview_audit", {}),
+        })
     history = [h for h in history if h["id"] != session_id]
     history.insert(0, entry)
     history = _trim_history_for_owner(history, owner.get("owner_key", ""))
     _save_history(history)
+    return entry
+
+
+def confirm_interview_audit_issue(
+    hist_id: str,
+    issue_index: int,
+    login: dict | None,
+) -> dict:
+    """确认一条访谈审校提醒，并同步仍然存在的临时会话。"""
+    history = _load_history()
+    history = _ensure_history_report_numbers(history, save=False)
+    entry = _find_history_for_login(history, hist_id, login)
+    if not entry or entry.get("mode") != "interview":
+        raise HTTPException(status_code=404, detail="未找到这份访谈报告")
+
+    audit = dict(entry.get("interview_audit") or {})
+    issues = [
+        dict(item) if isinstance(item, dict) else {}
+        for item in (audit.get("issues") or [])
+    ]
+    if issue_index < 0 or issue_index >= len(issues):
+        raise HTTPException(status_code=404, detail="未找到这条审校提醒")
+
+    reviewer = (
+        str((login or {}).get("email") or "").strip().lower()
+        or str((login or {}).get("open_id") or "").strip()
+        or str((login or {}).get("name") or "").strip()
+    )
+    issues[issue_index].update({
+        "review_status": "confirmed",
+        "reviewed_at": datetime.now().isoformat(timespec="seconds"),
+        "reviewed_by": reviewer,
+    })
+    audit["issues"] = issues
+    entry["interview_audit"] = audit
+    _save_history(history)
+
+    try:
+        sess = get_session(hist_id)
+        if sess.get("mode") == "interview" and _visible_to_owner(sess, login):
+            sess["interview_audit"] = audit
+            save_session(hist_id, sess)
+    except HTTPException:
+        pass
+    return entry
 
 
 def save_annotate_to_history(sid: str, sess: dict, result_path: str, download_name: str) -> None:

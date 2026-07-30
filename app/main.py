@@ -65,6 +65,7 @@ from app.routers import (
     export,
     feishu,
     history,
+    interview,
     settings_api,
     survey,
 )
@@ -78,3 +79,4 @@ app.include_router(crosstab.router)
 app.include_router(export.router)
 app.include_router(comment_analysis.router)
 app.include_router(annotate.router)
+app.include_router(interview.router)

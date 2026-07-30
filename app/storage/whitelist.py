@@ -3,19 +3,23 @@ import json
 
 from app.core.config import WHITELIST_FILE
 
-_PERMS_SCHEMA_VERSION = 2
+_PERMS_SCHEMA_VERSION = 3
 
 
 def _migrate_whitelist_perms(users: list[dict]) -> bool:
-    """一次性升级历史白名单：给已有访问权限(survey/annotate)的用户补 comment。
-    用 perms_v 标记已迁移，迁移后管理员再取消 comment 也不会被重新加上。
+    """逐版本升级历史白名单，保留已有用户对新增功能的访问能力。
+    v2 给已有访问权限的用户补 comment；v3 给 survey 用户补 interview。
+    用 perms_v 标记已迁移，迁移后管理员再取消权限也不会被重新加上。
     返回是否发生改动（需要回写）。"""
     changed = False
     for u in users:
-        if u.get("perms_v", 1) < _PERMS_SCHEMA_VERSION:
+        version = u.get("perms_v", 1)
+        if version < _PERMS_SCHEMA_VERSION:
             perms = list(u.get("perms", ["survey", "annotate"]))
-            if perms and "comment" not in perms:
+            if version < 2 and perms and "comment" not in perms:
                 perms.append("comment")
+            if version < 3 and "survey" in perms and "interview" not in perms:
+                perms.append("interview")
             u["perms"] = perms
             u["perms_v"] = _PERMS_SCHEMA_VERSION
             changed = True

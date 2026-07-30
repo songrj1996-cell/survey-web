@@ -64,6 +64,7 @@ function renderHistoryFilters(count, total) {
         <div class="hist-type-filter" role="group" aria-label="报告类型筛选">
           <button type="button" class="${f.type === 'all' ? 'active' : ''}" data-hist-filter-type="all">全部类型</button>
           <button type="button" class="${f.type === 'survey' ? 'active' : ''}" data-hist-filter-type="survey">问卷分析</button>
+          <button type="button" class="${f.type === 'interview' ? 'active' : ''}" data-hist-filter-type="interview">访谈报告</button>
           <button type="button" class="${f.type === 'comment' ? 'active' : ''}" data-hist-filter-type="comment">评论分析</button>
           <button type="button" class="${f.type === 'annotate' ? 'active' : ''}" data-hist-filter-type="annotate">数据标注</button>
         </div>
@@ -130,13 +131,15 @@ function historyDateKey(value) {
 }
 
 function historyTypeKey(mode) {
+  if (mode === 'interview') return 'interview';
   if (mode === 'comment') return 'comment';
   if (mode === 'annotate') return 'annotate';
   return 'survey';
 }
 
 function renderHistoryCard(h) {
-  const isActive = state.viewMode === 'history' && state.historyId === h.id;
+  const isActive = (state.viewMode === 'history' && state.historyId === h.id)
+    || (h.mode === 'interview' && ivState.fromHistory && ivState.sessionId === h.id);
   const reportNo = String(h.report_no || '').trim()
     || (h.id ? `R-${String(h.id).slice(0, 4).toUpperCase()}` : 'R-?');
   const source = historySourceMeta(h.mode);
@@ -192,6 +195,7 @@ function renderHistoryCard(h) {
 }
 
 function historySourceMeta(mode) {
+  if (mode === 'interview') return { key: 'interview', label: '访谈报告' };
   if (mode === 'comment') return { key: 'comment', label: '评论分析' };
   if (mode === 'annotate') return { key: 'annotate', label: '数据标注' };
   if (mode === 'crosstab') return { key: 'survey', label: '问卷分析' };
@@ -199,6 +203,7 @@ function historySourceMeta(mode) {
 }
 
 function historyQaMeta(h) {
+  if (h.mode === 'interview') return { key: 'disabled', label: '证据型报告' };
   if (h.mode === 'comment') return { key: 'disabled', label: '无追问功能' };
   if (h.mode === 'annotate') return { key: 'disabled', label: '无追问功能' };
   if (Number(h.qa_count || 0) > 0) return { key: 'done', label: '已追问' };
@@ -206,6 +211,13 @@ function historyQaMeta(h) {
 }
 
 function historyQuantityText(h) {
+  if (h.mode === 'interview') {
+    const players = Number(h.interview_player_count || 0);
+    const modules = Number(h.interview_module_count || 0);
+    if (players && modules) return `${players} 位玩家 · ${modules} 个模块`;
+    if (modules) return `${modules} 个模块`;
+    return `${Number(h.interview_sheet_count || 0)} 个 Sheet`;
+  }
   if (h.mode === 'comment') {
     return `有效 ${h.comment_valid_count || 0} 条`;
   }
@@ -255,6 +267,12 @@ async function openHistoryEntry(id) {
     const resp = await fetch(`/api/history/${id}`);
     const entry = await resp.json();
     if (!resp.ok) throw new Error(entry.detail || '加载失败');
+
+    if (entry.mode === 'interview') {
+      closeDrawer('history-drawer');
+      ivLoadHistoryEntry(entry);
+      return;
+    }
 
     if (entry.mode === 'comment') {
       switchMode('comment');

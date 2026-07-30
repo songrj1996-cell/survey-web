@@ -7,6 +7,7 @@ from fastapi import Request
 AUDIT_FEATURES = [
     {"key": "auth", "label": "登录与账号"},
     {"key": "survey", "label": "问卷分析"},
+    {"key": "interview", "label": "访谈报告"},
     {"key": "quant", "label": "定量分析"},
     {"key": "annotate", "label": "数据标注"},
     {"key": "comment", "label": "评论分析"},

@@ -39,9 +39,13 @@ class _LLMRequestError(RuntimeError):
         return self.message
 
 
-def _configured_models() -> list[str]:
+def _configured_models(model_overrides=None) -> list[str]:
     models = []
-    for model in (LLM_REPORT_MODEL, *LLM_REPORT_FALLBACK_MODELS):
+    candidates = model_overrides if model_overrides is not None else (
+        LLM_REPORT_MODEL,
+        *LLM_REPORT_FALLBACK_MODELS,
+    )
+    for model in candidates:
         model = str(model or "").strip()
         if model and model not in models:
             models.append(model)
@@ -157,13 +161,14 @@ async def _request_chat(
     client: httpx.AsyncClient,
     messages: list[dict],
     model: str,
+    max_tokens: int,
 ) -> str:
     protocol: _Protocol = "chat"
     payload = {
         "model": model,
         "messages": messages,
         "stream": True,
-        "max_tokens": LLM_REPORT_MAX_TOKENS,
+        "max_tokens": max_tokens,
     }
     headers = {
         "Authorization": f"Bearer {LLM_API_KEY}",
@@ -226,6 +231,7 @@ async def _request_messages(
     client: httpx.AsyncClient,
     messages: list[dict],
     model: str,
+    max_tokens: int,
 ) -> str:
     protocol: _Protocol = "messages"
     system, conversation = _split_messages(messages)
@@ -233,7 +239,7 @@ async def _request_messages(
         "model": model,
         "messages": conversation,
         "stream": True,
-        "max_tokens": LLM_REPORT_MAX_TOKENS,
+        "max_tokens": max_tokens,
     }
     if system:
         payload["system"] = system
@@ -309,6 +315,8 @@ async def _request_responses(
     client: httpx.AsyncClient,
     messages: list[dict],
     model: str,
+    max_tokens: int,
+    reasoning_effort: str | None,
 ) -> str:
     protocol: _Protocol = "responses"
     instructions, conversation = _split_messages(messages)
@@ -316,10 +324,12 @@ async def _request_responses(
         "model": model,
         "input": conversation,
         "stream": True,
-        "max_output_tokens": LLM_REPORT_MAX_TOKENS,
+        "max_output_tokens": max_tokens,
     }
     if instructions:
         payload["instructions"] = instructions
+    if reasoning_effort:
+        payload["reasoning"] = {"effort": reasoning_effort}
     headers = {
         "Authorization": f"Bearer {LLM_API_KEY}",
         "Content-Type": "application/json",
@@ -400,23 +410,38 @@ async def _request_once(
     messages: list[dict],
     model: str,
     protocol: _Protocol,
+    max_tokens: int,
+    reasoning_effort: str | None,
 ) -> str:
     if protocol == "messages":
-        return await _request_messages(client, messages, model)
+        return await _request_messages(client, messages, model, max_tokens)
     if protocol == "responses":
-        return await _request_responses(client, messages, model)
-    return await _request_chat(client, messages, model)
+        return await _request_responses(
+            client,
+            messages,
+            model,
+            max_tokens,
+            reasoning_effort,
+        )
+    return await _request_chat(client, messages, model, max_tokens)
 
 
-async def collect_chat_completion(messages: list[dict]) -> tuple[str, str]:
+async def collect_chat_completion(
+    messages: list[dict],
+    *,
+    models=None,
+    max_tokens: int | None = None,
+    reasoning_effort: str | None = None,
+) -> tuple[str, str]:
     """返回完整回答和实际模型；失败轮次不会向调用方暴露半截文本。"""
     if not LLM_API_BASE:
         raise RuntimeError("未配置 LLM_API_BASE")
     if not LLM_API_KEY:
         raise RuntimeError("未配置 LLM_API_KEY")
-    models = _configured_models()
-    if not models:
+    configured_models = _configured_models(models)
+    if not configured_models:
         raise RuntimeError("未配置 LLM_REPORT_MODEL")
+    request_max_tokens = max(1024, int(max_tokens or LLM_REPORT_MAX_TOKENS))
 
     timeout = httpx.Timeout(
         connect=LLM_CONNECT_TIMEOUT,
@@ -426,12 +451,19 @@ async def collect_chat_completion(messages: list[dict]) -> tuple[str, str]:
     )
     last_error: Exception | None = None
     async with httpx.AsyncClient(timeout=timeout) as client:
-        for model in models:
+        for model in configured_models:
             for protocol in _protocol_order(model):
                 switch_protocol = False
                 for attempt in range(1, LLM_REPORT_MAX_ATTEMPTS + 1):
                     try:
-                        answer = await _request_once(client, messages, model, protocol)
+                        answer = await _request_once(
+                            client,
+                            messages,
+                            model,
+                            protocol,
+                            request_max_tokens,
+                            reasoning_effort,
+                        )
                         return answer, model
                     except _LLMRequestError as exc:
                         last_error = exc
@@ -451,5 +483,6 @@ async def collect_chat_completion(messages: list[dict]) -> tuple[str, str]:
 
     detail = _safe_error_text(str(last_error or "unknown error"))
     raise RuntimeError(
-        f"LLM report generation failed after retries; models={','.join(models)}; last_error={detail}"
+        "LLM report generation failed after retries; "
+        f"models={','.join(configured_models)}; last_error={detail}"
     ) from last_error

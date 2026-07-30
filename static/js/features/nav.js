@@ -9,6 +9,11 @@ $('btn-restart').addEventListener('click', () => {
     showToast('已重置，请重新上传文件', 'info');
     return;
   }
+  if (currentMode === 'interview') {
+    ivReset();
+    showToast('已重置，请重新上传文件', 'info');
+    return;
+  }
   if (typeof saveContextDraft === 'function') saveContextDraft();
   state.sessionId = null;
   state.columns = null;
@@ -241,17 +246,20 @@ const annPanels = annPanelIds.map(n => $(`ann-panel-${n}`));
 
 const cmPanels = [1, 2, 3].map(n => $(`cm-panel-${n}`));
 
-let currentMode = 'survey'; // 'survey' | 'annotate' | 'comment'
+let currentMode = 'survey'; // 'survey' | 'interview' | 'annotate' | 'comment'
 
 function switchMode(mode) {
   currentMode = mode;
   const isSurvey = mode === 'survey';
+  const isInterview = mode === 'interview';
   const isAnnotate = mode === 'annotate';
   const isComment = mode === 'comment';
 
   // 一级导航激活状态
   $('nav-survey').classList.toggle('nav-item--active', isSurvey);
   $('nav-survey').classList.toggle('nav-item--expanded', isSurvey);
+  $('nav-interview').classList.toggle('nav-item--active', isInterview);
+  $('nav-interview').classList.toggle('nav-item--expanded', isInterview);
   $('nav-annotate').classList.toggle('nav-item--active', isAnnotate);
   $('nav-annotate').classList.toggle('nav-item--expanded', isAnnotate);
   $('nav-comment').classList.toggle('nav-item--active', isComment);
@@ -261,10 +269,13 @@ function switchMode(mode) {
   $('btn-open-history').style.display = '';
 
   surveyPanels.forEach(p => p.classList.add('panel--hidden'));
+  ivPanels.forEach(p => p && p.classList.add('panel--hidden'));
   annPanels.forEach(p => p.classList.add('panel--hidden'));
   cmPanels.forEach(p => p && p.classList.add('panel--hidden'));
   if (isSurvey) {
     goStep(state.currentStep);
+  } else if (isInterview) {
+    ivGoStep(ivState.currentStep);
   } else if (isAnnotate) {
     annGoStep(annState.currentStep);
   } else {
@@ -274,6 +285,7 @@ function switchMode(mode) {
 
 // 一级导航点击
 $('nav-header-survey').addEventListener('click', () => switchMode('survey'));
+$('nav-header-interview').addEventListener('click', () => switchMode('interview'));
 $('nav-header-annotate').addEventListener('click', () => switchMode('annotate'));
 $('nav-header-comment').addEventListener('click', () => switchMode('comment'));
 
@@ -281,6 +293,7 @@ $('nav-header-comment').addEventListener('click', () => switchMode('comment'));
 $('nav-header-settings').addEventListener('click', () => {
   $('nav-settings').classList.add('nav-item--active');
   $('nav-survey').classList.remove('nav-item--active');
+  $('nav-interview').classList.remove('nav-item--active');
   $('nav-annotate').classList.remove('nav-item--active');
   openDrawer('settings-drawer');
   loadActiveSettingsTab();

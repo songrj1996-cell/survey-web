@@ -94,6 +94,35 @@ LLM_CONNECT_TIMEOUT = max(1.0, _env_float("LLM_CONNECT_TIMEOUT", 15.0))
 LLM_READ_TIMEOUT = max(30.0, _env_float("LLM_READ_TIMEOUT", 900.0))
 LLM_STREAM_HEARTBEAT_SECONDS = max(5.0, _env_float("LLM_STREAM_HEARTBEAT_SECONDS", 20.0))
 
+# 访谈报告：复用同一公司 LLM 分发服务，但按阶段选择模型。
+INTERVIEW_EXTRACT_MODEL = os.getenv("INTERVIEW_EXTRACT_MODEL", "gpt-5.6-terra").strip()
+INTERVIEW_REPORT_MODEL = os.getenv("INTERVIEW_REPORT_MODEL", "gpt-5.6-sol").strip()
+INTERVIEW_AUDIT_MODEL = os.getenv("INTERVIEW_AUDIT_MODEL", "gpt-5.6-terra").strip()
+INTERVIEW_REPAIR_MODEL = os.getenv("INTERVIEW_REPAIR_MODEL", "gpt-5.6-sol").strip()
+INTERVIEW_FALLBACK_MODELS = (
+    _env_csv_list("INTERVIEW_FALLBACK_MODELS") or ("gpt-5.5",)
+)
+INTERVIEW_EXTRACT_REASONING = os.getenv("INTERVIEW_EXTRACT_REASONING", "medium").strip()
+INTERVIEW_REPORT_REASONING = os.getenv("INTERVIEW_REPORT_REASONING", "high").strip()
+INTERVIEW_AUDIT_REASONING = os.getenv("INTERVIEW_AUDIT_REASONING", "medium").strip()
+INTERVIEW_REPAIR_REASONING = os.getenv("INTERVIEW_REPAIR_REASONING", "high").strip()
+INTERVIEW_EXTRACT_MAX_TOKENS = max(
+    1024,
+    _env_int("INTERVIEW_EXTRACT_MAX_TOKENS", 32000),
+)
+INTERVIEW_MAX_UPLOAD_BYTES = max(
+    1024 * 1024,
+    _env_int("INTERVIEW_MAX_UPLOAD_BYTES", 50 * 1024 * 1024),
+)
+INTERVIEW_MAX_INPUT_CHARS = max(
+    10000,
+    _env_int("INTERVIEW_MAX_INPUT_CHARS", 700000),
+)
+INTERVIEW_MAX_REPAIR_ROUNDS = min(
+    3,
+    max(1, _env_int("INTERVIEW_MAX_REPAIR_ROUNDS", 2)),
+)
+
 
 # Google Form Responses 不含原表单跳转配置。小样本要求完全吻合；只有达到此回答量后，
 # 才允许按比例容忍少量分支外异常数据。样本量本身不作为拒绝识别跳转的条件。

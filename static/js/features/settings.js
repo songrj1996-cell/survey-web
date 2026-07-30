@@ -76,6 +76,13 @@ function loadActiveSettingsTab() {
 
 // ── 权限配置 ──────────────────────────────────────────────────
 
+const PERMISSION_FEATURES = [
+  { key: 'survey', label: '问卷分析', desc: '问卷上传、分析方案与报告生成' },
+  { key: 'interview', label: '访谈报告', desc: '访谈记录上传与证据型报告生成' },
+  { key: 'annotate', label: '数据标注', desc: '样本质量检测与数据标注' },
+  { key: 'comment', label: '评论分析', desc: '评论主题、情感与舆情分析' },
+];
+
 async function loadPermsTab() {
   const body = $('stab-content-perms');
   body.innerHTML = `<div class="hist-empty"><div class="spinner" style="margin:0 auto"></div></div>`;
@@ -91,68 +98,96 @@ async function loadPermsTab() {
 
 function renderPermsTable(users) {
   const body = $('stab-content-perms');
-  const addRow = `
-    <div class="perm-add-row" id="perm-add-row">
-      <input type="text" id="perm-new-email" class="plan-input" placeholder="飞书邮箱 或 Open ID（ou_xxxxx）" style="flex:1;min-width:240px" />
-      <div class="perm-checkboxes">
-        <label><input type="checkbox" id="perm-new-survey" checked class="perm-toggle" /> 问卷分析</label>
-        <label><input type="checkbox" id="perm-new-annotate" checked class="perm-toggle" /> 数据标注</label>
-        <label><input type="checkbox" id="perm-new-comment" checked class="perm-toggle" /> 评论分析</label>
-      </div>
-      <button class="btn btn--primary btn--sm" id="perm-add-btn">添加成员</button>
-    </div>`;
+  const newFeatureOptions = PERMISSION_FEATURES.map(feature => `
+    <label class="perm-feature-option">
+      <input type="checkbox" class="perm-toggle" data-perm-new="${esc(feature.key)}" checked />
+      <span>
+        <strong>${esc(feature.label)}</strong>
+        <small>${esc(feature.desc)}</small>
+      </span>
+    </label>
+  `).join('');
 
   const rows = users.map(u => {
     const isAdmin = u.is_admin;
-    const hasSurvey = u.perms.includes('survey');
-    const hasAnnotate = u.perms.includes('annotate');
-    const hasComment = u.perms.includes('comment');
+    const userPerms = Array.isArray(u.perms) ? u.perms : [];
     const adminBadge = isAdmin ? `<span class="perm-badge">管理员</span>` : '';
-    const surveyCell = isAdmin
-      ? `<span style="color:var(--green)">✓</span>`
-      : `<input type="checkbox" class="perm-toggle" ${hasSurvey ? 'checked' : ''} data-perm-email="${esc(u.email)}" data-perm-type="survey" />`;
-    const annotateCell = isAdmin
-      ? `<span style="color:var(--green)">✓</span>`
-      : `<input type="checkbox" class="perm-toggle" ${hasAnnotate ? 'checked' : ''} data-perm-email="${esc(u.email)}" data-perm-type="annotate" />`;
-    const commentCell = isAdmin
-      ? `<span style="color:var(--green)">✓</span>`
-      : `<input type="checkbox" class="perm-toggle" ${hasComment ? 'checked' : ''} data-perm-email="${esc(u.email)}" data-perm-type="comment" />`;
-    const deleteBtn = isAdmin ? `<span style="color:var(--text-3);font-size:12px">—</span>`
+    const featureOptions = PERMISSION_FEATURES.map(feature => {
+      const checked = isAdmin || userPerms.includes(feature.key);
+      return `
+        <label class="perm-feature-option${isAdmin ? ' perm-feature-option--locked' : ''}">
+          <input type="checkbox" class="perm-toggle" ${checked ? 'checked' : ''}
+            ${isAdmin ? 'disabled' : ''}
+            data-perm-email="${esc(u.email)}" data-perm-type="${esc(feature.key)}" />
+          <span>
+            <strong>${esc(feature.label)}</strong>
+            <small>${esc(feature.desc)}</small>
+          </span>
+        </label>
+      `;
+    }).join('');
+    const deleteBtn = isAdmin ? ''
       : `<button class="btn btn--ghost btn--sm" data-perm-delete="${esc(u.email)}">删除</button>`;
-    const enabledToggle = isAdmin ? '' : `
-      <input type="checkbox" class="perm-toggle" ${u.enabled ? 'checked' : ''} data-perm-email="${esc(u.email)}" data-perm-type="enabled" title="${u.enabled ? '已启用（点击禁用）' : '已禁用（点击启用）'}" />`;
+    const enabledToggle = isAdmin
+      ? `<span class="perm-status perm-status--enabled">始终启用</span>`
+      : `<label class="perm-enabled-toggle">
+          <input type="checkbox" class="perm-toggle" ${u.enabled ? 'checked' : ''}
+            data-perm-email="${esc(u.email)}" data-perm-type="enabled" />
+          <span>${u.enabled ? '已启用' : '已停用'}</span>
+        </label>`;
 
-    return `<tr>
-      <td>${esc(u.email)} ${adminBadge}</td>
-      <td style="text-align:center">${surveyCell}</td>
-      <td style="text-align:center">${annotateCell}</td>
-      <td style="text-align:center">${commentCell}</td>
-      <td style="text-align:center">${enabledToggle}</td>
-      <td style="text-align:center">${deleteBtn}</td>
-    </tr>`;
+    return `
+      <article class="perm-member-card" data-perm-user="${esc(u.email)}">
+        <div class="perm-member-card__head">
+          <div class="perm-member-card__identity">
+            <strong>${esc(u.email)}</strong>
+            ${adminBadge}
+          </div>
+          <div class="perm-member-card__actions">
+            ${enabledToggle}
+            ${deleteBtn}
+          </div>
+        </div>
+        <div class="perm-feature-grid">${featureOptions}</div>
+      </article>
+    `;
   }).join('');
 
-  body.innerHTML = addRow + `
-    <table class="perm-table">
-      <thead><tr>
-        <th>飞书邮箱</th>
-        <th style="text-align:center">问卷分析</th>
-        <th style="text-align:center">数据标注</th>
-        <th style="text-align:center">评论分析</th>
-        <th style="text-align:center">启用</th>
-        <th style="text-align:center">操作</th>
-      </tr></thead>
-      <tbody>${rows}</tbody>
-    </table>`;
+  body.innerHTML = `
+    <div class="perm-panel">
+      <div class="perm-panel__intro">
+        <div>
+          <h3>成员与功能权限</h3>
+          <p>按功能模块为成员授权。后续新增模块时会继续在同一区域扩展。</p>
+        </div>
+      </div>
+      <section class="perm-add-card" id="perm-add-row">
+        <div class="perm-add-card__head">
+          <label for="perm-new-email">添加成员</label>
+          <input type="text" id="perm-new-email" class="plan-input"
+            placeholder="飞书邮箱 或 Open ID（ou_xxxxx）" />
+        </div>
+        <div class="perm-feature-grid">${newFeatureOptions}</div>
+        <div class="perm-add-card__actions">
+          <button class="btn btn--primary btn--sm" id="perm-add-btn">添加成员</button>
+        </div>
+      </section>
+      <div class="perm-member-list">
+        <div class="perm-member-list__title">已有成员 <span>${esc(users.length)}</span></div>
+        ${rows || '<div class="hist-empty">暂无成员</div>'}
+      </div>
+    </div>`;
 
   // 添加成员
   $('perm-add-btn').addEventListener('click', async () => {
     const email = ($('perm-new-email').value || '').trim();
     if (!email) { showToast('请输入邮箱或 Open ID', 'error'); return; }
-    const perms = [];
-    if ($('perm-new-survey').checked) perms.push('survey');
-    if ($('perm-new-annotate').checked) perms.push('annotate');
-    if ($('perm-new-comment').checked) perms.push('comment');
+    const perms = Array.from(body.querySelectorAll('[data-perm-new]:checked'))
+      .map(el => el.dataset.permNew);
+    if (!perms.length) {
+      showToast('请至少选择一个功能权限', 'error');
+      return;
+    }
     try {
       const r = await fetch('/api/admin/users', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, perms }) });
       const d = await r.json();
@@ -171,17 +206,27 @@ function renderPermsTable(users) {
       try {
         let patch = {};
         if (type === 'enabled') {
+          if (checked) {
+            const card = cb.closest('.perm-member-card');
+            const hasPermission = card.querySelector('[data-perm-type]:checked:not([data-perm-type="enabled"])');
+            if (!hasPermission) {
+              showToast('启用成员至少需要一个功能权限', 'error');
+              cb.checked = false;
+              return;
+            }
+          }
           patch = { enabled: checked };
         } else {
-          // 重新读取该行另一个 checkbox 的状态
-          const row = cb.closest('tr');
-          const surveyEl = row.querySelector('[data-perm-type="survey"]');
-          const annotateEl = row.querySelector('[data-perm-type="annotate"]');
-          const commentEl = row.querySelector('[data-perm-type="comment"]');
-          const perms = [];
-          if ((type === 'survey' ? checked : surveyEl?.checked)) perms.push('survey');
-          if ((type === 'annotate' ? checked : annotateEl?.checked)) perms.push('annotate');
-          if ((type === 'comment' ? checked : commentEl?.checked)) perms.push('comment');
+          const card = cb.closest('.perm-member-card');
+          const perms = Array.from(card.querySelectorAll('[data-perm-type]:checked'))
+            .map(el => el.dataset.permType)
+            .filter(key => key !== 'enabled');
+          const enabledEl = card.querySelector('[data-perm-type="enabled"]');
+          if (enabledEl?.checked && !perms.length) {
+            showToast('启用成员至少需要一个功能权限；如需暂停访问，请关闭“已启用”', 'error');
+            cb.checked = true;
+            return;
+          }
           patch = { perms };
         }
         const r = await fetch(`/api/admin/users/${encodeURIComponent(email)}`, {
@@ -189,6 +234,10 @@ function renderPermsTable(users) {
         });
         const d = await r.json();
         if (!r.ok) throw new Error(d.detail || '更新失败');
+        if (type === 'enabled') {
+          const label = cb.closest('.perm-enabled-toggle')?.querySelector('span');
+          if (label) label.textContent = checked ? '已启用' : '已停用';
+        }
         showToast('已保存', 'success', 1500);
       } catch (e) { showToast(e.message, 'error'); cb.checked = !checked; }
     });
@@ -534,4 +583,3 @@ $('stab-content-prompts').addEventListener('click', async e => {
     }
   }
 });
-

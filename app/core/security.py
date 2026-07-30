@@ -18,7 +18,7 @@ from app.core.config import (
 )
 
 # 权限项全集（顺序即管理页展示顺序）
-ALL_PERMS = ["survey", "annotate", "comment"]
+ALL_PERMS = ["survey", "interview", "annotate", "comment"]
 
 
 def _email(login: dict | None) -> str:

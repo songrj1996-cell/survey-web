@@ -813,24 +813,28 @@ $('btn-export-word').addEventListener('click', () => {
 // ── 飞书登录状态 + 权限门控 ──
 state.feishu = {
   configured: false, logged_in: false, allowed: true, name: '', email: '',
-  perms: ['survey', 'annotate', 'comment'], is_admin: false
+  perms: ['survey', 'interview', 'annotate', 'comment'], is_admin: false
 };
 
 function applyPermGating() {
   const perms = state.feishu.perms || [];
   const hasSurvey = perms.includes('survey');
+  const hasInterview = perms.includes('interview');
   const hasAnnotate = perms.includes('annotate');
   const hasComment = perms.includes('comment');
   // 侧边栏：无权限则隐藏入口
   const navSurvey = $('nav-survey');
+  const navInterview = $('nav-interview');
   const navAnnotate = $('nav-annotate');
   const navComment = $('nav-comment');
   if (navSurvey) navSurvey.style.display = hasSurvey ? '' : 'none';
+  if (navInterview) navInterview.style.display = hasInterview ? '' : 'none';
   if (navAnnotate) navAnnotate.style.display = hasAnnotate ? '' : 'none';
   if (navComment) navComment.style.display = hasComment ? '' : 'none';
   // 如果当前模式无权限，切换到第一个有权限的模式
   const allowedModes = [
-    ['survey', hasSurvey], ['annotate', hasAnnotate], ['comment', hasComment],
+    ['survey', hasSurvey], ['interview', hasInterview],
+    ['annotate', hasAnnotate], ['comment', hasComment],
   ].filter(([, ok]) => ok).map(([m]) => m);
   if (!allowedModes.includes(currentMode) && allowedModes.length) {
     switchMode(allowedModes[0]);
@@ -1075,6 +1079,7 @@ async function sendQA() {
     if (!typingBubble) typingBubble = appendQABubble('ai', null, true);
     return typingBubble;
   };
+  ensureTypingBubble();
 
   try {
     let answer = '';
@@ -1087,7 +1092,11 @@ async function sendQA() {
 
     await consumeSSEPost(url, body, ev => {
       if (ev.type === 'qa_scope') {
-        appendQABubble('ai', `本次追问的信息范围：${ev.message}`);
+        const scopeBubble = appendQABubble('ai', `本次追问的信息范围：${ev.message}`);
+        const typingMessage = typingBubble?.parentElement;
+        if (typingMessage && scopeBubble?.parentElement === $('qa-messages')) {
+          $('qa-messages').insertBefore(scopeBubble.parentElement, typingMessage);
+        }
       }
       if (ev.type === 'chunk') {
         answer += ev.content;
