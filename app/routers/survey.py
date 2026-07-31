@@ -7,11 +7,9 @@ from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.core.config import (
-    DIFY_ANALYST_KEY,
-    DIFY_COLUMN_KEY,
-    DIFY_CROSSTAB_PLANNER_KEY,
-    DIFY_LARGE_ANALYST_KEY,
-    DIFY_PLANNER_KEY,
+    LLM_API_KEY,
+    LLM_COLUMN_MODEL,
+    LLM_PLANNER_MODEL,
 )
 from app.schemas.requests import (
     ColumnConfirmRequest,
@@ -61,8 +59,8 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
 @router.get("/api/columns/{session_id}")
 async def get_columns(session_id: str, request: Request):
     validate_columns_ready(session_id)
-    if not DIFY_COLUMN_KEY:
-        raise HTTPException(status_code=500, detail="未配置 DIFY_COLUMN_KEY（题型识别应用）")
+    if not LLM_API_KEY or not LLM_COLUMN_MODEL:
+        raise HTTPException(status_code=500, detail="未配置题型识别 LLM 分发服务")
     return StreamingResponse(columns_stream(session_id, request), media_type="text/event-stream")
 
 
@@ -90,11 +88,9 @@ async def submit_survey_context(session_id: str, req: QualitativeContextRequest,
 
 @router.get("/api/plan/{session_id}")
 async def get_plan(session_id: str, request: Request):
-    mode = validate_plan_ready(session_id)
-    if mode == "crosstab" and not DIFY_CROSSTAB_PLANNER_KEY:
-        raise HTTPException(status_code=500, detail="未配置 DIFY_CROSSTAB_PLANNER_KEY")
-    elif mode != "crosstab" and not DIFY_PLANNER_KEY:
-        raise HTTPException(status_code=500, detail="未配置 DIFY_PLANNER_KEY")
+    validate_plan_ready(session_id)
+    if not LLM_API_KEY or not LLM_PLANNER_MODEL:
+        raise HTTPException(status_code=500, detail="未配置方案规划 LLM 分发服务")
     return StreamingResponse(plan_stream(session_id, request), media_type="text/event-stream")
 
 
@@ -121,11 +117,7 @@ async def compute_stats(session_id: str, request: Request):
 
 @router.get("/api/report/{session_id}")
 async def generate_report(session_id: str, request: Request):
-    use_large = validate_report_ready(session_id)
-    if use_large and not DIFY_LARGE_ANALYST_KEY:
-        raise HTTPException(status_code=500, detail="未配置 DIFY_LARGE_ANALYST_KEY")
-    elif not use_large and not DIFY_ANALYST_KEY:
-        raise HTTPException(status_code=500, detail="未配置 DIFY_ANALYST_KEY")
+    validate_report_ready(session_id)
     return StreamingResponse(report_stream(session_id, request), media_type="text/event-stream")
 
 
@@ -138,10 +130,8 @@ async def qa(req: QARequest, request: Request):
 @router.post("/api/history-qa")
 async def history_qa(req: HistoryQARequest, request: Request):
     login = await _current_login(request)
-    history, analyst_conv_id, analyst_key, analyst_key_name = prepare_history_qa_context(
-        req.history_id, login
-    )
+    history = prepare_history_qa_context(req.history_id, login)
     return StreamingResponse(
-        history_qa_stream(req.history_id, req.question, history, analyst_conv_id, analyst_key, analyst_key_name, request),
+        history_qa_stream(req.history_id, req.question, history, request),
         media_type="text/event-stream",
     )

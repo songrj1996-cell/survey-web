@@ -232,6 +232,7 @@ async def _request_messages(
     messages: list[dict],
     model: str,
     max_tokens: int,
+    reasoning_effort: str | None,
 ) -> str:
     protocol: _Protocol = "messages"
     system, conversation = _split_messages(messages)
@@ -243,6 +244,11 @@ async def _request_messages(
     }
     if system:
         payload["system"] = system
+    if reasoning_effort and model.lower().startswith(
+        ("claude-sonnet-5", "claude-opus-5", "claude-fable-5")
+    ):
+        payload["thinking"] = {"type": "adaptive"}
+        payload["output_config"] = {"effort": reasoning_effort}
     headers = {
         "Authorization": f"Bearer {LLM_API_KEY}",
         "x-api-key": LLM_API_KEY,
@@ -414,7 +420,13 @@ async def _request_once(
     reasoning_effort: str | None,
 ) -> str:
     if protocol == "messages":
-        return await _request_messages(client, messages, model, max_tokens)
+        return await _request_messages(
+            client,
+            messages,
+            model,
+            max_tokens,
+            reasoning_effort,
+        )
     if protocol == "responses":
         return await _request_responses(
             client,
@@ -483,6 +495,6 @@ async def collect_chat_completion(
 
     detail = _safe_error_text(str(last_error or "unknown error"))
     raise RuntimeError(
-        "LLM report generation failed after retries; "
+        "LLM generation failed after retries; "
         f"models={','.join(configured_models)}; last_error={detail}"
     ) from last_error

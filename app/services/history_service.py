@@ -18,7 +18,7 @@ def get_history_list(login: dict | None, mode: str = "") -> list[dict]:
             "filename": h["filename"],
             "title": h["title"],
             "created_at": h["created_at"],
-            "has_qa": bool(h.get("analyst_conv_id")),
+            "has_qa": bool(h.get("qa_messages") or h.get("analyst_conv_id")),
             "qa_count": _qa_user_count(h),
             "mode": h.get("mode", ""),
             "row_count": _history_effective_row_count(h),

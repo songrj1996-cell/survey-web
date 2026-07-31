@@ -14,7 +14,13 @@ def get_upload_guide() -> str:
 
 
 def get_all_prompts() -> dict:
-    return _load_prompts()
+    # 旧数据中可能仍保留已迁移 Dify 应用的只读提示词入口，不再向设置页展示。
+    retired_keys = {"dify_analyst_system", "dify_planner_system"}
+    return {
+        key: value
+        for key, value in _load_prompts().items()
+        if key not in retired_keys
+    }
 
 
 def update_prompt(key: str, content: str, note: str) -> None:

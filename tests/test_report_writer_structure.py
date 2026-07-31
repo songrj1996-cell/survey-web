@@ -3,7 +3,6 @@ import unittest
 from app.core.config import DEFAULT_WRITER_REQUIREMENTS
 from app.services.report_engine import (
     _build_qa_context,
-    _build_qa_seed_query,
     _build_writer_action_query,
     _build_writer_context,
     _build_writer_part_query,
@@ -97,22 +96,6 @@ class ReportWriterStructureTests(unittest.TestCase):
         self.assertIn("有效样本(总计):总体=1", context)
         self.assertIn("Q1：是否遇到聊天问题？", context)
         self.assertIn("切换设备后消息消失", context)
-
-    def test_qa_seed_query_restores_previous_qa_and_current_question(self):
-        query = _build_qa_seed_query(
-            "<qa_context><report>报告正文</report></qa_context>",
-            [
-                {"role": "user", "content": "之前的问题"},
-                {"role": "ai", "content": "之前的回答"},
-            ],
-            "为什么得出这个结论？",
-        )
-
-        self.assertIn("报告正文", query)
-        self.assertIn("用户：之前的问题", query)
-        self.assertIn("AI：之前的回答", query)
-        self.assertIn("用户问题：为什么得出这个结论？", query)
-
 
 if __name__ == "__main__":
     unittest.main()

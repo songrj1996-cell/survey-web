@@ -270,44 +270,6 @@ def _col_samples(body: list[list], idx: int, n: int = 20) -> list[str]:
     return out
 
 
-_COLUMN_DETECT_SCHEMA_HINT = """\
-请只输出一段 ```json``` 围栏，schema 如下（不要附加任何解释文字）：
-{
-  "questions": [
-    {
-      "name_zh": "中文题名（把英文/原文题目翻译成简洁中文）",
-      "role": "single_choice|multi_choice|scale|profile_dim|open_text|id|mlbbid|matrix_scale|matrix_multi|ignore",
-      "column_indexes": [列号...],            // 普通题1个；矩阵题为该题所有子项列号
-      "delimiter": "，",                       // 仅 multi_choice：选项分隔符（兜底）
-      "options": ["选项A","选项B"],            // 选项题清单：优先用合并后的中文标准值
-      "scale_min": 1, "scale_max": 5,          // scale / matrix_scale：量程
-      "rows": ["子项1","子项2"],               // matrix_*：与 column_indexes 顺序一一对应的行标签
-      "value_aliases": {"中文标准值": ["原始变体1","Mythic","Mítica"]},  // 见下「同义归并」
-      "low_confidence": false  // 若对该题型判断不确定（样本稀少/题名模糊），设为 true
-    }
-  ]
-}
-角色判断要点：
-- 玩家ID/编号 → id；明确是 MLBB 游戏ID → mlbbid；提交时间等 → ignore
-- 年龄段/段位/地区等用于分群的 → profile_dim
-- 数值评分（如 1–5、1–10）→ scale
-- 含多个选项、可多选 → multi_choice，并尽量给出 options 清单；若多数回答为逗号分隔的短词（如 "Classic, Ranked"），即使少数回答带括号补充说明（如 "Arcade (Such as Tide Siege)"），括号内容视为该选项的描述、不影响题型判断，仍应判断为 multi_choice
-- 长文本主观回答 → open_text
-- 标注【疑似矩阵题】的，按子项判断 matrix_scale（每子项打分）或 matrix_multi（每子项可多选），rows 用给出的子项标签
-- 对选择题，所有符合题目选项体系的真实取值（包括只出现一次的尾项，如 "More than 25"）都必须写入 options；不要因为取值低频而省略。不能确定是否为正式选项的自由文本可以不写入 options，系统会单独交由人工确认。
-- 不要凭空添加 Other / 其他；只有原始单元格本身就是 Other / 其他时才可写入该标签。
-
-同义归并（value_aliases，重要）：
-- 仅对 single_choice / profile_dim / multi_choice / matrix_multi 这类「选项题」给出。
-- 我已在每列附上「去重取值」。请把**语义相同但写法/语种不同**的取值（如 神话/Mythic/Mítica，中国/China/CN）归并到**同一个中文标准值**：key=中文标准值，value=该标准值对应的所有原始变体（含中文标准值本身可不必重复列出）。
-- options 使用这些合并后的中文标准值；中文标准值可以不直接出现在原始数据里，但必须能由 value_aliases 中的真实取值支撑。
-- 只有确属同义才合并；拿不准就不要合并。没有任何同义可并的列，可以省略 value_aliases 或给 {}。
-- **程度不同的选项禁止合并**：如「有点长」与「太长了」、「还好」与「很好」，虽然方向相同但程度档位不同，不是同义，必须分开。同义归并仅限写法/语种不同、语义程度完全一致的取值。
-- **同一道题内必须完整归并**：若已把某语种的某个表达归入了某标准值（如把「Lebih dari 3 tahun」归入「3年以上」），则该题内同语种所有语义相同的取值也必须全部归入，不得部分遗漏（如已识别印尼语「tahun」=年，则含相同数字区间的「1~3 tahun」也须归入「1~3年」）。
-- 这样统计表里这些取值会被合并计数，避免同义被拆开。\
-"""
-
-
 def _col_distinct(body: list[list], idx: int, n: int = 60) -> tuple[list[tuple[str, int]], int]:
     """返回某列去重取值 [(值, 频次)]（按频次降序，上限 n）+ 去重总数。"""
     from collections import Counter
@@ -621,7 +583,7 @@ def _build_column_detect_query(rows: list[list], groups: list[dict]) -> str:
         + "\n\n".join(blocks)
         + "\n</columns>\n\n"
         + "选项边界（严格执行）：options 必须由该列「去重取值」里的真实单元格取值或多选拆分值支撑；不得从题干/表头中抽取选项。若 New Medal 等词只出现在题干里、没有出现在该列取值里，不得写入 options。若多语言取值语义相同，options 请写合并后的中文标准值，并在 value_aliases 中列出支撑它的真实取值。\n\n"
-        + _COLUMN_DETECT_SCHEMA_HINT
+        + "请按 system prompt 约定的 JSON schema 输出。"
     )
 
 

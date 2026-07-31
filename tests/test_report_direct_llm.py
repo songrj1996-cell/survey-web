@@ -30,11 +30,10 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(survey_service, "get_session", return_value=sess),
             patch.object(survey_service, "_current_login", new=AsyncMock(return_value=None)),
-            patch.object(survey_service, "_analyst_key_for_report", return_value=("dify-key", "DIFY_ANALYST_KEY")),
             patch.object(
                 survey_service,
-                "_answer_qa_with_recovery",
-                new=AsyncMock(return_value=("回答内容", "conv-1", qa_context)),
+                "_answer_qa_direct",
+                new=AsyncMock(return_value=("回答内容", "claude-sonnet-5", qa_context)),
             ),
             patch.object(survey_service, "save_session"),
             patch.object(survey_service, "save_to_history"),
@@ -45,6 +44,8 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"type": "qa_scope"', events[0])
         self.assertIn('全部 1 条原始玩家反馈', events[0])
         self.assertIn('"type": "chunk"', events[1])
+        self.assertEqual(sess["qa_provider"], "direct_llm")
+        self.assertEqual(sess["qa_model"], "claude-sonnet-5")
 
     async def test_standard_report_uses_direct_writer_and_builds_qa_context(self):
         sess = {
@@ -77,11 +78,6 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
             patch.object(survey_service, "save_to_history") as save_history,
             patch.object(survey_service, "audit_log", new=AsyncMock()),
             patch.object(survey_service.survey_stats, "find_numbers_not_in_stats", return_value=[]),
-            patch.object(
-                survey_service,
-                "sse_dify_stream",
-                side_effect=AssertionError("report writer must not call Dify"),
-            ),
         ):
             events = [event async for event in survey_service.report_stream("sid", object())]
 
@@ -182,35 +178,48 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any('"type": "report_done"' in event for event in events))
         self.assertIn("## 行动建议", sess["report_md"])
 
-    async def test_qa_failure_rebuilds_dify_conversation_from_full_context(self):
+    async def test_direct_qa_uses_context_history_and_configured_model_chain(self):
         source = {
             "report_md": "# 报告\n\n## 核心结论\n消息丢失需要优先处理。",
             "stats_md": "有效样本(总计):总体=2",
             "plan": {"columns": [], "parts": []},
             "rows": [["玩家ID", "反馈"], ["p-1", "消息丢失"]],
-            "rows_fed": True,
-            "qa_messages": [{"role": "user", "content": "上一个问题"}],
+            "qa_messages": [
+                {"role": "user", "content": "上一个问题"},
+                {"role": "ai", "content": "上一个回答"},
+            ],
         }
-        collect = AsyncMock(side_effect=[
-            RuntimeError("stale conversation"),
-            ("基于报告和原始反馈的回答", "new-conv"),
-        ])
+        collect = AsyncMock(return_value=("基于报告和原始反馈的回答", "gpt-5.6-sol"))
 
-        with patch.object(survey_service, "_collect_dify_answer", new=collect):
-            answer, conv_id, context = await survey_service._answer_qa_with_recovery(
-                source, "这个结论依据什么？", "sid", "old-conv", "dify-key"
+        with (
+            patch.object(survey_service, "collect_chat_completion", new=collect),
+            patch.object(survey_service, "_get_report_qa_system_prompt", return_value="QA rules"),
+            patch.object(survey_service, "LLM_QA_MODEL", "claude-sonnet-5"),
+            patch.object(survey_service, "LLM_QA_FALLBACK_MODELS", ("gpt-5.6-sol",)),
+            patch.object(survey_service, "LLM_QA_MAX_TOKENS", 16000),
+            patch.object(survey_service, "LLM_QA_REASONING", "medium"),
+        ):
+            answer, model, context = await survey_service._answer_qa_direct(
+                source, "这个结论依据什么？"
             )
 
         self.assertEqual(answer, "基于报告和原始反馈的回答")
-        self.assertEqual(conv_id, "new-conv")
+        self.assertEqual(model, "gpt-5.6-sol")
         self.assertIn("消息丢失需要优先处理", context)
-        self.assertEqual(collect.await_args_list[0].args[2], "old-conv")
-        recovery_query = collect.await_args_list[1].args[0]
-        self.assertEqual(collect.await_args_list[1].args[2], "")
-        self.assertIn("<report>", recovery_query)
-        self.assertIn("消息丢失", recovery_query)
-        self.assertIn("用户：上一个问题", recovery_query)
-        self.assertIn("用户问题：这个结论依据什么？", recovery_query)
+        messages = collect.await_args.args[0]
+        self.assertEqual(messages[0], {"role": "system", "content": "QA rules"})
+        self.assertIn("<report>", messages[1]["content"])
+        self.assertEqual(messages[2], {"role": "user", "content": "上一个问题"})
+        self.assertEqual(messages[3], {"role": "assistant", "content": "上一个回答"})
+        self.assertEqual(messages[4], {"role": "user", "content": "这个结论依据什么？"})
+        self.assertEqual(
+            collect.await_args.kwargs,
+            {
+                "models": ("claude-sonnet-5", "gpt-5.6-sol"),
+                "max_tokens": 16000,
+                "reasoning_effort": "medium",
+            },
+        )
 
     async def test_history_qa_allows_direct_report_without_conversation_id(self):
         entry = {
@@ -223,15 +232,12 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(survey_service, "_load_history", return_value=history),
             patch.object(survey_service, "_find_history_for_login", return_value=entry),
-            patch.object(
-                survey_service,
-                "_analyst_key_for_report",
-                return_value=("dify-key", "DIFY_ANALYST_KEY"),
-            ),
+            patch.object(survey_service, "LLM_API_KEY", "llm-key"),
+            patch.object(survey_service, "LLM_QA_MODEL", "claude-sonnet-5"),
         ):
             result = survey_service.prepare_history_qa_context("history-1", None)
 
-        self.assertEqual(result, (history, "", "dify-key", "DIFY_ANALYST_KEY"))
+        self.assertEqual(result, history)
 
     def test_history_archive_persists_direct_writer_and_qa_context(self):
         sess = {
@@ -242,6 +248,8 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
             "qa_context_md": "<qa_context>完整上下文</qa_context>",
             "report_writer_provider": "direct_llm",
             "report_writer_model": "model-a",
+            "qa_provider": "direct_llm",
+            "qa_model": "claude-sonnet-5",
             "rows_fed": False,
             "rows": [["id"], ["1"], ["2"]],
         }
@@ -257,6 +265,8 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(saved[0]["qa_context_md"], sess["qa_context_md"])
         self.assertEqual(saved[0]["report_writer_provider"], "direct_llm")
         self.assertEqual(saved[0]["report_writer_model"], "model-a")
+        self.assertEqual(saved[0]["qa_provider"], "direct_llm")
+        self.assertEqual(saved[0]["qa_model"], "claude-sonnet-5")
         self.assertFalse(saved[0]["rows_fed"])
 
 

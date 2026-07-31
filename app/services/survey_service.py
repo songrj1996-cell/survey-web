@@ -18,11 +18,20 @@ def is_survey_plan_approval(user_text: str) -> bool:
 from fastapi import HTTPException, Request
 
 from app.core.config import (
-    DIFY_COLUMN_KEY,
-    DIFY_CROSSTAB_PLANNER_KEY,
-    DIFY_PLANNER_KEY,
     LARGE_SAMPLE_THRESHOLD,
     LLM_API_KEY,
+    LLM_COLUMN_FALLBACK_MODELS,
+    LLM_COLUMN_MAX_TOKENS,
+    LLM_COLUMN_MODEL,
+    LLM_COLUMN_REASONING,
+    LLM_PLANNER_FALLBACK_MODELS,
+    LLM_PLANNER_MAX_TOKENS,
+    LLM_PLANNER_MODEL,
+    LLM_PLANNER_REASONING,
+    LLM_QA_FALLBACK_MODELS,
+    LLM_QA_MAX_TOKENS,
+    LLM_QA_MODEL,
+    LLM_QA_REASONING,
     LLM_REPORT_MODEL,
     LLM_STREAM_HEARTBEAT_SECONDS,
 )
@@ -30,7 +39,6 @@ from app.core.parsing import _parse_file
 from app.core.responses import sse_event
 from app.core.security import _assign_session_owner, _find_history_for_login
 from app.core.text import _short_text
-from app.integrations.dify_client import sse_dify_stream
 from app.integrations.llm_client import collect_chat_completion
 from app.schemas.requests import QualitativeContextRequest
 from app.services.audit import audit_log
@@ -45,7 +53,6 @@ from app.services.question_detect import (
     _sanitize_choice_options,
 )
 from app.services.report_engine import (
-    _analyst_key_for_report,
     _batch_qualitative_analysis,
     _build_crosstab_plan_revision_query,
     _build_crosstab_planner_query,
@@ -54,7 +61,6 @@ from app.services.report_engine import (
     _build_planner_query_with_confirmed,
     _build_planner_sample,
     _build_qa_context,
-    _build_qa_seed_query,
     _describe_qa_context_scope,
     _build_writer_action_query,
     _build_writer_action_repair_query,
@@ -70,7 +76,13 @@ from app.services.report_engine import (
 from app.services.report_history import save_to_history
 from app.services.report_render import _inject_disclaimer, _inject_research_background
 from app.storage.history import _load_history, _save_history
-from app.storage.prompts import _get_planner_extra
+from app.storage.prompts import (
+    _get_column_detect_system_prompt,
+    _get_crosstab_planner_system_prompt,
+    _get_planner_extra,
+    _get_report_qa_system_prompt,
+    _get_survey_planner_system_prompt,
+)
 from app.storage.sessions import get_session, new_session, save_session
 
 
@@ -108,6 +120,53 @@ async def handle_survey_upload(filename: str, content: bytes, login: dict | None
 # ── 列题型识别 SSE ───────────────────────────────────────────────
 
 
+async def _direct_llm_with_heartbeats(messages: list[dict], **kwargs):
+    """等待完整直连结果期间发送心跳；只在成功后暴露完整回答。"""
+    task = asyncio.create_task(collect_chat_completion(messages, **kwargs))
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=LLM_STREAM_HEARTBEAT_SECONDS)
+            if task in done:
+                yield ("result", task.result())
+                return
+            yield ("heartbeat", None)
+    finally:
+        if not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+
+async def _run_direct_llm(messages: list[dict], **kwargs):
+    """把直连调用包装成供 SSE 流程消费的统一事件。"""
+    async for kind, payload in _direct_llm_with_heartbeats(messages, **kwargs):
+        if kind == "heartbeat":
+            yield sse_event({"type": "heartbeat"}), None
+        else:
+            yield None, payload
+
+
+def _json_repair_messages(
+    system_prompt: str,
+    original_query: str,
+    previous_output: str,
+    parse_error: str | None,
+    repair_instruction: str,
+) -> list[dict]:
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": original_query},
+        {"role": "assistant", "content": previous_output},
+        {
+            "role": "user",
+            "content": (
+                f"上一次输出无法通过校验：{parse_error or '未知解析错误'}。\n"
+                f"{repair_instruction}"
+            ),
+        },
+    ]
+
+
 async def columns_stream(session_id: str, request: Request):
     """LLM 列题型识别 SSE 流程（async generator）。"""
     sess = get_session(session_id)
@@ -116,28 +175,49 @@ async def columns_stream(session_id: str, request: Request):
         groups = _group_googleform_matrix(rows[0])
         query = _build_column_detect_query(rows, groups)
         header_count = len(rows[0])
+        system_prompt = _get_column_detect_system_prompt()
+        models = (LLM_COLUMN_MODEL, *LLM_COLUMN_FALLBACK_MODELS)
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": query},
+        ]
+        answer = ""
+        used_model = ""
+        async for event, result in _run_direct_llm(
+            messages,
+            models=models,
+            max_tokens=LLM_COLUMN_MAX_TOKENS,
+            reasoning_effort=LLM_COLUMN_REASONING or None,
+        ):
+            if event:
+                yield event
+            if result:
+                answer, used_model = result
+        for event in _content_events(answer):
+            yield event
 
-        answer_chunks: list[str] = []
-        final_conv = ""
-        async for chunk, conv_id in sse_dify_stream(query, session_id, "", DIFY_COLUMN_KEY):
-            if chunk:
-                answer_chunks.append(chunk)
-                yield sse_event({"type": "chunk", "content": chunk})
-            if conv_id:
-                final_conv = conv_id
-
-        questions, err = survey_plan.parse_columns_from_llm("".join(answer_chunks), header_count)
+        questions, err = survey_plan.parse_columns_from_llm(answer, header_count)
 
         if not questions:
-            retry_q = (
-                f"上次输出无法解析: {err}。请严格按 schema 用 ```json``` 围栏重新输出，"
-                "不要附加任何解释文字。"
+            retry_messages = _json_repair_messages(
+                system_prompt,
+                query,
+                answer,
+                err,
+                "请严格按 schema 用 ```json``` 围栏重新输出，不要附加任何解释文字。",
             )
-            retry_chunks: list[str] = []
-            async for chunk, conv_id in sse_dify_stream(retry_q, session_id, final_conv, DIFY_COLUMN_KEY):
-                if chunk:
-                    retry_chunks.append(chunk)
-            questions, err = survey_plan.parse_columns_from_llm("".join(retry_chunks), header_count)
+            retry_answer = ""
+            async for event, result in _run_direct_llm(
+                retry_messages,
+                models=models,
+                max_tokens=LLM_COLUMN_MAX_TOKENS,
+                reasoning_effort=LLM_COLUMN_REASONING or None,
+            ):
+                if event:
+                    yield event
+                if result:
+                    retry_answer, used_model = result
+            questions, err = survey_plan.parse_columns_from_llm(retry_answer, header_count)
 
         if not questions:
             print(f"[columns] LLM 解析失败，回退本地启发式：{err}")
@@ -155,6 +235,8 @@ async def columns_stream(session_id: str, request: Request):
                         and str(hdrs[idx]).strip().endswith("__open"):
                     q["role"] = "open_text"
         sess["columns_detected"] = questions
+        sess["column_provider"] = "direct_llm"
+        sess["column_model"] = used_model
         save_session(session_id, sess)
         await audit_log(
             request, "survey", "识别题型",
@@ -220,28 +302,49 @@ async def plan_stream(session_id: str, request: Request):
             query = _build_crosstab_planner_query(
                 sess.get("questionnaire_text", ""), avail, open_names
             )
-            ans_chunks: list[str] = []
-            conv = ""
-            async for chunk, cid in sse_dify_stream(query, session_id, "", DIFY_CROSSTAB_PLANNER_KEY):
-                if chunk:
-                    ans_chunks.append(chunk)
-                    yield sse_event({"type": "chunk", "content": chunk})
-                if cid:
-                    conv = cid
-            ctp, err = survey_plan.parse_crosstab_plan("".join(ans_chunks))
+            system_prompt = _get_crosstab_planner_system_prompt()
+            models = (LLM_PLANNER_MODEL, *LLM_PLANNER_FALLBACK_MODELS)
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": query},
+            ]
+            answer = ""
+            used_model = ""
+            async for event, result in _run_direct_llm(
+                messages,
+                models=models,
+                max_tokens=LLM_PLANNER_MAX_TOKENS,
+                reasoning_effort=LLM_PLANNER_REASONING or None,
+            ):
+                if event:
+                    yield event
+                if result:
+                    answer, used_model = result
+            for event in _content_events(answer):
+                yield event
+            ctp, err = survey_plan.parse_crosstab_plan(answer)
             if not ctp:
                 yield sse_event({"type": "progress", "message": "方案格式校验中，正在修订输出…"})
-                retry_q = (
-                    f"上次输出无法解析: {err}。请只输出一个 JSON 对象"
-                    "(含 parts 和 open_questions)，用 ```json``` 围栏，不要解释文字。"
+                retry_messages = _json_repair_messages(
+                    system_prompt,
+                    query,
+                    answer,
+                    err,
+                    "请只输出一个含 parts 和 open_questions 的 JSON 对象，"
+                    "用 ```json``` 围栏，不要解释文字。",
                 )
-                retry_chunks: list[str] = []
-                async for chunk, cid in sse_dify_stream(retry_q, session_id, conv, DIFY_CROSSTAB_PLANNER_KEY):
-                    if chunk:
-                        retry_chunks.append(chunk)
-                    if cid:
-                        conv = cid
-                ctp, err = survey_plan.parse_crosstab_plan("".join(retry_chunks))
+                retry_answer = ""
+                async for event, result in _run_direct_llm(
+                    retry_messages,
+                    models=models,
+                    max_tokens=LLM_PLANNER_MAX_TOKENS,
+                    reasoning_effort=LLM_PLANNER_REASONING or None,
+                ):
+                    if event:
+                        yield event
+                    if result:
+                        retry_answer, used_model = result
+                ctp, err = survey_plan.parse_crosstab_plan(retry_answer)
             if not ctp:
                 yield sse_event({"type": "error", "message": f"章节大纲解析失败：{err}"}); return
             plan = {
@@ -252,7 +355,9 @@ async def plan_stream(session_id: str, request: Request):
                 "cross_tabs": [],
             }
             sess["plan"] = plan
-            sess["planner_conv_id"] = conv
+            sess["planner_conv_id"] = ""
+            sess["planner_provider"] = "direct_llm"
+            sess["planner_model"] = used_model
             save_session(session_id, sess)
             card_text = _render_crosstab_plan_card(plan)
             await audit_log(
@@ -272,30 +377,50 @@ async def plan_stream(session_id: str, request: Request):
         else:
             planner_query = _build_planner_sample(rows) + "\n\n" + _get_planner_extra()
 
-        answer_chunks: list[str] = []
-        final_conv_id = ""
-        async for chunk, conv_id in sse_dify_stream(planner_query, session_id, "", DIFY_PLANNER_KEY):
-            if chunk:
-                answer_chunks.append(chunk)
-                yield sse_event({"type": "chunk", "content": chunk})
-            if conv_id:
-                final_conv_id = conv_id
-
-        full_answer = "".join(answer_chunks)
+        system_prompt = _get_survey_planner_system_prompt()
+        models = (LLM_PLANNER_MODEL, *LLM_PLANNER_FALLBACK_MODELS)
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": planner_query},
+        ]
+        full_answer = ""
+        used_model = ""
+        async for event, result in _run_direct_llm(
+            messages,
+            models=models,
+            max_tokens=LLM_PLANNER_MAX_TOKENS,
+            reasoning_effort=LLM_PLANNER_REASONING or None,
+        ):
+            if event:
+                yield event
+            if result:
+                full_answer, used_model = result
+        for event in _content_events(full_answer):
+            yield event
         headers = rows[0]
         plan, err = survey_plan.parse_plan_from_llm(full_answer, len(headers))
 
         if not plan:
             yield sse_event({"type": "progress", "message": "方案格式校验中，正在修订输出…"})
-            retry_q = (
-                f"上次输出无法解析: {err}。请严格按 JSON schema 重新输出，"
-                "用 ```json ``` 围栏，不要附加解释文字。"
+            retry_messages = _json_repair_messages(
+                system_prompt,
+                planner_query,
+                full_answer,
+                err,
+                "请严格按 JSON schema 重新输出完整 plan，不要附加解释文字。",
             )
-            retry_chunks: list[str] = []
-            async for chunk, conv_id in sse_dify_stream(retry_q, session_id, final_conv_id, DIFY_PLANNER_KEY):
-                if chunk: retry_chunks.append(chunk)
-                if conv_id: final_conv_id = conv_id
-            plan, err = survey_plan.parse_plan_from_llm("".join(retry_chunks), len(headers))
+            retry_answer = ""
+            async for event, result in _run_direct_llm(
+                retry_messages,
+                models=models,
+                max_tokens=LLM_PLANNER_MAX_TOKENS,
+                reasoning_effort=LLM_PLANNER_REASONING or None,
+            ):
+                if event:
+                    yield event
+                if result:
+                    retry_answer, used_model = result
+            plan, err = survey_plan.parse_plan_from_llm(retry_answer, len(headers))
 
         if not plan:
             yield sse_event({"type": "error", "message": f"方案解析失败：{err}"}); return
@@ -305,7 +430,9 @@ async def plan_stream(session_id: str, request: Request):
         plan["branch_rules"] = branch_rules
 
         sess["plan"] = plan
-        sess["planner_conv_id"] = final_conv_id
+        sess["planner_conv_id"] = ""
+        sess["planner_provider"] = "direct_llm"
+        sess["planner_model"] = used_model
         save_session(session_id, sess)
         card_text = survey_plan.render_plan_for_user(plan, headers)
         await audit_log(
@@ -328,28 +455,68 @@ async def plan_revision_stream(session_id: str, user_text: str, request: Request
     branch_rules = _ensure_branch_rules(sess)
     plan = sess.get("plan")
     rows = sess.get("rows")
-    planner_conv_id = sess.get("planner_conv_id", "")
     try:
         if sess.get("mode") == "crosstab":
-            conv = planner_conv_id
+            cols = sess.get("confirmed_columns") or []
+            open_names = [c["name"] for c in cols if c.get("role") == "open_text"]
             rev_q = _build_crosstab_plan_revision_query(
-                sess.get("questionnaire_text", ""), plan.get("parts", []), user_text
+                sess.get("questionnaire_text", ""),
+                sess.get("crosstab_questions", []),
+                open_names,
+                plan.get("parts", []),
+                user_text,
             )
-            rchunks: list[str] = []
-            async for chunk, cid in sse_dify_stream(rev_q, session_id, "", DIFY_CROSSTAB_PLANNER_KEY):
-                if chunk:
-                    rchunks.append(chunk)
-                    yield sse_event({"type": "chunk", "content": chunk})
-                if cid:
-                    conv = cid
-            ctp, err = survey_plan.parse_crosstab_plan("".join(rchunks))
+            system_prompt = _get_crosstab_planner_system_prompt()
+            models = (LLM_PLANNER_MODEL, *LLM_PLANNER_FALLBACK_MODELS)
+            answer = ""
+            used_model = ""
+            async for event, result in _run_direct_llm(
+                [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": rev_q},
+                ],
+                models=models,
+                max_tokens=LLM_PLANNER_MAX_TOKENS,
+                reasoning_effort=LLM_PLANNER_REASONING or None,
+            ):
+                if event:
+                    yield event
+                if result:
+                    answer, used_model = result
+            for event in _content_events(answer):
+                yield event
+            ctp, err = survey_plan.parse_crosstab_plan(answer)
+            if not ctp:
+                yield sse_event({"type": "progress", "message": "方案格式校验中，正在修订输出…"})
+                retry_messages = _json_repair_messages(
+                    system_prompt,
+                    rev_q,
+                    answer,
+                    err,
+                    "请只输出一个含 parts 和 open_questions 的 JSON 对象，"
+                    "用 ```json``` 围栏，不要解释文字。",
+                )
+                retry_answer = ""
+                async for event, result in _run_direct_llm(
+                    retry_messages,
+                    models=models,
+                    max_tokens=LLM_PLANNER_MAX_TOKENS,
+                    reasoning_effort=LLM_PLANNER_REASONING or None,
+                ):
+                    if event:
+                        yield event
+                    if result:
+                        retry_answer, used_model = result
+                ctp, err = survey_plan.parse_crosstab_plan(retry_answer)
             if not ctp:
                 yield sse_event({"type": "error", "message": f"修订章节大纲解析失败：{err}"}); return
             new_plan = dict(plan)
             new_plan["parts"] = ctp["parts"]
             new_plan["open_questions"] = ctp["open_questions"]
             sess["plan"] = new_plan
-            sess["planner_conv_id"] = conv
+            sess["planner_conv_id"] = ""
+            sess["planner_provider"] = "direct_llm"
+            sess["planner_model"] = used_model
             save_session(session_id, sess)
             card_text = _render_crosstab_plan_card(new_plan)
             await audit_log(
@@ -360,8 +527,6 @@ async def plan_revision_stream(session_id: str, user_text: str, request: Request
             yield sse_event({"type": "plan_ready", "plan": new_plan, "card_text": card_text, "headers": rows[0]})
             return
 
-        new_conv_id = planner_conv_id
-        answer_chunks: list[str] = []
         headers = rows[0]
         revision_query = _build_plan_revision_query(
             plan,
@@ -370,35 +535,48 @@ async def plan_revision_stream(session_id: str, user_text: str, request: Request
             user_text,
             branch_rules=branch_rules,
         )
-        async for chunk, conv_id in sse_dify_stream(revision_query, session_id, "", DIFY_PLANNER_KEY):
-            if chunk:
-                answer_chunks.append(chunk)
-                yield sse_event({"type": "chunk", "content": chunk})
-            if conv_id:
-                new_conv_id = conv_id
-
-        full_answer = "".join(answer_chunks)
+        system_prompt = _get_survey_planner_system_prompt()
+        models = (LLM_PLANNER_MODEL, *LLM_PLANNER_FALLBACK_MODELS)
+        full_answer = ""
+        used_model = ""
+        async for event, result in _run_direct_llm(
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": revision_query},
+            ],
+            models=models,
+            max_tokens=LLM_PLANNER_MAX_TOKENS,
+            reasoning_effort=LLM_PLANNER_REASONING or None,
+        ):
+            if event:
+                yield event
+            if result:
+                full_answer, used_model = result
+        for event in _content_events(full_answer):
+            yield event
         new_plan, err = survey_plan.parse_plan_from_llm(full_answer, len(headers))
         if not new_plan:
-            retry_query = (
-                f"{revision_query}\n\n"
-                "上一次输出无法解析为 JSON。请修正并只返回完整 JSON 对象。\n"
-                f"解析错误：{err}\n"
-                f"<previous_output>\n{full_answer[:4000]}\n</previous_output>"
+            retry_messages = _json_repair_messages(
+                system_prompt,
+                revision_query,
+                full_answer,
+                err,
+                "请修正并只返回符合 schema 的完整 plan JSON 对象。",
             )
-            retry_chunks: list[str] = []
-            retry_conv_id = new_conv_id
             yield sse_event({"type": "progress", "message": "方案格式校验中，正在修订输出…"})
             yield sse_event({"type": "chunk", "content": "\n\n正在按严格 JSON 格式重新修订方案...\n"})
-            async for chunk, conv_id in sse_dify_stream(retry_query, session_id, "", DIFY_PLANNER_KEY):
-                if chunk:
-                    retry_chunks.append(chunk)
-                    yield sse_event({"type": "chunk", "content": chunk})
-                if conv_id:
-                    retry_conv_id = conv_id
-            new_plan, err = survey_plan.parse_plan_from_llm("".join(retry_chunks), len(headers))
-            if new_plan:
-                new_conv_id = retry_conv_id
+            retry_answer = ""
+            async for event, result in _run_direct_llm(
+                retry_messages,
+                models=models,
+                max_tokens=LLM_PLANNER_MAX_TOKENS,
+                reasoning_effort=LLM_PLANNER_REASONING or None,
+            ):
+                if event:
+                    yield event
+                if result:
+                    retry_answer, used_model = result
+            new_plan, err = survey_plan.parse_plan_from_llm(retry_answer, len(headers))
         if not new_plan:
             yield sse_event({"type": "error", "message": f"修订方案解析失败：{err}"}); return
 
@@ -407,7 +585,9 @@ async def plan_revision_stream(session_id: str, user_text: str, request: Request
         new_plan["branch_rules"] = branch_rules
 
         sess["plan"] = new_plan
-        sess["planner_conv_id"] = new_conv_id
+        sess["planner_conv_id"] = ""
+        sess["planner_provider"] = "direct_llm"
+        sess["planner_model"] = used_model
         save_session(session_id, sess)
         card_text = survey_plan.render_plan_for_user(new_plan, headers)
         await audit_log(
@@ -473,57 +653,42 @@ async def _direct_writer_round(
     return answer, model
 
 
-async def _collect_dify_answer(
-    query: str,
-    user_id: str,
-    conversation_id: str,
-    api_key: str,
-) -> tuple[str, str]:
-    """完整缓冲一次 Dify 回答，供追问断流后安全重建会话。"""
-    chunks: list[str] = []
-    final_conv_id = conversation_id
-    async for chunk, conv_id in sse_dify_stream(
-        query, user_id, conversation_id, api_key, max_attempts=4
-    ):
-        if chunk:
-            chunks.append(chunk)
-        if conv_id:
-            final_conv_id = conv_id
-    answer = "".join(chunks).strip()
-    if not answer:
-        raise RuntimeError("Dify 追问返回空内容")
-    return answer, final_conv_id
-
-
-async def _answer_qa_with_recovery(
+def _build_direct_qa_messages(
     source: dict,
     question: str,
-    user_id: str,
-    conversation_id: str,
-    api_key: str,
+    qa_context: str,
+) -> list[dict]:
+    """把持久化的业务上下文和历史问答转换为标准 LLM messages。"""
+    messages = [
+        {"role": "system", "content": _get_report_qa_system_prompt()},
+        {"role": "user", "content": qa_context},
+    ]
+    for item in source.get("qa_messages") or []:
+        content = str(item.get("content") or "").strip()
+        if not content:
+            continue
+        role = "user" if item.get("role") == "user" else "assistant"
+        messages.append({"role": role, "content": content})
+    messages.append({"role": "user", "content": question.strip()})
+    return messages
+
+
+async def _answer_qa_direct(
+    source: dict,
+    question: str,
 ) -> tuple[str, str, str]:
-    """优先续聊；无会话或续聊失败时，用完整报告上下文新建 Dify 会话。"""
+    """通过统一直连模型链回答报告追问，并返回实际使用的模型。"""
     qa_context = str(source.get("qa_context_md") or "").strip()
     if not qa_context:
         qa_context = _build_qa_context(source)
-    seed_query = _build_qa_seed_query(
-        qa_context,
-        source.get("qa_messages") or [],
-        question,
+    models = (LLM_QA_MODEL, *LLM_QA_FALLBACK_MODELS)
+    answer, model = await collect_chat_completion(
+        _build_direct_qa_messages(source, question, qa_context),
+        models=models,
+        max_tokens=LLM_QA_MAX_TOKENS,
+        reasoning_effort=LLM_QA_REASONING or None,
     )
-    should_seed = not conversation_id or not source.get("rows_fed", False)
-    first_query = seed_query if should_seed else question
-
-    try:
-        answer, new_conv_id = await _collect_dify_answer(
-            first_query, user_id, conversation_id, api_key
-        )
-    except Exception:
-        # 缓冲模式下尚未向前端输出内容，可以安全地舍弃失败会话并从完整上下文重建。
-        answer, new_conv_id = await _collect_dify_answer(
-            seed_query, user_id, "", api_key
-        )
-    return answer, new_conv_id, qa_context
+    return answer, model, qa_context
 
 
 async def report_stream(session_id: str, request: Request):
@@ -573,6 +738,8 @@ async def report_stream(session_id: str, request: Request):
             async for item in _batch_qualitative_analysis(open_text, plan, rows[0], session_id):
                 if item[0] == "progress":
                     yield sse_event({"type": "progress", "message": item[1]})
+                elif item[0] == "heartbeat":
+                    yield sse_event({"type": "heartbeat"})
                 elif item[0] == "diagnostics":
                     cluster_diagnostics = item[1]
                 elif item[0] == "result":
@@ -736,19 +903,15 @@ async def qa_stream(session_id: str, question: str, request: Request):
     """当前会话 QA SSE 流程（async generator）。"""
     sess = get_session(session_id)
     _assign_session_owner(sess, await _current_login(request))
-    analyst_conv_id = sess.get("analyst_conv_id", "")
-    analyst_key, analyst_key_name = _analyst_key_for_report(sess)
     try:
         qa_context = str(sess.get("qa_context_md") or "").strip() or _build_qa_context(sess)
         yield sse_event({"type": "qa_scope", "message": _describe_qa_context_scope(qa_context)})
-        answer_text, new_conv_id, qa_context = await _answer_qa_with_recovery(
-            sess, question, session_id, analyst_conv_id, analyst_key
-        )
+        answer_text, qa_model, qa_context = await _answer_qa_direct(sess, question)
         for event in _content_events(answer_text):
             yield event
-        sess["analyst_conv_id"] = new_conv_id or analyst_conv_id
-        sess["analyst_app"] = "large" if analyst_key_name == "DIFY_LARGE_ANALYST_KEY" else "standard"
         sess["qa_context_md"] = qa_context
+        sess["qa_provider"] = "direct_llm"
+        sess["qa_model"] = qa_model
         sess["rows_fed"] = True
         sess.setdefault("qa_messages", []).extend([
             {"role": "user", "content": question, "ts": datetime.now().isoformat()},
@@ -774,9 +937,6 @@ async def history_qa_stream(
     history_id: str,
     question: str,
     history: list,
-    analyst_conv_id: str,
-    analyst_key: str,
-    analyst_key_name: str,
     request: Request,
 ):
     """历史报告续聊 QA SSE 流程（async generator）。"""
@@ -784,14 +944,12 @@ async def history_qa_stream(
         entry = next(h for h in history if h["id"] == history_id)
         qa_context = str(entry.get("qa_context_md") or "").strip() or _build_qa_context(entry)
         yield sse_event({"type": "qa_scope", "message": _describe_qa_context_scope(qa_context)})
-        answer_text, new_conv_id, qa_context = await _answer_qa_with_recovery(
-            entry, question, history_id, analyst_conv_id, analyst_key
-        )
+        answer_text, qa_model, qa_context = await _answer_qa_direct(entry, question)
         for event in _content_events(answer_text):
             yield event
-        entry["analyst_conv_id"] = new_conv_id or analyst_conv_id
-        entry["analyst_app"] = "large" if analyst_key_name == "DIFY_LARGE_ANALYST_KEY" else "standard"
         entry["qa_context_md"] = qa_context
+        entry["qa_provider"] = "direct_llm"
+        entry["qa_model"] = qa_model
         entry["rows_fed"] = True
         entry.setdefault("qa_messages", []).extend([
                     {"role": "user", "content": question, "ts": datetime.now().isoformat()},
@@ -820,7 +978,7 @@ def validate_columns_ready(session_id: str) -> None:
 
 
 def validate_plan_ready(session_id: str) -> str:
-    """校验方案生成前置条件，返回 mode 供 router 选择正确的 planner key。"""
+    """校验方案生成前置条件，并返回当前分析模式。"""
     sess = get_session(session_id)
     if not sess.get("rows"):
         raise HTTPException(status_code=400, detail="会话中没有数据，请先上传文件")
@@ -849,29 +1007,28 @@ def validate_report_ready(session_id: str) -> bool:
 
 
 def validate_qa_ready(session_id: str) -> None:
-    """校验 QA 前置条件；直连写作后允许没有 Dify conversation_id。"""
+    """校验统一直连 QA 的报告与模型配置前置条件。"""
     sess = get_session(session_id)
     if not sess.get("report_md"):
         raise HTTPException(status_code=400, detail="请先生成报告")
-    analyst_key, analyst_key_name = _analyst_key_for_report(sess)
-    if not analyst_key:
-        raise HTTPException(status_code=500, detail=f"未配置 {analyst_key_name}")
+    if not LLM_API_KEY:
+        raise HTTPException(status_code=500, detail="未配置 LLM_API_KEY")
+    if not LLM_QA_MODEL:
+        raise HTTPException(status_code=500, detail="未配置 LLM_QA_MODEL")
 
 
 def prepare_history_qa_context(
     history_id: str, login: dict | None
-) -> tuple[list, str, str, str]:
-    """加载历史记录，校验续聊前置条件。
-    返回 (history, analyst_conv_id, analyst_key, analyst_key_name)。
-    """
+) -> list:
+    """加载历史记录并校验统一直连 QA 的前置条件。"""
     history = _load_history()
     entry = _find_history_for_login(history, history_id, login)
     if not entry:
         raise HTTPException(status_code=404, detail="历史记录不存在")
     if not entry.get("report_md"):
         raise HTTPException(status_code=400, detail="该历史记录没有可追问的报告")
-    analyst_conv_id = entry.get("analyst_conv_id", "")
-    analyst_key, analyst_key_name = _analyst_key_for_report(entry)
-    if not analyst_key:
-        raise HTTPException(status_code=500, detail=f"未配置 {analyst_key_name}")
-    return history, analyst_conv_id, analyst_key, analyst_key_name
+    if not LLM_API_KEY:
+        raise HTTPException(status_code=500, detail="未配置 LLM_API_KEY")
+    if not LLM_QA_MODEL:
+        raise HTTPException(status_code=500, detail="未配置 LLM_QA_MODEL")
+    return history

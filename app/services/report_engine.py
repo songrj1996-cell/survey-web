@@ -2,21 +2,40 @@
 
 planner/writer 问询构建、大样本分批定性分析、开放题兜底、统计上下文拼装、QA 取数。
 """
+import asyncio
 import json
 import re
+from contextlib import suppress
 
 from app.core.config import (
     BATCH_SIZE,
-    DIFY_ANALYST_KEY,
-    DIFY_CLASSIFY_KEY,
-    DIFY_LARGE_ANALYST_KEY,
-    DIFY_THEME_EXTRACT_KEY,
-    DIFY_THEME_MERGE_KEY,
+    LLM_CLASSIFY_CONCURRENCY,
+    LLM_CLASSIFY_FALLBACK_MODELS,
+    LLM_CLASSIFY_MAX_TOKENS,
+    LLM_CLASSIFY_MODEL,
+    LLM_CLASSIFY_REASONING,
+    LLM_STREAM_HEARTBEAT_SECONDS,
+    LLM_THEME_EXTRACT_CONCURRENCY,
+    LLM_THEME_EXTRACT_FALLBACK_MODELS,
+    LLM_THEME_EXTRACT_MAX_TOKENS,
+    LLM_THEME_EXTRACT_MODEL,
+    LLM_THEME_EXTRACT_REASONING,
+    LLM_THEME_MERGE_FALLBACK_MODELS,
+    LLM_THEME_MERGE_MAX_TOKENS,
+    LLM_THEME_MERGE_MODEL,
+    LLM_THEME_MERGE_REASONING,
     OTHER_THEME_PCT,
 )
+from app.integrations.llm_client import collect_chat_completion
 from app.services.branch_logic import branch_rule_for_column, branch_rule_label
 from app.services.question_detect import ROLE_LABEL_MAP
-from app.storage.prompts import _get_planner_extra, _get_writer_requirements
+from app.storage.prompts import (
+    _get_planner_extra,
+    _get_response_classify_system_prompt,
+    _get_theme_extract_system_prompt,
+    _get_theme_merge_system_prompt,
+    _get_writer_requirements,
+)
 
 _QUALITATIVE_CONTEXT_LABELS = [
     ("problem", "这次想解决什么问题"),
@@ -251,7 +270,7 @@ def _build_crosstab_planner_query(
     available_questions: list[str],
     open_question_names: list[str],
 ) -> str:
-    """跑数表模式：给章节策划 planner 的初始 query（任务/输出格式由 Dify 应用 system prompt 定义）。"""
+    """跑数表模式：给章节策划 LLM 的初始 query。"""
     q_text = (questionnaire_text or "").strip()
     if len(q_text) > 12000:
         q_text = q_text[:12000] + "\n…（问卷过长，已截断）"
@@ -267,16 +286,22 @@ def _build_crosstab_planner_query(
 
 def _build_crosstab_plan_revision_query(
     questionnaire_text: str,
+    available_questions: list[str],
+    open_question_names: list[str],
     current_parts: list[dict],
     user_text: str,
 ) -> str:
-    """跑数表模式：章节大纲的修订 query。"""
+    """跑数表模式：章节大纲修订 query，显式补齐无会话直连所需上下文。"""
     q_text = (questionnaire_text or "").strip()
     if len(q_text) > 12000:
         q_text = q_text[:12000] + "\n…（问卷过长，已截断）"
+    avail = "\n".join(f"- {q}" for q in available_questions) or "（无）"
+    opens = "\n".join(f"- {q}" for q in open_question_names) or "（无）"
     outline = json.dumps(current_parts or [], ensure_ascii=False, indent=2)
     return (
         f"<questionnaire>\n{q_text}\n</questionnaire>\n\n"
+        f"<available_questions>\n{avail}\n</available_questions>\n\n"
+        f"<open_questions_list>\n{opens}\n</open_questions_list>\n\n"
         f"<current_outline>\n{outline}\n</current_outline>\n\n"
         f"<user_request>\n{user_text.strip()}\n</user_request>\n\n"
         "请在当前大纲基础上按用户意见调整，按 system prompt 约定的 JSON 格式输出。"
@@ -339,6 +364,401 @@ def _cluster_diag_column(col_idx: int, col_name: str, total: int, batches: int) 
     }
 
 
+def _llm_json_messages(system_prompt: str, query: str) -> list[dict]:
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": query},
+    ]
+
+
+async def _direct_json_call(
+    system_prompt: str,
+    query: str,
+    *,
+    models: tuple[str, ...],
+    max_tokens: int,
+    reasoning_effort: str | None,
+    validator,
+) -> dict:
+    """调用直连 LLM 并做一次针对 JSON/业务 schema 的纠错重试。"""
+    try:
+        answer, model = await collect_chat_completion(
+            _llm_json_messages(system_prompt, query),
+            models=models,
+            max_tokens=max_tokens,
+            reasoning_effort=reasoning_effort,
+        )
+    except Exception as exc:
+        return {
+            "data": None,
+            "model": "",
+            "raw_len": 0,
+            "repaired": False,
+            "error": str(exc)[:300],
+        }
+
+    parsed, parse_error = _json_loads_loose(answer)
+    validation_error = validator(parsed) if parsed else (parse_error or "invalid JSON")
+    if not validation_error:
+        return {
+            "data": parsed,
+            "model": model,
+            "raw_len": len(answer),
+            "repaired": False,
+            "error": "",
+        }
+
+    repair_messages = [
+        *_llm_json_messages(system_prompt, query),
+        {"role": "assistant", "content": answer[:24000]},
+        {
+            "role": "user",
+            "content": (
+                f"上一次输出未通过校验：{validation_error}。"
+                "请修复后重新输出完整 JSON；不得解释、不得使用 Markdown 围栏。"
+            ),
+        },
+    ]
+    repair_models = (model, *(m for m in models if m != model))
+    try:
+        repaired_answer, repaired_model = await collect_chat_completion(
+            repair_messages,
+            models=repair_models,
+            max_tokens=max_tokens,
+            reasoning_effort=reasoning_effort,
+        )
+    except Exception as exc:
+        return {
+            "data": None,
+            "model": model,
+            "raw_len": len(answer),
+            "repaired": True,
+            "error": str(exc)[:300],
+        }
+
+    repaired, repair_parse_error = _json_loads_loose(repaired_answer)
+    repair_validation_error = (
+        validator(repaired) if repaired else (repair_parse_error or "invalid JSON")
+    )
+    return {
+        "data": repaired if not repair_validation_error else None,
+        "model": repaired_model,
+        "raw_len": len(repaired_answer),
+        "repaired": True,
+        "error": repair_validation_error or "",
+    }
+
+
+async def _run_bounded_calls(call_factories: list, concurrency: int):
+    """有限并发执行批次，并在等待期间产生 heartbeat 事件。"""
+    semaphore = asyncio.Semaphore(max(1, concurrency))
+
+    async def _invoke(index: int, factory):
+        async with semaphore:
+            return index, await factory()
+
+    pending = {
+        asyncio.create_task(_invoke(index, factory))
+        for index, factory in enumerate(call_factories)
+    }
+    try:
+        while pending:
+            done, pending = await asyncio.wait(
+                pending,
+                timeout=LLM_STREAM_HEARTBEAT_SECONDS,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                yield ("heartbeat", None)
+                continue
+            for task in done:
+                yield ("result", task.result())
+    finally:
+        for task in pending:
+            task.cancel()
+        for task in pending:
+            with suppress(asyncio.CancelledError):
+                await task
+
+
+def _text_key(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _validate_theme_candidates(data: dict | None, source_texts: list[str]) -> str | None:
+    if not isinstance(data, dict):
+        return "JSON 根节点必须是对象"
+    themes = data.get("themes")
+    if not isinstance(themes, list) or not themes:
+        return "themes 必须是非空数组"
+    if len(themes) > 15:
+        return f"themes 数量为 {len(themes)}，不得超过 15"
+    source_set = {_text_key(text) for text in source_texts if _text_key(text)}
+    seen_names: set[str] = set()
+    for index, theme in enumerate(themes):
+        if not isinstance(theme, dict):
+            return f"themes[{index}] 不是对象"
+        name = str(theme.get("name") or "").strip()
+        if not name:
+            return f"themes[{index}] 缺少 name"
+        name_key = name.casefold()
+        if name_key in seen_names:
+            return f"主题名称重复：{name}"
+        seen_names.add(name_key)
+        if not str(theme.get("description") or "").strip():
+            return f"主题「{name}」缺少 description"
+        for field in ("positive_summary", "negative_summary"):
+            value = theme.get(field)
+            if value is not None and not isinstance(value, str):
+                return f"主题「{name}」的 {field} 必须是字符串或 null"
+        quotes = theme.get("representative_quotes")
+        if not isinstance(quotes, list) or not quotes or len(quotes) > 3:
+            return f"主题「{name}」必须包含 1–3 条 representative_quotes"
+        for quote in quotes:
+            if _text_key(quote) not in source_set:
+                return f"主题「{name}」包含并非逐字来自输入的引用"
+    return None
+
+
+def _validate_merged_themes(data: dict | None, candidates: list[dict]) -> str | None:
+    if not isinstance(data, dict):
+        return "JSON 根节点必须是对象"
+    themes = data.get("themes")
+    if not isinstance(themes, list) or not themes:
+        return "themes 必须是非空数组"
+    unique_candidates = {
+        str(theme.get("name") or "").strip().casefold()
+        for theme in candidates
+        if str(theme.get("name") or "").strip()
+    }
+    required_min = min(10, len(unique_candidates))
+    if len(themes) < required_min or len(themes) > 25:
+        return (
+            f"最终主题数量为 {len(themes)}，本次必须在 "
+            f"{required_min}–25 个之间；不要用宽泛上位主题过度合并"
+        )
+    expected_ids = [f"t{i:02d}" for i in range(1, len(themes) + 1)]
+    actual_ids = [theme.get("id") if isinstance(theme, dict) else None for theme in themes]
+    if actual_ids != expected_ids:
+        return f"主题 ID 必须从 t01 连续编号，期望 {expected_ids}"
+    quote_pool = {
+        _text_key(quote)
+        for theme in candidates
+        if isinstance(theme, dict)
+        for quote in (theme.get("representative_quotes") or [])
+        if _text_key(quote)
+    }
+    seen_names: set[str] = set()
+    for theme in themes:
+        name = str(theme.get("name") or "").strip()
+        if not name or not str(theme.get("description") or "").strip():
+            return f"主题 {theme.get('id')} 缺少 name 或 description"
+        key = name.casefold()
+        if key in seen_names:
+            return f"最终主题名称重复：{name}"
+        seen_names.add(key)
+        for field in ("positive_summary", "negative_summary"):
+            value = theme.get(field)
+            if value is not None and not isinstance(value, str):
+                return f"主题「{name}」的 {field} 必须是字符串或 null"
+        quotes = theme.get("representative_quotes")
+        if not isinstance(quotes, list) or not quotes or len(quotes) > 3:
+            return f"主题「{name}」必须包含 1–3 条 representative_quotes"
+        for quote in quotes:
+            if _text_key(quote) not in quote_pool:
+                return f"主题「{name}」包含候选主题中不存在的引用"
+    return None
+
+
+_VALID_SENTIMENTS = {"positive", "negative", "neutral", "mixed"}
+
+
+def _normalize_classifications(
+    data: dict | None,
+    expected_ids: list[str],
+    valid_theme_ids: set[str],
+) -> dict[str, list[dict]]:
+    """只保留完全合法且不重复的分类；其余 ID 交给 miss 修复。"""
+    if not isinstance(data, dict) or not isinstance(data.get("classifications"), list):
+        return {}
+    expected = set(expected_ids)
+    normalized: dict[str, list[dict]] = {}
+    duplicate_ids: set[str] = set()
+    for item in data["classifications"]:
+        if not isinstance(item, dict):
+            continue
+        response_id = str(item.get("response_id") or "")
+        if response_id not in expected:
+            continue
+        if response_id in normalized:
+            duplicate_ids.add(response_id)
+            continue
+        assignments = item.get("assignments")
+        if not isinstance(assignments, list) or not 1 <= len(assignments) <= 3:
+            continue
+        clean_assignments: list[dict] = []
+        seen_themes: set[str] = set()
+        valid = True
+        for assignment in assignments:
+            if not isinstance(assignment, dict):
+                valid = False
+                break
+            theme_id = str(assignment.get("theme_id") or "")
+            sentiment = str(assignment.get("sentiment") or "")
+            if (
+                theme_id not in valid_theme_ids
+                or sentiment not in _VALID_SENTIMENTS
+                or theme_id in seen_themes
+            ):
+                valid = False
+                break
+            seen_themes.add(theme_id)
+            clean_assignments.append(
+                {"theme_id": theme_id, "sentiment": sentiment}
+            )
+        if not valid:
+            continue
+        if "other" in seen_themes and (
+            len(clean_assignments) != 1
+            or clean_assignments[0]["sentiment"] != "neutral"
+        ):
+            continue
+        normalized[response_id] = clean_assignments
+    for response_id in duplicate_ids:
+        normalized.pop(response_id, None)
+    return normalized
+
+
+def _build_theme_extract_query(
+    question: str,
+    batch: list[dict],
+) -> tuple[str, list[str]]:
+    texts = [str(entry.get("text") or "") for entry in batch]
+    responses = "\n".join(f"[{index}] {text}" for index, text in enumerate(texts))
+    return (
+        f"<question>\n{question}\n</question>\n\n"
+        f"<response_count>{len(batch)}</response_count>\n"
+        f"<responses>\n{responses}\n</responses>",
+        texts,
+    )
+
+
+def _build_theme_merge_query(
+    question: str,
+    candidates: list[dict],
+    total_responses: int,
+) -> str:
+    return (
+        f"<question>\n{question}\n</question>\n"
+        f"<total_responses>{total_responses}</total_responses>\n"
+        "<theme_candidates_json>\n"
+        f"{json.dumps(candidates, ensure_ascii=False)}\n"
+        "</theme_candidates_json>"
+    )
+
+
+def _build_classify_query(
+    question: str,
+    final_themes: list[dict],
+    batch: list[dict],
+    response_ids: list[str] | None = None,
+) -> str:
+    ids = response_ids or [str(index) for index in range(len(batch))]
+    responses = "\n".join(
+        f"[{response_id}] {batch[int(response_id)].get('text', '')}"
+        for response_id in ids
+    )
+    theme_list = [
+        {
+            "id": theme["id"],
+            "name": theme["name"],
+            "description": theme["description"],
+        }
+        for theme in final_themes
+    ]
+    return (
+        f"<question>\n{question}\n</question>\n"
+        f"<themes_json>\n{json.dumps(theme_list, ensure_ascii=False)}\n</themes_json>\n"
+        f"<responses>\n{responses}\n</responses>"
+    )
+
+
+async def _classify_batch_direct(
+    question: str,
+    final_themes: list[dict],
+    batch: list[dict],
+) -> dict:
+    expected_ids = [str(index) for index in range(len(batch))]
+    valid_theme_ids = {theme["id"] for theme in final_themes} | {"other"}
+    system_prompt = _get_response_classify_system_prompt()
+    models = (LLM_CLASSIFY_MODEL, *LLM_CLASSIFY_FALLBACK_MODELS)
+
+    def _root_validator(data):
+        if not isinstance(data, dict) or not isinstance(
+            data.get("classifications"), list
+        ):
+            return "classifications 必须是数组"
+        return None
+
+    first = await _direct_json_call(
+        system_prompt,
+        _build_classify_query(question, final_themes, batch),
+        models=models,
+        max_tokens=LLM_CLASSIFY_MAX_TOKENS,
+        reasoning_effort=LLM_CLASSIFY_REASONING or None,
+        validator=_root_validator,
+    )
+    normalized = _normalize_classifications(
+        first.get("data"), expected_ids, valid_theme_ids
+    )
+    missing_ids = [response_id for response_id in expected_ids if response_id not in normalized]
+    repaired_count = 0
+    repair_model = ""
+
+    if missing_ids:
+        miss = await _direct_json_call(
+            system_prompt,
+            _build_classify_query(
+                question,
+                final_themes,
+                batch,
+                response_ids=missing_ids,
+            ),
+            models=models,
+            max_tokens=LLM_CLASSIFY_MAX_TOKENS,
+            reasoning_effort=LLM_CLASSIFY_REASONING or None,
+            validator=_root_validator,
+        )
+        repaired = _normalize_classifications(
+            miss.get("data"), missing_ids, valid_theme_ids
+        )
+        normalized.update(repaired)
+        repaired_count = len(repaired)
+        repair_model = miss.get("model", "")
+
+    fallback_ids = [
+        response_id for response_id in expected_ids if response_id not in normalized
+    ]
+    for response_id in fallback_ids:
+        normalized[response_id] = [{"theme_id": "other", "sentiment": "neutral"}]
+
+    return {
+        "classifications": [
+            {
+                "response_id": response_id,
+                "assignments": normalized[response_id],
+            }
+            for response_id in expected_ids
+        ],
+        "model": first.get("model", ""),
+        "repair_model": repair_model,
+        "raw_len": first.get("raw_len", 0),
+        "repaired_count": repaired_count,
+        "fallback_count": len(fallback_ids),
+        "error": first.get("error", ""),
+    }
+
+
 async def _batch_qualitative_analysis(
     open_text: dict,
     plan: dict,
@@ -361,9 +781,6 @@ async def _batch_qualitative_analysis(
         }
     }
     """
-    import json as _json
-    from app.integrations.dify_client import workflow_run, STOP_SIGNAL
-
     clustered_themes: dict = {}
     diagnostics: dict[str, dict] = {}
 
@@ -383,41 +800,64 @@ async def _batch_qualitative_analysis(
         diag = _cluster_diag_column(col_idx, col_name, total, len(batches))
         diagnostics[str(col_idx)] = diag
 
+        extract_factories = []
         for bi, batch in enumerate(batches, 1):
             yield ("progress", f"【{col_name}】提取主题（批次 {bi}/{len(batches)}）")
-            responses_text = "\n".join(
-                f"[{i}] {e.get('text', '')}" for i, e in enumerate(batch)
-            )
-            raw = await workflow_run(
-                inputs={
-                    "question": col_name,
-                    "responses": responses_text,
-                    "count": len(batch),
-                },
-                api_key=DIFY_THEME_EXTRACT_KEY,
-                log_prefix=f"A col={col_idx} batch={bi}",
-            )
-            phase_a = {"batch": bi, "raw_len": len(raw or ""), "parsed": False, "themes": 0, "error": ""}
-            if raw == STOP_SIGNAL:
-                phase_a["error"] = "Dify returned 400 / STOP_SIGNAL"
-                diag["phase_a"].append(phase_a)
-                diag["status"] = "failed"
-                diag["reason"] = phase_a["error"]
-                yield ("progress", f"【{col_name}】主题提取遇到错误，跳过该列")
-                break
-            parsed, err = _json_loads_loose(raw)
-            if parsed:
-                themes = parsed.get("themes", [])
-                if isinstance(themes, list):
-                    all_candidates.extend(themes)
-                    phase_a["parsed"] = True
-                    phase_a["themes"] = len(themes)
-                else:
-                    phase_a["error"] = "`themes` is not list"
-            else:
-                phase_a["error"] = err
-                yield ("progress", f"【{col_name}】主题提取结果解析失败（批次 {bi}），继续处理后续批次")
+            query, source_texts = _build_theme_extract_query(col_name, batch)
+
+            async def _extract(
+                query=query,
+                source_texts=source_texts,
+            ):
+                return await _direct_json_call(
+                    _get_theme_extract_system_prompt(),
+                    query,
+                    models=(
+                        LLM_THEME_EXTRACT_MODEL,
+                        *LLM_THEME_EXTRACT_FALLBACK_MODELS,
+                    ),
+                    max_tokens=LLM_THEME_EXTRACT_MAX_TOKENS,
+                    reasoning_effort=LLM_THEME_EXTRACT_REASONING or None,
+                    validator=lambda data: _validate_theme_candidates(
+                        data, source_texts
+                    ),
+                )
+
+            extract_factories.append(_extract)
+
+        extracted_by_batch: dict[int, list[dict]] = {}
+        async for event_type, payload in _run_bounded_calls(
+            extract_factories,
+            LLM_THEME_EXTRACT_CONCURRENCY,
+        ):
+            if event_type == "heartbeat":
+                yield ("heartbeat", "")
+                continue
+            batch_index, result = payload
+            bi = batch_index + 1
+            parsed = result.get("data")
+            themes = parsed.get("themes", []) if isinstance(parsed, dict) else []
+            phase_a = {
+                "batch": bi,
+                "raw_len": result.get("raw_len", 0),
+                "parsed": bool(themes),
+                "themes": len(themes),
+                "model": result.get("model", ""),
+                "repaired": bool(result.get("repaired")),
+                "error": result.get("error", ""),
+            }
             diag["phase_a"].append(phase_a)
+            if themes:
+                extracted_by_batch[bi] = themes
+            else:
+                yield (
+                    "progress",
+                    f"【{col_name}】主题提取失败（批次 {bi}），继续处理后续批次",
+                )
+
+        diag["phase_a"].sort(key=lambda item: item["batch"])
+        for bi in sorted(extracted_by_batch):
+            all_candidates.extend(extracted_by_batch[bi])
 
         if not all_candidates:
             diag["status"] = "failed"
@@ -427,53 +867,49 @@ async def _batch_qualitative_analysis(
 
         # ── Phase B：合并去重 ──────────────────────────────────────────────
         yield ("progress", f"【{col_name}】合并主题候选（共 {len(all_candidates)} 个）")
-        candidates_text = "\n".join(
-            f"- {t.get('name', '')}：{t.get('description', '')}"
-            for t in all_candidates
-        )
-        raw_b = await workflow_run(
-            inputs={
-                "question": col_name,
-                "theme_candidates": candidates_text,
-                "total_responses": total,
-            },
-            api_key=DIFY_THEME_MERGE_KEY,
-            log_prefix=f"B col={col_idx}",
-        )
-        diag["phase_b"] = {"raw_len": len(raw_b or ""), "parsed": False, "themes": 0, "error": ""}
-        if raw_b == STOP_SIGNAL or not raw_b:
-            diag["phase_b"]["error"] = "Dify returned STOP_SIGNAL" if raw_b == STOP_SIGNAL else "empty response"
-            diag["status"] = "failed"
-            diag["reason"] = f"主题合并失败：{diag['phase_b']['error']}"
-            yield ("progress", f"【{col_name}】主题合并失败，跳过该列")
-            continue
-        merged, err = _json_loads_loose(raw_b)
-        if not merged:
-            diag["phase_b"]["error"] = err
-            diag["status"] = "failed"
-            diag["reason"] = f"主题合并结果解析失败：{err}"
-            yield ("progress", f"【{col_name}】主题合并结果解析失败，跳过该列")
-            continue
-        final_themes = merged.get("themes", [])
-        if isinstance(final_themes, list):
-            diag["phase_b"]["parsed"] = True
-            diag["phase_b"]["themes"] = len(final_themes)
-            diag["themes"] = len(final_themes)
-        else:
-            final_themes = []
-            diag["phase_b"]["error"] = "`themes` is not list"
+        merge_result = None
+
+        async def _merge():
+            return await _direct_json_call(
+                _get_theme_merge_system_prompt(),
+                _build_theme_merge_query(col_name, all_candidates, total),
+                models=(
+                    LLM_THEME_MERGE_MODEL,
+                    *LLM_THEME_MERGE_FALLBACK_MODELS,
+                ),
+                max_tokens=LLM_THEME_MERGE_MAX_TOKENS,
+                reasoning_effort=LLM_THEME_MERGE_REASONING or None,
+                validator=lambda data: _validate_merged_themes(
+                    data, all_candidates
+                ),
+            )
+
+        async for event_type, payload in _run_bounded_calls([_merge], 1):
+            if event_type == "heartbeat":
+                yield ("heartbeat", "")
+            else:
+                _batch_index, merge_result = payload
+
+        merge_result = merge_result or {}
+        merged = merge_result.get("data")
+        final_themes = merged.get("themes", []) if isinstance(merged, dict) else []
+        diag["phase_b"] = {
+            "raw_len": merge_result.get("raw_len", 0),
+            "parsed": bool(final_themes),
+            "themes": len(final_themes),
+            "model": merge_result.get("model", ""),
+            "repaired": bool(merge_result.get("repaired")),
+            "error": merge_result.get("error", ""),
+        }
+        diag["themes"] = len(final_themes)
 
         if not final_themes:
             diag["status"] = "failed"
-            diag["reason"] = diag["reason"] or "主题合并未返回 themes"
+            diag["reason"] = (
+                f"主题合并失败：{diag['phase_b']['error'] or '未返回 themes'}"
+            )
             yield ("progress", f"【{col_name}】主题合并为空，后续报告将尝试使用原文兜底")
             continue
-
-        theme_list_text = _json.dumps(
-            [{"id": t["id"], "name": t["name"], "description": t["description"]}
-             for t in final_themes],
-            ensure_ascii=False,
-        )
 
         # ── Phase C：回跑分类 ──────────────────────────────────────────────
         # counts[theme_id] = {"total": int, "pos": int, "neg": int, "neutral": int, "mixed": int}
@@ -483,57 +919,57 @@ async def _batch_qualitative_analysis(
         # quotes_pool[theme_id] = list of (sentiment, text)
         quotes_pool: dict[str, list] = {t["id"]: [] for t in final_themes}
 
+        classify_factories = []
         for bi, batch in enumerate(batches, 1):
             yield ("progress", f"【{col_name}】分类回复（批次 {bi}/{len(batches)}）")
-            responses_text = "\n".join(
-                f"[{i}] {e.get('text', '')}" for i, e in enumerate(batch)
-            )
-            raw_c = await workflow_run(
-                inputs={
-                    "question": col_name,
-                    "theme_list": theme_list_text,
-                    "responses": responses_text,
-                },
-                api_key=DIFY_CLASSIFY_KEY,
-                log_prefix=f"C col={col_idx} batch={bi}",
-            )
-            phase_c = {"batch": bi, "raw_len": len(raw_c or ""), "parsed": False, "classifications": 0, "assignments": 0, "error": ""}
-            if raw_c == STOP_SIGNAL:
-                phase_c["error"] = "Dify returned 400 / STOP_SIGNAL"
-                diag["phase_c"].append(phase_c)
-                yield ("progress", f"【{col_name}】分类回复遇到错误（批次 {bi}），继续处理后续批次")
-                continue
-            cls_data, err = _json_loads_loose(raw_c)
-            if not cls_data:
-                phase_c["error"] = err
-                diag["phase_c"].append(phase_c)
-                yield ("progress", f"【{col_name}】分类结果解析失败（批次 {bi}），继续处理后续批次")
-                continue
 
-            classifications = cls_data.get("classifications", [])
-            if not isinstance(classifications, list):
-                phase_c["error"] = "`classifications` is not list"
-                diag["phase_c"].append(phase_c)
+            async def _classify(batch=batch):
+                return await _classify_batch_direct(col_name, final_themes, batch)
+
+            classify_factories.append(_classify)
+
+        classified_by_batch: dict[int, dict] = {}
+        async for event_type, payload in _run_bounded_calls(
+            classify_factories,
+            LLM_CLASSIFY_CONCURRENCY,
+        ):
+            if event_type == "heartbeat":
+                yield ("heartbeat", "")
                 continue
-            phase_c["parsed"] = True
-            phase_c["classifications"] = len(classifications)
+            batch_index, result = payload
+            classified_by_batch[batch_index] = result
+
+        for batch_index in sorted(classified_by_batch):
+            bi = batch_index + 1
+            batch = batches[batch_index]
+            result = classified_by_batch[batch_index]
+            classifications = result.get("classifications", [])
+            phase_c = {
+                "batch": bi,
+                "raw_len": result.get("raw_len", 0),
+                "parsed": bool(classifications),
+                "classifications": len(classifications),
+                "assignments": 0,
+                "model": result.get("model", ""),
+                "repair_model": result.get("repair_model", ""),
+                "missing_repaired": result.get("repaired_count", 0),
+                "missing_fallback": result.get("fallback_count", 0),
+                "error": result.get("error", ""),
+            }
             diag["classifications"] += len(classifications)
 
             for item in classifications:
-                try:
-                    resp_idx = int(str(item.get("response_id", "")).strip("[]"))
-                    original_text = batch[resp_idx].get("text", "") if resp_idx < len(batch) else ""
-                except (ValueError, IndexError):
-                    continue
-
-                assignments = item.get("assignments", [])
-                if isinstance(assignments, list):
-                    phase_c["assignments"] += len(assignments)
+                resp_idx = int(item["response_id"])
+                original_text = (
+                    batch[resp_idx].get("text", "")
+                    if 0 <= resp_idx < len(batch)
+                    else ""
+                )
+                assignments = item["assignments"]
+                phase_c["assignments"] += len(assignments)
                 for assign in assignments:
-                    tid = assign.get("theme_id", "other")
-                    sentiment = assign.get("sentiment", "neutral")
-                    if tid not in counts:
-                        tid = "other"
+                    tid = assign["theme_id"]
+                    sentiment = assign["sentiment"]
                     counts[tid]["total"] += 1
                     if sentiment == "positive":
                         counts[tid]["pos"] += 1
@@ -543,18 +979,26 @@ async def _batch_qualitative_analysis(
                         counts[tid]["mixed"] += 1
                     else:
                         counts[tid]["neutral"] += 1
-                    if tid != "other" and len(quotes_pool[tid]) < 10 and original_text:
+                    if (
+                        tid != "other"
+                        and len(quotes_pool[tid]) < 10
+                        and original_text
+                    ):
                         quotes_pool[tid].append((sentiment, original_text))
             diag["assignments"] += phase_c["assignments"]
             diag["phase_c"].append(phase_c)
 
         # ── 统计汇总 ──────────────────────────────────────────────────────
-        total_mentions = sum(v["total"] for v in counts.values())
-        if total_mentions == 0:
+        classified_responses = sum(
+            item.get("classifications", 0) for item in diag["phase_c"]
+        )
+        if classified_responses == 0 or total == 0:
             diag["status"] = "failed"
             diag["reason"] = "分类阶段未产生任何主题归属"
             yield ("progress", f"【{col_name}】分类未产生有效归属，后续报告将尝试使用原文兜底")
             continue
+        diag["percentage_basis"] = "response_coverage"
+        diag["percentage_denominator"] = total
 
         themes_out = []
         other_themes_out = []
@@ -563,7 +1007,7 @@ async def _batch_qualitative_analysis(
             tid = t["id"]
             c = counts[tid]
             cnt = c["total"]
-            pct = round(cnt / total_mentions * 100, 1)
+            pct = round(cnt / total * 100, 1)
             pos_cnt = c["pos"]
             neg_cnt = c["neg"]
             pos_pct = round(pos_cnt / cnt * 100, 1) if cnt else 0.0
@@ -766,9 +1210,16 @@ def _build_large_sample_writer_query(
         col_name = data["col_name"]
         total = data["total"]
         lines = [f"### 问题：{col_name}（共 {total:,} 条有效回答）\n"]
+        lines.append(
+            "主题占比口径：提到该主题的回答数 ÷ 本题有效回答总数；"
+            "一条回答可属于多个主题，因此各主题占比之和可能超过 100%。\n"
+        )
 
         for i, t in enumerate(data["themes"], 1):
-            lines.append(f"**主题{i}：{t['name']}**（提及 {t['count']:,} 人次，占 {t['percentage']}%）")
+            lines.append(
+                f"**主题{i}：{t['name']}**"
+                f"（{t['count']:,} 条回答提及，占 {t['percentage']}%）"
+            )
             if t["positive_summary"] or t["positive_count"]:
                 lines.append(f"- 正面（{t['positive_count']:,} / {t['positive_pct']}%）：{t['positive_summary']}")
             if t["negative_summary"] or t["negative_count"]:
@@ -1159,31 +1610,6 @@ def _build_qa_context(source: dict, report_md: str | None = None) -> str:
     return "\n\n".join(blocks)
 
 
-def _build_qa_seed_query(
-    qa_context: str,
-    qa_messages: list[dict] | None,
-    question: str,
-) -> str:
-    """新建/重建 Dify 追问会话时，把报告上下文和既往问答一次性投喂。"""
-    history_lines = []
-    for message in qa_messages or []:
-        role = "用户" if message.get("role") == "user" else "AI"
-        content = str(message.get("content") or "").strip()
-        if content:
-            history_lines.append(f"{role}：{content}")
-    history_block = (
-        "<previous_qa>\n" + "\n\n".join(history_lines) + "\n</previous_qa>\n\n"
-        if history_lines else ""
-    )
-    return (
-        f"{qa_context.strip()}\n\n"
-        f"{history_block}"
-        "请基于以上完整上下文回答下面的问题。不要声称自己看不到报告或问卷；"
-        "引用数字时必须与 <stats> 一致，解释报告逻辑时要指出所依据的报告章节、统计或玩家反馈。\n\n"
-        f"用户问题：{question}"
-    )
-
-
 def _stratified_sample(body: list[list], profile_indexes: list[int], target: int = 100):
     if not profile_indexes or len(body) <= target:
         return body[:target]
@@ -1203,12 +1629,3 @@ def _stratified_sample(body: list[list], profile_indexes: list[int], target: int
         if len(out) >= target:
             break
     return out[:target]
-
-
-def _analyst_key_for_report(obj: dict) -> tuple[str, str]:
-    """Return the Dify key that owns this report conversation."""
-    analyst_app = obj.get("analyst_app") or ""
-    mode = obj.get("mode") or obj.get("plan", {}).get("mode", "")
-    if analyst_app == "large" or mode == "crosstab":
-        return DIFY_LARGE_ANALYST_KEY, "DIFY_LARGE_ANALYST_KEY"
-    return DIFY_ANALYST_KEY, "DIFY_ANALYST_KEY"

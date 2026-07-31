@@ -2,6 +2,8 @@
 import unittest
 
 from app.services.question_detect import (
+    _build_column_detect_query,
+    _group_googleform_matrix,
     _heuristic_type,
     _reconcile_question_roles,
     _sanitize_choice_options,
@@ -9,6 +11,20 @@ from app.services.question_detect import (
 
 
 class QuestionDetectTests(unittest.TestCase):
+    def test_multilingual_query_contains_real_values_without_duplicating_schema(self):
+        rows = [
+            ["Which role do you usually play?", "Seberapa puas Anda?"],
+            ["Tank", "1"],
+            ["Mage", "5"],
+        ]
+        query = _build_column_detect_query(rows, _group_googleform_matrix(rows[0]))
+
+        self.assertIn("Which role do you usually play?", query)
+        self.assertIn("Seberapa puas Anda?", query)
+        self.assertIn("Tank", query)
+        self.assertIn("请按 system prompt 约定的 JSON schema 输出", query)
+        self.assertNotIn('"role": "single_choice|multi_choice', query)
+
     def test_long_repeated_lists_are_multi_choice_before_open_text(self):
         values = [
             "广告和刷屏消息过多，聊天内容粗俗或恶意挑衅",

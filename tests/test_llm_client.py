@@ -120,6 +120,33 @@ class DirectLLMClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(client.calls[0]["url"].endswith("/responses"))
         self.assertEqual(client.calls[0]["json"]["instructions"], "rules")
 
+    async def test_claude_5_uses_adaptive_thinking_and_effort(self):
+        client = _FakeClient([_FakeResponse(lines=[
+            _sse({
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "answer"},
+            }),
+            _sse({"type": "message_delta", "delta": {"stop_reason": "end_turn"}}),
+        ])])
+
+        with (
+            patch.object(llm_client, "LLM_API_BASE", "https://llm.example/v1"),
+            patch.object(llm_client, "LLM_API_KEY", "secret"),
+            patch.object(llm_client.httpx, "AsyncClient", return_value=client),
+        ):
+            answer, model = await llm_client.collect_chat_completion(
+                [{"role": "user", "content": "question"}],
+                models=("claude-sonnet-5",),
+                max_tokens=16000,
+                reasoning_effort="medium",
+            )
+
+        self.assertEqual((answer, model), ("answer", "claude-sonnet-5"))
+        payload = client.calls[0]["json"]
+        self.assertEqual(payload["thinking"], {"type": "adaptive"})
+        self.assertEqual(payload["output_config"], {"effort": "medium"})
+        self.assertEqual(payload["max_tokens"], 16000)
+
     async def test_incompatible_protocol_switches_before_model_fallback(self):
         incompatible = (
             b'{"error":{"message":"no model_info.compatible[\\"/messages\\"] '

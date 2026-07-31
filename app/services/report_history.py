@@ -90,6 +90,8 @@ def save_to_history(session_id: str, sess: dict) -> dict | None:
         "analyst_app": sess.get("analyst_app", ""),
         "report_writer_provider": sess.get("report_writer_provider", ""),
         "report_writer_model": sess.get("report_writer_model", ""),
+        "qa_provider": sess.get("qa_provider") or (old_entry or {}).get("qa_provider", ""),
+        "qa_model": sess.get("qa_model") or (old_entry or {}).get("qa_model", ""),
         "qa_messages": qa_messages or [],
         "rows_fed": bool(sess.get("rows_fed", False)),
         "mode": sess.get("mode", ""),  # 保存模式，导出时据此选择免责声明（定性/crosstab/comment）

@@ -6,10 +6,16 @@ import json
 import os
 
 from app.core.config import (
+    DEFAULT_COLUMN_DETECT_SYSTEM_PROMPT,
+    DEFAULT_CROSSTAB_PLANNER_SYSTEM_PROMPT,
     DEFAULT_PLANNER_EXTRA,
+    DEFAULT_RESPONSE_CLASSIFY_SYSTEM_PROMPT,
+    DEFAULT_REPORT_QA_SYSTEM_PROMPT,
+    DEFAULT_SURVEY_PLANNER_SYSTEM_PROMPT,
+    DEFAULT_THEME_EXTRACT_SYSTEM_PROMPT,
+    DEFAULT_THEME_MERGE_SYSTEM_PROMPT,
     DEFAULT_UPLOAD_GUIDE,
     DEFAULT_WRITER_REQUIREMENTS,
-    DIFY_CONSOLE_URL,
     PROMPTS_FILE,
 )
 
@@ -55,31 +61,103 @@ DEFAULT_PROMPTS: dict = {
         "history": [],
         "version": 3,  # 改了默认值就 +1：未被用户编辑过的会自动升级
     },
-    "dify_planner_system": {
-        "key": "dify_planner_system",
-        "label": "规划器 System Prompt（Dify 管理）",
+    "column_detect_system": {
+        "key": "column_detect_system",
+        "label": "题型识别 System Prompt",
         "description": (
-            "配置在 Dify「调研分析-规划器」应用中的 System Prompt。"
-            "需在 Dify 后台「编排 → 提示词」中修改，此处仅供参考。"
+            "用于识别问卷列题型、翻译中文短名并归并多语言选项。"
+            "修改后下一次题型识别立即生效，无需重启服务。"
         ),
-        "dify_app": "调研分析-规划器",
-        "dify_url": DIFY_CONSOLE_URL,
-        "editable": False,
-        "current": "（请前往 Dify 后台查看：调研分析-规划器 → 编排 → 提示词）",
+        "dify_app": None,
+        "dify_url": None,
+        "editable": True,
+        "current": DEFAULT_COLUMN_DETECT_SYSTEM_PROMPT,
         "history": [],
+        "version": 1,
     },
-    "dify_analyst_system": {
-        "key": "dify_analyst_system",
-        "label": "分析师 System Prompt（Dify 管理）",
+    "survey_planner_system": {
+        "key": "survey_planner_system",
+        "label": "问卷方案规划 System Prompt",
         "description": (
-            "配置在 Dify「调研分析-分析师」应用中的 System Prompt。"
-            "需在 Dify 后台「编排 → 提示词」中修改，此处仅供参考。"
+            "用于生成和修订普通问卷分析方案，包含列结构、章节和交叉分析约束。"
+            "修改后下一次方案规划立即生效，无需重启服务。"
         ),
-        "dify_app": "调研分析-分析师",
-        "dify_url": DIFY_CONSOLE_URL,
-        "editable": False,
-        "current": "（请前往 Dify 后台查看：调研分析-分析师 → 编排 → 提示词）",
+        "dify_app": None,
+        "dify_url": None,
+        "editable": True,
+        "current": DEFAULT_SURVEY_PLANNER_SYSTEM_PROMPT,
         "history": [],
+        "version": 1,
+    },
+    "crosstab_planner_system": {
+        "key": "crosstab_planner_system",
+        "label": "跑数表章节规划 System Prompt",
+        "description": (
+            "用于生成和修订跑数表报告的主题化章节大纲。"
+            "修改后下一次章节规划立即生效，无需重启服务。"
+        ),
+        "dify_app": None,
+        "dify_url": None,
+        "editable": True,
+        "current": DEFAULT_CROSSTAB_PLANNER_SYSTEM_PROMPT,
+        "history": [],
+        "version": 1,
+    },
+    "theme_extract_system": {
+        "key": "theme_extract_system",
+        "label": "大样本主题提取 System Prompt",
+        "description": (
+            "用于从每批多语言开放题回答提取候选主题。"
+            "修改后下一次大样本开放题分析立即生效，无需重启服务。"
+        ),
+        "dify_app": None,
+        "dify_url": None,
+        "editable": True,
+        "current": DEFAULT_THEME_EXTRACT_SYSTEM_PROMPT,
+        "history": [],
+        "version": 1,
+    },
+    "theme_merge_system": {
+        "key": "theme_merge_system",
+        "label": "大样本主题合并 System Prompt",
+        "description": (
+            "用于跨批次合并候选主题，并生成连续主题 ID。"
+            "修改后下一次大样本开放题分析立即生效，无需重启服务。"
+        ),
+        "dify_app": None,
+        "dify_url": None,
+        "editable": True,
+        "current": DEFAULT_THEME_MERGE_SYSTEM_PROMPT,
+        "history": [],
+        "version": 1,
+    },
+    "response_classify_system": {
+        "key": "response_classify_system",
+        "label": "大样本回答分类 System Prompt",
+        "description": (
+            "用于把每条开放题回答归入最终主题并判断情感倾向。"
+            "修改后下一次大样本开放题分析立即生效，无需重启服务。"
+        ),
+        "dify_app": None,
+        "dify_url": None,
+        "editable": True,
+        "current": DEFAULT_RESPONSE_CLASSIFY_SYSTEM_PROMPT,
+        "history": [],
+        "version": 1,
+    },
+    "report_qa_system": {
+        "key": "report_qa_system",
+        "label": "报告追问 System Prompt",
+        "description": (
+            "用于普通问卷、大样本问卷和跑数表报告的统一追问。"
+            "修改后下一次追问立即生效，无需重启服务。"
+        ),
+        "dify_app": None,
+        "dify_url": None,
+        "editable": True,
+        "current": DEFAULT_REPORT_QA_SYSTEM_PROMPT,
+        "history": [],
+        "version": 1,
     },
 }
 
@@ -119,3 +197,31 @@ def _get_writer_requirements() -> str:
 
 def _get_planner_extra() -> str:
     return _load_prompts()["planner_extra"]["current"]
+
+
+def _get_column_detect_system_prompt() -> str:
+    return _load_prompts()["column_detect_system"]["current"]
+
+
+def _get_survey_planner_system_prompt() -> str:
+    return _load_prompts()["survey_planner_system"]["current"]
+
+
+def _get_crosstab_planner_system_prompt() -> str:
+    return _load_prompts()["crosstab_planner_system"]["current"]
+
+
+def _get_theme_extract_system_prompt() -> str:
+    return _load_prompts()["theme_extract_system"]["current"]
+
+
+def _get_theme_merge_system_prompt() -> str:
+    return _load_prompts()["theme_merge_system"]["current"]
+
+
+def _get_response_classify_system_prompt() -> str:
+    return _load_prompts()["response_classify_system"]["current"]
+
+
+def _get_report_qa_system_prompt() -> str:
+    return _load_prompts()["report_qa_system"]["current"]
