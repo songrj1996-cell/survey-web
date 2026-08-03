@@ -24,22 +24,175 @@ from app.core.config import (
     ANNOTATE_QUALITY_CONCURRENCY,
     ANNOTATE_QUALITY_MAX_QUERY_CHARS,
     ANNOTATE_RESULT_DIR,
-    DIFY_AI_DETECT_KEY,
-    DIFY_QUALITY_KEY,
+    LLM_ANNOTATE_AI_FALLBACK_MODELS,
+    LLM_ANNOTATE_AI_MAX_TOKENS,
+    LLM_ANNOTATE_AI_MODEL,
+    LLM_ANNOTATE_AI_REASONING,
+    LLM_ANNOTATE_QUALITY_FALLBACK_MODELS,
+    LLM_ANNOTATE_QUALITY_MAX_TOKENS,
+    LLM_ANNOTATE_QUALITY_MODEL,
+    LLM_ANNOTATE_QUALITY_REASONING,
+    LLM_ANNOTATE_TRANSLATION_FALLBACK_MODELS,
+    LLM_ANNOTATE_TRANSLATION_MAX_TOKENS,
+    LLM_ANNOTATE_TRANSLATION_MODEL,
+    LLM_ANNOTATE_TRANSLATION_REASONING,
 )
 from app.core.parsing import _parse_file
 from app.core.responses import sse_event
 from app.core.security import _assign_session_owner, _find_history_for_login
-from app.integrations.dify_client import workflow_run
+from app.integrations.llm_client import collect_chat_completion
 from app.services.audit import audit_log
 from app.services.auth import _current_login
 from app.services.question_detect import _detect_open_text_cols, _group_googleform_matrix
 from app.services.report_history import save_annotate_to_history
 from app.storage.history import _ensure_history_report_numbers, _load_history
+from app.storage.prompts import (
+    _get_annotate_ai_system_prompt,
+    _get_annotate_quality_system_prompt,
+    _get_annotate_translation_system_prompt,
+)
 
 # 标注会话用内存(生命周期短,不跨请求长期保活)
 annotate_sessions: dict[str, dict] = {}
 _ANNOTATE_SSE_HEARTBEAT_SECONDS = 15
+
+
+def _annotate_model_chain(
+    primary: str,
+    fallbacks: tuple[str, ...],
+    *,
+    fallback_first: bool = False,
+) -> tuple[str, ...]:
+    """Return a stable model chain, optionally prioritizing strict-repair fallbacks."""
+    models = tuple(dict.fromkeys(
+        model for model in (primary, *fallbacks) if str(model or "").strip()
+    ))
+    if fallback_first and len(models) > 1:
+        return (*models[1:], models[0])
+    return models
+
+
+async def _collect_annotate_json(
+    *,
+    task: str,
+    system_prompt: str,
+    user_prompt: str,
+    models: tuple[str, ...],
+    max_tokens: int,
+    reasoning_effort: str,
+    parser,
+) -> tuple[list[dict], str]:
+    """Call each configured model and retry malformed JSON once before failover."""
+    last_error = ""
+    for model in models:
+        current_prompt = user_prompt
+        for attempt in range(1, 3):
+            try:
+                output, actual_model = await collect_chat_completion(
+                    [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": current_prompt},
+                    ],
+                    models=(model,),
+                    max_tokens=max_tokens,
+                    reasoning_effort=reasoning_effort,
+                )
+            except Exception as exc:
+                last_error = _public_llm_error(str(exc))
+                _annotate_ai_log(
+                    "direct model failed", task=task, model=model,
+                    attempt=attempt, error=last_error,
+                )
+                break
+
+            parsed, parse_error = parser(output)
+            if parsed:
+                _annotate_ai_log(
+                    "direct model done", task=task, model=actual_model,
+                    attempt=attempt, answer_len=len(output),
+                )
+                return parsed, ""
+
+            last_error = str(parse_error or "模型返回内容无法解析")
+            _annotate_ai_log(
+                "direct model schema invalid", task=task, model=actual_model,
+                attempt=attempt,
+            )
+            current_prompt = (
+                f"上次输出无法解析（{last_error}）。请重新处理并严格返回系统提示词指定的 "
+                "JSON，不要附加解释文字。\n\n"
+                f"{user_prompt}"
+            )
+    return [], last_error or "模型调用失败"
+
+
+async def _call_ai_model(
+    query: str,
+    label: str,
+    *,
+    fallback_first: bool = False,
+) -> tuple[list[dict], str]:
+    return await _collect_annotate_json(
+        task=f"ai-{label}",
+        system_prompt=_get_annotate_ai_system_prompt(),
+        user_prompt=(
+            "请分析以下玩家问卷回答，并严格按照系统提示词规定的 JSON 结构输出：\n"
+            f"{query}"
+        ),
+        models=_annotate_model_chain(
+            LLM_ANNOTATE_AI_MODEL,
+            LLM_ANNOTATE_AI_FALLBACK_MODELS,
+            fallback_first=fallback_first,
+        ),
+        max_tokens=LLM_ANNOTATE_AI_MAX_TOKENS,
+        reasoning_effort=LLM_ANNOTATE_AI_REASONING,
+        parser=annotate.parse_ai_detect_result,
+    )
+
+
+async def _call_quality_model(
+    query: str,
+    label: str,
+    *,
+    fallback_first: bool = False,
+) -> tuple[list[dict], str]:
+    return await _collect_annotate_json(
+        task=f"quality-{label}",
+        system_prompt=_get_annotate_quality_system_prompt(),
+        user_prompt=(
+            "请逐题判断以下玩家主观题回答，并严格按照系统提示词规定的 JSON 结构返回："
+            f"{query}"
+        ),
+        models=_annotate_model_chain(
+            LLM_ANNOTATE_QUALITY_MODEL,
+            LLM_ANNOTATE_QUALITY_FALLBACK_MODELS,
+            fallback_first=fallback_first,
+        ),
+        max_tokens=LLM_ANNOTATE_QUALITY_MAX_TOKENS,
+        reasoning_effort=LLM_ANNOTATE_QUALITY_REASONING,
+        parser=annotate.parse_quality_result,
+    )
+
+
+async def _call_translation_model(
+    query: str,
+    label: str,
+    *,
+    fallback_first: bool = False,
+) -> tuple[list[dict], str]:
+    return await _collect_annotate_json(
+        task=f"translation-{label}",
+        system_prompt=_get_annotate_translation_system_prompt(),
+        user_prompt=query,
+        models=_annotate_model_chain(
+            LLM_ANNOTATE_TRANSLATION_MODEL,
+            LLM_ANNOTATE_TRANSLATION_FALLBACK_MODELS,
+            fallback_first=fallback_first,
+        ),
+        max_tokens=LLM_ANNOTATE_TRANSLATION_MAX_TOKENS,
+        reasoning_effort=LLM_ANNOTATE_TRANSLATION_REASONING,
+        parser=annotate.parse_translation_repair_result,
+    )
 
 
 # ── 会话辅助 ────────────────────────────────────────────────────
@@ -278,8 +431,6 @@ def _filter_annotate_open_text_cols(
 
 async def _translate_headers(headers: list) -> tuple[list, str]:
     """将表头翻译为中文简体；只补发缺失项，最终失败时返回明确警告。"""
-    if not DIFY_AI_DETECT_KEY:
-        return list(headers), "未配置 AI 识别应用，列名未翻译"
     translated = list(headers)
     pending: dict[str, dict] = {}
     for index, header in enumerate(headers):
@@ -297,17 +448,11 @@ async def _translate_headers(headers: list) -> tuple[list, str]:
     for attempt in range(1, 3):
         repair_items = list(pending.values())
         try:
-            output = await workflow_run(
-                inputs={
-                    "mode": "translation_repair",
-                    "query": annotate.build_translation_repair_query(repair_items),
-                },
-                api_key=DIFY_AI_DETECT_KEY,
-                user=f"hdr-translate-{attempt}",
-                max_retries=3,
-                log_prefix=f"annotate.header.translate.{attempt}",
+            repaired, _ = await _call_translation_model(
+                annotate.build_translation_repair_query(repair_items),
+                f"header-{attempt}",
+                fallback_first=attempt > 1,
             )
-            repaired, _ = annotate.parse_translation_repair_result(output)
         except Exception as exc:
             _annotate_ai_log("header translation failed", attempt=attempt, error=str(exc)[:500])
             repaired = []
@@ -576,7 +721,7 @@ def _translation_is_usable(original: str, translation: str) -> bool:
     )
 
 
-def _public_dify_error(error: str) -> str:
+def _public_llm_error(error: str) -> str:
     lowered = str(error or "").lower()
     if any(token in lowered for token in (
         "modelunavailable", "model unavailable", "apiconnectionerror",
@@ -599,7 +744,7 @@ def _validation_error_summary(errors: list[str]) -> str:
         ("标签非法", "标签格式错误"),
         ("缺少原因", "判断原因缺失"),
         ("原文证据", "AI 原文证据无效"),
-        ("Dify", "模型调用失败"),
+        ("LLM", "模型调用失败"),
         ("模型服务", "模型服务暂时不可用"),
     ):
         if token in joined and label not in categories:
@@ -849,10 +994,11 @@ async def _run_ai_direct_batch(
     open_text_cols: list[int],
     id_col: int,
     background: str,
-    api_key: str,
     label: str,
+    *,
+    fallback_first: bool = False,
 ) -> tuple[list[dict], str]:
-    """单个子批次的 Dify 调用 + 解析 + 一次重试。"""
+    """Directly run one AI-detection sub-batch through its model chain."""
     try:
         _, query = _fit_rows_to_query_budget(
             batch_rows,
@@ -866,45 +1012,15 @@ async def _run_ai_direct_batch(
             "subbatch start", sid=sid, batch=label,
             rows=len(batch_rows), query_len=len(query),
         )
-        text = await workflow_run(
-            inputs={"mode": "ai_detect", "query": query},
-            api_key=api_key,
-            user=f"{sid}-split-{label}",
-            max_retries=3,
-            log_prefix=f"annotate.ai_detect.{label}",
+        results, err = await _call_ai_model(
+            query, label, fallback_first=fallback_first,
         )
-        _annotate_ai_log(
-            "subbatch dify done", sid=sid, batch=label, mode="workflow",
-            answer_len=len(text or ""), fallback=False,
-        )
-        if not (text or "").strip():
-            return [], "Dify 返回空内容"
-        results, err = annotate.parse_ai_detect_result(text)
         if results:
             return _attach_originals(results, batch_rows, id_col, open_text_cols), ""
-        retry_q = (
-            f"上次输出无法解析（{err}）。请重新处理下面这批数据，严格返回系统提示词指定的"
-            "顶层 JSON 数组，不要附加解释文字。\n\n"
-            f"{query}"
-        )
-        retry_text = await workflow_run(
-            inputs={"mode": "ai_detect", "query": retry_q},
-            api_key=api_key,
-            user=f"{sid}-split-retry-{label}",
-            max_retries=3,
-            log_prefix=f"annotate.ai_detect.{label}.retry",
-        )
-        _annotate_ai_log(
-            "subbatch retry done", sid=sid, batch=label, mode="workflow",
-            answer_len=len(retry_text or ""), fallback=False,
-        )
-        results, retry_err = annotate.parse_ai_detect_result(retry_text)
-        if results:
-            return _attach_originals(results, batch_rows, id_col, open_text_cols), ""
-        return results, retry_err
+        return [], err
     except Exception as exc:
         _annotate_ai_log("subbatch failed", sid=sid, batch=label, error=str(exc)[:1000])
-        return [], _public_dify_error(str(exc))
+        return [], _public_llm_error(str(exc))
 
 
 async def _repair_missing_translations(
@@ -913,11 +1029,9 @@ async def _repair_missing_translations(
     batch_rows: list[list],
     id_col: int,
     open_text_cols: list[int],
-    api_key: str,
     stage: str,
-    fallback_api_key: str = "",
 ) -> tuple[set[str], str]:
-    """只翻译缺失单元格；定向重试后可切换另一工作流兜底。"""
+    """Only translate missing cells through the shared translation model chain."""
     rows_by_id = {_row_id(row, id_col): row for row in batch_rows}
     results_by_id = {str(result.get("id", "")): result for result in results}
 
@@ -952,13 +1066,12 @@ async def _repair_missing_translations(
         return pending
 
     async def run_repair_pass(
-        repair_api_key: str,
         items: list[dict],
         chunk_size: int,
         pass_name: str,
+        *,
+        fallback_first: bool = False,
     ) -> None:
-        if not repair_api_key:
-            return
         single_text_limit = max(1000, ANNOTATE_QUALITY_MAX_QUERY_CHARS - 1500)
         long_items = [
             item for item in items if len(str(item.get("text", ""))) > single_text_limit
@@ -977,17 +1090,11 @@ async def _repair_missing_translations(
                     "id": item["id"], "key": item["key"], "text": segment,
                 }])
                 try:
-                    text = await workflow_run(
-                        inputs={"mode": "translation_repair", "query": query},
-                        api_key=repair_api_key,
-                        user=f"{sid}-{stage}-translate-{pass_name}-long-{long_index}-{part_index}",
-                        max_retries=3,
-                        log_prefix=(
-                            f"annotate.{stage}.translate.{pass_name}."
-                            f"long-{long_index}-{part_index}"
-                        ),
+                    repaired, _ = await _call_translation_model(
+                        query,
+                        f"{stage}-{pass_name}-long-{long_index}-{part_index}",
+                        fallback_first=fallback_first,
                     )
-                    repaired, _ = annotate.parse_translation_repair_result(text)
                 except Exception as exc:
                     _annotate_ai_log(
                         "translation repair failed", sid=sid, stage=stage,
@@ -1029,14 +1136,10 @@ async def _repair_missing_translations(
         for index, repair_items in enumerate(repair_chunks, 1):
             query = annotate.build_translation_repair_query(repair_items)
             try:
-                text = await workflow_run(
-                    inputs={"mode": "translation_repair", "query": query},
-                    api_key=repair_api_key,
-                    user=f"{sid}-{stage}-translate-{pass_name}-{index}",
-                    max_retries=3,
-                    log_prefix=f"annotate.{stage}.translate.{pass_name}.{index}",
+                repaired, _ = await _call_translation_model(
+                    query, f"{stage}-{pass_name}-{index}",
+                    fallback_first=fallback_first,
                 )
-                repaired, _ = annotate.parse_translation_repair_result(text)
             except Exception as exc:
                 _annotate_ai_log(
                     "translation repair failed", sid=sid, stage=stage,
@@ -1055,13 +1158,10 @@ async def _repair_missing_translations(
                     ] = translation
 
     pending = pending_items()
-    await run_repair_pass(api_key, pending, 20, "primary")
+    await run_repair_pass(pending, 20, "primary")
     pending = pending_items()
     if pending:
-        await run_repair_pass(api_key, pending, 5, "retry")
-    pending = pending_items()
-    if pending and fallback_api_key and fallback_api_key != api_key:
-        await run_repair_pass(fallback_api_key, pending, 5, "fallback")
+        await run_repair_pass(pending, 5, "retry", fallback_first=True)
 
     missing_ids: set[str] = set()
     for row_id, result in results_by_id.items():
@@ -1164,14 +1264,15 @@ async def _run_ai_batch_checked(
 ) -> tuple[int, list[dict], set[str], set[str], str]:
     results, err = await _run_ai_direct_batch(
         sid, batch, headers, open_text_cols, id_col, background,
-        DIFY_AI_DETECT_KEY, str(batch_num),
+        str(batch_num),
     )
     valid, missing, errors = _validated_ai_results(results, batch, id_col, open_text_cols)
     if missing:
         missing_rows = [row for row in batch if _row_id(row, id_col) in missing]
         retry_results, retry_err = await _run_ai_direct_batch(
             sid, missing_rows, headers, open_text_cols, id_col, background,
-            DIFY_AI_DETECT_KEY, f"{batch_num}.miss",
+            f"{batch_num}.miss",
+            fallback_first=True,
         )
         retry_valid, retry_missing, retry_errors = _validated_ai_results(
             retry_results, missing_rows, id_col, open_text_cols,
@@ -1185,8 +1286,7 @@ async def _run_ai_batch_checked(
         errors = []
 
     translation_missing, translation_error = await _repair_missing_translations(
-        sid, valid, batch, id_col, open_text_cols, DIFY_AI_DETECT_KEY, f"ai-{batch_num}",
-        fallback_api_key=DIFY_QUALITY_KEY,
+        sid, valid, batch, id_col, open_text_cols, f"ai-{batch_num}",
     )
     if err and missing and not errors:
         errors.append(err)
@@ -1316,9 +1416,7 @@ async def ai_detect_stream(sid: str, request: Request):
             body,
             id_col,
             open_text_cols,
-            DIFY_AI_DETECT_KEY,
             "ai-final",
-            fallback_api_key=DIFY_QUALITY_KEY,
         )
         sess["ai_results"] = all_results
         sess["ai_status"] = "complete" if not all_missing_ids else "incomplete"
@@ -1390,17 +1488,16 @@ async def _run_one_quality_batch_strict(
     id_col: int,
     include_translations: bool,
 ) -> tuple[int, list[dict], set[str], str]:
-    async def call(current_query: str) -> tuple[list[dict], str]:
-        output = await workflow_run(
-            inputs={"mode": "quality_label", "query": current_query},
-            api_key=DIFY_QUALITY_KEY,
-            user=f"{sid}-quality-{batch_num}",
-            max_retries=3,
-            log_prefix=f"annotate.quality.{batch_num}",
+    async def call(
+        current_query: str,
+        call_label: str,
+        *,
+        fallback_first: bool = False,
+    ) -> tuple[list[dict], str]:
+        return await _call_quality_model(
+            current_query, f"{batch_num}-{call_label}",
+            fallback_first=fallback_first,
         )
-        if not output.strip():
-            return [], "Dify Workflow 返回空内容"
-        return annotate.parse_quality_result(output)
 
     try:
         _, query = _fit_rows_to_query_budget(
@@ -1412,12 +1509,7 @@ async def _run_one_quality_batch_strict(
                 include_translations=include_translations,
             ),
         )
-        parsed, conv_or_error = await call(query)
-        if not parsed:
-            retry_query = (
-                f"上次输出无法解析（{conv_or_error}）。请重新处理并严格返回指定 JSON。\n\n{query}"
-            )
-            parsed, conv_or_error = await call(retry_query)
+        parsed, _ = await call(query, "initial")
         parsed_by_id = {
             str(result.get("id", "")).strip(): result
             for result in parsed if str(result.get("id", "")).strip()
@@ -1449,11 +1541,13 @@ async def _run_one_quality_batch_strict(
                 ),
             )
             try:
-                repair_parsed, repair_context = await call(repair_query)
+                repair_parsed, repair_context = await call(
+                    repair_query, "missing", fallback_first=True,
+                )
                 repair_error = "" if repair_parsed else repair_context
             except Exception as exc:
                 repair_parsed = []
-                repair_error = _public_dify_error(str(exc))
+                repair_error = _public_llm_error(str(exc))
 
             for repaired in repair_parsed:
                 row_id = str(repaired.get("id", "")).strip()
@@ -1487,7 +1581,7 @@ async def _run_one_quality_batch_strict(
             batch_num,
             [],
             {_row_id(row, id_col) for row in batch},
-            _public_dify_error(str(exc)),
+            _public_llm_error(str(exc)),
         )
 
 
@@ -1608,9 +1702,7 @@ async def quality_stream(sid: str, request: Request):
             rows[1:],
             id_col,
             open_text_cols,
-            DIFY_QUALITY_KEY,
             "quality-final",
-            fallback_api_key=DIFY_AI_DETECT_KEY,
         )
         order = {_row_id(row, id_col): index for index, row in enumerate(rows[1:])}
         all_results.sort(key=lambda result: order.get(str(result.get("id", "")), len(order)))

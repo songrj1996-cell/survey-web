@@ -619,18 +619,17 @@ class AnnotateReviewTests(unittest.IsolatedAsyncioTestCase):
             "translations": {"col_1": ""},
         }]
         rows = [["P1", "中文原文", "The skill delay is too long.", "666"]]
-        response = (
-            '```json\n[{"id":"P1","key":"col_2",'
-            '"translation":"技能延迟太长。"}]\n```'
-        )
+        response = [{
+            "id": "P1", "key": "col_2", "translation": "技能延迟太长。",
+        }]
 
         with patch.object(
             annotate_workflow,
-            "workflow_run",
-            new=AsyncMock(return_value=response),
+            "_call_translation_model",
+            new=AsyncMock(return_value=(response, "")),
         ) as call:
             missing, error = await annotate_workflow._repair_missing_translations(
-                "sid", results, rows, 0, [1, 2, 3], "key", "test",
+                "sid", results, rows, 0, [1, 2, 3], "test",
             )
 
         self.assertEqual(missing, set())
@@ -638,37 +637,41 @@ class AnnotateReviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(results[0]["translations"]["col_1"], "中文原文")
         self.assertEqual(results[0]["translations"]["col_2"], "技能延迟太长。")
         self.assertEqual(results[0]["translations"]["col_3"], "666")
-        sent_inputs = call.await_args.kwargs["inputs"]
-        self.assertEqual(sent_inputs["mode"], "translation_repair")
-        sent_query = sent_inputs["query"]
+        sent_query = call.await_args.args[0]
         self.assertNotIn('"key": "col_1"', sent_query)
         self.assertIn('"key": "col_2"', sent_query)
         self.assertNotIn('"key": "col_3"', sent_query)
+        self.assertEqual(call.await_args.args[1], "test-primary-1")
+        self.assertFalse(call.await_args.kwargs["fallback_first"])
 
-    async def test_translation_repair_retries_small_batch_then_uses_other_workflow(self):
+    async def test_translation_repair_retries_only_still_missing_cells(self):
         results = [{"id": "P1", "translations": {}}]
         rows = [["P1", "The skill delay is too long."]]
-        fallback_response = json.dumps([{
+        repaired = [{
             "id": "P1", "key": "col_1", "translation": "技能延迟太长。",
-        }])
+        }]
 
         with patch.object(
             annotate_workflow,
-            "workflow_run",
-            new=AsyncMock(side_effect=["[]", "[]", fallback_response]),
+            "_call_translation_model",
+            new=AsyncMock(side_effect=[([], "invalid"), (repaired, "")]),
         ) as call:
             missing, error = await annotate_workflow._repair_missing_translations(
-                "sid", results, rows, 0, [1], "primary-key", "test",
-                fallback_api_key="fallback-key",
+                "sid", results, rows, 0, [1], "test",
             )
 
         self.assertEqual(missing, set())
         self.assertEqual(error, "")
         self.assertEqual(results[0]["translations"]["col_1"], "技能延迟太长。")
-        self.assertEqual(call.await_count, 3)
-        self.assertEqual(call.await_args_list[0].kwargs["api_key"], "primary-key")
-        self.assertEqual(call.await_args_list[1].kwargs["api_key"], "primary-key")
-        self.assertEqual(call.await_args_list[2].kwargs["api_key"], "fallback-key")
+        self.assertEqual(call.await_count, 2)
+        self.assertEqual(call.await_args_list[0].args[1], "test-primary-1")
+        self.assertEqual(call.await_args_list[1].args[1], "test-retry-1")
+        self.assertFalse(call.await_args_list[0].kwargs["fallback_first"])
+        self.assertTrue(call.await_args_list[1].kwargs["fallback_first"])
+        self.assertEqual(
+            json.loads(call.await_args_list[0].args[0]),
+            json.loads(call.await_args_list[1].args[0]),
+        )
 
     def test_translation_validation_accepts_terms_that_should_remain_unchanged(self):
         for value in ("Aulus", "MLBB", "N/A", "https://example.com/image.png"):
@@ -715,42 +718,82 @@ class AnnotateReviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(missing, set())
         self.assertEqual(missing_translations, {"P1"})
 
-    async def test_ai_batch_uses_ai_detect_workflow_mode(self):
-        response = json.dumps([{
+    async def test_ai_missing_row_retry_prioritizes_fallback_model(self):
+        first = [{
+            "id": "P1", "ai_prob": 15, "polish_prob": 5,
+            "reason": "包含具体个人体验", "evidence": "",
+            "counter_evidence": "first answer", "translations": {},
+        }]
+        repaired = [{
+            "id": "P2", "ai_prob": 20, "polish_prob": 5,
+            "reason": "包含具体个人体验", "evidence": "",
+            "counter_evidence": "second answer", "translations": {},
+        }]
+        rows = [["P1", "first answer"], ["P2", "second answer"]]
+
+        with (
+            patch.object(
+                annotate_workflow,
+                "_run_ai_direct_batch",
+                new=AsyncMock(side_effect=[(first, ""), (repaired, "")]),
+            ) as run_batch,
+            patch.object(
+                annotate_workflow,
+                "_repair_missing_translations",
+                new=AsyncMock(return_value=(set(), "")),
+            ),
+        ):
+            _, results, missing, _, error = await annotate_workflow._run_ai_batch_checked(
+                "sid", 1, rows, ["ID", "Q1"], [1], 0, "",
+            )
+
+        self.assertEqual(missing, set())
+        self.assertEqual(error, "")
+        self.assertEqual([result["id"] for result in results], ["P1", "P2"])
+        self.assertEqual(run_batch.await_count, 2)
+        self.assertNotIn("fallback_first", run_batch.await_args_list[0].kwargs)
+        self.assertTrue(run_batch.await_args_list[1].kwargs["fallback_first"])
+        self.assertEqual(run_batch.await_args_list[1].args[1], [rows[1]])
+
+    async def test_ai_batch_uses_direct_ai_model_helper(self):
+        response = [{
             "id": "P1",
             "ai_prob": 15,
             "polish_prob": 70,
             "reason": "包含具体个人体验",
             "evidence": "",
             "counter_evidence": "I played three ranked matches last night.",
-        }])
+            "translations": {},
+        }]
 
         with patch.object(
-            annotate_workflow, "workflow_run", new=AsyncMock(return_value=response)
+            annotate_workflow,
+            "_call_ai_model",
+            new=AsyncMock(return_value=(response, "")),
         ) as call:
             results, error = await annotate_workflow._run_ai_direct_batch(
                 "sid", [["P1", "I played three ranked matches last night."]],
-                ["ID", "Q1"], [1], 0, "", "key", "1",
+                ["ID", "Q1"], [1], 0, "", "1",
             )
 
         self.assertEqual(error, "")
         self.assertEqual(results[0]["id"], "P1")
-        sent_inputs = call.await_args.kwargs["inputs"]
-        self.assertEqual(sent_inputs["mode"], "ai_detect")
-        self.assertIn("I played three ranked matches last night.", sent_inputs["query"])
+        self.assertIn("I played three ranked matches last night.", call.await_args.args[0])
+        self.assertEqual(call.await_args.args[1], "1")
+        self.assertFalse(call.await_args.kwargs["fallback_first"])
 
-    async def test_header_translation_uses_translation_repair_workflow_mode(self):
-        first_response = json.dumps([
+    async def test_header_translation_uses_shared_translation_helper(self):
+        first_response = [
             {"id": "__headers__", "key": "col_0", "translation": "玩家ID"},
-        ])
-        second_response = json.dumps([
+        ]
+        second_response = [
             {"id": "__headers__", "key": "col_1", "translation": "反馈"},
-        ])
+        ]
 
         with patch.object(
             annotate_workflow,
-            "workflow_run",
-            new=AsyncMock(side_effect=[first_response, second_response]),
+            "_call_translation_model",
+            new=AsyncMock(side_effect=[(first_response, ""), (second_response, "")]),
         ) as call:
             translated, warning = await annotate_workflow._translate_headers(
                 ["ID", "Feedback", "中文列"]
@@ -759,16 +802,19 @@ class AnnotateReviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(translated, ["玩家ID", "反馈", "中文列"])
         self.assertEqual(warning, "")
         self.assertEqual(call.await_count, 2)
-        sent_inputs = call.await_args_list[0].kwargs["inputs"]
-        self.assertEqual(sent_inputs["mode"], "translation_repair")
-        self.assertNotIn("中文列", sent_inputs["query"])
-        retry_inputs = call.await_args_list[1].kwargs["inputs"]
-        self.assertNotIn('"key": "col_0"', retry_inputs["query"])
-        self.assertIn('"key": "col_1"', retry_inputs["query"])
+        self.assertNotIn("中文列", call.await_args_list[0].args[0])
+        self.assertNotIn('"key": "col_0"', call.await_args_list[1].args[0])
+        self.assertIn('"key": "col_1"', call.await_args_list[1].args[0])
+        self.assertEqual(call.await_args_list[0].args[1], "header-1")
+        self.assertEqual(call.await_args_list[1].args[1], "header-2")
+        self.assertFalse(call.await_args_list[0].kwargs["fallback_first"])
+        self.assertTrue(call.await_args_list[1].kwargs["fallback_first"])
 
     async def test_header_translation_warns_after_targeted_retry_is_exhausted(self):
         with patch.object(
-            annotate_workflow, "workflow_run", new=AsyncMock(return_value="[]")
+            annotate_workflow,
+            "_call_translation_model",
+            new=AsyncMock(return_value=([], "invalid")),
         ) as call:
             translated, warning = await annotate_workflow._translate_headers(["Feedback"])
 
@@ -794,12 +840,11 @@ class AnnotateReviewTests(unittest.IsolatedAsyncioTestCase):
         responses = [first, repaired]
         calls = []
 
-        async def fake_workflow_run(*, inputs, **kwargs):
-            calls.append(inputs)
-            payload = responses.pop(0)
-            return json.dumps(payload)
+        async def fake_quality_model(query, label, *, fallback_first=False):
+            calls.append((query, label, fallback_first))
+            return responses.pop(0), ""
 
-        with patch.object(annotate_workflow, "workflow_run", new=fake_workflow_run):
+        with patch.object(annotate_workflow, "_call_quality_model", new=fake_quality_model):
             _, results, missing, error = await annotate_workflow._run_one_quality_batch_strict(
                 "sid", 1, [["P1", "first answer", "second answer"]],
                 ["ID", "Q1", "Q2"], [1, 2], 0, False,
@@ -809,9 +854,115 @@ class AnnotateReviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(error, "")
         self.assertEqual(results[0]["q_labels"]["col_1"], "优秀反馈")
         self.assertEqual(results[0]["q_labels"]["col_2"], "普通反馈")
-        self.assertTrue(all(call["mode"] == "quality_label" for call in calls))
-        self.assertIn("col_2", calls[1]["query"])
-        self.assertNotIn("col_1", calls[1]["query"])
+        self.assertEqual(
+            [(label, fallback_first) for _, label, fallback_first in calls],
+            [("1-initial", False), ("1-missing", True)],
+        )
+        self.assertIn("col_2", calls[1][0])
+        self.assertNotIn("col_1", calls[1][0])
+
+    async def test_model_helpers_route_models_reasoning_and_token_limits(self):
+        with (
+            patch.object(annotate_workflow, "_get_annotate_ai_system_prompt", return_value="AI SYSTEM"),
+            patch.object(annotate_workflow, "_get_annotate_quality_system_prompt", return_value="QUALITY SYSTEM"),
+            patch.object(annotate_workflow, "_get_annotate_translation_system_prompt", return_value="TRANSLATION SYSTEM"),
+            patch.object(annotate_workflow, "LLM_ANNOTATE_AI_MODEL", "ai-primary"),
+            patch.object(annotate_workflow, "LLM_ANNOTATE_AI_FALLBACK_MODELS", ("ai-fallback",)),
+            patch.object(annotate_workflow, "LLM_ANNOTATE_AI_REASONING", "high"),
+            patch.object(annotate_workflow, "LLM_ANNOTATE_AI_MAX_TOKENS", 31001),
+            patch.object(annotate_workflow, "LLM_ANNOTATE_QUALITY_MODEL", "quality-primary"),
+            patch.object(annotate_workflow, "LLM_ANNOTATE_QUALITY_FALLBACK_MODELS", ("quality-fallback",)),
+            patch.object(annotate_workflow, "LLM_ANNOTATE_QUALITY_REASONING", "medium"),
+            patch.object(annotate_workflow, "LLM_ANNOTATE_QUALITY_MAX_TOKENS", 31002),
+            patch.object(annotate_workflow, "LLM_ANNOTATE_TRANSLATION_MODEL", "translation-primary"),
+            patch.object(annotate_workflow, "LLM_ANNOTATE_TRANSLATION_FALLBACK_MODELS", ("translation-fallback",)),
+            patch.object(annotate_workflow, "LLM_ANNOTATE_TRANSLATION_REASONING", "low"),
+            patch.object(annotate_workflow, "LLM_ANNOTATE_TRANSLATION_MAX_TOKENS", 15003),
+            patch.object(
+                annotate_workflow,
+                "_collect_annotate_json",
+                new=AsyncMock(side_effect=[
+                    ([{"id": "P1"}], ""),
+                    ([{"id": "P2"}], ""),
+                    ([{"id": "P3"}], ""),
+                ]),
+            ) as collect,
+        ):
+            ai_results, ai_error = await annotate_workflow._call_ai_model("AI QUERY", "route")
+            quality_results, quality_error = await annotate_workflow._call_quality_model(
+                "QUALITY QUERY", "route"
+            )
+            translation_results, translation_error = (
+                await annotate_workflow._call_translation_model("TRANSLATION QUERY", "route")
+            )
+
+        self.assertEqual((ai_error, quality_error, translation_error), ("", "", ""))
+        self.assertEqual(ai_results[0]["id"], "P1")
+        self.assertEqual(quality_results[0]["id"], "P2")
+        self.assertEqual(translation_results[0]["id"], "P3")
+        expected = [
+            (
+                "AI SYSTEM", "AI QUERY", ("ai-primary", "ai-fallback"),
+                31001, "high", annotate.parse_ai_detect_result,
+            ),
+            (
+                "QUALITY SYSTEM", "QUALITY QUERY",
+                ("quality-primary", "quality-fallback"), 31002, "medium",
+                annotate.parse_quality_result,
+            ),
+            (
+                "TRANSLATION SYSTEM", "TRANSLATION QUERY",
+                ("translation-primary", "translation-fallback"), 15003, "low",
+                annotate.parse_translation_repair_result,
+            ),
+        ]
+        for actual, (system, query, models, max_tokens, reasoning, parser) in zip(
+            collect.await_args_list, expected
+        ):
+            self.assertEqual(actual.kwargs["system_prompt"], system)
+            self.assertIn(query, actual.kwargs["user_prompt"])
+            self.assertEqual(actual.kwargs["models"], models)
+            self.assertEqual(actual.kwargs["max_tokens"], max_tokens)
+            self.assertEqual(actual.kwargs["reasoning_effort"], reasoning)
+            self.assertIs(actual.kwargs["parser"], parser)
+
+    async def test_schema_invalid_retries_same_model_then_falls_back(self):
+        valid_response = json.dumps([{
+            "id": "P1", "ai_prob": 10, "polish_prob": 5,
+            "reason": "包含具体经历", "evidence": "", "counter_evidence": "",
+            "translations": {},
+        }])
+        with (
+            patch.object(annotate_workflow, "_get_annotate_ai_system_prompt", return_value="AI SYSTEM"),
+            patch.object(annotate_workflow, "LLM_ANNOTATE_AI_MODEL", "primary"),
+            patch.object(annotate_workflow, "LLM_ANNOTATE_AI_FALLBACK_MODELS", ("fallback",)),
+            patch.object(annotate_workflow, "LLM_ANNOTATE_AI_REASONING", "high"),
+            patch.object(annotate_workflow, "LLM_ANNOTATE_AI_MAX_TOKENS", 32001),
+            patch.object(
+                annotate_workflow,
+                "collect_chat_completion",
+                new=AsyncMock(side_effect=[
+                    ("not json", "primary"),
+                    ("still not json", "primary"),
+                    (valid_response, "fallback"),
+                ]),
+            ) as collect,
+        ):
+            results, error = await annotate_workflow._call_ai_model("SOURCE QUERY", "schema")
+
+        self.assertEqual(error, "")
+        self.assertEqual(results[0]["id"], "P1")
+        self.assertEqual(
+            [call.kwargs["models"] for call in collect.await_args_list],
+            [("primary",), ("primary",), ("fallback",)],
+        )
+        self.assertTrue(all(
+            call.kwargs["reasoning_effort"] == "high"
+            and call.kwargs["max_tokens"] == 32001
+            for call in collect.await_args_list
+        ))
+        self.assertIn("上次输出无法解析", collect.await_args_list[1].args[0][1]["content"])
+        self.assertNotIn("上次输出无法解析", collect.await_args_list[2].args[0][1]["content"])
 
 if __name__ == "__main__":
     unittest.main()

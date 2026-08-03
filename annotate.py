@@ -145,7 +145,7 @@ def build_ai_detect_query(
     batch_num: int | str = 1,
     background: str = "",
 ) -> str:
-    """构建 AI 检测 Dify 查询。"""
+    """构建 AI 作答识别模型查询。"""
     cols = [id_col] + [c for c in open_text_cols if c != id_col]
     table = _rows_to_md_table(batch_rows, headers, cols)
     bg_block = f"调研背景参考：{background.strip()}\n" if background.strip() else ""
@@ -165,7 +165,7 @@ def build_quality_label_query(
     batch_num: int | str = 1,
     include_translations: bool = True,
 ) -> str:
-    """构建质量打标 Dify 查询。"""
+    """构建回答质量识别模型查询。"""
     cols = [id_col] + [c for c in open_text_cols if c != id_col]
     table = _rows_to_md_table(batch_rows, headers, cols)
     col_desc = "、".join(

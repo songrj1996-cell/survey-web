@@ -1,7 +1,8 @@
-"""帖子评论舆情分析 · 预处理与统计（纯函数，无 Dify / 网络依赖）。
+"""帖子评论舆情分析 · 预处理与统计（纯函数，无 LLM / 网络依赖）。
 
 负责：文件解析、规则清洗、分层抽样、批次切分、本地统计聚合。
-Dify 并发调用与 SSE 编排在 server.py 中完成，本模块只提供可单元测试的纯逻辑。
+LLM 并发调用与 SSE 编排在 services/comment_pipeline.py 中完成，
+本模块只提供可单元测试的纯逻辑。
 
 清洗规则、抽样比例、批次大小等阈值集中在本文件顶部，方便后续调参。
 """
@@ -852,7 +853,7 @@ def stratified_sample(
 
 
 def make_batches(comments: list[str], batch_size: int = BATCH_SIZE) -> list[list[str]]:
-    """把评论切分为若干批，供并发调用 Dify。"""
+    """把评论切分为若干批，供并发调用 LLM。"""
     return [comments[i:i + batch_size] for i in range(0, len(comments), batch_size)]
 
 

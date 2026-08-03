@@ -1,27 +1,136 @@
 """services/comment_pipeline:评论舆情分析的编排。
 
-并发调用 Dify 评论分析 Workflow、精选代表性原文引用、拼装最终报告。
+并发调用公司 LLM 分发服务、精选代表性原文引用、拼装最终报告。
 纯解析/清洗/抽样逻辑在 comment_analysis 模块,此处只做编排。
 """
 import asyncio
+import json
 
 import comment_analysis
 from app.core.config import (
     COMMENT_ANALYSIS_CONCURRENCY,
     COMMENT_QUOTE_SELECT_CONCURRENCY,
-    DIFY_COMMENT_ANALYSIS_KEY,
+    LLM_COMMENT_CLASSIFY_FALLBACK_MODELS,
+    LLM_COMMENT_CLASSIFY_MAX_TOKENS,
+    LLM_COMMENT_CLASSIFY_MODEL,
+    LLM_COMMENT_EXTRACT_FALLBACK_MODELS,
+    LLM_COMMENT_EXTRACT_MODEL,
+    LLM_COMMENT_FAST_REASONING,
+    LLM_COMMENT_MAX_TOKENS,
+    LLM_COMMENT_MERGE_FALLBACK_MODELS,
+    LLM_COMMENT_MERGE_MODEL,
+    LLM_COMMENT_QUOTE_BATCH_FALLBACK_MODELS,
+    LLM_COMMENT_QUOTE_BATCH_MODEL,
+    LLM_COMMENT_QUOTE_FINAL_FALLBACK_MODELS,
+    LLM_COMMENT_QUOTE_FINAL_MODEL,
+    LLM_COMMENT_RELEVANCE_FALLBACK_MODELS,
+    LLM_COMMENT_RELEVANCE_MODEL,
+    LLM_COMMENT_REPORT_FALLBACK_MODELS,
+    LLM_COMMENT_REPORT_MODEL,
+    LLM_COMMENT_SYNTHESIS_REASONING,
+)
+from app.integrations.llm_client import collect_chat_completion
+from app.storage.prompts import (
+    _get_comment_classify_system_prompt,
+    _get_comment_extract_system_prompt,
+    _get_comment_merge_system_prompt,
+    _get_comment_quote_batch_system_prompt,
+    _get_comment_quote_final_system_prompt,
+    _get_comment_relevance_system_prompt,
+    _get_comment_report_system_prompt,
 )
 
 
-def _comment_dify_inputs(mode: str, **kw) -> dict:
-    """构造评论分析 Workflow 的输入；START 节点变量需全部带上。"""
-    return {
-        "mode": mode,
-        "post_title": kw.get("post_title", ""),
-        "post_content": kw.get("post_content", ""),
-        "comments_json": kw.get("comments_json", ""),
-        "themes_json": kw.get("themes_json", ""),
-    }
+def _model_chain(primary: str, fallbacks: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(x for x in (primary, *fallbacks) if str(x).strip()))
+
+
+def _comment_query(**payload) -> str:
+    """将原 Workflow 变量协议映射为直连 LLM 的单条 JSON 用户消息。"""
+    return json.dumps(payload, ensure_ascii=False)
+
+
+async def _comment_json_call(
+    *,
+    task: str,
+    system_prompt: str,
+    query: str,
+    models: tuple[str, ...],
+    reasoning_effort: str,
+    max_tokens: int,
+    validate,
+) -> tuple[list, str, bool]:
+    """调用结构化评论任务，schema 失败时原模型再生成一次，然后切备选。"""
+    errors: list[str] = []
+    for model in models:
+        for schema_attempt in range(2):
+            correction = ""
+            if schema_attempt:
+                correction = (
+                    "\n\n上一次输出未通过结构校验。请重新完整生成，"
+                    "只输出符合系统提示词契约的 JSON 数组。"
+                )
+            try:
+                raw, actual_model = await collect_chat_completion(
+                    [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": query + correction},
+                    ],
+                    models=(model,),
+                    max_tokens=max_tokens,
+                    reasoning_effort=reasoning_effort,
+                )
+            except Exception as exc:
+                errors.append(f"{model}: {type(exc).__name__}")
+                break
+            parsed, parse_error = comment_analysis.loads_loose(raw)
+            validation_error = validate(parsed)
+            if isinstance(parsed, list) and not validation_error:
+                return parsed, actual_model, bool(schema_attempt)
+            errors.append(
+                f"{model}: {validation_error or parse_error or '输出不是 JSON 数组'}"
+            )
+    raise RuntimeError(f"{task} 直连 LLM 输出校验失败；" + "; ".join(errors[-4:]))
+
+
+async def _comment_text_call(
+    *,
+    task: str,
+    system_prompt: str,
+    query: str,
+    models: tuple[str, ...],
+    reasoning_effort: str,
+    max_tokens: int,
+    validate,
+) -> tuple[str, str, bool]:
+    errors: list[str] = []
+    for model in models:
+        for schema_attempt in range(2):
+            correction = ""
+            if schema_attempt:
+                correction = (
+                    "\n\n上一次输出未满足报告结构。请按系统提示词"
+                    "重新完整生成 Markdown，不要代码围栏或前言。"
+                )
+            try:
+                raw, actual_model = await collect_chat_completion(
+                    [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": query + correction},
+                    ],
+                    models=(model,),
+                    max_tokens=max_tokens,
+                    reasoning_effort=reasoning_effort,
+                )
+            except Exception as exc:
+                errors.append(f"{model}: {type(exc).__name__}")
+                break
+            cleaned = str(raw or "").lstrip("\ufeff\u200b").strip()
+            validation_error = validate(cleaned)
+            if not validation_error:
+                return cleaned, actual_model, bool(schema_attempt)
+            errors.append(f"{model}: {validation_error}")
+    raise RuntimeError(f"{task} 直连 LLM 输出校验失败；" + "; ".join(errors[-4:]))
 
 
 def _comment_selected_raw_comments_md(items: list[dict]) -> str:
@@ -66,12 +175,6 @@ def _comment_append_selected_raw_comments(report_md: str, selected_raw_comments:
 
 async def _select_comment_raw_quotes(sess: dict) -> list[dict]:
     """从清洗后的长评论候选中精选最多 50 条原文评论。失败由调用方隔离。"""
-    import json as _json
-    from app.integrations.dify_client import workflow_run, STOP_SIGNAL
-
-    if not DIFY_COMMENT_ANALYSIS_KEY:
-        raise RuntimeError("未配置 DIFY_COMMENT_ANALYSIS_KEY")
-
     post_title = sess.get("comment_post_title", "") or ""
     post_content = sess.get("comment_post_content", "") or ""
     long_candidates = [
@@ -82,11 +185,17 @@ async def _select_comment_raw_quotes(sess: dict) -> list[dict]:
     if not long_candidates:
         return []
 
-    key = DIFY_COMMENT_ANALYSIS_KEY
     sem = asyncio.Semaphore(COMMENT_QUOTE_SELECT_CONCURRENCY)
-
-    def _batch_to_json(batch: list) -> str:
-        return _json.dumps(batch, ensure_ascii=False)
+    quote_batch_prompt = _get_comment_quote_batch_system_prompt()
+    quote_final_prompt = _get_comment_quote_final_system_prompt()
+    quote_batch_models = _model_chain(
+        LLM_COMMENT_QUOTE_BATCH_MODEL,
+        LLM_COMMENT_QUOTE_BATCH_FALLBACK_MODELS,
+    )
+    quote_final_models = _model_chain(
+        LLM_COMMENT_QUOTE_FINAL_MODEL,
+        LLM_COMMENT_QUOTE_FINAL_FALLBACK_MODELS,
+    )
 
     def _first_nonempty(item: dict, keys: list[str]) -> str:
         for key in keys:
@@ -173,25 +282,45 @@ async def _select_comment_raw_quotes(sess: dict) -> list[dict]:
         }
 
     async def _quote_batch(batch: list[dict]) -> list[dict]:
-        async with sem:
-            raw = await workflow_run(
-                inputs=_comment_dify_inputs(
-                    "quote_select_batch",
-                    post_title=post_title,
-                    post_content=post_content,
-                    comments_json=_batch_to_json(batch),
-                ),
-                api_key=key,
-                log_prefix="comment quote_select_batch",
-            )
-        if not raw or raw == STOP_SIGNAL:
-            return []
-        parsed, _e = comment_analysis.loads_loose(raw)
-        if not isinstance(parsed, list):
-            print("[comment quote_select_batch] parse failed or non-list output", flush=True)
-            return []
         expected = [int(x["idx"]) for x in batch]
         expected_set = set(expected)
+
+        def _validate(parsed) -> str:
+            if not isinstance(parsed, list):
+                return "输出不是 JSON 数组"
+            if len(parsed) > comment_analysis.QUOTE_SELECT_BATCH_KEEP_N:
+                return f"候选数 {len(parsed)} 超过上限"
+            for item in parsed:
+                if not isinstance(item, dict):
+                    return "候选项不是对象"
+                try:
+                    idx = int(item.get("idx"))
+                except (TypeError, ValueError):
+                    return "候选项缺少有效 idx"
+                if idx not in expected_set:
+                    return f"idx {idx} 不在当前批次"
+                if not str(item.get("translation") or "").strip():
+                    return f"idx {idx} 缺少中文翻译"
+            return ""
+
+        async with sem:
+            parsed, actual_model, repaired = await _comment_json_call(
+                task="评论原文初筛",
+                system_prompt=quote_batch_prompt,
+                query=_comment_query(
+                    post_title=post_title,
+                    post_content=post_content,
+                    comments_json=batch,
+                ),
+                models=quote_batch_models,
+                reasoning_effort=LLM_COMMENT_FAST_REASONING,
+                max_tokens=LLM_COMMENT_MAX_TOKENS,
+                validate=_validate,
+            )
+        print(
+            f"[comment quote_select_batch] model={actual_model} repaired={repaired}",
+            flush=True,
+        )
         out: list[dict] = []
         for i, item in enumerate(parsed):
             fallback = expected[i] if i < len(expected) else None
@@ -215,7 +344,7 @@ async def _select_comment_raw_quotes(sess: dict) -> list[dict]:
         if out and translated_count == 0:
             first_raw = parsed[0] if parsed else {}
             first_keys = list(first_raw.keys()) if isinstance(first_raw, dict) else []
-            first_preview = _json.dumps(first_raw, ensure_ascii=False)[:500] if isinstance(first_raw, dict) else str(first_raw)[:500]
+            first_preview = json.dumps(first_raw, ensure_ascii=False)[:500] if isinstance(first_raw, dict) else str(first_raw)[:500]
             print(
                 f"[comment quote_select_batch] translation missing; first_keys={first_keys}; first_item={first_preview}",
                 flush=True,
@@ -283,27 +412,51 @@ async def _select_comment_raw_quotes(sess: dict) -> list[dict]:
     if not batch_candidates:
         return []
 
-    async with sem:
-        raw_final = await workflow_run(
-            inputs=_comment_dify_inputs(
-                "quote_select_final",
-                post_title=post_title,
-                post_content=post_content,
-                comments_json=_json.dumps(batch_candidates, ensure_ascii=False),
-            ),
-            api_key=key,
-            log_prefix="comment quote_select_final",
+    candidates_by_idx = {int(x["idx"]): x for x in batch_candidates if "idx" in x}
+
+    def _validate_final(parsed) -> str:
+        if not isinstance(parsed, list):
+            return "输出不是 JSON 数组"
+        if len(parsed) > comment_analysis.QUOTE_SELECT_FINAL_N:
+            return f"精选数 {len(parsed)} 超过上限"
+        for item in parsed:
+            if not isinstance(item, dict):
+                return "精选项不是对象"
+            try:
+                idx = int(item.get("idx"))
+            except (TypeError, ValueError):
+                return "精选项缺少有效 idx"
+            if idx not in candidates_by_idx:
+                return f"idx {idx} 不在候选池"
+            if not str(item.get("translation") or "").strip():
+                return f"idx {idx} 缺少中文翻译"
+        return ""
+
+    try:
+        async with sem:
+            final_parsed, actual_model, repaired = await _comment_json_call(
+                task="评论原文最终精选",
+                system_prompt=quote_final_prompt,
+                query=_comment_query(
+                    post_title=post_title,
+                    post_content=post_content,
+                    comments_json=batch_candidates,
+                ),
+                models=quote_final_models,
+                reasoning_effort=LLM_COMMENT_SYNTHESIS_REASONING,
+                max_tokens=LLM_COMMENT_MAX_TOKENS,
+                validate=_validate_final,
+            )
+        print(
+            f"[comment quote_select_final] model={actual_model} repaired={repaired}",
+            flush=True,
         )
-    if not raw_final or raw_final == STOP_SIGNAL:
-        return _fallback_selected_from_batch_candidates(batch_candidates)
-    final_parsed, _e = comment_analysis.loads_loose(raw_final)
-    if not isinstance(final_parsed, list):
-        print("[comment quote_select_final] parse failed or non-list output; fallback to batch candidates", flush=True)
+    except RuntimeError as exc:
+        print(f"[comment quote_select_final] {exc}; fallback to batch candidates", flush=True)
         return _fallback_selected_from_batch_candidates(batch_candidates)
 
     selected: list[dict] = []
     seen_text: set[str] = set()
-    candidates_by_idx = {int(x["idx"]): x for x in batch_candidates if "idx" in x}
     for i, item in enumerate(final_parsed):
         fallback = int(batch_candidates[i]["idx"]) if i < len(batch_candidates) and "idx" in batch_candidates[i] else None
         normalized = _normalize_quote_item(item, fallback)
@@ -370,14 +523,8 @@ async def _comment_analysis_pipeline(sess: dict):
     """评论舆情分析流水线。异步生成器，yield ("progress", msg) / ("result", payload)。
 
     流程：relevance(并发) → extract(并发) → merge → classify(并发) → 本地统计 → report。
-    所有 Dify 调用走同一个 Workflow，靠 mode 路由；并发用 Semaphore 限流。
+    七个任务直连公司 LLM 分发服务；批处理任务用 Semaphore 限流。
     """
-    import json as _json
-    from app.integrations.dify_client import workflow_run, STOP_SIGNAL
-
-    if not DIFY_COMMENT_ANALYSIS_KEY:
-        raise RuntimeError("未配置 DIFY_COMMENT_ANALYSIS_KEY")
-
     post_title = sess.get("comment_post_title", "") or ""
     post_content = sess.get("comment_post_content", "") or ""
     sample_pool: list[str] = list(sess.get("comment_sample", []) or [])
@@ -388,11 +535,32 @@ async def _comment_analysis_pipeline(sess: dict):
     if not sample_pool:
         raise RuntimeError("没有可分析的评论，请重新上传文件")
 
-    key = DIFY_COMMENT_ANALYSIS_KEY
     sem = asyncio.Semaphore(COMMENT_ANALYSIS_CONCURRENCY)
-
-    def _batch_to_json(batch: list) -> str:
-        return _json.dumps(batch, ensure_ascii=False)
+    relevance_prompt = _get_comment_relevance_system_prompt()
+    extract_prompt = _get_comment_extract_system_prompt()
+    merge_prompt = _get_comment_merge_system_prompt()
+    classify_prompt = _get_comment_classify_system_prompt()
+    report_prompt = _get_comment_report_system_prompt()
+    relevance_models = _model_chain(
+        LLM_COMMENT_RELEVANCE_MODEL,
+        LLM_COMMENT_RELEVANCE_FALLBACK_MODELS,
+    )
+    extract_models = _model_chain(
+        LLM_COMMENT_EXTRACT_MODEL,
+        LLM_COMMENT_EXTRACT_FALLBACK_MODELS,
+    )
+    merge_models = _model_chain(
+        LLM_COMMENT_MERGE_MODEL,
+        LLM_COMMENT_MERGE_FALLBACK_MODELS,
+    )
+    classify_models = _model_chain(
+        LLM_COMMENT_CLASSIFY_MODEL,
+        LLM_COMMENT_CLASSIFY_FALLBACK_MODELS,
+    )
+    report_models = _model_chain(
+        LLM_COMMENT_REPORT_MODEL,
+        LLM_COMMENT_REPORT_FALLBACK_MODELS,
+    )
 
     # ── Phase 0：语义相关性筛选。先跑初始 5000；不足目标时从样本池补样 ─────
     sample_pool = sample_pool[:comment_analysis.SAMPLE_POOL_MAX_N]
@@ -436,55 +604,69 @@ async def _comment_analysis_pipeline(sess: dict):
     async def _judge_relevance(batch: list[dict], depth: int = 0):
         expected_idxs = [int(x["idx"]) for x in batch]
         expected_set = set(expected_idxs)
-        last_err = ""
-        for attempt in range(2):
+
+        def _validate(parsed) -> str:
+            if not isinstance(parsed, list):
+                return "输出不是 JSON 数组"
+            seen: set[int] = set()
+            for item in parsed:
+                normalized = _normalize_relevance_item(item)
+                if not normalized:
+                    return "存在缺少有效 idx 的筛选结果"
+                idx = normalized["idx"]
+                if idx not in expected_set:
+                    return f"idx {idx} 不在当前批次"
+                if idx in seen:
+                    return f"idx {idx} 重复"
+                seen.add(idx)
+            return ""
+
+        try:
             async with sem:
-                raw = await workflow_run(
-                    inputs=_comment_dify_inputs(
-                        "relevance",
+                arr, actual_model, repaired = await _comment_json_call(
+                    task="评论相关性筛选",
+                    system_prompt=relevance_prompt,
+                    query=_comment_query(
                         post_title=post_title,
                         post_content=post_content,
-                        comments_json=_batch_to_json(batch),
+                        comments_json=batch,
                     ),
-                    api_key=key,
-                    log_prefix="comment relevance",
+                    models=relevance_models,
+                    reasoning_effort=LLM_COMMENT_FAST_REASONING,
+                    max_tokens=LLM_COMMENT_MAX_TOKENS,
+                    validate=_validate,
                 )
-            if raw == STOP_SIGNAL:
-                raise RuntimeError("评论相关性筛选调用被 Dify 拒绝（HTTP 400），请检查 relevance 节点配置或输入")
-            arr, _e = comment_analysis.loads_loose(raw) if raw else (None, "empty")
-            if isinstance(arr, list):
-                by_idx: dict[int, dict] = {}
-                for i, item in enumerate(arr):
-                    fallback_idx = expected_idxs[i] if i < len(expected_idxs) else None
-                    normalized = _normalize_relevance_item(item, fallback_idx)
-                    if normalized and normalized["idx"] in expected_set:
-                        by_idx[normalized["idx"]] = normalized
-                # relevance 是筛选任务：Dify 可以只返回相关评论的 idx。
-                # 未返回的 idx 默认视为 off_topic，避免为了无关评论反复重试。
-                return [
-                    by_idx.get(idx) or {
-                        "idx": idx,
-                        "is_related": False,
-                        "relation": "off_topic",
-                        "reason": "relevance 节点未返回该评论，按无关处理",
-                    }
-                    for idx in expected_idxs
-                ]
-            got = len(arr) if isinstance(arr, list) else "非数组"
-            last_err = f"返回 {got}，期望 idx 数 {len(batch)}"
-            print(f"[comment relevance] 第 {attempt + 1} 次返回格式不符（{last_err}），重试中…", flush=True)
-        if len(batch) > 10 and depth < 3:
-            mid = len(batch) // 2
             print(
-                f"[comment relevance] 批次仍不匹配，自动拆分为 {mid}+{len(batch) - mid} 条继续重试",
+                f"[comment relevance] model={actual_model} repaired={repaired}",
                 flush=True,
             )
-            left = await _judge_relevance(batch[:mid], depth + 1)
-            right = await _judge_relevance(batch[mid:], depth + 1)
-            return left + right
-        raise RuntimeError(
-            f"评论相关性筛选返回 idx 不完整（{last_err}），拆分重试后仍失败，已中止分析"
-        )
+        except RuntimeError:
+            if len(batch) > 10 and depth < 3:
+                mid = len(batch) // 2
+                print(
+                    f"[comment relevance] 批次校验失败，自动拆分为 {mid}+{len(batch) - mid} 条",
+                    flush=True,
+                )
+                left = await _judge_relevance(batch[:mid], depth + 1)
+                right = await _judge_relevance(batch[mid:], depth + 1)
+                return left + right
+            raise
+
+        by_idx: dict[int, dict] = {}
+        for item in arr:
+            normalized = _normalize_relevance_item(item)
+            if normalized:
+                by_idx[normalized["idx"]] = normalized
+        # 筛选任务只返回需保留评论；未返回 idx 按无关处理。
+        return [
+            by_idx.get(idx) or {
+                "idx": idx,
+                "is_related": False,
+                "relation": "off_topic",
+                "reason": "相关性筛选未返回该评论，按无关处理",
+            }
+            for idx in expected_idxs
+        ]
 
     async def _run_relevance_slice(start_idx: int, end_idx: int, round_results: list[dict]):
         nonlocal processed_sample_count, relevance_done, total_relevance_batches
@@ -576,18 +758,39 @@ async def _comment_analysis_pipeline(sess: dict):
     extract_done = 0
 
     async def _extract(batch: list[str]):
+        def _validate(parsed) -> str:
+            if not isinstance(parsed, list) or not parsed:
+                return "未返回候选主题数组"
+            for item in parsed:
+                if not isinstance(item, dict):
+                    return "候选主题不是对象"
+                if not str(item.get("theme_name") or "").strip():
+                    return "候选主题缺少 theme_name"
+                if not str(item.get("description") or "").strip():
+                    return "候选主题缺少 description"
+                if item.get("sentiment") not in {"positive", "negative", "neutral"}:
+                    return "候选主题 sentiment 非法"
+            return ""
+
         async with sem:
-            raw = await workflow_run(
-                inputs=_comment_dify_inputs(
-                    "extract", post_title=post_title, post_content=post_content, comments_json=_batch_to_json(batch)
+            parsed, actual_model, repaired = await _comment_json_call(
+                task="评论主题提取",
+                system_prompt=extract_prompt,
+                query=_comment_query(
+                    post_title=post_title,
+                    post_content=post_content,
+                    comments_json=batch,
                 ),
-                api_key=key,
-                log_prefix="comment extract",
+                models=extract_models,
+                reasoning_effort=LLM_COMMENT_SYNTHESIS_REASONING,
+                max_tokens=LLM_COMMENT_MAX_TOKENS,
+                validate=_validate,
             )
-        if not raw or raw == STOP_SIGNAL:
-            return []
-        parsed, _e = comment_analysis.loads_loose(raw)
-        return parsed if isinstance(parsed, list) else []
+        print(
+            f"[comment extract] model={actual_model} repaired={repaired}",
+            flush=True,
+        )
+        return parsed
 
     extract_tasks = [asyncio.create_task(_extract(b)) for b in extract_batches]
     candidates: list[dict] = []
@@ -598,25 +801,47 @@ async def _comment_analysis_pipeline(sess: dict):
         yield ("progress", f"主题提取进度 {extract_done}/{n_extract_batch} 批")
 
     if not candidates:
-        raise RuntimeError("主题提取未返回任何结果，请检查 Dify extract 节点配置")
+        raise RuntimeError("主题提取未返回任何有效结果")
 
     # ── Phase 2：合并去重主题（单次） ───────────────────────────────────
     yield ("progress", "正在汇总并合并去重主题…")
-    raw_merge = await workflow_run(
-        inputs=_comment_dify_inputs(
-            "merge",
+    def _validate_merged(parsed) -> str:
+        if not isinstance(parsed, list) or not parsed:
+            return "未返回最终主题数组"
+        seen: set[str] = set()
+        for item in parsed:
+            if not isinstance(item, dict):
+                return "最终主题不是对象"
+            tid = str(item.get("theme_id") or "").strip()
+            name = str(item.get("theme_name") or "").strip()
+            if not tid or not name or not str(item.get("description") or "").strip():
+                return "最终主题缺少 theme_id/theme_name/description"
+            if tid in seen:
+                return f"theme_id {tid} 重复"
+            seen.add(tid)
+            if item.get("sentiment") not in {"positive", "negative", "neutral"}:
+                return f"theme_id {tid} 的 sentiment 非法"
+        return ""
+
+    merged, merge_model, merge_repaired = await _comment_json_call(
+        task="评论主题合并",
+        system_prompt=merge_prompt,
+        query=_comment_query(
             post_title=post_title,
             post_content=post_content,
-            themes_json=_json.dumps(candidates, ensure_ascii=False),
+            themes_json=candidates,
         ),
-        api_key=key,
-        log_prefix="comment merge",
+        models=merge_models,
+        reasoning_effort=LLM_COMMENT_SYNTHESIS_REASONING,
+        max_tokens=LLM_COMMENT_MAX_TOKENS,
+        validate=_validate_merged,
     )
-    merged, _e = comment_analysis.loads_loose(raw_merge)
-    if not isinstance(merged, list) or not merged:
-        raise RuntimeError("主题合并未返回有效结果，请检查 Dify merge 节点配置")
+    print(
+        f"[comment merge] model={merge_model} repaired={merge_repaired}",
+        flush=True,
+    )
 
-    # Dify 用 theme_id / theme_name，内部统计用 id / name，转一层
+    # LLM 契约用 theme_id / theme_name，内部统计用 id / name，转一层。
     final_themes: list[dict] = []
     for t in merged:
         if not isinstance(t, dict):
@@ -635,10 +860,10 @@ async def _comment_analysis_pipeline(sess: dict):
         raise RuntimeError("主题合并结果缺少 theme_id / theme_name 字段")
 
     # 给 classify 用的主题列表（id + name + description）
-    themes_for_classify = _json.dumps(
-        [{"theme_id": t["id"], "theme_name": t["name"], "description": t["description"]} for t in final_themes],
-        ensure_ascii=False,
-    )
+    themes_for_classify = [
+        {"theme_id": t["id"], "theme_name": t["name"], "description": t["description"]}
+        for t in final_themes
+    ]
 
     # ── Phase 3：并发分类各批评论 ───────────────────────────────────────
     indexed_comments = [{"idx": i, "text": text} for i, text in enumerate(comments)]
@@ -672,59 +897,76 @@ async def _comment_analysis_pipeline(sess: dict):
 
     async def _classify(batch: list[dict], depth: int = 0):
         # classify 输入带 idx，输出也必须带回 idx；本地按 idx 回填。
-        # 如果 Dify 返回部分结果，缺失 idx 会拆成更小批次补跑，避免整批作废。
+        # 如果 LLM 返回部分结果，缺失 idx 会拆成更小批次补跑。
         expected_idxs = [int(x["idx"]) for x in batch]
         expected_set = set(expected_idxs)
-        last_err = ""
-        for attempt in range(3):  # 首次 + 重试 2 次
+        valid_theme_ids = {t["id"] for t in final_themes}
+
+        def _validate(parsed) -> str:
+            if not isinstance(parsed, list):
+                return "输出不是 JSON 数组"
+            by_idx: dict[int, dict] = {}
+            for item in parsed:
+                normalized = _normalize_classify_item(item)
+                if not normalized:
+                    return "存在缺少有效 idx 的分类结果"
+                idx = normalized["idx"]
+                if idx not in expected_set:
+                    return f"idx {idx} 不在当前批次"
+                if idx in by_idx:
+                    return f"idx {idx} 重复"
+                tids = normalized["theme_ids"]
+                if any(tid != "other" and tid not in valid_theme_ids for tid in tids):
+                    return f"idx {idx} 使用了未知 theme_id"
+                if "other" in tids and len(tids) > 1:
+                    return f"idx {idx} 的 other 不能与其他主题并存"
+                if normalized["sentiment"] not in {
+                    "positive", "negative", "neutral", "mixed"
+                }:
+                    return f"idx {idx} 的 sentiment 非法"
+                by_idx[idx] = normalized
+            missing = expected_set - set(by_idx)
+            if missing:
+                return f"缺少 {len(missing)} 条 idx"
+            return ""
+
+        try:
             async with sem:
-                raw = await workflow_run(
-                    inputs=_comment_dify_inputs(
-                        "classify",
+                arr, actual_model, repaired = await _comment_json_call(
+                    task="评论分类",
+                    system_prompt=classify_prompt,
+                    query=_comment_query(
                         post_title=post_title,
                         post_content=post_content,
-                        comments_json=_batch_to_json(batch),
+                        comments_json=batch,
                         themes_json=themes_for_classify,
                     ),
-                    api_key=key,
-                    log_prefix="comment classify",
+                    models=classify_models,
+                    reasoning_effort=LLM_COMMENT_FAST_REASONING,
+                    max_tokens=LLM_COMMENT_CLASSIFY_MAX_TOKENS,
+                    validate=_validate,
                 )
-            if raw == STOP_SIGNAL:
-                # STOP_SIGNAL 语义是 Dify 返回 400（永久性请求错误），重试无益，
-                # 且静默丢批会导致统计偏小却显示成功，故直接中止整个分析。
-                raise RuntimeError("评论分类调用被 Dify 拒绝（HTTP 400），已中止分析，请检查 classify 节点配置或输入")
-            arr, _e = comment_analysis.loads_loose(raw) if raw else (None, "empty")
-            if isinstance(arr, list):
-                by_idx: dict[int, dict] = {}
-                for i, item in enumerate(arr):
-                    fallback_idx = expected_idxs[i] if i < len(expected_idxs) else None
-                    normalized = _normalize_classify_item(item, fallback_idx)
-                    if normalized and normalized["idx"] in expected_set:
-                        by_idx[normalized["idx"]] = normalized
-                missing = [idx for idx in expected_idxs if idx not in by_idx]
-                if not missing:
-                    return [by_idx[idx] for idx in expected_idxs]
-                last_err = f"返回 {len(by_idx)} 条有效 idx，缺失 {len(missing)} 条"
-                print(
-                    f"[comment classify] 第 {attempt + 1} 次返回不完整（{last_err}），重试中…",
-                    flush=True,
-                )
-                continue
-            got = len(arr) if isinstance(arr, list) else "非数组"
-            last_err = f"返回 {got}，期望 idx 数 {len(batch)}"
-            print(f"[comment classify] 第 {attempt + 1} 次返回格式不符（{last_err}），重试中…", flush=True)
-        if len(batch) > 10 and depth < 3:
-            mid = len(batch) // 2
             print(
-                f"[comment classify] 批次仍不匹配，自动拆分为 {mid}+{len(batch) - mid} 条继续重试",
+                f"[comment classify] model={actual_model} repaired={repaired}",
                 flush=True,
             )
-            left = await _classify(batch[:mid], depth + 1)
-            right = await _classify(batch[mid:], depth + 1)
-            return left + right
-        raise RuntimeError(
-            f"评论分类批次返回 idx 不完整（{last_err}），拆分重试后仍失败，已中止分析"
-        )
+        except RuntimeError:
+            if len(batch) > 10 and depth < 3:
+                mid = len(batch) // 2
+                print(
+                    f"[comment classify] 批次校验失败，自动拆分为 {mid}+{len(batch) - mid} 条",
+                    flush=True,
+                )
+                left = await _classify(batch[:mid], depth + 1)
+                right = await _classify(batch[mid:], depth + 1)
+                return left + right
+            raise
+        by_idx = {}
+        for item in arr:
+            normalized = _normalize_classify_item(item)
+            if normalized:
+                by_idx[normalized["idx"]] = normalized
+        return [by_idx[idx] for idx in expected_idxs]
 
     classify_tasks = [asyncio.create_task(_classify(b)) for b in classify_batches]
     classifications: list[dict] = []
@@ -734,7 +976,7 @@ async def _comment_analysis_pipeline(sess: dict):
             classify_done += 1
             yield ("progress", f"评论分类进度 {classify_done}/{n_classify_batch} 批")
     except BaseException:
-        # 任一批失败/中止时，取消其余仍在跑的批，避免继续空打 Dify
+        # 任一批失败/中止时，取消其余仍在跑的批，避免继续消耗 LLM 请求。
         for task in classify_tasks:
             if not task.done():
                 task.cancel()
@@ -742,7 +984,7 @@ async def _comment_analysis_pipeline(sess: dict):
         raise
 
     if not classifications:
-        raise RuntimeError("评论分类未返回任何结果，请检查 Dify classify 节点配置")
+        raise RuntimeError("评论分类未返回任何有效结果")
 
     # ── Phase 4：本地统计聚合 ───────────────────────────────────────────
     yield ("progress", "正在统计占比、情感分布与代表引用…")
@@ -771,15 +1013,37 @@ async def _comment_analysis_pipeline(sess: dict):
         ],
         "other_themes": stats["other_themes"],
     }
-    report_md = await workflow_run(
-        inputs=_comment_dify_inputs(
-            "report", post_title=post_title, post_content=post_content, themes_json=_json.dumps(report_payload, ensure_ascii=False)
+    def _validate_report(text: str) -> str:
+        if not text:
+            return "报告为空"
+        if "```" in text:
+            return "报告包含 Markdown 代码围栏"
+        missing = [
+            heading
+            for heading in ("## 核心结论", "## 玩家核心观点", "## 业务建议")
+            if heading not in text
+        ]
+        if missing:
+            return "缺少章节：" + "、".join(missing)
+        return ""
+
+    report_md, report_model, report_repaired = await _comment_text_call(
+        task="中文评论舆情简报",
+        system_prompt=report_prompt,
+        query=_comment_query(
+            post_title=post_title,
+            post_content=post_content,
+            themes_json=report_payload,
         ),
-        api_key=key,
-        log_prefix="comment report",
+        models=report_models,
+        reasoning_effort=LLM_COMMENT_SYNTHESIS_REASONING,
+        max_tokens=LLM_COMMENT_MAX_TOKENS,
+        validate=_validate_report,
     )
-    if report_md == STOP_SIGNAL:
-        report_md = ""
+    print(
+        f"[comment report] model={report_model} repaired={report_repaired}",
+        flush=True,
+    )
 
     yield ("result", {
         "themes": stats["themes"],

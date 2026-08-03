@@ -6,7 +6,17 @@ import json
 import os
 
 from app.core.config import (
+    DEFAULT_ANNOTATE_AI_SYSTEM_PROMPT,
+    DEFAULT_ANNOTATE_QUALITY_SYSTEM_PROMPT,
+    DEFAULT_ANNOTATE_TRANSLATION_SYSTEM_PROMPT,
     DEFAULT_COLUMN_DETECT_SYSTEM_PROMPT,
+    DEFAULT_COMMENT_CLASSIFY_SYSTEM_PROMPT,
+    DEFAULT_COMMENT_EXTRACT_SYSTEM_PROMPT,
+    DEFAULT_COMMENT_MERGE_SYSTEM_PROMPT,
+    DEFAULT_COMMENT_QUOTE_BATCH_SYSTEM_PROMPT,
+    DEFAULT_COMMENT_QUOTE_FINAL_SYSTEM_PROMPT,
+    DEFAULT_COMMENT_RELEVANCE_SYSTEM_PROMPT,
+    DEFAULT_COMMENT_REPORT_SYSTEM_PROMPT,
     DEFAULT_CROSSTAB_PLANNER_SYSTEM_PROMPT,
     DEFAULT_PLANNER_EXTRA,
     DEFAULT_RESPONSE_CLASSIFY_SYSTEM_PROMPT,
@@ -145,6 +155,116 @@ DEFAULT_PROMPTS: dict = {
         "history": [],
         "version": 1,
     },
+    "annotate_ai_system": {
+        "key": "annotate_ai_system",
+        "label": "AI 作答识别 System Prompt",
+        "description": "用于判断玩家开放题回答的 AI 生成或润色概率，并提供证据与反证。",
+        "dify_app": None,
+        "dify_url": None,
+        "editable": True,
+        "current": DEFAULT_ANNOTATE_AI_SYSTEM_PROMPT,
+        "history": [],
+        "version": 1,
+    },
+    "annotate_quality_system": {
+        "key": "annotate_quality_system",
+        "label": "回答质量识别 System Prompt",
+        "description": "用于逐题标记玩家开放题回答的质量问题、理由与证据。",
+        "dify_app": None,
+        "dify_url": None,
+        "editable": True,
+        "current": DEFAULT_ANNOTATE_QUALITY_SYSTEM_PROMPT,
+        "history": [],
+        "version": 1,
+    },
+    "annotate_translation_system": {
+        "key": "annotate_translation_system",
+        "label": "标注中文翻译 System Prompt",
+        "description": "用于补齐标注结果中缺失的题头或玩家回答中文翻译。",
+        "dify_app": None,
+        "dify_url": None,
+        "editable": True,
+        "current": DEFAULT_ANNOTATE_TRANSLATION_SYSTEM_PROMPT,
+        "history": [],
+        "version": 1,
+    },
+    "comment_relevance_system": {
+        "key": "comment_relevance_system",
+        "label": "评论相关性筛选 System Prompt",
+        "description": "用于判断多语言评论是否与帖子主题相关且有分析价值。",
+        "dify_app": None,
+        "dify_url": None,
+        "editable": True,
+        "current": DEFAULT_COMMENT_RELEVANCE_SYSTEM_PROMPT,
+        "history": [],
+        "version": 1,
+    },
+    "comment_extract_system": {
+        "key": "comment_extract_system",
+        "label": "评论主题提取 System Prompt",
+        "description": "用于从已通过相关性筛选的评论中提取候选主题。",
+        "dify_app": None,
+        "dify_url": None,
+        "editable": True,
+        "current": DEFAULT_COMMENT_EXTRACT_SYSTEM_PROMPT,
+        "history": [],
+        "version": 1,
+    },
+    "comment_merge_system": {
+        "key": "comment_merge_system",
+        "label": "评论主题合并 System Prompt",
+        "description": "用于跨批次合并候选主题并生成稳定主题 ID。",
+        "dify_app": None,
+        "dify_url": None,
+        "editable": True,
+        "current": DEFAULT_COMMENT_MERGE_SYSTEM_PROMPT,
+        "history": [],
+        "version": 1,
+    },
+    "comment_classify_system": {
+        "key": "comment_classify_system",
+        "label": "评论分类 System Prompt",
+        "description": "用于将每条评论多标签归类、判断情感并翻译代表引用。",
+        "dify_app": None,
+        "dify_url": None,
+        "editable": True,
+        "current": DEFAULT_COMMENT_CLASSIFY_SYSTEM_PROMPT,
+        "history": [],
+        "version": 1,
+    },
+    "comment_report_system": {
+        "key": "comment_report_system",
+        "label": "评论舆情简报 System Prompt",
+        "description": "用于基于本地统计结果生成中文核心结论、玩家观点和业务建议。",
+        "dify_app": None,
+        "dify_url": None,
+        "editable": True,
+        "current": DEFAULT_COMMENT_REPORT_SYSTEM_PROMPT,
+        "history": [],
+        "version": 1,
+    },
+    "comment_quote_batch_system": {
+        "key": "comment_quote_batch_system",
+        "label": "评论原文初筛 System Prompt",
+        "description": "用于分批筛选表达完整、有业务价值的长评论并翻译为中文。",
+        "dify_app": None,
+        "dify_url": None,
+        "editable": True,
+        "current": DEFAULT_COMMENT_QUOTE_BATCH_SYSTEM_PROMPT,
+        "history": [],
+        "version": 1,
+    },
+    "comment_quote_final_system": {
+        "key": "comment_quote_final_system",
+        "label": "评论原文精选 System Prompt",
+        "description": "用于从各批候选中精选最终展示的多样化玩家原文。",
+        "dify_app": None,
+        "dify_url": None,
+        "editable": True,
+        "current": DEFAULT_COMMENT_QUOTE_FINAL_SYSTEM_PROMPT,
+        "history": [],
+        "version": 1,
+    },
     "report_qa_system": {
         "key": "report_qa_system",
         "label": "报告追问 System Prompt",
@@ -221,6 +341,46 @@ def _get_theme_merge_system_prompt() -> str:
 
 def _get_response_classify_system_prompt() -> str:
     return _load_prompts()["response_classify_system"]["current"]
+
+
+def _get_annotate_ai_system_prompt() -> str:
+    return _load_prompts()["annotate_ai_system"]["current"]
+
+
+def _get_annotate_quality_system_prompt() -> str:
+    return _load_prompts()["annotate_quality_system"]["current"]
+
+
+def _get_annotate_translation_system_prompt() -> str:
+    return _load_prompts()["annotate_translation_system"]["current"]
+
+
+def _get_comment_relevance_system_prompt() -> str:
+    return _load_prompts()["comment_relevance_system"]["current"]
+
+
+def _get_comment_extract_system_prompt() -> str:
+    return _load_prompts()["comment_extract_system"]["current"]
+
+
+def _get_comment_merge_system_prompt() -> str:
+    return _load_prompts()["comment_merge_system"]["current"]
+
+
+def _get_comment_classify_system_prompt() -> str:
+    return _load_prompts()["comment_classify_system"]["current"]
+
+
+def _get_comment_report_system_prompt() -> str:
+    return _load_prompts()["comment_report_system"]["current"]
+
+
+def _get_comment_quote_batch_system_prompt() -> str:
+    return _load_prompts()["comment_quote_batch_system"]["current"]
+
+
+def _get_comment_quote_final_system_prompt() -> str:
+    return _load_prompts()["comment_quote_final_system"]["current"]
 
 
 def _get_report_qa_system_prompt() -> str:
