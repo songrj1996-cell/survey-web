@@ -23,6 +23,7 @@ VALID_ROLES = {
     "multi_choice",
     "scale",
     "matrix_scale",
+    "matrix_single",
     "matrix_multi",
     "open_text",
     "ignore",
@@ -31,7 +32,7 @@ VALID_ROLES = {
 # 不参与统计的"标识列"角色（不强制归入某个 part）
 NON_STAT_ROLES = ("id", "mlbbid", "ignore")
 # 矩阵题角色（一道题跨多列）
-MATRIX_ROLES = ("matrix_scale", "matrix_multi")
+MATRIX_ROLES = ("matrix_scale", "matrix_single", "matrix_multi")
 
 
 # ============================================================================
@@ -290,6 +291,7 @@ _ROLE_LABELS: dict[str, tuple[str, str]] = {
     "multi_choice": ("☑️", "多选题"),
     "scale": ("🔢", "量表题"),
     "matrix_scale": ("📐", "矩阵打分"),
+    "matrix_single": ("🔘", "矩阵单选"),
     "matrix_multi": ("🧮", "矩阵多选"),
     "open_text": ("💬", "开放题"),
     "ignore": ("⏸️", "忽略"),
@@ -298,7 +300,7 @@ _ROLE_LABELS: dict[str, tuple[str, str]] = {
 # 渲染顺序
 _ROLE_ORDER = (
     "id", "mlbbid", "profile_dim", "single_choice", "multi_choice",
-    "scale", "matrix_scale", "matrix_multi", "open_text", "ignore",
+    "scale", "matrix_scale", "matrix_single", "matrix_multi", "open_text", "ignore",
 )
 
 
@@ -637,12 +639,12 @@ def expand_confirmed_to_columns(confirmed: list[dict]) -> list[dict]:
                 if role == "matrix_scale":
                     col["min"] = q.get("scale_min")
                     col["max"] = q.get("scale_max")
-                if role == "matrix_multi":
+                if role in ("matrix_single", "matrix_multi"):
                     if q.get("options"):
                         col["options"] = list(q["options"])
                     if q.get("options_original"):
                         col["options_original"] = list(q["options_original"])
-                    if q.get("delimiter"):
+                    if role == "matrix_multi" and q.get("delimiter"):
                         col["delimiter"] = q["delimiter"]
                     if aliases:
                         col["value_aliases"] = aliases

@@ -8,6 +8,7 @@ import asyncio
 from contextlib import suppress
 from datetime import datetime
 
+import crosstab_parser
 import survey_plan
 import survey_stats
 
@@ -52,6 +53,13 @@ from app.services.question_detect import (
     _reconcile_question_roles,
     _sanitize_choice_options,
 )
+from app.services.questionnaire_import import (
+    QUESTIONNAIRE_TRANSLATION_SYSTEM_PROMPT,
+    apply_questionnaire_translations,
+    build_questionnaire_translation_query,
+    parse_bested_qualitative_upload,
+    parse_questionnaire_translations,
+)
 from app.services.report_engine import (
     _batch_qualitative_analysis,
     _build_crosstab_plan_revision_query,
@@ -75,6 +83,7 @@ from app.services.report_engine import (
 )
 from app.services.report_history import save_to_history
 from app.services.report_render import _inject_disclaimer, _inject_research_background
+from app.services.stats_presentation import inject_qualitative_stats, render_stats_appendix
 from app.storage.history import _load_history, _save_history
 from app.storage.prompts import (
     _get_column_detect_system_prompt,
@@ -89,12 +98,44 @@ from app.storage.sessions import get_session, new_session, save_session
 # ── 上传 ────────────────────────────────────────────────────────
 
 
-async def handle_survey_upload(filename: str, content: bytes, login: dict | None) -> dict:
+async def handle_survey_upload(
+    filename: str,
+    content: bytes,
+    login: dict | None,
+    *,
+    source_type: str = "google",
+    questionnaire_filename: str | None = None,
+    questionnaire_content: bytes | None = None,
+) -> dict:
     """解析上传文件，创建 session，返回前端所需的 result dict。"""
-    try:
-        rows = _parse_file(filename, content)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    if source_type not in {"google", "bested"}:
+        raise HTTPException(status_code=400, detail="不支持的数据来源")
+    if questionnaire_content and source_type != "bested":
+        raise HTTPException(status_code=400, detail="当前仅倍市得来源支持上传调研问卷")
+
+    deterministic_questions: list[dict] | None = None
+    questionnaire_text = ""
+    matched_questions = 0
+    if questionnaire_content:
+        q_name = (questionnaire_filename or "").lower()
+        if not q_name.endswith((".xls", ".xlsx")):
+            raise HTTPException(
+                status_code=400,
+                detail="调研问卷仅支持倍市得导出的 .xls / .xlsx 文件",
+            )
+        try:
+            imported = parse_bested_qualitative_upload(content, questionnaire_content)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=f"调研问卷匹配失败：{e}")
+        rows = imported["rows"]
+        deterministic_questions = imported["questions"]
+        questionnaire_text = imported["questionnaire_text"]
+        matched_questions = imported["matched_questions"]
+    else:
+        try:
+            rows = _parse_file(filename, content)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
     if not rows:
         raise HTTPException(status_code=400, detail="文件为空")
@@ -105,6 +146,12 @@ async def handle_survey_upload(filename: str, content: bytes, login: dict | None
     sess = get_session(sid)
     sess["rows"] = rows
     sess["filename"] = filename
+    sess["source_type"] = source_type
+    if deterministic_questions is not None:
+        sess["columns_detected"] = deterministic_questions
+        sess["column_provider"] = "questionnaire"
+        sess["questionnaire_text"] = questionnaire_text
+        sess["questionnaire_filename"] = questionnaire_filename
     _assign_session_owner(sess, login)
     save_session(sid, sess)
 
@@ -114,6 +161,9 @@ async def handle_survey_upload(filename: str, content: bytes, login: dict | None
         "total_rows": len(rows) - 1,
         "headers": rows[0],
         "preview": rows[1: min(6, len(rows))],
+        "source_type": source_type,
+        "questionnaire_used": deterministic_questions is not None,
+        "matched_questions": matched_questions,
     }
 
 
@@ -172,6 +222,87 @@ async def columns_stream(session_id: str, request: Request):
     sess = get_session(session_id)
     rows = sess.get("rows")
     try:
+        if sess.get("column_provider") == "questionnaire":
+            questions = sess.get("columns_detected") or []
+            if sess.get("questionnaire_translation_status") != "translated":
+                yield sse_event({
+                    "type": "chunk",
+                    "content": "原问卷题型与结构已锁定，正在翻译题干、选项和矩阵行。\n",
+                })
+                query = build_questionnaire_translation_query(questions)
+                models = (LLM_COLUMN_MODEL, *LLM_COLUMN_FALLBACK_MODELS)
+                messages = [
+                    {
+                        "role": "system",
+                        "content": QUESTIONNAIRE_TRANSLATION_SYSTEM_PROMPT,
+                    },
+                    {"role": "user", "content": query},
+                ]
+                answer = ""
+                used_model = ""
+                async for event, result in _run_direct_llm(
+                    messages,
+                    models=models,
+                    max_tokens=LLM_COLUMN_MAX_TOKENS,
+                    reasoning_effort=LLM_COLUMN_REASONING or None,
+                ):
+                    if event:
+                        yield event
+                    if result:
+                        answer, used_model = result
+                try:
+                    translations = parse_questionnaire_translations(answer, questions)
+                except ValueError as exc:
+                    retry_messages = _json_repair_messages(
+                        QUESTIONNAIRE_TRANSLATION_SYSTEM_PROMPT,
+                        query,
+                        answer,
+                        str(exc),
+                        (
+                            "请只修复翻译 JSON。不得改变 question_id、数组长度或顺序，"
+                            "并确保英文题干已翻译为简体中文。"
+                        ),
+                    )
+                    retry_answer = ""
+                    async for event, result in _run_direct_llm(
+                        retry_messages,
+                        models=models,
+                        max_tokens=LLM_COLUMN_MAX_TOKENS,
+                        reasoning_effort=LLM_COLUMN_REASONING or None,
+                    ):
+                        if event:
+                            yield event
+                        if result:
+                            retry_answer, used_model = result
+                    translations = parse_questionnaire_translations(
+                        retry_answer, questions,
+                    )
+                questions = apply_questionnaire_translations(
+                    questions, translations,
+                )
+                sess["columns_detected"] = questions
+                sess["questionnaire_translation_status"] = "translated"
+                sess["questionnaire_translation_model"] = used_model
+                save_session(session_id, sess)
+            yield sse_event({
+                "type": "chunk",
+                "content": "已从调研问卷读取题型和结构，并完成中文翻译；AI 未参与题型判断。\n",
+            })
+            await audit_log(
+                request, "survey", "读取问卷题型",
+                f"会话：{session_id}；识别题目数：{len(questions)}",
+                metadata={
+                    "session_id": session_id,
+                    "columns": len(questions),
+                    "provider": "questionnaire",
+                    "translation_model": sess.get(
+                        "questionnaire_translation_model", "",
+                    ),
+                },
+            )
+            yield sse_event({"type": "columns_ready", "columns": questions})
+            return
+
         groups = _group_googleform_matrix(rows[0])
         query = _build_column_detect_query(rows, groups)
         header_count = len(rows[0])
@@ -294,13 +425,17 @@ async def plan_stream(session_id: str, request: Request):
     confirmed_columns = sess.get("confirmed_columns")
     branch_rules = _ensure_branch_rules(sess)
     is_crosstab = sess.get("mode") == "crosstab"
+    qualitative_context = sess.get("qualitative_context")
     try:
         if is_crosstab:
             cols = confirmed_columns or []
             open_names = [c["name"] for c in cols if c.get("role") == "open_text"]
             avail = sess.get("crosstab_questions", [])
             query = _build_crosstab_planner_query(
-                sess.get("questionnaire_text", ""), avail, open_names
+                sess.get("questionnaire_text", ""),
+                avail,
+                open_names,
+                qualitative_context,
             )
             system_prompt = _get_crosstab_planner_system_prompt()
             models = (LLM_PLANNER_MODEL, *LLM_PLANNER_FALLBACK_MODELS)
@@ -465,6 +600,7 @@ async def plan_revision_stream(session_id: str, user_text: str, request: Request
                 open_names,
                 plan.get("parts", []),
                 user_text,
+                sess.get("qualitative_context"),
             )
             system_prompt = _get_crosstab_planner_system_prompt()
             models = (LLM_PLANNER_MODEL, *LLM_PLANNER_FALLBACK_MODELS)
@@ -613,12 +749,21 @@ async def compute_survey_stats(session_id: str, request: Request) -> str:
     if not plan or not rows:
         raise HTTPException(status_code=400, detail="会话状态丢失")
     loop = asyncio.get_event_loop()
-    if sess.get("mode") == "crosstab":
+    stats_source = sess.get("stats_source") or (
+        "external_crosstab" if sess.get("mode") == "crosstab" else "python"
+    )
+    if stats_source == "external_crosstab":
         stats_md = sess.get("crosstab_md", "")
         open_text = await loop.run_in_executor(None, survey_stats.collect_open_text, rows, plan)
+        stats_blocks = crosstab_parser.structured_tables(
+            sess.get("crosstab_parsed") or {},
+        )
     else:
         stats_md, open_text = await loop.run_in_executor(None, survey_stats.compute, rows, plan)
+        stats_blocks = survey_stats.structured_tables(stats_md)
     sess["stats_md"] = stats_md
+    sess["stats_blocks"] = stats_blocks
+    sess["stats_source"] = stats_source
     sess["open_text"] = open_text
     sess["rows_fed"] = False
     save_session(session_id, sess)
@@ -701,7 +846,8 @@ async def report_stream(session_id: str, request: Request):
     stats_md = sess.get("stats_md")
     open_text = sess.get("open_text", {})
     is_crosstab = sess.get("mode") == "crosstab"
-    qualitative_context = None if is_crosstab else sess.get("qualitative_context")
+    quantitative_first = sess.get("analysis_mode") == "quantitative" or is_crosstab
+    qualitative_context = sess.get("qualitative_context")
     use_large_mode = is_crosstab or any(len(v) > LARGE_SAMPLE_THRESHOLD for v in open_text.values())
     writer_messages = [{"role": "system", "content": REPORT_WRITER_SYSTEM_PROMPT}]
     writer_models_used: list[str] = []
@@ -761,7 +907,15 @@ async def report_stream(session_id: str, request: Request):
             writer_query = _build_large_sample_writer_query(
                 stats_md, clustered_themes, plan, rows[0], open_text,
                 qualitative_context=qualitative_context,
+                quantitative_first=quantitative_first,
             )
+            if quantitative_first:
+                writer_query = (
+                    "<quantitative_report_rule>本报告以客观题统计为主、开放题分析为辅。"
+                    "正文必须优先解释关键分布和显著差异；完整逐题统计表将由系统确定性追加，"
+                    "不要自行重算或改写表内数字。</quantitative_report_rule>\n\n"
+                    + writer_query
+                )
             if is_crosstab:
                 q_text = (sess.get("questionnaire_text") or "").strip()
                 if q_text:
@@ -811,7 +965,10 @@ async def report_stream(session_id: str, request: Request):
                 yield sse_event({"type": "progress",
                                  "message": f"分章生成 {rnd}/{total_rounds}：Part {m['i']} {m['name']}…"})
                 yield sse_event({"type": "chunk", "content": "\n\n"})
-                async for ev in _round(_build_writer_part_query(m)):
+                async for ev in _round(_build_writer_part_query(
+                    m,
+                    quantitative_first=quantitative_first,
+                )):
                     yield ev
                 sec = _round.out
                 part_sections.append(sec.strip())
@@ -868,6 +1025,16 @@ async def report_stream(session_id: str, request: Request):
                 assembled.append(bug_section)
             assembled.append(action_section)
             full_report = "\n\n".join(b for b in assembled if b)
+
+        if quantitative_first:
+            appendix = render_stats_appendix(
+                sess.get("stats_blocks") or [],
+                sess.get("stats_source") or "python",
+            )
+            if appendix:
+                full_report = "\n\n".join((full_report.rstrip(), appendix))
+        else:
+            full_report = inject_qualitative_stats(full_report, stats_md, plan)
 
         drifted = survey_stats.find_numbers_not_in_stats(full_report, stats_md)
         if drifted:
@@ -975,6 +1142,14 @@ def validate_columns_ready(session_id: str) -> None:
     sess = get_session(session_id)
     if not sess.get("rows"):
         raise HTTPException(status_code=400, detail="会话中没有数据")
+
+
+def columns_require_llm(session_id: str) -> bool:
+    """原问卷结构不需模型判断，但首次展示前仍需模型完成纯文本翻译。"""
+    sess = get_session(session_id)
+    if sess.get("column_provider") != "questionnaire":
+        return True
+    return sess.get("questionnaire_translation_status") != "translated"
 
 
 def validate_plan_ready(session_id: str) -> str:

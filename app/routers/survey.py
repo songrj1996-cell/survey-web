@@ -3,7 +3,7 @@
 业务编排、SSE 流程、session 推进、历史落库全部在 services/survey_service。
 跑数表(crosstab)模式复用本组的 plan/stats/report/qa 流程，仅上传入口在 routers/crosstab。
 """
-from fastapi import APIRouter, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.core.config import (
@@ -22,6 +22,7 @@ from app.services.audit import audit_log
 from app.services.auth import _current_login
 from app.services.survey_service import (
     columns_stream,
+    columns_require_llm,
     compute_survey_stats,
     handle_survey_upload,
     history_qa_stream,
@@ -44,14 +45,36 @@ router = APIRouter()
 
 
 @router.post("/api/upload")
-async def upload_file(request: Request, file: UploadFile = File(...)):
+async def upload_file(
+    request: Request,
+    file: UploadFile = File(...),
+    source_type: str = Form("google"),
+    questionnaire_file: UploadFile | None = File(None),
+):
     content = await file.read()
+    questionnaire_content = (
+        await questionnaire_file.read() if questionnaire_file is not None else None
+    )
     login = await _current_login(request)
-    result = await handle_survey_upload(file.filename or "upload.csv", content, login)
+    result = await handle_survey_upload(
+        file.filename or "upload.csv",
+        content,
+        login,
+        source_type=source_type,
+        questionnaire_filename=(
+            questionnaire_file.filename if questionnaire_file is not None else None
+        ),
+        questionnaire_content=questionnaire_content,
+    )
     await audit_log(
         request, "survey", "上传数据",
         f"文件：{result['filename']}；样本行数：{result['total_rows']}",
-        metadata={"session_id": result["session_id"], "rows": result["total_rows"]},
+        metadata={
+            "session_id": result["session_id"],
+            "rows": result["total_rows"],
+            "source_type": result["source_type"],
+            "questionnaire_used": result["questionnaire_used"],
+        },
     )
     return result
 
@@ -59,7 +82,7 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
 @router.get("/api/columns/{session_id}")
 async def get_columns(session_id: str, request: Request):
     validate_columns_ready(session_id)
-    if not LLM_API_KEY or not LLM_COLUMN_MODEL:
+    if columns_require_llm(session_id) and (not LLM_API_KEY or not LLM_COLUMN_MODEL):
         raise HTTPException(status_code=500, detail="未配置题型识别 LLM 分发服务")
     return StreamingResponse(columns_stream(session_id, request), media_type="text/event-stream")
 

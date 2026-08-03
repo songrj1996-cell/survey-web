@@ -32,6 +32,79 @@ def _plan_json() -> str:
 
 
 class DirectSurveyPlannerTests(unittest.IsolatedAsyncioTestCase):
+    def test_questionnaire_columns_require_llm_only_until_translation_is_cached(self):
+        with patch.object(
+            survey_service,
+            "get_session",
+            return_value={"column_provider": "questionnaire"},
+        ):
+            self.assertTrue(survey_service.columns_require_llm("sid"))
+
+        with patch.object(
+            survey_service,
+            "get_session",
+            return_value={
+                "column_provider": "questionnaire",
+                "questionnaire_translation_status": "translated",
+            },
+        ):
+            self.assertFalse(survey_service.columns_require_llm("sid"))
+
+    async def test_questionnaire_columns_are_translated_without_reclassifying(self):
+        sess = {
+            "rows": [
+                ["Familiarity [The Mist]", "Familiarity [Northern Vale]"],
+                ["Very familiar", "Never heard of it"],
+            ],
+            "column_provider": "questionnaire",
+            "columns_detected": [{
+                "source_question_id": "Q5",
+                "name_zh": "How familiar are you with the following?",
+                "role": "matrix_single",
+                "column_indexes": [0, 1],
+                "rows": ["The Mist", "Northern Vale"],
+                "options": ["Very familiar", "Never heard of it"],
+                "options_original": ["Very familiar", "Never heard of it"],
+            }],
+        }
+        answer = json.dumps({
+            "translations": [{
+                "question_id": "Q5",
+                "name_zh": "您对以下内容的熟悉程度如何？",
+                "options_zh": ["非常熟悉", "从未听说过"],
+                "rows_zh": ["迷雾之地", "北境山谷"],
+            }],
+        }, ensure_ascii=False)
+        collect = AsyncMock(return_value=(answer, "gpt-5.6-terra"))
+
+        with (
+            patch.object(survey_service, "get_session", return_value=sess),
+            patch.object(survey_service, "save_session"),
+            patch.object(survey_service, "audit_log", new=AsyncMock()),
+            patch.object(survey_service, "collect_chat_completion", new=collect),
+            patch.object(survey_service, "LLM_COLUMN_MODEL", "gpt-5.6-terra"),
+            patch.object(
+                survey_service,
+                "LLM_COLUMN_FALLBACK_MODELS",
+                ("qwen3.7-plus",),
+            ),
+        ):
+            events = [
+                event async for event in survey_service.columns_stream("sid", object())
+            ]
+
+        translated = sess["columns_detected"][0]
+        self.assertEqual(translated["role"], "matrix_single")
+        self.assertEqual(translated["column_indexes"], [0, 1])
+        self.assertEqual(translated["name_zh"], "您对以下内容的熟悉程度如何？")
+        self.assertEqual(translated["options"], ["非常熟悉", "从未听说过"])
+        self.assertEqual(
+            translated["value_aliases"]["非常熟悉"],
+            ["Very familiar"],
+        )
+        self.assertEqual(sess["questionnaire_translation_status"], "translated")
+        self.assertTrue(any('"type": "columns_ready"' in event for event in events))
+
     async def test_columns_stream_uses_multilingual_direct_model_chain(self):
         rows = [
             ["Which role do you usually play?", "Seberapa puas Anda dengan antarmuka baru?"],

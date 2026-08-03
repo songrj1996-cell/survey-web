@@ -12,6 +12,8 @@ marked.setOptions({ breaks: true, gfm: true });
 const state = {
   sessionId: null,
   mode: null,         // null=定性(5步) | 'crosstab'=倍市得跑数表(4步)
+  surveySource: 'google',
+  questionnaireUsed: false,
   currentStep: 1,
   viewStep: 1,        // 当前查看的步骤（可回看已完成步骤，不影响 currentStep）
   columns: null,      // Step 2 题型数据
@@ -54,12 +56,13 @@ const ROLE_OPTIONS = [
   ['multi_choice', '多选题'],
   ['scale', '量表题'],
   ['matrix_scale', '矩阵打分'],
+  ['matrix_single', '矩阵单选'],
   ['matrix_multi', '矩阵多选'],
   ['open_text', '开放题'],
   ['ignore', '忽略此列'],
 ];
-const MATRIX_ROLES = ['matrix_scale', 'matrix_multi'];
-const CHOICE_ROLES = ['single_choice', 'profile_dim', 'multi_choice', 'matrix_multi'];
+const MATRIX_ROLES = ['matrix_scale', 'matrix_single', 'matrix_multi'];
+const CHOICE_ROLES = ['single_choice', 'profile_dim', 'multi_choice', 'matrix_single', 'matrix_multi'];
 
 // ── DOM 引用 ──
 const $ = id => document.getElementById(id);

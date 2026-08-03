@@ -119,6 +119,102 @@ def render_to_markdown(parsed: dict) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+def structured_tables(parsed: dict) -> list[dict]:
+    """把跑数表解析结果转成与 Python 统计一致的展示结构。"""
+    segment_labels = [segment["label"] for segment in parsed.get("segments", [])]
+    questions = parsed.get("questions", [])
+    blocks: list[dict] = []
+    matrix_groups: dict[str, list[dict]] = {}
+
+    for question in questions:
+        group = str(question.get("matrix_group") or "").strip()
+        if group:
+            matrix_groups.setdefault(group, []).append(question)
+            continue
+        options = question.get("options") or []
+        if not options:
+            continue
+        headers = ["选项", *segment_labels]
+        rows = [
+            [
+                str(option.get("label") or ""),
+                *[_fmt_pct((option.get("values") or {}).get(label)) for label in segment_labels],
+            ]
+            for option in options
+        ]
+        table_lines = [
+            "| " + " | ".join(headers) + " |",
+            "|" + "|".join(["---"] * len(headers)) + "|",
+            *["| " + " | ".join(row) + " |" for row in rows],
+        ]
+        blocks.append({
+            "title": str(question.get("name") or "未命名题目"),
+            "part": "",
+            "chart": {
+                "type": "bar",
+                "labels": [row[0] for row in rows],
+                "series": [
+                    {
+                        "name": label,
+                        "values": [
+                            round(float((option.get("values") or {}).get(label)) * 100, 1)
+                            if (option.get("values") or {}).get(label) is not None else None
+                            for option in options
+                        ],
+                    }
+                    for label in segment_labels[:6]
+                ],
+            },
+            "table_markdown": "\n".join(table_lines),
+        })
+
+    for group, members in matrix_groups.items():
+        option_labels: list[str] = []
+        for member in members:
+            for option in member.get("options") or []:
+                label = str(option.get("label") or "").strip()
+                if label and label not in option_labels:
+                    option_labels.append(label)
+        if not option_labels:
+            continue
+        primary_segment = segment_labels[0] if segment_labels else ""
+        heat_rows: list[list[str]] = []
+        values: list[list[float | None]] = []
+        for member in members:
+            by_option = {
+                str(option.get("label") or ""): (option.get("values") or {}).get(primary_segment)
+                for option in member.get("options") or []
+            }
+            raw_values = [by_option.get(label) for label in option_labels]
+            values.append([
+                round(float(value) * 100, 1) if value is not None else None
+                for value in raw_values
+            ])
+            heat_rows.append([
+                str(member.get("sub_item") or member.get("name") or "子项"),
+                *[_fmt_pct(value) for value in raw_values],
+            ])
+        headers = ["子项", *option_labels]
+        table_lines = [
+            "| " + " | ".join(headers) + " |",
+            "|" + "|".join(["---"] * len(headers)) + "|",
+            *["| " + " | ".join(row) + " |" for row in heat_rows],
+        ]
+        blocks.append({
+            "title": group,
+            "part": "",
+            "chart": {
+                "type": "heatmap",
+                "columns": option_labels,
+                "rows": [row[0] for row in heat_rows],
+                "values": values,
+                "series_name": primary_segment,
+            },
+            "table_markdown": "\n".join(table_lines),
+        })
+    return blocks
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 读取单元格网格(zip + XML,绕开 openpyxl dimension 问题)
 # ──────────────────────────────────────────────────────────────────────────────

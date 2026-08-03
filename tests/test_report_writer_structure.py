@@ -3,8 +3,12 @@ import unittest
 from app.core.config import DEFAULT_WRITER_REQUIREMENTS
 from app.services.report_engine import (
     _build_qa_context,
+    _build_crosstab_plan_revision_query,
+    _build_crosstab_planner_query,
+    _build_large_sample_writer_query,
     _build_writer_action_query,
     _build_writer_context,
+    _build_writer_core_query,
     _build_writer_part_query,
 )
 
@@ -20,6 +24,13 @@ class ReportWriterStructureTests(unittest.TestCase):
         self.assertIn("`**本节总结：**`", requirements)
         self.assertIn("Markdown 编号列表", requirements)
         self.assertIn("`**相关具体信息引用：**`", requirements)
+        self.assertIn("不看玩家原文也能立即理解的**大白话**", requirements)
+        self.assertIn("优先沿用玩家反馈中文翻译中的具体说法", requirements)
+        self.assertIn("不得为了通俗而补造", requirements)
+        self.assertIn("未参与调研立项、未看过问卷提纲的读者也能独立理解", requirements)
+        self.assertIn("分别回车成短段，不强制编号", requirements)
+        self.assertIn("不同范围的观点与风险不得混写", requirements)
+        self.assertNotIn("用 1 段话概括本次调研", requirements)
         self.assertIn("`建议内容`、`优先级`、`产品动作`、`验证方式`、`依据`、`不确定性/前提`", requirements)
         self.assertNotIn("用连贯的段落文字（不用列表）", requirements)
         self.assertNotIn("`**代表性玩家反馈：**`", requirements)
@@ -39,8 +50,71 @@ class ReportWriterStructureTests(unittest.TestCase):
         self.assertIn("玩家ID | 画像信息 | 中文翻译", query)
         self.assertIn("3–6 条带加粗短标题的 Markdown 编号列表", query)
         self.assertIn("`**相关具体信息引用：**`", query)
+        self.assertIn("不看后文原文也能理解的大白话", query)
+        self.assertIn("确需概括时", query)
+        self.assertIn("不得补造原文中没有的例子", query)
         self.assertNotIn("`**代表性玩家反馈：**`", query)
         self.assertNotIn("`#### 正面观点`", query)
+        self.assertIn("系统会在本节总结之后确定性插入一个 `辅助统计` 模块", query)
+        self.assertIn("不要自行复制客观题统计表", query)
+
+    def test_core_query_requires_plain_language_grounded_in_player_wording(self):
+        query = _build_writer_core_query(
+            [{"i": 1, "name": "皮肤编号", "col_desc": "编号评价(open_text)"}],
+            has_bug=False,
+        )
+
+        self.assertIn("不看玩家原文也能立即理解的大白话", query)
+        self.assertIn("优先沿用玩家中文翻译中的具体词语", query)
+        self.assertIn("功能性增益", query)
+        self.assertIn("具体希望增加、取消或改变什么", query)
+        self.assertIn("解释和例子只能来自 <open_text> 或已生成章节", query)
+        self.assertIn("未参与调研立项、未看过问卷提纲的读者也能独立理解", query)
+        self.assertIn("分别回车成短段，不使用 1、2、3 编号", query)
+        self.assertIn("不得写成一个超长段落", query)
+        self.assertIn("不同范围不得混写", query)
+        self.assertIn("不得机械套用标签或补造研究阶段", query)
+
+    def test_quantitative_part_query_prioritizes_objective_statistics(self):
+        query = _build_writer_part_query({
+            "i": 1,
+            "name": "使用情况",
+            "col_desc": "使用频率(single_choice); 使用原因(open_text)",
+        }, quantitative_first=True)
+
+        self.assertIn("本次为定量优先报告", query)
+        self.assertIn("主要分布、最高/最低项和显著差异", query)
+        self.assertIn("完整逐题统计表由系统在附录确定性插入", query)
+        self.assertNotIn("本节总结之后确定性插入一个 `辅助统计` 模块", query)
+
+    def test_large_sample_mode_keeps_qualitative_stats_rule_out_of_quantitative_query(self):
+        plan = {"parts": [], "columns": []}
+        qualitative = _build_large_sample_writer_query(
+            "", {}, plan, [], quantitative_first=False,
+        )
+        quantitative = _build_large_sample_writer_query(
+            "", {}, plan, [], quantitative_first=True,
+        )
+
+        self.assertIn("系统会在每个 Part 内确定性插入一个 `辅助统计` 模块", qualitative)
+        self.assertNotIn("系统会在每个 Part 内确定性插入一个 `辅助统计` 模块", quantitative)
+
+    def test_crosstab_planning_uses_business_context(self):
+        context = {
+            "problem": "判断新剧情是否值得继续投入",
+            "key_concerns": "不同熟悉度玩家的认知差异",
+            "target_users": "剧情内容玩家",
+        }
+
+        initial = _build_crosstab_planner_query("Q1", ["熟悉度"], [], context)
+        revised = _build_crosstab_plan_revision_query(
+            "Q1", ["熟悉度"], [], [{"name": "认知"}], "突出差异", context,
+        )
+
+        for query in (initial, revised):
+            self.assertIn("判断新剧情是否值得继续投入", query)
+            self.assertIn("不同熟悉度玩家的认知差异", query)
+            self.assertIn("剧情内容玩家", query)
 
     def test_action_query_requires_six_column_markdown_table(self):
         query = _build_writer_action_query(

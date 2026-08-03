@@ -4,6 +4,7 @@ import unittest
 from app.services.question_detect import (
     _build_column_detect_query,
     _group_googleform_matrix,
+    _heuristic_questions,
     _heuristic_type,
     _reconcile_question_roles,
     _sanitize_choice_options,
@@ -84,6 +85,23 @@ class QuestionDetectTests(unittest.TestCase):
         question = _reconcile_question_roles(rows, questions)[0]
 
         self.assertEqual(question["role"], "open_text")
+
+    def test_google_matrix_with_one_shared_category_per_cell_is_matrix_single(self):
+        rows = [
+            ["功能评价 [易用性]", "功能评价 [稳定性]"],
+            ["满意", "一般"],
+            ["一般", "满意"],
+            ["不满意", "一般"],
+        ]
+        groups = _group_googleform_matrix(rows[0])
+
+        questions = _heuristic_questions(rows, groups)
+
+        self.assertEqual(len(questions), 1)
+        self.assertEqual(questions[0]["role"], "matrix_single")
+        self.assertEqual(questions[0]["column_indexes"], [0, 1])
+        self.assertEqual(questions[0]["rows"], ["易用性", "稳定性"])
+        self.assertEqual(questions[0]["options"], ["满意", "一般", "不满意"])
 
 
 if __name__ == "__main__":

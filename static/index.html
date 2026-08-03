@@ -11,7 +11,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/style.css?v=33" />
+  <link rel="stylesheet" href="/static/style.css?v=36" />
 </head>
 
 <body>
@@ -169,7 +169,7 @@
         </div>
         <div class="panel__header">
           <h1 class="panel__title">选择分析入口</h1>
-          <p class="panel__desc">按数据来源选择流程。定量入口用于倍市得跑数表，上传三类文件后直接进入报告方案确认。</p>
+          <p class="panel__desc">按数据来源选择流程。定量入口用于倍市得数据：跑数表已上传时直接进入方案确认，未上传时先确认题型并由 Python 自动统计。</p>
         </div>
 
         <!-- 分析类型选择 -->
@@ -197,8 +197,8 @@
               </svg>
             </div>
             <div class="analysis-type-card__body">
-              <div class="analysis-type-card__title">定量分析（倍市得跑数表）</div>
-              <div class="analysis-type-card__desc">上传问卷、清数结果和跑数表。报告数字取自跑数表，主观题由平台聚类补充。</div>
+              <div class="analysis-type-card__title">定量分析（倍市得）</div>
+              <div class="analysis-type-card__desc">以客观题统计为主、开放题分析为辅。跑数表选填，未上传时由平台自动计算。</div>
               <div class="analysis-type-card__enter">选择入口 →</div>
             </div>
           </div>
@@ -210,14 +210,14 @@
             <div class="crosstab-uploader__header">
               <div>
                 <h2 class="crosstab-uploader__title">上传倍市得定量文件</h2>
-                <p class="crosstab-uploader__desc">请一次性准备问卷文件、回答数据和跑数表。全部选齐后，系统会解析跑数表并跳过题型确认。</p>
+                <p class="crosstab-uploader__desc">调研问卷和回答明细必填；专业跑数表选填。未上传跑数表时，平台将确认题型并由 Python 自动统计。</p>
               </div>
               <span class="analysis-type-card__badge">CSV / Excel · 最大 50MB</span>
             </div>
 
             <div class="crosstab-file-grid">
               <label class="crosstab-file-card" for="ct-survey" data-ct-slot="survey">
-                <input type="file" id="ct-survey" accept=".csv,.xlsx" hidden />
+                <input type="file" id="ct-survey" accept=".xls,.xlsx" hidden />
                 <span class="crosstab-file-card__icon">
                   <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
                     <path d="M14 2H7a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7z" />
@@ -226,8 +226,8 @@
                   </svg>
                 </span>
                 <span class="crosstab-file-card__body">
-                  <span class="crosstab-file-card__title">问卷文件</span>
-                  <span class="crosstab-file-card__desc">题目结构与问卷原文，用于理解报告章节。</span>
+                  <span class="crosstab-file-card__title">调研问卷 <em>必填</em></span>
+                  <span class="crosstab-file-card__desc">用于准确读取题型、选项、矩阵结构和问卷原文。</span>
                   <span class="crosstab-file-card__filename" data-ct-file-name="survey">未选择文件</span>
                 </span>
                 <span class="crosstab-file-card__action">选择文件</span>
@@ -242,8 +242,8 @@
                   </svg>
                 </span>
                 <span class="crosstab-file-card__body">
-                  <span class="crosstab-file-card__title">回答数据（清数结果）</span>
-                  <span class="crosstab-file-card__desc">已清洗的样本明细，用于主观题聚类和样本定位。</span>
+                  <span class="crosstab-file-card__title">回答明细 <em>必填</em></span>
+                  <span class="crosstab-file-card__desc">逐份回答数据，用于统计计算、主观题分析和样本定位。</span>
                   <span class="crosstab-file-card__filename" data-ct-file-name="data">未选择文件</span>
                 </span>
                 <span class="crosstab-file-card__action">选择文件</span>
@@ -258,17 +258,40 @@
                   </svg>
                 </span>
                 <span class="crosstab-file-card__body">
-                  <span class="crosstab-file-card__title">跑数表（统计结果）</span>
-                  <span class="crosstab-file-card__desc">倍市得后台导出的交叉统计表，报告数字以此为准。</span>
+                  <span class="crosstab-file-card__title">专业跑数表 <em class="is-optional">选填</em></span>
+                  <span class="crosstab-file-card__desc">上传后以跑数表为正式口径；不上传则由 Python 自动计算。</span>
                   <span class="crosstab-file-card__filename" data-ct-file-name="crosstab">未选择文件</span>
                 </span>
                 <span class="crosstab-file-card__action">选择文件</span>
               </label>
             </div>
 
+            <div class="context-form-wrap crosstab-context-form" id="crosstab-context-form-wrap">
+              <details class="context-form__details" open>
+                <summary class="context-form__summary">
+                  <span class="context-form__summary-title">建议填写：补充调研背景</span>
+                  <span class="context-form__summary-hint">用于确定统计解读重点和行动建议，不填不影响生成</span>
+                </summary>
+                <div class="context-form__body">
+                  <div class="context-form__field">
+                    <label for="ct-ctx-problem">业务问题/业务痛点/业务规划是什么？</label>
+                    <textarea id="ct-ctx-problem" rows="2"></textarea>
+                  </div>
+                  <div class="context-form__field">
+                    <label for="ct-ctx-key-concerns">本次调研最关心的问题是什么？</label>
+                    <textarea id="ct-ctx-key-concerns" rows="2"></textarea>
+                  </div>
+                  <div class="context-form__field">
+                    <label for="ct-ctx-target-users">产品/功能的目标用户是谁？</label>
+                    <textarea id="ct-ctx-target-users" rows="2"></textarea>
+                  </div>
+                </div>
+              </details>
+            </div>
+
             <div class="crosstab-actions">
               <button class="btn btn--ghost" id="btn-ct-back" type="button">返回入口选择</button>
-              <button class="btn btn--primary" id="btn-ct-upload" type="button" disabled>上传并解析跑数表</button>
+              <button class="btn btn--primary" id="btn-ct-upload" type="button" disabled>上传并开始分析</button>
             </div>
           </div>
         </div>
@@ -276,18 +299,60 @@
         <!-- 上传区（点定性分析后显示） -->
         <div id="upload-area" style="display:none">
           <div class="upload-guide" id="upload-guide"></div>
-          <div class="upload-zone" id="upload-zone">
-            <input type="file" id="file-input" accept=".csv,.xlsx" hidden />
-            <div class="upload-zone__icon">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-                <polyline points="17 8 12 3 7 8" />
-                <line x1="12" y1="3" x2="12" y2="15" />
-              </svg>
+          <div class="survey-source-picker" aria-label="选择问卷数据来源">
+            <button class="survey-source-card survey-source-card--active" data-survey-source="google" type="button">
+              <span class="survey-source-card__title">Google 表单 / 通用表格</span>
+              <span class="survey-source-card__desc">上传回答数据，由 AI 识别题型并在下一步确认。</span>
+            </button>
+            <button class="survey-source-card" data-survey-source="bested" type="button">
+              <span class="survey-source-card__title">倍市得</span>
+              <span class="survey-source-card__desc">支持拆列多选与矩阵单选，推荐同时上传调研问卷。</span>
+            </button>
+          </div>
+
+          <div id="survey-google-upload">
+            <div class="upload-zone" id="upload-zone">
+              <input type="file" id="file-input" accept=".csv,.xlsx" hidden />
+              <div class="upload-zone__icon">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                  <polyline points="17 8 12 3 7 8" />
+                  <line x1="12" y1="3" x2="12" y2="15" />
+                </svg>
+              </div>
+              <div class="upload-zone__text">
+                <span class="upload-zone__primary">拖放回答数据到这里，或点击选择</span>
+                <span class="upload-zone__secondary">支持 CSV / Excel（最大 50MB）</span>
+              </div>
             </div>
-            <div class="upload-zone__text">
-              <span class="upload-zone__primary">拖放文件到这里，或点击选择</span>
-              <span class="upload-zone__secondary">支持 CSV / Excel（最大 50MB）</span>
+          </div>
+
+          <div id="survey-bested-upload" style="display:none">
+            <div class="survey-file-grid">
+              <label class="survey-file-card" for="bested-result-file" data-survey-file-card="result">
+                <input type="file" id="bested-result-file" accept=".csv,.xlsx" hidden />
+                <span class="survey-file-card__body">
+                  <span class="survey-file-card__title">问卷结果 <em>必填</em></span>
+                  <span class="survey-file-card__desc">倍市得导出的可读回答数据。</span>
+                  <span class="survey-file-card__filename" data-survey-file-name="result">未选择文件</span>
+                </span>
+                <span class="survey-file-card__action">选择文件</span>
+              </label>
+              <label class="survey-file-card" for="bested-questionnaire-file" data-survey-file-card="questionnaire">
+                <input type="file" id="bested-questionnaire-file" accept=".xls,.xlsx" hidden />
+                <span class="survey-file-card__body">
+                  <span class="survey-file-card__title">调研问卷 <em class="is-recommended">推荐</em></span>
+                  <span class="survey-file-card__desc">上传后直接读取题型、选项和矩阵结构，不让 AI 猜测。</span>
+                  <span class="survey-file-card__filename" data-survey-file-name="questionnaire">未选择文件</span>
+                </span>
+                <span class="survey-file-card__action">选择文件</span>
+              </label>
+            </div>
+            <div class="survey-questionnaire-hint" id="survey-questionnaire-hint">
+              未上传调研问卷，将使用 AI 识别题型，请在下一步仔细核对。
+            </div>
+            <div class="survey-upload-actions">
+              <button class="btn btn--primary" id="btn-bested-upload" type="button" disabled>上传并解析</button>
             </div>
           </div>
         </div>
@@ -1338,13 +1403,13 @@
 
   <script src="https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js"></script>
   <!-- app.js 已按业务线拆分;顺序固定:core 最先,各 feature 居中(均含原顺序的初始化代码) -->
-  <script src="/static/js/core/core.js?v=30"></script>
-  <script src="/static/js/features/survey.js?v=32"></script>
-  <script src="/static/js/features/report.js?v=33"></script>
+  <script src="/static/js/core/core.js?v=31"></script>
+  <script src="/static/js/features/survey.js?v=35"></script>
+  <script src="/static/js/features/report.js?v=35"></script>
   <script src="/static/js/features/settings.js?v=30"></script>
   <script src="/static/js/features/history.js?v=31"></script>
   <script src="/static/js/features/interview.js?v=7"></script>
-  <script src="/static/js/features/nav.js?v=33"></script>
+  <script src="/static/js/features/nav.js?v=36"></script>
   <script src="/static/js/features/comment.js?v=29"></script>
 <script src="/static/js/features/annotate.js?v=34"></script>
 </body>

@@ -167,7 +167,9 @@ def _build_planner_query_with_confirmed(
         cis = q.get("column_indexes") or ([q["index"]] if "index" in q else [])
         label = ROLE_LABEL_MAP.get(role, role)
         extra = ""
-        if role in ("single_choice", "profile_dim", "multi_choice", "matrix_multi") and q.get("options"):
+        if role in (
+            "single_choice", "profile_dim", "multi_choice", "matrix_single", "matrix_multi",
+        ) and q.get("options"):
             opts = "、".join(str(o) for o in q["options"][:12])
             extra += f"，选项: {opts}"
         if role in ("multi_choice",) and q.get("delimiter"):
@@ -175,7 +177,7 @@ def _build_planner_query_with_confirmed(
         if role in ("scale", "matrix_scale") and q.get("scale_min") is not None:
             extra += f"，量程: {q.get('scale_min')}–{q.get('scale_max')}"
 
-        if role in ("matrix_scale", "matrix_multi"):
+        if role in ("matrix_scale", "matrix_single", "matrix_multi"):
             rows_lbl = "、".join(str(r) for r in (q.get("rows") or []))
             confirmed_lines.append(
                 f"- 矩阵题「{name}」({label})，子项行: {rows_lbl}；"
@@ -269,6 +271,7 @@ def _build_crosstab_planner_query(
     questionnaire_text: str,
     available_questions: list[str],
     open_question_names: list[str],
+    qualitative_context: dict | None = None,
 ) -> str:
     """跑数表模式：给章节策划 LLM 的初始 query。"""
     q_text = (questionnaire_text or "").strip()
@@ -280,6 +283,7 @@ def _build_crosstab_planner_query(
         f"<questionnaire>\n{q_text}\n</questionnaire>\n\n"
         f"<available_questions>\n{avail}\n</available_questions>\n\n"
         f"<open_questions_list>\n{opens}\n</open_questions_list>\n\n"
+        f"{_build_business_context_block(qualitative_context, '用于确定定量报告的章节结构和统计解读重点')}\n\n"
         "请基于以上规划报告章节大纲，按 system prompt 约定的 JSON 格式输出。"
     )
 
@@ -290,6 +294,7 @@ def _build_crosstab_plan_revision_query(
     open_question_names: list[str],
     current_parts: list[dict],
     user_text: str,
+    qualitative_context: dict | None = None,
 ) -> str:
     """跑数表模式：章节大纲修订 query，显式补齐无会话直连所需上下文。"""
     q_text = (questionnaire_text or "").strip()
@@ -304,6 +309,7 @@ def _build_crosstab_plan_revision_query(
         f"<open_questions_list>\n{opens}\n</open_questions_list>\n\n"
         f"<current_outline>\n{outline}\n</current_outline>\n\n"
         f"<user_request>\n{user_text.strip()}\n</user_request>\n\n"
+        f"{_build_business_context_block(qualitative_context, '用于辅助调整定量报告的章节和分析重点')}\n\n"
         "请在当前大纲基础上按用户意见调整，按 system prompt 约定的 JSON 格式输出。"
     )
 
@@ -1188,6 +1194,7 @@ def _build_large_sample_writer_query(
     headers: list[str],
     open_text: dict | None = None,
     qualitative_context: dict | None = None,
+    quantitative_first: bool = False,
 ) -> str:
     parts_lines = ["  Part 1 受访者画像（固定）"]
     for i, p in enumerate(plan["parts"], 2):
@@ -1254,6 +1261,11 @@ def _build_large_sample_writer_query(
         has_satisfaction=bool(satisfaction_md),
         has_business_context=has_context,
     )
+    qualitative_stats_rule = (
+        "\n- 系统会在每个 Part 内确定性插入一个 `辅助统计` 模块。不要自行复制客观题统计表、"
+        "不要新增统计章节；仍应在本节总结和主题分析中引用关键数字并解释其与玩家反馈的关系。"
+        if not quantitative_first else ""
+    )
 
     return (
         "**任务**：基于以下大样本问卷分析结果撰写调研报告。\n\n"
@@ -1263,7 +1275,7 @@ def _build_large_sample_writer_query(
         + f"{priority_block}"
         + f"{open_text_md}\n\n"
         + (f"{fallback_md}\n\n" if fallback_md else "")
-        + f"**要求**：\n{requirements}"
+        + f"**要求**：\n{requirements}{qualitative_stats_rule}"
         + (
             "\n- 必须执行 `<question_branch_logic>`：分支题按适用人群分别归纳，"
             "不得合并不同分支的回答池或使用问卷总样本作为分母。"
@@ -1407,12 +1419,30 @@ def _build_writer_first_query(
     )
 
 
-def _build_writer_part_query(part: dict) -> str:
+def _build_writer_part_query(
+    part: dict,
+    *,
+    quantitative_first: bool = False,
+) -> str:
     """多轮生成中的某个 Part 轮：仅指示写这一个 Part。原文已在会话历史中。"""
+    quantitative_rule = (
+        "本次为定量优先报告：本节先说明所有相关客观题的主要分布、最高/最低项和显著差异，"
+        "再用开放题解释原因。至少引用一组最关键的客观统计作为判断依据；"
+        "完整逐题统计表由系统在附录确定性插入，无需在正文机械复制全部表格。\n"
+        if quantitative_first else ""
+    )
+    qualitative_rule = (
+        "本次为定性报告：系统会在本节总结之后确定性插入一个 `辅助统计` 模块。"
+        "不要自行复制客观题统计表，也不要新增统计标题；仍须在本节总结和主题分析中引用关键数字，"
+        "并结合开放题解释原因、情境与产品含义。\n"
+        if not quantitative_first else ""
+    )
     return (
         f"**本轮任务**：现在**只**写 `## Part {part['i']} {part['name']}` 这一个章节的完整内容"
         f"（涉及列：{part['col_desc']}）。\n"
-        "严格按 <report_spec> 里对 Part 的写法：紧接 `## Part` 标题后写 `**本节总结：**`，并用 3–6 条带加粗短标题的 Markdown 编号列表归纳关键结论，"
+        + quantitative_rule
+        + qualitative_rule
+        + "严格按 <report_spec> 里对 Part 的写法：紧接 `## Part` 标题后写 `**本节总结：**`，并用 3–6 条带加粗短标题的 Markdown 编号列表归纳关键结论，"
         "不得把全部数字和中文说明塞进一个超长段落；"
         "再围绕本 Part 的业务 Topic 综合展开。同一 Topic 下的客观题与相关开放题必须结合分析，客观统计作为人群背景和判断依据，"
         "主观反馈用于完整解释原因、情境、分歧与产品含义；不要按问卷题目逐题复述，也不要按正面/负面/中立机械拆分。"
@@ -1421,6 +1451,9 @@ def _build_writer_part_query(part: dict) -> str:
         "再写 `**提及情况：**`。统计数据优先直接写进对应内容；需要单独列数据表或玩家反馈表时，表格前统一使用"
         " `**相关具体信息引用：**`，不得使用「代表性玩家反馈」，也不得留下空标题。玩家反馈表附 1–5 条"
         " `玩家ID | 画像信息 | 中文翻译` 证据，只展示中文翻译，不保留原始语言文本。\n"
+        "本节总结必须用不看后文原文也能理解的大白话，优先沿用玩家中文翻译中的具体说法。"
+        "不要用「功能性增益」「价值感知」「分层机制」这类抽象概念代替玩家实际在意的功能、体验或场景；"
+        "确需概括时，须在同一句用「也就是……」或等价表达解释具体所指，且不得补造原文中没有的例子。\n"
         "**约束**：① 只输出这一个 Part，不要写其它 Part；② 不要写核心结论、不要写 Bug 模块；"
         "③ 不要重复前面已经写过的标题或章节；④ 所有数字、百分比必须逐字取自 <stats>，禁止重算或编造。"
     )
@@ -1467,11 +1500,20 @@ def _build_writer_core_query(
         f"若用户提供了业务问题，可按业务问题组织小节；否则逐个写 `### Part X 章节名：关键发现`（必须引用真实 Part 名：{part_titles}）；"
         "按需写 `### 高信号少数观点与风险`。\n"
         f"{bug_clause}\n"
+        "`### 总体判断` 中每个判断必须主动说明它针对的具体对象、功能、方案、场景、人群或研究范围，"
+        "让未参与调研立项、未看过问卷提纲的读者也能独立理解。若涉及多个容易混淆的范围，须按真实业务语义"
+        "分别回车成短段，不使用 1、2、3 编号，不得写成一个超长段落，也不得使用无明确指代的「该方案」"
+        "「这一问题」「核心分歧」开门见山。`### 高信号少数观点与风险` 每条也必须在短标题或首句明确对应的"
+        "对象、功能、方案、场景、人群或研究范围，不同范围不得混写；范围名称只能来自 plan、题目、<open_text>"
+        "或已生成章节，不得机械套用标签或补造研究阶段。\n"
         "**约束**：① 只输出从 `<!--CORE_START-->` 到 `<!--CORE_END-->` 的内容，不要重复正文章节、不要再写一级标题、不要写行动建议；"
         "② 核心结论里不使用百分比、不使用精确人数，改用量级描述（样本总数可引用）；"
         "③ 引用的绝对数值必须与 <stats> 一致；"
         "④ 玩家观点必须来自 <open_text> 或已生成章节，不得编造；"
-        "⑤ 业务判断可以基于证据推断，但必须写清楚依据，凡是推测或猜测必须显式标注。"
+        "⑤ 业务判断可以基于证据推断，但必须写清楚依据，凡是推测或猜测必须显式标注；"
+        "⑥ 使用不看玩家原文也能立即理解的大白话，优先沿用玩家中文翻译中的具体词语。"
+        "不要只写「功能性增益」「价值感知」「分层机制」等抽象概括；确需使用时，必须在同一句用「也就是……」"
+        "或等价表达说明玩家具体希望增加、取消或改变什么，解释和例子只能来自 <open_text> 或已生成章节。"
     )
 
 

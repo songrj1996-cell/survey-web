@@ -4,6 +4,28 @@
 
 const uploadZone = $('upload-zone');
 const fileInput = $('file-input');
+const googleUpload = $('survey-google-upload');
+const bestedUpload = $('survey-bested-upload');
+const bestedResultInput = $('bested-result-file');
+const bestedQuestionnaireInput = $('bested-questionnaire-file');
+const bestedUploadButton = $('btn-bested-upload');
+
+function updateSurveySource(source) {
+  if (surveyUploadIsLocked()) return;
+  state.surveySource = source === 'bested' ? 'bested' : 'google';
+  document.querySelectorAll('[data-survey-source]').forEach(card => {
+    card.classList.toggle(
+      'survey-source-card--active',
+      card.dataset.surveySource === state.surveySource,
+    );
+  });
+  googleUpload.style.display = state.surveySource === 'google' ? '' : 'none';
+  bestedUpload.style.display = state.surveySource === 'bested' ? '' : 'none';
+}
+
+document.querySelectorAll('[data-survey-source]').forEach(card => {
+  card.addEventListener('click', () => updateSurveySource(card.dataset.surveySource));
+});
 
 function surveyUploadIsLocked() {
   return !!state.sessionId && state.currentStep > 1;
@@ -22,29 +44,73 @@ uploadZone.addEventListener('drop', e => {
   uploadZone.classList.remove('drag-over');
   if (surveyUploadIsLocked()) return;
   const file = e.dataTransfer.files[0];
-  if (file) handleUpload(file);
+  if (file) handleUpload(file, { sourceType: 'google' });
 });
 fileInput.addEventListener('change', () => {
   if (surveyUploadIsLocked()) {
     fileInput.value = '';
     return;
   }
-  if (fileInput.files[0]) handleUpload(fileInput.files[0]);
+  if (fileInput.files[0]) handleUpload(fileInput.files[0], { sourceType: 'google' });
 });
 
-async function handleUpload(file) {
+function updateBestedFileState(kind) {
+  const input = kind === 'result' ? bestedResultInput : bestedQuestionnaireInput;
+  const file = input.files[0];
+  const card = document.querySelector(`[data-survey-file-card="${kind}"]`);
+  const name = document.querySelector(`[data-survey-file-name="${kind}"]`);
+  card?.classList.toggle('survey-file-card--selected', !!file);
+  if (name) name.textContent = file ? file.name : '未选择文件';
+  bestedUploadButton.disabled = !bestedResultInput.files[0];
+
+  const hint = $('survey-questionnaire-hint');
+  const questionnaire = bestedQuestionnaireInput.files[0];
+  hint.classList.toggle('survey-questionnaire-hint--deterministic', !!questionnaire);
+  hint.textContent = questionnaire
+    ? '已选择调研问卷：将直接读取题型、选项和矩阵结构，不使用 AI 猜测题型。'
+    : '未上传调研问卷，将使用 AI 识别题型，请在下一步仔细核对。';
+}
+
+bestedResultInput.addEventListener('change', () => updateBestedFileState('result'));
+bestedQuestionnaireInput.addEventListener('change', () => updateBestedFileState('questionnaire'));
+bestedUploadButton.addEventListener('click', () => {
+  const resultFile = bestedResultInput.files[0];
+  if (!resultFile || surveyUploadIsLocked()) return;
+  const questionnaireFile = bestedQuestionnaireInput.files[0] || null;
+  if (questionnaireFile && !resultFile.name.toLowerCase().endsWith('.xlsx')) {
+    showToast('同时上传调研问卷时，问卷结果请选择倍市得导出的 .xlsx 文件', 'error');
+    return;
+  }
+  handleUpload(resultFile, {
+    sourceType: 'bested',
+    questionnaireFile,
+  });
+});
+
+async function handleUpload(file, { sourceType = 'google', questionnaireFile = null } = {}) {
   const MAX = 50 * 1024 * 1024;
   if (file.size > MAX) { showToast('文件超过 50MB 上限', 'error'); return; }
+  if (questionnaireFile && questionnaireFile.size > MAX) {
+    showToast('调研问卷超过 50MB 上限', 'error');
+    return;
+  }
   const uploadSignature = contextFileSignature(file);
 
-  uploadZone.innerHTML = `
-    <div class="upload-zone__icon"><div class="spinner" style="width:40px;height:40px;border-width:3px"></div></div>
-    <div class="upload-zone__text">
-      <span class="upload-zone__primary">正在上传 ${esc(file.name)}…</span>
-    </div>`;
+  if (sourceType === 'google') {
+    uploadZone.innerHTML = `
+      <div class="upload-zone__icon"><div class="spinner" style="width:40px;height:40px;border-width:3px"></div></div>
+      <div class="upload-zone__text">
+        <span class="upload-zone__primary">正在上传 ${esc(file.name)}…</span>
+      </div>`;
+  } else {
+    bestedUploadButton.disabled = true;
+    bestedUploadButton.textContent = questionnaireFile ? '正在读取问卷并匹配…' : '正在上传并解析…';
+  }
 
   const fd = new FormData();
   fd.append('file', file);
+  fd.append('source_type', sourceType);
+  if (questionnaireFile) fd.append('questionnaire_file', questionnaireFile);
 
   try {
     const resp = await fetch('/api/upload', { method: 'POST', body: fd });
@@ -52,6 +118,8 @@ async function handleUpload(file) {
     if (!resp.ok) throw new Error(data.detail || '上传失败');
 
     state.sessionId = data.session_id;
+    state.surveySource = data.source_type || sourceType;
+    state.questionnaireUsed = !!data.questionnaire_used;
     state.viewMode = 'session';
     state.historyId = null;
     clearPlanInput();
@@ -76,10 +144,17 @@ async function handleUpload(file) {
       running: false,
       stream: '',
     };
-    renderUploadedFileState(data.filename);
+    renderUploadedFileState(
+      data.filename,
+      state.surveySource,
+      questionnaireFile?.name || '',
+    );
     renderPreview(data);
     goStep(2);
-    showToast(`成功读取 ${data.total_rows} 行数据`, 'success');
+    const successMessage = data.questionnaire_used
+      ? `成功读取 ${data.total_rows} 行数据，并匹配 ${data.matched_questions} 道原问卷题目`
+      : `成功读取 ${data.total_rows} 行数据`;
+    showToast(successMessage, 'success');
     loadColumns();
   } catch (e) {
     showToast(`上传失败：${e.message}`, 'error');
@@ -87,8 +162,23 @@ async function handleUpload(file) {
   }
 }
 
-function renderUploadedFileState(filename) {
+function renderUploadedFileState(filename, sourceType = 'google', questionnaireFilename = '') {
   state.uploadedFilename = String(filename || '').trim();
+  document.querySelectorAll('[data-survey-source]').forEach(card => {
+    card.disabled = true;
+  });
+  if (sourceType === 'bested') {
+    bestedResultInput.disabled = true;
+    bestedQuestionnaireInput.disabled = true;
+    bestedUploadButton.disabled = true;
+    bestedUploadButton.textContent = '已上传';
+    const hint = $('survey-questionnaire-hint');
+    hint.classList.toggle('survey-questionnaire-hint--deterministic', !!questionnaireFilename);
+    hint.textContent = questionnaireFilename
+      ? `已上传调研问卷：${questionnaireFilename}`
+      : '未上传调研问卷，本次使用 AI 识别题型。';
+    return;
+  }
   fileInput.disabled = true;
   uploadZone.classList.remove('drag-over');
   uploadZone.classList.add('upload-zone--readonly');
@@ -109,7 +199,21 @@ function renderUploadedFileState(filename) {
 
 function resetUploadZone() {
   state.uploadedFilename = '';
+  state.questionnaireUsed = false;
+  document.querySelectorAll('[data-survey-source]').forEach(card => {
+    card.disabled = false;
+  });
   fileInput.disabled = false;
+  fileInput.value = '';
+  bestedResultInput.disabled = false;
+  bestedQuestionnaireInput.disabled = false;
+  bestedResultInput.value = '';
+  bestedQuestionnaireInput.value = '';
+  bestedUploadButton.disabled = true;
+  bestedUploadButton.textContent = '上传并解析';
+  updateBestedFileState('result');
+  updateBestedFileState('questionnaire');
+  updateSurveySource(state.surveySource || 'google');
   uploadZone.classList.remove('upload-zone--readonly', 'drag-over');
   uploadZone.removeAttribute('aria-disabled');
   uploadZone.innerHTML = `
@@ -121,7 +225,7 @@ function resetUploadZone() {
       </svg>
     </div>
     <div class="upload-zone__text">
-      <span class="upload-zone__primary">拖放文件到这里，或点击选择</span>
+      <span class="upload-zone__primary">拖放回答数据到这里，或点击选择</span>
       <span class="upload-zone__secondary">支持 CSV / Excel（最大 50MB）</span>
     </div>`;
 }
@@ -138,8 +242,11 @@ function renderPreview(data) {
 async function loadColumns() {
   const list = $('col-list');
   $('col-confirm-count').textContent = '';
+  const loadingTitle = state.questionnaireUsed
+    ? '正在从调研问卷读取题型、选项和矩阵结构…'
+    : 'AI 正在识别题型与中文题名（较慢，请稍候）…';
   list.innerHTML = `<div class="thinking-block"><div class="thinking-block__icon"><div class="spinner"></div></div>
-    <div class="thinking-block__content"><div class="thinking-block__title">AI 正在识别题型与中文题名（较慢，请稍候）…</div>
+    <div class="thinking-block__content"><div class="thinking-block__title">${loadingTitle}</div>
     <div class="thinking-block__stream" id="col-stream-text"></div></div></div>`;
   $('btn-start-plan').disabled = true;
 
@@ -284,7 +391,7 @@ function showBlockingFlowError(title, message) {
 function refreshContextFormVisibility() {
   const wrap = $('context-form-wrap');
   if (!wrap) return;
-  if (state.mode === 'crosstab') {
+  if (state.mode === 'crosstab' || state.mode === 'quantitative') {
     wrap.style.display = 'none';
     return;
   }
@@ -508,7 +615,7 @@ function updateExtra(i, role) {
   }
 
   if (role === 'multi_choice') {
-    const delim = c.delimiter || '，';
+    const delim = c.delimiter === '\n' ? '\\n' : (c.delimiter || '，');
     bits.push(`<span class="q-extra-inline">分隔符
       <input class="extra-input extra-input--sm" data-delim="${i}" value="${esc(delim)}" placeholder="，" /></span>`);
   }
@@ -663,7 +770,8 @@ function collectConfirmedColumns() {
 
     if (role === 'multi_choice') {
       const el = document.querySelector(`[data-delim="${i}"]`);
-      out.delimiter = el ? el.value : (c.delimiter || '，');
+      const entered = el ? el.value : (c.delimiter || '，');
+      out.delimiter = entered === '\\n' ? '\n' : (entered || c.delimiter || '，');
     }
 
     const otherEnabledEl = document.querySelector(`[data-other-text-enabled="${i}"]`);
@@ -768,32 +876,35 @@ async function startPlan() {
       return;
     }
 
-    try {
-      const ctx = readContextForm();
-      state.contextForm = ctx;
-      const ctxResp = await fetch(`/api/survey-context/${state.sessionId}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(ctx),
-      });
-      if (!ctxResp.ok) {
-        if (ctxResp.status === 404) {
-          saveContextDraft();
-          preserveContextDraftOnNextUpload = true;
-          showToast(
-            '当前会话已过期，请点击上方步骤条的"上传数据"重新上传文件；已填写的调研背景不会丢失',
-            'error', 6000,
-          );
-        } else {
-          showToast('保存调研背景失败，请重试', 'error');
+    // 定量入口已在上传步骤保存背景；这里只处理定性入口的数据确认表单。
+    if (state.mode !== 'quantitative') {
+      try {
+        const ctx = readContextForm();
+        state.contextForm = ctx;
+        const ctxResp = await fetch(`/api/survey-context/${state.sessionId}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(ctx),
+        });
+        if (!ctxResp.ok) {
+          if (ctxResp.status === 404) {
+            saveContextDraft();
+            preserveContextDraftOnNextUpload = true;
+            showToast(
+              '当前会话已过期，请点击上方步骤条的"上传数据"重新上传文件；已填写的调研背景不会丢失',
+              'error', 6000,
+            );
+          } else {
+            showToast('保存调研背景失败，请重试', 'error');
+          }
+          if (btn) btn.disabled = false;
+          return;
         }
+      } catch (e) {
+        showToast(`保存调研背景失败：${e.message}`, 'error');
         if (btn) btn.disabled = false;
         return;
       }
-    } catch (e) {
-      showToast(`保存调研背景失败：${e.message}`, 'error');
-      if (btn) btn.disabled = false;
-      return;
     }
   }
 
@@ -879,12 +990,13 @@ function buildPlanHTML(plan, headers) {
     scale: ['量表题', '分析评分分布与集中趋势'],
     open_text: ['开放题', '归纳主要主题、原因与体验反馈'],
     matrix_scale: ['矩阵量表', '按矩阵子项比较评分表现'],
+    matrix_single: ['矩阵单选', '按矩阵子项比较单选分布'],
     matrix_multi: ['矩阵多选', '按矩阵子项比较选择分布'],
   }[role] || ['分析题', '结合本题有效回答进行分析']);
 
   const logicalIndexesFor = (idx, partSet) => {
     const col = colMap[idx];
-    if (!col || !['matrix_scale', 'matrix_multi'].includes(col.role) || !col.matrix_group) return [idx];
+    if (!col || !MATRIX_ROLES.includes(col.role) || !col.matrix_group) return [idx];
     return [...partSet].filter(otherIdx => {
       const other = colMap[otherIdx];
       return other?.role === col.role && other?.matrix_group === col.matrix_group;
@@ -895,7 +1007,7 @@ function buildPlanHTML(plan, headers) {
     const keys = new Set();
     indexes.forEach(idx => {
       const col = colMap[idx];
-      const key = col?.matrix_group && ['matrix_scale', 'matrix_multi'].includes(col.role)
+      const key = col?.matrix_group && MATRIX_ROLES.includes(col.role)
         ? `${col.role}:${col.matrix_group}`
         : `column:${idx}`;
       keys.add(key);

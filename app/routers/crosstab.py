@@ -17,22 +17,29 @@ async def upload_crosstab(
     request: Request,
     survey_file: UploadFile = File(...),
     data_file: UploadFile = File(...),
-    crosstab_file: UploadFile = File(...),
+    crosstab_file: UploadFile | None = File(None),
 ):
     survey_content = await survey_file.read()
     data_content = await data_file.read()
-    ct_content = await crosstab_file.read()
+    ct_content = await crosstab_file.read() if crosstab_file is not None else None
     login = await _current_login(request)
     result = await handle_crosstab_upload(
         survey_content, survey_file.filename or "survey.xlsx",
         data_content, data_file.filename or "data.xlsx",
-        ct_content, crosstab_file.filename or "crosstab.xlsx",
+        ct_content,
+        (crosstab_file.filename or "crosstab.xlsx") if crosstab_file else None,
         login,
     )
     await audit_log(
         request, "survey", "上传跑数表数据",
         f"问卷：{survey_file.filename or '?'}；数据：{data_file.filename or '?'}；"
-        f"跑数表：{crosstab_file.filename or '?'}；样本行数：{result['total_rows']}",
-        metadata={"session_id": result["session_id"], "rows": result["total_rows"], "mode": "crosstab"},
+        f"跑数表：{(crosstab_file.filename if crosstab_file else '未上传')}；"
+        f"样本行数：{result['total_rows']}",
+        metadata={
+            "session_id": result["session_id"],
+            "rows": result["total_rows"],
+            "mode": result["mode"],
+            "stats_source": result["stats_source"],
+        },
     )
     return result

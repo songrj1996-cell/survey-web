@@ -63,12 +63,35 @@ $('btn-qual-enter').addEventListener('click', () => {
     .catch(() => { });
 });
 
-// ── 定量分析（跑数表模式）：三文件上传 ──
+// ── 定量分析：问卷 + 回答必填，专业跑数表选填 ──
 const CT_FILE_SLOTS = [
   { key: 'survey', inputId: 'ct-survey', label: '问卷文件' },
   { key: 'data', inputId: 'ct-data', label: '回答数据' },
   { key: 'crosstab', inputId: 'ct-crosstab', label: '跑数表' },
 ];
+const CT_CONTEXT_FIELD_IDS = {
+  problem: 'ct-ctx-problem',
+  key_concerns: 'ct-ctx-key-concerns',
+  target_users: 'ct-ctx-target-users',
+};
+
+function readCrosstabContextForm() {
+  return Object.fromEntries(
+    Object.entries(CT_CONTEXT_FIELD_IDS).map(([key, id]) => [key, ($(id)?.value || '').trim()]),
+  );
+}
+
+async function saveCrosstabContext(sessionId, context) {
+  const resp = await fetch(`/api/survey-context/${sessionId}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(context),
+  });
+  if (!resp.ok) {
+    const data = await resp.json().catch(() => ({}));
+    throw new Error(data.detail || '保存调研背景失败');
+  }
+}
 
 function getCrosstabFile(slot) {
   const input = $(slot.inputId);
@@ -92,7 +115,10 @@ function updateCrosstabUploadState() {
   CT_FILE_SLOTS.forEach(updateCrosstabFileCard);
   const btn = $('btn-ct-upload');
   if (!btn) return;
-  const ready = CT_FILE_SLOTS.every(slot => !!getCrosstabFile(slot));
+  const ready = ['survey', 'data'].every(key => {
+    const slot = CT_FILE_SLOTS.find(item => item.key === key);
+    return !!getCrosstabFile(slot);
+  });
   if (!btn.dataset.loading) btn.disabled = !ready;
 }
 
@@ -106,7 +132,7 @@ function resetCrosstabUploader() {
   const btn = $('btn-ct-upload');
   if (btn) {
     btn.disabled = true;
-    btn.textContent = '上传并解析跑数表';
+    btn.textContent = '上传并开始分析';
     delete btn.dataset.loading;
   }
   updateCrosstabUploadState();
@@ -123,7 +149,7 @@ function setCrosstabUploadLoading(loading) {
     btn.textContent = '正在上传与解析...';
   } else {
     delete btn.dataset.loading;
-    btn.textContent = '上传并解析跑数表';
+    btn.textContent = '上传并开始分析';
     updateCrosstabUploadState();
   }
 }
@@ -184,34 +210,50 @@ $('btn-ct-upload').addEventListener('click', async () => {
   const sf = $('ct-survey').files[0];
   const df = $('ct-data').files[0];
   const cf = $('ct-crosstab').files[0];
-  if (!sf || !df || !cf) { showToast('请把问卷、回答数据、跑数表三个文件都选上', 'error'); return; }
+  if (!sf || !df) { showToast('请上传调研问卷和回答明细', 'error'); return; }
+  if (!cf && !df.name.toLowerCase().endsWith('.xlsx')) {
+    showToast('未上传跑数表时，回答明细请选择倍市得导出的 .xlsx 文件', 'error');
+    return;
+  }
   const MAX = 50 * 1024 * 1024;
-  for (const f of [sf, df, cf]) {
+  for (const f of [sf, df, cf].filter(Boolean)) {
     if (f.size > MAX) { showToast(`文件 ${f.name} 超过 50MB 上限`, 'error'); return; }
   }
   setCrosstabUploadLoading(true);
   const fd = new FormData();
   fd.append('survey_file', sf);
   fd.append('data_file', df);
-  fd.append('crosstab_file', cf);
+  if (cf) fd.append('crosstab_file', cf);
   try {
+    const quantitativeContext = readCrosstabContextForm();
     const resp = await fetch('/api/upload/crosstab', { method: 'POST', body: fd });
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.detail || '上传失败');
     state.sessionId = data.session_id;
-    state.mode = 'crosstab';
+    state.mode = data.mode || (cf ? 'crosstab' : 'quantitative');
+    state.surveySource = 'bested';
+    state.questionnaireUsed = !!data.requires_column_confirmation;
     state.viewMode = 'session';
     state.historyId = null;
+    state.contextForm = quantitativeContext;
+    await saveCrosstabContext(state.sessionId, quantitativeContext);
     clearPlanInput();
     state.sessionReport = {
       reportMd: null, title: '', reportNo: '', qaHtml: '',
       qaMessages: [], feishuLinkHtml: '', running: false, stream: '',
     };
     renderPreview(data);
-    const segInfo = (data.crosstab_segments || []).join('、');
-    showToast(`跑数表解析成功：${data.crosstab_questions} 道题、分段[${segInfo}]；回答 ${data.total_rows} 行`, 'success');
-    // 跑数表模式：跳过题型确认，直接进方案确认
-    startPlan();
+    if (data.stats_source === 'external_crosstab') {
+      const segInfo = (data.crosstab_segments || []).join('、');
+      showToast(`跑数表解析成功：${data.crosstab_questions} 道题、分段[${segInfo}]；回答 ${data.total_rows} 行`, 'success');
+      // 外部跑数表已提供统计结构，跳过题型确认。
+      startPlan();
+    } else {
+      showToast(`已读取 ${data.total_rows} 份回答，将由 Python 自动计算统计`, 'success');
+      refreshContextFormVisibility();
+      goStep(2);
+      loadColumns();
+    }
   } catch (e) {
     showToast(`上传失败：${e.message}`, 'error');
     setCrosstabUploadLoading(false);

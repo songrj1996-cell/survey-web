@@ -86,7 +86,7 @@ def _inject_disclaimer(md: str, mode: str = "") -> str:
     """在第一行 `# 标题` 之后插入免责声明引用行；幂等；无 H1 则插到最前。
 
     通用声明 REPORT_DISCLAIMER 三种模式都插。第二条声明按 mode 选择：
-      - mode == "crosstab"（倍市得）：不插第二条，并清除历史报告里残留的定性/评论声明
+      - mode 为 "crosstab" 或 "quantitative"（定量）：不插第二条，并清除历史报告里残留的定性/评论声明
       - mode == "comment"（评论舆情）：插 COMMENT_DISCLAIMER，清除残留的定性声明
       - 其它（定性，默认）：插 QUALITATIVE_DISCLAIMER，清除残留的评论声明
     """
@@ -94,7 +94,7 @@ def _inject_disclaimer(md: str, mode: str = "") -> str:
         return md
 
     # 选定本模式应有的“第二条声明”
-    if mode == "crosstab":
+    if mode in {"crosstab", "quantitative"}:
         second = None
     elif mode == "comment":
         second = COMMENT_DISCLAIMER
@@ -149,9 +149,20 @@ def _strip_core_markers(md: str) -> str:
     return "\n".join(ln for ln in md.split("\n") if ln.strip() not in (CORE_START, CORE_END))
 
 
+def _strip_stats_chart_blocks(md: str) -> str:
+    """导出保留图表下方的完整统计表，但移除网页专用 JSON 图表标记。"""
+    return re.sub(
+        r"(?ms)^```stats-chart\s*$.*?^```\s*$\n?",
+        "",
+        str(md or ""),
+    )
+
+
 def _prep_export_md(md: str, mode: str = "") -> str:
     """通用导出前处理：补免责声明（幂等）+ 去掉核心结论标记。"""
-    return _strip_core_markers(_inject_disclaimer(md, mode=mode))
+    return _strip_stats_chart_blocks(
+        _strip_core_markers(_inject_disclaimer(md, mode=mode))
+    )
 
 
 def _extract_core_lines(md: str) -> list[str]:

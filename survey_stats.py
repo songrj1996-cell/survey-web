@@ -39,7 +39,7 @@ import statistics
 from collections import Counter
 from typing import Any, Callable
 
-_MATRIX_ROLES = ("matrix_scale", "matrix_multi")
+_MATRIX_ROLES = ("matrix_scale", "matrix_single", "matrix_multi")
 _OTHER_OPTION_LABEL = "Other / 其他"
 
 
@@ -235,6 +235,121 @@ def collect_open_text(rows: list[list], plan: dict) -> dict[int, list[dict]]:
                 c["index"], body, headers, mlbb_id_cols + id_cols, profile_cols
             )
     return open_text
+
+
+def _split_markdown_row(line: str) -> list[str]:
+    """拆分 Markdown 表格行，保留转义的竖线字符。"""
+    text = line.strip().strip("|")
+    cells: list[str] = []
+    current: list[str] = []
+    escaped = False
+    for char in text:
+        if escaped:
+            current.append(char)
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == "|":
+            cells.append("".join(current).strip())
+            current = []
+        else:
+            current.append(char)
+    cells.append("".join(current).strip())
+    return cells
+
+
+def _percent_number(value: str) -> float | None:
+    match = _re.search(r"(-?\d+(?:\.\d+)?)\s*%", str(value or ""))
+    if not match:
+        return None
+    return max(0.0, min(100.0, float(match.group(1))))
+
+
+def structured_tables(stats_md: str) -> list[dict]:
+    """把 Python 统计 Markdown 转为稳定的图表/附录数据。
+
+    每道客观题只取第一张总体表；后续画像交叉表仍保留在 ``stats_md``
+    供报告写作使用，但不重复塞入完整统计附录。
+    """
+    lines = str(stats_md or "").splitlines()
+    blocks: list[dict] = []
+    current_part = ""
+    current_question = ""
+    captured_question = ""
+    index = 0
+    while index < len(lines):
+        stripped = lines[index].strip()
+        if stripped.startswith("## Part "):
+            current_part = stripped.removeprefix("## ").strip()
+            current_question = ""
+            captured_question = ""
+        elif stripped.startswith("### "):
+            current_question = stripped.removeprefix("### ").strip()
+            captured_question = ""
+        elif stripped.startswith("## ") and not stripped.startswith("## 画像维度概览"):
+            current_question = stripped.removeprefix("## ").strip()
+            captured_question = ""
+
+        if (
+            current_question
+            and current_question != captured_question
+            and stripped.startswith("|")
+            and index + 1 < len(lines)
+            and _re.match(r"^\s*\|?\s*:?-{3,}", lines[index + 1])
+        ):
+            table_lines = [lines[index], lines[index + 1]]
+            cursor = index + 2
+            while cursor < len(lines) and lines[cursor].strip().startswith("|"):
+                table_lines.append(lines[cursor])
+                cursor += 1
+            headers = _split_markdown_row(table_lines[0])
+            rows = [_split_markdown_row(line) for line in table_lines[2:]]
+            if rows and headers:
+                chart: dict | None = None
+                if headers[0] == "子项" and len(headers) > 2:
+                    option_headers = headers[1:-1]
+                    values = [
+                        [_percent_number(cell) for cell in row[1:1 + len(option_headers)]]
+                        for row in rows
+                    ]
+                    chart = {
+                        "type": "heatmap",
+                        "columns": option_headers,
+                        "rows": [row[0] for row in rows],
+                        "values": values,
+                    }
+                else:
+                    percent_indexes = [
+                        position for position, header in enumerate(headers)
+                        if any(token in header for token in ("占比", "比例", "百分比"))
+                    ]
+                    if percent_indexes:
+                        chart = {
+                            "type": "bar",
+                            "labels": [row[0] for row in rows],
+                            "series": [
+                                {
+                                    "name": headers[position],
+                                    "values": [
+                                        _percent_number(row[position])
+                                        if position < len(row) else None
+                                        for row in rows
+                                    ],
+                                }
+                                for position in percent_indexes[:6]
+                            ],
+                        }
+                blocks.append({
+                    "title": current_question,
+                    "part": current_part,
+                    "chart": chart,
+                    "table_markdown": "\n".join(table_lines),
+                })
+                captured_question = current_question
+            index = cursor
+            continue
+        index += 1
+    return blocks
 
 
 # ============================================================================
@@ -949,6 +1064,10 @@ _DELIMITER_CANDIDATES = [",", "，", ";", "；", "、", "/", "|"]
 
 def _guess_delimiter(values: list[str]) -> str:
     sample = values[:20]
+    # 倍市得拆列多选在标准化后使用换行拼接。换行的出现次数通常少于
+    # 长文本选项内部的逗号数，因此必须优先识别，不能只按字符频次比较。
+    if any("\n" in value for value in sample):
+        return "\n"
     counts: dict[str, int] = {d: 0 for d in _DELIMITER_CANDIDATES}
     for v in sample:
         for d in _DELIMITER_CANDIDATES:
@@ -1026,7 +1145,7 @@ def _split_by_vocab(
 
 
 # ============================================================================
-# 矩阵题渲染（matrix_scale / matrix_multi）：组级合并成一张表
+# 矩阵题渲染（matrix_scale / matrix_single / matrix_multi）：组级合并成一张表
 # ============================================================================
 
 
@@ -1081,6 +1200,51 @@ def _render_matrix(
         if has_low:
             lines.append("")
             lines.append("> `*` 该子项有效样本量 < 5，均值不稳定，谨慎解读")
+        lines.append("")
+        lines.append("> （矩阵题 × 画像维度的交叉分析本期暂未提供）")
+        return "\n".join(lines)
+
+    if role == "matrix_single":
+        shared_options = members[0].get("options")
+        norm = _make_normalizer(members[0].get("value_aliases"))
+        opt_order: list[str] = []
+        seen: set[str] = set()
+        for option in shared_options or []:
+            value = norm(str(option).strip())
+            if value and value not in seen:
+                seen.add(value)
+                opt_order.append(value)
+        if not opt_order:
+            for member in members:
+                for value in _column_values(body, member["index"]):
+                    normalized = norm(value.strip())
+                    if normalized and normalized not in seen:
+                        seen.add(normalized)
+                        opt_order.append(normalized)
+
+        lines = [
+            f"{title}",
+            "",
+            "矩阵单选（每个子项一行；单元格 = 选择人数(占比)，分母 = 该子项非空回答人数）：",
+            "",
+            "| 子项 | " + " | ".join(_md_escape(option) for option in opt_order) + " | 回答人数 |",
+            "|" + "|".join(["---"] * (len(opt_order) + 2)) + "|",
+        ]
+        for member in members:
+            row_label = member.get("matrix_row") or _safe_header(headers, member["index"])
+            values = [
+                norm(value.strip())
+                for value in _column_values(body, member["index"])
+                if value.strip()
+            ]
+            counts = Counter(values)
+            denom = len(values)
+            cells = [_md_escape(row_label)]
+            for option in opt_order:
+                count = counts.get(option, 0)
+                cells.append(f"{count} ({_pct(count, denom)})" if denom else "0")
+            cells.append(str(denom))
+            lines.append("| " + " | ".join(cells) + " |")
         lines.append("")
         lines.append("> （矩阵题 × 画像维度的交叉分析本期暂未提供）")
         return "\n".join(lines)

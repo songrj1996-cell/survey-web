@@ -14,6 +14,7 @@ ROLE_LABEL_MAP = {
     "multi_choice":  "多选题",
     "scale":         "量表题",
     "matrix_scale":  "矩阵打分",
+    "matrix_single": "矩阵单选",
     "matrix_multi":  "矩阵多选",
     "open_text":     "开放题",
     "ignore":        "忽略此列",
@@ -291,7 +292,13 @@ def _fmt_distinct(body: list[list], idx: int, n: int = 60) -> str:
     return s or "（空）"
 
 
-CHOICE_ROLES = {"single_choice", "profile_dim", "multi_choice", "matrix_multi"}
+CHOICE_ROLES = {
+    "single_choice",
+    "profile_dim",
+    "multi_choice",
+    "matrix_single",
+    "matrix_multi",
+}
 _NUMERIC_TOKEN_RE = re.compile(r"\d+")
 
 
@@ -594,18 +601,27 @@ def _heuristic_questions(rows: list[list], groups: list[dict]) -> list[dict]:
     out: list[dict] = []
     for g in groups:
         if g["type"] == "matrix":
-            # 子项样本是否多为数值 → matrix_scale，否则 matrix_multi
+            # 子项样本多为数值 → matrix_scale；文本列表 → matrix_multi；
+            # 每个单元格只有一个共享分类值 → matrix_single。
             numeric = 0
             checked = 0
+            matrix_values: list[str] = []
             for idx in g["member_indexes"]:
                 for v in _col_samples(body, idx, 10):
                     checked += 1
+                    matrix_values.append(v)
                     try:
                         float(v)
                         numeric += 1
                     except ValueError:
                         pass
-            role = "matrix_scale" if checked and numeric / checked > 0.7 else "matrix_multi"
+            structure = _choice_structure(matrix_values)
+            if checked and numeric / checked > 0.7:
+                role = "matrix_scale"
+            elif structure and structure.get("role") == "multi_choice":
+                role = "matrix_multi"
+            else:
+                role = "matrix_single"
             q = {
                 "name_zh": g["title"],
                 "role": role,
@@ -614,8 +630,17 @@ def _heuristic_questions(rows: list[list], groups: list[dict]) -> list[dict]:
             }
             if role == "matrix_scale":
                 q["scale_min"], q["scale_max"] = 1, 5
-            else:
+            elif role == "matrix_multi":
                 q["delimiter"] = "，"
+            else:
+                options: list[str] = []
+                seen: set[str] = set()
+                for value in matrix_values:
+                    key = _choice_key(value)
+                    if key and key not in seen:
+                        seen.add(key)
+                        options.append(value)
+                q["options"] = options
             out.append(q)
         else:
             idx = g["member_indexes"][0]
@@ -642,7 +667,7 @@ def _enrich_questions(questions: list[dict], headers: list[str], groups: list[di
             first = cis[0] if cis else None
             q["name_zh"] = (headers[first].strip() if first is not None and first < len(headers) else "") or "未命名题目"
         # 矩阵题缺 rows → 用本地分组补
-        if q.get("role") in ("matrix_scale", "matrix_multi") and not q.get("rows"):
+        if q.get("role") in ("matrix_scale", "matrix_single", "matrix_multi") and not q.get("rows"):
             if cis and cis[0] in matrix_rows_by_first:
                 q["rows"] = matrix_rows_by_first[cis[0]]
     return questions
