@@ -2,6 +2,7 @@ import json
 import unittest
 from unittest.mock import AsyncMock, patch
 
+import survey_plan
 from app.services import survey_service
 
 
@@ -32,6 +33,145 @@ def _plan_json() -> str:
 
 
 class DirectSurveyPlannerTests(unittest.IsolatedAsyncioTestCase):
+    def test_plan_allows_disjoint_single_choice_filters_to_reuse_columns(self):
+        plan = {
+            "columns": [
+                {
+                    "index": 0,
+                    "name": "控制模式",
+                    "role": "single_choice",
+                    "options": ["中等按钮模式", "默认模式", "大按钮模式"],
+                    "value_aliases": {"中等按钮模式": ["Orta Buton Modu"]},
+                },
+                {"index": 1, "name": "选择原因", "role": "open_text"},
+                {"index": 2, "name": "满意度", "role": "scale", "min": 1, "max": 5},
+            ],
+            "parts": [
+                {"name": "整体选择", "column_indexes": [0]},
+                {
+                    "name": "中等按钮反馈",
+                    "column_indexes": [1, 2],
+                    "filter": {"column_index": 0, "allowed_options": ["Orta Buton Modu"]},
+                },
+                {
+                    "name": "默认模式反馈",
+                    "column_indexes": [1, 2],
+                    "filter": {"column_index": 0, "allowed_options": ["默认模式"]},
+                },
+            ],
+            "cross_tabs": [],
+            "open_questions": [],
+            "summary": "按模式分析",
+        }
+
+        parsed, error = survey_plan.parse_plan_from_llm(
+            json.dumps(plan, ensure_ascii=False), 3,
+        )
+
+        self.assertIsNone(error)
+        self.assertEqual(
+            parsed["parts"][1]["filter"]["allowed_options"],
+            ["中等按钮模式"],
+        )
+        merged = survey_plan.merge_confirmed_into_plan(parsed, [
+            {
+                "name_zh": "控制模式",
+                "role": "single_choice",
+                "column_indexes": [0],
+                "options": ["中等按钮模式", "默认模式", "大按钮模式"],
+                "value_aliases": {"中等按钮模式": ["Orta Buton Modu"]},
+            },
+            {"name_zh": "选择原因", "role": "open_text", "column_indexes": [1]},
+            {
+                "name_zh": "满意度",
+                "role": "scale",
+                "column_indexes": [2],
+                "scale_min": 1,
+                "scale_max": 5,
+            },
+        ])
+        self.assertEqual(merged["parts"][1]["column_indexes"], [1, 2])
+        self.assertEqual(merged["parts"][2]["column_indexes"], [1, 2])
+
+    def test_plan_rejects_overlapping_filters_for_reused_columns(self):
+        plan = {
+            "columns": [
+                {"index": 0, "name": "模式", "role": "single_choice", "options": ["A", "B"]},
+                {"index": 1, "name": "原因", "role": "open_text"},
+            ],
+            "parts": [
+                {"name": "整体", "column_indexes": [0]},
+                {"name": "A1", "column_indexes": [1], "filter": {"column_index": 0, "allowed_options": ["A"]}},
+                {"name": "A2", "column_indexes": [1], "filter": {"column_index": 0, "allowed_options": ["A"]}},
+            ],
+            "cross_tabs": [],
+            "open_questions": [],
+            "summary": "",
+        }
+
+        parsed, error = survey_plan.parse_plan_from_llm(json.dumps(plan), 2)
+
+        self.assertIsNone(parsed)
+        self.assertIn("overlapping part filters", error)
+
+    def test_plan_rejects_filter_column_inside_its_filtered_part(self):
+        plan = {
+            "columns": [
+                {"index": 0, "name": "模式", "role": "single_choice", "options": ["A", "B"]},
+                {"index": 1, "name": "原因", "role": "open_text"},
+            ],
+            "parts": [
+                {
+                    "name": "A模式反馈",
+                    "column_indexes": [0, 1],
+                    "filter": {"column_index": 0, "allowed_options": ["A"]},
+                },
+                {
+                    "name": "B模式反馈",
+                    "column_indexes": [1],
+                    "filter": {"column_index": 0, "allowed_options": ["B"]},
+                },
+            ],
+            "cross_tabs": [],
+            "open_questions": [],
+            "summary": "",
+        }
+
+        parsed, error = survey_plan.parse_plan_from_llm(json.dumps(plan), 2)
+
+        self.assertIsNone(parsed)
+        self.assertIn("must not analyze its own filter column", error)
+
+    def test_plan_requires_unfiltered_overview_for_filter_parent(self):
+        plan = {
+            "columns": [
+                {"index": 0, "name": "模式", "role": "single_choice", "options": ["A"]},
+                {"index": 1, "name": "原因", "role": "open_text"},
+                {"index": 2, "name": "其他分群", "role": "single_choice", "options": ["X"]},
+            ],
+            "parts": [
+                {"name": "其他分群概览", "column_indexes": [2]},
+                {
+                    "name": "模式题放错章节",
+                    "column_indexes": [0],
+                    "filter": {"column_index": 2, "allowed_options": ["X"]},
+                },
+                {
+                    "name": "A模式反馈",
+                    "column_indexes": [1],
+                    "filter": {"column_index": 0, "allowed_options": ["A"]},
+                },
+            ],
+            "cross_tabs": [],
+            "open_questions": [],
+            "summary": "",
+        }
+
+        parsed, error = survey_plan.parse_plan_from_llm(json.dumps(plan), 3)
+
+        self.assertIsNone(parsed)
+        self.assertIn("filter column 0 must appear in an unfiltered overview part", error)
+
     def test_questionnaire_columns_require_llm_only_until_translation_is_cached(self):
         with patch.object(
             survey_service,

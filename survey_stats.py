@@ -142,6 +142,12 @@ def compute(
     profile_cols = [c for c in plan["columns"] if c["role"] == "profile_dim"]
     mlbb_id_cols = [c for c in plan["columns"] if c["role"] == "mlbbid"]
     id_cols = [c for c in plan["columns"] if c["role"] == "id"]
+    segment_indexes = {
+        part.get("filter", {}).get("column_index")
+        for part in plan.get("parts") or []
+        if isinstance(part.get("filter"), dict)
+    }
+    segment_cols = [c for c in plan["columns"] if c["index"] in segment_indexes]
 
     md_parts: list[str] = []
 
@@ -168,6 +174,10 @@ def compute(
     for i, part in enumerate(plan["parts"], 1):
         md_parts.append(f"## Part {i} {part['name']}")
         md_parts.append("")
+        part_body = _filter_rows_for_part(body, part, cols_by_index)
+        if part.get("filter"):
+            md_parts.append(_part_filter_note(part, cols_by_index, len(part_body)))
+            md_parts.append("")
         rendered_matrix: set[str] = set()
         for col_idx in part["column_indexes"]:
             col = cols_by_index.get(col_idx)
@@ -185,13 +195,13 @@ def compute(
                     and cols_by_index[j]["role"] == col["role"]
                     and (cols_by_index[j].get("matrix_group") or "") == (col.get("matrix_group") or "")
                 ]
-                section = _render_matrix(grp, col["role"], members, headers, body)
+                section = _render_matrix(grp, col["role"], members, headers, part_body)
                 rendered_matrix.add(grp)
                 if section:
                     md_parts.append(section)
                     md_parts.append("")
                 continue
-            section = _render_column(col, headers, body, profile_cols)
+            section = _render_column(col, headers, part_body, profile_cols)
             if section:
                 md_parts.append(section)
                 md_parts.append("")
@@ -201,12 +211,12 @@ def compute(
     for c in plan["columns"]:
         if c["role"] == "open_text":
             open_text[c["index"]] = _collect_open_text(
-                c["index"], body, headers, mlbb_id_cols + id_cols, profile_cols
+                c["index"], body, headers, mlbb_id_cols + id_cols, profile_cols, segment_cols
             )
     for c in plan["columns"]:
         if c["role"] in ("single_choice", "multi_choice"):
             entries = _collect_choice_other_text(
-                c, body, headers, mlbb_id_cols + id_cols, profile_cols
+                c, body, headers, mlbb_id_cols + id_cols, profile_cols, segment_cols
             )
             if entries:
                 open_text.setdefault(c["index"], []).extend(entries)
@@ -228,13 +238,45 @@ def collect_open_text(rows: list[list], plan: dict) -> dict[int, list[dict]]:
     profile_cols = [c for c in plan["columns"] if c["role"] == "profile_dim"]
     mlbb_id_cols = [c for c in plan["columns"] if c["role"] == "mlbbid"]
     id_cols = [c for c in plan["columns"] if c["role"] == "id"]
+    segment_indexes = {
+        part.get("filter", {}).get("column_index")
+        for part in plan.get("parts") or []
+        if isinstance(part.get("filter"), dict)
+    }
+    segment_cols = [c for c in plan["columns"] if c["index"] in segment_indexes]
     open_text: dict[int, list[dict]] = {}
     for c in plan["columns"]:
         if c["role"] == "open_text":
             open_text[c["index"]] = _collect_open_text(
-                c["index"], body, headers, mlbb_id_cols + id_cols, profile_cols
+                c["index"], body, headers, mlbb_id_cols + id_cols, profile_cols, segment_cols
             )
     return open_text
+
+
+def _filter_rows_for_part(
+    body: list[list], part: dict, cols_by_index: dict[int, dict]
+) -> list[list]:
+    part_filter = part.get("filter")
+    if not isinstance(part_filter, dict):
+        return body
+    filter_idx = part_filter.get("column_index")
+    filter_col = cols_by_index.get(filter_idx)
+    if not filter_col:
+        return []
+    norm = _make_normalizer(filter_col.get("value_aliases"))
+    allowed = {norm(str(option).strip()) for option in part_filter.get("allowed_options") or []}
+    return [
+        row for row in body
+        if filter_idx < len(row) and norm(_format_cell(row[filter_idx]).strip()) in allowed
+    ]
+
+
+def _part_filter_note(part: dict, cols_by_index: dict[int, dict], count: int) -> str:
+    part_filter = part.get("filter") or {}
+    filter_col = cols_by_index.get(part_filter.get("column_index")) or {}
+    parent_name = filter_col.get("name") or f"列{part_filter.get('column_index')}"
+    options = " / ".join(f"「{option}」" for option in part_filter.get("allowed_options") or [])
+    return f"适用范围：{parent_name}选择{options}；本 Part 有效人群 {count} 人。"
 
 
 def _split_markdown_row(line: str) -> list[str]:
@@ -843,6 +885,7 @@ def _collect_choice_other_text(
     headers: list[str],
     id_cols: list[dict],
     profile_cols: list[dict],
+    segment_cols: list[dict],
 ) -> list[dict]:
     other_label = _choice_other_label(col)
     meta = _choice_other_meta(col)
@@ -897,7 +940,9 @@ def _collect_choice_other_text(
             if key in seen_rows:
                 continue
             seen_rows.add(key)
-            entry = _build_open_text_entry(row, text, headers, id_cols, profile_cols)
+            entry = _build_open_text_entry(
+                row, text, headers, id_cols, profile_cols, segment_cols
+            )
             entry["source"] = "choice_other_text"
             entry["parent_question"] = col.get("name") or _safe_header(headers, idx)
             entry["parent_index"] = idx
@@ -912,6 +957,7 @@ def _build_open_text_entry(
     headers: list[str],
     id_cols: list[dict],
     profile_cols: list[dict],
+    segment_cols: list[dict],
 ) -> dict:
     ids: dict[str, str] = {}
     for c in id_cols:
@@ -932,9 +978,18 @@ def _build_open_text_entry(
             norm = _make_normalizer(c.get("value_aliases"))
             profile[key] = norm(v.strip())
 
+    segments: dict[str, str] = {}
+    for c in segment_cols:
+        i = c["index"]
+        v = _format_cell(row[i]) if i < len(row) else ""
+        if v.strip():
+            norm = _make_normalizer(c.get("value_aliases"))
+            segments[str(i)] = norm(v.strip())
+
     return {
         "ids": ids,
         "profile": profile,
+        "segments": segments,
         "text": text.strip(),
     }
 
@@ -945,6 +1000,7 @@ def _collect_open_text(
     headers: list[str],
     id_cols: list[dict],
     profile_cols: list[dict],
+    segment_cols: list[dict],
 ) -> list[dict]:
     """收集某开放题的所有非空原文，每条附该行的所有 id 列值 + 画像列值。
 
@@ -957,7 +1013,11 @@ def _collect_open_text(
         text = _format_cell(row[col_idx]) if col_idx < len(row) else ""
         if not text.strip():
             continue
-        out.append(_build_open_text_entry(row, text.strip(), headers, id_cols, profile_cols))
+        out.append(
+            _build_open_text_entry(
+                row, text.strip(), headers, id_cols, profile_cols, segment_cols
+            )
+        )
     return out
 
 

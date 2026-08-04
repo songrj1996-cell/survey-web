@@ -222,8 +222,11 @@ def _validate_plan(data: dict, header_count: int) -> str | None:
     parts = data.get("parts")
     if not isinstance(parts, list) or not parts:
         return "parts missing or empty"
-    part_indexes_seen: set[int] = set()
-    # id / ignore 不参与章节统计，允许不在任何 part 里；其他角色必须恰好归到一个 part
+    cols_by_index = {c["index"]: c for c in cols}
+    part_index_filters: dict[int, list[tuple[int, frozenset[str]] | None]] = {}
+    filter_parent_indexes: set[int] = set()
+    # id / ignore 不参与章节统计，允许不在任何 part 里；其他角色必须至少归到一个 part。
+    # 带单选题筛选条件的 Part 可以复用同一组业务题，用于按互斥选项分别成章。
     must_be_in_part = {
         c["index"] for c in cols if c["role"] not in NON_STAT_ROLES
     }
@@ -233,16 +236,75 @@ def _validate_plan(data: dict, header_count: int) -> str | None:
         if not isinstance(p.get("name"), str) or not p["name"].strip():
             return "part name missing"
         ci = p.get("column_indexes")
-        if not isinstance(ci, list):
+        if not isinstance(ci, list) or not ci:
             return f"part {p.get('name')!r} missing column_indexes"
+        part_filter = p.get("filter")
+        filter_key: tuple[int, frozenset[str]] | None = None
+        if part_filter is not None:
+            if not isinstance(part_filter, dict):
+                return f"part {p.get('name')!r} filter must be an object"
+            filter_idx = part_filter.get("column_index")
+            allowed = part_filter.get("allowed_options")
+            filter_col = cols_by_index.get(filter_idx)
+            if not filter_col or filter_col.get("role") != "single_choice":
+                return f"part {p.get('name')!r} filter must reference a single_choice column"
+            if not isinstance(allowed, list) or not allowed or any(
+                not isinstance(option, str) or not option.strip() for option in allowed
+            ):
+                return f"part {p.get('name')!r} filter.allowed_options must be non-empty strings"
+
+            aliases = filter_col.get("value_aliases") or {}
+            canonical_by_value: dict[str, str] = {}
+            for canonical, alias_list in aliases.items():
+                if not isinstance(canonical, str):
+                    continue
+                canonical_by_value[canonical.strip().casefold()] = canonical.strip()
+                if isinstance(alias_list, list):
+                    for alias in alias_list:
+                        if isinstance(alias, str):
+                            canonical_by_value[alias.strip().casefold()] = canonical.strip()
+            declared_options = {
+                str(option).strip().casefold()
+                for option in (filter_col.get("options") or [])
+                if str(option).strip()
+            }
+            resolved_allowed = [
+                canonical_by_value.get(option.strip().casefold(), option.strip())
+                for option in allowed
+            ]
+            normalized_allowed = frozenset(option.casefold() for option in resolved_allowed)
+            if declared_options:
+                normalized_declared = {
+                    canonical_by_value.get(option, option).casefold() for option in declared_options
+                }
+                if not normalized_allowed.issubset(normalized_declared):
+                    return f"part {p.get('name')!r} filter references unknown options"
+            part_filter["allowed_options"] = resolved_allowed
+            filter_key = (filter_idx, normalized_allowed)
+            filter_parent_indexes.add(filter_idx)
+            if filter_idx in ci:
+                return f"part {p.get('name')!r} must not analyze its own filter column"
         for idx in ci:
             if idx not in seen_indexes:
                 return f"part references unknown column index: {idx}"
-            if idx in part_indexes_seen:
-                return f"column index {idx} appears in multiple parts"
-            part_indexes_seen.add(idx)
+            existing_filters = part_index_filters.setdefault(idx, [])
+            if existing_filters:
+                if filter_key is None or any(existing is None for existing in existing_filters):
+                    return f"column index {idx} appears in multiple unfiltered parts"
+                for existing in existing_filters:
+                    assert existing is not None
+                    if existing[0] != filter_key[0]:
+                        return f"column index {idx} uses different filter columns across parts"
+                    if existing[1] & filter_key[1]:
+                        return f"column index {idx} has overlapping part filters"
+            existing_filters.append(filter_key)
+    for filter_idx in filter_parent_indexes:
+        parent_placements = part_index_filters.get(filter_idx) or []
+        if not any(placement is None for placement in parent_placements):
+            return f"filter column {filter_idx} must appear in an unfiltered overview part"
     # 必须分章节的列（即 profile_dim / single_choice / multi_choice / scale / open_text）
     # 必须恰好出现在某个 part 里
+    part_indexes_seen = set(part_index_filters)
     missing = must_be_in_part - part_indexes_seen
     if missing:
         return f"stats columns not in any part: {sorted(missing)}"
@@ -319,6 +381,12 @@ def render_plan_for_user(plan: dict, headers: list[str]) -> str:
             lines.append("")  # 部分之间留空行做视觉分隔
         ordinal = _CHINESE_ORDINALS.get(i, str(i))
         lines.append(f"**第{ordinal}部分：{p['name']}**")
+        part_filter = p.get("filter")
+        if isinstance(part_filter, dict):
+            filter_col = find_column(plan, part_filter.get("column_index")) or {}
+            filter_name = filter_col.get("name") or _short_name(headers, part_filter.get("column_index"))
+            options = " / ".join(f"「{option}」" for option in part_filter.get("allowed_options") or [])
+            lines.append(f"适用人群：{filter_name}选择{options}")
         for j, idx in enumerate(p["column_indexes"], 1):
             col = find_column(plan, idx) or {}
             name = col.get("name") or _short_name(headers, idx)
@@ -682,13 +750,13 @@ def merge_confirmed_into_plan(plan: dict, confirmed: list[dict]) -> dict:
 
     # part 修补：保留 planner 的章节划分，但只留合法索引；矩阵成员对齐到兄弟列所在 part
     parts = plan.get("parts") or []
-    # 当前每个 index 落在哪个 part
-    placed: dict[int, int] = {}
+    # 当前每个 index 落在哪些 part；带互斥筛选的章节允许复用同一列。
+    placed: dict[int, set[int]] = {}
     for pi, p in enumerate(parts):
         cis = [i for i in (p.get("column_indexes") or []) if i in valid_idx]
         p["column_indexes"] = cis
         for i in cis:
-            placed[i] = pi
+            placed.setdefault(i, set()).add(pi)
 
     # 矩阵题：把同 group 的成员列都塞进「已有任一成员所在」的 part
     groups: dict[str, list[int]] = {}
@@ -696,20 +764,26 @@ def merge_confirmed_into_plan(plan: dict, confirmed: list[dict]) -> dict:
         if c["role"] in MATRIX_ROLES:
             groups.setdefault(c["matrix_group"], []).append(c["index"])
     for members in groups.values():
-        target_pi = next((placed[i] for i in members if i in placed), None)
-        if target_pi is None and parts:
-            target_pi = 0
-        if target_pi is None:
+        target_pis = sorted({pi for i in members for pi in placed.get(i, set())})
+        if not target_pis and parts:
+            target_pis = [0]
+        if not target_pis:
             continue
-        for i in members:
-            if placed.get(i) != target_pi:
-                # 从原 part 移除
-                if i in placed:
-                    old = parts[placed[i]]["column_indexes"]
-                    if i in old:
-                        old.remove(i)
-                parts[target_pi]["column_indexes"].append(i)
-                placed[i] = target_pi
+        preserve_repeated = len(target_pis) > 1 and all(parts[pi].get("filter") for pi in target_pis)
+        if not preserve_repeated:
+            target_pi = target_pis[0]
+            for other_pi in target_pis[1:]:
+                parts[other_pi]["column_indexes"] = [
+                    idx for idx in parts[other_pi]["column_indexes"] if idx not in members
+                ]
+                for idx in members:
+                    placed.get(idx, set()).discard(other_pi)
+            target_pis = [target_pi]
+        for target_pi in target_pis:
+            for i in members:
+                if i not in parts[target_pi]["column_indexes"]:
+                    parts[target_pi]["column_indexes"].append(i)
+                placed.setdefault(i, set()).add(target_pi)
 
     # 任何「应入 part 但没落位」的统计列，兜底塞进第一个 part
     must = {c["index"] for c in new_cols if c["role"] not in NON_STAT_ROLES}

@@ -410,11 +410,16 @@ DEFAULT_SURVEY_PLANNER_SYSTEM_PROMPT = """\
       "max": 5,
       "matrix_group": "矩阵题中文短名",
       "matrix_row": "子项中文短名",
+      "options": ["已确认选项"],
       "value_aliases": {"中文标准值": ["原始变体1", "原始变体2"]}
     }
   ],
   "parts": [
-    {"name": "章节中文名", "column_indexes": [0, 1]}
+    {
+      "name": "章节中文名",
+      "column_indexes": [0, 1],
+      "filter": {"column_index": 2, "allowed_options": ["某个已确认的单选项"]}
+    }
   ],
   "cross_tabs": [
     {"profile_index": 0, "question_index": 1}
@@ -428,8 +433,15 @@ DEFAULT_SURVEY_PLANNER_SYSTEM_PROMPT = """\
 - columns 必须逐个覆盖实际物理列，每个 index 只能出现一次。
 - 矩阵题需要把每个物理列分别写成一个 columns 项，并用相同 matrix_group、各自的
   matrix_row 表示矩阵归属；同一矩阵的所有列必须整体放入同一个 part。
+- filter 是可选字段。只有需要按某道已确认的 single_choice 题的不同选项分别成章时才使用；
+  column_index 必须指向该 single_choice 列，allowed_options 只能使用其已确认的标准选项。
 - profile_dim / single_choice / multi_choice / scale / matrix_scale / matrix_single / matrix_multi /
-  open_text 必须恰好出现在一个 part 的 column_indexes 中。
+  open_text 必须至少出现在一个 part 的 column_indexes 中。通常只能出现一次；只有多个 Part 分别带有同一
+  single_choice 筛选列、且 allowed_options 互不重叠时，才允许复用同一组题目列。
+- 当用户要求按选择某个方案/模式的人群分别分析时，应为每个选项建立独立 Part，并在每个 Part 内复用
+  该分支的原因、满意度、改进意见等后续题；筛选父题本身必须单独放在一个不带 filter 的整体选择 Part，
+  不得再放进任何由它筛选的 Part，否则该章只会得到无意义的 100% 选择率。不得创建没有
+  column_indexes 的空 Part，也不得把不同人群混写。
 - id / mlbbid / ignore 不得放入任何 part。
 - cross_tabs 不确定时必须输出 []。每一项必须同时包含整数 profile_index 和整数
   question_index，不能缺字段、不能为 null，二者不能相同。

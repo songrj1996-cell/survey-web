@@ -60,6 +60,50 @@ class ReportWriterStructureTests(unittest.TestCase):
         self.assertIn("大致代表什么、有哪些样本或解释限制", query)
         self.assertIn("不要机械复述最高项和最低项", query)
 
+    def test_filtered_part_context_excludes_other_option_responses(self):
+        plan = {
+            "parts": [
+                {
+                    "name": "中等按钮反馈",
+                    "column_indexes": [1],
+                    "filter": {"column_index": 0, "allowed_options": ["中等按钮模式"]},
+                },
+                {
+                    "name": "默认模式反馈",
+                    "column_indexes": [1],
+                    "filter": {"column_index": 0, "allowed_options": ["默认模式"]},
+                },
+            ],
+            "columns": [
+                {"index": 0, "name": "控制模式", "role": "single_choice"},
+                {"index": 1, "name": "选择原因", "role": "open_text"},
+            ],
+        }
+        open_text = {
+            1: [
+                {"ids": {}, "profile": {}, "segments": {"0": "中等按钮模式"}, "text": "大小正好"},
+                {"ids": {}, "profile": {}, "segments": {"0": "默认模式"}, "text": "已经习惯"},
+            ],
+        }
+
+        plan_md, open_text_md, requirements = _build_writer_context(
+            "", open_text, plan, ["模式", "原因"],
+        )
+        part_query = _build_writer_part_query({
+            "i": 1,
+            "name": "中等按钮反馈",
+            "col_desc": "选择原因(open_text)",
+            "filter_desc": "适用人群：控制模式选择「中等按钮模式」",
+        })
+
+        self.assertIn("适用人群：控制模式选择「中等按钮模式」", plan_md)
+        self.assertIn("Part 1 中等按钮反馈 / 选择原因", open_text_md)
+        self.assertIn("大小正好", open_text_md)
+        self.assertIn("Part 2 默认模式反馈 / 选择原因", open_text_md)
+        self.assertIn("已经习惯", open_text_md)
+        self.assertIn("分组选项成章强制规则", requirements)
+        self.assertIn("不得混入其他选项玩家", part_query)
+
     def test_core_query_requires_plain_language_grounded_in_player_wording(self):
         query = _build_writer_core_query(
             [{"i": 1, "name": "皮肤编号", "col_desc": "编号评价(open_text)"}],

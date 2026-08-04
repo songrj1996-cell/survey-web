@@ -11,6 +11,52 @@ from survey_stats import compute, structured_tables
 
 
 class StatsPresentationTests(unittest.TestCase):
+    def test_filtered_parts_use_aliases_and_keep_open_text_segments(self):
+        rows = [
+            ["模式", "原因", "满意度"],
+            ["Orta Buton Modu", "大小正好", "5"],
+            ["Varsayılan Mod", "已经习惯", "3"],
+            ["Orta Buton Modu", "不挡视野", "4"],
+        ]
+        plan = {
+            "columns": [
+                {
+                    "index": 0,
+                    "name": "控制模式",
+                    "role": "single_choice",
+                    "options": ["中等按钮模式", "默认模式"],
+                    "value_aliases": {
+                        "中等按钮模式": ["Orta Buton Modu"],
+                        "默认模式": ["Varsayılan Mod"],
+                    },
+                },
+                {"index": 1, "name": "选择原因", "role": "open_text"},
+                {"index": 2, "name": "满意度", "role": "scale", "min": 1, "max": 5},
+            ],
+            "parts": [
+                {"name": "整体选择", "column_indexes": [0]},
+                {
+                    "name": "中等按钮反馈",
+                    "column_indexes": [1, 2],
+                    "filter": {"column_index": 0, "allowed_options": ["中等按钮模式"]},
+                },
+                {
+                    "name": "默认模式反馈",
+                    "column_indexes": [1, 2],
+                    "filter": {"column_index": 0, "allowed_options": ["默认模式"]},
+                },
+            ],
+        }
+
+        stats_md, open_text = compute(rows, plan)
+
+        self.assertIn("## Part 2 中等按钮反馈", stats_md)
+        self.assertIn("本 Part 有效人群 2 人", stats_md)
+        self.assertIn("## Part 3 默认模式反馈", stats_md)
+        self.assertIn("本 Part 有效人群 1 人", stats_md)
+        self.assertEqual(open_text[1][0]["segments"]["0"], "中等按钮模式")
+        self.assertEqual(open_text[1][1]["segments"]["0"], "默认模式")
+
     def test_missing_multichoice_delimiter_prefers_normalized_newlines(self):
         rows = [
             ["剧情认知"],

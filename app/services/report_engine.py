@@ -119,6 +119,57 @@ def _question_name_with_branch(name: str, plan: dict, column_index: int) -> str:
     return f"{name}【{note}】" if note else name
 
 
+def _part_filter_desc(part: dict, plan: dict) -> str:
+    part_filter = part.get("filter")
+    if not isinstance(part_filter, dict):
+        return ""
+    filter_idx = part_filter.get("column_index")
+    col = next((c for c in plan.get("columns", []) if c.get("index") == filter_idx), None)
+    parent_name = (col and col.get("name")) or f"列{filter_idx}"
+    options = " / ".join(f"「{option}」" for option in part_filter.get("allowed_options") or [])
+    return f"适用人群：{parent_name}选择{options}"
+
+
+def _filter_open_entries(entries: list[dict], part_filter: dict | None) -> list[dict]:
+    if not isinstance(part_filter, dict):
+        return entries
+    filter_idx = str(part_filter.get("column_index"))
+    allowed = {
+        str(option).strip().casefold()
+        for option in part_filter.get("allowed_options") or []
+    }
+    return [
+        entry for entry in entries
+        if str((entry.get("segments") or {}).get(filter_idx, "")).strip().casefold() in allowed
+    ]
+
+
+def _open_text_scopes(open_text: dict, plan: dict):
+    """按 Part 筛选条件展开开放题分析池；旧方案仍使用原列号作为 key。"""
+    yielded_columns: set[int] = set()
+    for part_index, part in enumerate(plan.get("parts") or [], 1):
+        part_filter = part.get("filter")
+        for col_idx in part.get("column_indexes") or []:
+            entries = open_text.get(col_idx)
+            if entries is None:
+                entries = open_text.get(str(col_idx))
+            if entries is None:
+                continue
+            yielded_columns.add(col_idx)
+            scoped_entries = _filter_open_entries(entries, part_filter)
+            scope_key = f"part_{part_index}_col_{col_idx}" if part_filter else col_idx
+            yield scope_key, col_idx, part_index, part, scoped_entries
+    for raw_idx, entries in open_text.items():
+        try:
+            col_idx = int(raw_idx)
+        except (TypeError, ValueError):
+            continue
+        if col_idx in yielded_columns:
+            continue
+        fallback_part = {"name": "未分章开放题", "column_indexes": [col_idx]}
+        yield col_idx, col_idx, 0, fallback_part, entries
+
+
 def _build_planner_sample(rows: list[list], sample_n: int = 5) -> str:
     if not rows:
         return ""
@@ -250,6 +301,10 @@ def _build_plan_revision_query(
         "3. columns 必须保留用户已确认的题型、列号、选项、矩阵题分组等权威信息；不要重新猜测题型或选项。\n"
         "4. parts 必须使用实际存在的列号；矩阵题成员列必须整体归入同一个 part。\n"
         "5. 若用户意见只要求调整章节/分析重点，只改 parts、cross_tabs 或 open_questions，不要无故改 columns。\n"
+        "7. 当用户要求按某道已确认 single_choice 题的不同选项分别成章时，为每个选项建立带 filter 的 Part："
+        "filter.column_index 指向该单选题，filter.allowed_options 使用已确认标准选项；这些筛选互斥的 Part "
+        "可以复用同一组后续题 column_indexes。筛选父题必须单独放入一个不带 filter 的整体选择 Part，"
+        "不得出现在由它筛选的 Part 的 column_indexes 中。不得创建空 Part，也不得把不同选项人群合并。\n"
         f"{profile_constraint}\n"
         f"<headers>\n{header_lines}\n</headers>\n\n"
         f"<confirmed_columns_json>\n{confirmed_json}\n</confirmed_columns_json>\n\n"
@@ -784,21 +839,27 @@ async def _batch_qualitative_analysis(
     clustered_themes: dict = {}
     diagnostics: dict[str, dict] = {}
 
-    for col_idx, entries in open_text.items():
+    for scope_key, col_idx, part_index, part, entries in _open_text_scopes(open_text, plan):
         col = next((c for c in plan["columns"] if c["index"] == col_idx), None)
         col_name = (col and col.get("name")) or (
             headers[col_idx] if col_idx < len(headers) else f"列{col_idx}"
         )
         col_name = f"{col_name}{_open_text_source_note(entries)}"
         col_name = _question_name_with_branch(col_name, plan, col_idx)
+        filter_desc = _part_filter_desc(part, plan)
+        if filter_desc:
+            col_name = f"Part {part_index} {part.get('name')} / {col_name}【{filter_desc}】"
         total = len(entries)
         yield ("progress", f"【{col_name}】开始分析（共 {total} 条）")
+        if not entries:
+            diagnostics[str(scope_key)] = _cluster_diag_column(col_idx, col_name, 0, 0)
+            continue
 
         # ── Phase A：分批提取主题候选 ──────────────────────────────────────
         batches = [entries[i:i + BATCH_SIZE] for i in range(0, total, BATCH_SIZE)]
         all_candidates: list[dict] = []
         diag = _cluster_diag_column(col_idx, col_name, total, len(batches))
-        diagnostics[str(col_idx)] = diag
+        diagnostics[str(scope_key)] = diag
 
         extract_factories = []
         for bi, batch in enumerate(batches, 1):
@@ -1047,7 +1108,11 @@ async def _batch_qualitative_analysis(
         themes_out.sort(key=lambda x: x["count"], reverse=True)
         other_themes_out.sort(key=lambda x: x["count"], reverse=True)
 
-        clustered_themes[col_idx] = {
+        clustered_themes[scope_key] = {
+            "column_index": col_idx,
+            "part_index": part_index,
+            "part_name": part.get("name", ""),
+            "filter_desc": filter_desc,
             "col_name": col_name,
             "total": total,
             "themes": themes_out,
@@ -1138,25 +1203,24 @@ def _build_open_text_fallback_md(
     total_chars = 0
     max_chars = 45000
 
-    for raw_idx, entries in open_text.items():
-        idx_key = str(raw_idx)
+    for scope_key, col_idx, part_index, part, entries in _open_text_scopes(open_text, plan):
+        idx_key = str(scope_key)
         if idx_key in clustered_keys:
             continue
         if not entries:
             continue
-        try:
-            col_idx = int(raw_idx)
-        except (TypeError, ValueError):
-            col_idx = raw_idx
         col = next((c for c in plan.get("columns", []) if c.get("index") == col_idx), None)
         name = (col and col.get("name")) or (
-            headers[col_idx] if isinstance(col_idx, int) and col_idx < len(headers) else f"列{raw_idx}"
+            headers[col_idx] if isinstance(col_idx, int) and col_idx < len(headers) else f"列{col_idx}"
         )
         if isinstance(col_idx, int):
             name = _question_name_with_branch(name, plan, col_idx)
-        lines = [f"### {name}（列 {raw_idx}，共 {len(entries)} 条非空回答；以下为抽样原文）"]
+        filter_desc = _part_filter_desc(part, plan)
+        if filter_desc:
+            name = f"Part {part_index} {part.get('name')} / {name}【{filter_desc}】"
+        lines = [f"### {name}（列 {col_idx}，共 {len(entries)} 条非空回答；以下为抽样原文）"]
         name = f"{name}{_open_text_source_note(entries)}"
-        lines[0] = f"### {name} (col {raw_idx}, {len(entries)} responses; sampled raw text)"
+        lines[0] = f"### {name} (col {col_idx}, {len(entries)} responses; sampled raw text)"
         for i, entry in enumerate(_sample_open_entries(entries), 1):
             ident = _entry_identity(entry)
             prefix = f"{i}. "
@@ -1199,7 +1263,9 @@ def _build_large_sample_writer_query(
                 nm = (col and col.get("name")) or (headers[idx] if idx < len(headers) else f"列{idx}")
                 rl = col["role"] if col else "?"
                 col_names.append(f"{nm}({rl})")
-            parts_lines.append(f"  Part {i} {p['name']}: {'; '.join(col_names)}")
+            filter_desc = _part_filter_desc(p, plan)
+            suffix = f"；{filter_desc}" if filter_desc else ""
+            parts_lines.append(f"  Part {i} {p['name']}: {'; '.join(col_names)}{suffix}")
         else:
             scope = p.get("scope", "")
             parts_lines.append(f"  Part {i} {p['name']}" + (f": {scope}" if scope else ""))
@@ -1304,7 +1370,7 @@ def _get_large_sample_writer_requirements(
 
 
 def _writer_parts_meta(plan: dict, headers: list[str]) -> list[dict]:
-    """返回 [{'i','name','col_desc'}]，供分轮生成时逐 Part 取标题与列说明。"""
+    """返回逐 Part 写作元数据，包含可选的单选题人群筛选条件。"""
     meta = []
     for i, p in enumerate(plan["parts"], 1):
         col_names = []
@@ -1313,7 +1379,14 @@ def _writer_parts_meta(plan: dict, headers: list[str]) -> list[dict]:
             name = (col and col.get("name")) or (headers[idx] if idx < len(headers) else f"列{idx}")
             role = col["role"] if col else "?"
             col_names.append(f"{name}({role})")
-        meta.append({"i": i, "name": p["name"], "col_desc": "; ".join(col_names)})
+        meta.append({
+            "i": i,
+            "name": p["name"],
+            "col_desc": "; ".join(col_names),
+            "column_indexes": list(p["column_indexes"]),
+            "filter": p.get("filter"),
+            "filter_desc": _part_filter_desc(p, plan),
+        })
     return meta
 
 
@@ -1321,18 +1394,25 @@ def _build_writer_context(stats_md: str, open_text: dict, plan: dict, headers: l
     """构造 Writer 的完整上下文：(plan_summary, open_text_md, requirements)。
     plan_summary/open_text/stats 仅在多轮生成的第 1 轮发送一次，后续轮次复用会话历史。"""
     parts_meta = _writer_parts_meta(plan, headers)
-    parts_lines = [f"  Part {m['i']} {m['name']}: {m['col_desc']}" for m in parts_meta]
+    parts_lines = [
+        f"  Part {m['i']} {m['name']}: {m['col_desc']}"
+        + (f"；{m['filter_desc']}" if m["filter_desc"] else "")
+        for m in parts_meta
+    ]
     plan_summary = "<plan>\n报告结构：\n" + "\n".join(parts_lines) + "\n</plan>"
     branch_logic_block = _build_branch_logic_block(plan.get("branch_rules"))
     if branch_logic_block:
         plan_summary += "\n\n" + branch_logic_block
 
     open_text_blocks = []
-    for col_idx, texts in open_text.items():
+    for _, col_idx, part_index, part, texts in _open_text_scopes(open_text, plan):
+        if not texts:
+            continue
         col = next((c for c in plan["columns"] if c["index"] == col_idx), None)
         name = (col and col.get("name")) or (headers[col_idx] if col_idx < len(headers) else f"列{col_idx}")
         name = f"{name}{_open_text_source_note(texts)}"
         name = _question_name_with_branch(name, plan, col_idx)
+        scope = _part_filter_desc(part, plan)
         joined_lines = []
         for entry in texts:
             ids = entry.get("ids", {})
@@ -1343,7 +1423,11 @@ def _build_writer_context(stats_md: str, open_text: dict, plan: dict, headers: l
             text_val = entry.get("text", "")
             joined_lines.append(f"- {f'[{prefix}] ' if prefix else ''}{text_val}")
         joined = "\n".join(joined_lines)
-        open_text_blocks.append(f"### {name}（列 {col_idx}, 共 {len(texts)} 条非空回答）\n{joined}")
+        scope_suffix = f"；{scope}" if scope else ""
+        open_text_blocks.append(
+            f"### Part {part_index} {part.get('name')} / {name}"
+            f"（列 {col_idx}, 共 {len(texts)} 条非空回答{scope_suffix}）\n{joined}"
+        )
 
     open_text_md = (
         "<open_text>\n" + "\n\n".join(open_text_blocks) + "\n</open_text>"
@@ -1356,6 +1440,11 @@ def _build_writer_context(stats_md: str, open_text: dict, plan: dict, headers: l
             "\n\n跳转题强制规则：必须执行 `<question_branch_logic>`；同一章节内的不同分支必须分别归纳，"
             "不得合并回答池。每条分支结论都要说明适用人群，并使用进入该分支人数或该题有效回答数作为分母，"
             "不得使用问卷总样本替代。不同题干、不同使用程度人群的主观反馈不得直接比较高低。"
+        )
+    if any(m["filter_desc"] for m in parts_meta):
+        requirements += (
+            "\n\n分组选项成章强制规则：带有“适用人群”的 Part 只能使用该筛选人群对应的 <stats> "
+            "和 <open_text>；不得引用其他选项人群的回答，不得用问卷总样本替代该 Part 的有效人群分母。"
         )
     requirements += (
         "\n\n补充：在「相关具体信息引用」中展示玩家反馈时，必须沿用 `<open_text>` 前缀里的玩家身份信息。"
@@ -1411,11 +1500,17 @@ def _build_writer_part_query(
         "无法形成可靠解释时不要机械复述最高项和最低项。\n"
         if not quantitative_first else ""
     )
+    filter_rule = (
+        f"本 Part 的{part['filter_desc']}。只能使用 <stats> 与 <open_text> 中明确标为本 Part、"
+        "且属于该人群的数据；不得混入其他选项玩家的满意度、原因、意见或引用。\n"
+        if part.get("filter_desc") else ""
+    )
     return (
         f"**本轮任务**：现在**只**写 `## Part {part['i']} {part['name']}` 这一个章节的完整内容"
         f"（涉及列：{part['col_desc']}）。\n"
         + quantitative_rule
         + qualitative_rule
+        + filter_rule
         + "严格按 <report_spec> 里对 Part 的写法：紧接 `## Part` 标题后写 `**本节总结：**`，并用 3–6 条带加粗短标题的 Markdown 编号列表归纳关键结论，"
         "不得把全部数字和中文说明塞进一个超长段落；"
         "再围绕本 Part 的业务 Topic 综合展开。同一 Topic 下的客观题与相关开放题必须结合分析，客观统计作为人群背景和判断依据，"

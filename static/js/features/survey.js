@@ -1015,7 +1015,7 @@ function buildPlanHTML(plan, headers) {
     return keys.size;
   };
 
-  const renderQuestion = (idx, number, partSet, visited, nested = false) => {
+  const renderQuestion = (idx, number, partSet, visited, nested = false, partFilter = null) => {
     if (visited.has(idx) || !partSet.has(idx)) return '';
     const col = colMap[idx] || {};
     const logicalIndexes = logicalIndexesFor(idx, partSet);
@@ -1023,6 +1023,11 @@ function buildPlanHTML(plan, headers) {
     const name = col.matrix_group || columnDisplayName(idx) || '未命名题目';
     const [roleLabel, method] = rolePresentation(col.role);
     const applicability = ruleByTargetIndex.get(idx);
+    const applicabilityCoveredByPart = Boolean(
+      applicability
+      && partFilter
+      && Number(applicability.rule.parent_index) === Number(partFilter.column_index)
+    );
     let itemHTML = `<div class="plan-outline__question${nested ? ' plan-outline__question--nested' : ''}">
       <div class="plan-outline__question-head">
         <span class="plan-outline__number">${esc(number)}</span>
@@ -1031,7 +1036,7 @@ function buildPlanHTML(plan, headers) {
       </div>
       <div class="plan-outline__method">${esc(method)}</div>`;
 
-    if (applicability && !nested) {
+    if (applicability && !nested && !applicabilityCoveredByPart) {
       const { rule, target } = applicability;
       const options = (rule.allowed_options || []).map(option => `「${option}」`).join(' / ');
       const prefix = rule.confidence === 'medium' ? '疑似条件关系' : '适用范围';
@@ -1064,7 +1069,7 @@ function buildPlanHTML(plan, headers) {
             return;
           }
           childCounter += 1;
-          itemHTML += renderQuestion(targetIdx, `${number}.${childCounter}`, partSet, visited, true);
+          itemHTML += renderQuestion(targetIdx, `${number}.${childCounter}`, partSet, visited, true, partFilter);
         });
         if (externalTargets.length) {
           itemHTML += `<div class="plan-outline__external">其他章节继续分析：${esc(externalTargets.join('、'))}</div>`;
@@ -1088,14 +1093,19 @@ function buildPlanHTML(plan, headers) {
   for (let i = 0; i < plan.parts.length; i++) {
     const p = plan.parts[i];
     const indexes = Array.isArray(p.column_indexes) ? p.column_indexes : [];
+    const partFilter = p.filter && typeof p.filter === 'object' ? p.filter : null;
+    const partFilterOptions = Array.isArray(partFilter?.allowed_options) ? partFilter.allowed_options : [];
+    const partFilterName = partFilter ? (columnDisplayName(partFilter.column_index) || '筛选题目') : '';
     const partSet = new Set(indexes);
-    const partBranchRules = branchRules.filter(rule =>
-      partSet.has(rule.parent_index)
-      || (rule.targets || []).some(target => (target.indexes || []).some(idx => partSet.has(idx)))
-    );
+    const partBranchRules = branchRules.filter(rule => {
+      if (partFilter && Number(rule.parent_index) === Number(partFilter.column_index)) return false;
+      return partSet.has(rule.parent_index)
+        || (rule.targets || []).some(target => (target.indexes || []).some(idx => partSet.has(idx)));
+    });
     const summaryParts = [];
     if (indexes.length) summaryParts.push(`${logicalQuestionCount(indexes)} 道题`);
     if (partBranchRules.length) summaryParts.push(`${partBranchRules.length} 组条件关系`);
+    if (partFilter && partFilterOptions.length) summaryParts.push('1 组人群筛选');
     if (!summaryParts.length && p.scope) summaryParts.push(p.scope);
 
     html += `<details class="plan-outline__part" open>
@@ -1106,6 +1116,14 @@ function buildPlanHTML(plan, headers) {
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
       </summary>
       <div class="plan-outline__part-body">`;
+
+    if (partFilter && partFilterOptions.length) {
+      const options = partFilterOptions.map(option => `「${option}」`).join(' / ');
+      html += `<div class="plan-outline__applicability">
+        <span>本章适用人群</span>
+        ${esc(`「${partFilterName}」选择 ${options}；本章统计、满意度与开放反馈仅使用该组玩家`)}
+      </div>`;
+    }
 
     if (!indexes.length) {
       html += `<div class="plan-outline__scope">${esc(p.scope || '按本章节主题进行综合分析')}</div>`;
@@ -1124,13 +1142,13 @@ function buildPlanHTML(plan, headers) {
       indexes.forEach(idx => {
         if (nestedIndexes.has(idx) || visited.has(idx)) return;
         rootCounter += 1;
-        html += renderQuestion(idx, `${i + 1}.${rootCounter}`, partSet, visited);
+        html += renderQuestion(idx, `${i + 1}.${rootCounter}`, partSet, visited, false, partFilter);
       });
       // 容错：若父题在其他 Part，仍展示未渲染的问题及其适用条件。
       indexes.forEach(idx => {
         if (visited.has(idx)) return;
         rootCounter += 1;
-        html += renderQuestion(idx, `${i + 1}.${rootCounter}`, partSet, visited);
+        html += renderQuestion(idx, `${i + 1}.${rootCounter}`, partSet, visited, false, partFilter);
       });
     }
 
