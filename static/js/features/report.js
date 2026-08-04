@@ -279,101 +279,11 @@ function prepareReportMarkdownForPreview(md) {
   return String(md || '').replace(/(\d)~(?=\d)/g, (_, digit) => `${digit}\\~`);
 }
 
-function hydrateStatsCharts() {
+function removeLegacyStatsChartPayloads() {
   const content = $('report-content');
   if (!content) return;
   content.querySelectorAll('pre code.language-stats-chart').forEach(code => {
-    let chart;
-    try {
-      chart = JSON.parse(code.textContent || '{}');
-    } catch {
-      code.closest('pre')?.remove();
-      return;
-    }
-    const shell = document.createElement('section');
-    shell.className = `stats-chart stats-chart--${chart.type || 'unknown'}`;
-    shell.setAttribute('aria-label', `${chart.title || '统计'}图表`);
-
-    if (chart.type === 'bar') {
-      const series = Array.isArray(chart.series) ? chart.series.slice(0, 6) : [];
-      const labels = Array.isArray(chart.labels) ? chart.labels : [];
-      if (series.length > 1) {
-        const legend = document.createElement('div');
-        legend.className = 'stats-chart__legend';
-        series.forEach((item, index) => {
-          const badge = document.createElement('span');
-          badge.style.setProperty('--series-index', String(index));
-          badge.textContent = item.name || `系列${index + 1}`;
-          legend.appendChild(badge);
-        });
-        shell.appendChild(legend);
-      }
-      const rows = document.createElement('div');
-      rows.className = 'stats-bar-chart';
-      labels.forEach((label, rowIndex) => {
-        const row = document.createElement('div');
-        row.className = 'stats-bar-chart__row';
-        const labelEl = document.createElement('div');
-        labelEl.className = 'stats-bar-chart__label';
-        labelEl.textContent = label;
-        const tracks = document.createElement('div');
-        tracks.className = 'stats-bar-chart__tracks';
-        series.forEach((item, seriesIndex) => {
-          const rawValue = item.values?.[rowIndex];
-          const value = Number(rawValue);
-          const valid = rawValue !== null && rawValue !== undefined && rawValue !== '' && Number.isFinite(value);
-          const track = document.createElement('div');
-          track.className = 'stats-bar-chart__track';
-          const bar = document.createElement('span');
-          bar.className = 'stats-bar-chart__bar';
-          bar.style.setProperty('--bar-width', `${valid ? Math.max(0, Math.min(100, value)) : 0}%`);
-          bar.style.setProperty('--series-index', String(seriesIndex));
-          const valueEl = document.createElement('span');
-          valueEl.className = 'stats-bar-chart__value';
-          valueEl.textContent = valid ? `${value.toFixed(1)}%` : '—';
-          track.append(bar, valueEl);
-          tracks.appendChild(track);
-        });
-        row.append(labelEl, tracks);
-        rows.appendChild(row);
-      });
-      shell.appendChild(rows);
-    } else if (chart.type === 'heatmap') {
-      const table = document.createElement('div');
-      table.className = 'stats-heatmap';
-      const columns = Array.isArray(chart.columns) ? chart.columns : [];
-      const rowLabels = Array.isArray(chart.rows) ? chart.rows : [];
-      const values = Array.isArray(chart.values) ? chart.values : [];
-      table.style.gridTemplateColumns = `minmax(150px, 1.4fr) repeat(${columns.length}, minmax(92px, 1fr))`;
-      const corner = document.createElement('div');
-      corner.className = 'stats-heatmap__head';
-      corner.textContent = '子项';
-      table.appendChild(corner);
-      columns.forEach(column => {
-        const cell = document.createElement('div');
-        cell.className = 'stats-heatmap__head';
-        cell.textContent = column;
-        table.appendChild(cell);
-      });
-      rowLabels.forEach((label, rowIndex) => {
-        const rowHead = document.createElement('div');
-        rowHead.className = 'stats-heatmap__row-head';
-        rowHead.textContent = label;
-        table.appendChild(rowHead);
-        columns.forEach((_column, columnIndex) => {
-          const rawValue = values[rowIndex]?.[columnIndex];
-          const value = Number(rawValue);
-          const valid = rawValue !== null && rawValue !== undefined && rawValue !== '' && Number.isFinite(value);
-          const cell = document.createElement('div');
-          cell.className = 'stats-heatmap__cell';
-          cell.style.setProperty('--heat', valid ? String(Math.max(0, Math.min(100, value)) / 100) : '0');
-          cell.textContent = valid ? `${value.toFixed(1)}%` : '—';
-          table.appendChild(cell);
-        });
-      });
-      shell.appendChild(table);
-    }
-    code.closest('pre')?.replaceWith(shell);
+    code.closest('pre')?.remove();
   });
 }
 
@@ -753,7 +663,7 @@ function renderReportWorkspace(md, { preserveQa = true } = {}) {
   applyQAAvailability();
   updateReportContextSwitch();
   applyCoreHighlight();
-  hydrateStatsCharts();
+  removeLegacyStatsChartPayloads();
   enhanceReportTables();
   buildTOC();
   switchReportTab('report');

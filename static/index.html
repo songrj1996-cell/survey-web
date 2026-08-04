@@ -11,7 +11,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/style.css?v=36" />
+  <link rel="stylesheet" href="/static/style.css?v=38" />
 </head>
 
 <body>
@@ -863,6 +863,14 @@
           </div>
           <div class="iv-review-list" id="iv-review-list"></div>
         </section>
+        <div class="iv-review-batch" id="iv-review-batch" hidden>
+          <strong id="iv-review-batch-count">已选择 0 项修订</strong>
+          <div class="iv-review-batch__actions">
+            <button class="btn btn--ghost btn--sm" id="iv-review-batch-all" type="button">全部选择</button>
+            <button class="btn btn--ghost btn--sm" id="iv-review-batch-clear" type="button">取消选择</button>
+            <button class="btn btn--primary btn--sm" id="iv-review-batch-start" type="button">开始处理 0 项</button>
+          </div>
+        </div>
         <div class="report-document iv-report-document">
           <nav class="report-toc" id="iv-report-toc">
             <div class="report-toc__title">报告目录</div>
@@ -1312,7 +1320,7 @@
                 <path
                   d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
               </svg>
-              <span>Prompt 设置</span>
+              <span>提示词管理</span>
             </div>
             <div class="settings-nav__sep" id="settings-nav-admin-sep" style="display:none"></div>
             <div class="settings-nav__group-label" id="settings-nav-admin-label" style="display:none">管理员</div>
@@ -1375,6 +1383,7 @@
           </div>
         </div>
       </div>
+      <div class="prompt-editor-layer" id="prompt-editor-layer" hidden></div>
     </div>
   </div>
 
@@ -1406,9 +1415,9 @@
   <script src="/static/js/core/core.js?v=31"></script>
   <script src="/static/js/features/survey.js?v=35"></script>
   <script src="/static/js/features/report.js?v=35"></script>
-  <script src="/static/js/features/settings.js?v=30"></script>
+  <script src="/static/js/features/settings.js?v=32"></script>
   <script src="/static/js/features/history.js?v=31"></script>
-  <script src="/static/js/features/interview.js?v=7"></script>
+  <script src="/static/js/features/interview.js?v=9"></script>
   <script src="/static/js/features/nav.js?v=36"></script>
   <script src="/static/js/features/comment.js?v=29"></script>
 <script src="/static/js/features/annotate.js?v=34"></script>

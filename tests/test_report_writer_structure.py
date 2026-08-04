@@ -55,8 +55,10 @@ class ReportWriterStructureTests(unittest.TestCase):
         self.assertIn("不得补造原文中没有的例子", query)
         self.assertNotIn("`**代表性玩家反馈：**`", query)
         self.assertNotIn("`#### 正面观点`", query)
-        self.assertIn("系统会在本节总结之后确定性插入一个 `辅助统计` 模块", query)
+        self.assertIn("系统会在本节总结之后确定性插入客观题统计表", query)
         self.assertIn("不要自行复制客观题统计表", query)
+        self.assertIn("大致代表什么、有哪些样本或解释限制", query)
+        self.assertIn("不要机械复述最高项和最低项", query)
 
     def test_core_query_requires_plain_language_grounded_in_player_wording(self):
         query = _build_writer_core_query(
@@ -85,7 +87,7 @@ class ReportWriterStructureTests(unittest.TestCase):
         self.assertIn("本次为定量优先报告", query)
         self.assertIn("主要分布、最高/最低项和显著差异", query)
         self.assertIn("完整逐题统计表由系统在附录确定性插入", query)
-        self.assertNotIn("本节总结之后确定性插入一个 `辅助统计` 模块", query)
+        self.assertNotIn("本节总结之后确定性插入客观题统计表", query)
 
     def test_large_sample_mode_keeps_qualitative_stats_rule_out_of_quantitative_query(self):
         plan = {"parts": [], "columns": []}
@@ -96,8 +98,8 @@ class ReportWriterStructureTests(unittest.TestCase):
             "", {}, plan, [], quantitative_first=True,
         )
 
-        self.assertIn("系统会在每个 Part 内确定性插入一个 `辅助统计` 模块", qualitative)
-        self.assertNotIn("系统会在每个 Part 内确定性插入一个 `辅助统计` 模块", quantitative)
+        self.assertIn("系统会在对应 Part 内确定性插入客观题统计表", qualitative)
+        self.assertNotIn("系统会在对应 Part 内确定性插入客观题统计表", quantitative)
 
     def test_crosstab_planning_uses_business_context(self):
         context = {

@@ -1,12 +1,9 @@
-"""把确定性统计组织为报告附录与网页图表标记。"""
+"""把确定性统计组织为报告内表格与完整统计附录。"""
 
 from __future__ import annotations
 
 import json
 import re
-
-
-CHART_FENCE = "stats-chart"
 
 
 _PART_HEADING_RE = re.compile(r"^##\s+(Part\s+\d+\b.*)$")
@@ -160,73 +157,6 @@ def _cross_table_is_meaningful(table: dict) -> bool:
     return False
 
 
-def _basic_interpretation(section: dict, include_cross: bool) -> str:
-    table = section["tables"][0]
-    headers = table.get("headers") or []
-    rows = table.get("rows") or []
-    notes = section.get("notes") or []
-    metric = next((note for note in notes if note.startswith("- 均值:")), "")
-    if metric:
-        text = metric.removeprefix("- ").replace("**", "")
-        result = f"本题的{text}。"
-    else:
-        percent_indexes = [
-            index for index, header in enumerate(headers)
-            if any(token in header for token in ("占比", "比例", "百分比"))
-        ]
-        ranked: list[tuple[float, str, str]] = []
-        if percent_indexes:
-            position = percent_indexes[0]
-            for row in rows:
-                if not row or position >= len(row):
-                    continue
-                value = _cell_percent(row[position])
-                if value is not None:
-                    ranked.append((value, row[0], row[position]))
-        if ranked:
-            ranked.sort(reverse=True)
-            highest = ranked[0]
-            result = f"总体分布中，“{highest[1]}”占比最高（{highest[2]}）"
-            if len(ranked) > 1:
-                second = ranked[1]
-                result += f"，其次是“{second[1]}”（{second[2]}）"
-            result += "。"
-        elif headers and rows and "均值" in headers:
-            mean_index = headers.index("均值")
-            means = [
-                (_cell_number(row[mean_index]), row[0])
-                for row in rows if mean_index < len(row)
-            ]
-            means = [(value, label) for value, label in means if value is not None]
-            if means:
-                highest = max(means)
-                lowest = min(means)
-                result = (
-                    f"从均值看，“{highest[1]}”最高（{highest[0]:g}），"
-                    f"“{lowest[1]}”最低（{lowest[0]:g}）。"
-                )
-            else:
-                result = "该表用于描述本题各项的样本分布。"
-        else:
-            matrix_values: list[tuple[float, str, str]] = []
-            for row in rows:
-                for position in range(1, min(len(row), len(headers))):
-                    value = _cell_percent(row[position])
-                    if value is not None:
-                        matrix_values.append((value, row[0], headers[position]))
-            if matrix_values:
-                highest = max(matrix_values)
-                result = (
-                    f"矩阵各子项中，“{highest[1]}”选择“{highest[2]}”的占比最高"
-                    f"（{highest[0]:g}%）。"
-                )
-            else:
-                result = "该表用于描述本题各项的样本分布。"
-    if include_cross:
-        result += " 分组表中存在较明显的描述性差异，但仍需结合各组样本量谨慎理解。"
-    return result
-
-
 def render_qualitative_stats_by_part(
     stats_md: str,
     plan: dict | None = None,
@@ -255,11 +185,7 @@ def render_qualitative_stats_by_part(
     for part, part_sections in grouped.items():
         if not part_sections:
             continue
-        lines = [
-            "### 辅助统计",
-            "",
-            "> 以下统计仅用于理解本次定性样本，不作总体推断。",
-        ]
+        lines = ["> 以下统计仅用于理解本次定性样本，不作总体推断。"]
         for section in part_sections:
             lines.extend(["", f"**{section['title']}**", ""])
             notes = section.get("notes") or []
@@ -283,10 +209,6 @@ def render_qualitative_stats_by_part(
             low_sample_notes = [note for note in notes if note.startswith("> `*`")]
             if cross_tables and low_sample_notes:
                 lines.extend(["", low_sample_notes[-1]])
-            lines.extend([
-                "",
-                f"**基础解读：** {_basic_interpretation(section, bool(cross_tables))}",
-            ])
         rendered[part] = "\n".join(lines).rstrip()
     return rendered
 
@@ -339,7 +261,7 @@ def inject_qualitative_stats(
 
 
 def render_stats_appendix(blocks: list[dict], stats_source: str) -> str:
-    """每道客观题固定输出图表标记和完整表格，不交给 AI 决定是否展示。"""
+    """每道客观题固定输出完整表格，不交给 AI 决定是否展示。"""
     valid = [block for block in blocks if block.get("table_markdown")]
     if not valid:
         return ""
@@ -351,7 +273,7 @@ def render_stats_appendix(blocks: list[dict], stats_source: str) -> str:
     lines = [
         "## 完整统计附录",
         "",
-        f"> 统计来源：{source_text}。每道客观题均保留完整统计表；网页端同时显示统计图。",
+        f"> 统计来源：{source_text}。每道客观题均保留完整统计表。",
     ]
     current_part = None
     for block in valid:
@@ -361,17 +283,5 @@ def render_stats_appendix(blocks: list[dict], stats_source: str) -> str:
             current_part = part
         heading = "####" if part else "###"
         lines.extend(["", f"{heading} {block.get('title') or '未命名题目'}", ""])
-        chart = block.get("chart")
-        if chart:
-            payload = {
-                "title": block.get("title") or "未命名题目",
-                **chart,
-            }
-            lines.extend([
-                f"```{CHART_FENCE}",
-                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-                "```",
-                "",
-            ])
         lines.append(str(block["table_markdown"]).strip())
     return "\n".join(lines).rstrip()

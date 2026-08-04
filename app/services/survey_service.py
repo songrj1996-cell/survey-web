@@ -54,7 +54,6 @@ from app.services.question_detect import (
     _sanitize_choice_options,
 )
 from app.services.questionnaire_import import (
-    QUESTIONNAIRE_TRANSLATION_SYSTEM_PROMPT,
     apply_questionnaire_translations,
     build_questionnaire_translation_query,
     parse_bested_qualitative_upload,
@@ -79,7 +78,6 @@ from app.services.report_engine import (
     _normalize_action_section,
     _render_crosstab_plan_card,
     _writer_parts_meta,
-    REPORT_WRITER_SYSTEM_PROMPT,
 )
 from app.services.report_history import save_to_history
 from app.services.report_render import _inject_disclaimer, _inject_research_background
@@ -89,7 +87,9 @@ from app.storage.prompts import (
     _get_column_detect_system_prompt,
     _get_crosstab_planner_system_prompt,
     _get_planner_extra,
+    _get_questionnaire_translation_system_prompt,
     _get_report_qa_system_prompt,
+    _get_report_writer_system_prompt,
     _get_survey_planner_system_prompt,
 )
 from app.storage.sessions import get_session, new_session, save_session
@@ -230,11 +230,12 @@ async def columns_stream(session_id: str, request: Request):
                     "content": "原问卷题型与结构已锁定，正在翻译题干、选项和矩阵行。\n",
                 })
                 query = build_questionnaire_translation_query(questions)
+                system_prompt = _get_questionnaire_translation_system_prompt()
                 models = (LLM_COLUMN_MODEL, *LLM_COLUMN_FALLBACK_MODELS)
                 messages = [
                     {
                         "role": "system",
-                        "content": QUESTIONNAIRE_TRANSLATION_SYSTEM_PROMPT,
+                        "content": system_prompt,
                     },
                     {"role": "user", "content": query},
                 ]
@@ -254,7 +255,7 @@ async def columns_stream(session_id: str, request: Request):
                     translations = parse_questionnaire_translations(answer, questions)
                 except ValueError as exc:
                     retry_messages = _json_repair_messages(
-                        QUESTIONNAIRE_TRANSLATION_SYSTEM_PROMPT,
+                        system_prompt,
                         query,
                         answer,
                         str(exc),
@@ -849,7 +850,9 @@ async def report_stream(session_id: str, request: Request):
     quantitative_first = sess.get("analysis_mode") == "quantitative" or is_crosstab
     qualitative_context = sess.get("qualitative_context")
     use_large_mode = is_crosstab or any(len(v) > LARGE_SAMPLE_THRESHOLD for v in open_text.values())
-    writer_messages = [{"role": "system", "content": REPORT_WRITER_SYSTEM_PROMPT}]
+    writer_messages = [
+        {"role": "system", "content": _get_report_writer_system_prompt()}
+    ]
     writer_models_used: list[str] = []
 
     try:

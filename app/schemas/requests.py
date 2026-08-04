@@ -30,6 +30,17 @@ class QualitativeContextRequest(BaseModel):
     report_usage: str = ""
 
 
+class InterviewReviewItem(BaseModel):
+    issue_index: int
+    module_title: str
+    problem: str
+    suggestion: str = ""
+
+
+class InterviewBatchReviewRequest(BaseModel):
+    items: list[InterviewReviewItem]
+
+
 # ── 管理后台 ────────────────────────────────────────────────
 class AdminUserRequest(BaseModel):
     email: str

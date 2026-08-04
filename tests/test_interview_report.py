@@ -676,6 +676,270 @@ class InterviewServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sess["report_md"], original_report)
         save_history.assert_not_called()
 
+    async def test_manual_review_keeps_untouched_issues_when_reaudit_returns_passed(self):
+        parsed = parse_interview_workbook("访谈记录.xlsx", _workbook_bytes())
+        original_module = (
+            "## 战斗反馈\n\n### 模块判断\n\n玩家需要理解失败原因。\n\n"
+            "### 主要发现\n\n#### 发现1：反馈不足\n\n"
+            "- P01：希望失败后能立刻知道原因。[来源：记录者A!B2]\n\n"
+            "### 产品建议\n\n- 增加提示。"
+        )
+        repaired_module = original_module.replace(
+            "玩家需要理解失败原因。",
+            "玩家需要理解失败原因，因为这会影响后续决策。",
+        )
+        untouched_issue = {
+            "module_title": "组队沟通",
+            "problem": "建议缺少直接证据",
+            "suggestion": "补充证据或收窄表述",
+        }
+        sess = {
+            "session_id": "82345678-1234-1234-1234-123456789abc",
+            "kind": "interview",
+            "mode": "interview",
+            "filename": "访谈记录.xlsx",
+            "interview_status": "completed",
+            "interview_workbook": parsed,
+            "interview_source_text": serialize_interview_workbook(parsed),
+            "interview_extraction": {
+                "players": [{"player_id": "P01"}],
+                "modules": [{
+                    "title": "战斗反馈",
+                    "evidence": [{
+                        "player_id": "P01",
+                        "source_refs": ["记录者A!B2"],
+                    }],
+                }],
+            },
+            "interview_module_reports": [{
+                "title": "战斗反馈",
+                "report_md": original_module,
+            }],
+            "interview_audit": {
+                "status": "warning",
+                "issues": [
+                    {
+                        "module_title": "战斗反馈",
+                        "problem": "需求逻辑不够清楚",
+                        "suggestion": "补充原因",
+                    },
+                    untouched_issue,
+                ],
+            },
+            "report_md": f"# 访谈报告\n\n{original_module}",
+        }
+        responses = [
+            (repaired_module, "gpt-5.6-sol"),
+            ('{"ok":true,"issues":[],"summary":"通过"}', "gpt-5.6-terra"),
+        ]
+
+        with (
+            patch.object(interview_service, "get_session", return_value=sess),
+            patch.object(interview_service, "_visible_to_owner", return_value=True),
+            patch.object(interview_service, "save_session"),
+            patch.object(interview_service, "save_to_history", return_value={"report_no": "R-008"}),
+            patch.object(
+                interview_service,
+                "collect_chat_completion",
+                new=AsyncMock(side_effect=responses),
+            ),
+        ):
+            chunks = [
+                chunk
+                async for chunk in interview_service.revise_interview_audit_issue_stream(
+                    sess["session_id"],
+                    0,
+                    _Request(),
+                    None,
+                )
+            ]
+
+        self.assertIn('"type": "interview_review_done"', "".join(chunks))
+        self.assertEqual(sess["interview_audit"]["issues"], [untouched_issue])
+        self.assertFalse(sess["interview_audit"]["ok"])
+        self.assertEqual(sess["interview_audit"]["status"], "warning")
+        self.assertEqual(
+            sess["interview_progress_message"],
+            "批量修订完成；仍有待确认提醒",
+        )
+
+    def test_manual_review_reconciliation_keeps_order_and_deduplicates_new_issues(self):
+        selected = {
+            "module_title": "战斗反馈",
+            "problem": "需求逻辑不够清楚",
+            "suggestion": "补充原因",
+        }
+        untouched = {
+            "module_title": "组队沟通",
+            "problem": "建议缺少直接证据",
+            "suggestion": "补充证据",
+        }
+        new_issue = {
+            "module_title": "藏品展示",
+            "problem": "样本范围不明确",
+            "suggestion": "补充范围",
+        }
+
+        reconciled = interview_service._reconcile_manual_audit_issues(
+            [selected, untouched],
+            {0},
+            [dict(untouched), new_issue],
+        )
+
+        self.assertEqual(reconciled, [untouched, new_issue])
+
+    async def test_batch_review_groups_same_module_and_audits_once(self):
+        parsed = parse_interview_workbook("访谈记录.xlsx", _workbook_bytes())
+        original_module = (
+            "## 战斗反馈\n\n### 模块判断\n\n玩家需要理解失败原因。\n\n"
+            "### 主要发现\n\n#### 发现1：反馈不足\n\n"
+            "- P01：希望失败后能立刻知道原因。[来源：记录者A!B2]\n\n"
+            "### 产品建议\n\n- 增加提示。"
+        )
+        repaired_module = original_module.replace(
+            "玩家需要理解失败原因。",
+            "玩家需要理解失败原因，因为这会影响后续决策。",
+        )
+        issues = [
+            {
+                "module_title": "战斗反馈",
+                "problem": "需求逻辑不够清楚",
+                "suggestion": "补充原因",
+            },
+            {
+                "module_title": "战斗反馈",
+                "problem": "建议过于宽泛",
+                "suggestion": "收窄建议范围",
+            },
+        ]
+        sess = {
+            "session_id": "92345678-1234-1234-1234-123456789abc",
+            "kind": "interview",
+            "mode": "interview",
+            "filename": "访谈记录.xlsx",
+            "interview_status": "completed",
+            "interview_workbook": parsed,
+            "interview_source_text": serialize_interview_workbook(parsed),
+            "interview_extraction": {
+                "players": [{"player_id": "P01"}],
+                "modules": [{
+                    "title": "战斗反馈",
+                    "evidence": [{
+                        "player_id": "P01",
+                        "source_refs": ["记录者A!B2"],
+                    }],
+                }],
+            },
+            "interview_module_reports": [{
+                "title": "战斗反馈",
+                "report_md": original_module,
+            }],
+            "interview_audit": {"status": "warning", "issues": issues},
+            "report_md": f"# 访谈报告\n\n{original_module}",
+        }
+        selections = [
+            {"issue_index": index, **issue}
+            for index, issue in enumerate(issues)
+        ]
+        completion = AsyncMock(side_effect=[
+            (repaired_module, "gpt-5.6-sol"),
+            ('{"ok":true,"issues":[],"summary":"通过"}', "gpt-5.6-terra"),
+        ])
+
+        with (
+            patch.object(interview_service, "get_session", return_value=sess),
+            patch.object(interview_service, "_visible_to_owner", return_value=True),
+            patch.object(interview_service, "save_session"),
+            patch.object(interview_service, "save_to_history", return_value={"report_no": "R-009"}),
+            patch.object(interview_service, "collect_chat_completion", new=completion),
+        ):
+            chunks = [
+                chunk
+                async for chunk in interview_service.revise_interview_audit_issues_stream(
+                    sess["session_id"], selections, _Request(), None
+                )
+            ]
+
+        self.assertIn('"type": "interview_review_done"', "".join(chunks))
+        self.assertEqual(completion.await_count, 2)
+        self.assertEqual(sess["interview_audit"]["issues"], [])
+        self.assertEqual(sess["interview_audit"]["manual_review_round"], 1)
+
+    async def test_batch_review_failure_keeps_entire_original_report(self):
+        parsed = parse_interview_workbook("访谈记录.xlsx", _workbook_bytes())
+        first_module = (
+            "## 战斗反馈\n\n### 模块判断\n\n玩家需要理解失败原因。\n\n"
+            "### 主要发现\n\n#### 发现1：反馈不足\n\n"
+            "- P01：希望失败后能立刻知道原因。[来源：记录者A!B2]\n\n"
+            "### 产品建议\n\n- 增加提示。"
+        )
+        second_module = first_module.replace("战斗反馈", "组队沟通")
+        repaired_first = first_module.replace("增加提示。", "增加明确的失败原因提示。")
+        invalid_second = second_module.replace("记录者A!B2", "不存在!Z99")
+        issues = [
+            {"module_title": "战斗反馈", "problem": "原因不足", "suggestion": "补充原因"},
+            {"module_title": "组队沟通", "problem": "建议宽泛", "suggestion": "收窄建议"},
+        ]
+        original_reports = [
+            {"title": "战斗反馈", "report_md": first_module},
+            {"title": "组队沟通", "report_md": second_module},
+        ]
+        original_report_md = f"# 访谈报告\n\n{first_module}\n\n{second_module}"
+        sess = {
+            "session_id": "a2345678-1234-1234-1234-123456789abc",
+            "kind": "interview",
+            "mode": "interview",
+            "filename": "访谈记录.xlsx",
+            "interview_status": "completed",
+            "interview_workbook": parsed,
+            "interview_source_text": serialize_interview_workbook(parsed),
+            "interview_extraction": {
+                "players": [{"player_id": "P01"}],
+                "modules": [
+                    {"title": title, "evidence": [{
+                        "player_id": "P01",
+                        "source_refs": ["记录者A!B2"],
+                    }]}
+                    for title in ("战斗反馈", "组队沟通")
+                ],
+            },
+            "interview_module_reports": original_reports,
+            "interview_audit": {"status": "warning", "issues": issues},
+            "report_md": original_report_md,
+        }
+        selections = [
+            {"issue_index": index, **issue}
+            for index, issue in enumerate(issues)
+        ]
+
+        with (
+            patch.object(interview_service, "get_session", return_value=sess),
+            patch.object(interview_service, "_visible_to_owner", return_value=True),
+            patch.object(interview_service, "save_session") as save_session,
+            patch.object(interview_service, "save_to_history") as save_history,
+            patch.object(
+                interview_service,
+                "collect_chat_completion",
+                new=AsyncMock(side_effect=[
+                    (repaired_first, "gpt-5.6-sol"),
+                    (invalid_second, "gpt-5.6-sol"),
+                ]),
+            ),
+            patch.object(interview_service.logger, "exception"),
+        ):
+            chunks = [
+                chunk
+                async for chunk in interview_service.revise_interview_audit_issues_stream(
+                    sess["session_id"], selections, _Request(), None
+                )
+            ]
+
+        self.assertIn('"report_unchanged": true', "".join(chunks))
+        self.assertEqual(sess["report_md"], original_report_md)
+        self.assertEqual(sess["interview_module_reports"], original_reports)
+        save_session.assert_not_called()
+        save_history.assert_not_called()
+
 
 class InterviewHistoryTests(unittest.TestCase):
     def test_history_entry_preserves_interview_metadata(self):

@@ -27,13 +27,25 @@ async def get_upload_guide_endpoint():
 
 
 @router.get("/api/prompts")
-async def get_prompts():
+async def get_prompts(request: Request):
+    await _require_admin(request)
     return get_all_prompts()
 
 
 @router.put("/api/prompts/{key}")
-async def update_prompt_endpoint(key: str, req: PromptUpdateRequest, request: Request):
-    update_prompt(key, req.content, req.note or "")
+async def update_prompt_endpoint(
+    key: str,
+    req: PromptUpdateRequest,
+    request: Request,
+    expected_revision: str,
+):
+    await _require_admin(request)
+    update_prompt(
+        key,
+        req.content,
+        req.note or "",
+        expected_revision=expected_revision,
+    )
     await audit_log(request, "settings", "修改 Prompt", f"{key}；备注：{_short_text(req.note or '')}")
     return {"ok": True, "key": key}
 
@@ -45,6 +57,7 @@ async def get_ui_texts():
 
 @router.put("/api/ui-texts/{key}")
 async def update_ui_text_endpoint(key: str, req: UiTextUpdateRequest, request: Request):
+    await _require_admin(request)
     update_ui_text(key, req.content)
     await audit_log(request, "settings", "修改页面文案", f"{key}；内容：{_short_text(req.content)}")
     return {"ok": True, "key": key}

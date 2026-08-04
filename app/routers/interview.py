@@ -2,12 +2,14 @@
 from fastapi import APIRouter, File, Form, Request, UploadFile
 from fastapi.responses import StreamingResponse
 
+from app.schemas.requests import InterviewBatchReviewRequest
 from app.services.audit import audit_log
 from app.services.auth import _require_feature
 from app.services.interview_service import (
     handle_interview_upload,
     get_interview_status,
     interview_report_stream,
+    revise_interview_audit_issues_stream,
     revise_interview_audit_issue_stream,
     validate_interview_session,
 )
@@ -97,6 +99,36 @@ async def interview_revise_review_issue(
         revise_interview_audit_issue_stream(
             session_id,
             issue_index,
+            request,
+            login,
+        ),
+        media_type="text/event-stream",
+    )
+
+
+@router.post("/api/interview/review/{session_id}/revise-batch")
+async def interview_revise_review_batch(
+    session_id: str,
+    body: InterviewBatchReviewRequest,
+    request: Request,
+):
+    login = await _require_feature(request, "interview")
+    validate_interview_session(session_id, login)
+    items = [item.model_dump() for item in body.items]
+    await audit_log(
+        request,
+        "interview",
+        "批量按审校建议修订访谈报告",
+        f"会话：{session_id}；修订项数：{len(items)}",
+        metadata={
+            "session_id": session_id,
+            "issue_indexes": [item["issue_index"] for item in items],
+        },
+    )
+    return StreamingResponse(
+        revise_interview_audit_issues_stream(
+            session_id,
+            items,
             request,
             login,
         ),

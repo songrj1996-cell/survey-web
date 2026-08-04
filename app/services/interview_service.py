@@ -32,6 +32,12 @@ from app.core.responses import sse_event
 from app.core.security import _assign_session_owner, _visible_to_owner
 from app.integrations.llm_client import collect_chat_completion
 from app.services.report_history import save_to_history
+from app.storage.prompts import (
+    _get_interview_audit_system_prompt,
+    _get_interview_extract_system_prompt,
+    _get_interview_repair_system_prompt,
+    _get_interview_report_system_prompt,
+)
 from app.storage.sessions import get_session, new_session, save_session
 
 
@@ -350,12 +356,7 @@ def _extract_messages(source_text: str, research_focus: str) -> list[dict]:
     return [
         {
             "role": "system",
-            "content": (
-                "你是资深游戏用户研究员。需要把同一访谈提纲、同一批玩家、不同"
-                "记录者的多个 Sheet 归并为可追溯研究证据。先判断 Sheet 是互补记录"
-                "还是不同玩家，不按固定行号机械对齐。追问必须回到父问题语境；"
-                "“无记录”不能自动解释成“未询问”。只依据输入，不补写事实。"
-            ),
+            "content": _get_interview_extract_system_prompt(),
         },
         {
             "role": "user",
@@ -393,11 +394,7 @@ def _module_messages(
     return [
         {
             "role": "system",
-            "content": (
-                "你是资深游戏用户研究报告作者。你的任务是解释玩家需求及其形成逻辑，"
-                "而不是机械摘录。每个判断必须能被玩家记录支持；保留不同玩家之间的"
-                "差异，不用多数意见覆盖少数但重要的场景。"
-            ),
+            "content": _get_interview_report_system_prompt(),
         },
         {
             "role": "user",
@@ -433,7 +430,7 @@ def _module_repair_messages(
     return [
         {
             "role": "system",
-            "content": "你负责修订证据型访谈报告模块，只能使用给定证据。",
+            "content": _get_interview_repair_system_prompt(),
         },
         {
             "role": "user",
@@ -457,7 +454,7 @@ def _audit_messages(report_md: str, extraction: dict) -> list[dict]:
     return [
         {
             "role": "system",
-            "content": "你是严格的游戏用户研究证据审校员，只审核，不直接重写。",
+            "content": _get_interview_audit_system_prompt(),
         },
         {
             "role": "user",
@@ -562,13 +559,49 @@ def _audit_issue_key(issue: dict) -> tuple[str, str]:
     )
 
 
-async def revise_interview_audit_issue_stream(
+def _reconcile_manual_audit_issues(
+    original_issues: list,
+    revised_issue_indexes: set[int],
+    reviewed_issues: list[dict],
+) -> list[dict]:
+    """保留未操作提醒，并把本轮复审的新发现稳定合并进列表。"""
+    reconciled: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+
+    def append_issue(item: dict) -> None:
+        key = _audit_issue_key(item)
+        if key in seen:
+            return
+        seen.add(key)
+        reconciled.append(dict(item))
+
+    for index, item in enumerate(original_issues):
+        if not isinstance(item, dict) or index in revised_issue_indexes:
+            continue
+        append_issue(item)
+
+    for item in reviewed_issues:
+        if isinstance(item, dict):
+            append_issue(item)
+
+    return reconciled
+
+
+def _review_selection_matches(issue: dict, selection: dict) -> bool:
+    return all(
+        str(issue.get(key) or "").strip()
+        == str(selection.get(key) or "").strip()
+        for key in ("module_title", "problem", "suggestion")
+    )
+
+
+async def revise_interview_audit_issues_stream(
     session_id: str,
-    issue_index: int,
+    selections: list[dict],
     request: Request,
     login: dict | None,
 ):
-    """按单条人工选中的审校意见修订模块，通过硬校验和复审后再覆盖报告。"""
+    """整批修订人工选中的审校意见，全部成功后统一复审并原子写回。"""
     lock = _INTERVIEW_LOCKS.setdefault(session_id, asyncio.Lock())
     if lock.locked():
         yield sse_event({"type": "error", "message": "该访谈报告正在处理，请稍后再试"})
@@ -583,17 +616,26 @@ async def revise_interview_audit_issue_stream(
 
             original_audit = dict(sess.get("interview_audit") or {})
             original_issues = original_audit.get("issues") or []
-            if issue_index < 0 or issue_index >= len(original_issues):
-                raise RuntimeError("未找到这条审校提醒，请刷新报告后重试")
-            issue = original_issues[issue_index]
-            if not isinstance(issue, dict):
-                raise RuntimeError("这条审校提醒格式无效，请重新生成报告")
-            if issue.get("review_status") == "confirmed":
-                raise RuntimeError("这条提醒已确认，无需再次修订")
+            if not selections:
+                raise RuntimeError("请至少选择一条需要修订的审校提醒")
 
-            module_title = str(issue.get("module_title") or "").strip()
-            if not module_title:
-                raise RuntimeError("审校提醒没有关联模块，无法安全修订")
+            selected: list[tuple[int, dict]] = []
+            selected_indexes: set[int] = set()
+            for selection in selections:
+                issue_index = int(selection.get("issue_index", -1))
+                if issue_index in selected_indexes:
+                    raise RuntimeError("批量修订中包含重复提醒，请重新选择")
+                if issue_index < 0 or issue_index >= len(original_issues):
+                    raise RuntimeError("审校提醒已发生变化，请刷新报告后重新选择")
+                issue = original_issues[issue_index]
+                if not isinstance(issue, dict) or not _review_selection_matches(issue, selection):
+                    raise RuntimeError("审校提醒已发生变化，请刷新报告后重新选择")
+                if issue.get("review_status") == "confirmed":
+                    raise RuntimeError("所选提醒中包含已确认内容，请重新选择")
+                if not str(issue.get("module_title") or "").strip():
+                    raise RuntimeError("所选审校提醒没有关联模块，无法安全修订")
+                selected_indexes.add(issue_index)
+                selected.append((issue_index, issue))
 
             workbook = sess.get("interview_workbook") or {}
             extraction = sess.get("interview_extraction") or {}
@@ -602,77 +644,98 @@ async def revise_interview_audit_issue_stream(
             module_reports = [
                 dict(item) for item in (sess.get("interview_module_reports") or [])
             ]
-            target_module = next(
-                (
-                    module for module in modules
-                    if str(module.get("title") or "").strip() == module_title
-                ),
-                None,
-            )
-            target_report = next(
-                (
-                    item for item in module_reports
-                    if str(item.get("title") or "").strip() == module_title
-                ),
-                None,
-            )
-            if not target_module or not target_report:
-                raise RuntimeError(f"无法定位提醒对应的模块“{module_title}”")
-
-            issue_instructions = [
-                text
-                for text in (
-                    str(issue.get("problem") or "").strip(),
-                    str(issue.get("suggestion") or "").strip(),
-                )
-                if text
-            ]
-            if not issue_instructions:
-                raise RuntimeError("这条审校提醒没有可执行的修改建议")
-
-            yield sse_event({
-                "type": "interview_review_progress",
-                "message": f"正在按审校建议修订模块：{module_title}",
-                "module_title": module_title,
-            })
-            repaired_md = ""
-            repair_model = ""
-            async for kind, result in _collect_stage(
-                messages=_module_repair_messages(
-                    str(target_report.get("report_md") or ""),
-                    target_module,
-                    players,
-                    issue_instructions,
-                ),
-                model=INTERVIEW_REPAIR_MODEL,
-                reasoning=INTERVIEW_REPAIR_REASONING,
-                request=request,
-                stage="review_repair",
-                percent=96,
-                module_title=module_title,
-            ):
-                if kind == "heartbeat":
-                    yield result
-                else:
-                    repaired_md, repair_model = result
-            if not repaired_md:
-                return
-
             valid_refs = interview_source_refs(workbook)
-            repaired_md = repaired_md.strip()
-            hard_issues = _module_structure_issues(repaired_md, module_title, valid_refs)
-            if hard_issues:
-                raise RuntimeError(
-                    "修订结果未通过结构与引用校验，当前报告未被修改："
-                    + "；".join(hard_issues)
+            grouped: dict[str, list[dict]] = {}
+            for _, issue in selected:
+                module_title = str(issue.get("module_title") or "").strip()
+                grouped.setdefault(module_title, []).append(issue)
+
+            repair_models: list[str] = []
+            total_modules = len(grouped)
+            for module_number, (module_title, module_issues) in enumerate(
+                grouped.items(),
+                start=1,
+            ):
+                target_module = next(
+                    (
+                        module for module in modules
+                        if str(module.get("title") or "").strip() == module_title
+                    ),
+                    None,
                 )
-            target_report["report_md"] = repaired_md
+                target_report = next(
+                    (
+                        item for item in module_reports
+                        if str(item.get("title") or "").strip() == module_title
+                    ),
+                    None,
+                )
+                if not target_module or not target_report:
+                    raise RuntimeError(f"无法定位提醒对应的模块“{module_title}”")
+
+                issue_instructions = [
+                    text
+                    for issue in module_issues
+                    for text in (
+                        str(issue.get("problem") or "").strip(),
+                        str(issue.get("suggestion") or "").strip(),
+                    )
+                    if text
+                ]
+                if not issue_instructions:
+                    raise RuntimeError(f"模块“{module_title}”没有可执行的修改建议")
+
+                yield sse_event({
+                    "type": "interview_review_progress",
+                    "message": (
+                        f"正在修订第 {module_number}/{total_modules} 个模块：{module_title}"
+                    ),
+                    "module_title": module_title,
+                    "current": module_number,
+                    "total": total_modules,
+                })
+                repaired_md = ""
+                repair_model = ""
+                async for kind, result in _collect_stage(
+                    messages=_module_repair_messages(
+                        str(target_report.get("report_md") or ""),
+                        target_module,
+                        players,
+                        issue_instructions,
+                    ),
+                    model=INTERVIEW_REPAIR_MODEL,
+                    reasoning=INTERVIEW_REPAIR_REASONING,
+                    request=request,
+                    stage="review_repair",
+                    percent=95 + min(2, module_number),
+                    module_title=module_title,
+                ):
+                    if kind == "heartbeat":
+                        yield result
+                    else:
+                        repaired_md, repair_model = result
+                if not repaired_md:
+                    raise RuntimeError(f"模块“{module_title}”未返回有效修订内容")
+
+                repaired_md = repaired_md.strip()
+                hard_issues = _module_structure_issues(
+                    repaired_md,
+                    module_title,
+                    valid_refs,
+                )
+                if hard_issues:
+                    raise RuntimeError(
+                        f"模块“{module_title}”的修订结果未通过结构与引用校验，"
+                        "整批报告未被修改：" + "；".join(hard_issues)
+                    )
+                target_report["report_md"] = repaired_md
+                repair_models.append(repair_model)
+
             candidate_report_md = _assemble_report(sess, extraction, module_reports)
 
             yield sse_event({
                 "type": "interview_review_progress",
-                "message": "修订完成，正在重新进行证据与质量复审",
-                "module_title": module_title,
+                "message": "所选内容已全部修订，正在统一进行证据与质量复审",
             })
             audit_text = ""
             audit_model = ""
@@ -683,14 +746,13 @@ async def revise_interview_audit_issue_stream(
                 request=request,
                 stage="review_audit",
                 percent=98,
-                module_title=module_title,
             ):
                 if kind == "heartbeat":
                     yield result
                 else:
                     audit_text, audit_model = result
             if not audit_text:
-                return
+                raise RuntimeError("统一复审未返回有效结果，整批报告未被修改")
 
             audit = _parse_json_object(audit_text, "报告复审")
             issues = [
@@ -712,43 +774,48 @@ async def revise_interview_audit_issue_stream(
                 )
             if audit.get("ok") is not True and not issues:
                 issues = [{
-                    "module_title": module_title,
+                    "module_title": str(selected[0][1].get("module_title") or "").strip(),
                     "problem": str(audit.get("summary") or "复审仍建议人工确认").strip(),
                     "suggestion": "请结合原始访谈证据确认当前表述。",
                 }]
 
-            confirmed = {
-                _audit_issue_key(item): item
-                for item in original_issues
-                if isinstance(item, dict) and item.get("review_status") == "confirmed"
-            }
-            for item in issues:
-                previous = confirmed.get(_audit_issue_key(item))
-                if previous:
-                    for key in ("review_status", "reviewed_at", "reviewed_by"):
-                        if previous.get(key):
-                            item[key] = previous[key]
+            issues = _reconcile_manual_audit_issues(
+                original_issues,
+                selected_indexes,
+                issues,
+            )
+            pending_issues = [
+                item for item in issues
+                if item.get("review_status") != "confirmed"
+            ]
 
             audit.update({
-                "ok": not issues,
+                "ok": not pending_issues,
                 "issues": issues,
                 "local_issues": [],
-                "status": "warning" if issues else "passed",
+                "status": "warning" if pending_issues else "passed",
+                "summary": (
+                    f"仍有 {len(pending_issues)} 条提醒尚未处理"
+                    if pending_issues else str(audit.get("summary") or "复审通过")
+                ),
                 "manual_review_round": int(
                     original_audit.get("manual_review_round") or 0
                 ) + 1,
                 "repair_exhausted": False,
             })
             models_used = dict(sess.get("interview_models_used") or {})
-            models_used[f"manual_repair_{audit['manual_review_round']}"] = repair_model
+            for model_index, repair_model in enumerate(repair_models, start=1):
+                models_used[
+                    f"manual_repair_{audit['manual_review_round']}_{model_index}"
+                ] = repair_model
             models_used[f"manual_audit_{audit['manual_review_round']}"] = audit_model
             sess.update({
                 "interview_module_reports": module_reports,
                 "interview_audit": audit,
                 "interview_models_used": models_used,
                 "interview_progress_message": (
-                    "定向修订完成；仍有待确认提醒"
-                    if issues else "定向修订完成并通过质量复审"
+                    "批量修订完成；仍有待确认提醒"
+                    if pending_issues else "批量修订完成并通过质量复审"
                 ),
                 "report_md": candidate_report_md,
             })
@@ -764,15 +831,47 @@ async def revise_interview_audit_issue_stream(
             })
         except Exception as exc:
             logger.exception(
-                "interview manual review failed session=%s issue_index=%s",
+                "interview batch manual review failed session=%s issue_indexes=%s",
                 session_id,
-                issue_index,
+                sorted(
+                    int(item.get("issue_index", -1))
+                    for item in selections
+                    if isinstance(item, dict)
+                ),
             )
             yield sse_event({
                 "type": "error",
                 "message": str(exc),
                 "report_unchanged": True,
             })
+
+
+async def revise_interview_audit_issue_stream(
+    session_id: str,
+    issue_index: int,
+    request: Request,
+    login: dict | None,
+):
+    """兼容原单条接口，内部按单项批次执行。"""
+    sess = _require_owned_interview_session(session_id, login)
+    issues = (sess.get("interview_audit") or {}).get("issues") or []
+    if issue_index < 0 or issue_index >= len(issues) or not isinstance(issues[issue_index], dict):
+        yield sse_event({"type": "error", "message": "未找到这条审校提醒，请刷新报告后重试"})
+        return
+    issue = issues[issue_index]
+    selection = {
+        "issue_index": issue_index,
+        "module_title": str(issue.get("module_title") or ""),
+        "problem": str(issue.get("problem") or ""),
+        "suggestion": str(issue.get("suggestion") or ""),
+    }
+    async for chunk in revise_interview_audit_issues_stream(
+        session_id,
+        [selection],
+        request,
+        login,
+    ):
+        yield chunk
 
 
 async def interview_report_stream(

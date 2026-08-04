@@ -30,6 +30,7 @@ from app.integrations.llm_client import collect_chat_completion
 from app.services.branch_logic import branch_rule_for_column, branch_rule_label
 from app.services.question_detect import ROLE_LABEL_MAP
 from app.storage.prompts import (
+    _get_large_sample_writer_requirements as _get_large_sample_writer_requirements_base,
     _get_planner_extra,
     _get_response_classify_system_prompt,
     _get_theme_extract_system_prompt,
@@ -44,13 +45,6 @@ _QUALITATIVE_CONTEXT_LABELS = [
     ("key_concerns", "最关心的问题"),
     ("report_usage", "报告准备用在哪里"),
 ]
-
-REPORT_WRITER_SYSTEM_PROMPT = (
-    "你是资深定性研究报告撰写者。必须严格执行用户消息中的 <report_spec>、<plan>、"
-    "<question_branch_logic> 和分轮任务；只能使用用户提供的统计、问卷回答、聚类结果与业务背景。"
-    "不得重新计算、改写或编造任何数字，不得补造玩家观点、身份或画像。"
-    "每轮只输出当轮指定内容，并保持 Markdown 结构要求。"
-)
 
 
 def _build_business_context_block(qualitative_context: dict | None, extra_note: str = "") -> str:
@@ -1262,8 +1256,9 @@ def _build_large_sample_writer_query(
         has_business_context=has_context,
     )
     qualitative_stats_rule = (
-        "\n- 系统会在每个 Part 内确定性插入一个 `辅助统计` 模块。不要自行复制客观题统计表、"
-        "不要新增统计章节；仍应在本节总结和主题分析中引用关键数字并解释其与玩家反馈的关系。"
+        "\n- 系统会在对应 Part 内确定性插入客观题统计表。不要自行复制客观题统计表或新增统计章节；"
+        "必须在本节总结或后续主题分析中说明相关统计大致代表什么、有哪些样本或解释限制，"
+        "无法形成可靠解释时不要机械复述最高项和最低项。"
         if not quantitative_first else ""
     )
 
@@ -1290,44 +1285,22 @@ def _get_large_sample_writer_requirements(
     has_business_context: bool = False,
 ) -> str:
     satisfaction_rule = (
-        "   - **满意度优先原则**：`<priority_metrics>` 中已提取满意度数据，必须将其作为核心结论中最靠前的 1-2 条展示，须包含具体数字"
+        "- **满意度优先原则**：`<priority_metrics>` 中已提取满意度数据，必须将其作为核心结论中最靠前的 1-2 条展示，须包含具体数字"
         if has_satisfaction else
-        "   - **满意度优先原则**：若报告中存在任何与满意度评分/评价相关的数据（如好评率、满意度评分、认可度等），必须将其作为核心结论中最靠前的 1-2 条展示，且须包含具体数字"
+        "- **满意度优先原则**：若报告中存在任何与满意度评分/评价相关的数据（如好评率、满意度评分、认可度等），必须将其作为核心结论中最靠前的 1-2 条展示，且须包含具体数字"
     )
     context_rule = (
-        "- 用户已提供 `<business_context>` 时，核心结论必须优先回答其中的核心问题，并纳入会影响决策的相关 topic、风险、样本限制；不要按 Part 机械复述。\n"
+        "- 用户已提供 `<business_context>`：核心结论必须优先回答其中的核心问题，并纳入会影响决策的相关 topic、风险和样本限制；不要按 Part 机械复述。"
         if has_business_context else
-        "- 用户未提供 `<business_context>` 时，不得编造业务目标；只能根据问卷题目、统计结果和玩家反馈归纳基础发现。如需判断调研意图，必须写成「从问卷内容推测/看起来」。\n"
+        "- 用户未提供 `<business_context>`：不得编造业务目标；只能根据问卷题目、统计结果和玩家反馈归纳基础发现。如需判断调研意图，必须写成「从问卷内容推测/看起来」。"
     )
-    return f"""一、报告结构（严格按此顺序，不得调换）
-1. **## 核心结论**（必须是第一个二级章节）
-   - 列出整份报告中最重要的 5-8 条发现，每条一行，格式：「**结论标题**：具体说明（含数字）」
-   - 覆盖所有 Part 的关键洞察，让读者读完此节即可掌握全部重点
-{satisfaction_rule}
-{context_rule}   - 只把 `<stats>` 中存在的数字写成事实；只把 `<open_text_themes>` 或 `<open_text_fallback>` 中存在的玩家反馈写成玩家观点；推测必须明确标注。
-2. **## Part 1 受访者画像**（固定为第一个 Part，紧接核心结论之后）
-   - 画像分布数据用 Markdown 表格呈现（列：维度 / 选项 / 人数占比），不要纯文字罗列
-   - 表格之后用 1-2 句话解读画像特征
-3. 其余 Part 按方案顺序逐章展开
-4. **## 行动建议**（最后一节，3-5 条，每条必须有对应数据依据）
-
-二、结论驱动
-- 以"多少人持有什么观点"为核心叙事框架
-- 每个结论必须附具体数字（人数或占比），禁止使用"部分用户""少数玩家"等模糊表述
-
-三、主观题原文展示（关键）
-- 每个主题/观点至少引用 3 条代表性玩家原文
-- 展示格式：先展示原始语言原文（用引号括起），下方紧跟中文翻译（若原文已是中文则免翻译）
-  示例：
-  > "She's very outdated compared to other mage heroes."（该英雄与其他法师相比显得十分过时。）
-  > "Modelnya kurang dipoles."（模型精致度不足。）
-  > "模型感觉太老了，需要 revamp。"
-- 引用的原文要能支撑该主题的核心论断，优先选择信息量最丰富的
-- 若某主题可用原文不足 3 条，则展示全部可用原文，不要编造或重复引用
-
-四、语言风格
-- 简洁直接，去掉冗长铺垫和过渡句
-- 报告语言为中文；玩家原文保留原语种并附中文翻译"""
+    base = _get_large_sample_writer_requirements_base().rstrip()
+    return (
+        f"{base}\n\n"
+        "五、当前数据条件规则\n"
+        f"{satisfaction_rule}\n"
+        f"{context_rule}"
+    )
 
 
 def _writer_parts_meta(plan: dict, headers: list[str]) -> list[dict]:
@@ -1432,9 +1405,10 @@ def _build_writer_part_query(
         if quantitative_first else ""
     )
     qualitative_rule = (
-        "本次为定性报告：系统会在本节总结之后确定性插入一个 `辅助统计` 模块。"
-        "不要自行复制客观题统计表，也不要新增统计标题；仍须在本节总结和主题分析中引用关键数字，"
-        "并结合开放题解释原因、情境与产品含义。\n"
+        "本次为定性报告：系统会在本节总结之后确定性插入客观题统计表。"
+        "不要自行复制客观题统计表，也不要新增统计标题；须在本节总结或后续主题分析中说明相关统计"
+        "大致代表什么、有哪些样本或解释限制，并结合开放题解释原因、情境与产品含义。"
+        "无法形成可靠解释时不要机械复述最高项和最低项。\n"
         if not quantitative_first else ""
     )
     return (

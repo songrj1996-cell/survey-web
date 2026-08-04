@@ -12,9 +12,10 @@ const ivState = {
   running: false,
   eventSource: null,
   audit: {},
-  reviewQueue: [],
-  reviewActive: null,
-  reviewJobs: new Map(),
+  reviewSelections: new Map(),
+  reviewConfirming: new Set(),
+  reviewBatchRunning: false,
+  reviewBatchMessage: '',
   stageModels: {},
 };
 
@@ -165,9 +166,10 @@ function ivReset() {
   ivState.running = false;
   ivState.eventSource = null;
   ivState.audit = {};
-  ivState.reviewQueue = [];
-  ivState.reviewActive = null;
-  ivState.reviewJobs.clear();
+  ivState.reviewSelections.clear();
+  ivState.reviewConfirming.clear();
+  ivState.reviewBatchRunning = false;
+  ivState.reviewBatchMessage = '';
   $('iv-file-input').value = '';
   $('iv-research-focus').value = '';
   $('iv-selected-file').hidden = true;
@@ -327,16 +329,31 @@ function ivAuditIssueKey(issue, issueIndex, issues = ivAuditIssues()) {
   return `${baseKey}\u241e${occurrence}`;
 }
 
-function ivReviewJobForIssue(issue, issueIndex, issues = ivAuditIssues()) {
-  return ivState.reviewJobs.get(ivAuditIssueKey(issue, issueIndex, issues)) || null;
+function ivReviewStateForIssue(issue, issueIndex, issues = ivAuditIssues()) {
+  const key = ivAuditIssueKey(issue, issueIndex, issues);
+  return {
+    key,
+    selected: ivState.reviewSelections.has(key),
+    confirming: ivState.reviewConfirming.has(key),
+  };
 }
 
-function ivReviewJobStateText(job) {
-  if (!job) return '';
-  if (job.state === 'queued') {
-    return job.action === 'confirm' ? '等待确认' : '等待修订';
-  }
-  return job.action === 'confirm' ? '保存中' : '修订中';
+function ivRenderReviewBatchBar() {
+  const bar = $('iv-review-batch');
+  const count = ivState.reviewSelections.size;
+  const hasPending = ivAuditIssues().some(issue => !ivIssueConfirmed(issue));
+  bar.hidden = !hasPending && !ivState.reviewBatchRunning;
+  $('iv-review-batch-count').textContent = ivState.reviewBatchRunning
+    ? (ivState.reviewBatchMessage || `正在处理 ${count} 项修订…`)
+    : `已选择 ${count} 项修订`;
+  $('iv-review-batch-clear').disabled = ivState.reviewBatchRunning || count === 0;
+  $('iv-review-batch-all').disabled = ivState.reviewBatchRunning;
+  $('iv-review-batch-start').disabled = (
+    ivState.reviewBatchRunning || ivState.reviewConfirming.size > 0 || count === 0
+  );
+  $('iv-review-batch-start').textContent = ivState.reviewBatchRunning
+    ? '处理中…'
+    : `开始处理 ${count} 项`;
 }
 
 function ivModuleHeading(moduleTitle) {
@@ -380,9 +397,18 @@ function ivRenderAuditReview() {
   badge.disabled = !issues.length;
   badge.classList.toggle('iv-quality-badge--warning', pending.length > 0);
   if (!issues.length) {
+    if (ivState.reviewBatchRunning) {
+      badge.textContent = '批量修订处理中';
+      badge.disabled = true;
+      $('iv-review-list').innerHTML = '';
+      ivToggleReviewPanel(false);
+      ivRenderReviewBatchBar();
+      return;
+    }
     badge.textContent = '✓ 证据复审通过';
     $('iv-review-list').innerHTML = '';
     ivToggleReviewPanel(false);
+    ivRenderReviewBatchBar();
     return;
   }
   badge.textContent = pending.length
@@ -394,8 +420,10 @@ function ivRenderAuditReview() {
 
   $('iv-review-list').innerHTML = issues.map((issue, index) => {
     const confirmed = ivIssueConfirmed(issue);
-    const job = ivReviewJobForIssue(issue, index, issues);
-    const stateText = confirmed ? '已确认' : (ivReviewJobStateText(job) || '待确认');
+    const state = ivReviewStateForIssue(issue, index, issues);
+    const stateText = confirmed
+      ? '已确认'
+      : (state.confirming ? '保存中' : (state.selected ? '已选择修订' : '待确认'));
     return `
       <div class="iv-review-list__item" data-iv-review-jump="${index}" role="button" tabindex="0">
         <strong>${esc(issue.module_title || '未关联模块')}</strong>
@@ -412,8 +440,10 @@ function ivRenderAuditReview() {
     const heading = ivModuleHeading(issue.module_title);
     if (!heading) return;
     const confirmed = ivIssueConfirmed(issue);
-    const job = ivReviewJobForIssue(issue, index, issues);
-    const stateText = confirmed ? '已确认' : (ivReviewJobStateText(job) || '待确认');
+    const state = ivReviewStateForIssue(issue, index, issues);
+    const stateText = confirmed
+      ? '已确认'
+      : (state.confirming ? '保存中' : (state.selected ? '已选择修订' : '待确认'));
     const existingState = headingStates.get(heading);
     headingStates.set(heading, existingState === false ? false : confirmed);
 
@@ -421,7 +451,8 @@ function ivRenderAuditReview() {
     card.className = [
       'iv-module-review-card',
       confirmed ? 'iv-module-review-card--confirmed' : '',
-      job ? 'iv-module-review-card--busy' : '',
+      state.selected ? 'iv-module-review-card--selected' : '',
+      (state.confirming || ivState.reviewBatchRunning) ? 'iv-module-review-card--busy' : '',
     ].filter(Boolean).join(' ');
     card.dataset.ivAuditIndex = String(index);
     card.innerHTML = `
@@ -436,15 +467,17 @@ function ivRenderAuditReview() {
       ${confirmed ? '' : `
         <div class="iv-module-review-card__actions">
           <button class="btn btn--ghost btn--sm" type="button"
-            data-iv-review-action="confirm" data-iv-audit-index="${index}"${job ? ' disabled' : ''}>
+            data-iv-review-action="confirm" data-iv-audit-index="${index}"${state.selected || state.confirming || ivState.reviewBatchRunning ? ' disabled' : ''}>
             确认当前内容
           </button>
           <button class="btn btn--primary btn--sm" type="button"
-            data-iv-review-action="revise" data-iv-audit-index="${index}"${job ? ' disabled' : ''}>
-            按建议重新修订
+            data-iv-review-action="revise" data-iv-audit-index="${index}"${state.confirming || ivState.reviewBatchRunning ? ' disabled' : ''}>
+            ${state.selected ? '取消修订选择' : '选择进行修订'}
           </button>
         </div>
-        <div class="iv-module-review-card__progress">${esc(job?.message || '正在准备修订…')}</div>
+        <div class="iv-module-review-card__progress">${esc(
+          state.confirming ? '正在保存确认状态…' : (ivState.reviewBatchMessage || '正在批量修订…')
+        )}</div>
       `}
     `;
     heading.insertAdjacentElement('afterend', card);
@@ -456,6 +489,7 @@ function ivRenderAuditReview() {
     label.textContent = confirmed ? '已确认' : '待确认';
     heading.appendChild(label);
   });
+  ivRenderReviewBatchBar();
 }
 
 function ivRenderReport(data, { fromHistory = false } = {}) {
@@ -725,129 +759,121 @@ async function ivRenameReport() {
   }
 }
 
-function ivFindReviewIssueIndex(job) {
-  const issues = ivAuditIssues();
-  return issues.findIndex((issue, index) => (
-    !ivIssueConfirmed(issue)
-    && ivAuditIssueKey(issue, index, issues) === job.key
-  ));
-}
-
-function ivEnqueueReviewAction(issueIndex, action) {
-  if (!ivState.sessionId) return;
+function ivToggleReviewSelection(issueIndex) {
+  if (!ivState.sessionId || ivState.reviewBatchRunning) return;
   const issues = ivAuditIssues();
   const issue = issues[issueIndex];
   if (!issue || ivIssueConfirmed(issue)) return;
   const key = ivAuditIssueKey(issue, issueIndex, issues);
-  if (ivState.reviewJobs.has(key)) {
-    showToast('这条审校提醒已经在处理队列中', 'info');
-    return;
+  if (ivState.reviewSelections.has(key)) {
+    ivState.reviewSelections.delete(key);
+  } else {
+    ivState.reviewSelections.set(key, {
+      key,
+      issueIndex,
+      issue: { ...issue },
+    });
   }
-  const waiting = Boolean(ivState.reviewActive);
-  const job = {
-    key,
-    action,
-    issue: { ...issue },
-    state: 'queued',
-    message: action === 'confirm' ? '已加入确认队列…' : '已加入修订队列…',
-  };
-  ivState.reviewJobs.set(key, job);
-  ivState.reviewQueue.push(job);
   ivRenderAuditReview();
-  if (waiting) {
-    showToast(
-      action === 'confirm' ? '已加入确认队列，将自动处理' : '已加入修订队列，将自动处理',
-      'info',
-    );
-  }
-  void ivProcessReviewQueue();
 }
 
-async function ivExecuteConfirmAuditIssue(issueIndex) {
-  const response = await fetch(
-    `/api/interview/review/${ivState.sessionId}/issues/${issueIndex}/confirm`,
-    { method: 'PATCH' },
-  );
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.detail || '确认失败');
-  ivState.audit = data.interview_audit || {};
+function ivSelectAllReviewIssues() {
+  if (ivState.reviewBatchRunning) return;
+  const issues = ivAuditIssues();
+  issues.forEach((issue, issueIndex) => {
+    if (ivIssueConfirmed(issue)) return;
+    const key = ivAuditIssueKey(issue, issueIndex, issues);
+    if (ivState.reviewConfirming.has(key)) return;
+    ivState.reviewSelections.set(key, {
+      key,
+      issueIndex,
+      issue: { ...issue },
+    });
+  });
   ivRenderAuditReview();
-  showToast('已确认当前内容，原始审校记录已保留', 'success');
 }
 
-async function ivExecuteReviseAuditIssue(issueIndex, job) {
+function ivClearReviewSelections() {
+  if (ivState.reviewBatchRunning) return;
+  ivState.reviewSelections.clear();
+  ivRenderAuditReview();
+}
+
+async function ivSubmitReviewBatch() {
+  if (
+    !ivState.sessionId
+    || ivState.reviewBatchRunning
+    || ivState.reviewConfirming.size
+    || !ivState.reviewSelections.size
+  ) return;
+  const selections = Array.from(ivState.reviewSelections.values())
+    .sort((left, right) => left.issueIndex - right.issueIndex);
+  ivState.reviewBatchRunning = true;
+  ivState.reviewBatchMessage = `准备处理 ${selections.length} 项修订…`;
+  ivRenderAuditReview();
   let finalData = null;
-  await consumeSSEPost(
-    `/api/interview/review/${ivState.sessionId}/issues/${issueIndex}/revise`,
-    {},
-    data => {
-      if (data.type === 'interview_review_progress') {
-        job.message = data.message || '正在修订…';
-        ivRenderAuditReview();
-      } else if (data.type === 'interview_review_done') {
-        finalData = data;
-      }
-    },
-  );
-  if (!finalData?.report_md) throw new Error('修订完成后未返回有效报告');
-  ivRenderReport(finalData, { fromHistory: ivState.fromHistory });
-  showToast(finalData.message || '已按建议修订并重新审校', 'success', 5000);
-}
-
-async function ivProcessReviewQueue() {
-  if (ivState.reviewActive || !ivState.sessionId) return;
-  while (!ivState.reviewActive && ivState.reviewQueue.length) {
-    const job = ivState.reviewQueue.shift();
-    if (!ivState.reviewJobs.has(job.key)) continue;
-    const issueIndex = ivFindReviewIssueIndex(job);
-    if (issueIndex < 0) {
-      ivState.reviewJobs.delete(job.key);
-      ivRenderAuditReview();
-      showToast(
-        `“${job.issue.module_title || '对应模块'}”中的这条提醒已在前一次复审中解决或发生变化，未重复处理`,
-        'info',
-        6000,
-      );
-      continue;
-    }
-
-    ivState.reviewActive = job;
-    job.state = 'running';
-    job.message = job.action === 'confirm'
-      ? '正在保存确认状态…'
-      : '正在按建议修订对应模块…';
+  try {
+    await consumeSSEPost(
+      `/api/interview/review/${ivState.sessionId}/revise-batch`,
+      {
+        items: selections.map(item => ({
+          issue_index: item.issueIndex,
+          module_title: item.issue.module_title || '',
+          problem: item.issue.problem || '',
+          suggestion: item.issue.suggestion || '',
+        })),
+      },
+      data => {
+        if (data.type === 'interview_review_progress') {
+          ivState.reviewBatchMessage = data.message || '正在批量修订…';
+          ivRenderAuditReview();
+        } else if (data.type === 'interview_review_done') {
+          finalData = data;
+        }
+      },
+    );
+    if (!finalData?.report_md) throw new Error('批量修订完成后未返回有效报告');
+    ivState.reviewSelections.clear();
+    ivState.reviewBatchRunning = false;
+    ivState.reviewBatchMessage = '';
+    ivRenderReport(finalData, { fromHistory: ivState.fromHistory });
+    showToast(finalData.message || '所选内容已全部修订并统一复审', 'success', 5000);
+  } catch (error) {
+    ivState.reviewBatchRunning = false;
+    ivState.reviewBatchMessage = '';
     ivRenderAuditReview();
-    try {
-      if (job.action === 'confirm') {
-        await ivExecuteConfirmAuditIssue(issueIndex);
-      } else {
-        await ivExecuteReviseAuditIssue(issueIndex, job);
-      }
-    } catch (error) {
-      const message = String(error.message || error);
-      if (message.includes('会话不存在或已过期')) {
-        showToast('原始证据会话已过期，请重新上传访谈记录后生成报告', 'error', 8000);
-      } else {
-        showToast(
-          `${job.action === 'confirm' ? '确认' : '修订'}失败：${message}`,
-          'error',
-          8000,
-        );
-      }
-    } finally {
-      ivState.reviewJobs.delete(job.key);
-      ivState.reviewActive = null;
-      ivRenderAuditReview();
+    const message = String(error.message || error);
+    if (message.includes('会话不存在或已过期')) {
+      showToast('原始证据会话已过期，请重新上传访谈记录后生成报告', 'error', 8000);
+    } else {
+      showToast(`批量修订失败，原报告未修改：${message}`, 'error', 8000);
     }
   }
 }
 
-function ivConfirmAuditIssue(issueIndex) {
-  ivEnqueueReviewAction(issueIndex, 'confirm');
-}
-
-function ivReviseAuditIssue(issueIndex) {
-  ivEnqueueReviewAction(issueIndex, 'revise');
+async function ivConfirmAuditIssue(issueIndex) {
+  if (ivState.reviewBatchRunning) return;
+  const issues = ivAuditIssues();
+  const issue = issues[issueIndex];
+  if (!issue || ivIssueConfirmed(issue)) return;
+  const key = ivAuditIssueKey(issue, issueIndex, issues);
+  ivState.reviewConfirming.add(key);
+  ivRenderAuditReview();
+  try {
+    const response = await fetch(
+      `/api/interview/review/${ivState.sessionId}/issues/${issueIndex}/confirm`,
+      { method: 'PATCH' },
+    );
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || '确认失败');
+    ivState.audit = data.interview_audit || {};
+    showToast('已确认当前内容，原始审校记录已保留', 'success');
+  } catch (error) {
+    showToast(`确认失败：${error.message}`, 'error', 8000);
+  } finally {
+    ivState.reviewConfirming.delete(key);
+    ivRenderAuditReview();
+  }
 }
 
 function ivLoadHistoryEntry(entry) {
@@ -898,6 +924,9 @@ $('iv-quality-badge').addEventListener('click', () => {
   ivToggleReviewPanel($('iv-review-panel').hidden);
 });
 $('iv-review-close').addEventListener('click', () => ivToggleReviewPanel(false));
+$('iv-review-batch-all').addEventListener('click', ivSelectAllReviewIssues);
+$('iv-review-batch-clear').addEventListener('click', ivClearReviewSelections);
+$('iv-review-batch-start').addEventListener('click', ivSubmitReviewBatch);
 $('iv-review-list').addEventListener('click', event => {
   const item = event.target.closest('[data-iv-review-jump]');
   if (item) ivScrollToAuditIssue(Number(item.dataset.ivReviewJump));
@@ -916,7 +945,7 @@ $('iv-report-content').addEventListener('click', event => {
   if (button.dataset.ivReviewAction === 'confirm') {
     ivConfirmAuditIssue(issueIndex);
   } else if (button.dataset.ivReviewAction === 'revise') {
-    ivReviseAuditIssue(issueIndex);
+    ivToggleReviewSelection(issueIndex);
   }
 });
 $('iv-export-toggle').addEventListener('click', event => {

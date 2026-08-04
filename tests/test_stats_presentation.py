@@ -61,7 +61,7 @@ class StatsPresentationTests(unittest.TestCase):
         self.assertEqual(blocks[0]["chart"]["series"][0]["values"], [60.0, 40.0])
         self.assertEqual(blocks[1]["chart"]["values"], [[80.0, 20.0], [50.0, 50.0]])
 
-    def test_appendix_has_every_table_and_export_removes_only_chart_payload(self):
+    def test_appendix_has_every_table_without_chart_payload(self):
         blocks = [{
             "title": "使用频率",
             "part": "Part 1 使用情况",
@@ -74,10 +74,19 @@ class StatsPresentationTests(unittest.TestCase):
         }]
 
         appendix = render_stats_appendix(blocks, "python")
-        exported = _prep_export_md("# 报告\n\n" + appendix, mode="quantitative")
+        legacy_chart = (
+            '```stats-chart\n'
+            '{"title":"使用频率","type":"bar"}\n'
+            '```\n\n'
+        )
+        exported = _prep_export_md(
+            "# 报告\n\n" + legacy_chart + appendix,
+            mode="quantitative",
+        )
 
         self.assertIn("平台 Python 自动计算", appendix)
-        self.assertIn("```stats-chart", appendix)
+        self.assertNotIn("stats-chart", appendix)
+        self.assertNotIn("统计图", appendix)
         self.assertIn("| 每天 | 60.0% |", exported)
         self.assertNotIn("stats-chart", exported)
         self.assertNotIn("定性分析结果", exported)
@@ -165,14 +174,14 @@ class StatsPresentationTests(unittest.TestCase):
         blocks = render_qualitative_stats_by_part(stats_md)
         result = inject_qualitative_stats(report_md, stats_md)
 
-        self.assertEqual(blocks["Part 1 聊天意愿"].count("### 辅助统计"), 1)
-        self.assertEqual(result.count("### 辅助统计"), 1)
+        self.assertNotIn("### 辅助统计", blocks["Part 1 聊天意愿"])
+        self.assertNotIn("### 辅助统计", result)
         self.assertIn("**好友数量**", result)
         self.assertIn("**聊天意愿评分**", result)
         self.assertIn("| 6~10 | 24 | 4.10 | 4 | 0.80 |", result)
-        self.assertIn("**基础解读：**", result)
+        self.assertNotIn("**基础解读：**", result)
         self.assertNotIn("stats-chart", result)
-        self.assertLess(result.index("### 辅助统计"), result.index("**使用现状与人群分层**"))
+        self.assertLess(result.index("**好友数量**"), result.index("**使用现状与人群分层**"))
 
 
 if __name__ == "__main__":
