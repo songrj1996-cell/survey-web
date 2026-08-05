@@ -31,6 +31,11 @@ from app.core.interview_parsing import (
 from app.core.responses import sse_event
 from app.core.security import _assign_session_owner, _visible_to_owner
 from app.integrations.llm_client import collect_chat_completion
+from app.services.glossary_service import (
+    normalize_glossary_data,
+    normalize_glossary_terms,
+    prepare_glossary_messages,
+)
 from app.services.report_history import save_to_history
 from app.storage.prompts import (
     _get_interview_audit_system_prompt,
@@ -43,7 +48,33 @@ from app.storage.sessions import get_session, new_session, save_session
 
 _INTERVIEW_LOCKS: dict[str, asyncio.Lock] = {}
 _REQUIRED_MODULE_HEADINGS = ("### 模块判断", "### 主要发现", "### 产品建议")
+_GLOSSARY_PROTECTED_DATA_KEYS = {
+    "comment",
+    "original",
+    "original_text",
+    "quote",
+    "quotes",
+    "raw_text",
+    "record_excerpt",
+    "source_refs",
+    "text",
+}
 logger = logging.getLogger(__name__)
+
+
+def _normalize_interview_markdown(text: str) -> str:
+    """规范化正文，同时保持 `[来源：Sheet!A1]` 引用标记逐字不变。"""
+    source_markers = list(re.finditer(r"\[来源[：:][^\]\r\n]+\]", text or ""))
+    if not source_markers:
+        return normalize_glossary_terms(text)
+    normalized: list[str] = []
+    cursor = 0
+    for marker in source_markers:
+        normalized.append(normalize_glossary_terms(text[cursor:marker.start()]))
+        normalized.append(marker.group(0))
+        cursor = marker.end()
+    normalized.append(normalize_glossary_terms(text[cursor:]))
+    return "".join(normalized)
 
 
 def _stage_models(primary_model: str) -> tuple[str, ...]:
@@ -91,7 +122,10 @@ def _parse_json_object(text: str, label: str) -> dict:
         raise RuntimeError(f"{label}返回的 JSON 无法解析：{exc.msg}") from exc
     if not isinstance(value, dict):
         raise RuntimeError(f"{label}返回格式不正确")
-    return value
+    return normalize_glossary_data(
+        value,
+        protected_keys=_GLOSSARY_PROTECTED_DATA_KEYS,
+    )
 
 
 def _sheet_summary(workbook: dict) -> list[dict]:
@@ -337,7 +371,9 @@ def get_interview_status(session_id: str, login: dict | None) -> dict:
 
 
 async def _llm_with_heartbeats(messages: list[dict], **kwargs):
-    task = asyncio.create_task(collect_chat_completion(messages, **kwargs))
+    task = asyncio.create_task(
+        collect_chat_completion(prepare_glossary_messages(messages), **kwargs)
+    )
     try:
         while True:
             done, _ = await asyncio.wait({task}, timeout=LLM_STREAM_HEARTBEAT_SECONDS)
@@ -539,7 +575,10 @@ async def _collect_stage(
                     if await request.is_disconnected():
                         return
                     continue
-                yield ("result", result)
+                answer, used_model = result
+                if stage not in {"extract", "audit", "review_audit"}:
+                    answer = _normalize_interview_markdown(answer)
+                yield ("result", (answer, used_model))
                 return
         except Exception as exc:
             last_error = exc

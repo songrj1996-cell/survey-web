@@ -1,5 +1,5 @@
 """所有 FastAPI 请求体模型(Pydantic)。由各 router 共用,只定义数据结构,不含业务逻辑。"""
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 # ── 问卷主流程 ──────────────────────────────────────────────
@@ -65,6 +65,26 @@ class UiTextUpdateRequest(BaseModel):
 
 class AppSettingsPatch(BaseModel):
     comment_duplicate_reminder_enabled: bool | None = None
+
+
+class GlossaryCreateRequest(BaseModel):
+    category: str = ""
+    ch: str
+    terms_by_lang: dict[str, list[str] | str] = Field(default_factory=dict)
+    note: str = ""
+    enabled: bool = True
+    priority: int = 0
+    expected_revision: int | None = None
+
+
+class GlossaryUpdateRequest(BaseModel):
+    category: str | None = None
+    ch: str | None = None
+    terms_by_lang: dict[str, list[str] | str] | None = None
+    note: str | None = None
+    enabled: bool | None = None
+    priority: int | None = None
+    expected_revision: int | None = None
 
 
 # ── 历史记录 ────────────────────────────────────────────────

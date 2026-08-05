@@ -11,7 +11,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/style.css?v=38" />
+  <link rel="stylesheet" href="/static/style.css?v=40" />
 </head>
 
 <body>
@@ -1322,6 +1322,17 @@
               </svg>
               <span>提示词管理</span>
             </div>
+            <div class="settings-nav__item" data-stab="glossary">
+              <svg class="settings-nav__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M4 7h6" />
+                <path d="M4 12h10" />
+                <path d="M4 17h8" />
+                <path d="M16 6h4v4" />
+                <path d="M13 18h7" />
+                <path d="M17 10v8" />
+              </svg>
+              <span>术语库</span>
+            </div>
             <div class="settings-nav__sep" id="settings-nav-admin-sep" style="display:none"></div>
             <div class="settings-nav__group-label" id="settings-nav-admin-label" style="display:none">管理员</div>
             <div class="settings-nav__item" data-stab="system" id="stab-system-nav" style="display:none">
@@ -1361,6 +1372,11 @@
               </div>
             </div>
             <div id="stab-content-prompts" style="display:none">
+              <div class="hist-empty">
+                <div class="spinner" style="margin:0 auto"></div>
+              </div>
+            </div>
+            <div id="stab-content-glossary" style="display:none">
               <div class="hist-empty">
                 <div class="spinner" style="margin:0 auto"></div>
               </div>
@@ -1415,7 +1431,7 @@
   <script src="/static/js/core/core.js?v=31"></script>
   <script src="/static/js/features/survey.js?v=35"></script>
   <script src="/static/js/features/report.js?v=35"></script>
-  <script src="/static/js/features/settings.js?v=32"></script>
+  <script src="/static/js/features/settings.js?v=34"></script>
   <script src="/static/js/features/history.js?v=31"></script>
   <script src="/static/js/features/interview.js?v=9"></script>
   <script src="/static/js/features/nav.js?v=36"></script>

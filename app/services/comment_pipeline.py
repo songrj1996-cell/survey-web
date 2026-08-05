@@ -30,6 +30,11 @@ from app.core.config import (
     LLM_COMMENT_SYNTHESIS_REASONING,
 )
 from app.integrations.llm_client import collect_chat_completion
+from app.services.glossary_service import (
+    normalize_glossary_data,
+    normalize_glossary_terms,
+    prepare_glossary_messages,
+)
 from app.storage.prompts import (
     _get_comment_classify_system_prompt,
     _get_comment_extract_system_prompt,
@@ -39,6 +44,21 @@ from app.storage.prompts import (
     _get_comment_relevance_system_prompt,
     _get_comment_report_system_prompt,
 )
+
+_GLOSSARY_PROTECTED_DATA_KEYS = {
+    "comment",
+    "commentText",
+    "comment_text",
+    "original",
+    "originalText",
+    "original_text",
+    "quote",
+    "quotes",
+    "rawText",
+    "raw_text",
+    "source_refs",
+    "text",
+}
 
 
 def _model_chain(primary: str, fallbacks: tuple[str, ...]) -> tuple[str, ...]:
@@ -72,10 +92,12 @@ async def _comment_json_call(
                 )
             try:
                 raw, actual_model = await collect_chat_completion(
-                    [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": query + correction},
-                    ],
+                    prepare_glossary_messages(
+                        [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": query + correction},
+                        ]
+                    ),
                     models=(model,),
                     max_tokens=max_tokens,
                     reasoning_effort=reasoning_effort,
@@ -86,7 +108,14 @@ async def _comment_json_call(
             parsed, parse_error = comment_analysis.loads_loose(raw)
             validation_error = validate(parsed)
             if isinstance(parsed, list) and not validation_error:
-                return parsed, actual_model, bool(schema_attempt)
+                return (
+                    normalize_glossary_data(
+                        parsed,
+                        protected_keys=_GLOSSARY_PROTECTED_DATA_KEYS,
+                    ),
+                    actual_model,
+                    bool(schema_attempt),
+                )
             errors.append(
                 f"{model}: {validation_error or parse_error or '输出不是 JSON 数组'}"
             )
@@ -114,10 +143,12 @@ async def _comment_text_call(
                 )
             try:
                 raw, actual_model = await collect_chat_completion(
-                    [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": query + correction},
-                    ],
+                    prepare_glossary_messages(
+                        [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": query + correction},
+                        ]
+                    ),
                     models=(model,),
                     max_tokens=max_tokens,
                     reasoning_effort=reasoning_effort,
@@ -128,7 +159,11 @@ async def _comment_text_call(
             cleaned = str(raw or "").lstrip("\ufeff\u200b").strip()
             validation_error = validate(cleaned)
             if not validation_error:
-                return cleaned, actual_model, bool(schema_attempt)
+                return (
+                    normalize_glossary_terms(cleaned),
+                    actual_model,
+                    bool(schema_attempt),
+                )
             errors.append(f"{model}: {validation_error}")
     raise RuntimeError(f"{task} 直连 LLM 输出校验失败；" + "; ".join(errors[-4:]))
 

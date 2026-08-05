@@ -28,6 +28,10 @@ from app.core.config import (
 )
 from app.integrations.llm_client import collect_chat_completion
 from app.services.branch_logic import branch_rule_for_column, branch_rule_label
+from app.services.glossary_service import (
+    normalize_glossary_data,
+    prepare_glossary_messages,
+)
 from app.services.question_detect import ROLE_LABEL_MAP
 from app.storage.prompts import (
     _get_large_sample_writer_requirements as _get_large_sample_writer_requirements_base,
@@ -45,6 +49,19 @@ _QUALITATIVE_CONTEXT_LABELS = [
     ("key_concerns", "最关心的问题"),
     ("report_usage", "报告准备用在哪里"),
 ]
+
+_GLOSSARY_PROTECTED_DATA_KEYS = {
+    "comment",
+    "original",
+    "original_text",
+    "quote",
+    "quotes",
+    "raw_text",
+    "record_excerpt",
+    "representative_quotes",
+    "source_refs",
+    "text",
+}
 
 
 def _build_business_context_block(qualitative_context: dict | None, extra_note: str = "") -> str:
@@ -438,7 +455,7 @@ async def _direct_json_call(
     """调用直连 LLM 并做一次针对 JSON/业务 schema 的纠错重试。"""
     try:
         answer, model = await collect_chat_completion(
-            _llm_json_messages(system_prompt, query),
+            prepare_glossary_messages(_llm_json_messages(system_prompt, query)),
             models=models,
             max_tokens=max_tokens,
             reasoning_effort=reasoning_effort,
@@ -456,7 +473,10 @@ async def _direct_json_call(
     validation_error = validator(parsed) if parsed else (parse_error or "invalid JSON")
     if not validation_error:
         return {
-            "data": parsed,
+            "data": normalize_glossary_data(
+                parsed,
+                protected_keys=_GLOSSARY_PROTECTED_DATA_KEYS,
+            ),
             "model": model,
             "raw_len": len(answer),
             "repaired": False,
@@ -477,7 +497,7 @@ async def _direct_json_call(
     repair_models = (model, *(m for m in models if m != model))
     try:
         repaired_answer, repaired_model = await collect_chat_completion(
-            repair_messages,
+            prepare_glossary_messages(repair_messages),
             models=repair_models,
             max_tokens=max_tokens,
             reasoning_effort=reasoning_effort,
@@ -496,7 +516,14 @@ async def _direct_json_call(
         validator(repaired) if repaired else (repair_parse_error or "invalid JSON")
     )
     return {
-        "data": repaired if not repair_validation_error else None,
+        "data": (
+            normalize_glossary_data(
+                repaired,
+                protected_keys=_GLOSSARY_PROTECTED_DATA_KEYS,
+            )
+            if not repair_validation_error
+            else None
+        ),
         "model": repaired_model,
         "raw_len": len(repaired_answer),
         "repaired": True,
@@ -1567,14 +1594,19 @@ def _build_writer_core_query(
         "严格按 <report_spec> 里『核心结论』部分的格式：用 `<!--CORE_START-->` 和 `<!--CORE_END-->` 两个标记"
         "**各自独占一行**包裹整段，内部依次写：`## 核心结论`（首行写明样本总数）、`### 总体判断`、"
         f"若用户提供了业务问题，可按业务问题组织小节；否则逐个写 `### Part X 章节名：关键发现`（必须引用真实 Part 名：{part_titles}）；"
-        "按需写 `### 高信号少数观点与风险`。\n"
+        "按需写 `### 少数但值得关注的反馈`。\n"
         f"{bug_clause}\n"
         "`### 总体判断` 中每个判断必须主动说明它针对的具体对象、功能、方案、场景、人群或研究范围，"
         "让未参与调研立项、未看过问卷提纲的读者也能独立理解。若涉及多个容易混淆的范围，须按真实业务语义"
         "分别回车成短段，不使用 1、2、3 编号，不得写成一个超长段落，也不得使用无明确指代的「该方案」"
-        "「这一问题」「核心分歧」开门见山。`### 高信号少数观点与风险` 每条也必须在短标题或首句明确对应的"
+        "「这一问题」「核心分歧」开门见山。`### 少数但值得关注的反馈` 每条也必须在短标题或首句明确对应的"
         "对象、功能、方案、场景、人群或研究范围，不同范围不得混写；范围名称只能来自 plan、题目、<open_text>"
         "或已生成章节，不得机械套用标签或补造研究阶段。\n"
+        "不要复述业务问题或调研需求，第一句话就用「谁/什么因素 + 与什么评价或结果有关 + 具体表现」直接下结论。"
+        "禁止使用「针对……这一核心问题」「证据显示相关」「结果给出了明确信号」「对于这个问题，答案是……」"
+        "等研究过程话术。若证据只能说明相关关系或群体差异，应写「从本次调研看，A 与 B 有关」"
+        "「不同 A 的玩家对 B 的评价存在差异」或「A 可能影响 B」，不得写成已经证明因果的「A 导致 B」；"
+        "结论之后再补数据、群体差异和玩家理由。\n"
         "**约束**：① 只输出从 `<!--CORE_START-->` 到 `<!--CORE_END-->` 的内容，不要重复正文章节、不要再写一级标题、不要写行动建议；"
         "② 核心结论里不使用百分比、不使用精确人数，改用量级描述（样本总数可引用）；"
         "③ 引用的绝对数值必须与 <stats> 一致；"

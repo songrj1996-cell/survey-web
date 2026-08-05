@@ -45,6 +45,10 @@ from app.schemas.requests import QualitativeContextRequest
 from app.services.audit import audit_log
 from app.services.auth import _current_login
 from app.services.branch_logic import infer_branch_rules
+from app.services.glossary_service import (
+    normalize_glossary_terms,
+    prepare_glossary_messages,
+)
 from app.services.question_detect import (
     _build_column_detect_query,
     _enrich_questions,
@@ -96,6 +100,55 @@ from app.storage.sessions import get_session, new_session, save_session
 
 
 # ── 上传 ────────────────────────────────────────────────────────
+
+
+def _normalize_questionnaire_translation_texts(
+    translations: dict[str, dict],
+) -> dict[str, dict]:
+    """只规范化确定性翻译的展示字段，保留题号和原值映射。"""
+    normalized: dict[str, dict] = {}
+    for question_id, item in translations.items():
+        copied = dict(item)
+        copied["name_zh"] = normalize_glossary_terms(copied.get("name_zh", ""))
+        normalized[question_id] = copied
+    return normalized
+
+
+def _normalize_question_display_texts(questions: list[dict]) -> list[dict]:
+    """只改题目展示短名；选项、矩阵行和列映射仍使用上传原值。"""
+    normalized: list[dict] = []
+    for question in questions:
+        copied = dict(question)
+        if isinstance(copied.get("name_zh"), str):
+            copied["name_zh"] = normalize_glossary_terms(copied["name_zh"])
+        normalized.append(copied)
+    return normalized
+
+
+def _normalize_plan_display_texts(plan: dict) -> dict:
+    """规范化方案卡片文案，不改 columns、筛选选项或索引等机器字段。"""
+    normalized = dict(plan)
+    parts: list = []
+    for part in plan.get("parts") or []:
+        if not isinstance(part, dict):
+            parts.append(part)
+            continue
+        copied = dict(part)
+        for field in ("name", "scope"):
+            if isinstance(copied.get(field), str):
+                copied[field] = normalize_glossary_terms(copied[field])
+        parts.append(copied)
+    if isinstance(plan.get("parts"), list):
+        normalized["parts"] = parts
+    open_questions = plan.get("open_questions")
+    if isinstance(open_questions, list):
+        normalized["open_questions"] = [
+            normalize_glossary_terms(item) if isinstance(item, str) else item
+            for item in open_questions
+        ]
+    if isinstance(plan.get("summary"), str):
+        normalized["summary"] = normalize_glossary_terms(plan["summary"])
+    return normalized
 
 
 async def handle_survey_upload(
@@ -172,7 +225,9 @@ async def handle_survey_upload(
 
 async def _direct_llm_with_heartbeats(messages: list[dict], **kwargs):
     """等待完整直连结果期间发送心跳；只在成功后暴露完整回答。"""
-    task = asyncio.create_task(collect_chat_completion(messages, **kwargs))
+    task = asyncio.create_task(
+        collect_chat_completion(prepare_glossary_messages(messages), **kwargs)
+    )
     try:
         while True:
             done, _ = await asyncio.wait({task}, timeout=LLM_STREAM_HEARTBEAT_SECONDS)
@@ -278,6 +333,9 @@ async def columns_stream(session_id: str, request: Request):
                     translations = parse_questionnaire_translations(
                         retry_answer, questions,
                     )
+                translations = _normalize_questionnaire_translation_texts(
+                    translations
+                )
                 questions = apply_questionnaire_translations(
                     questions, translations,
                 )
@@ -356,6 +414,7 @@ async def columns_stream(session_id: str, request: Request):
             questions = _heuristic_questions(rows, groups)
             yield sse_event({"type": "chunk", "content": "\n（题型识别解析失败，已回退本地推断，请仔细核对）\n"})
 
+        questions = _normalize_question_display_texts(questions)
         questions = _enrich_questions(questions, rows[0], groups)
         questions = _reconcile_question_roles(rows, questions)
         questions = _sanitize_choice_options(rows, questions)
@@ -483,6 +542,7 @@ async def plan_stream(session_id: str, request: Request):
                 ctp, err = survey_plan.parse_crosstab_plan(retry_answer)
             if not ctp:
                 yield sse_event({"type": "error", "message": f"章节大纲解析失败：{err}"}); return
+            ctp = _normalize_plan_display_texts(ctp)
             plan = {
                 "mode": "crosstab",
                 "columns": cols,
@@ -560,6 +620,7 @@ async def plan_stream(session_id: str, request: Request):
 
         if not plan:
             yield sse_event({"type": "error", "message": f"方案解析失败：{err}"}); return
+        plan = _normalize_plan_display_texts(plan)
 
         if confirmed_columns:
             plan = survey_plan.merge_confirmed_into_plan(plan, confirmed_columns)
@@ -647,6 +708,7 @@ async def plan_revision_stream(session_id: str, user_text: str, request: Request
                 ctp, err = survey_plan.parse_crosstab_plan(retry_answer)
             if not ctp:
                 yield sse_event({"type": "error", "message": f"修订章节大纲解析失败：{err}"}); return
+            ctp = _normalize_plan_display_texts(ctp)
             new_plan = dict(plan)
             new_plan["parts"] = ctp["parts"]
             new_plan["open_questions"] = ctp["open_questions"]
@@ -716,6 +778,7 @@ async def plan_revision_stream(session_id: str, user_text: str, request: Request
             new_plan, err = survey_plan.parse_plan_from_llm(retry_answer, len(headers))
         if not new_plan:
             yield sse_event({"type": "error", "message": f"修订方案解析失败：{err}"}); return
+        new_plan = _normalize_plan_display_texts(new_plan)
 
         if sess.get("confirmed_columns"):
             new_plan = survey_plan.merge_confirmed_into_plan(new_plan, sess["confirmed_columns"])
@@ -791,7 +854,10 @@ async def _direct_writer_round(
 ) -> tuple[str, str]:
     """直连 LLM 完成一轮写作；成功后才把本轮加入本地对话历史。"""
     user_message = {"role": "user", "content": query}
-    answer, model = await collect_chat_completion([*messages, user_message])
+    answer, model = await collect_chat_completion(
+        prepare_glossary_messages([*messages, user_message])
+    )
+    answer = normalize_glossary_terms(answer)
     messages.extend([
         user_message,
         {"role": "assistant", "content": answer},
@@ -829,12 +895,14 @@ async def _answer_qa_direct(
         qa_context = _build_qa_context(source)
     models = (LLM_QA_MODEL, *LLM_QA_FALLBACK_MODELS)
     answer, model = await collect_chat_completion(
-        _build_direct_qa_messages(source, question, qa_context),
+        prepare_glossary_messages(
+            _build_direct_qa_messages(source, question, qa_context)
+        ),
         models=models,
         max_tokens=LLM_QA_MAX_TOKENS,
         reasoning_effort=LLM_QA_REASONING or None,
     )
-    return answer, model, qa_context
+    return normalize_glossary_terms(answer), model, qa_context
 
 
 async def report_stream(session_id: str, request: Request):
@@ -1045,6 +1113,7 @@ async def report_stream(session_id: str, request: Request):
 
         full_report = _inject_disclaimer(full_report, mode=sess.get("mode") or "")
         full_report = _inject_research_background(full_report, qualitative_context)
+        full_report = normalize_glossary_terms(full_report)
         sess["report_md"] = full_report
         sess["qa_context_md"] = _build_qa_context(sess, full_report)
         sess["analyst_conv_id"] = ""

@@ -52,6 +52,7 @@ document.addEventListener('keydown', e => {
 const STAB_LOADERS = {
   texts: loadUiTextsSettings,
   prompts: () => loadPrompts(true),
+  glossary: () => loadGlossary(true),
   system: loadSystemSettings,
   perms: loadPermsTab,
   audit: loadAuditLogsTab,
@@ -61,7 +62,7 @@ function switchSettingsTab(name) {
   document.querySelectorAll('.settings-nav__item').forEach(el => {
     el.classList.toggle('settings-nav__item--active', el.dataset.stab === name);
   });
-  ['texts', 'prompts', 'system', 'perms', 'audit'].forEach(k => {
+  ['texts', 'prompts', 'glossary', 'system', 'perms', 'audit'].forEach(k => {
     const el = $(`stab-content-${k}`);
     if (el) el.style.display = k === name ? '' : 'none';
   });
@@ -103,6 +104,822 @@ function loadActiveSettingsTab() {
   const active = document.querySelector('.settings-nav__item--active');
   const name = active ? active.dataset.stab : 'texts';
   switchSettingsTab(name);
+}
+
+// ── 术语库 ──────────────────────────────────────────────────
+
+const GLOSSARY_IMPORT_INPUT_ID = 'glossary-import-input';
+const GLOSSARY_STATUS_OPTIONS = [
+  { value: 'all', label: '全部状态' },
+  { value: 'enabled', label: '仅看启用' },
+  { value: 'disabled', label: '仅看停用' },
+];
+const GLOSSARY_IMPORT_ACTION_LABELS = {
+  create: '新增',
+  update: '更新',
+  unchanged: '无变化',
+  error: '异常',
+};
+
+const glossaryUiState = {
+  loaded: false,
+  loading: false,
+  loadPromise: null,
+  items: [],
+  pendingToggleIds: new Set(),
+  revision: '',
+  languages: [],
+  filters: {
+    search: '',
+    category: 'all',
+    status: 'all',
+  },
+  editor: {
+    open: false,
+    mode: 'create',
+    targetId: '',
+    category: '',
+    ch: '',
+    note: '',
+    enabled: true,
+    languages: [{ code: 'en', value: '' }],
+    busy: false,
+  },
+  importer: {
+    file: null,
+    preview: null,
+    fileHash: '',
+    baseRevision: '',
+    busy: false,
+    error: '',
+  },
+};
+
+function resetGlossaryEditor(overrides = {}) {
+  glossaryUiState.editor = {
+    open: false,
+    mode: 'create',
+    targetId: '',
+    category: '',
+    ch: '',
+    note: '',
+    enabled: true,
+    languages: [{ code: 'en', value: '' }],
+    busy: false,
+    ...overrides,
+  };
+}
+
+function resetGlossaryImporter(overrides = {}) {
+  glossaryUiState.importer = {
+    file: null,
+    preview: null,
+    fileHash: '',
+    baseRevision: '',
+    busy: false,
+    error: '',
+    ...overrides,
+  };
+}
+
+function normalizeGlossaryAliases(value) {
+  if (Array.isArray(value)) {
+    return value
+      .map(item => String(item ?? '').trim())
+      .filter(Boolean);
+  }
+  return String(value ?? '')
+    .split('|')
+    .map(item => item.trim())
+    .filter(Boolean);
+}
+
+function normalizeGlossaryItem(item) {
+  const source = item && typeof item === 'object' ? item : {};
+  const languageSource = source.terms_by_lang && typeof source.terms_by_lang === 'object'
+    ? source.terms_by_lang
+    : {};
+  const languages = {};
+
+  Object.entries(languageSource).forEach(([code, value]) => {
+    const trimmedCode = String(code || '').trim().toLowerCase();
+    if (!trimmedCode || trimmedCode === 'ch') return;
+    const aliases = normalizeGlossaryAliases(value);
+    if (aliases.length) languages[trimmedCode] = aliases;
+  });
+
+  return {
+    id: String(source.id ?? ''),
+    category: String(source.category ?? '').trim(),
+    ch: String(source.ch ?? '').trim(),
+    note: String(source.note ?? '').trim(),
+    enabled: source.enabled !== false,
+    languages,
+  };
+}
+
+function normalizeGlossaryResponse(data) {
+  const source = data && typeof data === 'object' ? data : {};
+  const items = Array.isArray(source.items)
+    ? source.items.map(normalizeGlossaryItem).filter(item => item.ch)
+    : [];
+  const languages = Array.from(new Set([
+    ...(Array.isArray(source.languages) ? source.languages : []),
+    ...items.flatMap(item => Object.keys(item.languages)),
+  ].map(code => String(code || '').trim().toLowerCase()).filter(Boolean))).sort();
+
+  return {
+    items,
+    revision: String(source.revision ?? ''),
+    languages,
+  };
+}
+
+function glossaryCategoryOptions(items = glossaryUiState.items) {
+  return Array.from(new Set(
+    items.map(item => item.category).filter(Boolean)
+  )).sort((a, b) => a.localeCompare(b, 'zh-CN'));
+}
+
+function glossaryVisibleItems() {
+  const query = glossaryUiState.filters.search.trim().toLowerCase();
+  return glossaryUiState.items.filter(item => {
+    const matchesQuery = !query || [
+      item.category,
+      item.ch,
+      item.note,
+      ...Object.values(item.languages).flat(),
+    ].some(value => String(value || '').toLowerCase().includes(query));
+    const matchesCategory = glossaryUiState.filters.category === 'all' || item.category === glossaryUiState.filters.category;
+    const matchesStatus = glossaryUiState.filters.status === 'all'
+      || (glossaryUiState.filters.status === 'enabled' ? item.enabled : !item.enabled);
+    return matchesQuery && matchesCategory && matchesStatus;
+  });
+}
+
+function glossaryDisplayLanguages() {
+  const order = glossaryUiState.languages.length ? glossaryUiState.languages : [];
+  const extra = glossaryVisibleItems().flatMap(item => Object.keys(item.languages));
+  return Array.from(new Set([...order, ...extra])).sort();
+}
+
+function glossarySummaryCounts(items = glossaryUiState.items) {
+  const enabled = items.filter(item => item.enabled).length;
+  return {
+    total: items.length,
+    enabled,
+    disabled: items.length - enabled,
+  };
+}
+
+function glossaryPendingToggle(id) {
+  return glossaryUiState.pendingToggleIds.has(String(id || ''));
+}
+
+function applyGlossaryCatalog(data) {
+  const normalized = normalizeGlossaryResponse(data);
+  glossaryUiState.items = normalized.items;
+  glossaryUiState.languages = normalized.languages;
+  glossaryUiState.revision = normalized.revision;
+  if (
+    glossaryUiState.filters.category !== 'all'
+    && !glossaryCategoryOptions(normalized.items).includes(glossaryUiState.filters.category)
+  ) {
+    glossaryUiState.filters.category = 'all';
+  }
+}
+
+function applyGlossaryUpsert(item, revision) {
+  const normalized = normalizeGlossaryItem(item);
+  const index = glossaryUiState.items.findIndex(entry => entry.id === normalized.id);
+  if (index >= 0) {
+    glossaryUiState.items.splice(index, 1, normalized);
+  } else {
+    glossaryUiState.items.push(normalized);
+  }
+  glossaryUiState.items.sort((a, b) => (
+    String(a.category || '').localeCompare(String(b.category || ''), 'zh-CN')
+    || String(a.ch || '').localeCompare(String(b.ch || ''), 'zh-CN')
+  ));
+  glossaryUiState.languages = Array.from(new Set(
+    glossaryUiState.items.flatMap(entry => Object.keys(entry.languages || {}))
+  )).sort();
+  glossaryUiState.revision = revision ?? glossaryUiState.revision;
+  if (
+    glossaryUiState.filters.category !== 'all'
+    && !glossaryCategoryOptions().includes(glossaryUiState.filters.category)
+  ) {
+    glossaryUiState.filters.category = 'all';
+  }
+}
+
+function glossaryLanguageRowsHtml(rows) {
+  const safeRows = rows.length ? rows : [{ code: '', value: '' }];
+  return safeRows.map((row, index) => `
+    <div class="glossary-editor__lang-row">
+      <input class="glossary-input glossary-input--code" type="text" data-glossary-lang-code="${index}" value="${esc(row.code || '')}" placeholder="en" maxlength="16" />
+      <input class="glossary-input glossary-input--aliases" type="text" data-glossary-lang-value="${index}" value="${esc(row.value || '')}" placeholder="名称；多个别名用 | 分隔" />
+      <button class="btn btn--ghost btn--sm" type="button" data-glossary-remove-lang="${index}">移除</button>
+    </div>
+  `).join('');
+}
+
+function glossaryTableHtml(items, languages) {
+  const rows = items.map(item => `
+    <tr>
+      <td>${esc(item.category || '未分类')}</td>
+      <td>
+        <div class="glossary-term__main">${esc(item.ch)}</div>
+        <div class="glossary-term__sub">${esc(item.note || '无备注')}</div>
+      </td>
+      ${languages.map(code => `<td title="${esc((item.languages[code] || []).join(' | '))}">${esc((item.languages[code] || []).join(' | ') || '—')}</td>`).join('')}
+      <td>
+        <button
+          class="glossary-status-switch${item.enabled ? ' glossary-status-switch--on' : ''}${glossaryPendingToggle(item.id) ? ' glossary-status-switch--busy' : ''}"
+          type="button"
+          role="switch"
+          aria-checked="${item.enabled ? 'true' : 'false'}"
+          aria-label="${esc(`${item.ch} 当前${item.enabled ? '已启用' : '已停用'}，点击${item.enabled ? '停用' : '启用'}`)}"
+          aria-busy="${glossaryPendingToggle(item.id) ? 'true' : 'false'}"
+          data-glossary-toggle="${esc(item.id)}"
+          ${glossaryPendingToggle(item.id) ? 'disabled' : ''}
+        >
+          <span class="glossary-status-switch__track" aria-hidden="true">
+            <span class="glossary-status-switch__text glossary-status-switch__text--on">开</span>
+            <span class="glossary-status-switch__text glossary-status-switch__text--off">关</span>
+            <span class="glossary-status-switch__thumb"></span>
+          </span>
+          <span class="glossary-status-switch__label">${glossaryPendingToggle(item.id) ? '更新中…' : item.enabled ? '已启用' : '已停用'}</span>
+        </button>
+      </td>
+      <td>
+        <div class="glossary-row-actions">
+          <button class="btn btn--ghost btn--sm" type="button" data-glossary-edit="${esc(item.id)}">编辑</button>
+          <button class="btn btn--ghost btn--sm" type="button" data-glossary-delete="${esc(item.id)}">删除</button>
+        </div>
+      </td>
+    </tr>
+  `).join('');
+
+  return `
+    <div class="glossary-table-wrap">
+      <table class="glossary-table">
+        <thead>
+          <tr>
+            <th>分类</th>
+            <th>标准中文 ch</th>
+            ${languages.map(code => `<th>${esc(code)}</th>`).join('')}
+            <th>状态</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+  `;
+}
+
+function glossaryPreviewRows(preview) {
+  if (Array.isArray(preview?.rows)) return preview.rows;
+  return [];
+}
+
+function glossaryPreviewRowsHtml(preview, languages) {
+  const rows = glossaryPreviewRows(preview);
+  if (!rows.length) {
+    return `<div class="glossary-empty">预览没有返回可导入的术语。</div>`;
+  }
+  return `
+    <div class="glossary-table-wrap">
+      <table class="glossary-table glossary-table--preview">
+        <thead>
+          <tr>
+            <th>结果</th>
+            <th>分类</th>
+            <th>ch</th>
+            ${languages.map(code => `<th>${esc(code)}</th>`).join('')}
+            <th>说明</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows.map(row => {
+            const normalized = normalizeGlossaryItem(row.item || row);
+            const action = String(row.action || row.status || '').trim();
+            const status = GLOSSARY_IMPORT_ACTION_LABELS[action] || action || '预览';
+            const detail = String(row.detail || row.message || '').trim();
+            return `
+              <tr>
+                <td><span class="glossary-status glossary-status--preview">${esc(status)}</span></td>
+                <td>${esc(normalized.category || '未分类')}</td>
+                <td>${esc(normalized.ch)}</td>
+                ${languages.map(code => `<td>${esc((normalized.languages[code] || []).join(' | ') || '—')}</td>`).join('')}
+                <td>${esc(detail || '—')}</td>
+              </tr>
+            `;
+          }).join('')}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+function glossaryCanCommit(preview) {
+  if (!preview) return false;
+  if (preview.can_commit === false) return false;
+  const stats = preview.stats || {};
+  const conflictCount = Number(stats.conflicts ?? stats.conflict ?? 0);
+  const errorCount = Number(stats.errors ?? stats.error ?? 0);
+  const previewErrors = Array.isArray(preview.errors)
+    ? preview.errors.map(error => String(error || '').trim()).filter(Boolean)
+    : [];
+  return conflictCount === 0 && errorCount === 0 && previewErrors.length === 0;
+}
+
+function renderGlossaryTab() {
+  const body = $('stab-content-glossary');
+  if (!body) return;
+
+  const visibleItems = glossaryVisibleItems();
+  const categories = glossaryCategoryOptions();
+  const languages = glossaryDisplayLanguages();
+  const summary = glossarySummaryCounts();
+  const preview = glossaryUiState.importer.preview;
+  const previewStats = preview?.stats || {};
+  const previewRows = glossaryPreviewRows(preview);
+  const previewCanCommit = glossaryCanCommit(preview) && !!glossaryUiState.importer.fileHash;
+  const previewErrors = Array.isArray(preview?.errors)
+    ? preview.errors.map(error => String(error || '').trim()).filter(Boolean)
+    : [];
+  const importPanelVisible = !!(
+    preview
+    || glossaryUiState.importer.file
+    || glossaryUiState.importer.busy
+    || glossaryUiState.importer.error
+  );
+  const previewLanguages = Array.from(new Set([
+    ...(preview?.languages || []),
+    ...previewRows.flatMap(row => Object.keys(normalizeGlossaryItem(row.item || row).languages)),
+  ])).sort();
+
+  body.innerHTML = `
+    <section class="glossary-settings">
+      <header class="glossary-settings__header">
+        <div>
+          <h2 class="glossary-settings__title">术语库</h2>
+          <p class="glossary-settings__desc">命中术语时统一使用标准中文名；玩家原话、来源引用和结构化标识保持原样；未命中时保留原文，不让模型猜译。</p>
+        </div>
+        <div class="glossary-settings__summary">
+          <span>当前 ${summary.total} 条</span>
+          <span>启用 ${summary.enabled} 条</span>
+          <span>停用 ${summary.disabled} 条</span>
+        </div>
+      </header>
+
+      <div class="glossary-toolbar">
+        <div class="glossary-toolbar__filters">
+          <label class="prompt-search glossary-toolbar__search" for="glossary-search-input">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="11" cy="11" r="7"></circle>
+              <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+            </svg>
+            <input id="glossary-search-input" type="search" value="${esc(glossaryUiState.filters.search)}" placeholder="搜索分类、中文名或任意语言别名" />
+          </label>
+          <label class="glossary-select">
+            <select id="glossary-category-filter" aria-label="分类筛选">
+              <option value="all">全部分类</option>
+              ${categories.map(category => `<option value="${esc(category)}" ${glossaryUiState.filters.category === category ? 'selected' : ''}>${esc(category)}</option>`).join('')}
+            </select>
+          </label>
+          <label class="glossary-select">
+            <select id="glossary-status-filter" aria-label="状态筛选">
+              ${GLOSSARY_STATUS_OPTIONS.map(option => `<option value="${option.value}" ${glossaryUiState.filters.status === option.value ? 'selected' : ''}>${option.label}</option>`).join('')}
+            </select>
+          </label>
+        </div>
+        <div class="glossary-toolbar__actions">
+          <button class="btn btn--ghost btn--sm" type="button" data-glossary-template>下载模板</button>
+          <button class="btn btn--ghost btn--sm" type="button" data-glossary-export>导出全部</button>
+          <button class="btn btn--ghost btn--sm" type="button" data-glossary-import>导入 Excel</button>
+          <button class="btn btn--primary btn--sm" type="button" data-glossary-create>新增术语</button>
+        </div>
+      </div>
+
+      <input id="${GLOSSARY_IMPORT_INPUT_ID}" type="file" accept=".xlsx" hidden />
+
+      <div class="glossary-meta">
+        <span>语言列：${languages.length ? languages.map(code => esc(code)).join('、') : '尚未配置'}</span>
+        <span>当前显示 ${visibleItems.length} 条</span>
+        <span>${glossaryUiState.revision ? `版本 ${esc(glossaryUiState.revision)}` : '版本未返回'}</span>
+      </div>
+
+      ${visibleItems.length ? glossaryTableHtml(visibleItems, languages) : `<div class="glossary-empty">没有符合当前筛选条件的术语。</div>`}
+
+      <section class="glossary-panel${glossaryUiState.editor.open ? '' : ' glossary-panel--hidden'}" id="glossary-editor-panel">
+        <div class="glossary-panel__head">
+          <div>
+            <h3>${glossaryUiState.editor.mode === 'edit' ? '编辑术语' : '新增术语'}</h3>
+            <p>支持动态语言列；同一语言多个别名用 <code>|</code> 分隔。</p>
+          </div>
+          <button class="btn btn--ghost btn--sm" type="button" data-glossary-cancel-editor>收起</button>
+        </div>
+        <div class="glossary-editor">
+          <label class="glossary-field">
+            <span>分类</span>
+            <input class="glossary-input" id="glossary-editor-category" list="glossary-category-options" value="${esc(glossaryUiState.editor.category)}" placeholder="例如：英雄 / 皮肤 / 装备" />
+          </label>
+          <label class="glossary-field">
+            <span>标准中文名 ch</span>
+            <input class="glossary-input" id="glossary-editor-ch" value="${esc(glossaryUiState.editor.ch)}" placeholder="必填，例如：米娅" />
+          </label>
+          <label class="glossary-field glossary-field--wide">
+            <span>备注</span>
+            <textarea class="glossary-input glossary-input--textarea" id="glossary-editor-note" rows="2" placeholder="可选，例如：正式服英雄名">${esc(glossaryUiState.editor.note)}</textarea>
+          </label>
+          <label class="glossary-switch glossary-field--wide">
+            <input type="checkbox" id="glossary-editor-enabled" ${glossaryUiState.editor.enabled ? 'checked' : ''} />
+            <span>启用该术语</span>
+          </label>
+          <div class="glossary-field glossary-field--wide">
+            <div class="glossary-field__title-row">
+              <div>
+                <span>其他语言</span>
+                <small>语言代码可自由增加，支持 en / id / ru 等任意列。</small>
+              </div>
+              <button class="btn btn--ghost btn--sm" type="button" data-glossary-add-lang>增加语言</button>
+            </div>
+            <div class="glossary-editor__lang-list">
+              ${glossaryLanguageRowsHtml(glossaryUiState.editor.languages)}
+            </div>
+          </div>
+          <div class="glossary-panel__actions glossary-field--wide">
+            <button class="btn btn--ghost btn--sm" type="button" data-glossary-cancel-editor>取消</button>
+            <button class="btn btn--primary btn--sm" type="button" data-glossary-save ${glossaryUiState.editor.busy ? 'disabled' : ''}>${glossaryUiState.editor.busy ? '保存中…' : '保存术语'}</button>
+          </div>
+        </div>
+        <datalist id="glossary-category-options">
+          ${categories.map(category => `<option value="${esc(category)}"></option>`).join('')}
+        </datalist>
+      </section>
+
+      <section class="glossary-panel${importPanelVisible ? '' : ' glossary-panel--hidden'}" id="glossary-import-panel">
+        <div class="glossary-panel__head">
+          <div>
+            <h3>导入预览${glossaryUiState.importer.file ? `：${esc(glossaryUiState.importer.file.name)}` : ''}</h3>
+            <p>先检查列结构、缺失中文名和重复别名；确认前不会写入术语库。</p>
+          </div>
+          <button class="btn btn--ghost btn--sm" type="button" data-glossary-cancel-import>取消</button>
+        </div>
+        ${glossaryUiState.importer.error ? `<div class="glossary-alert glossary-alert--warning">${esc(glossaryUiState.importer.error)}</div>` : ''}
+        ${!preview && glossaryUiState.importer.busy ? `<div class="glossary-empty"><div class="spinner" style="margin:0 auto 10px"></div>正在校验文件并生成预览…</div>` : ''}
+        ${preview ? `
+          <div class="glossary-import__meta">
+            <span>识别列：${(previewLanguages.length ? previewLanguages : ['ch']).map(code => esc(code)).join('、')}</span>
+            <span>可新增 ${esc(previewStats.created ?? previewStats.create ?? 0)} 条</span>
+            <span>可更新 ${esc(previewStats.updated ?? previewStats.update ?? 0)} 条</span>
+            ${(previewStats.conflicts ?? previewStats.conflict ?? 0) ? `<span>冲突 ${esc(previewStats.conflicts ?? previewStats.conflict)} 条</span>` : ''}
+            ${(previewStats.errors ?? 0) ? `<span>异常 ${esc(previewStats.errors)} 条</span>` : ''}
+          </div>
+          ${previewErrors.length ? `<div class="glossary-alert glossary-alert--warning">${previewErrors.map(error => `<div>${esc(error)}</div>`).join('')}</div>` : ''}
+          ${glossaryPreviewRowsHtml(preview, previewLanguages)}
+          <div class="glossary-import__warning">若文件被替换，或其他管理员先修改了术语库，确认时会要求重新预览。</div>
+          <div class="glossary-panel__actions">
+            <button class="btn btn--ghost btn--sm" type="button" data-glossary-repreview ${glossaryUiState.importer.busy ? 'disabled' : ''}>重新预览</button>
+            <button class="btn btn--primary btn--sm" type="button" data-glossary-commit ${glossaryUiState.importer.busy || !previewCanCommit ? 'disabled' : ''}>${glossaryUiState.importer.busy ? '导入中…' : `确认导入 ${(previewStats.total ?? previewRows.length ?? 0)} 条`}</button>
+          </div>
+        ` : ''}
+      </section>
+    </section>
+  `;
+}
+
+async function loadGlossary(force = false) {
+  const body = $('stab-content-glossary');
+  if (!body) return;
+  if (glossaryUiState.loaded && !force) {
+    renderGlossaryTab();
+    return;
+  }
+  if (glossaryUiState.loading) {
+    const pending = glossaryUiState.loadPromise;
+    if (pending) await pending;
+    if (!force && glossaryUiState.loaded) renderGlossaryTab();
+    return;
+  }
+  glossaryUiState.loading = true;
+  glossaryUiState.loadPromise = (async () => {
+    body.innerHTML = `<div class="hist-empty"><div class="spinner" style="margin:0 auto"></div></div>`;
+    try {
+      const resp = await fetch('/api/glossary', { cache: 'no-store' });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(data.detail || '加载术语库失败');
+      applyGlossaryCatalog(data);
+      glossaryUiState.loaded = true;
+      renderGlossaryTab();
+    } catch (error) {
+      body.innerHTML = `
+        <div class="hist-empty">
+          <div style="display:flex;flex-direction:column;align-items:center;gap:12px;">
+            <div>加载术语库失败：${esc(error.message)}</div>
+            <button class="btn btn--ghost btn--sm" type="button" data-glossary-retry-load>重试</button>
+          </div>
+        </div>`;
+    } finally {
+      glossaryUiState.loading = false;
+    }
+  })();
+  try {
+    await glossaryUiState.loadPromise;
+  } finally {
+    glossaryUiState.loadPromise = null;
+  }
+}
+
+function openGlossaryEditor(item = null) {
+  if (item) {
+    const languageRows = Object.entries(item.languages).map(([code, aliases]) => ({
+      code,
+      value: aliases.join(' | '),
+    }));
+    resetGlossaryEditor({
+      open: true,
+      mode: 'edit',
+      targetId: item.id,
+      category: item.category,
+      ch: item.ch,
+      note: item.note,
+      enabled: item.enabled,
+      languages: languageRows.length ? languageRows : [{ code: 'en', value: '' }],
+    });
+  } else {
+    resetGlossaryEditor({
+      open: true,
+      category: glossaryUiState.filters.category !== 'all' ? glossaryUiState.filters.category : '',
+    });
+  }
+  renderGlossaryTab();
+}
+
+function closeGlossaryEditor() {
+  resetGlossaryEditor();
+  renderGlossaryTab();
+}
+
+function closeGlossaryImportPanel() {
+  resetGlossaryImporter();
+  renderGlossaryTab();
+}
+
+function collectGlossaryEditorPayload() {
+  const category = String(glossaryUiState.editor.category || '').trim();
+  const ch = String(glossaryUiState.editor.ch || '').trim();
+  if (!ch) {
+    throw new Error('请填写标准中文名 ch');
+  }
+
+  const languages = {};
+  glossaryUiState.editor.languages.forEach(row => {
+    const code = String(row.code || '').trim().toLowerCase();
+    const aliases = normalizeGlossaryAliases(row.value);
+    if (!code && !aliases.length) return;
+    if (!code) throw new Error('请为每一行填写语言代码');
+    if (code === 'ch') throw new Error('ch 是标准中文列，请不要在其他语言里重复添加');
+    if (!/^[a-z][a-z0-9_-]{0,15}$/i.test(code)) throw new Error(`语言代码格式不正确：${code}`);
+    if (!aliases.length) throw new Error(`请填写 ${code} 的术语名称`);
+    if (Object.prototype.hasOwnProperty.call(languages, code)) {
+      throw new Error(`语言代码重复：${code}`);
+    }
+    languages[code] = aliases;
+  });
+
+  return {
+    category,
+    ch,
+    note: String(glossaryUiState.editor.note || '').trim(),
+    enabled: !!glossaryUiState.editor.enabled,
+    terms_by_lang: languages,
+  };
+}
+
+async function saveGlossaryEditor() {
+  let payload;
+  try {
+    payload = collectGlossaryEditorPayload();
+  } catch (error) {
+    showToast(error.message, 'error');
+    return;
+  }
+
+  glossaryUiState.editor.busy = true;
+  renderGlossaryTab();
+  try {
+    const isEdit = glossaryUiState.editor.mode === 'edit';
+    const revisionQuery = glossaryUiState.revision
+      ? `?expected_revision=${encodeURIComponent(glossaryUiState.revision)}`
+      : '';
+    const url = isEdit
+      ? `/api/glossary/${encodeURIComponent(glossaryUiState.editor.targetId)}${revisionQuery}`
+      : `/api/glossary${revisionQuery}`;
+    const resp = await fetch(url, {
+      method: isEdit ? 'PATCH' : 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...payload,
+        expected_revision: glossaryUiState.revision || undefined,
+      }),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      const error = new Error(data.detail || '保存术语失败');
+      error.status = resp.status;
+      throw error;
+    }
+    showToast(isEdit ? '术语已更新' : '术语已新增', 'success');
+    resetGlossaryEditor();
+    await loadGlossary(true);
+  } catch (error) {
+    glossaryUiState.editor.busy = false;
+    if (error.status === 409) {
+      showToast('术语库版本已变化，请刷新后重试', 'error');
+      await loadGlossary(true);
+      return;
+    }
+    renderGlossaryTab();
+    showToast(error.message, 'error');
+  }
+}
+
+async function updateGlossaryTerm(id, changes, successMessage) {
+  const pendingId = String(id || '');
+  if (glossaryPendingToggle(pendingId)) return;
+  const isToggleOnly = Object.keys(changes || {}).length === 1 && Object.prototype.hasOwnProperty.call(changes, 'enabled');
+  if (isToggleOnly) {
+    glossaryUiState.pendingToggleIds.add(pendingId);
+    renderGlossaryTab();
+  }
+  try {
+    const revisionQuery = glossaryUiState.revision
+      ? `?expected_revision=${encodeURIComponent(glossaryUiState.revision)}`
+      : '';
+    const resp = await fetch(`/api/glossary/${encodeURIComponent(id)}${revisionQuery}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...changes,
+        expected_revision: glossaryUiState.revision || undefined,
+      }),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      const error = new Error(data.detail || '更新术语失败');
+      error.status = resp.status;
+      throw error;
+    }
+    if (data?.item) {
+      applyGlossaryUpsert(data.item, data.revision);
+      if (isToggleOnly) {
+        glossaryUiState.pendingToggleIds.delete(pendingId);
+        renderGlossaryTab();
+      }
+    } else {
+      await loadGlossary(true);
+    }
+    showToast(successMessage, 'success');
+  } catch (error) {
+    if (isToggleOnly) {
+      glossaryUiState.pendingToggleIds.delete(pendingId);
+      renderGlossaryTab();
+    }
+    if (error.status === 409) {
+      showToast('术语库版本已变化，请刷新后再试', 'error');
+      await loadGlossary(true);
+      return;
+    }
+    showToast(error.message, 'error');
+  }
+}
+
+async function deleteGlossaryTerm(id) {
+  try {
+    const revisionQuery = glossaryUiState.revision
+      ? `?expected_revision=${encodeURIComponent(glossaryUiState.revision)}`
+      : '';
+    const resp = await fetch(`/api/glossary/${encodeURIComponent(id)}${revisionQuery}`, {
+      method: 'DELETE',
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      const error = new Error(data.detail || '删除术语失败');
+      error.status = resp.status;
+      throw error;
+    }
+    showToast('术语已删除', 'success');
+    await loadGlossary(true);
+  } catch (error) {
+    if (error.status === 409) {
+      showToast('术语库版本已变化，请刷新后再试', 'error');
+      await loadGlossary(true);
+      return;
+    }
+    showToast(error.message, 'error');
+  }
+}
+
+async function previewGlossaryImport(file) {
+  if (!file) return;
+  resetGlossaryImporter({
+    file,
+    busy: true,
+    error: '',
+  });
+  renderGlossaryTab();
+  try {
+    const form = new FormData();
+    form.append('file', file);
+    const resp = await fetch('/api/glossary/import/preview', {
+      method: 'POST',
+      body: form,
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      throw new Error(data.detail || '导入预览失败');
+    }
+    glossaryUiState.importer = {
+      file,
+      preview: data.preview || data,
+      fileHash: String(data.file_hash || ''),
+      baseRevision: String(data.base_revision ?? glossaryUiState.revision ?? ''),
+      busy: false,
+      error: '',
+    };
+    renderGlossaryTab();
+    showToast('已生成导入预览', 'success', 1800);
+  } catch (error) {
+    glossaryUiState.importer.busy = false;
+    glossaryUiState.importer.error = error.message;
+    glossaryUiState.importer.preview = null;
+    renderGlossaryTab();
+    showToast(error.message, 'error');
+  }
+}
+
+async function commitGlossaryImport() {
+  const { file, fileHash, baseRevision, preview } = glossaryUiState.importer;
+  if (!file || !preview) {
+    showToast('请先完成导入预览', 'error');
+    return;
+  }
+
+  glossaryUiState.importer.busy = true;
+  renderGlossaryTab();
+  try {
+    const form = new FormData();
+    form.append('file', file);
+    if (fileHash) form.append('file_hash', fileHash);
+    form.append('base_revision', baseRevision || glossaryUiState.revision || '');
+    const resp = await fetch('/api/glossary/import/commit', {
+      method: 'POST',
+      body: form,
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      const error = new Error(data.detail || '术语库导入失败');
+      error.status = resp.status;
+      throw error;
+    }
+    showToast('术语库已导入', 'success');
+    resetGlossaryImporter();
+    await loadGlossary(true);
+  } catch (error) {
+    glossaryUiState.importer.busy = false;
+    if (error.status === 409) {
+      glossaryUiState.importer.error = '文件或术语库版本已变化，请重新预览后再确认。';
+      renderGlossaryTab();
+      showToast(glossaryUiState.importer.error, 'error');
+      return;
+    }
+    renderGlossaryTab();
+    showToast(error.message, 'error');
+  }
+}
+
+async function downloadGlossaryFile(url, fallbackName) {
+  try {
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error('下载失败');
+    const blob = await resp.blob();
+    const objectUrl = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    const disposition = resp.headers.get('content-disposition') || '';
+    const matchedName = disposition.match(/filename\*?=(?:UTF-8''|")?([^\";]+)/i);
+    anchor.href = objectUrl;
+    anchor.download = matchedName ? decodeURIComponent(matchedName[1].replace(/"/g, '')) : fallbackName;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(objectUrl);
+  } catch (error) {
+    showToast(error.message, 'error');
+  }
 }
 
 // ── 权限配置 ──────────────────────────────────────────────────
@@ -1155,6 +1972,65 @@ window.addEventListener('beforeunload', event => {
 });
 
 $('settings-drawer').addEventListener('input', e => {
+  const glossarySearch = e.target.closest('#glossary-search-input');
+  if (glossarySearch) {
+    glossaryUiState.filters.search = glossarySearch.value || '';
+    if (e.isComposing) return;
+    const { selectionStart, selectionEnd } = glossarySearch;
+    renderGlossaryTab();
+    requestAnimationFrame(() => {
+      const nextInput = $('glossary-search-input');
+      if (!nextInput) return;
+      nextInput.focus();
+      if (selectionStart !== null && selectionEnd !== null) {
+        nextInput.setSelectionRange(selectionStart, selectionEnd);
+      }
+    });
+    return;
+  }
+
+  const glossaryCategoryInput = e.target.closest('#glossary-editor-category');
+  if (glossaryCategoryInput) {
+    glossaryUiState.editor.category = glossaryCategoryInput.value || '';
+    return;
+  }
+
+  const glossaryChInput = e.target.closest('#glossary-editor-ch');
+  if (glossaryChInput) {
+    glossaryUiState.editor.ch = glossaryChInput.value || '';
+    return;
+  }
+
+  const glossaryNoteInput = e.target.closest('#glossary-editor-note');
+  if (glossaryNoteInput) {
+    glossaryUiState.editor.note = glossaryNoteInput.value || '';
+    return;
+  }
+
+  const glossaryEnabledInput = e.target.closest('#glossary-editor-enabled');
+  if (glossaryEnabledInput) {
+    glossaryUiState.editor.enabled = glossaryEnabledInput.checked;
+    return;
+  }
+
+  const glossaryLangCode = e.target.closest('[data-glossary-lang-code]');
+  if (glossaryLangCode) {
+    const index = Number(glossaryLangCode.dataset.glossaryLangCode);
+    if (glossaryUiState.editor.languages[index]) {
+      glossaryUiState.editor.languages[index].code = glossaryLangCode.value || '';
+    }
+    return;
+  }
+
+  const glossaryLangValue = e.target.closest('[data-glossary-lang-value]');
+  if (glossaryLangValue) {
+    const index = Number(glossaryLangValue.dataset.glossaryLangValue);
+    if (glossaryUiState.editor.languages[index]) {
+      glossaryUiState.editor.languages[index].value = glossaryLangValue.value || '';
+    }
+    return;
+  }
+
   const searchInput = e.target.closest('#prompt-search-input');
   if (searchInput) {
     promptUiState.search = searchInput.value || '';
@@ -1179,6 +2055,114 @@ $('settings-drawer').addEventListener('input', e => {
 });
 
 $('settings-drawer').addEventListener('click', async e => {
+  const glossaryRetryLoadBtn = e.target.closest('[data-glossary-retry-load]');
+  if (glossaryRetryLoadBtn) {
+    await loadGlossary(true);
+    return;
+  }
+
+  const glossaryCreateBtn = e.target.closest('[data-glossary-create]');
+  if (glossaryCreateBtn) {
+    openGlossaryEditor();
+    return;
+  }
+
+  const glossaryCancelEditorBtn = e.target.closest('[data-glossary-cancel-editor]');
+  if (glossaryCancelEditorBtn) {
+    closeGlossaryEditor();
+    return;
+  }
+
+  const glossaryAddLangBtn = e.target.closest('[data-glossary-add-lang]');
+  if (glossaryAddLangBtn) {
+    glossaryUiState.editor.languages.push({ code: '', value: '' });
+    renderGlossaryTab();
+    return;
+  }
+
+  const glossaryRemoveLangBtn = e.target.closest('[data-glossary-remove-lang]');
+  if (glossaryRemoveLangBtn) {
+    const index = Number(glossaryRemoveLangBtn.dataset.glossaryRemoveLang);
+    glossaryUiState.editor.languages.splice(index, 1);
+    if (!glossaryUiState.editor.languages.length) {
+      glossaryUiState.editor.languages.push({ code: '', value: '' });
+    }
+    renderGlossaryTab();
+    return;
+  }
+
+  const glossarySaveBtn = e.target.closest('[data-glossary-save]');
+  if (glossarySaveBtn) {
+    await saveGlossaryEditor();
+    return;
+  }
+
+  const glossaryEditBtn = e.target.closest('[data-glossary-edit]');
+  if (glossaryEditBtn) {
+    const item = glossaryUiState.items.find(entry => entry.id === glossaryEditBtn.dataset.glossaryEdit);
+    if (item) openGlossaryEditor(item);
+    return;
+  }
+
+  const glossaryDeleteBtn = e.target.closest('[data-glossary-delete]');
+  if (glossaryDeleteBtn) {
+    const item = glossaryUiState.items.find(entry => entry.id === glossaryDeleteBtn.dataset.glossaryDelete);
+    if (!item) return;
+    if (window.confirm(`确认删除术语“${item.ch}”？`)) {
+      await deleteGlossaryTerm(item.id);
+    }
+    return;
+  }
+
+  const glossaryToggleBtn = e.target.closest('[data-glossary-toggle]');
+  if (glossaryToggleBtn) {
+    const item = glossaryUiState.items.find(entry => entry.id === glossaryToggleBtn.dataset.glossaryToggle);
+    if (!item) return;
+    await updateGlossaryTerm(item.id, { enabled: !item.enabled }, item.enabled ? '术语已停用' : '术语已启用');
+    return;
+  }
+
+  const glossaryTemplateBtn = e.target.closest('[data-glossary-template]');
+  if (glossaryTemplateBtn) {
+    await downloadGlossaryFile('/api/glossary/template', 'glossary-template.xlsx');
+    return;
+  }
+
+  const glossaryExportBtn = e.target.closest('[data-glossary-export]');
+  if (glossaryExportBtn) {
+    await downloadGlossaryFile('/api/glossary/export', 'glossary-export.xlsx');
+    return;
+  }
+
+  const glossaryImportBtn = e.target.closest('[data-glossary-import]');
+  if (glossaryImportBtn) {
+    const input = $(GLOSSARY_IMPORT_INPUT_ID);
+    if (!input) return;
+    input.value = '';
+    input.click();
+    return;
+  }
+
+  const glossaryCancelImportBtn = e.target.closest('[data-glossary-cancel-import]');
+  if (glossaryCancelImportBtn) {
+    closeGlossaryImportPanel();
+    return;
+  }
+
+  const glossaryRepreviewBtn = e.target.closest('[data-glossary-repreview]');
+  if (glossaryRepreviewBtn) {
+    if (glossaryUiState.importer.file) {
+      await previewGlossaryImport(glossaryUiState.importer.file);
+    }
+    return;
+  }
+
+  const glossaryCommitBtn = e.target.closest('[data-glossary-commit]');
+  if (glossaryCommitBtn) {
+    await commitGlossaryImport();
+    return;
+  }
+
   const openBtn = e.target.closest('[data-open-prompt-editor]');
   if (openBtn) {
     openPromptEditor(openBtn.dataset.openPromptEditor);
@@ -1281,5 +2265,26 @@ $('settings-drawer').addEventListener('click', async e => {
       saveBtn.disabled = false;
       saveBtn.textContent = '保存';
     }
+  }
+});
+
+$('settings-drawer').addEventListener('change', async e => {
+  const glossaryCategoryFilter = e.target.closest('#glossary-category-filter');
+  if (glossaryCategoryFilter) {
+    glossaryUiState.filters.category = glossaryCategoryFilter.value || 'all';
+    renderGlossaryTab();
+    return;
+  }
+
+  const glossaryStatusFilter = e.target.closest('#glossary-status-filter');
+  if (glossaryStatusFilter) {
+    glossaryUiState.filters.status = glossaryStatusFilter.value || 'all';
+    renderGlossaryTab();
+    return;
+  }
+
+  const glossaryImportInput = e.target.closest(`#${GLOSSARY_IMPORT_INPUT_ID}`);
+  if (glossaryImportInput?.files?.[0]) {
+    await previewGlossaryImport(glossaryImportInput.files[0]);
   }
 });

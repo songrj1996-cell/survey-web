@@ -30,6 +30,11 @@ class ReportWriterStructureTests(unittest.TestCase):
         self.assertIn("未参与调研立项、未看过问卷提纲的读者也能独立理解", requirements)
         self.assertIn("分别回车成短段，不强制编号", requirements)
         self.assertIn("不同范围的观点与风险不得混写", requirements)
+        self.assertIn("第一句话就用", requirements)
+        self.assertIn("禁止使用「针对……这一核心问题」", requirements)
+        self.assertIn("不得写成已经证明因果的「A 导致 B」", requirements)
+        self.assertIn("### 少数但值得关注的反馈", requirements)
+        self.assertNotIn("高信号少数观点与风险", requirements)
         self.assertNotIn("用 1 段话概括本次调研", requirements)
         self.assertIn("`建议内容`、`优先级`、`产品动作`、`验证方式`、`依据`、`不确定性/前提`", requirements)
         self.assertNotIn("用连贯的段落文字（不用列表）", requirements)
@@ -120,6 +125,13 @@ class ReportWriterStructureTests(unittest.TestCase):
         self.assertIn("不得写成一个超长段落", query)
         self.assertIn("不同范围不得混写", query)
         self.assertIn("不得机械套用标签或补造研究阶段", query)
+        self.assertIn("不要复述业务问题或调研需求", query)
+        self.assertIn("第一句话就用", query)
+        self.assertIn("证据显示相关", query)
+        self.assertIn("从本次调研看，A 与 B 有关", query)
+        self.assertIn("不得写成已经证明因果的「A 导致 B」", query)
+        self.assertIn("### 少数但值得关注的反馈", query)
+        self.assertNotIn("高信号少数观点与风险", query)
 
     def test_quantitative_part_query_prioritizes_objective_statistics(self):
         query = _build_writer_part_query({
