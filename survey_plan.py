@@ -4,6 +4,7 @@ planner Dify 应用输出一段 JSON（用 ```json 围栏包），描述这份�
 - columns: 每列的角色（id / profile_dim / single_choice / multi_choice / scale / open_text / ignore）
 - parts:   报告章节划分（每个 part 内同时含客观题和主观题，**不**按题型割裂）
 - cross_tabs: 画像 × 题目的交叉分析建议
+- analysis_focus: 可选的报告分析主线与交付要求
 - open_questions: planner 自己拿不准、想问用户的事
 
 bot 拿到 plan 后渲染成飞书卡片让用户确认。用户回 "OK" 进入计算；回别的 → 喂回 planner 出新 plan 再确认。
@@ -33,6 +34,16 @@ VALID_ROLES = {
 NON_STAT_ROLES = ("id", "mlbbid", "ignore")
 # 矩阵题角色（一道题跨多列）
 MATRIX_ROLES = ("matrix_scale", "matrix_single", "matrix_multi")
+ANALYSIS_FOCUS_STRING_FIELDS = (
+    "core_question",
+    "report_organization",
+    "evidence_role",
+)
+ANALYSIS_FOCUS_LIST_FIELDS = (
+    "supporting_analyses",
+    "expected_deliverables",
+    "avoid_structures",
+)
 
 
 # ============================================================================
@@ -41,7 +52,11 @@ MATRIX_ROLES = ("matrix_scale", "matrix_single", "matrix_multi")
 
 
 def parse_plan_from_llm(
-    answer: str, header_count: int
+    answer: str,
+    header_count: int,
+    *,
+    require_analysis_focus: bool = False,
+    ignore_analysis_focus: bool = False,
 ) -> tuple[dict | None, str | None]:
     """从 LLM 回复抽 JSON plan。返回 (plan, error_msg)。
 
@@ -61,7 +76,14 @@ def parse_plan_from_llm(
     if not isinstance(data, dict):
         return None, "top-level JSON is not an object"
 
-    err = _validate_plan(data, header_count)
+    if ignore_analysis_focus:
+        data.pop("analysis_focus", None)
+
+    err = _validate_plan(
+        data,
+        header_count,
+        require_analysis_focus=require_analysis_focus,
+    )
     if err:
         return None, err
     return data, None
@@ -173,8 +195,57 @@ def _sanitize_json(s: str) -> str:
     return s
 
 
-def _validate_plan(data: dict, header_count: int) -> str | None:
+def _validate_analysis_focus(data: dict, *, required: bool) -> str | None:
+    """校验可选分析主线；旧 plan 缺少该字段时保持兼容。"""
+    if "analysis_focus" not in data:
+        return "analysis_focus missing" if required else None
+
+    focus = data.get("analysis_focus")
+    if not isinstance(focus, dict):
+        return "analysis_focus must be an object"
+
+    required_fields = (*ANALYSIS_FOCUS_STRING_FIELDS, *ANALYSIS_FOCUS_LIST_FIELDS)
+    unexpected = sorted(set(focus) - set(required_fields))
+    if unexpected:
+        return f"analysis_focus has unexpected fields: {unexpected}"
+    missing = [field for field in required_fields if field not in focus]
+    if missing:
+        return f"analysis_focus missing fields: {missing}"
+
+    for field in ANALYSIS_FOCUS_STRING_FIELDS:
+        value = focus.get(field)
+        if not isinstance(value, str):
+            return f"analysis_focus.{field} must be a string"
+        focus[field] = value.strip()
+        if not focus[field]:
+            return f"analysis_focus.{field} must be non-empty"
+
+    for field in ANALYSIS_FOCUS_LIST_FIELDS:
+        value = focus.get(field)
+        if not isinstance(value, list):
+            return f"analysis_focus.{field} must be a list"
+        if any(not isinstance(item, str) or not item.strip() for item in value):
+            return f"analysis_focus.{field} must contain non-empty strings"
+        focus[field] = [item.strip() for item in value]
+    if not focus["expected_deliverables"]:
+        return "analysis_focus.expected_deliverables must be non-empty"
+    return None
+
+
+def _validate_plan(
+    data: dict,
+    header_count: int,
+    *,
+    require_analysis_focus: bool = False,
+) -> str | None:
     """schema 校验。返回 None=通过，否则返回错误描述。"""
+    focus_error = _validate_analysis_focus(
+        data,
+        required=require_analysis_focus,
+    )
+    if focus_error:
+        return focus_error
+
     cols = data.get("columns")
     if not isinstance(cols, list) or not cols:
         return "columns missing or empty"

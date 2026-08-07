@@ -214,6 +214,47 @@ def _row_value(row: list[str], index: int) -> str:
     return row[index] if index < len(row) else ""
 
 
+def _parse_same_column_multi_value(
+    value: str,
+    options: list[str],
+) -> list[str] | None:
+    """按完整选项文本解析倍市得同列多选，避免误切选项内的逗号。"""
+    text = str(value or "").strip()
+    if not text:
+        return []
+
+    ordered_options = sorted(options, key=len, reverse=True)
+    memo: dict[int, list[str] | None] = {}
+
+    def walk(position: int) -> list[str] | None:
+        if position == len(text):
+            return []
+        if position in memo:
+            return memo[position]
+
+        for option in ordered_options:
+            if not text.startswith(option, position):
+                continue
+            end = position + len(option)
+            if end == len(text):
+                memo[position] = [option]
+                return memo[position]
+            if text[end] != ",":
+                continue
+            next_position = end + 1
+            while next_position < len(text) and text[next_position].isspace():
+                next_position += 1
+            remaining = walk(next_position)
+            if remaining is not None:
+                memo[position] = [option, *remaining]
+                return memo[position]
+
+        memo[position] = None
+        return None
+
+    return walk(0)
+
+
 def _translation_sources(questions: list[dict]) -> list[dict]:
     sources: list[dict] = []
     for question in questions:
@@ -397,17 +438,52 @@ def parse_bested_qualitative_upload(
             role = "ignore"
 
         if question.role == "multi_choice":
-            source_indexes = _group_headers(
-                headers, code_title, question.options, used_indexes,
+            split_prefix = f"{code_title}__"
+            split_candidates = [
+                index for index, header in enumerate(headers)
+                if index not in used_indexes and header.startswith(split_prefix)
+            ]
+            same_column_index = _find_exact_header(
+                headers, code_title, used_indexes, cursor,
             )
-            combined = []
-            for row in body:
-                selected: list[str] = []
-                for source_index, option in zip(source_indexes, question.options):
-                    value = _row_value(row, source_index).strip()
-                    if value:
-                        selected.append(value if value != option else option)
-                combined.append("\n".join(selected))
+            if split_candidates and same_column_index is not None:
+                raise ValueError(
+                    f"题目「{code_title}」同时存在同列与拆列多选回答"
+                )
+
+            combined: list[str] = []
+            if split_candidates:
+                source_indexes = _group_headers(
+                    headers, code_title, question.options, used_indexes,
+                )
+                for row in body:
+                    selected: list[str] = []
+                    for source_index, option in zip(
+                        source_indexes, question.options,
+                    ):
+                        value = _row_value(row, source_index).strip()
+                        if value:
+                            selected.append(value if value != option else option)
+                    combined.append("\n".join(selected))
+            elif same_column_index is not None:
+                source_indexes = [same_column_index]
+                for row_number, row in enumerate(body, start=2):
+                    value = _row_value(row, same_column_index)
+                    selected = _parse_same_column_multi_value(
+                        value, question.options,
+                    )
+                    if selected is None:
+                        raise ValueError(
+                            f"题目「{code_title}」第 {row_number} 行的同列多选答案"
+                            "无法按原问卷选项匹配"
+                        )
+                    combined.append("\n".join(selected))
+            else:
+                _group_headers(
+                    headers, code_title, question.options, used_indexes,
+                )
+                raise AssertionError("多选题列匹配未返回结果")
+
             target_index = len(normalized_headers)
             normalized_headers.append(question.title)
             normalized_columns.append(combined)

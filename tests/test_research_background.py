@@ -16,6 +16,7 @@ class ResearchBackgroundTests(unittest.TestCase):
             "problem": "解决聊天频道体验问题",
             "key_concerns": "不同频道分别遇到了什么问题",
             "target_users": "使用游戏内聊天的玩家",
+            "analysis_approach": "先建立跨案例框架，再把案例作为证据",
             "background": "不应展示的旧字段",
             "report_usage": "不应展示的旧字段",
         })
@@ -24,12 +25,20 @@ class ResearchBackgroundTests(unittest.TestCase):
         self.assertIn("**业务问题/业务痛点/业务规划**：解决聊天频道体验问题", result)
         self.assertIn("**本次调研最关心的问题**：不同频道分别遇到了什么问题", result)
         self.assertIn("**产品/功能的目标用户**：使用游戏内聊天的玩家", result)
+        self.assertNotIn("先建立跨案例框架", result)
         self.assertNotIn("不应展示的旧字段", result)
 
     def test_omits_section_when_context_is_empty(self):
         report = "# 调研报告\n\n## 核心结论\n\n报告结论。"
 
         self.assertEqual(_inject_research_background(report, {}), report)
+        self.assertEqual(
+            _inject_research_background(
+                report,
+                {"analysis_approach": "按目标用户横向比较三个案例"},
+            ),
+            report,
+        )
 
     def test_export_preparation_keeps_research_background(self):
         report = _inject_research_background(

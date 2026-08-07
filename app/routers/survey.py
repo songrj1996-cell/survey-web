@@ -12,23 +12,33 @@ from app.core.config import (
     LLM_PLANNER_MODEL,
 )
 from app.schemas.requests import (
+    AnalysisPresetApplyRequest,
     ColumnConfirmRequest,
     HistoryQARequest,
     PlanConfirmRequest,
+    PrepareReportRerunRequest,
     QARequest,
     QualitativeContextRequest,
+    ReportVersionRequest,
 )
 from app.services.audit import audit_log
 from app.services.auth import _current_login
 from app.services.survey_service import (
+    apply_analysis_preset_to_session,
     columns_stream,
     columns_require_llm,
+    confirm_survey_plan,
     compute_survey_stats,
+    delete_session_report_version,
+    get_analysis_preset_offer_for_session,
+    get_session_report_version,
+    get_session_report_versions,
     handle_survey_upload,
     history_qa_stream,
     is_survey_plan_approval,
     plan_revision_stream,
     plan_stream,
+    prepare_duplicate_report_rerun,
     prepare_history_qa_context,
     qa_stream,
     report_stream,
@@ -90,23 +100,44 @@ async def get_columns(session_id: str, request: Request):
 @router.post("/api/columns/{session_id}/confirm")
 async def confirm_columns(session_id: str, req: ColumnConfirmRequest, request: Request):
     set_survey_columns(session_id, req.columns)
+    login = await _current_login(request)
+    preset_offer = get_analysis_preset_offer_for_session(session_id, login)
     await audit_log(
         request, "survey", "确认数据列",
         f"会话：{session_id}；确认列数：{len(req.columns)}",
         metadata={"session_id": session_id, "columns": len(req.columns)},
     )
-    return {"ok": True}
+    return {"ok": True, "analysis_preset_offer": preset_offer}
+
+
+@router.post("/api/analysis-presets/{session_id}/apply")
+async def apply_analysis_preset_route(
+    session_id: str,
+    req: AnalysisPresetApplyRequest,
+    request: Request,
+):
+    login = await _current_login(request)
+    preset = apply_analysis_preset_to_session(session_id, login, req.preset_id)
+    await audit_log(
+        request,
+        "survey",
+        "复用分析思路",
+        f"会话：{session_id}",
+        metadata={"session_id": session_id, "preset_id": req.preset_id},
+    )
+    return {"ok": True, "preset": preset}
 
 
 @router.post("/api/survey-context/{session_id}")
 async def submit_survey_context(session_id: str, req: QualitativeContextRequest, request: Request):
-    save_qualitative_context(session_id, req)
+    login = await _current_login(request)
+    duplicate_report = save_qualitative_context(session_id, req, login)
     await audit_log(
         request, "survey", "提交业务上下文",
         f"会话：{session_id}",
         metadata={"session_id": session_id},
     )
-    return {"ok": True}
+    return {"ok": True, "duplicate_report": duplicate_report}
 
 
 @router.get("/api/plan/{session_id}")
@@ -121,11 +152,13 @@ async def get_plan(session_id: str, request: Request):
 async def confirm_plan(req: PlanConfirmRequest, request: Request):
     validate_plan_confirm_ready(req.session_id)
     if is_survey_plan_approval(req.user_text):
+        login = await _current_login(request)
+        result = confirm_survey_plan(req.session_id, login)
         await audit_log(
             request, "survey", "确认分析方案",
             f"会话：{req.session_id}", metadata={"session_id": req.session_id},
         )
-        return JSONResponse({"approved": True})
+        return JSONResponse(result)
     return StreamingResponse(
         plan_revision_stream(req.session_id, req.user_text, request),
         media_type="text/event-stream",
@@ -138,23 +171,93 @@ async def compute_stats(session_id: str, request: Request):
     return {"stats_md": stats_md}
 
 
+@router.post("/api/report/{session_id}/prepare-rerun")
+async def prepare_report_rerun(
+    session_id: str,
+    req: PrepareReportRerunRequest,
+    request: Request,
+):
+    login = await _current_login(request)
+    result = prepare_duplicate_report_rerun(
+        session_id,
+        login,
+        history_id=req.history_id,
+        instruction=req.instruction,
+        base_version=req.base_version,
+    )
+    await audit_log(
+        request,
+        "survey",
+        "准备重新生成报告",
+        f"会话：{session_id}；原报告：{req.history_id}",
+        metadata={
+            "session_id": session_id,
+            "history_id": req.history_id,
+            "base_version": result["base_version"],
+            "target_version": result["target_version"],
+        },
+    )
+    return result
+
+
 @router.get("/api/report/{session_id}")
-async def generate_report(session_id: str, request: Request):
+async def generate_report(
+    session_id: str,
+    request: Request,
+    version: int | None = None,
+):
+    if version is not None:
+        return get_session_report_version(session_id, version)
     validate_report_ready(session_id)
-    return StreamingResponse(report_stream(session_id, request), media_type="text/event-stream")
+    return StreamingResponse(
+        report_stream(session_id, request, generation_kind="initial"),
+        media_type="text/event-stream",
+    )
+
+
+@router.get("/api/report/{session_id}/versions")
+async def list_report_versions(session_id: str):
+    return get_session_report_versions(session_id)
+
+
+@router.post("/api/report/{session_id}/versions")
+async def generate_report_version(
+    session_id: str,
+    req: ReportVersionRequest,
+    request: Request,
+):
+    raise HTTPException(
+        status_code=405,
+        detail="报告页不再支持直接生成新版本，请重新上传数据并从数据确认页发起。",
+    )
+
+
+@router.delete("/api/report/{session_id}/versions/{version}")
+async def delete_report_version_route(session_id: str, version: int, request: Request):
+    login = await _current_login(request)
+    return delete_session_report_version(session_id, version, login)
 
 
 @router.post("/api/qa")
 async def qa(req: QARequest, request: Request):
-    validate_qa_ready(req.session_id)
-    return StreamingResponse(qa_stream(req.session_id, req.question, request), media_type="text/event-stream")
+    validate_qa_ready(req.session_id, req.version)
+    return StreamingResponse(
+        qa_stream(req.session_id, req.question, request, req.version),
+        media_type="text/event-stream",
+    )
 
 
 @router.post("/api/history-qa")
 async def history_qa(req: HistoryQARequest, request: Request):
     login = await _current_login(request)
-    history = prepare_history_qa_context(req.history_id, login)
+    history = prepare_history_qa_context(req.history_id, login, req.version)
     return StreamingResponse(
-        history_qa_stream(req.history_id, req.question, history, request),
+        history_qa_stream(
+            req.history_id,
+            req.question,
+            history,
+            request,
+            req.version,
+        ),
         media_type="text/event-stream",
     )

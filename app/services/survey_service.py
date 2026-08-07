@@ -6,7 +6,9 @@ HTTP 参数解析与响应包装在 routers/survey。
 """
 import asyncio
 from contextlib import suppress
+from copy import deepcopy
 from datetime import datetime
+import hashlib
 
 import crosstab_parser
 import survey_plan
@@ -35,14 +37,25 @@ from app.core.config import (
     LLM_QA_REASONING,
     LLM_REPORT_MODEL,
     LLM_STREAM_HEARTBEAT_SECONDS,
+    MAX_REPORT_VERSIONS,
 )
 from app.core.parsing import _parse_file
 from app.core.responses import sse_event
-from app.core.security import _assign_session_owner, _find_history_for_login
+from app.core.security import (
+    _assign_session_owner,
+    _find_history_for_login,
+    _history_owner_key,
+)
 from app.core.text import _short_text
 from app.integrations.llm_client import collect_chat_completion
 from app.schemas.requests import QualitativeContextRequest
 from app.services.audit import audit_log
+from app.services.analysis_preferences import (
+    apply_analysis_preset,
+    build_analysis_preset_fingerprint,
+    get_analysis_preset_offer,
+    save_analysis_preset,
+)
 from app.services.auth import _current_login
 from app.services.branch_logic import infer_branch_rules
 from app.services.glossary_service import (
@@ -65,6 +78,10 @@ from app.services.questionnaire_import import (
 )
 from app.services.report_engine import (
     _batch_qualitative_analysis,
+    _build_analysis_approach_block,
+    _build_analysis_focus_block,
+    _build_analysis_focus_mode_block,
+    _build_business_context_block,
     _build_crosstab_plan_revision_query,
     _build_crosstab_planner_query,
     _build_large_sample_writer_query,
@@ -72,21 +89,44 @@ from app.services.report_engine import (
     _build_planner_query_with_confirmed,
     _build_planner_sample,
     _build_qa_context,
+    _build_report_generation_instruction_block,
+    _build_reused_analysis_preset_block,
     _describe_qa_context_scope,
     _build_writer_action_query,
     _build_writer_action_repair_query,
     _build_writer_bug_query,
     _build_writer_core_query,
+    _build_writer_core_review_query,
     _build_writer_first_query,
     _build_writer_part_query,
     _normalize_action_section,
     _render_crosstab_plan_card,
+    _resolve_core_coverage_review,
     _writer_parts_meta,
 )
-from app.services.report_history import save_to_history
+from app.services.report_history import (
+    DEFAULT_RERUN_VERSION_INSTRUCTION,
+    _copy_report_version_state,
+    append_exact_rerun_to_history,
+    delete_history_report_version as _delete_history_report_version,
+    find_exact_survey_duplicate_entry,
+    find_exact_survey_duplicate_report,
+    save_to_history,
+    sync_exact_rerun_qa_to_history,
+)
+from app.services.report_versions import (
+    append_report_version,
+    delete_report_version,
+    normalize_report_versions,
+    report_version_summaries,
+    resolve_report_version,
+    sync_active_report_version,
+    update_report_version,
+)
 from app.services.report_render import _inject_disclaimer, _inject_research_background
 from app.services.stats_presentation import inject_qualitative_stats, render_stats_appendix
-from app.storage.history import _load_history, _save_history
+from app.storage.history import _load_history, mutate_history
+from app.storage.analysis_presets import AnalysisPresetStorageError
 from app.storage.prompts import (
     _get_column_detect_system_prompt,
     _get_crosstab_planner_system_prompt,
@@ -97,6 +137,31 @@ from app.storage.prompts import (
     _get_survey_planner_system_prompt,
 )
 from app.storage.sessions import get_session, new_session, save_session
+
+
+_REPORT_GENERATION_LOCKS: dict[str, asyncio.Lock] = {}
+_REPORT_RERUN_TARGET_LOCKS: dict[str, asyncio.Lock] = {}
+_NON_VERSIONED_REPORT_MODES = {"comment", "interview", "annotate"}
+
+
+def _report_generation_lock(session_id: str) -> asyncio.Lock:
+    lock = _REPORT_GENERATION_LOCKS.get(session_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _REPORT_GENERATION_LOCKS[session_id] = lock
+    return lock
+
+
+def _report_rerun_target_lock(history_id: str) -> asyncio.Lock:
+    lock = _REPORT_RERUN_TARGET_LOCKS.get(history_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _REPORT_RERUN_TARGET_LOCKS[history_id] = lock
+    return lock
+
+
+def _uses_report_versions(source: dict) -> bool:
+    return (source.get("mode") or "") not in _NON_VERSIONED_REPORT_MODES
 
 
 # ── 上传 ────────────────────────────────────────────────────────
@@ -148,6 +213,19 @@ def _normalize_plan_display_texts(plan: dict) -> dict:
         ]
     if isinstance(plan.get("summary"), str):
         normalized["summary"] = normalize_glossary_terms(plan["summary"])
+    focus = plan.get("analysis_focus")
+    if isinstance(focus, dict):
+        normalized_focus = dict(focus)
+        for field in ("core_question", "report_organization", "evidence_role"):
+            if isinstance(normalized_focus.get(field), str):
+                normalized_focus[field] = normalize_glossary_terms(normalized_focus[field])
+        for field in ("supporting_analyses", "expected_deliverables", "avoid_structures"):
+            if isinstance(normalized_focus.get(field), list):
+                normalized_focus[field] = [
+                    normalize_glossary_terms(item) if isinstance(item, str) else item
+                    for item in normalized_focus[field]
+                ]
+        normalized["analysis_focus"] = normalized_focus
     return normalized
 
 
@@ -200,6 +278,13 @@ async def handle_survey_upload(
     sess["rows"] = rows
     sess["filename"] = filename
     sess["source_type"] = source_type
+    sess["file_sha256"] = hashlib.sha256(content).hexdigest()
+    sess["questionnaire_sha256"] = (
+        hashlib.sha256(questionnaire_content).hexdigest()
+        if deterministic_questions is not None and questionnaire_content is not None
+        else ""
+    )
+    sess["questionnaire_used"] = deterministic_questions is not None
     if deterministic_questions is not None:
         sess["columns_detected"] = deterministic_questions
         sess["column_provider"] = "questionnaire"
@@ -446,9 +531,55 @@ async def columns_stream(session_id: str, request: Request):
 def set_survey_columns(session_id: str, columns: list) -> None:
     """存储用户确认后的列题型配置。"""
     sess = get_session(session_id)
+    previous_fingerprint = str(
+        sess.get("analysis_preference_fingerprint")
+        or build_analysis_preset_fingerprint(sess)
+        or sess.get("applied_analysis_preset_fingerprint")
+        or ""
+    ).strip()
     sess["confirmed_columns"] = columns
     sess["branch_rules"] = infer_branch_rules(sess.get("rows") or [], columns)
+    _discard_stale_applied_analysis_preset(
+        sess,
+        previous_fingerprint=previous_fingerprint,
+    )
     save_session(session_id, sess)
+
+
+def _discard_stale_applied_analysis_preset(
+    sess: dict,
+    *,
+    previous_fingerprint: str | None = None,
+) -> bool:
+    """问卷指纹变化时清除属于旧问卷的预设和修订来源。"""
+    current_fingerprint = build_analysis_preset_fingerprint(sess) or ""
+    tracked_fingerprint = str(
+        previous_fingerprint
+        if previous_fingerprint is not None
+        else sess.get("analysis_preference_fingerprint")
+        or sess.get("applied_analysis_preset_fingerprint")
+        or ""
+    ).strip()
+    changed = False
+    if tracked_fingerprint and tracked_fingerprint != current_fingerprint:
+        sess["plan_revision_texts"] = []
+        for field in (
+            "applied_analysis_preset_id",
+            "applied_analysis_preset_fingerprint",
+            "preset_analysis_focus",
+            "preset_plan_revision_texts",
+            "current_plan_revision_texts",
+        ):
+            sess.pop(field, None)
+        changed = True
+
+    if current_fingerprint:
+        if sess.get("analysis_preference_fingerprint") != current_fingerprint:
+            sess["analysis_preference_fingerprint"] = current_fingerprint
+            changed = True
+    elif sess.pop("analysis_preference_fingerprint", None) is not None:
+        changed = True
+    return changed
 
 
 def _ensure_branch_rules(sess: dict) -> list[dict]:
@@ -468,11 +599,213 @@ def _ensure_branch_rules(sess: dict) -> list[dict]:
     return branch_rules
 
 
-def save_qualitative_context(session_id: str, ctx: QualitativeContextRequest) -> None:
-    """存储用户可选填写的定性报告业务上下文。"""
+def _is_focus_capable_planning_session(sess: dict) -> bool:
+    """仅标准、非定量且未预计进入大样本路径的会话启用 analysis_focus。"""
+    if sess.get("mode") == "crosstab" or sess.get("analysis_mode") == "quantitative":
+        return False
+
+    confirmed = sess.get("confirmed_columns")
+    columns = confirmed if isinstance(confirmed, list) and confirmed else sess.get("columns_detected")
+    open_text_indexes: set[int] = set()
+    for column in columns or []:
+        if not isinstance(column, dict):
+            continue
+        if (column.get("role") or column.get("confirmed_type")) != "open_text":
+            continue
+        indexes = column.get("column_indexes")
+        if not isinstance(indexes, list) or not indexes:
+            indexes = [column.get("index")]
+        open_text_indexes.update(
+            index for index in indexes if type(index) is int and index >= 0
+        )
+
+    rows = sess.get("rows") or []
+    for index in open_text_indexes:
+        response_count = 0
+        for row in rows[1:]:
+            if not isinstance(row, (list, tuple)) or index >= len(row):
+                continue
+            value = row[index]
+            if value is not None and str(value).strip():
+                response_count += 1
+                if response_count > LARGE_SAMPLE_THRESHOLD:
+                    return False
+    return True
+
+
+def get_analysis_preset_offer_for_session(
+    session_id: str,
+    login: dict | None,
+) -> dict | None:
+    """查询同 owner、同问卷的可复用分析预设；异常时不阻断主流程。"""
     sess = get_session(session_id)
-    sess["qualitative_context"] = ctx.model_dump() if hasattr(ctx, "model_dump") else ctx.dict()
+    try:
+        return get_analysis_preset_offer(
+            sess,
+            login,
+            eligible=_is_focus_capable_planning_session(sess),
+        )
+    except AnalysisPresetStorageError as exc:
+        print(f"[analysis-preset] WARN offer unavailable: {exc}")
+        return None
+
+
+def apply_analysis_preset_to_session(
+    session_id: str,
+    login: dict | None,
+    preset_id: str,
+) -> dict:
+    """二次校验预设归属和问卷指纹后，将其合并进当前 session。"""
+    sess = get_session(session_id)
+    try:
+        preset = apply_analysis_preset(
+            sess,
+            login,
+            preset_id,
+            eligible=_is_focus_capable_planning_session(sess),
+        )
+    except AnalysisPresetStorageError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if not preset:
+        raise HTTPException(
+            status_code=404,
+            detail="该分析预设不存在、无权访问，或已不再匹配当前问卷。",
+        )
     save_session(session_id, sess)
+    return preset
+
+
+def confirm_survey_plan(
+    session_id: str,
+    login: dict | None,
+) -> dict:
+    """确认当前方案，并在适用时保存同问卷可复用分析预设。"""
+    sess = get_session(session_id)
+    sess["plan_approved_at"] = datetime.now().isoformat(timespec="seconds")
+    save_session(session_id, sess)
+    try:
+        preset = save_analysis_preset(
+            sess,
+            login,
+            eligible=_is_focus_capable_planning_session(sess),
+        )
+    except AnalysisPresetStorageError as exc:
+        print(f"[analysis-preset] WARN save failed: {exc}")
+        return {
+            "approved": True,
+            "preset_saved": False,
+            "warning": "方案已确认，但本次分析思路没有成功保存为可复用预设。",
+        }
+    return {
+        "approved": True,
+        "preset_saved": bool(preset),
+        "preset_id": (preset or {}).get("id", ""),
+    }
+
+
+def save_qualitative_context(
+    session_id: str,
+    ctx: QualitativeContextRequest,
+    login: dict | None = None,
+) -> dict | None:
+    """存储数据确认上下文，并查找严格匹配的成功历史报告。"""
+    sess = get_session(session_id)
+    _assign_session_owner(sess, login)
+    if hasattr(ctx, "model_dump"):
+        submitted = ctx.model_dump(exclude_unset=True)
+    else:
+        submitted = ctx.dict(exclude_unset=True)
+    current = sess.get("qualitative_context")
+    merged = dict(current) if isinstance(current, dict) else {}
+    merged.update(submitted)
+    for field in ("problem", "key_concerns", "target_users", "analysis_approach"):
+        merged.setdefault(field, "")
+    sess["qualitative_context"] = merged
+    save_session(session_id, sess)
+    return find_exact_survey_duplicate_report(sess, login)
+
+
+def _next_history_version_number(entry: dict, versions: list[dict]) -> int:
+    minimum = max((item["version"] for item in versions), default=0) + 1
+    try:
+        configured = int(entry.get("next_report_version") or minimum)
+    except (TypeError, ValueError):
+        configured = minimum
+    return max(minimum, configured)
+
+
+def prepare_duplicate_report_rerun(
+    session_id: str,
+    login: dict | None,
+    *,
+    history_id: str,
+    instruction: str = "",
+    base_version: int | None = None,
+) -> dict:
+    """Bind a fresh exact-match upload to one existing history card for rerun."""
+    sess = get_session(session_id)
+    _assign_session_owner(sess, login)
+    if not sess.get("rows") or not isinstance(sess.get("confirmed_columns"), list):
+        raise HTTPException(status_code=400, detail="请先完成数据与题型确认")
+    if sess.get("report_md") or normalize_report_versions(sess):
+        raise HTTPException(status_code=409, detail="当前任务已经生成过报告，不能改为历史重跑")
+
+    target_id = str(history_id or "").strip()
+    if not target_id:
+        raise HTTPException(status_code=400, detail="缺少原报告编号")
+    if _report_rerun_target_lock(target_id).locked():
+        raise HTTPException(status_code=409, detail="原报告正在重新生成，请稍后再试")
+
+    entry = find_exact_survey_duplicate_entry(sess, login, target_id)
+    if not entry:
+        raise HTTPException(
+            status_code=409,
+            detail="原报告与当前上传数据或确认信息不再完全一致，请重新确认。",
+        )
+    plan = entry.get("plan")
+    if not isinstance(plan, dict):
+        raise HTTPException(status_code=409, detail="原报告缺少可复用的分析方案")
+
+    try:
+        versions = normalize_report_versions(entry)
+        if len(versions) >= MAX_REPORT_VERSIONS:
+            raise HTTPException(
+                status_code=409,
+                detail=f"报告版本已达上限（{MAX_REPORT_VERSIONS} 个），请先删除一个旧版本。",
+            )
+        resolved_base = (
+            resolve_report_version(entry)["version"]
+            if base_version is None
+            else resolve_report_version(entry, base_version)["version"]
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    supplement = str(instruction or "").strip()
+    version_instruction = supplement or DEFAULT_RERUN_VERSION_INSTRUCTION
+    target_version = _next_history_version_number(entry, versions)
+    sess["plan"] = deepcopy(plan)
+    if isinstance(plan.get("branch_rules"), list):
+        sess["branch_rules"] = deepcopy(plan["branch_rules"])
+    sess.update({
+        "rerun_target_history_id": target_id,
+        "rerun_base_version": resolved_base,
+        "rerun_supplement": supplement,
+        "rerun_instruction": version_instruction,
+        "rerun_target_version": target_version,
+        "rerun_prepared_at": datetime.now().isoformat(timespec="seconds"),
+    })
+    save_session(session_id, sess)
+    return {
+        "ok": True,
+        "session_id": session_id,
+        "history_id": target_id,
+        "base_version": resolved_base,
+        "instruction": version_instruction,
+        "target_version": target_version,
+        "skip_plan": True,
+        "plan": deepcopy(plan),
+    }
 
 
 # ── 方案生成 SSE ────────────────────────────────────────────────
@@ -481,11 +814,25 @@ def save_qualitative_context(session_id: str, ctx: QualitativeContextRequest) ->
 async def plan_stream(session_id: str, request: Request):
     """分析方案生成 SSE 流程（async generator）。"""
     sess = get_session(session_id)
+    if _discard_stale_applied_analysis_preset(sess):
+        save_session(session_id, sess)
     rows = sess.get("rows")
     confirmed_columns = sess.get("confirmed_columns")
     branch_rules = _ensure_branch_rules(sess)
     is_crosstab = sess.get("mode") == "crosstab"
     qualitative_context = sess.get("qualitative_context")
+    analysis_focus_enabled = _is_focus_capable_planning_session(sess)
+    reused_analysis_focus = sess.get("preset_analysis_focus")
+    reused_revision_texts = (
+        sess.get("plan_revision_texts")
+        if sess.get("applied_analysis_preset_id")
+        else []
+    )
+    planning_context = (
+        qualitative_context
+        if sess.get("analysis_mode") != "quantitative"
+        else None
+    )
     try:
         if is_crosstab:
             cols = confirmed_columns or []
@@ -568,12 +915,42 @@ async def plan_stream(session_id: str, request: Request):
             planner_query = _build_planner_query_with_confirmed(
                 rows,
                 confirmed_columns,
+                qualitative_context=planning_context,
                 branch_rules=branch_rules,
+                analysis_focus_enabled=analysis_focus_enabled,
+                reused_analysis_focus=reused_analysis_focus,
+                reused_revision_texts=reused_revision_texts,
             )
         else:
-            planner_query = _build_planner_sample(rows) + "\n\n" + _get_planner_extra()
+            planner_query = (
+                _build_planner_sample(rows)
+                + "\n\n"
+                + _get_planner_extra()
+                + _build_business_context_block(
+                    planning_context,
+                    "用于辅助规划章节结构和分析重点",
+                )
+                + (
+                    _build_analysis_approach_block(
+                        planning_context,
+                        "必须转译为 plan.analysis_focus",
+                    )
+                    if analysis_focus_enabled else ""
+                )
+                + (
+                    _build_reused_analysis_preset_block(
+                        reused_analysis_focus,
+                        reused_revision_texts,
+                    )
+                    if analysis_focus_enabled else ""
+                )
+                + _build_analysis_focus_mode_block(analysis_focus_enabled)
+            )
 
-        system_prompt = _get_survey_planner_system_prompt()
+        system_prompt = (
+            _get_survey_planner_system_prompt()
+            + _build_analysis_focus_mode_block(analysis_focus_enabled)
+        )
         models = (LLM_PLANNER_MODEL, *LLM_PLANNER_FALLBACK_MODELS)
         messages = [
             {"role": "system", "content": system_prompt},
@@ -594,7 +971,17 @@ async def plan_stream(session_id: str, request: Request):
         for event in _content_events(full_answer):
             yield event
         headers = rows[0]
-        plan, err = survey_plan.parse_plan_from_llm(full_answer, len(headers))
+        require_analysis_focus = analysis_focus_enabled and bool(
+            str((planning_context or {}).get("analysis_approach") or "").strip()
+            or reused_analysis_focus
+            or reused_revision_texts
+        )
+        plan, err = survey_plan.parse_plan_from_llm(
+            full_answer,
+            len(headers),
+            require_analysis_focus=require_analysis_focus,
+            ignore_analysis_focus=not analysis_focus_enabled,
+        )
 
         if not plan:
             yield sse_event({"type": "progress", "message": "方案格式校验中，正在修订输出…"})
@@ -616,7 +1003,12 @@ async def plan_stream(session_id: str, request: Request):
                     yield event
                 if result:
                     retry_answer, used_model = result
-            plan, err = survey_plan.parse_plan_from_llm(retry_answer, len(headers))
+            plan, err = survey_plan.parse_plan_from_llm(
+                retry_answer,
+                len(headers),
+                require_analysis_focus=require_analysis_focus,
+                ignore_analysis_focus=not analysis_focus_enabled,
+            )
 
         if not plan:
             yield sse_event({"type": "error", "message": f"方案解析失败：{err}"}); return
@@ -624,6 +1016,8 @@ async def plan_stream(session_id: str, request: Request):
 
         if confirmed_columns:
             plan = survey_plan.merge_confirmed_into_plan(plan, confirmed_columns)
+        if not analysis_focus_enabled:
+            plan.pop("analysis_focus", None)
         plan["branch_rules"] = branch_rules
 
         sess["plan"] = plan
@@ -644,6 +1038,32 @@ async def plan_stream(session_id: str, request: Request):
 
 
 # ── 方案修订 SSE ────────────────────────────────────────────────
+
+
+def _record_successful_plan_revision(sess: dict, user_text: str) -> None:
+    """保留成功修订的完整原文，供同问卷后续任务复用。"""
+    text = str(user_text or "").strip()
+    if not text:
+        return
+    revisions = [
+        str(item).strip()
+        for item in (sess.get("plan_revision_texts") or [])
+        if str(item).strip()
+    ]
+    if not revisions or revisions[-1] != text:
+        revisions.append(text)
+    sess["plan_revision_texts"] = revisions
+    current_revisions = [
+        str(item).strip()
+        for item in (sess.get("current_plan_revision_texts") or [])
+        if str(item).strip()
+    ]
+    if not current_revisions or current_revisions[-1] != text:
+        current_revisions.append(text)
+    sess["current_plan_revision_texts"] = current_revisions
+    fingerprint = build_analysis_preset_fingerprint(sess)
+    if fingerprint:
+        sess["analysis_preference_fingerprint"] = fingerprint
 
 
 async def plan_revision_stream(session_id: str, user_text: str, request: Request):
@@ -716,6 +1136,7 @@ async def plan_revision_stream(session_id: str, user_text: str, request: Request
             sess["planner_conv_id"] = ""
             sess["planner_provider"] = "direct_llm"
             sess["planner_model"] = used_model
+            _record_successful_plan_revision(sess, user_text)
             save_session(session_id, sess)
             card_text = _render_crosstab_plan_card(new_plan)
             await audit_log(
@@ -727,14 +1148,27 @@ async def plan_revision_stream(session_id: str, user_text: str, request: Request
             return
 
         headers = rows[0]
+        qualitative_context = sess.get("qualitative_context")
+        analysis_focus_enabled = _is_focus_capable_planning_session(sess)
+        planning_context = (
+            qualitative_context
+            if sess.get("analysis_mode") != "quantitative"
+            else None
+        )
+        require_analysis_focus = analysis_focus_enabled
         revision_query = _build_plan_revision_query(
             plan,
             headers,
             sess.get("confirmed_columns", []),
             user_text,
+            qualitative_context=planning_context,
             branch_rules=branch_rules,
+            require_analysis_focus=require_analysis_focus,
         )
-        system_prompt = _get_survey_planner_system_prompt()
+        system_prompt = (
+            _get_survey_planner_system_prompt()
+            + _build_analysis_focus_mode_block(analysis_focus_enabled)
+        )
         models = (LLM_PLANNER_MODEL, *LLM_PLANNER_FALLBACK_MODELS)
         full_answer = ""
         used_model = ""
@@ -753,7 +1187,12 @@ async def plan_revision_stream(session_id: str, user_text: str, request: Request
                 full_answer, used_model = result
         for event in _content_events(full_answer):
             yield event
-        new_plan, err = survey_plan.parse_plan_from_llm(full_answer, len(headers))
+        new_plan, err = survey_plan.parse_plan_from_llm(
+            full_answer,
+            len(headers),
+            require_analysis_focus=require_analysis_focus,
+            ignore_analysis_focus=not analysis_focus_enabled,
+        )
         if not new_plan:
             retry_messages = _json_repair_messages(
                 system_prompt,
@@ -775,19 +1214,27 @@ async def plan_revision_stream(session_id: str, user_text: str, request: Request
                     yield event
                 if result:
                     retry_answer, used_model = result
-            new_plan, err = survey_plan.parse_plan_from_llm(retry_answer, len(headers))
+            new_plan, err = survey_plan.parse_plan_from_llm(
+                retry_answer,
+                len(headers),
+                require_analysis_focus=require_analysis_focus,
+                ignore_analysis_focus=not analysis_focus_enabled,
+            )
         if not new_plan:
             yield sse_event({"type": "error", "message": f"修订方案解析失败：{err}"}); return
         new_plan = _normalize_plan_display_texts(new_plan)
 
         if sess.get("confirmed_columns"):
             new_plan = survey_plan.merge_confirmed_into_plan(new_plan, sess["confirmed_columns"])
+        if not analysis_focus_enabled:
+            new_plan.pop("analysis_focus", None)
         new_plan["branch_rules"] = branch_rules
 
         sess["plan"] = new_plan
         sess["planner_conv_id"] = ""
         sess["planner_provider"] = "direct_llm"
         sess["planner_model"] = used_model
+        _record_successful_plan_revision(sess, user_text)
         save_session(session_id, sess)
         card_text = survey_plan.render_plan_for_user(new_plan, headers)
         await audit_log(
@@ -905,25 +1352,118 @@ async def _answer_qa_direct(
     return normalize_glossary_terms(answer), model, qa_context
 
 
-async def report_stream(session_id: str, request: Request):
+async def report_stream(
+    session_id: str,
+    request: Request,
+    *,
+    instruction: str = "",
+    base_version: int | None = None,
+    generation_kind: str | None = None,
+):
     """报告生成 SSE 流程（大样本/标准两路，async generator）。"""
-    sess = get_session(session_id)
-    _assign_session_owner(sess, await _current_login(request))
-    _ensure_branch_rules(sess)
-    plan = sess.get("plan")
-    rows = sess.get("rows")
-    stats_md = sess.get("stats_md")
-    open_text = sess.get("open_text", {})
-    is_crosstab = sess.get("mode") == "crosstab"
-    quantitative_first = sess.get("analysis_mode") == "quantitative" or is_crosstab
-    qualitative_context = sess.get("qualitative_context")
-    use_large_mode = is_crosstab or any(len(v) > LARGE_SAMPLE_THRESHOLD for v in open_text.values())
+    login = await _current_login(request)
     writer_messages = [
         {"role": "system", "content": _get_report_writer_system_prompt()}
     ]
     writer_models_used: list[str] = []
+    generation_lock = _report_generation_lock(session_id)
+    rerun_target_lock: asyncio.Lock | None = None
+    rerun_target_lock_acquired = False
+    if generation_lock.locked():
+        yield sse_event({
+            "type": "error",
+            "message": "当前任务正在生成报告，请等待本次生成完成后再试。",
+        })
+        return
+    await generation_lock.acquire()
 
     try:
+        # 请求可能在锁外等待登录态刷新；拿锁后必须重读，避免旧快照覆盖
+        # 刚完成的新版本或追问。
+        sess = get_session(session_id)
+        _assign_session_owner(sess, login)
+        if not _uses_report_versions(sess):
+            raise ValueError("该报告类型不支持生成报告版本")
+        _ensure_branch_rules(sess)
+        plan = sess.get("plan")
+        rows = sess.get("rows")
+        stats_md = sess.get("stats_md")
+        open_text = sess.get("open_text", {})
+        is_crosstab = sess.get("mode") == "crosstab"
+        quantitative_first = (
+            sess.get("analysis_mode") == "quantitative" or is_crosstab
+        )
+        qualitative_context = sess.get("qualitative_context")
+        use_large_mode = is_crosstab or any(
+            len(value) > LARGE_SAMPLE_THRESHOLD for value in open_text.values()
+        )
+        analysis_focus = (
+            plan.get("analysis_focus")
+            if not use_large_mode
+            and not quantitative_first
+            and isinstance(plan, dict)
+            else None
+        )
+        if not _build_analysis_focus_block(analysis_focus):
+            analysis_focus = None
+        rerun_history_id = str(sess.get("rerun_target_history_id") or "").strip()
+        rerun_entry: dict | None = None
+        prompt_instruction = str(instruction or "").strip()
+        version_instruction = prompt_instruction
+        if rerun_history_id:
+            if generation_kind not in (None, "initial"):
+                raise ValueError("历史重跑只能从数据确认流程发起")
+            if sess.get("rerun_completed_at"):
+                raise ValueError("本次历史重跑已经完成，请到原报告查看新版本")
+            rerun_target_lock = _report_rerun_target_lock(rerun_history_id)
+            if rerun_target_lock.locked():
+                raise ValueError("原报告正在重新生成，请等待本次生成完成后再试。")
+            await rerun_target_lock.acquire()
+            rerun_target_lock_acquired = True
+            rerun_entry = find_exact_survey_duplicate_entry(
+                sess,
+                login,
+                rerun_history_id,
+            )
+            if not rerun_entry:
+                raise ValueError("原报告与当前上传数据或确认信息不再完全一致")
+            if not isinstance(plan, dict) or plan != rerun_entry.get("plan"):
+                raise ValueError("当前分析方案与原报告不一致，请重新确认")
+            existing_versions = normalize_report_versions(rerun_entry)
+            resolved_kind = "regenerate"
+            try:
+                resolved_base_version = int(sess.get("rerun_base_version"))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("历史重跑缺少基础版本") from exc
+            resolve_report_version(rerun_entry, resolved_base_version)
+            prompt_instruction = str(sess.get("rerun_supplement") or "").strip()
+            version_instruction = (
+                str(sess.get("rerun_instruction") or "").strip()
+                or DEFAULT_RERUN_VERSION_INSTRUCTION
+            )
+        else:
+            existing_versions = normalize_report_versions(sess)
+            resolved_kind = generation_kind or (
+                "initial" if not existing_versions else "regenerate"
+            )
+            if resolved_kind not in {"initial", "regenerate"}:
+                raise ValueError("不支持的报告生成类型")
+            resolved_base_version = base_version
+            if resolved_kind == "initial" and existing_versions:
+                raise ValueError("当前任务已经有报告，请从数据确认页重新上传后生成。")
+            if resolved_kind == "regenerate":
+                if not existing_versions:
+                    raise ValueError("当前任务还没有可用于重跑的报告版本")
+                active_version = resolve_report_version(sess)["version"]
+                if resolved_base_version is None:
+                    resolved_base_version = active_version
+                resolve_report_version(sess, resolved_base_version)
+
+        if len(existing_versions) >= MAX_REPORT_VERSIONS:
+            raise ValueError(
+                f"报告版本已达上限（{MAX_REPORT_VERSIONS} 个），请先删除一个旧版本。"
+            )
+
         async def _writer_call(query: str):
             """等待完整写作轮次时发送轻量心跳，避免 SSE 代理空闲超时。"""
             task = asyncio.create_task(_direct_writer_round(writer_messages, query))
@@ -966,8 +1506,10 @@ async def report_stream(session_id: str, request: Request):
                 d.get("col_name", f"列{k}") for k, d in (cluster_diagnostics or {}).items()
                 if d.get("status") != "ok"
             ]
-            sess["open_text_cluster_diagnostics"] = cluster_diagnostics
-            save_session(session_id, sess)
+            latest_session = get_session(session_id)
+            latest_session["open_text_cluster_diagnostics"] = cluster_diagnostics
+            save_session(session_id, latest_session)
+            sess = latest_session
             if failed_cols:
                 msg = "部分主观题聚类未完成，报告将使用原文兜底：" + "、".join(failed_cols[:4])
                 if len(failed_cols) > 4:
@@ -979,6 +1521,10 @@ async def report_stream(session_id: str, request: Request):
                 stats_md, clustered_themes, plan, rows[0], open_text,
                 qualitative_context=qualitative_context,
                 quantitative_first=quantitative_first,
+            )
+            writer_query = (
+                _build_report_generation_instruction_block(prompt_instruction)
+                + writer_query
             )
             if quantitative_first:
                 writer_query = (
@@ -1018,7 +1564,16 @@ async def report_stream(session_id: str, request: Request):
             yield sse_event({"type": "progress",
                              "message": f"分章生成 1/{total_rounds}：准备数据并生成标题…"})
             first_q = _build_writer_first_query(
-                stats_md, open_text, plan, rows[0], qualitative_context=qualitative_context
+                stats_md,
+                open_text,
+                plan,
+                rows[0],
+                qualitative_context=qualitative_context,
+                analysis_focus=analysis_focus,
+            )
+            first_q = (
+                _build_report_generation_instruction_block(prompt_instruction)
+                + first_q
             )
             async for ev in _round(first_q):
                 yield ev
@@ -1056,16 +1611,63 @@ async def report_stream(session_id: str, request: Request):
             yield sse_event({"type": "progress",
                              "message": f"分章生成 {total_rounds - 1}/{total_rounds}：汇总核心结论…"})
             yield sse_event({"type": "chunk", "content": "\n\n"})
-            async for ev in _round(_build_writer_core_query(parts_meta, has_bug, qualitative_context)):
-                yield ev
-            core_text = _round.out
+            async for heartbeat in _writer_call(_build_writer_core_query(
+                parts_meta,
+                has_bug,
+                qualitative_context,
+                analysis_focus=analysis_focus,
+            )):
+                yield heartbeat
+            core_text, core_model = _writer_call.out
+            writer_models_used.append(core_model)
             core_block = core_text.strip()
+
+            if analysis_focus:
+                yield sse_event({
+                    "type": "progress",
+                    "message": "正在复核核心结论对分析交付要求的覆盖…",
+                })
+                review_history_len = len(writer_messages)
+                selected_core = core_block
+                try:
+                    async for heartbeat in _writer_call(
+                        _build_writer_core_review_query(analysis_focus, has_bug)
+                    ):
+                        yield heartbeat
+                    review_text, review_model = _writer_call.out
+                    writer_models_used.append(review_model)
+                    selected_core = _resolve_core_coverage_review(core_block, review_text)
+                except Exception as review_error:
+                    print(
+                        "[report] WARN optional core coverage review skipped: "
+                        f"{type(review_error).__name__}"
+                    )
+                    yield sse_event({
+                        "type": "progress",
+                        "message": "核心结论覆盖复核未完成，已沿用原核心结论继续生成报告。",
+                    })
+                finally:
+                    # 复核轮只用于选择核心结论；成功、无效或异常输出都不进入后续会话。
+                    del writer_messages[review_history_len:]
+                if selected_core != core_block:
+                    core_block = selected_core
+                    if writer_messages and writer_messages[-1].get("role") == "assistant":
+                        writer_messages[-1]["content"] = core_block
+
+            for event in _content_events(core_block):
+                yield event
 
             yield sse_event({"type": "progress",
                              "message": f"分章生成 {total_rounds}/{total_rounds}：生成行动建议…"})
             yield sse_event({"type": "chunk", "content": "\n\n"})
             async for heartbeat in _writer_call(
-                _build_writer_action_query(parts_meta, has_bug, qualitative_context)
+                _build_writer_action_query(
+                    parts_meta,
+                    has_bug,
+                    qualitative_context,
+                    analysis_focus=analysis_focus,
+                    selected_core=core_block,
+                )
             ):
                 yield heartbeat
             action_text, action_model = _writer_call.out
@@ -1114,59 +1716,333 @@ async def report_stream(session_id: str, request: Request):
         full_report = _inject_disclaimer(full_report, mode=sess.get("mode") or "")
         full_report = _inject_research_background(full_report, qualitative_context)
         full_report = normalize_glossary_terms(full_report)
-        sess["report_md"] = full_report
-        sess["qa_context_md"] = _build_qa_context(sess, full_report)
-        sess["analyst_conv_id"] = ""
-        sess["analyst_app"] = "large" if use_large_mode else "standard"
-        sess["report_writer_provider"] = "direct_llm"
-        sess["report_writer_model"] = ",".join(dict.fromkeys(writer_models_used))
-        sess["rows_fed"] = False
-        save_session(session_id, sess)
-        save_to_history(session_id, sess)
+        qa_context_md = _build_qa_context(sess, full_report)
+        writer_model = ",".join(dict.fromkeys(writer_models_used))
+        # 生成期间仍可能发生改名等非模型写入；提交前重读最新 session，
+        # 普通首版写回本 session；精确重复重跑则在历史事务里追加到原卡片。
+        sess = get_session(session_id)
+        precommit_session = deepcopy(sess)
+        snapshot = {
+            "report_md": full_report,
+            "title": "",
+            "qa_context_md": qa_context_md,
+            "qa_messages": [],
+            "qa_provider": "",
+            "qa_model": "",
+            "analyst_conv_id": "",
+            "analyst_app": "large" if use_large_mode else "standard",
+            "report_writer_provider": "direct_llm",
+            "report_writer_model": writer_model,
+        }
+        if rerun_history_id:
+            if str(sess.get("rerun_target_history_id") or "").strip() != rerun_history_id:
+                raise ValueError("历史重跑目标已变化，本次结果未保存")
+            committed_entry, committed_version = append_exact_rerun_to_history(
+                rerun_history_id,
+                sess,
+                snapshot,
+                base_version=resolved_base_version,
+                instruction=version_instruction,
+                login=login,
+            )
+            _copy_report_version_state(sess, committed_entry)
+            sess["rows_fed"] = False
+            sess["rerun_target_version"] = committed_version["version"]
+            sess["rerun_completed_at"] = datetime.now().isoformat(timespec="seconds")
+            try:
+                save_session(session_id, sess)
+            except Exception as save_error:
+                # history 已原子提交，不能为恢复临时 session 而反向覆盖并发 QA。
+                print(
+                    "[report-rerun] WARN history committed but session sync failed: "
+                    f"{type(save_error).__name__}"
+                )
+        else:
+            committed_version = append_report_version(
+                sess,
+                snapshot,
+                kind=resolved_kind,
+                base_version=resolved_base_version,
+                instruction=version_instruction,
+            )
+            sess["rows_fed"] = False
+            try:
+                save_session(session_id, sess)
+                save_to_history(session_id, sess)
+            except Exception:
+                # history 使用原子写；若其提交失败，恢复 session，确保失败不占版本号。
+                sess.clear()
+                sess.update(precommit_session)
+                save_session(session_id, sess)
+                raise
         await audit_log(
             request, "survey", "生成报告",
             f"会话：{session_id}；文件：{sess.get('filename', 'unknown')}；模式：{'大样本' if use_large_mode else '标准'}",
             metadata={"session_id": session_id, "filename": sess.get("filename", "unknown"),
-                      "large_mode": use_large_mode},
+                      "large_mode": use_large_mode, "version": committed_version["version"],
+                      **({"history_id": rerun_history_id} if rerun_history_id else {})},
         )
-        yield sse_event({"type": "report_done", "report_md": full_report})
+        yield sse_event({
+            "type": "report_done",
+            "report_md": full_report,
+            "version": committed_version["version"],
+            **(
+                {
+                    "history_id": rerun_history_id,
+                    "report_no": committed_entry.get("report_no", ""),
+                }
+                if rerun_history_id
+                else {}
+            ),
+            **_session_report_version_payload(sess),
+        })
     except Exception as e:
         import traceback; traceback.print_exc()
         yield sse_event({"type": "error", "message": str(e)})
+    finally:
+        if rerun_target_lock is not None and rerun_target_lock_acquired:
+            rerun_target_lock.release()
+        generation_lock.release()
 
 
 # ── 当前会话 QA SSE ─────────────────────────────────────────────
 
 
-async def qa_stream(session_id: str, question: str, request: Request):
-    """当前会话 QA SSE 流程（async generator）。"""
-    sess = get_session(session_id)
-    _assign_session_owner(sess, await _current_login(request))
+def _session_report_version_payload(sess: dict) -> dict:
+    versions = normalize_report_versions(sess)
+    active_version = (
+        resolve_report_version(sess)["version"] if versions else None
+    )
+    highest_version = max((item["version"] for item in versions), default=0)
     try:
-        qa_context = str(sess.get("qa_context_md") or "").strip() or _build_qa_context(sess)
+        next_version = int(sess.get("next_report_version") or highest_version + 1)
+    except (TypeError, ValueError):
+        next_version = highest_version + 1
+    next_version = max(next_version, highest_version + 1)
+    return {
+        "versions": report_version_summaries(sess),
+        "active_version": active_version,
+        "next_version": next_version,
+        "version_count": len(versions),
+        "max_versions": MAX_REPORT_VERSIONS,
+        # 新版本只能从重新上传后的数据确认页发起；报告页仅保留查看能力。
+        "can_generate_version": False,
+    }
+
+
+def get_session_report_versions(session_id: str) -> dict:
+    """返回当前 session 的报告版本元数据，不包含多份正文。"""
+    sess = get_session(session_id)
+    if not _uses_report_versions(sess):
+        raise HTTPException(status_code=400, detail="该报告类型不支持版本管理")
+    if not normalize_report_versions(sess):
+        raise HTTPException(status_code=404, detail="当前任务还没有报告版本")
+    return _session_report_version_payload(sess)
+
+
+def get_session_report_version(session_id: str, version: int) -> dict:
+    """读取当前 session 的指定报告版本，不改变 active 版本。"""
+    sess = get_session(session_id)
+    if not _uses_report_versions(sess):
+        raise HTTPException(status_code=400, detail="该报告类型不支持版本管理")
+    try:
+        snapshot = resolve_report_version(sess, version)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {
+        **snapshot,
+        "version": snapshot["version"],
+        "selected_version": snapshot["version"],
+        **_session_report_version_payload(sess),
+    }
+
+
+def delete_session_report_version(
+    session_id: str,
+    version: int,
+    login: dict | None = None,
+) -> dict:
+    """在用户明确选择后删除一个旧版本；最后一版受保护。"""
+    generation_lock = _report_generation_lock(session_id)
+    if generation_lock.locked():
+        raise HTTPException(
+            status_code=409,
+            detail="当前任务正在生成报告，完成后才能删除旧版本。",
+        )
+    if _report_rerun_target_lock(session_id).locked():
+        raise HTTPException(
+            status_code=409,
+            detail="该报告正在重新生成，完成后才能删除旧版本。",
+        )
+    sess = get_session(session_id)
+    if not _uses_report_versions(sess):
+        raise HTTPException(status_code=400, detail="该报告类型不支持版本管理")
+    rerun_history_id = str(sess.get("rerun_target_history_id") or "").strip()
+    if rerun_history_id:
+        result = delete_owned_history_report_version(
+            rerun_history_id,
+            version,
+            login,
+        )
+        entry = find_exact_survey_duplicate_entry(sess, login, rerun_history_id)
+        if entry:
+            _copy_report_version_state(sess, entry)
+            save_session(session_id, sess)
+        return result
+    predelete_session = deepcopy(sess)
+    try:
+        deleted = delete_report_version(sess, version)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        save_session(session_id, sess)
+        save_to_history(
+            session_id,
+            sess,
+            replace_report_versions=True,
+        )
+    except Exception:
+        sess.clear()
+        sess.update(predelete_session)
+        save_session(session_id, sess)
+        raise
+    active = resolve_report_version(sess)
+    return {
+        **active,
+        "ok": True,
+        "deleted_version": deleted["version"],
+        "version": active["version"],
+        "selected_version": active["version"],
+        **_session_report_version_payload(sess),
+    }
+
+
+def delete_owned_history_report_version(
+    history_id: str,
+    version: int,
+    login: dict | None,
+) -> dict:
+    """Delete from a history card unless it is being regenerated or queried."""
+    target_id = str(history_id or "").strip()
+    if _report_rerun_target_lock(target_id).locked():
+        raise HTTPException(
+            status_code=409,
+            detail="原报告正在重新生成，完成后才能删除旧版本。",
+        )
+    if _report_generation_lock(target_id).locked():
+        raise HTTPException(
+            status_code=409,
+            detail="该历史报告正在处理追问，完成后才能删除旧版本。",
+        )
+    return _delete_history_report_version(target_id, version, login)
+
+
+async def qa_stream(
+    session_id: str,
+    question: str,
+    request: Request,
+    version: int | None = None,
+):
+    """当前会话 QA SSE 流程（async generator）。"""
+    login = await _current_login(request)
+    operation_lock = _report_generation_lock(session_id)
+    if operation_lock.locked():
+        yield sse_event({
+            "type": "error",
+            "message": "当前任务正在生成新版本或处理追问，请完成后再试。",
+        })
+        return
+    await operation_lock.acquire()
+    try:
+        # 与报告重跑共用同一把锁；锁内重读，避免排队请求回写旧版本快照。
+        sess = get_session(session_id)
+        _assign_session_owner(sess, login)
+        uses_versions = _uses_report_versions(sess)
+        if uses_versions:
+            try:
+                snapshot = resolve_report_version(sess, version)
+            except ValueError as exc:
+                raise ValueError(str(exc)) from exc
+            selected_version = snapshot["version"]
+            qa_source = dict(sess)
+            qa_source.update(snapshot)
+        else:
+            if version not in (None, 1):
+                raise ValueError("该报告不支持版本切换")
+            snapshot = sess
+            selected_version = None
+            qa_source = sess
+        qa_context = (
+            str(qa_source.get("qa_context_md") or "").strip()
+            or _build_qa_context(qa_source)
+        )
         yield sse_event({"type": "qa_scope", "message": _describe_qa_context_scope(qa_context)})
-        answer_text, qa_model, qa_context = await _answer_qa_direct(sess, question)
+        answer_text, qa_model, qa_context = await _answer_qa_direct(qa_source, question)
         for event in _content_events(answer_text):
             yield event
-        sess["qa_context_md"] = qa_context
-        sess["qa_provider"] = "direct_llm"
-        sess["qa_model"] = qa_model
-        sess["rows_fed"] = True
-        sess.setdefault("qa_messages", []).extend([
+        # 模型回答期间可能发生改名；提交 QA 前重读并在最新版本快照上更新。
+        sess = get_session(session_id)
+        precommit_session = deepcopy(sess)
+        snapshot = (
+            resolve_report_version(sess, selected_version)
+            if uses_versions
+            else sess
+        )
+        qa_messages = list(snapshot.get("qa_messages") or [])
+        qa_messages.extend([
             {"role": "user", "content": question, "ts": datetime.now().isoformat()},
             {"role": "ai", "content": answer_text, "ts": datetime.now().isoformat()},
         ])
-        save_session(session_id, sess)
-        save_to_history(session_id, sess)
+        if uses_versions:
+            update_report_version(
+                sess,
+                selected_version,
+                qa_context_md=qa_context,
+                qa_provider="direct_llm",
+                qa_model=qa_model,
+                qa_messages=qa_messages,
+            )
+        else:
+            sess["qa_context_md"] = qa_context
+            sess["qa_provider"] = "direct_llm"
+            sess["qa_model"] = qa_model
+            sess["qa_messages"] = qa_messages
+        sess["rows_fed"] = True
+        try:
+            save_session(session_id, sess)
+            rerun_history_id = str(sess.get("rerun_target_history_id") or "").strip()
+            if rerun_history_id:
+                sync_exact_rerun_qa_to_history(
+                    rerun_history_id,
+                    sess,
+                    selected_version,
+                    login=login,
+                )
+            else:
+                save_to_history(session_id, sess)
+        except Exception:
+            sess.clear()
+            sess.update(precommit_session)
+            save_session(session_id, sess)
+            raise
         await audit_log(
             request, "report", "追问当前报告",
             f"会话：{session_id}；问题：{_short_text(question)}",
-            metadata={"session_id": session_id},
+            metadata={
+                "session_id": session_id,
+                **({"version": selected_version} if selected_version else {}),
+            },
         )
-        yield sse_event({"type": "qa_done", "answer": answer_text})
+        yield sse_event({
+            "type": "qa_done",
+            "answer": answer_text,
+            **({"version": selected_version} if selected_version else {}),
+        })
     except Exception as e:
         import traceback; traceback.print_exc()
         yield sse_event({"type": "error", "message": str(e)})
+    finally:
+        operation_lock.release()
 
 
 # ── 历史报告 QA SSE ─────────────────────────────────────────────
@@ -1177,33 +2053,129 @@ async def history_qa_stream(
     question: str,
     history: list,
     request: Request,
+    version: int | None = None,
 ):
     """历史报告续聊 QA SSE 流程（async generator）。"""
+    operation_lock = _report_generation_lock(history_id)
+    if operation_lock.locked():
+        yield sse_event({
+            "type": "error",
+            "message": "当前任务正在生成新版本或处理追问，请完成后再试。",
+        })
+        return
+    await operation_lock.acquire()
     try:
+        # 路由鉴权后到 SSE 真正开始之间可能有短暂间隔；拿到互斥锁后
+        # 重新读取，避免基于生成新版本前的旧快照回答。
+        history = _load_history()
         entry = next(h for h in history if h["id"] == history_id)
-        qa_context = str(entry.get("qa_context_md") or "").strip() or _build_qa_context(entry)
+        uses_versions = _uses_report_versions(entry)
+        if uses_versions:
+            snapshot = resolve_report_version(entry, version)
+            selected_version = snapshot["version"]
+            qa_source = dict(entry)
+            qa_source.update(snapshot)
+        else:
+            if version not in (None, 1):
+                raise ValueError("该报告不支持版本切换")
+            snapshot = entry
+            selected_version = None
+            qa_source = entry
+        qa_context = (
+            str(qa_source.get("qa_context_md") or "").strip()
+            or _build_qa_context(qa_source)
+        )
         yield sse_event({"type": "qa_scope", "message": _describe_qa_context_scope(qa_context)})
-        answer_text, qa_model, qa_context = await _answer_qa_direct(entry, question)
+        answer_text, qa_model, qa_context = await _answer_qa_direct(qa_source, question)
         for event in _content_events(answer_text):
             yield event
-        entry["qa_context_md"] = qa_context
-        entry["qa_provider"] = "direct_llm"
-        entry["qa_model"] = qa_model
-        entry["rows_fed"] = True
-        entry.setdefault("qa_messages", []).extend([
-                    {"role": "user", "content": question, "ts": datetime.now().isoformat()},
-                    {"role": "ai", "content": answer_text, "ts": datetime.now().isoformat()},
-                ])
-        _save_history(history)
+
+        committed_qa_state: dict = {}
+
+        def _commit_history_qa(current_history: list) -> None:
+            current_entry = next(
+                (item for item in current_history if item.get("id") == history_id),
+                None,
+            )
+            if current_entry is None:
+                raise ValueError("历史记录不存在")
+            current_snapshot = (
+                resolve_report_version(current_entry, selected_version)
+                if uses_versions
+                else current_entry
+            )
+            qa_messages = list(current_snapshot.get("qa_messages") or [])
+            qa_messages.extend([
+                {"role": "user", "content": question, "ts": datetime.now().isoformat()},
+                {"role": "ai", "content": answer_text, "ts": datetime.now().isoformat()},
+            ])
+            if uses_versions:
+                update_report_version(
+                    current_entry,
+                    selected_version,
+                    qa_context_md=qa_context,
+                    qa_provider="direct_llm",
+                    qa_model=qa_model,
+                    qa_messages=qa_messages,
+                )
+            else:
+                current_entry["qa_context_md"] = qa_context
+                current_entry["qa_provider"] = "direct_llm"
+                current_entry["qa_model"] = qa_model
+                current_entry["qa_messages"] = qa_messages
+            current_entry["rows_fed"] = True
+            committed_qa_state.update({
+                "owner_key": _history_owner_key(current_entry),
+                "qa_context_md": qa_context,
+                "qa_provider": "direct_llm",
+                "qa_model": qa_model,
+                "qa_messages": qa_messages,
+            })
+
+        mutate_history(_commit_history_qa)
+        try:
+            live_session = get_session(history_id)
+            if _history_owner_key(live_session) != committed_qa_state["owner_key"]:
+                raise ValueError("历史记录与临时会话归属不一致")
+            if uses_versions:
+                if not _uses_report_versions(live_session):
+                    raise ValueError("历史记录与临时会话的版本模式不一致")
+                update_report_version(
+                    live_session,
+                    selected_version,
+                    qa_context_md=committed_qa_state["qa_context_md"],
+                    qa_provider=committed_qa_state["qa_provider"],
+                    qa_model=committed_qa_state["qa_model"],
+                    qa_messages=committed_qa_state["qa_messages"],
+                )
+            else:
+                live_session["qa_context_md"] = committed_qa_state["qa_context_md"]
+                live_session["qa_provider"] = committed_qa_state["qa_provider"]
+                live_session["qa_model"] = committed_qa_state["qa_model"]
+                live_session["qa_messages"] = committed_qa_state["qa_messages"]
+            live_session["rows_fed"] = True
+            save_session(history_id, live_session)
+        except (HTTPException, ValueError):
+            # 历史记录仍可追问；临时会话已过期或版本不一致时不阻断结果。
+            pass
         await audit_log(
             request, "report", "追问历史报告",
             f"历史报告：{history_id}；问题：{_short_text(question)}",
-            metadata={"history_id": history_id},
+            metadata={
+                "history_id": history_id,
+                **({"version": selected_version} if selected_version else {}),
+            },
         )
-        yield sse_event({"type": "qa_done", "answer": answer_text})
+        yield sse_event({
+            "type": "qa_done",
+            "answer": answer_text,
+            **({"version": selected_version} if selected_version else {}),
+        })
     except Exception as e:
         import traceback; traceback.print_exc()
         yield sse_event({"type": "error", "message": str(e)})
+    finally:
+        operation_lock.release()
 
 
 # ── Router 前置校验函数 ──────────────────────────────────────────
@@ -1253,9 +2225,18 @@ def validate_report_ready(session_id: str) -> bool:
     )
 
 
-def validate_qa_ready(session_id: str) -> None:
+def validate_qa_ready(session_id: str, version: int | None = None) -> None:
     """校验统一直连 QA 的报告与模型配置前置条件。"""
     sess = get_session(session_id)
+    if _uses_report_versions(sess):
+        try:
+            resolve_report_version(sess, version)
+        except ValueError as exc:
+            if not normalize_report_versions(sess):
+                raise HTTPException(status_code=400, detail="请先生成报告") from exc
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+    elif version not in (None, 1):
+        raise HTTPException(status_code=400, detail="该报告不支持版本切换")
     if not sess.get("report_md"):
         raise HTTPException(status_code=400, detail="请先生成报告")
     if not LLM_API_KEY:
@@ -1265,13 +2246,27 @@ def validate_qa_ready(session_id: str) -> None:
 
 
 def prepare_history_qa_context(
-    history_id: str, login: dict | None
+    history_id: str,
+    login: dict | None,
+    version: int | None = None,
 ) -> list:
     """加载历史记录并校验统一直连 QA 的前置条件。"""
     history = _load_history()
     entry = _find_history_for_login(history, history_id, login)
     if not entry:
         raise HTTPException(status_code=404, detail="历史记录不存在")
+    if _uses_report_versions(entry):
+        try:
+            resolve_report_version(entry, version)
+        except ValueError as exc:
+            if not normalize_report_versions(entry):
+                raise HTTPException(
+                    status_code=400,
+                    detail="该历史记录没有可追问的报告",
+                ) from exc
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+    elif version not in (None, 1):
+        raise HTTPException(status_code=400, detail="该报告不支持版本切换")
     if not entry.get("report_md"):
         raise HTTPException(status_code=400, detail="该历史记录没有可追问的报告")
     if not LLM_API_KEY:

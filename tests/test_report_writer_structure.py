@@ -2,15 +2,29 @@ import unittest
 
 from app.core.config import DEFAULT_WRITER_REQUIREMENTS
 from app.services.report_engine import (
+    _build_analysis_focus_block,
     _build_qa_context,
     _build_crosstab_plan_revision_query,
     _build_crosstab_planner_query,
     _build_large_sample_writer_query,
     _build_writer_action_query,
     _build_writer_context,
+    _build_writer_core_review_query,
     _build_writer_core_query,
+    _build_writer_first_query,
     _build_writer_part_query,
 )
+
+
+def _analysis_focus() -> dict:
+    return {
+        "core_question": "三个案例共同说明了什么，以及是否值得继续投入",
+        "report_organization": "先上提跨案例对比框架，再把各案例作为证据",
+        "supporting_analyses": ["比较目标用户差异", "归纳共性风险"],
+        "evidence_role": "案例只作为支持或反证，不作为一级主线",
+        "expected_deliverables": ["投入判断", "跨案例优先级"],
+        "avoid_structures": ["不要按案例逐章平铺"],
+    }
 
 
 class ReportWriterStructureTests(unittest.TestCase):
@@ -33,6 +47,9 @@ class ReportWriterStructureTests(unittest.TestCase):
         self.assertIn("第一句话就用", requirements)
         self.assertIn("禁止使用「针对……这一核心问题」", requirements)
         self.assertIn("不得写成已经证明因果的「A 导致 B」", requirements)
+        self.assertIn("精确人数和百分比", requirements)
+        self.assertIn("必须同时说明对应分母或有效回答范围", requirements)
+        self.assertNotIn("**不使用百分比，也不使用精确人数**", requirements)
         self.assertIn("### 少数但值得关注的反馈", requirements)
         self.assertNotIn("高信号少数观点与风险", requirements)
         self.assertNotIn("用 1 段话概括本次调研", requirements)
@@ -125,13 +142,72 @@ class ReportWriterStructureTests(unittest.TestCase):
         self.assertIn("不得写成一个超长段落", query)
         self.assertIn("不同范围不得混写", query)
         self.assertIn("不得机械套用标签或补造研究阶段", query)
-        self.assertIn("不要复述业务问题或调研需求", query)
+        self.assertIn("不要复述、转述或重新提出业务问题或调研需求", query)
         self.assertIn("第一句话就用", query)
         self.assertIn("证据显示相关", query)
         self.assertIn("从本次调研看，A 与 B 有关", query)
         self.assertIn("不得写成已经证明因果的「A 导致 B」", query)
+        self.assertIn("精确人数和百分比", query)
+        self.assertIn("必须说明对应分母或有效回答范围", query)
+        self.assertNotIn("核心结论里不使用百分比、不使用精确人数", query)
         self.assertIn("### 少数但值得关注的反馈", query)
         self.assertNotIn("高信号少数观点与风险", query)
+
+    def test_analysis_focus_reaches_explicit_standard_writer_rounds(self):
+        focus = _analysis_focus()
+        plan = {
+            "parts": [{"name": "案例证据", "column_indexes": [0]}],
+            "columns": [{"index": 0, "name": "案例反馈", "role": "open_text"}],
+            "analysis_focus": focus,
+        }
+        part_meta = {
+            "i": 1,
+            "name": "案例证据",
+            "col_desc": "案例反馈(open_text)",
+        }
+
+        first_query = _build_writer_first_query("", {}, plan, ["案例反馈"])
+        core_query = _build_writer_core_query(
+            [part_meta],
+            has_bug=False,
+            analysis_focus=focus,
+        )
+        selected_core = (
+            "<!--CORE_START-->\n## 核心结论\n跨案例判断。\n<!--CORE_END-->"
+        )
+        action_query = _build_writer_action_query(
+            [part_meta],
+            has_bug=False,
+            analysis_focus=focus,
+            selected_core=selected_core,
+        )
+
+        for query in (first_query, core_query, action_query):
+            self.assertIn("<analysis_focus>", query)
+            self.assertIn("三个案例共同说明了什么", query)
+            self.assertIn("投入判断", query)
+            self.assertIn("不要按案例逐章平铺", query)
+
+        self.assertIn("<selected_core>", action_query)
+        self.assertIn("跨案例判断", action_query)
+        self.assertEqual(_build_analysis_focus_block(None), "")
+
+    def test_core_review_prioritizes_deliverables_and_promotes_cross_case_framework(self):
+        query = _build_writer_core_review_query(_analysis_focus(), has_bug=False)
+
+        self.assertIn("expected_deliverables", query)
+        self.assertIn("最高优先级", query)
+        self.assertIn("跨案例对比框架", query)
+        self.assertIn("上提", query)
+        self.assertIn("不能用机械逐 Part 摘要代替", query)
+        self.assertIn("PASS", query)
+        self.assertIn("<!--CORE_START-->", query)
+        self.assertIn("<!--CORE_END-->", query)
+        self.assertIn("覆盖与表达复核", query)
+        self.assertIn("未参与调研立项的读者也能理解的大白话", query)
+        self.assertIn("针对……这个/这一问题", query)
+        self.assertIn("已经清楚、正确的段落原样保留", query)
+        self.assertIn("精确人数和百分比必须原样保留", query)
 
     def test_quantitative_part_query_prioritizes_objective_statistics(self):
         query = _build_writer_part_query({

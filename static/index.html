@@ -11,7 +11,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/style.css?v=40" />
+  <link rel="stylesheet" href="/static/style.css?v=43" />
 </head>
 
 <body>
@@ -396,6 +396,11 @@
                 <label for="ctx-target-users">产品/功能的目标用户是谁？</label>
                 <textarea id="ctx-target-users" rows="2"></textarea>
               </div>
+              <div class="context-form__field">
+                <label for="ctx-analysis-approach">期望的分析思路（选填）</label>
+                <textarea id="ctx-analysis-approach" rows="3"
+                  placeholder="例如：围绕玩家决策链路组织结论，并说明问题成因与改进优先级"></textarea>
+              </div>
             </div>
           </details>
         </div>
@@ -461,11 +466,11 @@
                 <circle cx="12" cy="12" r="10" />
                 <path d="M12 8v4l3 3" />
               </svg>
-              确认无误请点「确认方案」；或直接描述修改意见后点「提交修改」
+              可直接描述希望如何重建分析主线，不必保留当前 Parts；确认无误可直接确认方案
             </div>
             <div class="plan-actions__row">
-              <input class="plan-input" id="plan-input" type="text" autocomplete="off" autocapitalize="off"
-                spellcheck="false" placeholder="比如：Part1 中应该包括 A、B、C；XXX 需要单独做分析，因为 XXX" />
+              <textarea class="plan-input" id="plan-input" rows="3" autocomplete="off" autocapitalize="off"
+                spellcheck="false" placeholder="例如：重新围绕核心业务问题组织分析主线，并补充关键人群差异；不必沿用当前 Part 划分"></textarea>
               <button class="btn btn--ghost" id="btn-plan-revise">提交修改</button>
               <button class="btn btn--primary" id="btn-plan-ok">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
@@ -573,6 +578,20 @@
             </div>
             <div class="report-toolbar__status-line">
               <div class="report-toolbar__steps" id="report-breadcrumb"></div>
+              <div class="report-version-bar" id="report-version-bar" hidden>
+                <div class="report-version-picker" id="report-version-picker">
+                  <button class="report-version-picker__trigger" id="report-version-trigger" type="button"
+                    aria-haspopup="listbox" aria-expanded="false" aria-controls="report-version-menu">
+                    <span id="report-version-value">V1</span>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <polyline points="6 9 12 15 18 9" />
+                    </svg>
+                  </button>
+                  <div class="report-version-picker__menu" id="report-version-menu" role="listbox"
+                    aria-label="选择报告版本" hidden></div>
+                </div>
+                <button class="report-version-bar__manage" id="btn-report-version-manage" type="button" hidden>管理版本</button>
+              </div>
               <div class="report-toolbar__history-meta" id="report-history-meta" hidden>
                 <span class="report-toolbar__history-badge">历史报告</span>
                 <span id="report-history-info"></span>
@@ -1424,17 +1443,71 @@
     </div>
   </div>
 
+  <div class="modal-shell" id="duplicate-report-modal" hidden>
+    <div class="modal-shell__backdrop"></div>
+    <div class="modal-shell__dialog modal-shell__dialog--compact" role="dialog" aria-modal="true"
+      aria-labelledby="duplicate-report-title">
+      <div class="modal-shell__header">
+        <div>
+          <div class="modal-shell__title" id="duplicate-report-title">这份内容已经生成过报告</div>
+          <p class="modal-shell__desc">上传内容、调研背景、分析思路和题型确认均与已有任务一致，可以直接查看，也可以补充要求后重新生成。</p>
+        </div>
+      </div>
+      <div class="modal-shell__body">
+        <div class="duplicate-report-card">
+          <div class="duplicate-report-card__eyebrow" id="duplicate-report-number"></div>
+          <div class="duplicate-report-card__title" id="duplicate-report-name"></div>
+          <div class="duplicate-report-card__meta" id="duplicate-report-meta"></div>
+        </div>
+        <label class="report-version-modal__field" for="duplicate-report-instruction">
+          <span>如果希望重新生成，可补充本次要求（选填）</span>
+          <textarea id="duplicate-report-instruction" rows="5"
+            placeholder="例如：把最关注的发现前置到核心结论，并补充不同用户群的差异"></textarea>
+        </label>
+        <div class="report-version-modal__empty-warning" id="duplicate-report-empty-warning">
+          不填写时也可以重新生成，系统会沿用已有方案完整生成一份新版本。
+        </div>
+      </div>
+      <div class="modal-shell__footer duplicate-report-modal__actions">
+        <button class="btn btn--ghost" id="btn-duplicate-report-view" type="button">查看已有报告</button>
+        <button class="btn btn--primary" id="btn-duplicate-report-rerun" type="button">补充要求并重新生成</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-shell" id="report-version-manage-modal" hidden>
+    <div class="modal-shell__backdrop" data-version-manage-close></div>
+    <div class="modal-shell__dialog modal-shell__dialog--compact" role="dialog" aria-modal="true"
+      aria-labelledby="report-version-manage-title">
+      <div class="modal-shell__header">
+        <div>
+          <div class="modal-shell__title" id="report-version-manage-title">管理报告版本</div>
+          <p class="modal-shell__desc">每个版本都保留了当次补充要求。删除后不可恢复，且至少需要保留一个版本。</p>
+        </div>
+        <button class="modal-shell__close" id="btn-report-version-manage-close" type="button" aria-label="关闭">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="6" x2="6" y2="18" />
+            <line x1="6" y1="6" x2="18" y2="18" />
+          </svg>
+        </button>
+      </div>
+      <div class="modal-shell__body">
+        <div class="report-version-modal__version-list" id="report-version-manage-list"></div>
+      </div>
+    </div>
+  </div>
+
   <div class="toast-container" id="toast-container" aria-live="polite"></div>
 
   <script src="https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js"></script>
   <!-- app.js 已按业务线拆分;顺序固定:core 最先,各 feature 居中(均含原顺序的初始化代码) -->
-  <script src="/static/js/core/core.js?v=31"></script>
-  <script src="/static/js/features/survey.js?v=35"></script>
-  <script src="/static/js/features/report.js?v=35"></script>
+  <script src="/static/js/core/core.js?v=32"></script>
+  <script src="/static/js/features/survey.js?v=38"></script>
+  <script src="/static/js/features/report.js?v=38"></script>
   <script src="/static/js/features/settings.js?v=34"></script>
-  <script src="/static/js/features/history.js?v=31"></script>
+  <script src="/static/js/features/history.js?v=33"></script>
   <script src="/static/js/features/interview.js?v=9"></script>
-  <script src="/static/js/features/nav.js?v=36"></script>
+  <script src="/static/js/features/nav.js?v=37"></script>
   <script src="/static/js/features/comment.js?v=29"></script>
 <script src="/static/js/features/annotate.js?v=34"></script>
 </body>

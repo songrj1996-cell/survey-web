@@ -12,14 +12,31 @@ class PlanConfirmRequest(BaseModel):
     user_text: str
 
 
+class AnalysisPresetApplyRequest(BaseModel):
+    preset_id: str
+
+
+class ReportVersionRequest(BaseModel):
+    instruction: str = Field(default="", max_length=4000)
+    base_version: int | None = Field(default=None, ge=1)
+
+
+class PrepareReportRerunRequest(BaseModel):
+    history_id: str = Field(min_length=1, max_length=128)
+    instruction: str = Field(default="", max_length=4000)
+    base_version: int | None = Field(default=None, ge=1)
+
+
 class QARequest(BaseModel):
     session_id: str
     question: str
+    version: int | None = Field(default=None, ge=1)
 
 
 class HistoryQARequest(BaseModel):
     history_id: str
     question: str
+    version: int | None = Field(default=None, ge=1)
 
 
 class QualitativeContextRequest(BaseModel):
@@ -28,6 +45,7 @@ class QualitativeContextRequest(BaseModel):
     target_users: str = ""
     key_concerns: str = ""
     report_usage: str = ""
+    analysis_approach: str = ""
 
 
 class InterviewReviewItem(BaseModel):

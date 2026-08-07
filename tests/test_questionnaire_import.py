@@ -104,6 +104,53 @@ class BestedQuestionnaireImportTests(unittest.TestCase):
         self.assertEqual(contact["role"], "ignore")
         self.assertEqual(respondent_id["role"], "id")
 
+    def test_same_column_multi_choice_matches_full_options_with_commas(self):
+        questionnaire = _workbook_bytes({
+            "问卷内容": [
+                ["题号", "题目"],
+                ["Q1[多选题]", "常用模式"],
+                ["选项", ""],
+                ["1", "排位"],
+                ["2", "经典, 娱乐"],
+            ],
+        })
+        response = _workbook_bytes({
+            "data": [
+                ["常用模式"],
+                ["排位"],
+                ["排位,经典, 娱乐"],
+            ],
+            "code": [["1", "Q1.常用模式"]],
+        })
+
+        imported = parse_bested_qualitative_upload(response, questionnaire)
+
+        self.assertEqual(imported["rows"][1][0], "排位")
+        self.assertEqual(imported["rows"][2][0], "排位\n经典, 娱乐")
+        self.assertEqual(imported["questions"][0]["delimiter"], "\n")
+        self.assertEqual(
+            imported["questions"][0]["options"],
+            ["排位", "经典, 娱乐"],
+        )
+
+    def test_unknown_same_column_multi_choice_value_blocks_import(self):
+        questionnaire = _workbook_bytes({
+            "问卷内容": [
+                ["题号", "题目"],
+                ["Q1[多选题]", "常用模式"],
+                ["选项", ""],
+                ["1", "排位"],
+                ["2", "经典"],
+            ],
+        })
+        response = _workbook_bytes({
+            "data": [["常用模式"], ["排位,未知模式"]],
+            "code": [["1", "Q1.常用模式"]],
+        })
+
+        with self.assertRaisesRegex(ValueError, "同列多选答案"):
+            parse_bested_qualitative_upload(response, questionnaire)
+
     def test_incomplete_matrix_match_blocks_instead_of_falling_back(self):
         with self.assertRaisesRegex(ValueError, "无法完整匹配"):
             parse_bested_qualitative_upload(

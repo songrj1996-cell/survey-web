@@ -309,12 +309,14 @@ PROMPTS_FILE   = os.path.join(DATA_DIR, "prompts.json")
 WHITELIST_FILE = os.path.join(DATA_DIR, "whitelist.json")
 WEB_LOGINS_FILE = os.path.join(DATA_DIR, "web_logins.json")
 HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
+ANALYSIS_PRESETS_FILE = os.path.join(DATA_DIR, "analysis_presets.json")
 AUDIT_LOG_FILE = os.path.join(DATA_DIR, "audit_logs.json")
 APP_SETTINGS_FILE = os.path.join(DATA_DIR, "app_settings.json")
 UI_TEXTS_FILE = os.path.join(DATA_DIR, "ui_texts.json")
 GLOSSARY_FILE = os.path.join(DATA_DIR, "glossary.json")
 ANNOTATE_RESULT_DIR = Path(DATA_DIR) / "annotate_results"
 MAX_HISTORY  = 20
+MAX_REPORT_VERSIONS = 5
 MAX_AUDIT_LOGS = max(200, _env_int("AUDIT_LOG_MAX", 5000))
 
 # ============================================================
@@ -426,6 +428,14 @@ DEFAULT_SURVEY_PLANNER_SYSTEM_PROMPT = """\
     {"profile_index": 0, "question_index": 1}
   ],
   "open_questions": ["需要用户确认的问题"],
+  "analysis_focus": {
+    "core_question": "报告需要回答的核心问题",
+    "report_organization": "结论与正文采用的组织主线",
+    "supporting_analyses": ["支撑主线所需的补充分析"],
+    "evidence_role": "统计、原话和案例分别承担什么证据作用",
+    "expected_deliverables": ["报告必须交付的结论、框架或标准"],
+    "avoid_structures": ["需要避免的报告结构或写法"]
+  },
   "summary": "一句话说明分析方案及章节划分逻辑"
 }
 
@@ -448,6 +458,16 @@ DEFAULT_SURVEY_PLANNER_SYSTEM_PROMPT = """\
   question_index，不能缺字段、不能为 null，二者不能相同。
 - profile_index 只能引用 role 为 profile_dim 的列；question_index 必须引用参与分析的
   业务题目列；不要用矩阵题子项做 cross_tabs。
+- 只有用户消息包含 `<analysis_focus_mode>enabled</analysis_focus_mode>` 时才允许输出 analysis_focus；
+  若标记为 disabled，必须忽略 analysis_approach，并从输出 JSON 中省略 analysis_focus。
+- 在 analysis_focus 已启用的前提下，用户消息包含 `<analysis_approach>` 时必须输出，并完整包含
+  core_question、report_organization、supporting_analyses、evidence_role、expected_deliverables、
+  avoid_structures 六个字段。core_question、report_organization、evidence_role 使用字符串，
+  supporting_analyses、expected_deliverables、avoid_structures 使用字符串数组。六个键必须恰好齐全，不得新增其它键；
+  三个字符串和 expected_deliverables 必须非空，只有不适用的 supporting_analyses 或 avoid_structures 可写 []。
+- 当 analysis_focus 已启用时，`<analysis_approach>` 是用户明确指定的分析方式，优先级高于 `<business_context>` 和根据问卷结构推断出的
+  默认报告套路。必须先把它转译为 analysis_focus，再据此组织 parts、cross_tabs 和 open_questions；
+  但不得因此改变用户已确认的 columns、伪造问卷没有的数据或突破证据边界。
 - 输出必须是完整 plan，不是 diff。
 
 name 字段规则：
@@ -488,8 +508,14 @@ open_questions 规则：
 - 不得再次询问用户已经确认的题型、选项或选项归并方式。
 
 修订模式：
-- 如果用户提供当前方案和修订意见，必须在其基础上输出修订后的完整 plan。
+- 如果用户提供当前方案和修订意见，当前方案只作为理解已有内容的参考，不是必须保留的结构模板；
+  仅在 `<analysis_focus_mode>` 为 enabled 且用户要求分析主线重建时，不得沿用当前 Parts 作为新结构的锚点，
+  须按新 analysis_focus 重新组织。
 - 保留用户已确认的 columns 权威信息；用户只调整章节时，不得无故改动 columns。
+- 仅当 `<analysis_focus_mode>` 为 enabled 时，修订后的标准问卷 plan 才必须带完整 analysis_focus；
+  标记为 disabled 时必须省略该字段。启用时，局部调整应保留未被意见触及的分析主线；
+  当用户改变核心问题、报告组织方式、预期交付物或明确要求避免原结构时，应重建 analysis_focus，
+  并让 parts、cross_tabs 与 open_questions 重新对齐新的分析主线。
 - 不要解释修改过程。\
 """
 
@@ -1376,10 +1402,10 @@ DEFAULT_WRITER_REQUIREMENTS = """\
    <!--CORE_END-->
    `<!--CORE_START-->` 必须在 `## 核心结论` 这一行的正上方、`<!--CORE_END-->` 在核心结论结束后另起一行，两个标记各自独占一行。
    核心结论各条要点的写作规则：
-   - **不使用百分比，也不使用精确人数**，改用笼统的量级描述（例：「38 名受访者中，绝大多数人认为…」「少数玩家提到…」「近半数受访者…」），总样本数可在首行已说明的基础上引用
+   - 核心结论可以并应当使用能直接支撑判断的**精确人数和百分比**，但所有数字必须逐字来自 `<stats>`，不得自行计算、合并、四舍五入或改写。涉及分支题、筛选人群或不同使用程度人群时，必须同时说明对应分母或有效回答范围，不能用问卷总样本替代
    - 采用「混合结构」：先写 `### 总体判断`，再按报告 Part 逐组写 `### Part X 章节名：关键发现`，最后按需写 `### 少数但值得关注的反馈` 与 `### 待确认问题概述`；不要把所有内容堆成一整段或一个超长列表。
    - `### 总体判断` 中的每个判断都必须主动交代它针对的具体对象、功能、方案、场景、人群或研究范围，使未参与调研立项、未看过问卷提纲的读者也能独立理解。若同时涉及多个容易混淆的范围（例如当前体验与未来方案验证），须按真实业务语义分别回车成短段，不强制编号；禁止用「该方案」「这一问题」「核心分歧」等无明确指代的说法开门见山，也不要把总体判断写成一个超长段落。
-   - 不要在结论中复述业务问题或调研需求，第一句话就用「谁/什么因素 + 与什么评价或结果有关 + 具体表现」直接写出判断。禁止使用「针对……这一核心问题」「证据显示相关」「结果给出了明确信号」「对于这个问题，答案是……」等研究过程话术。若现有证据只能说明相关关系或群体差异，应写「从本次调研看，A 与 B 有关」「不同 A 的玩家对 B 的评价存在差异」或「A 可能影响 B」，不得写成已经证明因果的「A 导致 B」；结论之后再补数据、群体差异和玩家理由。
+   - 不要在结论中复述、转述或重新提出业务问题或调研需求，第一句话就用「谁/什么因素 + 与什么评价或结果有关 + 具体表现」直接写出判断。「按业务问题组织」只表示结论必须覆盖业务需要了解的内容，不表示把问题改写成正文。禁止使用「针对……这一核心问题」「关于……是否……」「证据显示相关」「结果给出了明确信号」「对于这个问题，答案是……」「本次调研的结果并不是单一方向的」等研究过程话术。若现有证据只能说明相关关系或群体差异，应写「从本次调研看，A 与 B 有关」「不同 A 的玩家对 B 的评价存在差异」或「A 可能影响 B」，不得写成已经证明因果的「A 导致 B」；结论之后再补数据、群体差异和玩家理由。
    - `### 少数但值得关注的反馈` 的每条短标题或首句必须明确标出其对应的具体对象、功能、方案、场景、人群或研究范围；不同范围的观点与风险不得混写。范围名称必须来自真实的 plan、题目、玩家反馈或已生成章节，不得机械套用「现状」「方案验证」等标签，也不得自行补造研究阶段。
    - Part 小节标题必须引用正文/plan 里的真实 Part 标题，例如 `### Part 1 子播报区体验反馈：关键发现`、`### Part 2 新勋章设计评价：关键发现`；严禁只写 `Part 1 关键发现`、`Part 2 关键发现` 这种无法判断内容的泛化标题。
    - 每条要点必须使用「**短标题**：结论 + 原因/证据 + 必要案例」的格式；短标题要直接点明主题，后文再说明为什么重要。
@@ -1389,6 +1415,11 @@ DEFAULT_WRITER_REQUIREMENTS = """\
    - 少数玩家反馈只要具备高业务风险、强烈情绪、明确案例、功能异常、流失风险或设计决策价值，就必须进入核心结论，不能因人数少而省略；但普通偏好、泛泛建议、无具体依据的情绪抱怨不用强行写入。
    - 玩家提供了明确案例时，核心结论必须适当概述案例，不需要逐字复述，但要保留关键信息（例：「某玩家反馈 Lolita 98% 坦克成就只进入副播报，被击杀播报挤占主播报位置，并表达流失风险」）。
    - 每个 Part 至少覆盖 1 条关键发现；如果某 Part 内有多个决策价值很高的分歧或风险，可写 2–3 条，不要为了控制条数遗漏重点。
+   - 若 plan 含 `<analysis_focus>`，其中 `expected_deliverables` 是核心结论覆盖范围的最高优先级；
+     `report_organization` 指定的跨题、跨人群或跨案例分析框架优先于机械的逐 Part 摘要。此时可按该主线组织核心结论，
+     但仍须覆盖各 Part 的关键证据，不得遗漏与主线相关的少数高风险反馈。
+   - 如果 `expected_deliverables` 要求形成可复用的框架、判定标准、分层模型或检查清单，核心结论必须把它上提为
+     可直接复用的独立产出，明确维度、判断条件、适用边界和证据依据；不得只在段落中顺带提及或只给一次性案例总结。
    - 若报告末尾包含 `## Bug 或待确认问题` 模块，则核心结论最后必须追加 `### 待确认问题概述`，只概述有哪些问题类型需要确认，不展开玩家原文；若正文没有该模块，则核心结论不要写任何待确认问题相关小节。
 3. 之后严格按 plan 给的 parts 顺序划分章节，每个 part 用 `## Part X 章节名` 二级标题；详细内容的目录只保留这些 Part 业务主题，Part 内部**禁止使用任何 `###` 或 `####` 标题**，题目、分析维度、观点分类和具体观点都必须使用普通正文或加粗正文呈现
 4. 每个 part 章节**紧接标题之后**先写 `**本节总结：**`，下方用 3–6 条 Markdown 编号列表综合该 part 所有题目的客观统计结果与主观观点；每条固定采用 `1. **短标题**：结论、关键数据和必要解释` 的形式，按业务 Topic 分组，不得把全部数字和结论堆在一个超长段落里。每条控制为便于阅读的短段，关键判断、显著差异、主要风险或产品含义用加粗短标题突出；不要机械加粗每一个数字。要求读完本节总结即可完整了解该 part 的关键数据（绝对数值）、玩家态度分布、多元观点及其核心逻辑，在改善可读性的同时不得删减重要信息。本节总结同样必须使用不看后文原文也能理解的大白话：优先沿用玩家反馈中文翻译中的具体说法；若使用抽象概括，须在同一句解释它具体指什么，不得用术语替代玩家实际在意的功能、体验或场景，也不得补造原文中没有的例子。总结之后按业务 Topic 展开，用 `**使用现状与人群分层**`、`**核心动机与体验问题**` 这类加粗正文作为内部区隔。不得按问卷题目逐题复述；同一 Topic 下的客观题和相关开放题必须结合分析，客观统计用于说明人群背景、使用分层和判断依据，主观反馈用于完整解释原因、情境、分歧与产品含义。涉及跳转逻辑时仍须区分各分支适用人群与回答池，不得为了 Topic 汇总而混用分母或合并不同分支的反馈

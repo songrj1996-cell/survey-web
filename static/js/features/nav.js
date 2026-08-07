@@ -3,6 +3,10 @@
 // ============================================================
 
 $('btn-restart').addEventListener('click', () => {
+  if (reportInteractionBusy()) {
+    showToast('当前报告操作尚未完成，请稍候再重新开始', 'info', 5000);
+    return;
+  }
   if (!confirm('确定要重新开始吗？当前会话数据将被清除。')) return;
   if (currentMode === 'comment') {
     cmReset();
@@ -20,17 +24,48 @@ $('btn-restart').addEventListener('click', () => {
   state.planData = null;
   state.reportMd = null;
   state.qaLoading = false;
+  state.reportVersionLoading = false;
   state.viewMode = 'session';
   state.historyId = null;
   state.sessionReport = {
+    id: null,
     reportMd: null,
     title: '',
     reportNo: '',
+    version: null,
+    versions: [],
+    activeVersion: null,
+    selectedVersion: null,
+    nextVersion: null,
+    maxVersions: 5,
+    canGenerateVersion: true,
+    versionInstructions: {},
     qaHtml: '',
     qaMessages: [],
     feishuLinkHtml: '',
     running: false,
     stream: '',
+    pendingVersionRequest: null,
+    generatingVersion: null,
+    lastVersionInstruction: '',
+  };
+  state.historyReport = {
+    id: null,
+    reportMd: null,
+    title: '',
+    reportNo: '',
+    version: null,
+    versions: [],
+    activeVersion: null,
+    selectedVersion: null,
+    nextVersion: null,
+    maxVersions: 5,
+    canGenerateVersion: false,
+    analystConvId: null,
+    qaHtml: '',
+    qaMessages: [],
+    feishuLinkHtml: '',
+    planData: null,
   };
   resetUploadZone();
   fileInput.value = '';
@@ -239,8 +274,12 @@ $('btn-ct-upload').addEventListener('click', async () => {
     await saveCrosstabContext(state.sessionId, quantitativeContext);
     clearPlanInput();
     state.sessionReport = {
+      id: null,
       reportMd: null, title: '', reportNo: '', qaHtml: '',
+      version: null, versions: [], activeVersion: null, selectedVersion: null,
+      nextVersion: null, maxVersions: 5, canGenerateVersion: true, versionInstructions: {},
       qaMessages: [], feishuLinkHtml: '', running: false, stream: '',
+      pendingVersionRequest: null, generatingVersion: null, lastVersionInstruction: '',
     };
     renderPreview(data);
     if (data.stats_source === 'external_crosstab') {
@@ -291,6 +330,10 @@ const cmPanels = [1, 2, 3].map(n => $(`cm-panel-${n}`));
 let currentMode = 'survey'; // 'survey' | 'interview' | 'annotate' | 'comment'
 
 function switchMode(mode) {
+  if (currentMode === 'survey' && mode !== 'survey' && reportInteractionBusy()) {
+    showToast('当前报告操作尚未完成，请稍候再切换功能', 'info', 5000);
+    return;
+  }
   currentMode = mode;
   const isSurvey = mode === 'survey';
   const isInterview = mode === 'interview';

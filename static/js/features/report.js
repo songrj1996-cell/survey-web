@@ -67,8 +67,280 @@ function _parseReportProgress(message) {
   };
 }
 
-async function runStats() {
+const EMPTY_RERUN_INSTRUCTION = '未填写补充要求，本次为重新生成';
+
+function normalizeReportVersions(versions) {
+  return (Array.isArray(versions) ? versions : [])
+    .map(item => {
+      if (item && typeof item === 'object') {
+        const version = Number(item.version ?? item.id ?? item.value);
+        if (!Number.isFinite(version)) return null;
+        const kind = item.kind || '';
+        const rawInstruction = String(item.instruction || '').trim();
+        const isRerun = kind === 'regenerate' || kind === 'rerun' || item.base_version != null;
+        return {
+          version,
+          label: item.label || `V${version}`,
+          created_at: item.created_at || '',
+          instruction: rawInstruction || (isRerun ? EMPTY_RERUN_INSTRUCTION : ''),
+          kind,
+          base_version: toFiniteVersion(item.base_version),
+          title: item.title || '',
+        };
+      }
+      const version = Number(item);
+      if (!Number.isFinite(version)) return null;
+      return { version, label: `V${version}`, created_at: '' };
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.version - b.version);
+}
+
+function toFiniteVersion(value) {
+  const version = Number(value);
+  return Number.isFinite(version) ? version : null;
+}
+
+let reportVersionLoadSerial = 0;
+let reportVersionLoadTarget = null;
+
+function reportInteractionBusy() {
+  return !!(
+    state.sessionReport.running
+    || state.qaLoading
+    || state.reportVersionLoading
+    || state.historyLoading
+  );
+}
+
+function activeReportInteractionBusy() {
+  return !!(
+    state.qaLoading
+    || state.reportVersionLoading
+    || state.historyLoading
+    || (state.viewMode === 'session' && state.sessionReport.running)
+  );
+}
+
+function updateReportActionAvailability() {
+  const busy = activeReportInteractionBusy();
+  const renameBtn = $('btn-report-rename');
+  if (renameBtn) renameBtn.disabled = !activeReportId() || busy;
+  const exportDropdown = $('btn-export-dropdown');
+  if (exportDropdown) exportDropdown.disabled = busy;
+  const hasSession = !!(
+    state.sessionId
+    || state.sessionReport.reportMd
+    || state.sessionReport.running
+  );
+  const sessionBtn = $('btn-report-session');
+  const historyBtn = $('btn-report-history');
+  const backBtn = $('btn-report-back-session');
+  if (sessionBtn) sessionBtn.disabled = (state.qaLoading || state.reportVersionLoading || state.historyLoading) || !hasSession;
+  if (historyBtn) historyBtn.disabled = state.qaLoading || state.reportVersionLoading || state.historyLoading;
+  if (backBtn) backBtn.disabled = busy;
+  if (busy) $('export-dropdown-menu')?.classList.remove('open');
+}
+
+function syncReportVersionMeta(target, meta = {}) {
+  if (!target) return;
+  const normalized = normalizeReportVersions(meta.versions ?? target.versions);
+  target.versions = normalized;
+  target.versionInstructions = target.versionInstructions || {};
+  normalized.forEach(item => {
+    if (item.instruction) target.versionInstructions[item.version] = item.instruction;
+  });
+  const latestVersion = normalized.at(-1);
+  target.lastVersionInstruction = latestVersion?.kind === 'regenerate'
+    ? latestVersion.instruction
+    : '';
+  target.maxVersions = Number(meta.max_versions ?? target.maxVersions ?? 5) || 5;
+  target.canGenerateVersion = meta.can_generate_version ?? target.canGenerateVersion ?? (target === state.sessionReport);
+  const nextVersion = toFiniteVersion(meta.next_version);
+  const version = toFiniteVersion(meta.version);
+  const activeVersion = toFiniteVersion(meta.active_version);
+  const selectedVersion = toFiniteVersion(meta.selected_version);
+  if (nextVersion != null) target.nextVersion = nextVersion;
+  if (version != null) target.version = version;
+  if (activeVersion != null) target.activeVersion = activeVersion;
+  if (selectedVersion != null) target.selectedVersion = selectedVersion;
+  if (!target.selectedVersion) target.selectedVersion = target.version || target.activeVersion || normalized.at(-1)?.version || null;
+}
+
+function activeVersionNumber(ctx = activeReportCtx()) {
+  return Number(ctx?.selectedVersion || ctx?.version || ctx?.activeVersion || 0) || null;
+}
+
+function withOptionalVersion(url, version) {
+  const numericVersion = toFiniteVersion(version);
+  return numericVersion != null ? `${url}?version=${encodeURIComponent(numericVersion)}` : url;
+}
+
+async function loadSessionReportVersion(version) {
+  const requestId = ++reportVersionLoadSerial;
+  const sessionId = state.sessionId;
+  reportVersionLoadTarget = version;
+  state.reportVersionLoading = true;
+  updateReportVersionUi();
+  applyQAAvailability();
+  try {
+    const resp = await fetch(`/api/report/${sessionId}?version=${encodeURIComponent(version)}`);
+    const data = await resp.json().catch(() => ({}));
+    if (requestId !== reportVersionLoadSerial || state.sessionId !== sessionId) return false;
+    if (!resp.ok) throw new Error(data.detail || '加载报告版本失败');
+    state.viewMode = 'session';
+    state.historyId = null;
+    state.sessionReport.reportMd = data.report_md || '';
+    state.sessionReport.title = data.title || reportTitleFromMarkdown(data.report_md || '');
+    state.sessionReport.qaMessages = normalizeQAMessages(data.qa_messages || []);
+    state.sessionReport.qaHtml = '';
+    state.sessionReport.feishuLinkHtml = '';
+    syncReportVersionMeta(state.sessionReport, {
+      ...data,
+      version: data.version ?? version,
+      selected_version: data.version ?? version,
+    });
+    renderReportWorkspace(state.sessionReport.reportMd, { preserveQa: true });
+    return true;
+  } finally {
+    if (requestId === reportVersionLoadSerial) {
+      reportVersionLoadTarget = null;
+      state.reportVersionLoading = false;
+      updateReportVersionUi();
+      applyQAAvailability();
+    }
+  }
+}
+
+async function loadHistoryReportVersion(version) {
+  const requestId = ++reportVersionLoadSerial;
+  const historyId = state.historyReport.id;
+  reportVersionLoadTarget = version;
+  state.reportVersionLoading = true;
+  updateReportVersionUi();
+  applyQAAvailability();
+  try {
+    const resp = await fetch(`/api/history/${historyId}?version=${encodeURIComponent(version)}`);
+    const data = await resp.json().catch(() => ({}));
+    if (
+      requestId !== reportVersionLoadSerial
+      || state.historyReport.id !== historyId
+    ) return false;
+    if (!resp.ok) throw new Error(data.detail || '加载历史版本失败');
+    state.viewMode = 'history';
+    state.historyId = historyId;
+    state.historyReport.reportMd = data.report_md || '';
+    state.historyReport.title = data.title || reportTitleFromMarkdown(data.report_md || '');
+    state.historyReport.qaMessages = normalizeQAMessages(data.qa_messages || []);
+    state.historyReport.qaHtml = '';
+    state.historyReport.feishuLinkHtml = '';
+    syncReportVersionMeta(state.historyReport, {
+      ...data,
+      version: data.version ?? version,
+      selected_version: data.version ?? version,
+    });
+    renderReportWorkspace(state.historyReport.reportMd, { preserveQa: true });
+    return true;
+  } finally {
+    if (requestId === reportVersionLoadSerial) {
+      reportVersionLoadTarget = null;
+      state.reportVersionLoading = false;
+      updateReportVersionUi();
+      applyQAAvailability();
+    }
+  }
+}
+
+function updateReportVersionUi() {
+  const bar = $('report-version-bar');
+  const picker = $('report-version-picker');
+  const trigger = $('report-version-trigger');
+  const value = $('report-version-value');
+  const menu = $('report-version-menu');
+  const manageBtn = $('btn-report-version-manage');
+  const ctx = activeReportCtx();
+  const versions = normalizeReportVersions(ctx?.versions);
+  const hasVersions = versions.length > 0;
+  const generatingVersion = toFiniteVersion(state.sessionReport.generatingVersion);
+  const linkedHistoryId = String(state.sessionReport.pendingVersionRequest?.linkedHistoryId || '');
+  const isLinkedHistoryRunning = state.viewMode === 'history'
+    && linkedHistoryId
+    && linkedHistoryId === String(state.historyReport.id || state.historyId || '');
+  const isVersionRunning = state.sessionReport.running
+    && generatingVersion != null
+    && (state.viewMode === 'session' || isLinkedHistoryRunning);
+  if (bar) bar.hidden = !hasVersions;
+  const displayedVersion = state.reportVersionLoading && reportVersionLoadTarget != null
+    ? reportVersionLoadTarget
+    : activeVersionNumber(ctx) || versions.at(-1)?.version;
+  const pickerDisabled = !hasVersions
+    || state.qaLoading
+    || state.reportVersionLoading
+    || state.historyLoading
+    || (state.viewMode === 'session' && state.sessionReport.running);
+  if (value) value.textContent = displayedVersion ? `V${displayedVersion}` : '';
+  if (trigger) {
+    trigger.disabled = pickerDisabled;
+    trigger.title = isVersionRunning ? `正在生成 V${generatingVersion}` : '选择报告版本';
+  }
+  if (menu) {
+    menu.innerHTML = versions.map(item => {
+      const isSelected = item.version === displayedVersion;
+      const isActive = item.version === ctx?.activeVersion;
+      const revision = item.instruction || (item.version === 1 ? '首次生成' : '未记录修订要求');
+      return `
+        <button class="report-version-picker__option${isSelected ? ' report-version-picker__option--selected' : ''}"
+          type="button" role="option" aria-selected="${isSelected}" data-report-version-option="${item.version}">
+          <span class="report-version-picker__option-version">V${item.version}${isActive ? ' · 当前生效' : ''}</span>
+          <span class="report-version-picker__option-note">${esc(revision)}</span>
+        </button>`;
+    }).join('');
+  }
+  if (picker && (!hasVersions || pickerDisabled)) {
+    setReportVersionMenuOpen(false);
+  }
+  if (manageBtn) {
+    manageBtn.hidden = !(state.viewMode === 'history' && versions.length > 1);
+    manageBtn.disabled = reportInteractionBusy();
+  }
+  updateReportActionAvailability();
+}
+
+async function runStats(options = {}) {
   if (state.sessionReport.running) return;
+  const generationSessionId = state.sessionId;
+  if (!generationSessionId) {
+    showToast('当前分析任务已失效，请重新上传文件', 'error');
+    return;
+  }
+  const generationRequestId = (Number(state.reportGenerationSerial) || 0) + 1;
+  state.reportGenerationSerial = generationRequestId;
+  const isCurrentGeneration = () => (
+    state.reportGenerationSerial === generationRequestId
+    && state.sessionId === generationSessionId
+  );
+  const isLinkedRerun = options.linkedRerun === true;
+  const linkedHistoryId = String(
+    options.historyId || state.sessionReport.pendingVersionRequest?.linkedHistoryId || '',
+  ).trim();
+  const generationBaseVersion = toFiniteVersion(
+    options.baseVersion || state.sessionReport.pendingVersionRequest?.baseVersion,
+  );
+  const targetVersion = toFiniteVersion(
+    options.targetVersion || state.sessionReport.pendingVersionRequest?.targetVersion,
+  );
+  const generationInstruction = String(
+    options.instruction ?? state.sessionReport.pendingVersionRequest?.instruction ?? '',
+  ).trim();
+  state.sessionReport.generatingVersion = isLinkedRerun ? targetVersion : null;
+  if (isLinkedRerun) {
+    state.sessionReport.pendingVersionRequest = {
+      linkedHistoryId,
+      baseVersion: generationBaseVersion,
+      targetVersion,
+      instruction: generationInstruction,
+    };
+  }
   state.viewMode = 'session';
   state.historyId = null;
   state.sessionReport.running = true;
@@ -82,11 +354,15 @@ async function runStats() {
   $('ps-writing').classList.remove('progress-step--active', 'progress-step--done', 'progress-step--failed');
   $('report-stream-container').style.display = 'none';
   $('report-stream-content').textContent = '';
+  updateReportVersionUi();
+  applyQAAvailability();
 
   let generationStatusTimer = null;
+  let generationCompleted = false;
 
   try {
-    const statsResp = await fetch(`/api/stats/${state.sessionId}`, { method: 'POST' });
+    const statsResp = await fetch(`/api/stats/${generationSessionId}`, { method: 'POST' });
+    if (!isCurrentGeneration()) return;
     if (!statsResp.ok) {
       const d = await statsResp.json();
       throw new Error(d.detail || '统计计算失败');
@@ -94,8 +370,8 @@ async function runStats() {
     $('ps-stats').classList.remove('progress-step--active');
     $('ps-stats').classList.add('progress-step--done');
     $('ps-writing').classList.add('progress-step--active');
-
     $('report-stream-container').style.display = 'block';
+    if (isLinkedRerun && targetVersion) showToast(`开始生成 V${targetVersion}`, 'info', 3000);
     let fullReport = '';
     let currentStep = 0;
     let totalSteps = 0;
@@ -105,6 +381,7 @@ async function runStats() {
     let lastSignalAt = Date.now();
 
     const renderGenerationStatus = () => {
+      if (!isCurrentGeneration()) return;
       const now = Date.now();
       const waitedMs = now - stepStartedAt;
       const connectionText = now - lastSignalAt < 45000 ? '连接正常' : '正在等待服务响应';
@@ -137,7 +414,8 @@ async function runStats() {
     renderGenerationStatus();
     generationStatusTimer = window.setInterval(renderGenerationStatus, 1000);
 
-    await consumeSSE(`/api/report/${state.sessionId}`, ev => {
+    const onReportEvent = ev => {
+      if (!isCurrentGeneration()) return;
       lastSignalAt = Date.now();
       if (ev.type === 'progress') {
         // 服务端按完整章节输出；状态区持续说明当前步骤，避免等待期间像卡死。
@@ -178,32 +456,85 @@ async function runStats() {
         }
       }
       if (ev.type === 'report_done') {
+        generationCompleted = true;
         completedSteps = totalSteps || completedSteps;
         renderGenerationStatus();
         state.sessionReport.running = false;
         resetReportFailureUi();
+        state.sessionReport.id = generationSessionId;
         state.sessionReport.reportMd = ev.report_md;
         state.sessionReport.title = reportTitleFromMarkdown(ev.report_md);
+        state.sessionReport.reportNo = ev.report_no || state.sessionReport.reportNo || '';
+        state.sessionReport.qaMessages = [];
+        state.sessionReport.qaHtml = '';
+        state.sessionReport.feishuLinkHtml = '';
+        const doneVersion = toFiniteVersion(ev.version) || (isLinkedRerun ? targetVersion : null);
+        syncReportVersionMeta(state.sessionReport, {
+          ...ev,
+          versions: ev.versions || ev.report_versions || state.sessionReport.versions,
+          active_version: ev.active_version || ev.active_report_version || doneVersion,
+          version: doneVersion ?? ev.version,
+          selected_version: doneVersion ?? state.sessionReport.selectedVersion,
+        });
+        if (doneVersion != null && isLinkedRerun) {
+          const note = generationInstruction || EMPTY_RERUN_INSTRUCTION;
+          state.sessionReport.versionInstructions[doneVersion] = note;
+          state.sessionReport.lastVersionInstruction = note;
+        }
         if (state.viewMode === 'session') {
           state.historyId = null;
-          showReport(ev.report_md);
+          showReport(ev.report_md, { notify: !isLinkedRerun });
         } else {
-          showToast('当前报告已生成完成，可点击「当前分析」查看', 'success', 7000);
           updateReportContextSwitch();
         }
+        if (isLinkedRerun) {
+          const versionLabel = doneVersion ? `V${doneVersion}` : '新版本';
+          showToast(`${versionLabel} 已生成，并已加入原历史报告`, 'success', 7000);
+          if (linkedHistoryId && typeof refreshHistoryEntryAfterGeneration === 'function') {
+            refreshHistoryEntryAfterGeneration(linkedHistoryId).catch(error => {
+              console.warn('[report] Refresh linked history failed:', error);
+            });
+          }
+        } else if (state.viewMode !== 'session') {
+          showToast('当前报告已生成完成，可点击「当前分析」查看', 'success', 7000);
+        }
       }
-    });
+    };
+    await consumeSSE(`/api/report/${generationSessionId}`, onReportEvent);
   } catch (e) {
+    if (!isCurrentGeneration()) return;
     state.sessionReport.running = false;
-    showReportFailureUi(e.message);
-    showToast(`报告生成失败：${state.sessionReport.error}`, 'error', 7000);
+    if (isLinkedRerun) {
+      showReportFailureUi(e.message);
+      showToast(`新版本生成失败：${e.message}`, 'error', 7000);
+    } else {
+      showReportFailureUi(e.message);
+      showToast(`报告生成失败：${state.sessionReport.error}`, 'error', 7000);
+    }
   } finally {
     if (generationStatusTimer) window.clearInterval(generationStatusTimer);
+    if (!isCurrentGeneration()) return;
+    if (isLinkedRerun && generationCompleted) state.sessionReport.pendingVersionRequest = null;
+    state.sessionReport.generatingVersion = null;
+    updateReportVersionUi();
+    applyQAAvailability();
   }
+  return generationCompleted;
 }
 
 $('btn-report-retry')?.addEventListener('click', () => {
   if (state.sessionReport.running) return;
+  const pending = state.sessionReport.pendingVersionRequest;
+  if (pending?.linkedHistoryId) {
+    runStats({
+      linkedRerun: true,
+      historyId: pending.linkedHistoryId,
+      baseVersion: pending.baseVersion,
+      targetVersion: pending.targetVersion,
+      instruction: pending.instruction,
+    });
+    return;
+  }
   runStats();
 });
 
@@ -596,12 +927,25 @@ function updateReportContextSwitch() {
     }
     historyInfo.textContent = [ctx.reportNo, createdText, modeLabel].filter(Boolean).join(' · ');
   }
+  updateReportVersionUi();
 }
 
 function applyQAAvailability() {
   const input = $('qa-input');
   const btn = $('btn-qa-send');
   if (!input || !btn) return;
+  if (state.reportVersionLoading || state.historyLoading) {
+    input.placeholder = state.historyLoading ? '正在加载历史报告，请稍候' : '正在切换报告版本，请稍候';
+    input.disabled = true;
+    btn.disabled = true;
+    return;
+  }
+  if (state.viewMode === 'session' && state.sessionReport.running) {
+    input.placeholder = '报告生成中，暂时不能追问';
+    input.disabled = true;
+    btn.disabled = true;
+    return;
+  }
   if (state.viewMode === 'history') {
     const canChat = !!state.historyReport.reportMd;
     input.placeholder = canChat ? '可基于该历史报告发起或继续追问（Enter 发送）' : '该历史记录没有可追问的报告';
@@ -662,6 +1006,7 @@ function renderReportWorkspace(md, { preserveQa = true } = {}) {
   }
   applyQAAvailability();
   updateReportContextSwitch();
+  updateReportVersionUi();
   applyCoreHighlight();
   removeLegacyStatsChartPayloads();
   enhanceReportTables();
@@ -671,15 +1016,19 @@ function renderReportWorkspace(md, { preserveQa = true } = {}) {
   updateQaBadge();
 }
 
-function showReport(md) {
+function showReport(md, { notify = true } = {}) {
   const ctx = activeReportCtx();
   ctx.reportMd = md;
   ctx.title = reportTitleFromMarkdown(md);
   renderReportWorkspace(md, { preserveQa: true });
-  if (state.viewMode === 'session') showToast('报告生成完毕！', 'success');
+  if (notify && state.viewMode === 'session') showToast('报告生成完毕！', 'success');
 }
 
 function switchReportContext(mode) {
+  if (state.qaLoading || state.reportVersionLoading || state.historyLoading) {
+    showToast('当前操作完成后才能切换报告', 'info');
+    return;
+  }
   if (mode === state.viewMode) return;
   saveActiveReportUi();
   if (mode === 'history') {
@@ -712,6 +1061,10 @@ function switchReportContext(mode) {
 
 $('btn-report-session')?.addEventListener('click', () => switchReportContext('session'));
 $('btn-report-history')?.addEventListener('click', () => {
+  if (state.qaLoading || state.reportVersionLoading || state.historyLoading) {
+    showToast('当前操作完成后才能打开其他报告', 'info');
+    return;
+  }
   if (typeof openHistoryDrawer === 'function') {
     openHistoryDrawer();
     return;
@@ -720,6 +1073,136 @@ $('btn-report-history')?.addEventListener('click', () => {
   loadHistory();
 });
 $('btn-report-back-session')?.addEventListener('click', () => switchReportContext('session'));
+function setReportVersionMenuOpen(open) {
+  const picker = $('report-version-picker');
+  const trigger = $('report-version-trigger');
+  const menu = $('report-version-menu');
+  if (!picker || !trigger || !menu) return;
+  const nextOpen = Boolean(open) && !trigger.disabled;
+  picker.classList.toggle('report-version-picker--open', nextOpen);
+  trigger.setAttribute('aria-expanded', String(nextOpen));
+  menu.hidden = !nextOpen;
+}
+
+$('report-version-trigger')?.addEventListener('click', e => {
+  e.stopPropagation();
+  const trigger = e.currentTarget;
+  setReportVersionMenuOpen(trigger.getAttribute('aria-expanded') !== 'true');
+});
+
+$('report-version-menu')?.addEventListener('click', async e => {
+  const option = e.target.closest('[data-report-version-option]');
+  if (!option) return;
+  e.stopPropagation();
+  const version = Number(option.dataset.reportVersionOption);
+  setReportVersionMenuOpen(false);
+  if (!Number.isFinite(version) || version === activeVersionNumber(activeReportCtx())) return;
+  try {
+    if (state.viewMode === 'history') {
+      await loadHistoryReportVersion(version);
+    } else {
+      await loadSessionReportVersion(version);
+    }
+  } catch (error) {
+    showToast(error.message, 'error');
+    updateReportVersionUi();
+  }
+});
+
+document.addEventListener('click', e => {
+  if (!e.target.closest('#report-version-picker')) setReportVersionMenuOpen(false);
+});
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') setReportVersionMenuOpen(false);
+});
+
+function closeReportVersionManageModal() {
+  const modal = $('report-version-manage-modal');
+  if (modal) modal.hidden = true;
+  document.body.style.removeProperty('overflow');
+}
+
+function renderReportVersionManageList() {
+  const list = $('report-version-manage-list');
+  if (!list) return;
+  const versions = normalizeReportVersions(state.historyReport.versions);
+  list.innerHTML = versions.map(item => {
+    const isActive = item.version === state.historyReport.activeVersion;
+    const note = item.instruction || (item.version === 1 ? '首次生成' : EMPTY_RERUN_INSTRUCTION);
+    return `<div class="report-version-delete-row">
+      <div class="report-version-delete-row__content">
+        <div class="report-version-delete-row__title">V${item.version}${isActive ? ' · 当前生效' : ''}</div>
+        <div class="report-version-delete-row__meta">${esc(item.created_at || '生成时间未记录')}</div>
+        <div class="report-version-delete-row__instruction">${esc(note)}</div>
+      </div>
+      <div class="report-version-delete-row__actions">
+        <button class="btn btn--ghost" type="button" data-history-delete-version="${item.version}"
+          ${versions.length <= 1 || reportInteractionBusy() ? 'disabled' : ''}>删除 V${item.version}</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function openReportVersionManageModal() {
+  if (state.viewMode !== 'history' || normalizeReportVersions(state.historyReport.versions).length <= 1) return;
+  renderReportVersionManageList();
+  $('report-version-manage-modal').hidden = false;
+  document.body.style.overflow = 'hidden';
+}
+
+$('btn-report-version-manage')?.addEventListener('click', openReportVersionManageModal);
+$('btn-report-version-manage-close')?.addEventListener('click', closeReportVersionManageModal);
+document.querySelectorAll('[data-version-manage-close]').forEach(node => {
+  node.addEventListener('click', closeReportVersionManageModal);
+});
+$('report-version-manage-list')?.addEventListener('click', async e => {
+  const deleteBtn = e.target.closest('[data-history-delete-version]');
+  if (!deleteBtn || reportInteractionBusy()) return;
+  const version = Number(deleteBtn.dataset.historyDeleteVersion);
+  const historyId = String(state.historyReport.id || state.historyId || '');
+  if (!Number.isFinite(version) || !historyId) return;
+  if (!window.confirm(`确定删除 V${version} 吗？删除后不可恢复。`)) return;
+
+  const requestId = ++reportVersionLoadSerial;
+  const previousSelectedVersion = activeVersionNumber(state.historyReport);
+  state.reportVersionLoading = true;
+  updateReportVersionUi();
+  applyQAAvailability();
+  renderReportVersionManageList();
+  try {
+    const resp = await fetch(`/api/history/${encodeURIComponent(historyId)}/versions/${version}`, { method: 'DELETE' });
+    const data = await resp.json().catch(() => ({}));
+    if (requestId !== reportVersionLoadSerial || String(state.historyReport.id || '') !== historyId) return;
+    if (!resp.ok) throw new Error(data.detail || '删除旧版本失败');
+    syncReportVersionMeta(state.historyReport, {
+      ...data,
+      versions: data.versions || data.report_versions || [],
+      active_version: data.active_version || data.active_report_version || data.version,
+    });
+    const versions = normalizeReportVersions(state.historyReport.versions);
+    const selectedStillExists = versions.some(item => item.version === previousSelectedVersion);
+    const nextVersion = selectedStillExists
+      ? previousSelectedVersion
+      : toFiniteVersion(data.active_version || data.active_report_version || data.version) || versions.at(-1)?.version;
+    state.historyReport.selectedVersion = nextVersion || null;
+    state.reportVersionLoading = false;
+    if (!selectedStillExists && nextVersion) await loadHistoryReportVersion(nextVersion);
+    if (typeof refreshHistoryEntryAfterGeneration === 'function') {
+      await refreshHistoryEntryAfterGeneration(historyId);
+    }
+    showToast(`已删除 V${version}`, 'success');
+    if (versions.length <= 1) closeReportVersionManageModal();
+    else renderReportVersionManageList();
+  } catch (error) {
+    showToast(error.message, 'error');
+  } finally {
+    if (requestId === reportVersionLoadSerial) state.reportVersionLoading = false;
+    updateReportVersionUi();
+    applyQAAvailability();
+    renderReportVersionManageList();
+  }
+});
 
 async function updateReportTitle(historyId, title) {
   const cleanTitle = String(title || '').trim();
@@ -744,20 +1227,31 @@ async function updateReportTitle(historyId, title) {
 }
 
 function applyRenamedReport(data) {
-  const title = data.title || reportTitleFromMarkdown(data.report_md);
-  const reportMd = data.report_md || replaceReportTitleInMarkdown(activeReportCtx().reportMd || state.reportMd || '', title);
+  const title = data.title || reportTitleFromMarkdown(data.report_md || '');
   if (state.sessionId === data.id) {
+    const reportMd = replaceReportTitleInMarkdown(
+      state.sessionReport.reportMd || '',
+      title,
+    );
     state.sessionReport.title = title;
     state.sessionReport.reportNo = data.report_no || state.sessionReport.reportNo || '';
     state.sessionReport.reportMd = reportMd;
   }
   if (state.historyReport.id === data.id) {
+    const reportMd = replaceReportTitleInMarkdown(
+      state.historyReport.reportMd || '',
+      title,
+    );
     state.historyReport.title = title;
     state.historyReport.reportNo = data.report_no || state.historyReport.reportNo || '';
     state.historyReport.reportMd = reportMd;
   }
   if ((state.viewMode === 'history' && state.historyId === data.id) || (state.viewMode === 'session' && state.sessionId === data.id)) {
     saveActiveReportUi();
+    const reportMd = replaceReportTitleInMarkdown(
+      activeReportCtx().reportMd || state.reportMd || '',
+      title,
+    );
     activeReportCtx().title = title;
     activeReportCtx().reportMd = reportMd;
     state.reportMd = reportMd;
@@ -766,6 +1260,10 @@ function applyRenamedReport(data) {
 }
 
 function startReportTitleEdit() {
+  if (reportInteractionBusy()) {
+    showToast('当前操作完成后才能修改报告名称', 'info');
+    return;
+  }
   const titleEl = $('report-title-display');
   const btn = $('btn-report-rename');
   const row = titleEl?.closest('.report-title-row');
@@ -832,10 +1330,15 @@ $('btn-report-rename')?.addEventListener('click', startReportTitleEdit);
 // ============================================================
 
 $('btn-export-word').addEventListener('click', () => {
+  if (state.reportVersionLoading || (state.viewMode === 'session' && state.sessionReport.running)) {
+    showToast('当前报告版本准备完成后再导出', 'info');
+    return;
+  }
+  const version = activeVersionNumber();
   if (state.viewMode === 'history' && state.historyId) {
-    window.location.href = `/api/export/word-history/${state.historyId}`;
+    window.location.href = withOptionalVersion(`/api/export/word-history/${state.historyId}`, version);
   } else {
-    window.location.href = `/api/export/word/${state.sessionId}`;
+    window.location.href = withOptionalVersion(`/api/export/word/${state.sessionId}`, version);
   }
 });
 
@@ -961,10 +1464,15 @@ $('btn-feishu-login').addEventListener('click', async () => {
 
 // ── 飞书文档导出 ──
 $('btn-export-pdf').addEventListener('click', () => {
+  if (state.reportVersionLoading || (state.viewMode === 'session' && state.sessionReport.running)) {
+    showToast('当前报告版本准备完成后再导出', 'info');
+    return;
+  }
+  const version = activeVersionNumber();
   if (state.viewMode === 'history' && state.historyId) {
-    window.location.href = `/api/export/pdf-history/${state.historyId}`;
+    window.location.href = withOptionalVersion(`/api/export/pdf-history/${state.historyId}`, version);
   } else if (state.sessionId) {
-    window.location.href = `/api/export/pdf/${state.sessionId}`;
+    window.location.href = withOptionalVersion(`/api/export/pdf/${state.sessionId}`, version);
   } else {
     showToast('还没有生成报告', 'error');
   }
@@ -1004,6 +1512,10 @@ function showFeishuConfirmModal(email) {
 }
 
 async function exportFeishu() {
+  if (state.reportVersionLoading || (state.viewMode === 'session' && state.sessionReport.running)) {
+    showToast('当前报告版本准备完成后再导出', 'info');
+    return;
+  }
   if (!state.feishu.configured) {
     showToast('服务端未配置飞书应用', 'error');
     return;
@@ -1018,14 +1530,23 @@ async function exportFeishu() {
   const confirmed = await showFeishuConfirmModal(email);
   if (!confirmed) return;
 
+  const exportMode = state.viewMode;
+  const exportReportId = activeReportId();
+  const exportVersion = activeVersionNumber();
+  const isSameExportTarget = () => (
+    state.viewMode === exportMode
+    && activeReportId() === exportReportId
+    && activeVersionNumber() === exportVersion
+  );
+
   const btn = $('btn-export-feishu');
   const original = btn.innerHTML;
   btn.disabled = true;
   btn.textContent = '导出中…';
 
-  const url = state.viewMode === 'history' && state.historyId
-    ? `/api/export/feishu-history/${state.historyId}`
-    : `/api/export/feishu/${state.sessionId}`;
+  const url = exportMode === 'history'
+    ? withOptionalVersion(`/api/export/feishu-history/${exportReportId}`, exportVersion)
+    : withOptionalVersion(`/api/export/feishu/${exportReportId}`, exportVersion);
   try {
     const resp = await fetch(url, { method: 'POST' });
     const data = await resp.json();
@@ -1033,9 +1554,10 @@ async function exportFeishu() {
       if (resp.status === 401) { showToast('飞书登录已过期，请重新登录', 'error'); await refreshFeishuStatus(); }
       throw new Error(data.detail || '生成失败');
     }
-    showFeishuLink(data.url);
-    try { await navigator.clipboard.writeText(data.url); showToast('飞书文档已创建，链接已复制，机器人消息已发送', 'success'); }
-    catch { showToast('飞书文档已创建，机器人消息已发送', 'success'); }
+    if (isSameExportTarget()) showFeishuLink(data.url);
+    const versionText = exportVersion ? `V${exportVersion}` : '当前报告';
+    try { await navigator.clipboard.writeText(data.url); showToast(`${versionText} 飞书文档已创建，链接已复制，机器人消息已发送`, 'success'); }
+    catch { showToast(`${versionText} 飞书文档已创建，机器人消息已发送`, 'success'); }
   } catch (e) {
     showToast(`导出飞书文档失败：${e.message}`, 'error', 10000);
   } finally {
@@ -1071,18 +1593,17 @@ document.addEventListener('click', e => {
   if (menu && dropdown && !dropdown.contains(e.target)) menu.classList.remove('open');
 });
 $('btn-export-md').addEventListener('click', () => {
-  if (state.viewMode === 'history') {
-    // 历史无专用 md 导出端点，直接用浏览器下载已渲染的 md
-    const blob = new Blob([state.reportMd || ''], { type: 'text/markdown;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `${($('report-title-display').textContent || '调研报告')}.md`;
-    a.click();
-    URL.revokeObjectURL(url);
-  } else {
-    window.location.href = `/api/export/markdown/${state.sessionId}`;
+  if (state.reportVersionLoading || (state.viewMode === 'session' && state.sessionReport.running)) {
+    showToast('当前报告版本准备完成后再导出', 'info');
+    return;
   }
+  const blob = new Blob([state.reportMd || ''], { type: 'text/markdown;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `${($('report-title-display').textContent || '调研报告')}.md`;
+  a.click();
+  URL.revokeObjectURL(url);
 });
 
 $('btn-qa-send').addEventListener('click', sendQA);
@@ -1091,16 +1612,28 @@ $('qa-input').addEventListener('keydown', e => {
 });
 
 async function sendQA() {
-  if (state.qaLoading) return;
+  if (
+    state.qaLoading
+    || state.reportVersionLoading
+    || (state.viewMode === 'session' && state.sessionReport.running)
+  ) return;
   const question = $('qa-input').value.trim();
   if (!question) return;
 
   state.qaLoading = true;
   $('btn-qa-send').disabled = true;
   $('qa-input').value = '';
+  updateReportVersionUi();
 
   const qaMode = state.viewMode;
   const qaCtx = activeReportCtx();
+  const qaReportId = activeReportId();
+  const qaVersion = activeVersionNumber(qaCtx);
+  const isSameQaTarget = () => (
+    state.viewMode === qaMode
+    && activeReportId() === qaReportId
+    && activeVersionNumber(activeReportCtx()) === qaVersion
+  );
   appendQABubble('user', question);
   let typingBubble = null;
 
@@ -1116,11 +1649,12 @@ async function sendQA() {
 
     const url = qaMode === 'history' ? '/api/history-qa' : '/api/qa';
     const body = qaMode === 'history'
-      ? { history_id: state.historyId, question }
-      : { session_id: state.sessionId, question };
+      ? { history_id: qaReportId, question, version: qaVersion }
+      : { session_id: qaReportId, question, version: qaVersion };
 
     await consumeSSEPost(url, body, ev => {
       if (ev.type === 'qa_scope') {
+        if (!isSameQaTarget()) return;
         const scopeBubble = appendQABubble('ai', `本次追问的信息范围：${ev.message}`);
         const typingMessage = typingBubble?.parentElement;
         if (typingMessage && scopeBubble?.parentElement === $('qa-messages')) {
@@ -1129,16 +1663,20 @@ async function sendQA() {
       }
       if (ev.type === 'chunk') {
         answer += ev.content;
-        ensureTypingBubble().innerHTML = renderMarkdown(answer);
-        typingBubble.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        if (isSameQaTarget()) {
+          ensureTypingBubble().innerHTML = renderMarkdown(answer);
+          typingBubble.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        }
       }
       if (ev.type === 'qa_done') {
         finalAnswer = ev.answer || answer;
-        ensureTypingBubble().innerHTML = renderMarkdown(finalAnswer);
+        if (isSameQaTarget()) {
+          ensureTypingBubble().innerHTML = renderMarkdown(finalAnswer);
+        }
       }
     });
     finalAnswer = finalAnswer || answer;
-    if (finalAnswer) {
+    if (finalAnswer && isSameQaTarget()) {
       qaCtx.qaMessages = normalizeQAMessages([
         ...(qaCtx.qaMessages || []),
         { role: 'user', content: question },
@@ -1157,8 +1695,9 @@ async function sendQA() {
     }
   } finally {
     state.qaLoading = false;
-    saveActiveReportUi();
+    if (isSameQaTarget()) saveActiveReportUi();
     applyQAAvailability();
+    updateReportVersionUi();
     $('qa-input').focus();
   }
 }

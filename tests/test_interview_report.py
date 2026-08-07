@@ -1,4 +1,6 @@
 import json
+from pathlib import Path
+import tempfile
 import unittest
 from io import BytesIO
 from unittest.mock import AsyncMock, patch
@@ -11,6 +13,7 @@ from app.core.interview_parsing import (
     serialize_interview_workbook,
 )
 from app.services import interview_service, report_history
+from app.storage import history as history_storage
 
 
 def _workbook_bytes() -> bytes:
@@ -959,20 +962,11 @@ class InterviewHistoryTests(unittest.TestCase):
             },
             "interview_audit": {"ok": True, "issues": []},
         }
-        saved = []
-
-        with (
-            patch.object(report_history, "_load_history", return_value=[]),
-            patch.object(report_history, "_ensure_history_report_numbers"),
-            patch.object(report_history, "_next_history_report_no", return_value="R-004"),
-            patch.object(
-                report_history,
-                "_trim_history_for_owner",
-                side_effect=lambda entries, _owner: entries,
-            ),
-            patch.object(report_history, "_save_history", side_effect=saved.append),
-        ):
-            entry = report_history.save_to_history("history-interview-1", session)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            history_path = Path(tmpdir) / "history.json"
+            with patch.object(history_storage, "HISTORY_FILE", str(history_path)):
+                entry = report_history.save_to_history("history-interview-1", session)
+            saved = json.loads(history_path.read_text(encoding="utf-8"))
 
         self.assertEqual(entry["mode"], "interview")
         self.assertEqual(entry["title"], "访谈洞察报告")
@@ -982,7 +976,7 @@ class InterviewHistoryTests(unittest.TestCase):
         self.assertEqual(entry["interview_research_focus"], "重点关注失败反馈")
         self.assertEqual(entry["interview_models_used"]["report"], ["gpt-5.6-sol"])
         self.assertTrue(entry["interview_audit"]["ok"])
-        self.assertEqual(saved[0][0]["id"], "history-interview-1")
+        self.assertEqual(saved[0]["id"], "history-interview-1")
 
     def test_confirm_review_issue_persists_history_and_live_session(self):
         entry = {
@@ -999,26 +993,26 @@ class InterviewHistoryTests(unittest.TestCase):
             },
         }
         session = {"mode": "interview", "interview_audit": entry["interview_audit"]}
-        saved_history = []
-
-        with (
-            patch.object(report_history, "_load_history", return_value=[entry]),
-            patch.object(
-                report_history,
-                "_ensure_history_report_numbers",
-                side_effect=lambda entries, save=False: entries,
-            ),
-            patch.object(report_history, "_find_history_for_login", return_value=entry),
-            patch.object(report_history, "_save_history", side_effect=saved_history.append),
-            patch.object(report_history, "get_session", return_value=session),
-            patch.object(report_history, "_visible_to_owner", return_value=True),
-            patch.object(report_history, "save_session") as save_session,
-        ):
-            result = report_history.confirm_interview_audit_issue(
-                "history-interview-2",
-                0,
-                {"email": "reviewer@example.com"},
-            )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            history_path = Path(tmpdir) / "history.json"
+            with patch.object(history_storage, "HISTORY_FILE", str(history_path)):
+                history_storage._save_history([entry])
+                with (
+                    patch.object(
+                        report_history,
+                        "_find_history_for_login",
+                        side_effect=lambda entries, _hist_id, _login: entries[0],
+                    ),
+                    patch.object(report_history, "get_session", return_value=session),
+                    patch.object(report_history, "_visible_to_owner", return_value=True),
+                    patch.object(report_history, "save_session") as save_session,
+                ):
+                    result = report_history.confirm_interview_audit_issue(
+                        "history-interview-2",
+                        0,
+                        {"email": "reviewer@example.com"},
+                    )
+                saved_history = history_storage._load_history()
 
         issue = result["interview_audit"]["issues"][0]
         self.assertEqual(issue["review_status"], "confirmed")
@@ -1028,7 +1022,7 @@ class InterviewHistoryTests(unittest.TestCase):
             session["interview_audit"]["issues"][0]["review_status"],
             "confirmed",
         )
-        self.assertEqual(saved_history[0][0]["id"], "history-interview-2")
+        self.assertEqual(saved_history[0]["id"], "history-interview-2")
         save_session.assert_called_once_with("history-interview-2", session)
 
 

@@ -108,7 +108,7 @@ DEFAULT_PROMPTS: dict = {
         order=30,
         kind="system",
         current=DEFAULT_SURVEY_PLANNER_SYSTEM_PROMPT,
-        version=2,
+        version=4,
     ),
     "crosstab_planner_system": _prompt(
         "crosstab_planner_system",
@@ -150,7 +150,7 @@ DEFAULT_PROMPTS: dict = {
         order=20,
         kind="instruction",
         current=DEFAULT_WRITER_REQUIREMENTS,
-        version=11,
+        version=13,
     ),
     "large_sample_writer_requirements": _prompt(
         "large_sample_writer_requirements",

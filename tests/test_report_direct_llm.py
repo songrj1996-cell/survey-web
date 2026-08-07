@@ -1,12 +1,77 @@
+import json
+from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import AsyncMock, patch
 
 from app.services import report_history
 from app.services import survey_service
-from app.services.report_engine import _describe_qa_context_scope
+from app.storage import history as history_storage
+from app.services.report_engine import (
+    _describe_qa_context_scope,
+    _resolve_core_coverage_review,
+)
+
+
+def _analysis_focus() -> dict:
+    return {
+        "core_question": "聊天消息丢失是否需要优先处理",
+        "report_organization": "按影响与风险组织，而不是逐题平铺",
+        "supporting_analyses": ["确认发生场景"],
+        "evidence_role": "玩家反馈用于解释丢失场景",
+        "expected_deliverables": ["修复优先级判断"],
+        "avoid_structures": ["不要只复述题目"],
+    }
+
+
+def _streamed_chunk_text(events: list[str]) -> str:
+    chunks = []
+    for event in events:
+        if not event.startswith("data: "):
+            continue
+        payload = json.loads(event.removeprefix("data: ").strip())
+        if payload.get("type") == "chunk":
+            chunks.append(payload.get("content", ""))
+    return "".join(chunks)
 
 
 class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
+    def test_core_coverage_review_pass_and_invalid_outputs_preserve_original(self):
+        original = (
+            "<!--CORE_START-->\n"
+            "## 核心结论\n"
+            "原始核心判断。\n"
+            "<!--CORE_END-->"
+        )
+
+        self.assertEqual(_resolve_core_coverage_review(original, "PASS"), original)
+        self.assertEqual(_resolve_core_coverage_review(original, "  PASS\n"), original)
+        for invalid in (
+            "",
+            "PASS\n补充说明",
+            "## 核心结论\n缺少完整标记",
+            "<!--CORE_START-->\n## 核心结论\n缺少结束标记",
+            (
+                "解释如下：\n<!--CORE_START-->\n## 核心结论\n替换内容。\n"
+                "<!--CORE_END-->"
+            ),
+            (
+                "<!--CORE_START-->\n## 核心结论\n"
+                "针对这个问题，本次调研的结果并不是单一方向的。\n"
+                "<!--CORE_END-->"
+            ),
+            (
+                "<!--CORE_START-->\n## 核心结论\n"
+                "关于使用习惯是否影响复杂度，证据显示两者相关。\n"
+                "<!--CORE_END-->"
+            ),
+        ):
+            with self.subTest(invalid=invalid):
+                self.assertEqual(
+                    _resolve_core_coverage_review(original, invalid),
+                    original,
+                )
+
     def test_qa_context_scope_reports_full_sampled_and_missing_feedback(self):
         full_context = '<qa_context><rows>\n{"id": "p-1"}\n{"id": "p-2"}\n</rows></qa_context>'
         sampled_context = (
@@ -47,7 +112,7 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sess["qa_provider"], "direct_llm")
         self.assertEqual(sess["qa_model"], "claude-sonnet-5")
 
-    async def test_standard_report_uses_direct_writer_and_builds_qa_context(self):
+    async def test_valid_core_review_replaces_only_core_and_builds_qa_context(self):
         sess = {
             "filename": "responses.xlsx",
             "rows": [["玩家ID", "聊天反馈"], ["p-1", "消息会消失"]],
@@ -55,6 +120,7 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
                 "columns": [{"index": 1, "name": "聊天反馈", "role": "open_text"}],
                 "parts": [{"name": "聊天体验", "column_indexes": [1]}],
                 "branch_rules": [],
+                "analysis_focus": _analysis_focus(),
             },
             "branch_rules": [],
             "stats_md": "有效样本(总计):总体=1",
@@ -66,7 +132,14 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
             ("# 聊天功能调研", "model-a"),
             ("## Part 1 聊天体验\n\n本节总结。", "model-a"),
             ("NONE", "model-a"),
-            ("<!--CORE_START-->\n## 核心结论\n样本总数 1。\n<!--CORE_END-->", "model-a"),
+            (
+                "<!--CORE_START-->\n## 核心结论\n旧核心判断。\n<!--CORE_END-->",
+                "model-a",
+            ),
+            (
+                "<!--CORE_START-->\n## 核心结论\n覆盖审校后的核心判断。\n<!--CORE_END-->",
+                "model-a",
+            ),
             ("## 行动建议\n\n**修复消息丢失**", "model-a"),
         ])
 
@@ -81,7 +154,7 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
         ):
             events = [event async for event in survey_service.report_stream("sid", object())]
 
-        self.assertEqual(direct.await_count, 5)
+        self.assertEqual(direct.await_count, 6)
         self.assertTrue(any('"type": "report_done"' in event for event in events))
         self.assertEqual(sess["report_writer_provider"], "direct_llm")
         self.assertEqual(sess["report_writer_model"], "model-a")
@@ -90,8 +163,61 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("<report>", sess["qa_context_md"])
         self.assertIn("聊天功能调研", sess["qa_context_md"])
         self.assertIn("消息会消失", sess["qa_context_md"])
+        self.assertIn("覆盖审校后的核心判断", sess["report_md"])
+        self.assertNotIn("旧核心判断", sess["report_md"])
+        streamed_text = _streamed_chunk_text(events)
+        self.assertIn("覆盖审校后的核心判断", streamed_text)
+        self.assertNotIn("旧核心判断", streamed_text)
+        self.assertIn("## Part 1 聊天体验", sess["report_md"])
+        self.assertIn("## 行动建议", sess["report_md"])
         save_session.assert_called_once()
         save_history.assert_called_once()
+
+    async def test_core_review_failure_keeps_original_and_continues_report(self):
+        sess = {
+            "filename": "responses.xlsx",
+            "rows": [["玩家ID", "聊天反馈"], ["p-1", "消息会消失"]],
+            "plan": {
+                "columns": [{"index": 1, "name": "聊天反馈", "role": "open_text"}],
+                "parts": [{"name": "聊天体验", "column_indexes": [1]}],
+                "branch_rules": [],
+                "analysis_focus": _analysis_focus(),
+            },
+            "branch_rules": [],
+            "stats_md": "有效样本(总计):总体=1",
+            "open_text": {
+                1: [{"ids": {"玩家ID": "p-1"}, "profile": {}, "text": "消息会消失"}],
+            },
+        }
+        original_core = (
+            "<!--CORE_START-->\n## 核心结论\n原始核心判断。\n<!--CORE_END-->"
+        )
+        direct = AsyncMock(side_effect=[
+            ("# 聊天功能调研", "model-a"),
+            ("## Part 1 聊天体验\n\n本节总结。", "model-a"),
+            ("NONE", "model-a"),
+            (original_core, "model-a"),
+            RuntimeError("review unavailable"),
+            ("## 行动建议\n\n**修复消息丢失**", "model-a"),
+        ])
+
+        with (
+            patch.object(survey_service, "get_session", return_value=sess),
+            patch.object(survey_service, "_current_login", new=AsyncMock(return_value=None)),
+            patch.object(survey_service, "_direct_writer_round", new=direct),
+            patch.object(survey_service, "save_session"),
+            patch.object(survey_service, "save_to_history"),
+            patch.object(survey_service, "audit_log", new=AsyncMock()),
+            patch.object(survey_service.survey_stats, "find_numbers_not_in_stats", return_value=[]),
+        ):
+            events = [event async for event in survey_service.report_stream("sid", object())]
+
+        self.assertEqual(direct.await_count, 6)
+        self.assertTrue(any("核心结论覆盖复核未完成" in event for event in events))
+        self.assertTrue(any('"type": "report_done"' in event for event in events))
+        self.assertIn("原始核心判断", sess["report_md"])
+        self.assertIn("原始核心判断", _streamed_chunk_text(events))
+        self.assertIn("## 行动建议", sess["report_md"])
 
     async def test_action_section_is_repaired_without_streaming_invalid_attempt(self):
         sess = {
@@ -253,14 +379,11 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
             "rows_fed": False,
             "rows": [["id"], ["1"], ["2"]],
         }
-        saved = []
-        with (
-            patch.object(report_history, "_load_history", return_value=[]),
-            patch.object(report_history, "_save_history", side_effect=lambda value: saved.extend(value)),
-            patch.object(report_history, "_ensure_history_report_numbers"),
-            patch.object(report_history, "_next_history_report_no", return_value="R-001"),
-        ):
-            report_history.save_to_history("sid", sess)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            history_path = Path(tmpdir) / "history.json"
+            with patch.object(history_storage, "HISTORY_FILE", str(history_path)):
+                report_history.save_to_history("sid", sess)
+            saved = json.loads(history_path.read_text(encoding="utf-8"))
 
         self.assertEqual(saved[0]["qa_context_md"], sess["qa_context_md"])
         self.assertEqual(saved[0]["report_writer_provider"], "direct_llm")

@@ -122,6 +122,7 @@ async function handleUpload(file, { sourceType = 'google', questionnaireFile = n
     state.questionnaireUsed = !!data.questionnaire_used;
     state.viewMode = 'session';
     state.historyId = null;
+    state.reportVersionLoading = false;
     clearPlanInput();
     currentContextFileSignature = uploadSignature;
     const draft = loadContextDraft();
@@ -143,6 +144,7 @@ async function handleUpload(file, { sourceType = 'google', questionnaireFile = n
       feishuLinkHtml: '',
       running: false,
       stream: '',
+      generatingVersion: null,
     };
     renderUploadedFileState(
       data.filename,
@@ -282,6 +284,7 @@ const CONTEXT_FIELD_IDS = {
   problem: 'ctx-problem',
   key_concerns: 'ctx-key-concerns',
   target_users: 'ctx-target-users',
+  analysis_approach: 'ctx-analysis-approach',
 };
 let currentContextFileSignature = '';
 
@@ -399,6 +402,64 @@ function refreshContextFormVisibility() {
   const draft = loadContextDraftForCurrentFile();
   if (draft) writeContextForm(draft);
 }
+
+let duplicateReportResolve = null;
+
+function duplicateReportHistoryId(report) {
+  return String(report?.history_id || report?.id || '').trim();
+}
+
+function closeDuplicateReportModal(result) {
+  const modal = $('duplicate-report-modal');
+  if (modal) modal.hidden = true;
+  document.body.style.removeProperty('overflow');
+  if (duplicateReportResolve) {
+    const resolve = duplicateReportResolve;
+    duplicateReportResolve = null;
+    resolve(result);
+  }
+}
+
+function promptDuplicateReport(report) {
+  const modal = $('duplicate-report-modal');
+  if (!modal || !duplicateReportHistoryId(report)) return Promise.resolve(null);
+  const versionCount = Number(report?.version_count || 1) || 1;
+  const activeVersion = Number(report?.active_version || versionCount) || versionCount;
+  let createdText = '';
+  if (report?.created_at) {
+    const created = new Date(report.created_at);
+    if (!Number.isNaN(created.getTime())) createdText = created.toLocaleString('zh-CN', { hour12: false });
+  }
+  $('duplicate-report-number').textContent = String(report?.report_no || '已有报告');
+  $('duplicate-report-name').textContent = String(report?.title || '分析报告');
+  $('duplicate-report-meta').textContent = [
+    createdText,
+    `${versionCount} 个版本`,
+    `当前 V${activeVersion}`,
+  ].filter(Boolean).join(' · ');
+  const instruction = $('duplicate-report-instruction');
+  if (instruction) instruction.value = '';
+  $('duplicate-report-empty-warning').hidden = false;
+  modal.hidden = false;
+  document.body.style.overflow = 'hidden';
+  window.setTimeout(() => instruction?.focus(), 50);
+  return new Promise(resolve => {
+    duplicateReportResolve = resolve;
+  });
+}
+
+$('duplicate-report-instruction')?.addEventListener('input', e => {
+  $('duplicate-report-empty-warning').hidden = !!e.target.value.trim();
+});
+$('btn-duplicate-report-view')?.addEventListener('click', () => {
+  closeDuplicateReportModal({ action: 'view', instruction: '' });
+});
+$('btn-duplicate-report-rerun')?.addEventListener('click', () => {
+  closeDuplicateReportModal({
+    action: 'rerun',
+    instruction: $('duplicate-report-instruction')?.value.trim() || '',
+  });
+});
 
 function optionEditorHTML(i, c) {
   const options = [...(c.options || [])];
@@ -856,6 +917,7 @@ async function startPlan() {
   const btn = $('btn-start-plan');
   if (btn) btn.disabled = true;
   clearPlanInput();
+  let confirmData = null;
 
   // 跑数表模式:列已在上传时确定性建好,跳过题型确认;其余模式先存用户确认的题型
   if (state.mode !== 'crosstab') {
@@ -866,9 +928,9 @@ async function startPlan() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ columns }),
       });
+      confirmData = await resp.json().catch(() => ({}));
       if (!resp.ok) {
-        const d = await resp.json();
-        throw new Error(d.detail || '保存题型失败');
+        throw new Error(confirmData.detail || '保存题型失败');
       }
     } catch (e) {
       showToast(`保存题型失败：${e.message}`, 'error');
@@ -886,6 +948,7 @@ async function startPlan() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(ctx),
         });
+        const ctxData = await ctxResp.json().catch(() => ({}));
         if (!ctxResp.ok) {
           if (ctxResp.status === 404) {
             saveContextDraft();
@@ -895,13 +958,61 @@ async function startPlan() {
               'error', 6000,
             );
           } else {
-            showToast('保存调研背景失败，请重试', 'error');
+            showToast(ctxData.detail || '保存调研背景失败，请重试', 'error');
           }
           if (btn) btn.disabled = false;
           return;
         }
+        if (ctxData.duplicate_report) {
+          const duplicate = ctxData.duplicate_report;
+          const historyId = duplicateReportHistoryId(duplicate);
+          const decision = await promptDuplicateReport(duplicate);
+          if (!decision || !historyId) {
+            if (btn) btn.disabled = false;
+            return;
+          }
+          if (decision.action === 'view') {
+            if (btn) btn.disabled = false;
+            if (typeof openHistoryEntry !== 'function') throw new Error('历史报告入口尚未加载，请刷新页面后重试');
+            await openHistoryEntry(historyId);
+            return;
+          }
+          if (decision.action === 'rerun') {
+            const prepareResp = await fetch(`/api/report/${state.sessionId}/prepare-rerun`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                history_id: historyId,
+                instruction: decision.instruction,
+                base_version: duplicate.active_version || null,
+              }),
+            });
+            const prepared = await prepareResp.json().catch(() => ({}));
+            if (!prepareResp.ok) throw new Error(prepared.detail || '准备重新生成失败');
+            const baseVersion = Number(prepared.base_version || duplicate.active_version || 1) || 1;
+            const targetVersion = Number(
+              prepared.target_version || (Number(duplicate.version_count || 1) + 1),
+            ) || 2;
+            state.planData = prepared.plan || state.planData;
+            state.sessionReport.pendingVersionRequest = {
+              linkedHistoryId: historyId,
+              baseVersion,
+              targetVersion,
+              instruction: String(prepared.instruction ?? decision.instruction ?? '').trim(),
+            };
+            const generated = await runStats({
+              linkedRerun: true,
+              historyId,
+              baseVersion,
+              targetVersion,
+              instruction: state.sessionReport.pendingVersionRequest.instruction,
+            });
+            if (!generated && btn) btn.disabled = false;
+            return;
+          }
+        }
       } catch (e) {
-        showToast(`保存调研背景失败：${e.message}`, 'error');
+        showToast(`无法继续：${e.message}`, 'error');
         if (btn) btn.disabled = false;
         return;
       }
@@ -943,6 +1054,7 @@ function showPlanCard(plan, headers) {
   $('plan-thinking').style.display = 'none';
   $('plan-card').style.display = 'block';
   $('plan-card-content').innerHTML = buildPlanHTML(plan, headers);
+  $('plan-input').disabled = false;
   clearPlanInput();
   // 确保按钮状态与输入框同步（修订后面板可能处于 disabled 残留）
   $('btn-plan-ok').disabled = false;
@@ -1082,6 +1194,39 @@ function buildPlanHTML(plan, headers) {
     return itemHTML;
   };
 
+  const analysisFocus = plan.analysis_focus && typeof plan.analysis_focus === 'object'
+    ? plan.analysis_focus
+    : null;
+  if (analysisFocus) {
+    const focusText = value => (Array.isArray(value) ? value : [value])
+      .map(item => String(item || '').trim())
+      .filter(Boolean)
+      .join('；');
+    const focusItems = [
+      ['核心问题', focusText(analysisFocus.core_question)],
+      ['报告主线', focusText(analysisFocus.report_organization)],
+      ['辅助分析', focusText(analysisFocus.supporting_analyses)],
+      ['证据作用', focusText(analysisFocus.evidence_role)],
+      ['预期交付', focusText(analysisFocus.expected_deliverables)],
+      ['避免结构', focusText(analysisFocus.avoid_structures)],
+    ].filter(([, value]) => value);
+
+    if (focusItems.length) {
+      html += `<section class="plan-focus-card" aria-label="本次分析重点">
+        <div class="plan-focus-card__title">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4"/><path d="M12 2v3M22 12h-3M12 22v-3M2 12h3"/></svg>
+          本次分析重点
+        </div>
+        <div class="plan-focus-card__items">
+          ${focusItems.map(([label, value]) => `<div class="plan-focus-card__item">
+            <span class="plan-focus-card__label">${esc(label)}</span>
+            <span class="plan-focus-card__value">${esc(value)}</span>
+          </div>`).join('')}
+        </div>
+      </section>`;
+    }
+  }
+
   // 1. 报告章节大纲
   html += `<div class="plan-section">
     <div class="plan-section__title">
@@ -1215,32 +1360,67 @@ $('btn-plan-ok').addEventListener('click', () => {
 $('btn-plan-revise').addEventListener('click', () => {
   const txt = $('plan-input').value.trim();
   if (!txt) { showToast('请先输入修改意见', 'info'); return; }
-  clearPlanInput();
   confirmPlan(txt);
 });
 $('plan-input').addEventListener('input', syncPlanActionButtons);
 $('plan-input').addEventListener('keydown', e => {
-  if (e.key === 'Enter' && !e.shiftKey) {
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
     e.preventDefault();
     const txt = $('plan-input').value.trim();
     if (txt) {
-      clearPlanInput();
       confirmPlan(txt);
     }
   }
 });
 
 async function confirmPlan(text) {
+  $('plan-input').disabled = true;
   $('btn-plan-ok').disabled = true;
   $('btn-plan-revise').disabled = true;
 
   try {
     let approved = false;
+    let approvalWarning = '';
     let newPlan = null;
     let newHeaders = null;
 
     if (text.toLowerCase() === 'ok') {
-      approved = true;
+      $('plan-thinking').style.display = 'flex';
+      $('plan-thinking').querySelector('.thinking-block__title').textContent = '正在确认方案…';
+      $('plan-stream-text').textContent = '';
+      $('plan-card').style.display = 'none';
+
+      await consumeSSEPost('/api/plan/confirm', {
+        session_id: state.sessionId,
+        user_text: text,
+      }, ev => {
+        if (ev.type === 'progress') {
+          const el = $('plan-stream-text');
+          el.textContent = ev.message;
+          _updateProgressStatus(ev.message);
+        }
+        if (ev.type === 'chunk') {
+          const el = $('plan-stream-text');
+          el.textContent += ev.content;
+          el.scrollTop = el.scrollHeight;
+        }
+        if (ev.type === 'plan_ready') {
+          newPlan = ev.plan;
+          newHeaders = ev.headers;
+        }
+        if (ev.type === 'json' && ev.approved) {
+          approved = true;
+          approvalWarning = String(ev.warning || '').trim();
+        }
+      });
+
+      if (newPlan) {
+        state.planData = newPlan;
+        showPlanCard(newPlan, newHeaders);
+        showToast('方案已修订，请再次确认', 'success');
+        return;
+      }
+      if (!approved) throw new Error('未收到确认结果，请重试');
     } else {
       $('plan-thinking').style.display = 'flex';
       $('plan-thinking').querySelector('.thinking-block__title').textContent = 'AI 正在修订方案…';
@@ -1277,9 +1457,11 @@ async function confirmPlan(text) {
         showToast('方案已修订，请再次确认', 'success');
         return;
       }
+      if (!approved) throw new Error('未收到修订后的方案，请重试');
     }
 
     if (approved) {
+      if (approvalWarning) showToast(approvalWarning, 'info', 8000);
       await runStats();
     }
   } catch (e) {
@@ -1289,6 +1471,7 @@ async function confirmPlan(text) {
       $('plan-thinking').style.display = 'none';
       $('plan-card').style.display = 'block';
     }
+    $('plan-input').disabled = false;
     syncPlanActionButtons();
   }
 }

@@ -10,6 +10,7 @@ const historyState = {
     to: '',
   },
 };
+let historyEntryLoadSerial = 0;
 
 function openHistoryDrawer() {
   openDrawer('history-drawer');
@@ -30,6 +31,41 @@ async function loadHistory() {
   } catch (e) {
     body.innerHTML = `<div class="hist-empty">加载历史失败：${esc(e.message)}</div>`;
   }
+}
+
+async function refreshHistoryEntryAfterGeneration(historyId) {
+  const targetId = String(historyId || '').trim();
+  if (!targetId) return null;
+
+  const listResp = await fetch('/api/history');
+  const list = await listResp.json().catch(() => []);
+  if (!listResp.ok) throw new Error((list && list.detail) || '刷新历史记录失败');
+  historyState.all = Array.isArray(list) ? list : [];
+  const summary = historyState.all.find(item => String(item.id) === targetId) || null;
+  if ($('history-drawer')?.classList.contains('drawer--open')) renderHistoryPanel();
+
+  const isActiveTarget = state.viewMode === 'history'
+    && String(state.historyReport.id || state.historyId || '') === targetId;
+  if (isActiveTarget) {
+    const selectedVersion = activeVersionNumber(state.historyReport);
+    const detailUrl = selectedVersion
+      ? `/api/history/${encodeURIComponent(targetId)}?version=${encodeURIComponent(selectedVersion)}`
+      : `/api/history/${encodeURIComponent(targetId)}`;
+    const detailResp = await fetch(detailUrl);
+    const detail = await detailResp.json().catch(() => ({}));
+    if (detailResp.ok && state.viewMode === 'history' && String(state.historyReport.id || '') === targetId) {
+      syncReportVersionMeta(state.historyReport, {
+        versions: detail.report_versions || summary?.report_versions || [],
+        active_version: detail.active_report_version || detail.active_version || summary?.active_report_version,
+        selected_version: selectedVersion,
+        max_versions: detail.max_versions || summary?.max_versions,
+        can_generate_version: false,
+      });
+      updateReportVersionUi();
+      updateReportContextSwitch();
+    }
+  }
+  return summary;
 }
 
 function renderHistoryPanel() {
@@ -145,6 +181,7 @@ function renderHistoryCard(h) {
   const source = historySourceMeta(h.mode);
   const qa = historyQaMeta(h);
   const quantity = historyQuantityText(h);
+  const versionCount = Number(h.version_count || h.report_versions?.length || 0);
   const action = h.mode === 'annotate'
     ? `<button class="hist-card__edit hist-card__download" type="button" data-hist-download title="下载标注结果" aria-label="下载标注结果">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -165,6 +202,7 @@ function renderHistoryCard(h) {
     <div class="hist-card hist-card--${esc(source.key)}${isActive ? ' hist-card--active' : ''}" data-hist-id="${esc(h.id)}" data-hist-mode="${esc(h.mode || '')}">
       <div class="hist-card__top">
         <span class="hist-card__no">${esc(reportNo)}</span>
+        ${versionCount > 1 ? `<span class="hist-card__qa hist-card__qa--done">${esc(versionCount)} 个版本</span>` : ''}
         <span class="hist-card__source hist-card__source--${esc(source.key)}">${esc(source.label)}</span>
       </div>
       <div class="hist-card__title-row">
@@ -263,10 +301,30 @@ $('history-body').addEventListener('click', async e => {
 });
 
 async function openHistoryEntry(id) {
+  if (state.qaLoading || state.reportVersionLoading) {
+    showToast('当前操作完成后才能切换历史报告', 'info');
+    return;
+  }
+  const requestId = ++historyEntryLoadSerial;
+  state.historyLoading = true;
+  updateReportVersionUi();
+  applyQAAvailability();
   try {
     const resp = await fetch(`/api/history/${id}`);
     const entry = await resp.json();
+    if (requestId !== historyEntryLoadSerial) return;
     if (!resp.ok) throw new Error(entry.detail || '加载失败');
+    if (state.qaLoading || state.reportVersionLoading) {
+      showToast('当前操作完成后才能切换历史报告', 'info');
+      return;
+    }
+    if (state.sessionReport.running && ['interview', 'comment', 'annotate'].includes(entry.mode)) {
+      showToast('新报告生成期间可查看问卷历史报告；其他类型请在生成完成后打开', 'info');
+      return;
+    }
+    state.historyLoading = false;
+    updateReportVersionUi();
+    applyQAAvailability();
 
     if (entry.mode === 'interview') {
       closeDrawer('history-drawer');
@@ -308,6 +366,14 @@ async function openHistoryEntry(id) {
     state.historyReport.mode = entry.mode || 'survey';
     state.historyReport.analystConvId = entry.analyst_conv_id || null;
     state.historyReport.planData = entry.plan || null;
+    syncReportVersionMeta(state.historyReport, {
+      versions: entry.report_versions || [],
+      active_version: entry.active_report_version || entry.version,
+      version: entry.active_report_version || entry.version,
+      selected_version: entry.active_report_version || entry.version,
+      max_versions: entry.max_versions,
+      can_generate_version: entry.can_generate_version,
+    });
     state.historyReport.qaMessages = normalizeQAMessages(entry.qa_messages);
     state.historyReport.qaHtml = '';
     state.historyReport.feishuLinkHtml = '';
@@ -318,11 +384,23 @@ async function openHistoryEntry(id) {
     renderReportWorkspace(entry.report_md, { preserveQa: true });
     showToast('已载入历史报告', 'success');
   } catch (err) {
-    showToast(`载入失败：${err.message}`, 'error');
+    if (requestId === historyEntryLoadSerial) {
+      showToast(`载入失败：${err.message}`, 'error');
+    }
+  } finally {
+    if (requestId === historyEntryLoadSerial) {
+      state.historyLoading = false;
+      updateReportVersionUi();
+      applyQAAvailability();
+    }
   }
 }
 
 function startHistoryTitleEdit(card) {
+  if (state.qaLoading || state.reportVersionLoading || state.historyLoading || state.sessionReport.running) {
+    showToast('当前操作完成后才能修改报告名称', 'info');
+    return;
+  }
   if (!card || card.querySelector('.hist-card-title-edit')) return;
   const titleEl = card.querySelector('[data-hist-title]');
   const editBtn = card.querySelector('[data-hist-edit]');

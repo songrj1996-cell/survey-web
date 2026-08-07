@@ -138,8 +138,12 @@ class PromptCatalogTests(unittest.TestCase):
             prompt_storage.DEFAULT_PROMPTS["column_detect_system"]["current"],
         )
         self.assertEqual(migrated["column_detect_system"]["version"], 2)
-        self.assertEqual(migrated["survey_planner_system"]["version"], 2)
-        self.assertEqual(migrated["writer_requirements"]["version"], 11)
+        self.assertEqual(migrated["survey_planner_system"]["version"], 4)
+        self.assertEqual(migrated["writer_requirements"]["version"], 13)
+        self.assertEqual(
+            migrated["writer_requirements"]["current"],
+            prompt_storage.DEFAULT_PROMPTS["writer_requirements"]["current"],
+        )
         self.assertEqual(migrated["planner_extra"]["current"], "CUSTOM_PLANNER_EXTRA")
         self.assertEqual(migrated["planner_extra"]["version"], 3)
         self.assertEqual(len(migrated["planner_extra"]["history"]), 1)
@@ -147,6 +151,56 @@ class PromptCatalogTests(unittest.TestCase):
         self.assertNotIn("dify_url", migrated["column_detect_system"])
         self.assertEqual(migrated["future_prompt"]["current"], "keep me")
         self.assertIn("dify_analyst_system", migrated)
+
+    def test_version_bumps_refresh_defaults_but_preserve_custom_content(self):
+        for key, previous_version in (
+            ("survey_planner_system", 3),
+            ("writer_requirements", 11),
+        ):
+            with self.subTest(key=key, content="default"):
+                stored = deepcopy(prompt_storage.DEFAULT_PROMPTS[key])
+                stored.update({
+                    "current": "OUTDATED_DEFAULT",
+                    "history": [],
+                    "version": previous_version,
+                })
+
+                prompt_storage._sync_entry(
+                    stored,
+                    prompt_storage.DEFAULT_PROMPTS[key],
+                )
+
+                self.assertEqual(
+                    stored["current"],
+                    prompt_storage.DEFAULT_PROMPTS[key]["current"],
+                )
+                self.assertEqual(
+                    stored["version"],
+                    prompt_storage.DEFAULT_PROMPTS[key]["version"],
+                )
+
+            with self.subTest(key=key, content="custom"):
+                stored = deepcopy(prompt_storage.DEFAULT_PROMPTS[key])
+                stored.update({
+                    "current": f"CUSTOM_{key}",
+                    "history": [{
+                        "ts": "2026-01-01",
+                        "content": "earlier content",
+                        "note": "customized",
+                    }],
+                    "version": previous_version,
+                })
+
+                prompt_storage._sync_entry(
+                    stored,
+                    prompt_storage.DEFAULT_PROMPTS[key],
+                )
+
+                self.assertEqual(stored["current"], f"CUSTOM_{key}")
+                self.assertEqual(
+                    stored["version"],
+                    prompt_storage.DEFAULT_PROMPTS[key]["version"],
+                )
 
     def test_catalog_api_filters_unknown_and_legacy_entries(self):
         with tempfile.TemporaryDirectory(prefix="prompt-api-test-") as temp_dir:
