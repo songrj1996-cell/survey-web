@@ -150,7 +150,7 @@ DEFAULT_PROMPTS: dict = {
         order=20,
         kind="instruction",
         current=DEFAULT_WRITER_REQUIREMENTS,
-        version=13,
+        version=14,
     ),
     "large_sample_writer_requirements": _prompt(
         "large_sample_writer_requirements",

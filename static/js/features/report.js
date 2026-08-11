@@ -67,6 +67,51 @@ function _parseReportProgress(message) {
   };
 }
 
+function _appendReportPreparationStep(steps, message) {
+  const text = String(message || '').trim();
+  if (!text) return;
+  const previous = steps.at(-1);
+  if (previous?.text === text) return;
+  if (previous) previous.status = 'done';
+  steps.push({ text, status: 'active' });
+  if (steps.length > 80) steps.splice(0, steps.length - 80);
+}
+
+function _renderReportPreparationSteps(element, steps) {
+  if (!element) return;
+  element.textContent = '';
+  element.classList.add('report-stream-content--waiting');
+
+  const intro = document.createElement('div');
+  intro.className = 'report-preparation__intro';
+  intro.textContent = '报告正文展示前，系统正在完成以下处理与生成步骤：';
+  element.append(intro);
+
+  const list = document.createElement('ol');
+  list.className = 'report-preparation';
+  for (const step of steps) {
+    const item = document.createElement('li');
+    item.className = `report-preparation__item report-preparation__item--${step.status}`;
+
+    const marker = document.createElement('span');
+    marker.className = 'report-preparation__marker';
+    marker.setAttribute('aria-hidden', 'true');
+
+    const copy = document.createElement('span');
+    copy.className = 'report-preparation__copy';
+    copy.textContent = step.text;
+
+    const status = document.createElement('span');
+    status.className = 'report-preparation__status';
+    status.textContent = step.status === 'done' ? '已完成' : '进行中';
+
+    item.append(marker, copy, status);
+    list.append(item);
+  }
+  element.append(list);
+  element.scrollTop = element.scrollHeight;
+}
+
 const EMPTY_RERUN_INSTRUCTION = '未填写补充要求，本次为重新生成';
 
 function normalizeReportVersions(versions) {
@@ -377,6 +422,7 @@ async function runStats(options = {}) {
     let totalSteps = 0;
     let currentTask = '正在准备报告内容';
     let completedSteps = 0;
+    const preparationSteps = [];
     let stepStartedAt = Date.now();
     let lastSignalAt = Date.now();
 
@@ -432,8 +478,8 @@ async function runStats(options = {}) {
         renderGenerationStatus();
         const el = $('report-stream-content');
         if (el && !fullReport) {
-          el.textContent = '当前章节或模块完成并校验后，将在这里显示。';
-          el.classList.add('report-stream-content--waiting');
+          _appendReportPreparationStep(preparationSteps, ev.message);
+          _renderReportPreparationSteps(el, preparationSteps);
         }
       }
       if (ev.type === 'heartbeat') renderGenerationStatus();

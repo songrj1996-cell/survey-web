@@ -76,6 +76,10 @@ from app.services.questionnaire_import import (
     parse_bested_qualitative_upload,
     parse_questionnaire_translations,
 )
+from app.services.qualitative_viewpoints import (
+    build_report_viewpoint_stats,
+    render_viewpoint_stats,
+)
 from app.services.report_engine import (
     _batch_qualitative_analysis,
     _build_analysis_approach_block,
@@ -1492,7 +1496,13 @@ async def report_stream(
             yield sse_event({"type": "progress", "message": start_msg})
             clustered_themes: dict = {}
             cluster_diagnostics: dict = {}
-            async for item in _batch_qualitative_analysis(open_text, plan, rows[0], session_id):
+            async for item in _batch_qualitative_analysis(
+                open_text,
+                plan,
+                rows[0],
+                session_id,
+                deduplicate_respondents=not quantitative_first and not is_crosstab,
+            ):
                 if item[0] == "progress":
                     yield sse_event({"type": "progress", "message": item[1]})
                 elif item[0] == "heartbeat":
@@ -1516,11 +1526,28 @@ async def report_stream(
                     msg += f"等 {len(failed_cols)} 列"
                 yield sse_event({"type": "progress", "message": msg})
 
+            viewpoint_stats_md = ""
+            if not quantitative_first and not is_crosstab:
+                report_viewpoints: list[dict] = []
+                async for item in build_report_viewpoint_stats(
+                    clustered_themes, open_text, plan, rows[0]
+                ):
+                    if item[0] == "progress":
+                        yield sse_event({"type": "progress", "message": item[1]})
+                    elif item[0] == "heartbeat":
+                        yield sse_event({"type": "heartbeat"})
+                    elif item[0] == "result":
+                        report_viewpoints = item[1]
+                viewpoint_stats_md = render_viewpoint_stats(
+                    clustered_themes, report_viewpoints
+                )
+
             yield sse_event({"type": "progress", "message": "主题分析完成，开始生成报告..."})
             writer_query = _build_large_sample_writer_query(
                 stats_md, clustered_themes, plan, rows[0], open_text,
                 qualitative_context=qualitative_context,
                 quantitative_first=quantitative_first,
+                viewpoint_stats_md=viewpoint_stats_md,
             )
             writer_query = (
                 _build_report_generation_instruction_block(prompt_instruction)
@@ -1549,6 +1576,40 @@ async def report_stream(
             for event in _content_events(full_report):
                 yield event
         else:
+            viewpoint_stats_md = ""
+            if not quantitative_first and open_text:
+                yield sse_event({
+                    "type": "progress",
+                    "message": "正在提炼主观题观点并按玩家去重统计提及人数...",
+                })
+                clustered_themes: dict = {}
+                async for item in _batch_qualitative_analysis(
+                    open_text,
+                    plan,
+                    rows[0],
+                    session_id,
+                    deduplicate_respondents=True,
+                ):
+                    if item[0] == "progress":
+                        yield sse_event({"type": "progress", "message": item[1]})
+                    elif item[0] == "heartbeat":
+                        yield sse_event({"type": "heartbeat"})
+                    elif item[0] == "result":
+                        clustered_themes = item[1]
+
+                report_viewpoints: list[dict] = []
+                async for item in build_report_viewpoint_stats(
+                    clustered_themes, open_text, plan, rows[0]
+                ):
+                    if item[0] == "progress":
+                        yield sse_event({"type": "progress", "message": item[1]})
+                    elif item[0] == "heartbeat":
+                        yield sse_event({"type": "heartbeat"})
+                    elif item[0] == "result":
+                        report_viewpoints = item[1]
+                viewpoint_stats_md = render_viewpoint_stats(
+                    clustered_themes, report_viewpoints
+                )
             parts_meta = _writer_parts_meta(plan, rows[0])
 
             async def _round(query: str):
@@ -1570,6 +1631,7 @@ async def report_stream(
                 rows[0],
                 qualitative_context=qualitative_context,
                 analysis_focus=analysis_focus,
+                viewpoint_stats_md=viewpoint_stats_md,
             )
             first_q = (
                 _build_report_generation_instruction_block(prompt_instruction)
@@ -1709,7 +1771,10 @@ async def report_stream(
         else:
             full_report = inject_qualitative_stats(full_report, stats_md, plan)
 
-        drifted = survey_stats.find_numbers_not_in_stats(full_report, stats_md)
+        numeric_sources = "\n".join(
+            source for source in (stats_md, viewpoint_stats_md) if source
+        )
+        drifted = survey_stats.find_numbers_not_in_stats(full_report, numeric_sources)
         if drifted:
             print(f"[stats] WARN drifted numbers: {drifted[:20]}")
 

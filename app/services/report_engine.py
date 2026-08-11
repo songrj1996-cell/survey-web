@@ -1063,6 +1063,8 @@ async def _batch_qualitative_analysis(
     plan: dict,
     headers: list,
     session_id: str,
+    *,
+    deduplicate_respondents: bool = False,
 ):
     """大样本定性分析四阶段批处理。
 
@@ -1094,7 +1096,19 @@ async def _batch_qualitative_analysis(
         if filter_desc:
             col_name = f"Part {part_index} {part.get('name')} / {col_name}【{filter_desc}】"
         total = len(entries)
-        yield ("progress", f"【{col_name}】开始分析（共 {total} 条）")
+        respondent_keys = {
+            (
+                str(entry.get("respondent_key") or f"entry:{index}")
+                if deduplicate_respondents else f"entry:{index}"
+            )
+            for index, entry in enumerate(entries)
+        }
+        respondent_total = len(respondent_keys)
+        count_label = (
+            f"{respondent_total} 名玩家"
+            if deduplicate_respondents else f"{respondent_total} 条"
+        )
+        yield ("progress", f"【{col_name}】开始分析（共 {count_label}）")
         if not entries:
             diagnostics[str(scope_key)] = _cluster_diag_column(col_idx, col_name, 0, 0)
             continue
@@ -1218,9 +1232,9 @@ async def _batch_qualitative_analysis(
 
         # ── Phase C：回跑分类 ──────────────────────────────────────────────
         # counts[theme_id] = {"total": int, "pos": int, "neg": int, "neutral": int, "mixed": int}
-        counts: dict[str, dict] = {t["id"]: {"total": 0, "pos": 0, "neg": 0, "neutral": 0, "mixed": 0}
+        counts: dict[str, dict] = {t["id"]: {"members": set(), "pos": 0, "neg": 0, "neutral": 0, "mixed": 0}
                                     for t in final_themes}
-        counts["other"] = {"total": 0, "pos": 0, "neg": 0, "neutral": 0, "mixed": 0}
+        counts["other"] = {"members": set(), "pos": 0, "neg": 0, "neutral": 0, "mixed": 0}
         # quotes_pool[theme_id] = list of (sentiment, text)
         quotes_pool: dict[str, list] = {t["id"]: [] for t in final_themes}
 
@@ -1271,11 +1285,19 @@ async def _batch_qualitative_analysis(
                     else ""
                 )
                 assignments = item["assignments"]
+                respondent_key = str(
+                    (
+                        batch[resp_idx].get("respondent_key")
+                        if deduplicate_respondents else ""
+                    ) or f"entry:{batch_index * BATCH_SIZE + resp_idx}"
+                )
                 phase_c["assignments"] += len(assignments)
                 for assign in assignments:
                     tid = assign["theme_id"]
                     sentiment = assign["sentiment"]
-                    counts[tid]["total"] += 1
+                    if respondent_key in counts[tid]["members"]:
+                        continue
+                    counts[tid]["members"].add(respondent_key)
                     if sentiment == "positive":
                         counts[tid]["pos"] += 1
                     elif sentiment == "negative":
@@ -1302,17 +1324,21 @@ async def _batch_qualitative_analysis(
             diag["reason"] = "分类阶段未产生任何主题归属"
             yield ("progress", f"【{col_name}】分类未产生有效归属，后续报告将尝试使用原文兜底")
             continue
-        diag["percentage_basis"] = "response_coverage"
-        diag["percentage_denominator"] = total
+        diag["percentage_basis"] = (
+            "unique_respondent_coverage"
+            if deduplicate_respondents else "response_coverage"
+        )
+        diag["percentage_denominator"] = respondent_total
 
         themes_out = []
+        all_themes_out = []
         other_themes_out = []
 
         for t in final_themes:
             tid = t["id"]
             c = counts[tid]
-            cnt = c["total"]
-            pct = round(cnt / total * 100, 1)
+            cnt = len(c["members"])
+            pct = round(cnt / respondent_total * 100, 1)
             pos_cnt = c["pos"]
             neg_cnt = c["neg"]
             pos_pct = round(pos_cnt / cnt * 100, 1) if cnt else 0.0
@@ -1343,7 +1369,10 @@ async def _batch_qualitative_analysis(
                 "negative_pct": neg_pct,
                 "negative_summary": t.get("negative_summary") or "",
                 "quotes": quotes,
+                "source_quotes": list(t.get("representative_quotes") or []),
+                "respondent_keys": sorted(c["members"]),
             }
+            all_themes_out.append(entry)
             if pct < OTHER_THEME_PCT:
                 other_themes_out.append({"name": t["name"], "count": cnt, "percentage": pct})
             else:
@@ -1358,8 +1387,10 @@ async def _batch_qualitative_analysis(
             "part_name": part.get("name", ""),
             "filter_desc": filter_desc,
             "col_name": col_name,
-            "total": total,
+            "total": respondent_total,
+            "count_unit": "players" if deduplicate_respondents else "responses",
             "themes": themes_out,
+            "all_themes": all_themes_out,
             "other_themes": other_themes_out,
         }
         diag["status"] = "ok"
@@ -1497,6 +1528,7 @@ def _build_large_sample_writer_query(
     open_text: dict | None = None,
     qualitative_context: dict | None = None,
     quantitative_first: bool = False,
+    viewpoint_stats_md: str = "",
 ) -> str:
     parts_lines = ["  Part 1 受访者画像（固定）"]
     for i, p in enumerate(plan["parts"], 2):
@@ -1520,16 +1552,24 @@ def _build_large_sample_writer_query(
     for col_idx, data in clustered_themes.items():
         col_name = data["col_name"]
         total = data["total"]
-        lines = [f"### 问题：{col_name}（共 {total:,} 条有效回答）\n"]
-        lines.append(
-            "主题占比口径：提到该主题的回答数 ÷ 本题有效回答总数；"
-            "一条回答可属于多个主题，因此各主题占比之和可能超过 100%。\n"
-        )
+        player_unit = data.get("count_unit") == "players"
+        if player_unit:
+            lines = [f"### 问题：{col_name}（共 {total:,} 名有效回答玩家）\n"]
+            lines.append(
+                "主题占比口径：提到该主题的去重玩家数 ÷ 本题有效回答玩家数；"
+                "同一玩家可提到多个主题，因此各主题占比之和可能超过 100%。\n"
+            )
+        else:
+            lines = [f"### 问题：{col_name}（共 {total:,} 条有效回答）\n"]
+            lines.append(
+                "主题占比口径：提到该主题的回答数 ÷ 本题有效回答总数；"
+                "一条回答可属于多个主题，因此各主题占比之和可能超过 100%。\n"
+            )
 
         for i, t in enumerate(data["themes"], 1):
             lines.append(
                 f"**主题{i}：{t['name']}**"
-                f"（{t['count']:,} 条回答提及，占 {t['percentage']}%）"
+                f"（{t['count']:,} {'名玩家' if player_unit else '条回答'}提及，占 {t['percentage']}%）"
             )
             if t["positive_summary"] or t["positive_count"]:
                 lines.append(f"- 正面（{t['positive_count']:,} / {t['positive_pct']}%）：{t['positive_summary']}")
@@ -1571,6 +1611,13 @@ def _build_large_sample_writer_query(
         "无法形成可靠解释时不要机械复述最高项和最低项。"
         if not quantitative_first else ""
     )
+    viewpoint_rule = (
+        "\n- 玩家直接表达的观点，其人数、分母和占比必须逐字使用 "
+        "`<subjective_viewpoint_stats>`；目录中没有对应项时不得编造数字。"
+        "凡是玩家没有直接表达、而是系统根据跨题关系、客观统计、人群差异或多类证据得出的判断，"
+        "必须明确写成“分析推断”并说明依据；不得写成玩家的逻辑，也不得使用“X名玩家提及”。"
+        if viewpoint_stats_md else ""
+    )
 
     return (
         "**任务**：基于以下大样本问卷分析结果撰写调研报告。\n\n"
@@ -1579,8 +1626,9 @@ def _build_large_sample_writer_query(
         + f"<stats>\n{stats_md}\n</stats>\n\n"
         + f"{priority_block}"
         + f"{open_text_md}\n\n"
+        + (f"{viewpoint_stats_md}\n\n" if viewpoint_stats_md else "")
         + (f"{fallback_md}\n\n" if fallback_md else "")
-        + f"**要求**：\n{requirements}{qualitative_stats_rule}"
+        + f"**要求**：\n{requirements}{qualitative_stats_rule}{viewpoint_rule}"
         + (
             "\n- 必须执行 `<question_branch_logic>`：分支题按适用人群分别归纳，"
             "不得合并不同分支的回答池或使用问卷总样本作为分母。"
@@ -1640,6 +1688,7 @@ def _build_writer_context(
     plan: dict,
     headers: list[str],
     analysis_focus: dict | None = None,
+    viewpoint_stats_md: str = "",
 ) -> tuple[str, str, str]:
     """构造 Writer 的完整上下文：(plan_summary, open_text_md, requirements)。
     plan_summary/open_text/stats 仅在多轮生成的第 1 轮发送一次，后续轮次复用会话历史。"""
@@ -1709,6 +1758,8 @@ def _build_writer_context(
         "只有 `<open_text>` 前缀里真的存在 `画像=...` 时才可填写画像；没有画像时使用 `—`，不得编造。"
         "反馈表只能展示中文内容：中文回答原样展示，非中文回答翻译为中文，不得展示原始语言文本。"
     )
+    if viewpoint_stats_md:
+        open_text_md += f"\n\n{viewpoint_stats_md}"
     return plan_summary, open_text_md, requirements
 
 
@@ -1719,6 +1770,7 @@ def _build_writer_first_query(
     headers: list[str],
     qualitative_context: dict | None = None,
     analysis_focus: dict | None | object = _ANALYSIS_FOCUS_FROM_PLAN,
+    viewpoint_stats_md: str = "",
 ) -> str:
     """多轮生成第 1 轮：发送全部上下文 + 要求，但本轮只让模型输出一级标题。"""
     if analysis_focus is _ANALYSIS_FOCUS_FROM_PLAN:
@@ -1729,6 +1781,7 @@ def _build_writer_first_query(
         plan,
         headers,
         analysis_focus=analysis_focus,
+        viewpoint_stats_md=viewpoint_stats_md,
     )
     return (
         "**协作方式**：本次报告将**分多轮**生成。下面先给你全部数据（<plan> 报告结构、<stats> 确定性统计、"
@@ -1770,6 +1823,20 @@ def _build_writer_part_query(
         "且属于该人群的数据；不得混入其他选项玩家的满意度、原因、意见或引用。\n"
         if part.get("filter_desc") else ""
     )
+    viewpoint_rule = (
+        "每个玩家直接表达的观点使用 `**观点：短标题**`，并将主要发现、原因与情境、分歧或例外、产品含义拆成 2–4 条简短项目，"
+        "再逐字使用 <subjective_viewpoint_stats> 写 `**提及情况：** X名玩家提及，占相关有效回答玩家的Y%`。"
+        "若某个判断由系统根据多题、客观统计或多类证据综合得出，而不是玩家直接说出的观点，必须改写为 `**分析推断：短标题**`，"
+        "明确说明推断依据，禁止写成玩家的逻辑，也禁止套用“X名玩家提及”。"
+        if not quantitative_first else
+        "开放题观点只用于解释客观统计；不得自行编造主观观点的精确提及人数或占比。"
+    )
+    number_rule = (
+        "④ 客观统计数字必须逐字取自 <stats>，观点提及人数与占比必须逐字取自 "
+        "<subjective_viewpoint_stats>，禁止重算、拼接或编造。"
+        if not quantitative_first else
+        "④ 所有客观统计数字必须逐字取自 <stats>，禁止重算或编造。"
+    )
     return (
         f"**本轮任务**：现在**只**写 `## Part {part['i']} {part['name']}` 这一个章节的完整内容"
         f"（涉及列：{part['col_desc']}）。\n"
@@ -1781,15 +1848,16 @@ def _build_writer_part_query(
         "再围绕本 Part 的业务 Topic 综合展开。同一 Topic 下的客观题与相关开放题必须结合分析，客观统计作为人群背景和判断依据，"
         "主观反馈用于完整解释原因、情境、分歧与产品含义；不要按问卷题目逐题复述，也不要按正面/负面/中立机械拆分。"
         "本章内部禁止使用任何 `###` 或 `####` 标题，内部分析维度和观点名称一律使用加粗正文。"
-        "每个观点使用 `**观点：短标题**`，并将主要发现、原因与情境、分歧或例外、产品含义拆成 2–4 条简短项目，"
-        "再写 `**提及情况：**`。统计数据优先直接写进对应内容；需要单独列数据表或玩家反馈表时，表格前统一使用"
+        + viewpoint_rule
+        + "需要单独列数据表或玩家反馈表时，表格前统一使用"
         " `**相关具体信息引用：**`，不得使用「代表性玩家反馈」，也不得留下空标题。玩家反馈表附 1–5 条"
         " `玩家ID | 画像信息 | 中文翻译` 证据，只展示中文翻译，不保留原始语言文本。\n"
         "本节总结必须用不看后文原文也能理解的大白话，优先沿用玩家中文翻译中的具体说法。"
         "不要用「功能性增益」「价值感知」「分层机制」这类抽象概念代替玩家实际在意的功能、体验或场景；"
         "确需概括时，须在同一句用「也就是……」或等价表达解释具体所指，且不得补造原文中没有的例子。\n"
         "**约束**：① 只输出这一个 Part，不要写其它 Part；② 不要写核心结论、不要写 Bug 模块；"
-        "③ 不要重复前面已经写过的标题或章节；④ 所有数字、百分比必须逐字取自 <stats>，禁止重算或编造。"
+        "③ 不要重复前面已经写过的标题或章节；"
+        + number_rule
     )
 
 
@@ -1878,10 +1946,13 @@ def _build_writer_core_query(
         "「不同 A 的玩家对 B 的评价存在差异」或「A 可能影响 B」，不得写成已经证明因果的「A 导致 B」；"
         "结论之后再补数据、群体差异和玩家理由。\n"
         "**约束**：① 只输出从 `<!--CORE_START-->` 到 `<!--CORE_END-->` 的内容，不要重复正文章节、不要再写一级标题、不要写行动建议；"
-        "② 核心结论可以并应当使用能直接支撑判断的精确人数和百分比，但必须逐字来自 <stats>，不得自行计算、合并、四舍五入或改写；"
+        "② 核心结论可以并应当使用能直接支撑判断的精确人数和百分比：客观统计逐字来自 <stats>；"
+        "若会话中存在 <subjective_viewpoint_stats>，玩家观点提及人数与占比必须逐字来自该目录；"
+        "不得自行计算、合并、四舍五入或改写；"
         "③ 涉及分支题、筛选人群或不同使用程度人群时，必须说明对应分母或有效回答范围，不得用问卷总样本替代；"
         "④ 玩家观点必须来自 <open_text> 或已生成章节，不得编造；"
-        "⑤ 业务判断可以基于证据推断，但必须写清楚依据，凡是推测或猜测必须显式标注；"
+        "⑤ 凡是玩家原话没有直接表达、而是系统根据跨题关系、客观统计、人群差异或多类证据综合得出的判断，"
+        "必须明确标为“分析推断”并写清依据；不得写成玩家的逻辑，不得使用“X名玩家提及”；"
         "⑥ 使用不看玩家原文也能立即理解的大白话，优先沿用玩家中文翻译中的具体词语。"
         "不要只写「功能性增益」「价值感知」「分层机制」等抽象概括；确需使用时，必须在同一句用「也就是……」"
         "或等价表达说明玩家具体希望增加、取消或改变什么，解释和例子只能来自 <open_text> 或已生成章节。"
@@ -1920,7 +1991,9 @@ def _build_writer_core_review_query(
         f"`{CORE_END}`，内部必须含独占一行的 `## 核心结论`；标记外不得有任何解释。\n"
         "不得输出检查清单、遗漏说明、代码围栏、前言或行动建议。替换时只补齐覆盖缺口或改写不合格句子；"
         "已经清楚、正确的段落原样保留，不改变任何数字、事实、玩家观点和证据边界，不新增分析结论。"
-        "每个判断第一句话直接写结论；精确人数和百分比必须原样保留并继续与 <stats> 一致。"
+        "每个判断第一句话直接写结论；客观统计继续与 <stats> 一致，观点提及人数继续与 "
+        "<subjective_viewpoint_stats> 一致。玩家没有直接表达的综合判断必须保留“分析推断”标识，"
+        "不得在替换稿中改写成玩家观点。"
     )
 
 

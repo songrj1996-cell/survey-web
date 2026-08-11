@@ -48,6 +48,9 @@ class ReportWriterStructureTests(unittest.TestCase):
         self.assertIn("禁止使用「针对……这一核心问题」", requirements)
         self.assertIn("不得写成已经证明因果的「A 导致 B」", requirements)
         self.assertIn("精确人数和百分比", requirements)
+        self.assertIn("<subjective_viewpoint_stats>", requirements)
+        self.assertIn("`**分析推断：短标题**`", requirements)
+        self.assertIn("不得表述为“玩家认为/玩家提及”", requirements)
         self.assertIn("必须同时说明对应分母或有效回答范围", requirements)
         self.assertNotIn("**不使用百分比，也不使用精确人数**", requirements)
         self.assertIn("### 少数但值得关注的反馈", requirements)
@@ -81,6 +84,9 @@ class ReportWriterStructureTests(unittest.TestCase):
         self.assertIn("不要自行复制客观题统计表", query)
         self.assertIn("大致代表什么、有哪些样本或解释限制", query)
         self.assertIn("不要机械复述最高项和最低项", query)
+        self.assertIn("玩家直接表达的观点", query)
+        self.assertIn("<subjective_viewpoint_stats>", query)
+        self.assertIn("`**分析推断：短标题**`", query)
 
     def test_filtered_part_context_excludes_other_option_responses(self):
         plan = {
@@ -148,6 +154,8 @@ class ReportWriterStructureTests(unittest.TestCase):
         self.assertIn("从本次调研看，A 与 B 有关", query)
         self.assertIn("不得写成已经证明因果的「A 导致 B」", query)
         self.assertIn("精确人数和百分比", query)
+        self.assertIn("玩家原话没有直接表达", query)
+        self.assertIn("不得写成玩家的逻辑", query)
         self.assertIn("必须说明对应分母或有效回答范围", query)
         self.assertNotIn("核心结论里不使用百分比、不使用精确人数", query)
         self.assertIn("### 少数但值得关注的反馈", query)
@@ -207,7 +215,8 @@ class ReportWriterStructureTests(unittest.TestCase):
         self.assertIn("未参与调研立项的读者也能理解的大白话", query)
         self.assertIn("针对……这个/这一问题", query)
         self.assertIn("已经清楚、正确的段落原样保留", query)
-        self.assertIn("精确人数和百分比必须原样保留", query)
+        self.assertIn("观点提及人数继续与 <subjective_viewpoint_stats> 一致", query)
+        self.assertIn("必须保留“分析推断”标识", query)
 
     def test_quantitative_part_query_prioritizes_objective_statistics(self):
         query = _build_writer_part_query({

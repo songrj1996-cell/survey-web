@@ -173,12 +173,12 @@ class LargeSampleDirectLLMTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("[2] 😂", miss_query)
         self.assertNotIn("[0] Clean UI", miss_query)
 
-    async def test_pipeline_uses_response_coverage_percentage(self):
+    async def test_pipeline_uses_unique_respondent_coverage_percentage(self):
         entries = [
-            {"text": "A"},
-            {"text": "B"},
-            {"text": "C"},
-            {"text": "D"},
+            {"text": "A", "respondent_key": "p1"},
+            {"text": "B", "respondent_key": "p1"},
+            {"text": "C", "respondent_key": "p2"},
+            {"text": "D", "respondent_key": "p3"},
         ]
         open_text = {0: entries}
         plan = {
@@ -278,6 +278,7 @@ class LargeSampleDirectLLMTests(unittest.IsolatedAsyncioTestCase):
                     plan,
                     ["反馈"],
                     "sid",
+                    deduplicate_respondents=True,
                 )
             ]
 
@@ -285,15 +286,15 @@ class LargeSampleDirectLLMTests(unittest.IsolatedAsyncioTestCase):
         clustered = next(item[1] for item in items if item[0] == "result")
         themes = {theme["id"]: theme for theme in clustered[0]["themes"]}
 
-        self.assertEqual(themes["t01"]["count"], 3)
-        self.assertEqual(themes["t01"]["percentage"], 75.0)
+        self.assertEqual(themes["t01"]["count"], 2)
+        self.assertEqual(themes["t01"]["percentage"], 66.7)
         self.assertEqual(themes["t02"]["count"], 2)
-        self.assertEqual(themes["t02"]["percentage"], 50.0)
+        self.assertEqual(themes["t02"]["percentage"], 66.7)
         self.assertEqual(
             diagnostics["0"]["percentage_basis"],
-            "response_coverage",
+            "unique_respondent_coverage",
         )
-        self.assertEqual(diagnostics["0"]["percentage_denominator"], 4)
+        self.assertEqual(diagnostics["0"]["percentage_denominator"], 3)
 
     def test_merge_query_keeps_full_candidate_evidence(self):
         candidates = [

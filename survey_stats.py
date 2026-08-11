@@ -941,7 +941,8 @@ def _collect_choice_other_text(
                 continue
             seen_rows.add(key)
             entry = _build_open_text_entry(
-                row, text, headers, id_cols, profile_cols, segment_cols
+                row, text, headers, id_cols, profile_cols, segment_cols,
+                row_number=row_no + 1,
             )
             entry["source"] = "choice_other_text"
             entry["parent_question"] = col.get("name") or _safe_header(headers, idx)
@@ -958,6 +959,8 @@ def _build_open_text_entry(
     id_cols: list[dict],
     profile_cols: list[dict],
     segment_cols: list[dict],
+    *,
+    row_number: int,
 ) -> dict:
     ids: dict[str, str] = {}
     for c in id_cols:
@@ -986,7 +989,12 @@ def _build_open_text_entry(
             norm = _make_normalizer(c.get("value_aliases"))
             segments[str(i)] = norm(v.strip())
 
+    respondent_key = "|".join(
+        f"{key}={value}" for key, value in sorted(ids.items())
+    ) or f"row:{row_number}"
+
     return {
+        "respondent_key": respondent_key,
         "ids": ids,
         "profile": profile,
         "segments": segments,
@@ -1009,13 +1017,14 @@ def _collect_open_text(
       - 引用原话时附玩家 ID + 画像（"mlbbid:xxx (王者/中国): ..."）
     """
     out: list[dict] = []
-    for row in body:
+    for row_no, row in enumerate(body, 1):
         text = _format_cell(row[col_idx]) if col_idx < len(row) else ""
         if not text.strip():
             continue
         out.append(
             _build_open_text_entry(
-                row, text.strip(), headers, id_cols, profile_cols, segment_cols
+                row, text.strip(), headers, id_cols, profile_cols, segment_cols,
+                row_number=row_no,
             )
         )
     return out

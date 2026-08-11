@@ -1,4 +1,5 @@
 import json
+from copy import deepcopy
 from pathlib import Path
 import tempfile
 import unittest
@@ -33,6 +34,21 @@ def _streamed_chunk_text(events: list[str]) -> str:
         if payload.get("type") == "chunk":
             chunks.append(payload.get("content", ""))
     return "".join(chunks)
+
+
+VIEWPOINT_STATS_MD = (
+    "<subjective_viewpoint_stats>\n"
+    "观点：消息会消失；提及情况：1名玩家提及，占相关有效回答玩家的100.0%\n"
+    "</subjective_viewpoint_stats>"
+)
+
+
+async def _stub_qualitative_analysis(*_args, **_kwargs):
+    yield ("result", {1: {"col_name": "聊天反馈", "themes": []}})
+
+
+async def _stub_report_viewpoint_stats(*_args, **_kwargs):
+    yield ("result", [{"title": "消息会消失", "count": 1, "percentage": 100.0}])
 
 
 class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
@@ -146,6 +162,21 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(survey_service, "get_session", return_value=sess),
             patch.object(survey_service, "_current_login", new=AsyncMock(return_value=None)),
+            patch.object(
+                survey_service,
+                "_batch_qualitative_analysis",
+                new=_stub_qualitative_analysis,
+            ),
+            patch.object(
+                survey_service,
+                "build_report_viewpoint_stats",
+                new=_stub_report_viewpoint_stats,
+            ),
+            patch.object(
+                survey_service,
+                "render_viewpoint_stats",
+                return_value=VIEWPOINT_STATS_MD,
+            ),
             patch.object(survey_service, "_direct_writer_round", new=direct),
             patch.object(survey_service, "save_session") as save_session,
             patch.object(survey_service, "save_to_history") as save_history,
@@ -204,6 +235,21 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(survey_service, "get_session", return_value=sess),
             patch.object(survey_service, "_current_login", new=AsyncMock(return_value=None)),
+            patch.object(
+                survey_service,
+                "_batch_qualitative_analysis",
+                new=_stub_qualitative_analysis,
+            ),
+            patch.object(
+                survey_service,
+                "build_report_viewpoint_stats",
+                new=_stub_report_viewpoint_stats,
+            ),
+            patch.object(
+                survey_service,
+                "render_viewpoint_stats",
+                return_value=VIEWPOINT_STATS_MD,
+            ),
             patch.object(survey_service, "_direct_writer_round", new=direct),
             patch.object(survey_service, "save_session"),
             patch.object(survey_service, "save_to_history"),
@@ -246,6 +292,21 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(survey_service, "get_session", return_value=sess),
             patch.object(survey_service, "_current_login", new=AsyncMock(return_value=None)),
+            patch.object(
+                survey_service,
+                "_batch_qualitative_analysis",
+                new=_stub_qualitative_analysis,
+            ),
+            patch.object(
+                survey_service,
+                "build_report_viewpoint_stats",
+                new=_stub_report_viewpoint_stats,
+            ),
+            patch.object(
+                survey_service,
+                "render_viewpoint_stats",
+                return_value=VIEWPOINT_STATS_MD,
+            ),
             patch.object(survey_service, "_direct_writer_round", new=direct),
             patch.object(survey_service, "save_session"),
             patch.object(survey_service, "save_to_history"),
@@ -291,6 +352,21 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(survey_service, "get_session", return_value=sess),
             patch.object(survey_service, "_current_login", new=AsyncMock(return_value=None)),
+            patch.object(
+                survey_service,
+                "_batch_qualitative_analysis",
+                new=_stub_qualitative_analysis,
+            ),
+            patch.object(
+                survey_service,
+                "build_report_viewpoint_stats",
+                new=_stub_report_viewpoint_stats,
+            ),
+            patch.object(
+                survey_service,
+                "render_viewpoint_stats",
+                return_value=VIEWPOINT_STATS_MD,
+            ),
             patch.object(survey_service, "_direct_writer_round", side_effect=slow_writer),
             patch.object(survey_service, "LLM_STREAM_HEARTBEAT_SECONDS", 0.001),
             patch.object(survey_service, "save_session"),
@@ -303,6 +379,77 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any('"type": "heartbeat"' in event for event in events))
         self.assertTrue(any('"type": "report_done"' in event for event in events))
         self.assertIn("## 行动建议", sess["report_md"])
+
+    async def test_standard_report_passes_viewpoint_stats_through_final_writer_prompt(self):
+        sess = {
+            "filename": "responses.xlsx",
+            "rows": [["玩家ID", "聊天反馈"], ["p-1", "消息会消失"]],
+            "plan": {
+                "columns": [{"index": 1, "name": "聊天反馈", "role": "open_text"}],
+                "parts": [{"name": "聊天体验", "column_indexes": [1]}],
+                "branch_rules": [],
+            },
+            "branch_rules": [],
+            "stats_md": "有效样本(总计):总体=1",
+            "open_text": {
+                1: [{"ids": {"玩家ID": "p-1"}, "profile": {}, "text": "消息会消失"}],
+            },
+        }
+        answers = iter([
+            ("# 聊天功能调研", "model-a"),
+            ("## Part 1 聊天体验\n\n本节总结。", "model-a"),
+            ("NONE", "model-a"),
+            (
+                "<!--CORE_START-->\n## 核心结论\n消息丢失需要处理。\n<!--CORE_END-->",
+                "model-a",
+            ),
+            ("## 行动建议\n\n**修复消息丢失**", "model-a"),
+        ])
+        writer_calls: list[tuple[list[dict], str]] = []
+
+        async def capture_writer(messages, query):
+            writer_calls.append((deepcopy(messages), query))
+            answer, model = next(answers)
+            messages.extend([
+                {"role": "user", "content": query},
+                {"role": "assistant", "content": answer},
+            ])
+            return answer, model
+
+        with (
+            patch.object(survey_service, "get_session", return_value=sess),
+            patch.object(survey_service, "_current_login", new=AsyncMock(return_value=None)),
+            patch.object(
+                survey_service,
+                "_batch_qualitative_analysis",
+                new=_stub_qualitative_analysis,
+            ),
+            patch.object(
+                survey_service,
+                "build_report_viewpoint_stats",
+                new=_stub_report_viewpoint_stats,
+            ),
+            patch.object(
+                survey_service,
+                "render_viewpoint_stats",
+                return_value=VIEWPOINT_STATS_MD,
+            ),
+            patch.object(survey_service, "_direct_writer_round", new=capture_writer),
+            patch.object(survey_service, "save_session"),
+            patch.object(survey_service, "save_to_history"),
+            patch.object(survey_service, "audit_log", new=AsyncMock()),
+            patch.object(survey_service.survey_stats, "find_numbers_not_in_stats", return_value=[]),
+        ):
+            events = [event async for event in survey_service.report_stream("sid", object())]
+
+        self.assertTrue(any('"type": "report_done"' in event for event in events))
+        self.assertEqual(len(writer_calls), 5)
+        self.assertIn(VIEWPOINT_STATS_MD, writer_calls[0][1])
+        final_messages, final_query = writer_calls[-1]
+        final_prompt = "\n".join(
+            [*(message["content"] for message in final_messages), final_query]
+        )
+        self.assertIn(VIEWPOINT_STATS_MD, final_prompt)
 
     async def test_direct_qa_uses_context_history_and_configured_model_chain(self):
         source = {
