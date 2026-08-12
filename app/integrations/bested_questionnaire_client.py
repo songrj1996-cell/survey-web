@@ -12,6 +12,7 @@ import io
 import posixpath
 import re
 import stat
+import warnings
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
@@ -134,6 +135,16 @@ class BestedQuestionnaireImage:
 
 
 @dataclass(frozen=True)
+class BestedQuestionnaireMediaIssue:
+    """Safe, file-local evidence for one recoverable media failure."""
+
+    code: str
+    sheet_name: str | None = None
+    source_cell: str | None = None
+    source_row: int | None = None
+
+
+@dataclass(frozen=True)
 class BestedQuestionnaireHyperlink:
     """Cell hyperlink preserved as a reference; the URL is never fetched here."""
 
@@ -156,6 +167,7 @@ class BestedQuestionnaireParseResult:
     questionnaire_text: str
     images: tuple[BestedQuestionnaireImage, ...] = ()
     hyperlinks: tuple[BestedQuestionnaireHyperlink, ...] = ()
+    media_issues: tuple[BestedQuestionnaireMediaIssue, ...] = ()
 
 
 @dataclass
@@ -856,6 +868,70 @@ def _validate_xlsx_package(content: bytes) -> None:
                 raise ValueError("倍市得 .xlsx 实际解压总量超过安全上限")
 
 
+def worksheet_image_use_count(content: bytes, sheet_name: str) -> int:
+    """Return the validated OOXML image-use count for one worksheet."""
+
+    _validate_xlsx_package(content)
+    return _validated_worksheet_image_use_count(content, sheet_name)
+
+
+def _validated_worksheet_image_use_count(content: bytes, sheet_name: str) -> int:
+    """Read one worksheet inventory after the package preflight has passed."""
+
+    with zipfile.ZipFile(io.BytesIO(content), "r") as archive:
+        info_by_name = {info.filename: info for info in archive.infolist()}
+        defaults, overrides = _content_types(archive, info_by_name)
+        workbook_part = "xl/workbook.xml"
+        root = _xml_root(archive, info_by_name, workbook_part, "workbook")
+        relationships = _relationships(
+            archive,
+            info_by_name,
+            workbook_part,
+            required=True,
+        )
+        sheet_tag = f"{{{_SPREADSHEET_NAMESPACE}}}sheet"
+        relationship_attribute = f"{{{_OFFICE_RELATIONSHIP_NAMESPACE}}}id"
+        worksheet_part: str | None = None
+        for sheet in root.iter(sheet_tag):
+            if sheet.attrib.get("name") != sheet_name:
+                continue
+            relationship_id = str(
+                sheet.attrib.get(relationship_attribute) or ""
+            ).strip()
+            relationship = relationships.get(relationship_id)
+            if relationship is None:
+                raise ValueError("倍市得 .xlsx 问卷工作表关系缺失")
+            relationship_type, target, target_mode = relationship
+            if (
+                relationship_type != _WORKSHEET_RELATIONSHIP_TYPE
+                or target_mode.casefold() != "internal"
+            ):
+                raise ValueError("倍市得 .xlsx 问卷工作表关系无效")
+            worksheet_part = _resolve_ooxml_target(
+                workbook_part,
+                target,
+                label="问卷工作表关系",
+            )
+            break
+        if worksheet_part is None:
+            raise ValueError("倍市得 .xlsx 缺少已解析的问卷工作表")
+        drawing_parts = _drawing_parts(
+            archive,
+            info_by_name,
+            (worksheet_part,),
+            defaults,
+            overrides,
+        )
+        _, image_uses = _drawing_image_parts(
+            archive,
+            info_by_name,
+            drawing_parts,
+            defaults,
+            overrides,
+        )
+        return image_uses
+
+
 def _load_workbook(content: bytes, *, read_only: bool = True):
     _validate_xlsx_package(content)
     try:
@@ -955,24 +1031,64 @@ def _discover_questionnaire_media(
 ) -> tuple[
     tuple[BestedQuestionnaireImage, ...],
     tuple[BestedQuestionnaireHyperlink, ...],
+    tuple[BestedQuestionnaireMediaIssue, ...],
 ]:
-    workbook = _load_workbook(content, read_only=False)
+    _validate_xlsx_package(content)
+    expected_image_uses = _validated_worksheet_image_use_count(
+        content,
+        sheet_name,
+    )
+    try:
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            workbook = openpyxl.load_workbook(
+                io.BytesIO(content),
+                read_only=False,
+                data_only=True,
+            )
+    except (MemoryError, RecursionError):
+        raise
+    except Exception:
+        return (), (), (BestedQuestionnaireMediaIssue(
+            code="media_workbook_load_failed",
+            sheet_name=sheet_name,
+        ),)
     try:
         worksheet = workbook[sheet_name]
         if len(worksheet._images) > _XLSX_MAX_IMAGES:
             raise ValueError("倍市得 .xlsx 问卷工作表图片数量超过安全上限")
+        if len(worksheet._images) > expected_image_uses:
+            raise ValueError("倍市得 .xlsx 图片加载结果超过 OOXML 声明数量")
         images: list[BestedQuestionnaireImage] = []
+        media_issues: list[BestedQuestionnaireMediaIssue] = [
+            BestedQuestionnaireMediaIssue(
+                code="image_loading_failed",
+                sheet_name=sheet_name,
+            )
+            for _ in range(expected_image_uses - len(worksheet._images))
+        ]
         total_image_bytes = 0
         seen_image_hashes: set[str] = set()
         for image in worksheet._images:
-            image_content = image._data()
+            source_cell, source_row, end_row, coverage = _image_location(image)
+            try:
+                image_content = image._data()
+            except (MemoryError, RecursionError):
+                raise
+            except Exception:
+                media_issues.append(BestedQuestionnaireMediaIssue(
+                    code="image_extraction_failed",
+                    sheet_name=sheet_name,
+                    source_cell=source_cell,
+                    source_row=source_row,
+                ))
+                continue
             image_hash = hashlib.sha256(image_content).hexdigest()
             if image_hash not in seen_image_hashes:
                 seen_image_hashes.add(image_hash)
                 total_image_bytes += len(image_content)
             if total_image_bytes > _XLSX_MAX_TOTAL_IMAGE_BYTES:
                 raise ValueError("倍市得 .xlsx 问卷工作表图片总字节超过安全上限")
-            source_cell, source_row, end_row, coverage = _image_location(image)
             start_qid = _question_qid_for_row(questions, source_row)
             end_qid = _question_qid_for_row(questions, end_row)
             images.append(BestedQuestionnaireImage(
@@ -1006,7 +1122,7 @@ def _discover_questionnaire_media(
                     source_row=cell.row,
                     question_qid=_question_qid_for_row(questions, cell.row),
                 ))
-        return tuple(images), tuple(hyperlinks)
+        return tuple(images), tuple(hyperlinks), tuple(media_issues)
     finally:
         workbook.close()
 
@@ -1101,8 +1217,9 @@ def parse_bested_questionnaire(
     )
     images: tuple[BestedQuestionnaireImage, ...] = ()
     hyperlinks: tuple[BestedQuestionnaireHyperlink, ...] = ()
+    media_issues: tuple[BestedQuestionnaireMediaIssue, ...] = ()
     if discover_media:
-        images, hyperlinks = _discover_questionnaire_media(
+        images, hyperlinks, media_issues = _discover_questionnaire_media(
             content,
             sheet_name,
             questions,
@@ -1115,6 +1232,7 @@ def parse_bested_questionnaire(
         questionnaire_text=questionnaire_text,
         images=images,
         hyperlinks=hyperlinks,
+        media_issues=media_issues,
     )
 
 

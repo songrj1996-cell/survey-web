@@ -2,8 +2,9 @@
 
 Authentication and HTTP lifecycle are owned by callers.  This module only
 translates the ``forms.get`` protocol into an in-memory result and downloads
-short-lived Google image URLs before returning.  It never persists credentials,
-temporary URLs, form definitions, or image bytes.
+short-lived Google image URLs before returning.  Individual image failures are
+reported without discarding the form definition or other images.  The client
+never persists credentials, temporary URLs, form definitions, or image bytes.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ __all__ = [
     "AuthorizationProvider",
     "GoogleFormCapture",
     "GoogleFormImageCapture",
+    "GoogleFormImageFailure",
     "GoogleFormsClient",
     "GoogleFormsConnectorError",
     "GoogleFormsErrorCode",
@@ -147,12 +149,25 @@ class GoogleFormImageCapture:
 
 
 @dataclass(frozen=True, slots=True)
+class GoogleFormImageFailure:
+    """One image acquisition failure safe for later mapping and persistence."""
+
+    json_path: tuple[JsonPathPart, ...]
+    context: GoogleImageContext
+    code: GoogleFormsErrorCode
+    stage: GoogleFormsStage
+    retryable: bool
+    status_code: int | None
+
+
+@dataclass(frozen=True, slots=True)
 class GoogleFormCapture:
-    """A Forms definition plus all immediately captured image bytes."""
+    """A Forms definition plus captured images and path-complete failures."""
 
     form_id: str
     raw_form: dict[str, Any]
     images: tuple[GoogleFormImageCapture, ...]
+    image_failures: tuple[GoogleFormImageFailure, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -570,6 +585,33 @@ def _forms_http_error(status_code: int) -> GoogleFormsConnectorError:
     )
 
 
+def _image_failure(
+    image: _DiscoveredImage,
+    error: GoogleFormsConnectorError,
+) -> GoogleFormImageFailure:
+    if error.stage != GoogleFormsStage.IMAGE_DOWNLOAD:
+        raise error
+    return GoogleFormImageFailure(
+        json_path=image.json_path,
+        context=image.context,
+        code=error.code,
+        stage=error.stage,
+        retryable=error.retryable,
+        status_code=error.status_code,
+    )
+
+
+def _total_size_failure(image: _DiscoveredImage) -> GoogleFormImageFailure:
+    return GoogleFormImageFailure(
+        json_path=image.json_path,
+        context=image.context,
+        code=GoogleFormsErrorCode.IMAGE_TOO_LARGE,
+        stage=GoogleFormsStage.IMAGE_DOWNLOAD,
+        retryable=False,
+        status_code=None,
+    )
+
+
 class GoogleFormsClient:
     """Minimal read-only client for one authorized ``forms.get`` call."""
 
@@ -604,7 +646,7 @@ class GoogleFormsClient:
         )
 
     async def fetch_form(self, form_id: str) -> GoogleFormCapture:
-        """Fetch one form and immediately capture every temporary image URL."""
+        """Fetch one form and capture each independently usable image."""
 
         request_url = _forms_url(self._forms_api_base, form_id)
         headers = await self._authorization_headers()
@@ -664,25 +706,56 @@ class GoogleFormsClient:
                 safe_context={"image_count": len(discovered)},
             )
 
+        sanitized_payload = _strip_content_uris(payload)
         captures: list[GoogleFormImageCapture] = []
+        failures: list[GoogleFormImageFailure] = []
         total_bytes = 0
-        for image in discovered:
-            capture = await self._download_image(image)
-            total_bytes += len(capture.content)
-            if total_bytes > self._image_policy.max_total_bytes:
-                raise GoogleFormsConnectorError(
-                    GoogleFormsErrorCode.IMAGE_TOO_LARGE,
-                    "Google form images exceed the configured total size limit",
-                    stage=GoogleFormsStage.IMAGE_DOWNLOAD,
-                    safe_context=_image_safe_context(image),
+        for index, image in enumerate(discovered):
+            remaining_total_bytes = self._image_policy.max_total_bytes - total_bytes
+            if remaining_total_bytes <= 0:
+                failures.extend(
+                    _total_size_failure(unresolved)
+                    for unresolved in discovered[index:]
                 )
+                break
+            try:
+                capture = await self._download_image(
+                    image,
+                    remaining_total_bytes=remaining_total_bytes,
+                )
+            except GoogleFormsConnectorError as error:
+                failures.append(_image_failure(image, error))
+                received = error.safe_context.get("bytes_received", 0)
+                if (
+                    not isinstance(received, int)
+                    or isinstance(received, bool)
+                    or received < 0
+                ):
+                    raise GoogleFormsConnectorError(
+                        GoogleFormsErrorCode.IMAGE_INVALID_RESPONSE,
+                        "Image download accounting is invalid",
+                        stage=GoogleFormsStage.IMAGE_DOWNLOAD,
+                    ) from None
+                total_bytes += received
+                if (
+                    error.safe_context.get("total_limit_reached") == 1
+                    or total_bytes >= self._image_policy.max_total_bytes
+                ):
+                    failures.extend(
+                        _total_size_failure(unresolved)
+                        for unresolved in discovered[index + 1:]
+                    )
+                    break
+                continue
+
+            total_bytes += len(capture.content)
             captures.append(capture)
 
-        sanitized_payload = _strip_content_uris(payload)
         return GoogleFormCapture(
             form_id=form_id,
             raw_form=sanitized_payload,
             images=tuple(captures),
+            image_failures=tuple(failures),
         )
 
     async def _authorization_headers(self) -> dict[str, str]:
@@ -734,6 +807,8 @@ class GoogleFormsClient:
     async def _download_image(
         self,
         image: _DiscoveredImage,
+        *,
+        remaining_total_bytes: int,
     ) -> GoogleFormImageCapture:
         current_url = _validate_image_url(
             image.content_uri,
@@ -759,7 +834,7 @@ class GoogleFormsClient:
                     auth=None,
                     follow_redirects=False,
                 )
-            except httpx.TransportError:
+            except httpx.RequestError:
                 raise GoogleFormsConnectorError(
                     GoogleFormsErrorCode.TRANSPORT_ERROR,
                     "Temporary image download failed before receiving a response",
@@ -847,6 +922,22 @@ class GoogleFormsClient:
                         ),
                     )
 
+                content_encoding = response.headers.get(
+                    "content-encoding",
+                    "",
+                ).strip().lower()
+                if content_encoding not in {"", "identity"}:
+                    raise GoogleFormsConnectorError(
+                        GoogleFormsErrorCode.IMAGE_INVALID_RESPONSE,
+                        "Temporary image used an unsupported Content-Encoding",
+                        stage=GoogleFormsStage.IMAGE_DOWNLOAD,
+                        status_code=response.status_code,
+                        safe_context=_image_safe_context(
+                            image,
+                            host=current_url.host,
+                        ),
+                    )
+
                 declared_length = _content_length(response, image)
                 if (
                     declared_length is not None
@@ -862,12 +953,48 @@ class GoogleFormsClient:
                             host=current_url.host,
                         ),
                     )
+                if (
+                    declared_length is not None
+                    and declared_length > remaining_total_bytes
+                ):
+                    raise GoogleFormsConnectorError(
+                        GoogleFormsErrorCode.IMAGE_TOO_LARGE,
+                        "Temporary image exceeds the remaining total size limit",
+                        stage=GoogleFormsStage.IMAGE_DOWNLOAD,
+                        status_code=response.status_code,
+                        safe_context={
+                            **_image_safe_context(
+                                image,
+                                host=current_url.host,
+                            ),
+                            "total_limit_reached": 1,
+                        },
+                    )
 
                 content = bytearray()
                 try:
-                    async for chunk in response.aiter_bytes():
-                        content.extend(chunk)
-                        if len(content) > self._image_policy.max_image_bytes:
+                    if hasattr(response, "_content"):
+                        stream = response.aiter_bytes()
+                    else:
+                        stream = response.aiter_raw()
+                    async for chunk in stream:
+                        next_size = len(content) + len(chunk)
+                        if next_size > remaining_total_bytes:
+                            raise GoogleFormsConnectorError(
+                                GoogleFormsErrorCode.IMAGE_TOO_LARGE,
+                                "Temporary image exceeds the remaining total size limit",
+                                stage=GoogleFormsStage.IMAGE_DOWNLOAD,
+                                status_code=response.status_code,
+                                safe_context={
+                                    **_image_safe_context(
+                                        image,
+                                        host=current_url.host,
+                                    ),
+                                    "bytes_received": next_size,
+                                    "total_limit_reached": 1,
+                                },
+                            )
+                        if next_size > self._image_policy.max_image_bytes:
                             raise GoogleFormsConnectorError(
                                 GoogleFormsErrorCode.IMAGE_TOO_LARGE,
                                 "Temporary image exceeds the configured size limit",
@@ -876,9 +1003,10 @@ class GoogleFormsClient:
                                 safe_context=_image_safe_context(
                                     image,
                                     host=current_url.host,
-                                ),
+                                ) | {"bytes_received": next_size},
                             )
-                except httpx.TransportError:
+                        content.extend(chunk)
+                except httpx.RequestError:
                     raise GoogleFormsConnectorError(
                         GoogleFormsErrorCode.TRANSPORT_ERROR,
                         "Temporary image download was interrupted",
@@ -887,7 +1015,7 @@ class GoogleFormsClient:
                         safe_context=_image_safe_context(
                             image,
                             host=current_url.host,
-                        ),
+                        ) | {"bytes_received": len(content)},
                     ) from None
 
                 immutable_content = bytes(content)
@@ -900,7 +1028,7 @@ class GoogleFormsClient:
                         safe_context=_image_safe_context(
                             image,
                             host=current_url.host,
-                        ),
+                        ) | {"bytes_received": len(immutable_content)},
                     )
                 return GoogleFormImageCapture(
                     json_path=image.json_path,

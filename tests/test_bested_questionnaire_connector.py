@@ -16,6 +16,7 @@ from openpyxl.drawing.spreadsheet_drawing import (
 )
 
 from app.integrations.bested_questionnaire_client import (
+    BestedQuestionnaireMediaIssue,
     BestedQuestionnaireParseResult,
     parse_bested_questionnaire,
     parse_bested_questionnaire_upload,
@@ -206,6 +207,9 @@ class BestedQuestionnaireConnectorTests(unittest.TestCase):
 
         parsed = parse_bested_questionnaire(content, discover_media=False)
         self.assertEqual(parsed.questions[0].qid, 1)
+        self.assertEqual(parsed.images, ())
+        self.assertEqual(parsed.hyperlinks, ())
+        self.assertEqual(parsed.media_issues, ())
 
     def test_embedded_images_and_cell_links_keep_local_source_evidence(self):
         parsed = parse_bested_questionnaire_upload(
@@ -234,6 +238,143 @@ class BestedQuestionnaireConnectorTests(unittest.TestCase):
         self.assertEqual(links["B8"].question_qid, 2)
         self.assertEqual(links["B6"].display_text, "演示视频")
         self.assertEqual(links["B6"].url, "https://example.test/video")
+        self.assertEqual(parsed.media_issues, ())
+
+    def test_one_image_extraction_failure_keeps_structure_and_other_media(self):
+        content = _questionnaire_with_media_bytes()
+        original_image_data = Image._data
+
+        def extract_or_fail(image):
+            source_cell, _, _, _ = bested_client._image_location(image)
+            if source_cell == "C3":
+                raise RuntimeError("secret image decoder detail")
+            return original_image_data(image)
+
+        with patch.object(Image, "_data", autospec=True, side_effect=extract_or_fail):
+            parsed = parse_bested_questionnaire_upload(
+                "questionnaire.xlsx",
+                content,
+            )
+
+        self.assertEqual([question.qid for question in parsed.questions], [1, 2])
+        self.assertIn("是否满意", parsed.questionnaire_text)
+        self.assertEqual(
+            {image.source_cell for image in parsed.images},
+            {"C5", "C20"},
+        )
+        self.assertEqual(parsed.media_issues, (
+            BestedQuestionnaireMediaIssue(
+                code="image_extraction_failed",
+                sheet_name="问卷内容",
+                source_cell="C3",
+                source_row=3,
+            ),
+        ))
+        self.assertTrue(BestedQuestionnaireMediaIssue.__dataclass_params__.frozen)
+        self.assertNotIn("secret image decoder detail", repr(parsed.media_issues))
+
+    def test_corrupt_declared_image_is_reported_instead_of_silently_dropped(self):
+        content = _questionnaire_with_media_bytes()
+        with zipfile.ZipFile(io.BytesIO(content), "r") as archive:
+            image_name = next(
+                name for name in archive.namelist()
+                if name.startswith("xl/media/")
+            )
+        corrupted = _replace_xlsx_members(
+            content,
+            {image_name: b"not a valid image"},
+        )
+
+        with warnings.catch_warnings(record=True) as emitted:
+            parsed = parse_bested_questionnaire_upload(
+                "questionnaire.xlsx",
+                corrupted,
+            )
+
+        self.assertEqual([question.qid for question in parsed.questions], [1, 2])
+        self.assertEqual(len(parsed.images), 2)
+        self.assertEqual(
+            tuple(issue.code for issue in parsed.media_issues),
+            ("image_loading_failed",),
+        )
+        self.assertEqual(emitted, [])
+
+    def test_media_workbook_load_failure_becomes_one_safe_issue(self):
+        content = _questionnaire_with_media_bytes()
+        original_loader = openpyxl.load_workbook
+        load_count = 0
+
+        def load_structure_only(*args, **kwargs):
+            nonlocal load_count
+            load_count += 1
+            if load_count == 2:
+                raise RuntimeError("secret media workbook detail")
+            return original_loader(*args, **kwargs)
+
+        with patch.object(openpyxl, "load_workbook", side_effect=load_structure_only):
+            parsed = parse_bested_questionnaire_upload(
+                "questionnaire.xlsx",
+                content,
+            )
+
+        self.assertEqual([question.qid for question in parsed.questions], [1, 2])
+        self.assertIn("其他建议", parsed.questionnaire_text)
+        self.assertEqual(parsed.images, ())
+        self.assertEqual(parsed.hyperlinks, ())
+        self.assertEqual(parsed.media_issues, (
+            BestedQuestionnaireMediaIssue(
+                code="media_workbook_load_failed",
+                sheet_name="问卷内容",
+            ),
+        ))
+        self.assertNotIn("secret media workbook detail", repr(parsed.media_issues))
+
+    def test_resource_exhaustion_during_media_load_remains_a_hard_failure(self):
+        content = _questionnaire_with_media_bytes()
+        original_loader = openpyxl.load_workbook
+        load_count = 0
+
+        def exhaust_on_media_load(*args, **kwargs):
+            nonlocal load_count
+            load_count += 1
+            if load_count == 2:
+                raise MemoryError("synthetic resource exhaustion")
+            return original_loader(*args, **kwargs)
+
+        with (
+            patch.object(
+                openpyxl,
+                "load_workbook",
+                side_effect=exhaust_on_media_load,
+            ),
+            self.assertRaises(MemoryError),
+        ):
+            parse_bested_questionnaire_upload(
+                "questionnaire.xlsx",
+                content,
+            )
+
+    def test_second_media_preflight_failure_remains_a_hard_failure(self):
+        content = _questionnaire_with_media_bytes()
+        validator = bested_client._validate_xlsx_package
+        validation_count = 0
+
+        def validate_then_fail(payload):
+            nonlocal validation_count
+            validation_count += 1
+            if validation_count == 2:
+                raise ValueError("blocked media preflight")
+            return validator(payload)
+
+        with (
+            patch.object(
+                bested_client,
+                "_validate_xlsx_package",
+                side_effect=validate_then_fail,
+            ),
+            self.assertRaisesRegex(ValueError, "blocked media preflight"),
+        ):
+            parse_bested_questionnaire_upload("questionnaire.xlsx", content)
 
     def test_online_urls_are_explicitly_rejected(self):
         for source in (
@@ -404,6 +545,11 @@ class BestedQuestionnaireConnectorTests(unittest.TestCase):
                         bested_client,
                         "_validate_xlsx_package",
                         return_value=None,
+                    ),
+                    patch.object(
+                        bested_client,
+                        "_validated_worksheet_image_use_count",
+                        return_value=3,
                     ),
                     patch.object(bested_client, constant, limit),
                     self.assertRaisesRegex(ValueError, message),

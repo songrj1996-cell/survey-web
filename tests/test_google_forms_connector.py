@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import FrozenInstanceError, fields
 import hashlib
 import json
 from pathlib import Path
@@ -9,10 +10,13 @@ import unittest
 import httpx
 
 from app.integrations.google_forms_client import (
+    GoogleFormCapture,
+    GoogleFormImageFailure,
     GoogleFormsClient,
     GoogleFormsConnectorError,
     GoogleFormsErrorCode,
     GoogleFormsStage,
+    GoogleImageContext,
     GoogleImageDownloadPolicy,
 )
 
@@ -85,7 +89,59 @@ class _AsyncChunks(httpx.AsyncByteStream):
         return None
 
 
+class _InterruptedChunks(httpx.AsyncByteStream):
+    def __init__(self, content: bytes):
+        self._content = content
+
+    async def __aiter__(self):
+        yield self._content
+        raise httpx.ReadError(
+            "synthetic interrupted stream secret",
+            request=httpx.Request("GET", "https://safe.invalid/image"),
+        )
+
+    async def aclose(self) -> None:
+        return None
+
+
 class GoogleFormsConnectorTests(unittest.IsolatedAsyncioTestCase):
+    def test_public_image_failure_contract_is_safe_frozen_and_compatible(self):
+        context = GoogleImageContext(
+            item_position=0,
+            item_id="safe-item-id",
+            question_id=None,
+            question_ids=(),
+            option_index=None,
+        )
+        failure = GoogleFormImageFailure(
+            json_path=IMAGE_PATHS[0],
+            context=context,
+            code=GoogleFormsErrorCode.IMAGE_HTTP_ERROR,
+            stage=GoogleFormsStage.IMAGE_DOWNLOAD,
+            retryable=False,
+            status_code=404,
+        )
+
+        self.assertEqual(
+            tuple(field.name for field in fields(GoogleFormImageFailure)),
+            (
+                "json_path",
+                "context",
+                "code",
+                "stage",
+                "retryable",
+                "status_code",
+            ),
+        )
+        with self.assertRaises(FrozenInstanceError):
+            failure.retryable = True
+        self.assertFalse(hasattr(failure, "message"))
+        self.assertFalse(hasattr(failure, "safe_context"))
+        self.assertEqual(
+            GoogleFormCapture(FORM_ID, {"formId": FORM_ID}, ()).image_failures,
+            (),
+        )
+
     async def test_fetches_form_and_captures_all_images_in_memory(self):
         image_urls = tuple(
             f"https://lh{index}.googleusercontent.com/image-{index}?temporary=secret-{index}"
@@ -146,6 +202,7 @@ class GoogleFormsConnectorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(authorization_calls, 1)
         self.assertEqual(capture.form_id, FORM_ID)
         self.assertEqual(len(capture.images), 4)
+        self.assertEqual(capture.image_failures, ())
         self.assertTrue(capture.raw_form["syntheticProviderField"]["mustSurvive"])
         serialized = json.dumps(capture.raw_form, ensure_ascii=False)
         self.assertNotIn("contentUri", serialized)
@@ -228,17 +285,26 @@ class GoogleFormsConnectorTests(unittest.IsolatedAsyncioTestCase):
                         lambda: {"Authorization": "Bearer hidden-token"},
                         forms_api_base=FORMS_API_BASE,
                     )
-                    with self.assertRaises(GoogleFormsConnectorError) as caught:
-                        await connector.fetch_form(FORM_ID)
+                    capture = await connector.fetch_form(FORM_ID)
 
-                error = caught.exception
-                self.assertEqual(error.code, GoogleFormsErrorCode.IMAGE_URL_REJECTED)
-                self.assertEqual(error.stage, GoogleFormsStage.IMAGE_DOWNLOAD)
-                self.assertFalse(error.retryable)
+                self.assertEqual(capture.images, ())
+                failure, = capture.image_failures
+                self.assertEqual(
+                    failure.code,
+                    GoogleFormsErrorCode.IMAGE_URL_REJECTED,
+                )
+                self.assertEqual(failure.stage, GoogleFormsStage.IMAGE_DOWNLOAD)
+                self.assertFalse(failure.retryable)
+                self.assertIsNone(failure.status_code)
+                self.assertEqual(failure.json_path, IMAGE_PATHS[0])
                 self.assertEqual(len(requests), 1)
-                safe_error = f"{error} {error.safe_context!r}"
-                self.assertNotIn("secret-query-value", safe_error)
-                self.assertNotIn("hidden-token", safe_error)
+                safe_capture = repr(capture)
+                self.assertNotIn("secret-query-value", safe_capture)
+                self.assertNotIn("hidden-token", safe_capture)
+                self.assertNotIn(
+                    "contentUri",
+                    json.dumps(capture.raw_form, ensure_ascii=False),
+                )
 
     async def test_validates_every_redirect_and_never_follows_an_evil_target(self):
         initial_url = "https://lh3.googleusercontent.com/start?token=initial-secret"
@@ -262,15 +328,16 @@ class GoogleFormsConnectorTests(unittest.IsolatedAsyncioTestCase):
                 lambda: {"Authorization": "Bearer hidden-token"},
                 forms_api_base=FORMS_API_BASE,
             )
-            with self.assertRaises(GoogleFormsConnectorError) as caught:
-                await connector.fetch_form(FORM_ID)
+            capture = await connector.fetch_form(FORM_ID)
 
+        failure, = capture.image_failures
         self.assertEqual(
-            caught.exception.code,
+            failure.code,
             GoogleFormsErrorCode.IMAGE_URL_REJECTED,
         )
+        self.assertEqual(capture.images, ())
         self.assertEqual(len(requested_urls), 2)
-        self.assertNotIn("redirect-secret", str(caught.exception))
+        self.assertNotIn("redirect-secret", repr(capture))
         self.assertFalse(any("evil.invalid" in url for url in requested_urls))
 
     async def test_follows_a_bounded_safe_redirect_without_authorization(self):
@@ -394,11 +461,13 @@ class GoogleFormsConnectorTests(unittest.IsolatedAsyncioTestCase):
                         forms_api_base=FORMS_API_BASE,
                         image_policy=policy,
                     )
-                    with self.assertRaises(GoogleFormsConnectorError) as caught:
-                        await connector.fetch_form(FORM_ID)
+                    capture = await connector.fetch_form(FORM_ID)
 
-                self.assertEqual(caught.exception.code, expected_code)
-                self.assertNotIn("temporary=secret", str(caught.exception))
+                self.assertEqual(capture.images, ())
+                failure, = capture.image_failures
+                self.assertEqual(failure.code, expected_code)
+                self.assertEqual(failure.stage, GoogleFormsStage.IMAGE_DOWNLOAD)
+                self.assertNotIn("temporary=secret", repr(capture))
 
     async def test_enforces_actual_streamed_size_without_content_length(self):
         payload = _payload_with_one_image(
@@ -427,13 +496,14 @@ class GoogleFormsConnectorTests(unittest.IsolatedAsyncioTestCase):
                 forms_api_base=FORMS_API_BASE,
                 image_policy=policy,
             )
-            with self.assertRaises(GoogleFormsConnectorError) as caught:
-                await connector.fetch_form(FORM_ID)
+            capture = await connector.fetch_form(FORM_ID)
 
+        failure, = capture.image_failures
         self.assertEqual(
-            caught.exception.code,
+            failure.code,
             GoogleFormsErrorCode.IMAGE_TOO_LARGE,
         )
+        self.assertEqual(capture.images, ())
 
     async def test_image_http_and_transport_errors_are_structured(self):
         payload = _payload_with_one_image(
@@ -453,14 +523,13 @@ class GoogleFormsConnectorTests(unittest.IsolatedAsyncioTestCase):
                 lambda: {"Authorization": "Bearer auth-secret"},
                 forms_api_base=FORMS_API_BASE,
             )
-            with self.assertRaises(GoogleFormsConnectorError) as caught:
-                await connector.fetch_form(FORM_ID)
+            capture = await connector.fetch_form(FORM_ID)
 
-        error = caught.exception
-        self.assertEqual(error.code, GoogleFormsErrorCode.IMAGE_HTTP_ERROR)
-        self.assertEqual(error.status_code, 503)
-        self.assertTrue(error.retryable)
-        self.assertNotIn("provider-image-error-secret", str(error))
+        failure, = capture.image_failures
+        self.assertEqual(failure.code, GoogleFormsErrorCode.IMAGE_HTTP_ERROR)
+        self.assertEqual(failure.status_code, 503)
+        self.assertTrue(failure.retryable)
+        self.assertNotIn("provider-image-error-secret", repr(capture))
 
         async def transport_handler(request: httpx.Request) -> httpx.Response:
             if request.url.host == "forms.googleapis.test":
@@ -475,13 +544,279 @@ class GoogleFormsConnectorTests(unittest.IsolatedAsyncioTestCase):
                 lambda: {"Authorization": "Bearer auth-secret"},
                 forms_api_base=FORMS_API_BASE,
             )
+            capture = await connector.fetch_form(FORM_ID)
+
+        failure, = capture.image_failures
+        self.assertEqual(failure.code, GoogleFormsErrorCode.TRANSPORT_ERROR)
+        self.assertTrue(failure.retryable)
+        self.assertIsNone(failure.status_code)
+        self.assertNotIn("transport-secret", repr(capture))
+
+    async def test_one_image_404_preserves_definition_and_other_images(self):
+        image_urls = tuple(
+            f"https://lh{index}.googleusercontent.com/image-{index}?temporary=secret-{index}"
+            for index in range(1, 5)
+        )
+        payload = _payload_with_image_urls(image_urls)
+        requested_paths: list[str] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.host == "forms.googleapis.test":
+                return httpx.Response(200, json=payload)
+            requested_paths.append(request.url.path)
+            if request.url.path == "/image-2":
+                return httpx.Response(
+                    404,
+                    content=b"temporary-image-error-body-secret",
+                )
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "image/png"},
+                content=_png(request.url.path.removeprefix("/")),
+            )
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as http_client:
+            connector = GoogleFormsClient(
+                http_client,
+                lambda: {"Authorization": "Bearer auth-secret"},
+                forms_api_base=FORMS_API_BASE,
+            )
+            capture = await connector.fetch_form(FORM_ID)
+
+        self.assertEqual(capture.form_id, FORM_ID)
+        self.assertTrue(capture.raw_form["syntheticProviderField"]["mustSurvive"])
+        self.assertNotIn(
+            "contentUri",
+            json.dumps(capture.raw_form, ensure_ascii=False),
+        )
+        self.assertEqual(
+            {image.json_path for image in capture.images},
+            {IMAGE_PATHS[0], IMAGE_PATHS[2], IMAGE_PATHS[3]},
+        )
+        failure, = capture.image_failures
+        self.assertEqual(failure.json_path, IMAGE_PATHS[1])
+        self.assertEqual(failure.code, GoogleFormsErrorCode.IMAGE_HTTP_ERROR)
+        self.assertEqual(failure.stage, GoogleFormsStage.IMAGE_DOWNLOAD)
+        self.assertFalse(failure.retryable)
+        self.assertEqual(failure.status_code, 404)
+        self.assertEqual(
+            requested_paths,
+            ["/image-1", "/image-2", "/image-3", "/image-4"],
+        )
+        self.assertNotIn("temporary-image-error-body-secret", repr(capture))
+        self.assertNotIn("auth-secret", repr(capture))
+
+    async def test_total_byte_limit_closes_all_unresolved_paths_without_more_calls(self):
+        image_urls = tuple(
+            f"https://lh{index}.googleusercontent.com/image-{index}?temporary=secret-{index}"
+            for index in range(1, 5)
+        )
+        payload = _payload_with_image_urls(image_urls)
+        requested_paths: list[str] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.host == "forms.googleapis.test":
+                return httpx.Response(200, json=payload)
+            requested_paths.append(request.url.path)
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "image/png"},
+                content=_png("one"),
+            )
+
+        policy = GoogleImageDownloadPolicy(
+            max_image_bytes=16,
+            max_total_bytes=20,
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as http_client:
+            connector = GoogleFormsClient(
+                http_client,
+                lambda: {"Authorization": "Bearer auth-secret"},
+                forms_api_base=FORMS_API_BASE,
+                image_policy=policy,
+            )
+            capture = await connector.fetch_form(FORM_ID)
+
+        self.assertEqual(
+            tuple(image.json_path for image in capture.images),
+            (IMAGE_PATHS[0],),
+        )
+        self.assertEqual(
+            tuple(failure.json_path for failure in capture.image_failures),
+            IMAGE_PATHS[1:],
+        )
+        self.assertTrue(all(
+            failure.code == GoogleFormsErrorCode.IMAGE_TOO_LARGE
+            and failure.stage == GoogleFormsStage.IMAGE_DOWNLOAD
+            and not failure.retryable
+            for failure in capture.image_failures
+        ))
+        self.assertEqual(
+            tuple(failure.status_code for failure in capture.image_failures),
+            (200, None, None),
+        )
+        self.assertEqual(requested_paths, ["/image-1", "/image-2"])
+        self.assertNotIn(
+            "contentUri",
+            json.dumps(capture.raw_form, ensure_ascii=False),
+        )
+
+    async def test_failed_streams_count_toward_total_download_budget(self):
+        image_urls = tuple(
+            f"https://lh{index}.googleusercontent.com/image-{index}"
+            for index in range(1, 5)
+        )
+        payload = _payload_with_image_urls(image_urls)
+        requested_paths: list[str] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.host == "forms.googleapis.test":
+                return httpx.Response(200, json=payload)
+            requested_paths.append(request.url.path)
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "image/png"},
+                stream=_AsyncChunks(PNG_SIGNATURE, b"x" * 9),
+            )
+
+        policy = GoogleImageDownloadPolicy(
+            max_image_bytes=16,
+            max_total_bytes=32,
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as http_client:
+            connector = GoogleFormsClient(
+                http_client,
+                lambda: {"Authorization": "Bearer auth-secret"},
+                forms_api_base=FORMS_API_BASE,
+                image_policy=policy,
+            )
+            capture = await connector.fetch_form(FORM_ID)
+
+        self.assertEqual(capture.images, ())
+        self.assertEqual(
+            tuple(failure.json_path for failure in capture.image_failures),
+            IMAGE_PATHS,
+        )
+        self.assertEqual(requested_paths, ["/image-1", "/image-2"])
+
+    async def test_interrupted_short_buffers_count_toward_total_budget(self):
+        image_urls = tuple(
+            f"https://lh{index}.googleusercontent.com/image-{index}"
+            for index in range(1, 5)
+        )
+        payload = _payload_with_image_urls(image_urls)
+        requested_paths: list[str] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.host == "forms.googleapis.test":
+                return httpx.Response(200, json=payload)
+            requested_paths.append(request.url.path)
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "image/png"},
+                stream=_InterruptedChunks(PNG_SIGNATURE + (b"x" * 7)),
+            )
+
+        policy = GoogleImageDownloadPolicy(
+            max_image_bytes=16,
+            max_total_bytes=32,
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as http_client:
+            capture = await GoogleFormsClient(
+                http_client,
+                lambda: {"Authorization": "Bearer auth-secret"},
+                forms_api_base=FORMS_API_BASE,
+                image_policy=policy,
+            ).fetch_form(FORM_ID)
+
+        self.assertEqual(capture.images, ())
+        self.assertEqual(
+            tuple(failure.json_path for failure in capture.image_failures),
+            IMAGE_PATHS,
+        )
+        self.assertEqual(requested_paths, ["/image-1", "/image-2", "/image-3"])
+        self.assertEqual(
+            tuple(failure.code for failure in capture.image_failures),
+            (
+                GoogleFormsErrorCode.TRANSPORT_ERROR,
+                GoogleFormsErrorCode.TRANSPORT_ERROR,
+                GoogleFormsErrorCode.IMAGE_TOO_LARGE,
+                GoogleFormsErrorCode.IMAGE_TOO_LARGE,
+            ),
+        )
+        self.assertNotIn("interrupted stream secret", repr(capture))
+
+    async def test_rejects_compressed_image_response_as_safe_partial_failure(self):
+        payload = _payload_with_one_image(
+            "https://lh3.googleusercontent.com/image"
+        )
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.host == "forms.googleapis.test":
+                return httpx.Response(200, json=payload)
+            return httpx.Response(
+                200,
+                headers={
+                    "Content-Type": "image/png",
+                    "Content-Encoding": "gzip",
+                },
+                stream=_AsyncChunks(b"not-gzip provider-decoder-secret"),
+            )
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as http_client:
+            capture = await GoogleFormsClient(
+                http_client,
+                lambda: {"Authorization": "Bearer auth-secret"},
+                forms_api_base=FORMS_API_BASE,
+            ).fetch_form(FORM_ID)
+
+        self.assertEqual(capture.images, ())
+        failure, = capture.image_failures
+        self.assertEqual(
+            failure.code,
+            GoogleFormsErrorCode.IMAGE_INVALID_RESPONSE,
+        )
+        self.assertEqual(failure.status_code, 200)
+        self.assertNotIn("provider-decoder-secret", repr(capture))
+
+    async def test_global_image_count_limit_remains_a_hard_failure(self):
+        image_urls = tuple(
+            f"https://lh{index}.googleusercontent.com/image-{index}"
+            for index in range(1, 5)
+        )
+        payload = _payload_with_image_urls(image_urls)
+        requests: list[httpx.Request] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200, json=payload)
+
+        policy = GoogleImageDownloadPolicy(max_images=3)
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as http_client:
+            connector = GoogleFormsClient(
+                http_client,
+                lambda: {"Authorization": "Bearer auth-secret"},
+                forms_api_base=FORMS_API_BASE,
+                image_policy=policy,
+            )
             with self.assertRaises(GoogleFormsConnectorError) as caught:
                 await connector.fetch_form(FORM_ID)
 
-        error = caught.exception
-        self.assertEqual(error.code, GoogleFormsErrorCode.TRANSPORT_ERROR)
-        self.assertTrue(error.retryable)
-        self.assertNotIn("transport-secret", str(error))
+        self.assertEqual(caught.exception.code, GoogleFormsErrorCode.TOO_MANY_IMAGES)
+        self.assertEqual(caught.exception.stage, GoogleFormsStage.IMAGE_DISCOVERY)
+        self.assertEqual(len(requests), 1)
 
     async def test_invalid_json_identity_and_content_uri_are_structured(self):
         scenarios = []

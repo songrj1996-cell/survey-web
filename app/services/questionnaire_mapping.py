@@ -17,12 +17,18 @@ from app.core.research_assets import (
     validate_research_contract,
 )
 from app.integrations.bested_questionnaire_client import (
+    BestedQuestionnaireMediaIssue,
     BestedQuestionnaireParseResult,
     BestedQuestionnaireQuestion,
+    worksheet_image_use_count,
 )
 from app.integrations.google_forms_client import (
     GoogleFormCapture,
     GoogleFormImageCapture,
+    GoogleFormImageFailure,
+    GoogleFormsErrorCode,
+    GoogleFormsStage,
+    GoogleImageContext,
 )
 from app.schemas.questionnaire import (
     BranchAction,
@@ -64,6 +70,7 @@ from app.storage.research_assets import ResearchAssetBundle
 
 
 _DRIVE_FILE_RE = re.compile(r"/file/d/([A-Za-z0-9_-]+)")
+_EXCEL_CELL_RE = re.compile(r"^([A-Z]{1,3})([1-9]\d*)$")
 _GOOGLE_ITEM_KEYS = (
     "questionItem",
     "questionGroupItem",
@@ -80,6 +87,32 @@ _BESTED_TYPE_MAP = {
     "matrix_scale": CanonicalQuestionType.MATRIX_SCALE,
     "scale": CanonicalQuestionType.SCALE,
     "open_text": CanonicalQuestionType.OPEN_TEXT,
+}
+_GOOGLE_IMAGE_FAILURE_MESSAGES = {
+    GoogleFormsErrorCode.IMAGE_URL_REJECTED:
+        "图片临时地址未通过安全下载校验，已跳过该素材",
+    GoogleFormsErrorCode.IMAGE_REDIRECT_LIMIT:
+        "图片临时地址重定向次数超过限制，已跳过该素材",
+    GoogleFormsErrorCode.IMAGE_HTTP_ERROR:
+        "图片服务返回失败状态，已保留问卷结构并跳过该素材",
+    GoogleFormsErrorCode.IMAGE_INVALID_RESPONSE:
+        "图片服务响应无效，已保留问卷结构并跳过该素材",
+    GoogleFormsErrorCode.IMAGE_CONTENT_TYPE_REJECTED:
+        "图片类型不在安全支持范围内，已跳过该素材",
+    GoogleFormsErrorCode.IMAGE_TOO_LARGE:
+        "图片超过安全大小限制，已跳过该素材",
+    GoogleFormsErrorCode.IMAGE_SIGNATURE_MISMATCH:
+        "图片内容与声明格式不一致，已跳过该素材",
+    GoogleFormsErrorCode.TRANSPORT_ERROR:
+        "图片下载连接失败，已保留问卷结构并跳过该素材",
+}
+_BESTED_MEDIA_ISSUE_MESSAGES = {
+    "image_loading_failed":
+        "一张 OOXML 声明的内嵌图片无法加载；问卷文字结构和其他素材已保留",
+    "image_extraction_failed":
+        "一张内嵌图片无法读取；问卷文字结构和其他素材已保留",
+    "media_workbook_load_failed":
+        "问卷文字结构已解析，但素材工作簿无法加载；内嵌素材未完整恢复",
 }
 
 
@@ -156,35 +189,428 @@ def _google_option_index(path: tuple[Any, ...]) -> int | None:
     return indexes[0] if indexes else None
 
 
-def _validate_google_image_capture(
-    image: GoogleFormImageCapture,
+def _value_at_json_path(
+    value: Any,
+    path: tuple[str | int, ...],
+) -> Any:
+    current = value
+    for part in path:
+        if isinstance(part, int):
+            if not isinstance(current, list) or part >= len(current):
+                raise ValueError("Google 图片证据的 JSON 路径不存在")
+            current = current[part]
+        else:
+            if not isinstance(current, dict) or part not in current:
+                raise ValueError("Google 图片证据的 JSON 路径不存在")
+            current = current[part]
+    return current
+
+
+def _google_question_context_at_path(
+    raw_item: dict[str, Any],
+    relative_path: tuple[str | int, ...],
+) -> tuple[str | None, tuple[str, ...]]:
+    current: Any = raw_item
+    inherited_question_id: str | None = None
+    shared_question_ids: tuple[str, ...] = ()
+
+    def update_context(value: Any) -> None:
+        nonlocal inherited_question_id, shared_question_ids
+        if isinstance(value, dict):
+            own_question_id = value.get("questionId")
+            if isinstance(own_question_id, str) and own_question_id:
+                inherited_question_id = own_question_id
+            nested_question = value.get("question")
+            if isinstance(nested_question, dict):
+                nested_question_id = nested_question.get("questionId")
+                if isinstance(nested_question_id, str) and nested_question_id:
+                    inherited_question_id = nested_question_id
+            group = value.get("questionGroupItem")
+            if isinstance(group, dict):
+                raw_questions = group.get("questions")
+                if isinstance(raw_questions, list):
+                    shared_question_ids = tuple(
+                        question_id
+                        for question in raw_questions
+                        if isinstance(question, dict)
+                        and isinstance(
+                            question_id := question.get("questionId"),
+                            str,
+                        )
+                        and question_id
+                    )
+
+    for part in relative_path:
+        update_context(current)
+        try:
+            current = current[part]
+        except (KeyError, IndexError, TypeError):
+            raise ValueError("Google 图片证据的 JSON 路径不存在") from None
+    update_context(current)
+    return (
+        inherited_question_id,
+        (
+            (inherited_question_id,)
+            if inherited_question_id is not None
+            else shared_question_ids
+        ),
+    )
+
+
+def _validate_google_image_evidence(
+    json_path: tuple[str | int, ...],
+    context: GoogleImageContext,
     raw_items: list[Any],
 ) -> None:
-    position = image.context.item_position
+    if (
+        not isinstance(json_path, tuple)
+        or any(
+            not isinstance(part, (str, int))
+            or isinstance(part, bool)
+            or (isinstance(part, str) and not part)
+            or (isinstance(part, int) and part < 0)
+            for part in json_path
+        )
+    ):
+        raise ValueError("Google 图片证据的 JSON 路径无效")
+    if not isinstance(context, GoogleImageContext):
+        raise ValueError("Google 图片证据的上下文无效")
+    if (
+        not isinstance(context.item_position, int)
+        or isinstance(context.item_position, bool)
+    ):
+        raise ValueError("Google 图片证据的 Item 位置无效")
+    if context.item_id is not None and not isinstance(context.item_id, str):
+        raise ValueError("Google 图片证据的 itemId 无效")
+    if (
+        context.question_id is not None
+        and not isinstance(context.question_id, str)
+    ):
+        raise ValueError("Google 图片证据的 questionId 无效")
+    if (
+        not isinstance(context.question_ids, tuple)
+        or any(
+            not isinstance(question_id, str) or not question_id
+            for question_id in context.question_ids
+        )
+        or len(context.question_ids) != len(set(context.question_ids))
+    ):
+        raise ValueError("Google 图片证据的 question_ids 无效")
+    if context.option_index is not None and (
+        not isinstance(context.option_index, int)
+        or isinstance(context.option_index, bool)
+        or context.option_index < 0
+    ):
+        raise ValueError("Google 图片证据的 option_index 无效")
+    position = context.item_position
     if (
         position < 0
         or position >= len(raw_items)
-        or len(image.json_path) < 3
-        or image.json_path[0] != "items"
-        or image.json_path[1] != position
-        or image.json_path[-1] != "image"
+        or len(json_path) < 3
+        or json_path[0] != "items"
+        or json_path[1] != position
+        or json_path[-1] != "image"
     ):
         raise ValueError("Google 图片捕获的 JSON 路径与 Item 位置不一致")
     raw_item = raw_items[position]
     if not isinstance(raw_item, dict):
         raise ValueError("Google 图片捕获指向的 Item 不是对象")
-    if raw_item.get("itemId") != image.context.item_id:
+    if raw_item.get("itemId") != context.item_id:
         raise ValueError("Google 图片捕获的 itemId 与原始 Item 不一致")
-    expected_question_ids = set(_question_ids(raw_item))
-    if image.context.question_id is not None:
-        if image.context.question_id not in expected_question_ids:
-            raise ValueError("Google 图片捕获的 questionId 不属于原始 Item")
-        if set(image.context.question_ids) != {image.context.question_id}:
-            raise ValueError("Google 图片捕获的 question_ids 与 questionId 不一致")
-    elif set(image.context.question_ids) != expected_question_ids:
-        raise ValueError("Google 图片捕获的题组 questionIds 与原始 Item 不一致")
-    if image.context.option_index != _google_option_index(image.json_path):
+    relative_path = json_path[2:]
+    if not isinstance(_value_at_json_path(raw_item, relative_path), dict):
+        raise ValueError("Google 图片证据的 JSON 路径未指向图片对象")
+    expected_question_id, expected_question_ids = (
+        _google_question_context_at_path(raw_item, relative_path)
+    )
+    if context.question_id != expected_question_id:
+        raise ValueError("Google 图片捕获的 questionId 与 JSON 路径不一致")
+    if context.question_ids != expected_question_ids:
+        raise ValueError("Google 图片捕获的 question_ids 与 JSON 路径不一致")
+    if context.option_index != _google_option_index(json_path):
         raise ValueError("Google 图片捕获的 option_index 与 JSON 路径不一致")
+
+
+def _validate_google_image_capture(
+    image: GoogleFormImageCapture,
+    raw_items: list[Any],
+) -> None:
+    _validate_google_image_evidence(
+        image.json_path,
+        image.context,
+        raw_items,
+    )
+
+
+def _google_image_failure_warning(
+    failure: GoogleFormImageFailure,
+    *,
+    form_id: str,
+) -> ImportWarning:
+    if not isinstance(failure.code, GoogleFormsErrorCode):
+        raise ValueError("Google 图片失败记录的错误代码无效")
+    if (
+        not isinstance(failure.stage, GoogleFormsStage)
+        or failure.stage != GoogleFormsStage.IMAGE_DOWNLOAD
+    ):
+        raise ValueError("Google 图片失败记录的 stage 必须是 image_download")
+    message = _GOOGLE_IMAGE_FAILURE_MESSAGES.get(failure.code)
+    if message is None:
+        raise ValueError("Google 图片失败记录包含不可降级的错误代码")
+    if not isinstance(failure.retryable, bool):
+        raise ValueError("Google 图片失败记录的 retryable 必须是布尔值")
+    if (
+        failure.status_code is not None
+        and (
+            not isinstance(failure.status_code, int)
+            or isinstance(failure.status_code, bool)
+            or not 100 <= failure.status_code <= 599
+        )
+    ):
+        raise ValueError("Google 图片失败记录的 HTTP 状态码无效")
+    if failure.code == GoogleFormsErrorCode.IMAGE_HTTP_ERROR:
+        if (
+            failure.status_code is None
+            or failure.status_code == 200
+            or failure.status_code in {301, 302, 303, 307, 308}
+        ):
+            raise ValueError("Google 图片 HTTP 失败记录缺少非成功状态码")
+        expected_retryable = (
+            failure.status_code in {408, 409, 425, 429}
+            or failure.status_code >= 500
+        )
+        if failure.retryable != expected_retryable:
+            raise ValueError("Google 图片 HTTP 失败记录的重试语义不一致")
+    elif failure.code == GoogleFormsErrorCode.TRANSPORT_ERROR:
+        if failure.status_code is not None or not failure.retryable:
+            raise ValueError("Google 图片传输失败记录的状态或重试语义不一致")
+    elif failure.code == GoogleFormsErrorCode.IMAGE_REDIRECT_LIMIT:
+        if (
+            failure.status_code not in {301, 302, 303, 307, 308}
+            or failure.retryable
+        ):
+            raise ValueError("Google 图片重定向失败记录的状态语义不一致")
+    elif failure.code in {
+        GoogleFormsErrorCode.IMAGE_CONTENT_TYPE_REJECTED,
+        GoogleFormsErrorCode.IMAGE_SIGNATURE_MISMATCH,
+    }:
+        if failure.status_code != 200 or failure.retryable:
+            raise ValueError("Google 图片响应失败记录的状态语义不一致")
+    elif failure.code == GoogleFormsErrorCode.IMAGE_INVALID_RESPONSE:
+        if (
+            failure.status_code not in {200, 301, 302, 303, 307, 308}
+            or failure.retryable
+        ):
+            raise ValueError("Google 图片无效响应记录的状态语义不一致")
+    elif failure.code == GoogleFormsErrorCode.IMAGE_URL_REJECTED:
+        if failure.retryable or failure.status_code is not None:
+            raise ValueError("Google 图片地址失败记录的状态语义不一致")
+    elif failure.code == GoogleFormsErrorCode.IMAGE_TOO_LARGE:
+        if failure.retryable or failure.status_code not in {None, 200}:
+            raise ValueError("Google 图片超限失败记录的状态语义不一致")
+    retry_guidance = (
+        "；可稍后重试该素材"
+        if failure.retryable
+        else "；该结果无需自动重试"
+    )
+    return ImportWarning(
+        code=f"google_forms_{failure.code.value}",
+        message=message + retry_guidance,
+        blocking=False,
+        source_locator=SourceLocator(
+            provider=Provider.GOOGLE_FORMS,
+            provider_form_id=form_id,
+            provider_question_id=failure.context.question_id,
+            provider_item_id=failure.context.item_id,
+            question_position=failure.context.item_position,
+            json_path=list(failure.json_path),
+        ),
+    )
+
+
+def _bested_media_issue_warning(
+    issue: BestedQuestionnaireMediaIssue,
+    *,
+    filename: str,
+    sheet_name: str,
+) -> ImportWarning:
+    if not isinstance(issue.code, str):
+        raise ValueError("倍市得素材问题的错误代码无效")
+    message = _BESTED_MEDIA_ISSUE_MESSAGES.get(issue.code)
+    if message is None:
+        raise ValueError("倍市得素材问题包含未知错误代码")
+    if issue.sheet_name is not None and (
+        not isinstance(issue.sheet_name, str)
+        or issue.sheet_name != sheet_name
+    ):
+        raise ValueError("倍市得素材问题指向其他工作表")
+    if issue.source_row is not None and (
+        not isinstance(issue.source_row, int)
+        or isinstance(issue.source_row, bool)
+        or issue.source_row < 1
+    ):
+        raise ValueError("倍市得素材问题的来源行无效")
+    if issue.source_cell is not None:
+        if not isinstance(issue.source_cell, str):
+            raise ValueError("倍市得素材问题的来源单元格无效")
+        cell_match = _EXCEL_CELL_RE.fullmatch(issue.source_cell)
+        if cell_match is None:
+            raise ValueError("倍市得素材问题的来源单元格无效")
+        if (
+            issue.source_row is None
+            or int(cell_match.group(2)) != issue.source_row
+        ):
+            raise ValueError("倍市得素材问题的单元格与来源行不一致")
+    elif issue.source_row is not None:
+        raise ValueError("倍市得素材问题的来源行缺少单元格定位")
+    if issue.code == "media_workbook_load_failed" and (
+        issue.source_cell is not None or issue.source_row is not None
+    ):
+        raise ValueError("倍市得素材工作簿加载失败不能声明单图位置")
+    return ImportWarning(
+        code=f"bested_{issue.code}",
+        message=message,
+        blocking=False,
+        source_locator=SourceLocator(
+            provider=Provider.BESTED,
+            file_id=filename,
+            sheet_name=issue.sheet_name or sheet_name,
+            cell=issue.source_cell,
+        ),
+    )
+
+
+def _bested_question_qid_for_row(
+    questions: tuple[BestedQuestionnaireQuestion, ...],
+    source_row: int | None,
+) -> int | None:
+    if source_row is None:
+        return None
+    matches = [
+        question.qid
+        for question in questions
+        if question.source_row
+        <= source_row
+        <= question.source_row + len(question.raw_rows) - 1
+    ]
+    if len(matches) > 1:
+        raise ValueError("倍市得素材来源行同时落入多个题目区间")
+    return matches[0] if matches else None
+
+
+def _validate_bested_cell_row(
+    *,
+    source_cell: str | None,
+    source_row: int | None,
+    label: str,
+) -> None:
+    if source_cell is None:
+        if source_row is not None:
+            raise ValueError(f"{label}来源行缺少单元格定位")
+        return
+    if not isinstance(source_cell, str):
+        raise ValueError(f"{label}来源单元格无效")
+    match = _EXCEL_CELL_RE.fullmatch(source_cell)
+    if match is None:
+        raise ValueError(f"{label}来源单元格无效")
+    if (
+        not isinstance(source_row, int)
+        or isinstance(source_row, bool)
+        or int(match.group(2)) != source_row
+    ):
+        raise ValueError(f"{label}来源单元格与来源行不一致")
+
+
+def _bested_coverage_end_row(
+    coverage: str | None,
+    *,
+    source_cell: str | None,
+    source_row: int | None,
+) -> int | None:
+    if source_cell is None:
+        if coverage is not None:
+            raise ValueError("倍市得图片缺少锚点却声明 coverage")
+        return source_row
+    if not isinstance(coverage, str):
+        raise ValueError("倍市得图片 coverage 无效")
+    parts = coverage.split(":")
+    if len(parts) not in {1, 2} or parts[0] != source_cell:
+        raise ValueError("倍市得图片 coverage 与来源单元格不一致")
+    end_match = _EXCEL_CELL_RE.fullmatch(parts[-1])
+    if end_match is None:
+        raise ValueError("倍市得图片 coverage 无效")
+    end_row = int(end_match.group(2))
+    if source_row is None or end_row < source_row:
+        raise ValueError("倍市得图片 coverage 范围无效")
+    return end_row
+
+
+def _validate_bested_media_closure(
+    parsed: BestedQuestionnaireParseResult,
+    content: bytes,
+) -> None:
+    workbook_failure_count = sum(
+        issue.code == "media_workbook_load_failed"
+        for issue in parsed.media_issues
+    )
+    if workbook_failure_count:
+        if (
+            workbook_failure_count != 1
+            or len(parsed.media_issues) != 1
+            or parsed.images
+            or parsed.hyperlinks
+        ):
+            raise ValueError("倍市得素材工作簿加载失败记录与解析结果矛盾")
+        return
+    expected_image_uses = worksheet_image_use_count(content, parsed.sheet_name)
+    per_image_failures = sum(
+        issue.code in {"image_loading_failed", "image_extraction_failed"}
+        for issue in parsed.media_issues
+    )
+    if len(parsed.images) + per_image_failures != expected_image_uses:
+        raise ValueError("倍市得图片成功/失败集合与 OOXML 声明数量不一致")
+
+    for image in parsed.images:
+        if image.sheet_name != parsed.sheet_name:
+            raise ValueError("倍市得图片指向其他工作表")
+        _validate_bested_cell_row(
+            source_cell=image.source_cell,
+            source_row=image.source_row,
+            label="倍市得图片",
+        )
+        start_qid = _bested_question_qid_for_row(
+            parsed.questions,
+            image.source_row,
+        )
+        end_qid = _bested_question_qid_for_row(
+            parsed.questions,
+            _bested_coverage_end_row(
+                image.coverage,
+                source_cell=image.source_cell,
+                source_row=image.source_row,
+            ),
+        )
+        expected_qid = (
+            start_qid
+            if start_qid is not None and start_qid == end_qid
+            else None
+        )
+        if image.question_qid != expected_qid:
+            raise ValueError("倍市得图片的题目归属与来源行不一致")
+    for hyperlink in parsed.hyperlinks:
+        if hyperlink.sheet_name != parsed.sheet_name:
+            raise ValueError("倍市得超链接指向其他工作表")
+        _validate_bested_cell_row(
+            source_cell=hyperlink.source_cell,
+            source_row=hyperlink.source_row,
+            label="倍市得超链接",
+        )
+        expected_qid = _bested_question_qid_for_row(
+            parsed.questions,
+            hyperlink.source_row,
+        )
+        if hyperlink.question_qid != expected_qid:
+            raise ValueError("倍市得超链接的题目归属与来源行不一致")
 
 
 def _google_item_type(item: dict[str, Any]) -> str:
@@ -756,6 +1182,36 @@ def map_google_form_capture(
         if question.provider_item_id is not None
     }
 
+    expected_image_paths = _google_image_paths(raw_items, ("items",))
+    successful_image_paths: set[tuple[str | int, ...]] = set()
+    for image in capture.images:
+        _validate_google_image_capture(image, raw_items)
+        if image.json_path in successful_image_paths:
+            raise ValueError("Google capture 包含重复图片 JSON 路径")
+        successful_image_paths.add(image.json_path)
+    failed_image_paths: set[tuple[str | int, ...]] = set()
+    image_failure_warnings: list[ImportWarning] = []
+    for failure in capture.image_failures:
+        _validate_google_image_evidence(
+            failure.json_path,
+            failure.context,
+            raw_items,
+        )
+        if failure.json_path in failed_image_paths:
+            raise ValueError("Google capture 包含重复图片失败 JSON 路径")
+        if failure.json_path in successful_image_paths:
+            raise ValueError("Google 图片路径不能同时标记为成功和失败")
+        failed_image_paths.add(failure.json_path)
+        image_failure_warnings.append(_google_image_failure_warning(
+            failure,
+            form_id=capture.form_id,
+        ))
+    if successful_image_paths | failed_image_paths != expected_image_paths:
+        raise ValueError("Google 图片成功/失败集合与原始表单图片位置不一致")
+    if image_failure_warnings:
+        exact = False
+        snapshot_warnings.extend(image_failure_warnings)
+
     sources = [ResearchSource(
         source_id=source_id,
         source_kind=SourceKind.PROVIDER_CONNECTION,
@@ -768,8 +1224,13 @@ def map_google_form_capture(
         ),
         owner_ref=owner,
         created_at=retrieved,
-        acquisition_status=ProcessingStatus.COMPLETED,
+        acquisition_status=(
+            ProcessingStatus.PARTIAL
+            if image_failure_warnings
+            else ProcessingStatus.COMPLETED
+        ),
         access_status=AccessStatus.ACCESSIBLE,
+        warnings=list(image_failure_warnings),
     )]
     documents = [ResearchDocument(
         document_id=document_id,
@@ -780,7 +1241,12 @@ def map_google_form_capture(
         content_hash=definition_hash,
         retrieved_at=retrieved,
         snapshot_policy=SnapshotPolicy.FULL_COPY,
-        parse_status=ProcessingStatus.COMPLETED,
+        parse_status=(
+            ProcessingStatus.PARTIAL
+            if image_failure_warnings
+            else ProcessingStatus.COMPLETED
+        ),
+        warnings=list(image_failure_warnings),
         source_locator=SourceLocator(
             source_id=source_id,
             document_id=document_id,
@@ -792,18 +1258,9 @@ def map_google_form_capture(
     assets: list[ResearchAsset] = []
     references: list[AssetReference] = []
     media: dict[str, bytes] = {}
-    seen_image_paths: set[tuple[str | int, ...]] = set()
-    expected_image_paths = _google_image_paths(raw_items, ("items",))
-    captured_image_paths = {image.json_path for image in capture.images}
-    if captured_image_paths != expected_image_paths:
-        raise ValueError("Google 图片捕获集合与原始表单图片位置不一致")
     for image in capture.images:
-        if image.json_path in seen_image_paths:
-            raise ValueError("Google capture 包含重复图片 JSON 路径")
-        seen_image_paths.add(image.json_path)
         if content_sha256(image.content) != image.sha256:
             raise ValueError("Google 图片捕获内容与 sha256 不一致")
-        _validate_google_image_capture(image, raw_items)
         if image.context.item_id not in canonical_by_item:
             raise ValueError("Google 图片无法定位到 Provider Item")
         question = canonical_by_item[image.context.item_id]
@@ -1009,6 +1466,15 @@ def map_bested_questionnaire_upload(
         "sheet_name": parsed.sheet_name,
         "rows": [list(row) for row in parsed.provider_rows],
     })
+    media_issue_warnings = [
+        _bested_media_issue_warning(
+            issue,
+            filename=safe_name,
+            sheet_name=parsed.sheet_name,
+        )
+        for issue in parsed.media_issues
+    ]
+    _validate_bested_media_closure(parsed, questionnaire_content)
 
     provider_items: list[ProviderItemDefinition] = []
     canonical_questions: list[CanonicalQuestion] = []
@@ -1094,8 +1560,13 @@ def map_bested_questionnaire_upload(
         original_name=safe_name,
         owner_ref=owner,
         created_at=retrieved,
-        acquisition_status=ProcessingStatus.COMPLETED,
+        acquisition_status=(
+            ProcessingStatus.PARTIAL
+            if media_issue_warnings
+            else ProcessingStatus.COMPLETED
+        ),
         access_status=AccessStatus.ACCESSIBLE,
+        warnings=list(media_issue_warnings),
     )]
     documents = [ResearchDocument(
         document_id=document_id,
@@ -1112,7 +1583,12 @@ def map_bested_questionnaire_upload(
         content_hash=file_hash,
         retrieved_at=retrieved,
         snapshot_policy=SnapshotPolicy.FULL_COPY,
-        parse_status=ProcessingStatus.COMPLETED,
+        parse_status=(
+            ProcessingStatus.PARTIAL
+            if media_issue_warnings
+            else ProcessingStatus.COMPLETED
+        ),
+        warnings=list(media_issue_warnings),
         source_locator=SourceLocator(
             source_id=source_id,
             document_id=document_id,
@@ -1247,11 +1723,14 @@ def map_bested_questionnaire_upload(
         provider_items=provider_items,
         canonical_questions=canonical_questions,
         response_column_mappings=response_mappings,
-        warnings=[ImportWarning(
-            code="bested_file_local_ids",
-            message="题目身份仅在本次原问卷文件快照内稳定，不代表倍市得在线 ID",
-            blocking=False,
-        )],
+        warnings=[
+            ImportWarning(
+                code="bested_file_local_ids",
+                message="题目身份仅在本次原问卷文件快照内稳定，不代表倍市得在线 ID",
+                blocking=False,
+            ),
+            *media_issue_warnings,
+        ],
     )
     collection = ResearchAssetCollection(
         collection_id=collection_id,
