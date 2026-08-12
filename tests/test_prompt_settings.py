@@ -140,6 +140,7 @@ class PromptCatalogTests(unittest.TestCase):
         self.assertEqual(migrated["column_detect_system"]["version"], 2)
         self.assertEqual(migrated["survey_planner_system"]["version"], 4)
         self.assertEqual(migrated["writer_requirements"]["version"], 14)
+        self.assertEqual(migrated["annotate_quality_system"]["version"], 2)
         self.assertEqual(
             migrated["writer_requirements"]["current"],
             prompt_storage.DEFAULT_PROMPTS["writer_requirements"]["current"],
@@ -156,6 +157,7 @@ class PromptCatalogTests(unittest.TestCase):
         for key, previous_version in (
             ("survey_planner_system", 3),
             ("writer_requirements", 11),
+            ("annotate_quality_system", 1),
         ):
             with self.subTest(key=key, content="default"):
                 stored = deepcopy(prompt_storage.DEFAULT_PROMPTS[key])

@@ -8,12 +8,21 @@ import openpyxl
 from fastapi import HTTPException
 
 import annotate
+from app.core.config import DEFAULT_ANNOTATE_QUALITY_SYSTEM_PROMPT
 from app.core.parsing import _parse_file
 from app.services import auth
 from app.services import annotate_workflow
 
 
 class AnnotateRuleTests(unittest.TestCase):
+    def test_quality_prompt_keeps_bare_evaluations_invalid(self):
+        prompt = DEFAULT_ANNOTATE_QUALITY_SYSTEM_PROMPT
+
+        self.assertIn('"most boring"', prompt)
+        self.assertIn('"It\'s not good"', prompt)
+        self.assertIn("仅仅完整表达态度仍属于无效反馈", prompt)
+        self.assertIn("标签必须是无效反馈，不能是普通反馈", prompt)
+
     def test_workflow_queries_only_contain_task_data(self):
         rows = [["P1", "answer one", "answer two"]]
         headers = ["ID", "Q1", "Q2"]
