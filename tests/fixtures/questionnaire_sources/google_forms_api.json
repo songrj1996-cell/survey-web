@@ -1,0 +1,140 @@
+{
+  "formId": "FORM_SYNTHETIC_001",
+  "info": {
+    "title": "合成问卷连接器样例",
+    "documentTitle": "仅用于本地 MockTransport 测试",
+    "description": "不含真实账号、表单、回答或临时下载地址"
+  },
+  "settings": {
+    "quizSettings": {
+      "isQuiz": false
+    }
+  },
+  "revisionId": "synthetic-opaque-revision",
+  "publishSettings": {
+    "publishState": {
+      "isPublished": true,
+      "isAcceptingResponses": true
+    }
+  },
+  "items": [
+    {
+      "itemId": "item-standalone-image",
+      "title": "独立图片",
+      "imageItem": {
+        "image": {
+          "altText": "独立概念图",
+          "properties": {
+            "alignment": "CENTER",
+            "width": 640
+          }
+        }
+      }
+    },
+    {
+      "itemId": "item-choice",
+      "title": "请选择方案",
+      "questionItem": {
+        "question": {
+          "questionId": "question-choice",
+          "required": true,
+          "choiceQuestion": {
+            "type": "RADIO",
+            "options": [
+              {
+                "value": "方案 A",
+                "image": {
+                  "altText": "方案 A 配图"
+                },
+                "goToSectionId": "item-details"
+              },
+              {
+                "value": "方案 B",
+                "goToAction": "NEXT_SECTION"
+              }
+            ],
+            "shuffle": false
+          }
+        },
+        "image": {
+          "altText": "题干说明图"
+        }
+      }
+    },
+    {
+      "itemId": "item-grid",
+      "title": "功能评价",
+      "questionGroupItem": {
+        "questions": [
+          {
+            "questionId": "question-grid-usability",
+            "required": true,
+            "rowQuestion": {
+              "title": "易用性"
+            }
+          },
+          {
+            "questionId": "question-grid-art",
+            "required": true,
+            "rowQuestion": {
+              "title": "美术表现"
+            }
+          }
+        ],
+        "image": {
+          "altText": "题组共用图"
+        },
+        "grid": {
+          "columns": {
+            "type": "RADIO",
+            "options": [
+              {
+                "value": "满意"
+              },
+              {
+                "value": "不满意"
+              }
+            ]
+          },
+          "shuffleQuestions": false
+        }
+      }
+    },
+    {
+      "itemId": "item-video-reference",
+      "title": "视频仅保留引用",
+      "videoItem": {
+        "video": {
+          "youtubeUri": "https://www.youtube.com/watch?v=SYNTHETIC_INVALID_VIDEO"
+        },
+        "caption": "连接器不得访问该地址"
+      }
+    },
+    {
+      "itemId": "item-file-upload",
+      "title": "文件上传题仅保留定义",
+      "questionItem": {
+        "question": {
+          "questionId": "question-upload",
+          "required": false,
+          "fileUploadQuestion": {
+            "folderId": "SYNTHETIC_INVALID_DRIVE_FOLDER",
+            "types": [
+              "IMAGE"
+            ],
+            "maxFiles": 1,
+            "maxFileSize": "1048576"
+          }
+        }
+      }
+    },
+    {
+      "itemId": "item-details",
+      "title": "详情",
+      "pageBreakItem": {}
+    }
+  ],
+  "syntheticProviderField": {
+    "mustSurvive": true
+  }
+}

@@ -9,8 +9,10 @@ import openpyxl
 from fastapi import HTTPException
 
 from app.services.questionnaire_import import (
+    BestedQuestionnaireParseResult,
     apply_questionnaire_translations,
     build_questionnaire_translation_query,
+    parse_bested_questionnaire,
     parse_bested_qualitative_upload,
     parse_questionnaire_translations,
 )
@@ -77,6 +79,50 @@ def _response_bytes(matrix_second_header: str = "功能评价__稳定性") -> by
 
 
 class BestedQuestionnaireImportTests(unittest.TestCase):
+    def test_public_parser_preserves_provider_rows_and_source_locations(self):
+        questionnaire = _workbook_bytes({
+            "说明": [["这不是问卷工作表"]],
+            "问卷内容": [
+                ["题号", "题目"],
+                ["Q7[矩阵多选题]", "使用体验"],
+                ["选项", ""],
+                ["1", "流畅"],
+                ["2", "稳定"],
+                ["矩阵行", ""],
+                ["1", "客户端"],
+                ["2", "服务器"],
+                ["Q8[填空题]", "其他建议"],
+            ],
+        })
+
+        parsed = parse_bested_questionnaire(questionnaire)
+
+        self.assertIsInstance(parsed, BestedQuestionnaireParseResult)
+        self.assertEqual(parsed.sheet_name, "问卷内容")
+        self.assertEqual(parsed.provider_rows[0], ("题号", "题目"))
+        self.assertIn("Q7[矩阵多选题] | 使用体验", parsed.questionnaire_text)
+
+        matrix, open_text = parsed.questions
+        self.assertEqual(
+            (
+                matrix.qid,
+                matrix.source_type,
+                matrix.role,
+                matrix.title,
+            ),
+            (7, "矩阵多选题", "matrix_multi", "使用体验"),
+        )
+        self.assertEqual(matrix.options, ("流畅", "稳定"))
+        self.assertEqual(matrix.rows, ("客户端", "服务器"))
+        self.assertEqual(matrix.sheet_name, "问卷内容")
+        self.assertEqual(matrix.source_row, 2)
+        self.assertEqual(matrix.source_cell, "A2")
+        self.assertEqual(matrix.raw_heading, "Q7[矩阵多选题]")
+        self.assertEqual(matrix.raw_rows[0], ("Q7[矩阵多选题]", "使用体验"))
+        self.assertEqual(matrix.raw_rows[-1], ("2", "服务器"))
+        self.assertEqual(open_text.source_row, 9)
+        self.assertEqual(open_text.source_cell, "A9")
+
     def test_questionnaire_types_and_split_columns_are_mapped_without_ai(self):
         imported = parse_bested_qualitative_upload(
             _response_bytes(),
@@ -103,6 +149,26 @@ class BestedQuestionnaireImportTests(unittest.TestCase):
         self.assertEqual(matrix["column_indexes"], [1, 2])
         self.assertEqual(contact["role"], "ignore")
         self.assertEqual(respondent_id["role"], "id")
+
+    def test_qualitative_upload_keeps_legacy_return_protocol(self):
+        with patch(
+            "app.integrations.bested_questionnaire_client."
+            "_discover_questionnaire_media",
+            side_effect=AssertionError("legacy path must not inspect media"),
+        ):
+            imported = parse_bested_qualitative_upload(
+                _response_bytes(),
+                _questionnaire_bytes(),
+            )
+
+        self.assertEqual(
+            set(imported),
+            {"rows", "questions", "questionnaire_text", "matched_questions"},
+        )
+        self.assertIsInstance(imported["rows"], list)
+        self.assertIsInstance(imported["questions"], list)
+        self.assertIsInstance(imported["questionnaire_text"], str)
+        self.assertEqual(imported["matched_questions"], 3)
 
     def test_same_column_multi_choice_matches_full_options_with_commas(self):
         questionnaire = _workbook_bytes({

@@ -5,39 +5,23 @@ from __future__ import annotations
 import io
 import json
 import re
-from dataclasses import dataclass, field
 
 import openpyxl
 
+from app.integrations.bested_questionnaire_client import (
+    BestedQuestionnaireHyperlink,
+    BestedQuestionnaireImage,
+    BestedQuestionnaireParseResult,
+    BestedQuestionnaireQuestion,
+    parse_bested_questionnaire,
+)
 
-_QUESTION_RE = re.compile(r"^Q(\d+)\[([^\]]+)\]$")
+
 _CODE_QUESTION_RE = re.compile(r"^Q(\d+)\.(.*)$", re.DOTALL)
 _CONTACT_RE = re.compile(r"whatsapp|手机号|手机号码|联系电话|联系方式", re.IGNORECASE)
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
 _CHINESE_RE = re.compile(r"[\u4e00-\u9fff]")
 _LATIN_RE = re.compile(r"[A-Za-z]")
-
-_BESTED_ROLE_MAP = {
-    "单选题": "single_choice",
-    "多选题": "multi_choice",
-    "矩阵单选题": "matrix_single",
-    "矩阵多选题": "matrix_multi",
-    "矩阵打分题": "matrix_scale",
-    "矩阵量表题": "matrix_scale",
-    "量表题": "scale",
-    "打分题": "scale",
-    "填空题": "open_text",
-}
-
-
-@dataclass
-class _BestedQuestion:
-    qid: int
-    source_type: str
-    role: str
-    title: str
-    options: list[str] = field(default_factory=list)
-    rows: list[str] = field(default_factory=list)
 
 
 def _cell_text(value) -> str:
@@ -64,77 +48,11 @@ def _worksheet_rows(ws) -> list[list[str]]:
     return rows
 
 
-def _questionnaire_sheet(workbook):
-    if "问卷内容" in workbook.sheetnames:
-        return workbook["问卷内容"]
-    return workbook[workbook.sheetnames[0]]
-
-
-def _parse_bested_questionnaire(content: bytes) -> tuple[list[_BestedQuestion], str]:
-    workbook = _load_workbook(content)
-    try:
-        rows = _worksheet_rows(_questionnaire_sheet(workbook))
-    finally:
-        workbook.close()
-    if len(rows) <= 1:
-        raise ValueError("调研问卷为空或缺少题目")
-
-    questions: list[_BestedQuestion] = []
-    current: _BestedQuestion | None = None
-    section = ""
-    for row in rows[1:]:
-        first = row[0] if row else ""
-        second = row[1] if len(row) > 1 else ""
-        match = _QUESTION_RE.match(first)
-        if match:
-            raw_type = match.group(2).strip()
-            role = _BESTED_ROLE_MAP.get(raw_type)
-            if not role:
-                raise ValueError(f"暂不支持 Q{match.group(1)} 的题型「{raw_type}」")
-            if not second:
-                raise ValueError(f"Q{match.group(1)} 缺少题干")
-            current = _BestedQuestion(
-                qid=int(match.group(1)),
-                source_type=raw_type,
-                role=role,
-                title=second,
-            )
-            questions.append(current)
-            section = ""
-            continue
-        if not current:
-            continue
-        if first == "选项":
-            section = "options"
-            continue
-        if first == "矩阵行":
-            section = "rows"
-            continue
-        if first.isdigit() and second:
-            if section == "options":
-                current.options.append(second)
-            elif section == "rows":
-                current.rows.append(second)
-
-    if not questions:
-        raise ValueError("未识别到 Q号[题型] 格式的题目")
-    seen: set[int] = set()
-    for question in questions:
-        if question.qid in seen:
-            raise ValueError(f"原问卷中 Q{question.qid} 重复")
-        seen.add(question.qid)
-        if question.role in {"single_choice", "multi_choice", "matrix_single", "matrix_multi"} \
-                and not question.options:
-            raise ValueError(f"Q{question.qid} 缺少选项")
-        if question.role.startswith("matrix_") and not question.rows:
-            raise ValueError(f"Q{question.qid} 缺少矩阵行")
-
-    questionnaire_text = "\n".join(
-        " | ".join(cell for cell in row if cell)
-        for row in rows
-        if any(row)
-    )
-    return questions, questionnaire_text
+def _parse_bested_questionnaire(
+    content: bytes,
+) -> tuple[list[BestedQuestionnaireQuestion], str]:
+    parsed = parse_bested_questionnaire(content, discover_media=False)
+    return list(parsed.questions), parsed.questionnaire_text
 
 
 def _parse_response_workbook(content: bytes) -> tuple[list[list[str]], list[tuple[int, str]]]:
