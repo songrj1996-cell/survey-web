@@ -1,7 +1,7 @@
 {
   "snapshot": {
     "schema_version": 1,
-    "snapshot_id": "qsn_google_demo_open",
+    "snapshot_id": "qsn_google_demo_closed",
     "document_id": "doc_google_demo",
     "provider": "google_forms",
     "provider_form_id": "DEMO_INVALID_FORM_ID",
@@ -11,7 +11,7 @@
     "provider_modified_at": null,
     "provider_revision": "demo-opaque-revision",
     "content_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "collection_state": "open",
+    "collection_state": "closed",
     "item_count": 10,
     "question_count": 4,
     "asset_count": 6,
@@ -32,8 +32,7 @@
       "linkedSheetId": "DEMO_INVALID_SHEET_ID",
       "publishSettings": {
         "publishState": {
-          "isPublished": true,
-          "isAcceptingResponses": true
+          "isPublished": true
         }
       },
       "items": [

@@ -5,36 +5,37 @@
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from typing import NamedTuple, Protocol, runtime_checkable
 
 from app.schemas.questionnaire import QuestionnaireSnapshot
 from app.schemas.research_assets import ResearchAssetCollection
 
 
+class ResearchAssetBundle(NamedTuple):
+    """必须作为一个事务整体读取和保存的问卷快照与素材集合。"""
+
+    snapshot: QuestionnaireSnapshot
+    collection: ResearchAssetCollection
+
+
 @runtime_checkable
 class ResearchAssetStorage(Protocol):
-    """后续存储实现必须满足的最小同步接口。"""
+    """按用户隔离、以聚合为原子边界的最小同步存储端口。
 
-    def load_questionnaire_snapshot(
+    实现必须拒绝空 ``owner_ref``，并在保存前确认它与
+    ``bundle.collection.owner_ref`` 一致；快照与素材集合不得分步提交。
+    """
+
+    def load_bundle(
         self,
+        owner_ref: str,
         snapshot_id: str,
-    ) -> QuestionnaireSnapshot | None:
+    ) -> ResearchAssetBundle | None:
         ...
 
-    def save_questionnaire_snapshot(
+    def save_bundle(
         self,
-        snapshot: QuestionnaireSnapshot,
-    ) -> None:
-        ...
-
-    def load_asset_collection(
-        self,
-        document_id: str,
-    ) -> ResearchAssetCollection | None:
-        ...
-
-    def save_asset_collection(
-        self,
-        collection: ResearchAssetCollection,
+        owner_ref: str,
+        bundle: ResearchAssetBundle,
     ) -> None:
         ...

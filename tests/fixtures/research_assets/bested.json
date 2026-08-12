@@ -4,72 +4,187 @@
     "snapshot_id": "qsn_bested_demo",
     "document_id": "doc_bested_demo",
     "provider": "bested",
-    "provider_form_id": "bested-demo-001",
+    "provider_form_id": "BESTED_DEMO_INVALID_FORM_ID",
     "source_mode": "original_questionnaire_upload",
     "title": "脱敏倍市得问卷",
     "retrieved_at": "2026-08-12T04:00:00Z",
     "provider_modified_at": null,
     "provider_revision": null,
-    "content_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "content_hash": "1010101010101010101010101010101010101010101010101010101010101010",
     "collection_state": "unknown",
-    "question_count": 1,
-    "asset_count": 0,
-    "mapping_status": "normalized",
+    "item_count": 5,
+    "question_count": 2,
+    "asset_count": 3,
+    "mapping_status": "partial",
     "provider_raw_definition": {
+      "workbook_filename": "fixture-bested-questionnaire.xlsx",
       "sheet_name": "问卷内容",
+      "rows": [
+        ["Q1[矩阵单选题]", "功能评价"],
+        ["选项", "满意", "一般", "不满意"],
+        ["矩阵行", "易用性", "稳定性"],
+        ["图片", "embedded://xl/media/image1.png"],
+        ["媒体链接", "https://www.youtube.com/watch?v=BESTED_DEMO_INVALID_VIDEO"],
+        ["外部文件", "https://drive.google.com/file/d/BESTED_DEMO_INVALID_DRIVE_ID/view"],
+        ["Q2[单选题]", "是否继续查看详情"],
+        ["选项", "继续", "结束"],
+        ["分页/跳转", "继续->PAGE_2", "结束->SUBMIT"]
+      ],
       "provider_only_export_metadata": {
         "matrix_layout": "rows_after_options",
+        "image_storage": "xlsx_embedded_object",
+        "media_storage": "cell_hyperlink",
+        "navigation_storage": "unverified_export_annotation",
         "must_survive_round_trip": true
       }
     },
-    "provider_questions": [
+    "provider_items": [
       {
         "provider": "bested",
-        "provider_question_id": "Q1",
-        "provider_item_id": null,
-        "provider_question_type": "矩阵单选题",
+        "provider_item_id": "bested-item-q1",
+        "provider_item_type": "矩阵单选题",
         "provider_position": 0,
+        "provider_question_ids": ["Q1-row-1", "Q1-row-2"],
         "raw_definition": {
           "source_cell": "问卷内容!A2",
           "raw_heading": "Q1[矩阵单选题]",
-          "raw_options": [
-            "满意",
-            "一般",
-            "不满意"
-          ],
+          "raw_title": "功能评价",
+          "raw_options": ["满意", "一般", "不满意"],
           "raw_rows": [
-            "易用性",
-            "稳定性"
+            {"row_id": "Q1-row-1", "value": "易用性"},
+            {"row_id": "Q1-row-2", "value": "稳定性"}
+          ],
+          "layout": "rows_after_options"
+        },
+        "source_locator": {
+          "provider": "bested",
+          "provider_form_id": "BESTED_DEMO_INVALID_FORM_ID",
+          "provider_item_id": "bested-item-q1",
+          "file_id": "fixture-bested-questionnaire.xlsx",
+          "sheet_name": "问卷内容",
+          "cell": "A2",
+          "question_position": 0
+        }
+      },
+      {
+        "provider": "bested",
+        "provider_item_id": "bested-item-image",
+        "provider_item_type": "xlsxEmbeddedImage",
+        "provider_position": 1,
+        "provider_question_ids": [],
+        "raw_definition": {
+          "relationship_target": "xl/media/image1.png",
+          "drawing_anchor": "twoCellAnchor",
+          "from": "问卷内容!B5",
+          "to": "问卷内容!E13",
+          "nearby_label": "角色概念图"
+        },
+        "source_locator": {
+          "provider": "bested",
+          "provider_form_id": "BESTED_DEMO_INVALID_FORM_ID",
+          "provider_item_id": "bested-item-image",
+          "file_id": "fixture-bested-questionnaire.xlsx",
+          "sheet_name": "问卷内容",
+          "anchor": "B5",
+          "coverage": "B5:E13",
+          "question_position": 1
+        }
+      },
+      {
+        "provider": "bested",
+        "provider_item_id": "bested-item-media",
+        "provider_item_type": "cellHyperlinks",
+        "provider_position": 2,
+        "provider_question_ids": [],
+        "raw_definition": {
+          "source_cells": ["问卷内容!B14", "问卷内容!B15"],
+          "hyperlinks": [
+            "https://www.youtube.com/watch?v=BESTED_DEMO_INVALID_VIDEO",
+            "https://drive.google.com/file/d/BESTED_DEMO_INVALID_DRIVE_ID/view"
           ]
         },
         "source_locator": {
           "provider": "bested",
-          "provider_form_id": "bested-demo-001",
-          "provider_question_id": "Q1",
-          "file_id": "fixture-questionnaire.xlsx",
+          "provider_form_id": "BESTED_DEMO_INVALID_FORM_ID",
+          "provider_item_id": "bested-item-media",
+          "file_id": "fixture-bested-questionnaire.xlsx",
           "sheet_name": "问卷内容",
-          "cell": "A2",
-          "question_position": 0
+          "coverage": "B14:B15",
+          "question_position": 2
+        }
+      },
+      {
+        "provider": "bested",
+        "provider_item_id": "bested-item-q2",
+        "provider_item_type": "单选题",
+        "provider_position": 3,
+        "provider_question_ids": ["Q2"],
+        "raw_definition": {
+          "source_cell": "问卷内容!A16",
+          "raw_heading": "Q2[单选题]",
+          "raw_title": "是否继续查看详情",
+          "raw_options": [
+            {"code": "1", "value": "继续", "image_anchor": "B5:E13"},
+            {"code": "2", "value": "结束"}
+          ],
+          "raw_navigation_annotation": {
+            "1": "PAGE_2",
+            "2": "SUBMIT"
+          },
+          "navigation_semantics_verified": false
+        },
+        "source_locator": {
+          "provider": "bested",
+          "provider_form_id": "BESTED_DEMO_INVALID_FORM_ID",
+          "provider_question_id": "Q2",
+          "provider_item_id": "bested-item-q2",
+          "file_id": "fixture-bested-questionnaire.xlsx",
+          "sheet_name": "问卷内容",
+          "cell": "A16",
+          "question_position": 3
+        }
+      },
+      {
+        "provider": "bested",
+        "provider_item_id": "bested-item-page-2",
+        "provider_item_type": "unverifiedPageMarker",
+        "provider_position": 4,
+        "provider_question_ids": [],
+        "raw_definition": {
+          "source_cell": "问卷内容!A20",
+          "raw_marker": "PAGE_2",
+          "title": "详情",
+          "navigation_semantics_verified": false
+        },
+        "source_locator": {
+          "provider": "bested",
+          "provider_form_id": "BESTED_DEMO_INVALID_FORM_ID",
+          "provider_item_id": "bested-item-page-2",
+          "file_id": "fixture-bested-questionnaire.xlsx",
+          "sheet_name": "问卷内容",
+          "cell": "A20",
+          "question_position": 4
         }
       }
     ],
     "canonical_questions": [
       {
         "question_id": "q_bested_matrix",
-        "provider_question_id": "Q1",
+        "provider_question_id": null,
+        "provider_item_id": "bested-item-q1",
         "canonical_type": "matrix_single",
         "title": "功能评价",
         "description": "",
         "required": false,
         "rows": [
           {
-            "row_key": "row-1",
+            "row_key": "row-usability",
             "label": "易用性",
             "provider_question_id": "Q1-row-1",
             "asset_reference_ids": []
           },
           {
-            "row_key": "row-2",
+            "row_key": "row-stability",
             "label": "稳定性",
             "provider_question_id": "Q1-row-2",
             "asset_reference_ids": []
@@ -103,41 +218,245 @@
         "mapping_status": "normalized",
         "mapping_confidence": 1.0,
         "warnings": []
+      },
+      {
+        "question_id": "q_bested_static_image",
+        "provider_question_id": null,
+        "provider_item_id": "bested-item-image",
+        "canonical_type": "static_text",
+        "title": "角色概念图",
+        "description": "来自原问卷 XLSX 嵌入对象",
+        "required": false,
+        "rows": [],
+        "options": [],
+        "branching": [],
+        "asset_reference_ids": ["aref_bested_image_static"],
+        "mapping_status": "normalized",
+        "mapping_confidence": 1.0,
+        "warnings": []
+      },
+      {
+        "question_id": "q_bested_static_media",
+        "provider_question_id": null,
+        "provider_item_id": "bested-item-media",
+        "canonical_type": "static_text",
+        "title": "外部媒体",
+        "description": "来自单元格超链接",
+        "required": false,
+        "rows": [],
+        "options": [],
+        "branching": [],
+        "asset_reference_ids": ["aref_bested_youtube", "aref_bested_drive"],
+        "mapping_status": "normalized",
+        "mapping_confidence": 1.0,
+        "warnings": []
+      },
+      {
+        "question_id": "q_bested_branch",
+        "provider_question_id": "Q2",
+        "provider_item_id": "bested-item-q2",
+        "canonical_type": "single_choice",
+        "title": "是否继续查看详情",
+        "description": "",
+        "required": false,
+        "rows": [],
+        "options": [
+          {
+            "option_key": "1",
+            "value": "继续",
+            "label": "继续",
+            "asset_reference_ids": ["aref_bested_image_option"],
+            "provider_option_id": "1"
+          },
+          {
+            "option_key": "2",
+            "value": "结束",
+            "label": "结束",
+            "asset_reference_ids": [],
+            "provider_option_id": "2"
+          }
+        ],
+        "branching": [
+          {
+            "option_key": "1",
+            "action": "go_to_section",
+            "target_section_id": "q_bested_page_2",
+            "provider_raw_action": "PAGE_2 (unverified export annotation)"
+          },
+          {
+            "option_key": "2",
+            "action": "submit_form",
+            "target_section_id": null,
+            "provider_raw_action": "SUBMIT (unverified export annotation)"
+          }
+        ],
+        "asset_reference_ids": [],
+        "mapping_status": "needs_review",
+        "mapping_confidence": 0.5,
+        "warnings": [
+          {
+            "code": "bested_navigation_unverified",
+            "message": "原问卷样例中的分页/跳转注记尚无正式 Provider API 语义保证。",
+            "field_path": "provider_items[3].raw_definition.raw_navigation_annotation",
+            "blocking": false,
+            "source_locator": {
+              "provider": "bested",
+              "provider_form_id": "BESTED_DEMO_INVALID_FORM_ID",
+              "provider_question_id": "Q2",
+              "provider_item_id": "bested-item-q2"
+            }
+          }
+        ]
+      },
+      {
+        "question_id": "q_bested_page_2",
+        "provider_question_id": null,
+        "provider_item_id": "bested-item-page-2",
+        "canonical_type": "section",
+        "title": "详情",
+        "description": "Provider 分页标记未经正式能力验证",
+        "required": false,
+        "rows": [],
+        "options": [],
+        "branching": [],
+        "asset_reference_ids": [],
+        "mapping_status": "unsupported",
+        "mapping_confidence": 0.0,
+        "warnings": [
+          {
+            "code": "bested_page_marker_unsupported",
+            "message": "仅保留原始分页标记，不承诺生产连接器支持。",
+            "field_path": "provider_items[4]",
+            "blocking": false,
+            "source_locator": {
+              "provider": "bested",
+              "provider_form_id": "BESTED_DEMO_INVALID_FORM_ID",
+              "provider_item_id": "bested-item-page-2"
+            }
+          }
+        ]
       }
     ],
     "response_column_mappings": [
       {
         "question_id": "q_bested_matrix",
-        "provider_question_id": "Q1",
-        "response_key": "Q1",
-        "column_indexes": [
-          2,
-          3
+        "bindings": [
+          {
+            "provider_question_id": "Q1-row-1",
+            "row_key": "row-usability",
+            "response_key": "Q1-row-1",
+            "column_index": 2,
+            "column_header": "功能评价__易用性",
+            "source_locator": {
+              "provider": "bested",
+              "provider_form_id": "BESTED_DEMO_INVALID_FORM_ID",
+              "provider_question_id": "Q1-row-1",
+              "provider_item_id": "bested-item-q1",
+              "file_id": "fixture-bested-response.xlsx",
+              "sheet_name": "data",
+              "cell": "C1"
+            }
+          },
+          {
+            "provider_question_id": "Q1-row-2",
+            "row_key": "row-stability",
+            "response_key": "Q1-row-2",
+            "column_index": 3,
+            "column_header": "功能评价__稳定性",
+            "source_locator": {
+              "provider": "bested",
+              "provider_form_id": "BESTED_DEMO_INVALID_FORM_ID",
+              "provider_question_id": "Q1-row-2",
+              "provider_item_id": "bested-item-q1",
+              "file_id": "fixture-bested-response.xlsx",
+              "sheet_name": "data",
+              "cell": "D1"
+            }
+          }
         ],
-        "column_headers": [
-          "功能评价__易用性",
-          "功能评价__稳定性"
+        "mapping_status": "exact",
+        "mapping_confidence": 1.0,
+        "warnings": []
+      },
+      {
+        "question_id": "q_bested_branch",
+        "bindings": [
+          {
+            "provider_question_id": "Q2",
+            "row_key": null,
+            "response_key": "Q2",
+            "column_index": 4,
+            "column_header": "是否继续查看详情",
+            "source_locator": {
+              "provider": "bested",
+              "provider_form_id": "BESTED_DEMO_INVALID_FORM_ID",
+              "provider_question_id": "Q2",
+              "provider_item_id": "bested-item-q2",
+              "file_id": "fixture-bested-response.xlsx",
+              "sheet_name": "data",
+              "cell": "E1"
+            }
+          }
         ],
         "mapping_status": "exact",
         "mapping_confidence": 1.0,
         "warnings": []
       }
     ],
-    "warnings": []
+    "warnings": [
+      {
+        "code": "bested_navigation_unverified",
+        "message": "分页和跳转仅按脱敏导出注记保留，尚未验证正式 API 或编辑页稳定表达。",
+        "field_path": "provider_raw_definition.provider_only_export_metadata.navigation_storage",
+        "blocking": false,
+        "source_locator": {
+          "provider": "bested",
+          "provider_form_id": "BESTED_DEMO_INVALID_FORM_ID"
+        }
+      }
+    ]
   },
   "collection": {
     "schema_version": 1,
+    "collection_id": "rac_bested_demo",
+    "owner_ref": "fixture-user",
     "sources": [
       {
         "source_id": "src_bested_demo",
         "source_kind": "local_upload",
         "provider": "bested",
-        "original_name": "fixture-questionnaire.xlsx",
+        "original_name": "fixture-bested-questionnaire.xlsx",
         "original_url": null,
         "owner_ref": "fixture-user",
         "created_at": "2026-08-12T04:00:00Z",
         "acquisition_status": "completed",
         "access_status": "accessible",
+        "warnings": [],
+        "issues": []
+      },
+      {
+        "source_id": "src_bested_youtube",
+        "source_kind": "remote_url",
+        "provider": "youtube",
+        "original_name": "倍市得演示视频链接",
+        "original_url": "https://www.youtube.com/watch?v=BESTED_DEMO_INVALID_VIDEO",
+        "owner_ref": "fixture-user",
+        "created_at": "2026-08-12T04:00:00Z",
+        "acquisition_status": "completed",
+        "access_status": "accessible",
+        "warnings": [],
+        "issues": []
+      },
+      {
+        "source_id": "src_bested_drive",
+        "source_kind": "remote_url",
+        "provider": "google_drive",
+        "original_name": "倍市得演示 Drive 链接",
+        "original_url": "https://drive.google.com/file/d/BESTED_DEMO_INVALID_DRIVE_ID/view",
+        "owner_ref": "fixture-user",
+        "created_at": "2026-08-12T04:00:00Z",
+        "acquisition_status": "partial",
+        "access_status": "permission_required",
         "warnings": [],
         "issues": []
       }
@@ -148,10 +467,10 @@
         "source_id": "src_bested_demo",
         "document_type": "questionnaire",
         "title": "脱敏倍市得问卷",
-        "filename": "fixture-questionnaire.xlsx",
+        "filename": "fixture-bested-questionnaire.xlsx",
         "mime_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         "size_bytes": 4096,
-        "content_hash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "content_hash": "2020202020202020202020202020202020202020202020202020202020202020",
         "provider_modified_at": null,
         "retrieved_at": "2026-08-12T04:00:00Z",
         "snapshot_policy": "full_copy",
@@ -160,15 +479,240 @@
           "source_id": "src_bested_demo",
           "document_id": "doc_bested_demo",
           "provider": "bested",
-          "file_id": "fixture-questionnaire.xlsx",
+          "file_id": "fixture-bested-questionnaire.xlsx",
           "sheet_name": "问卷内容"
+        },
+        "warnings": [],
+        "issues": []
+      },
+      {
+        "document_id": "doc_bested_youtube",
+        "source_id": "src_bested_youtube",
+        "document_type": "video",
+        "title": "倍市得演示视频链接",
+        "filename": null,
+        "mime_type": "video/youtube",
+        "size_bytes": null,
+        "content_hash": null,
+        "provider_modified_at": null,
+        "retrieved_at": "2026-08-12T04:00:00Z",
+        "snapshot_policy": "metadata_only",
+        "parse_status": "completed",
+        "source_locator": {
+          "source_id": "src_bested_youtube",
+          "document_id": "doc_bested_youtube",
+          "provider": "youtube",
+          "video_id": "BESTED_DEMO_INVALID_VIDEO"
+        },
+        "warnings": [],
+        "issues": []
+      },
+      {
+        "document_id": "doc_bested_drive",
+        "source_id": "src_bested_drive",
+        "document_type": "external_resource",
+        "title": "倍市得演示 Drive 链接",
+        "filename": null,
+        "mime_type": "application/octet-stream",
+        "size_bytes": null,
+        "content_hash": null,
+        "provider_modified_at": null,
+        "retrieved_at": "2026-08-12T04:00:00Z",
+        "snapshot_policy": "reference_only",
+        "parse_status": "partial",
+        "source_locator": {
+          "source_id": "src_bested_drive",
+          "document_id": "doc_bested_drive",
+          "provider": "google_drive",
+          "drive_file_id": "BESTED_DEMO_INVALID_DRIVE_ID"
         },
         "warnings": [],
         "issues": []
       }
     ],
-    "assets": [],
-    "references": [],
+    "assets": [
+      {
+        "asset_id": "asset_bested_image",
+        "document_id": "doc_bested_demo",
+        "media_type": "image",
+        "mime_type": "image/png",
+        "filename": "image1.png",
+        "display_name": "角色概念图",
+        "size_bytes": 1536,
+        "content_hash": "3030303030303030303030303030303030303030303030303030303030303030",
+        "provider": "bested",
+        "provider_resource_id": "xl/media/image1.png",
+        "provider_version": null,
+        "access_status": "accessible",
+        "processing_status": "completed",
+        "sensitivity_status": "internal",
+        "export_policy": "manual_confirmation",
+        "source_locator": {
+          "source_id": "src_bested_demo",
+          "document_id": "doc_bested_demo",
+          "provider": "bested",
+          "provider_item_id": "bested-item-image",
+          "file_id": "fixture-bested-questionnaire.xlsx",
+          "sheet_name": "问卷内容",
+          "anchor": "B5",
+          "coverage": "B5:E13"
+        },
+        "warnings": [],
+        "issues": []
+      },
+      {
+        "asset_id": "asset_bested_youtube",
+        "document_id": "doc_bested_youtube",
+        "media_type": "video",
+        "mime_type": "video/youtube",
+        "filename": null,
+        "display_name": "倍市得演示视频链接",
+        "size_bytes": null,
+        "content_hash": null,
+        "provider": "youtube",
+        "provider_resource_id": "BESTED_DEMO_INVALID_VIDEO",
+        "provider_version": null,
+        "access_status": "accessible",
+        "processing_status": "completed",
+        "sensitivity_status": "public",
+        "export_policy": "allowed",
+        "source_locator": {
+          "source_id": "src_bested_youtube",
+          "document_id": "doc_bested_youtube",
+          "provider": "youtube",
+          "video_id": "BESTED_DEMO_INVALID_VIDEO"
+        },
+        "warnings": [],
+        "issues": []
+      },
+      {
+        "asset_id": "asset_bested_drive",
+        "document_id": "doc_bested_drive",
+        "media_type": "external_link",
+        "mime_type": "application/octet-stream",
+        "filename": null,
+        "display_name": "倍市得演示 Drive 链接",
+        "size_bytes": null,
+        "content_hash": null,
+        "provider": "google_drive",
+        "provider_resource_id": "BESTED_DEMO_INVALID_DRIVE_ID",
+        "provider_version": null,
+        "access_status": "permission_required",
+        "processing_status": "needs_review",
+        "sensitivity_status": "unknown",
+        "export_policy": "never",
+        "source_locator": {
+          "source_id": "src_bested_drive",
+          "document_id": "doc_bested_drive",
+          "provider": "google_drive",
+          "drive_file_id": "BESTED_DEMO_INVALID_DRIVE_ID"
+        },
+        "warnings": [],
+        "issues": []
+      }
+    ],
+    "references": [
+      {
+        "reference_id": "aref_bested_image_static",
+        "asset_id": "asset_bested_image",
+        "context_type": "survey_question",
+        "context_id": "q_bested_static_image",
+        "role": "question_stimulus",
+        "option_key": null,
+        "row_key": null,
+        "source_locator": {
+          "provider": "bested",
+          "provider_form_id": "BESTED_DEMO_INVALID_FORM_ID",
+          "provider_item_id": "bested-item-image",
+          "file_id": "fixture-bested-questionnaire.xlsx",
+          "sheet_name": "问卷内容",
+          "anchor": "B5",
+          "coverage": "B5:E13"
+        },
+        "binding_status": "confirmed",
+        "binding_confidence": 1.0,
+        "warnings": []
+      },
+      {
+        "reference_id": "aref_bested_youtube",
+        "asset_id": "asset_bested_youtube",
+        "context_type": "survey_question",
+        "context_id": "q_bested_static_media",
+        "role": "researcher_material",
+        "option_key": null,
+        "row_key": null,
+        "source_locator": {
+          "provider": "bested",
+          "provider_form_id": "BESTED_DEMO_INVALID_FORM_ID",
+          "provider_item_id": "bested-item-media",
+          "file_id": "fixture-bested-questionnaire.xlsx",
+          "sheet_name": "问卷内容",
+          "cell": "B14",
+          "video_id": "BESTED_DEMO_INVALID_VIDEO"
+        },
+        "binding_status": "confirmed",
+        "binding_confidence": 1.0,
+        "warnings": []
+      },
+      {
+        "reference_id": "aref_bested_drive",
+        "asset_id": "asset_bested_drive",
+        "context_type": "survey_question",
+        "context_id": "q_bested_static_media",
+        "role": "researcher_material",
+        "option_key": null,
+        "row_key": null,
+        "source_locator": {
+          "provider": "bested",
+          "provider_form_id": "BESTED_DEMO_INVALID_FORM_ID",
+          "provider_item_id": "bested-item-media",
+          "file_id": "fixture-bested-questionnaire.xlsx",
+          "sheet_name": "问卷内容",
+          "cell": "B15",
+          "drive_file_id": "BESTED_DEMO_INVALID_DRIVE_ID"
+        },
+        "binding_status": "needs_review",
+        "binding_confidence": 0.75,
+        "warnings": []
+      },
+      {
+        "reference_id": "aref_bested_image_option",
+        "asset_id": "asset_bested_image",
+        "context_type": "survey_option",
+        "context_id": "q_bested_branch",
+        "role": "option_stimulus",
+        "option_key": "1",
+        "row_key": null,
+        "source_locator": {
+          "provider": "bested",
+          "provider_form_id": "BESTED_DEMO_INVALID_FORM_ID",
+          "provider_question_id": "Q2",
+          "provider_option_id": "1",
+          "provider_item_id": "bested-item-q2",
+          "file_id": "fixture-bested-questionnaire.xlsx",
+          "sheet_name": "问卷内容",
+          "anchor": "B5",
+          "coverage": "B5:E13"
+        },
+        "binding_status": "needs_review",
+        "binding_confidence": 0.5,
+        "warnings": [
+          {
+            "code": "bested_option_image_unverified",
+            "message": "原问卷注记保留了选项图锚点，但尚未验证编辑页中的稳定绑定。",
+            "field_path": "provider_items[3].raw_definition.raw_options[0].image_anchor",
+            "blocking": false,
+            "source_locator": {
+              "provider": "bested",
+              "provider_form_id": "BESTED_DEMO_INVALID_FORM_ID",
+              "provider_question_id": "Q2",
+              "provider_option_id": "1",
+              "provider_item_id": "bested-item-q2"
+            }
+          }
+        ]
+      }
+    ],
     "derivatives": []
   }
 }

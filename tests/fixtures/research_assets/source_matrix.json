@@ -1,0 +1,615 @@
+{
+  "collection": {
+    "schema_version": 1,
+    "collection_id": "rac_source_matrix_demo",
+    "owner_ref": "fixture-user",
+    "sources": [
+      {
+        "source_id": "src_excel_demo",
+        "source_kind": "local_upload",
+        "provider": "excel",
+        "original_name": "fixture-interview.xlsx",
+        "original_url": null,
+        "owner_ref": "fixture-user",
+        "created_at": "2026-08-12T05:00:00Z",
+        "acquisition_status": "completed",
+        "access_status": "accessible",
+        "warnings": [],
+        "issues": []
+      },
+      {
+        "source_id": "src_drive_accessible",
+        "source_kind": "provider_connection",
+        "provider": "google_drive",
+        "original_name": "演示 Shared Drive 图片",
+        "original_url": "https://drive.google.com/file/d/DEMO_DRIVE_ACCESSIBLE_ID/view",
+        "owner_ref": "fixture-user",
+        "created_at": "2026-08-12T05:00:00Z",
+        "acquisition_status": "completed",
+        "access_status": "accessible",
+        "warnings": [],
+        "issues": []
+      },
+      {
+        "source_id": "src_drive_permission",
+        "source_kind": "remote_url",
+        "provider": "google_drive",
+        "original_name": "演示无权限文件",
+        "original_url": "https://drive.google.com/file/d/DEMO_DRIVE_PERMISSION_ID/view",
+        "owner_ref": "fixture-user",
+        "created_at": "2026-08-12T05:00:00Z",
+        "acquisition_status": "partial",
+        "access_status": "permission_required",
+        "warnings": [],
+        "issues": [
+          {
+            "code": "permission_required",
+            "message": "当前演示身份没有文件权限。",
+            "retryable": true,
+            "suggested_action": "申请访问、切换账号或上传副本",
+            "safe_log_ref": "fixture-drive-permission",
+            "source_locator": {
+              "provider": "google_drive",
+              "drive_file_id": "DEMO_DRIVE_PERMISSION_ID"
+            }
+          }
+        ]
+      },
+      {
+        "source_id": "src_drive_not_found",
+        "source_kind": "remote_url",
+        "provider": "google_drive",
+        "original_name": "演示不存在文件",
+        "original_url": "https://drive.google.com/file/d/DEMO_DRIVE_NOT_FOUND_ID/view",
+        "owner_ref": "fixture-user",
+        "created_at": "2026-08-12T05:00:00Z",
+        "acquisition_status": "failed",
+        "access_status": "not_found",
+        "warnings": [],
+        "issues": [
+          {
+            "code": "not_found",
+            "message": "演示资源不存在；没有发起真实网络请求。",
+            "retryable": false,
+            "suggested_action": "检查链接或上传副本",
+            "safe_log_ref": "fixture-drive-not-found",
+            "source_locator": {
+              "provider": "google_drive",
+              "drive_file_id": "DEMO_DRIVE_NOT_FOUND_ID"
+            }
+          }
+        ]
+      },
+      {
+        "source_id": "src_youtube_matrix",
+        "source_kind": "remote_url",
+        "provider": "youtube",
+        "original_name": "演示刺激视频",
+        "original_url": "https://www.youtube.com/watch?v=SOURCE_MATRIX_INVALID_VIDEO",
+        "owner_ref": "fixture-user",
+        "created_at": "2026-08-12T05:00:00Z",
+        "acquisition_status": "completed",
+        "access_status": "accessible",
+        "warnings": [],
+        "issues": []
+      },
+      {
+        "source_id": "src_local_media",
+        "source_kind": "local_upload",
+        "provider": "local_upload",
+        "original_name": "fixture-audio.wav",
+        "original_url": null,
+        "owner_ref": "fixture-user",
+        "created_at": "2026-08-12T05:00:00Z",
+        "acquisition_status": "completed",
+        "access_status": "accessible",
+        "warnings": [],
+        "issues": []
+      }
+    ],
+    "documents": [
+      {
+        "document_id": "doc_excel_demo",
+        "source_id": "src_excel_demo",
+        "document_type": "spreadsheet",
+        "title": "脱敏访谈记录",
+        "filename": "fixture-interview.xlsx",
+        "mime_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "size_bytes": 8192,
+        "content_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+        "provider_modified_at": null,
+        "retrieved_at": "2026-08-12T05:00:00Z",
+        "snapshot_policy": "full_copy",
+        "parse_status": "completed",
+        "source_locator": {
+          "source_id": "src_excel_demo",
+          "document_id": "doc_excel_demo",
+          "provider": "excel",
+          "file_id": "fixture-interview.xlsx",
+          "sheet_name": "访谈记录"
+        },
+        "warnings": [],
+        "issues": []
+      },
+      {
+        "document_id": "doc_drive_accessible",
+        "source_id": "src_drive_accessible",
+        "document_type": "image",
+        "title": "演示 Shared Drive 图片",
+        "filename": "shared-concept.png",
+        "mime_type": "image/png",
+        "size_bytes": 2048,
+        "content_hash": "2222222222222222222222222222222222222222222222222222222222222222",
+        "provider_modified_at": "2026-08-11T01:02:03Z",
+        "retrieved_at": "2026-08-12T05:00:00Z",
+        "snapshot_policy": "full_copy",
+        "parse_status": "completed",
+        "source_locator": {
+          "source_id": "src_drive_accessible",
+          "document_id": "doc_drive_accessible",
+          "provider": "google_drive",
+          "drive_file_id": "DEMO_DRIVE_ACCESSIBLE_ID",
+          "provider_revision": "demo-drive-version-1",
+          "shared_drive_id": "DEMO_SHARED_DRIVE_ID",
+          "corpora": "drive",
+          "supports_all_drives": true
+        },
+        "warnings": [],
+        "issues": []
+      },
+      {
+        "document_id": "doc_drive_permission",
+        "source_id": "src_drive_permission",
+        "document_type": "external_resource",
+        "title": "演示无权限文件",
+        "filename": null,
+        "mime_type": null,
+        "size_bytes": null,
+        "content_hash": null,
+        "provider_modified_at": null,
+        "retrieved_at": "2026-08-12T05:00:00Z",
+        "snapshot_policy": "reference_only",
+        "parse_status": "partial",
+        "source_locator": {
+          "source_id": "src_drive_permission",
+          "document_id": "doc_drive_permission",
+          "provider": "google_drive",
+          "drive_file_id": "DEMO_DRIVE_PERMISSION_ID"
+        },
+        "warnings": [],
+        "issues": [
+          {
+            "code": "permission_required",
+            "message": "当前演示身份没有文件权限。",
+            "retryable": true,
+            "suggested_action": "获取权限后重试",
+            "safe_log_ref": "fixture-drive-permission",
+            "source_locator": {
+              "provider": "google_drive",
+              "drive_file_id": "DEMO_DRIVE_PERMISSION_ID"
+            }
+          }
+        ]
+      },
+      {
+        "document_id": "doc_drive_not_found",
+        "source_id": "src_drive_not_found",
+        "document_type": "external_resource",
+        "title": "演示不存在文件",
+        "filename": null,
+        "mime_type": null,
+        "size_bytes": null,
+        "content_hash": null,
+        "provider_modified_at": null,
+        "retrieved_at": "2026-08-12T05:00:00Z",
+        "snapshot_policy": "reference_only",
+        "parse_status": "failed",
+        "source_locator": {
+          "source_id": "src_drive_not_found",
+          "document_id": "doc_drive_not_found",
+          "provider": "google_drive",
+          "drive_file_id": "DEMO_DRIVE_NOT_FOUND_ID"
+        },
+        "warnings": [],
+        "issues": [
+          {
+            "code": "not_found",
+            "message": "演示资源不存在。",
+            "retryable": false,
+            "suggested_action": "检查链接",
+            "safe_log_ref": "fixture-drive-not-found",
+            "source_locator": {
+              "provider": "google_drive",
+              "drive_file_id": "DEMO_DRIVE_NOT_FOUND_ID"
+            }
+          }
+        ]
+      },
+      {
+        "document_id": "doc_youtube_matrix",
+        "source_id": "src_youtube_matrix",
+        "document_type": "video",
+        "title": "演示刺激视频",
+        "filename": null,
+        "mime_type": "video/youtube",
+        "size_bytes": null,
+        "content_hash": null,
+        "provider_modified_at": null,
+        "retrieved_at": "2026-08-12T05:00:00Z",
+        "snapshot_policy": "metadata_only",
+        "parse_status": "completed",
+        "source_locator": {
+          "source_id": "src_youtube_matrix",
+          "document_id": "doc_youtube_matrix",
+          "provider": "youtube",
+          "video_id": "SOURCE_MATRIX_INVALID_VIDEO",
+          "time_start_seconds": 12.5,
+          "time_end_seconds": 42.0
+        },
+        "warnings": [],
+        "issues": []
+      },
+      {
+        "document_id": "doc_local_media",
+        "source_id": "src_local_media",
+        "document_type": "audio",
+        "title": "演示本地音频刺激物",
+        "filename": "fixture-audio.wav",
+        "mime_type": "audio/wav",
+        "size_bytes": 4096,
+        "content_hash": "3333333333333333333333333333333333333333333333333333333333333333",
+        "provider_modified_at": null,
+        "retrieved_at": "2026-08-12T05:00:00Z",
+        "snapshot_policy": "full_copy",
+        "parse_status": "completed",
+        "source_locator": {
+          "source_id": "src_local_media",
+          "document_id": "doc_local_media",
+          "provider": "local_upload",
+          "local_file_id": "fixture-audio.wav",
+          "time_start_seconds": 0,
+          "time_end_seconds": 15
+        },
+        "warnings": [],
+        "issues": []
+      }
+    ],
+    "assets": [
+      {
+        "asset_id": "asset_excel_image",
+        "document_id": "doc_excel_demo",
+        "media_type": "image",
+        "mime_type": "image/png",
+        "filename": "xl-image-1.png",
+        "display_name": "Excel 嵌入战斗截图",
+        "size_bytes": 1024,
+        "content_hash": "4444444444444444444444444444444444444444444444444444444444444444",
+        "provider": "excel",
+        "provider_resource_id": "xl/media/image1.png",
+        "provider_version": null,
+        "access_status": "accessible",
+        "processing_status": "completed",
+        "sensitivity_status": "internal",
+        "export_policy": "manual_confirmation",
+        "source_locator": {
+          "source_id": "src_excel_demo",
+          "document_id": "doc_excel_demo",
+          "provider": "excel",
+          "file_id": "fixture-interview.xlsx",
+          "sheet_name": "访谈记录",
+          "anchor": "C7",
+          "coverage": "C7:F15",
+          "object_id": "drawing-image-1"
+        },
+        "warnings": [],
+        "issues": []
+      },
+      {
+        "asset_id": "asset_drive_accessible",
+        "document_id": "doc_drive_accessible",
+        "media_type": "image",
+        "mime_type": "image/png",
+        "filename": "shared-concept.png",
+        "display_name": "演示 Shared Drive 图片",
+        "size_bytes": 2048,
+        "content_hash": "5555555555555555555555555555555555555555555555555555555555555555",
+        "provider": "google_drive",
+        "provider_resource_id": "DEMO_DRIVE_ACCESSIBLE_ID",
+        "provider_version": "demo-drive-version-1",
+        "access_status": "accessible",
+        "processing_status": "completed",
+        "sensitivity_status": "internal",
+        "export_policy": "manual_confirmation",
+        "source_locator": {
+          "source_id": "src_drive_accessible",
+          "document_id": "doc_drive_accessible",
+          "provider": "google_drive",
+          "drive_file_id": "DEMO_DRIVE_ACCESSIBLE_ID",
+          "provider_revision": "demo-drive-version-1",
+          "shared_drive_id": "DEMO_SHARED_DRIVE_ID",
+          "corpora": "drive",
+          "supports_all_drives": true
+        },
+        "warnings": [],
+        "issues": []
+      },
+      {
+        "asset_id": "asset_drive_permission",
+        "document_id": "doc_drive_permission",
+        "media_type": "external_link",
+        "mime_type": null,
+        "filename": null,
+        "display_name": "演示无权限文件",
+        "size_bytes": null,
+        "content_hash": null,
+        "provider": "google_drive",
+        "provider_resource_id": "DEMO_DRIVE_PERMISSION_ID",
+        "provider_version": null,
+        "access_status": "permission_required",
+        "processing_status": "needs_review",
+        "sensitivity_status": "unknown",
+        "export_policy": "never",
+        "source_locator": {
+          "source_id": "src_drive_permission",
+          "document_id": "doc_drive_permission",
+          "provider": "google_drive",
+          "drive_file_id": "DEMO_DRIVE_PERMISSION_ID"
+        },
+        "warnings": [],
+        "issues": [
+          {
+            "code": "permission_required",
+            "message": "当前演示身份没有文件权限。",
+            "retryable": true,
+            "suggested_action": "获取权限后重试",
+            "safe_log_ref": "fixture-drive-permission",
+            "source_locator": {
+              "provider": "google_drive",
+              "drive_file_id": "DEMO_DRIVE_PERMISSION_ID"
+            }
+          }
+        ]
+      },
+      {
+        "asset_id": "asset_drive_not_found",
+        "document_id": "doc_drive_not_found",
+        "media_type": "external_link",
+        "mime_type": null,
+        "filename": null,
+        "display_name": "演示不存在文件",
+        "size_bytes": null,
+        "content_hash": null,
+        "provider": "google_drive",
+        "provider_resource_id": "DEMO_DRIVE_NOT_FOUND_ID",
+        "provider_version": null,
+        "access_status": "not_found",
+        "processing_status": "failed",
+        "sensitivity_status": "unknown",
+        "export_policy": "never",
+        "source_locator": {
+          "source_id": "src_drive_not_found",
+          "document_id": "doc_drive_not_found",
+          "provider": "google_drive",
+          "drive_file_id": "DEMO_DRIVE_NOT_FOUND_ID"
+        },
+        "warnings": [],
+        "issues": [
+          {
+            "code": "not_found",
+            "message": "演示资源不存在。",
+            "retryable": false,
+            "suggested_action": "检查链接",
+            "safe_log_ref": "fixture-drive-not-found",
+            "source_locator": {
+              "provider": "google_drive",
+              "drive_file_id": "DEMO_DRIVE_NOT_FOUND_ID"
+            }
+          }
+        ]
+      },
+      {
+        "asset_id": "asset_youtube_matrix",
+        "document_id": "doc_youtube_matrix",
+        "media_type": "video",
+        "mime_type": "video/youtube",
+        "filename": null,
+        "display_name": "演示刺激视频",
+        "size_bytes": null,
+        "content_hash": null,
+        "provider": "youtube",
+        "provider_resource_id": "SOURCE_MATRIX_INVALID_VIDEO",
+        "provider_version": null,
+        "access_status": "accessible",
+        "processing_status": "completed",
+        "sensitivity_status": "public",
+        "export_policy": "allowed",
+        "source_locator": {
+          "source_id": "src_youtube_matrix",
+          "document_id": "doc_youtube_matrix",
+          "provider": "youtube",
+          "video_id": "SOURCE_MATRIX_INVALID_VIDEO",
+          "time_start_seconds": 12.5,
+          "time_end_seconds": 42.0
+        },
+        "warnings": [],
+        "issues": []
+      },
+      {
+        "asset_id": "asset_local_media",
+        "document_id": "doc_local_media",
+        "media_type": "audio",
+        "mime_type": "audio/wav",
+        "filename": "fixture-audio.wav",
+        "display_name": "演示本地音频刺激物",
+        "size_bytes": 4096,
+        "content_hash": "6666666666666666666666666666666666666666666666666666666666666666",
+        "provider": "local_upload",
+        "provider_resource_id": "fixture-audio.wav",
+        "provider_version": null,
+        "access_status": "accessible",
+        "processing_status": "completed",
+        "sensitivity_status": "internal",
+        "export_policy": "manual_confirmation",
+        "source_locator": {
+          "source_id": "src_local_media",
+          "document_id": "doc_local_media",
+          "provider": "local_upload",
+          "local_file_id": "fixture-audio.wav",
+          "time_start_seconds": 0,
+          "time_end_seconds": 15
+        },
+        "warnings": [],
+        "issues": []
+      }
+    ],
+    "references": [
+      {
+        "reference_id": "aref_excel_image_module",
+        "asset_id": "asset_excel_image",
+        "context_type": "interview_position",
+        "context_id": "participant-demo:module-combat",
+        "role": "interview_evidence",
+        "option_key": null,
+        "row_key": null,
+        "source_locator": {
+          "provider": "excel",
+          "file_id": "fixture-interview.xlsx",
+          "sheet_name": "访谈记录",
+          "anchor": "C7",
+          "coverage": "C7:F15",
+          "nearby_cells": ["B7", "B8"]
+        },
+        "binding_status": "confirmed",
+        "binding_confidence": 1.0,
+        "warnings": []
+      },
+      {
+        "reference_id": "aref_excel_image_summary",
+        "asset_id": "asset_excel_image",
+        "context_type": "interview_position",
+        "context_id": "participant-demo:summary",
+        "role": "interview_evidence",
+        "option_key": null,
+        "row_key": null,
+        "source_locator": {
+          "provider": "excel",
+          "file_id": "fixture-interview.xlsx",
+          "sheet_name": "访谈记录",
+          "anchor": "C7",
+          "coverage": "C7:F15",
+          "nearby_cells": ["B7", "B8"]
+        },
+        "binding_status": "confirmed",
+        "binding_confidence": 1.0,
+        "warnings": []
+      },
+      {
+        "reference_id": "aref_shared_drive",
+        "asset_id": "asset_drive_accessible",
+        "context_type": "research_document",
+        "context_id": "doc_excel_demo",
+        "role": "researcher_material",
+        "option_key": null,
+        "row_key": null,
+        "source_locator": {
+          "provider": "google_drive",
+          "drive_file_id": "DEMO_DRIVE_ACCESSIBLE_ID",
+          "shared_drive_id": "DEMO_SHARED_DRIVE_ID",
+          "corpora": "drive",
+          "supports_all_drives": true
+        },
+        "binding_status": "confirmed",
+        "binding_confidence": 1.0,
+        "warnings": []
+      },
+      {
+        "reference_id": "aref_drive_permission",
+        "asset_id": "asset_drive_permission",
+        "context_type": "research_document",
+        "context_id": "doc_excel_demo",
+        "role": "researcher_material",
+        "option_key": null,
+        "row_key": null,
+        "source_locator": {
+          "provider": "google_drive",
+          "drive_file_id": "DEMO_DRIVE_PERMISSION_ID"
+        },
+        "binding_status": "needs_review",
+        "binding_confidence": 0.0,
+        "warnings": []
+      },
+      {
+        "reference_id": "aref_drive_not_found",
+        "asset_id": "asset_drive_not_found",
+        "context_type": "research_document",
+        "context_id": "doc_excel_demo",
+        "role": "researcher_material",
+        "option_key": null,
+        "row_key": null,
+        "source_locator": {
+          "provider": "google_drive",
+          "drive_file_id": "DEMO_DRIVE_NOT_FOUND_ID"
+        },
+        "binding_status": "rejected",
+        "binding_confidence": 0.0,
+        "warnings": []
+      },
+      {
+        "reference_id": "aref_youtube_matrix",
+        "asset_id": "asset_youtube_matrix",
+        "context_type": "interview_position",
+        "context_id": "participant-demo:module-media",
+        "role": "researcher_material",
+        "option_key": null,
+        "row_key": null,
+        "source_locator": {
+          "provider": "youtube",
+          "video_id": "SOURCE_MATRIX_INVALID_VIDEO",
+          "time_start_seconds": 12.5,
+          "time_end_seconds": 42.0
+        },
+        "binding_status": "confirmed",
+        "binding_confidence": 1.0,
+        "warnings": []
+      },
+      {
+        "reference_id": "aref_local_media",
+        "asset_id": "asset_local_media",
+        "context_type": "interview_position",
+        "context_id": "participant-demo:module-audio",
+        "role": "researcher_material",
+        "option_key": null,
+        "row_key": null,
+        "source_locator": {
+          "provider": "local_upload",
+          "local_file_id": "fixture-audio.wav",
+          "time_start_seconds": 0,
+          "time_end_seconds": 15
+        },
+        "binding_status": "confirmed",
+        "binding_confidence": 1.0,
+        "warnings": []
+      }
+    ],
+    "derivatives": [
+      {
+        "derivative_id": "der_excel_metadata",
+        "asset_id": "asset_excel_image",
+        "derivative_type": "metadata",
+        "status": "completed",
+        "model": null,
+        "model_version": null,
+        "created_at": "2026-08-12T05:01:00Z",
+        "payload": {
+          "width": 800,
+          "height": 450,
+          "anchor": "C7",
+          "coverage": "C7:F15"
+        },
+        "review_status": "not_required",
+        "created_by_ref": "fixture-parser",
+        "revised_from_derivative_id": null
+      }
+    ]
+  }
+}

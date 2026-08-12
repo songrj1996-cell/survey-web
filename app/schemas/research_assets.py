@@ -7,9 +7,22 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    StringConstraints,
+    model_validator,
+)
+
+
+_OwnerRef = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1),
+]
 
 
 class ContractModel(BaseModel):
@@ -50,6 +63,7 @@ class ProcessingStatus(str, Enum):
 
 
 class AccessStatus(str, Enum):
+    UNKNOWN = "unknown"
     ACCESSIBLE = "accessible"
     LOGIN_REQUIRED = "login_required"
     PERMISSION_REQUIRED = "permission_required"
@@ -105,6 +119,7 @@ class ExportPolicy(str, Enum):
 class AssetContextType(str, Enum):
     SURVEY_QUESTION = "survey_question"
     SURVEY_OPTION = "survey_option"
+    SURVEY_ROW = "survey_row"
     INTERVIEW_POSITION = "interview_position"
     RESEARCH_DOCUMENT = "research_document"
     REPORT = "report"
@@ -164,6 +179,7 @@ class SourceLocator(BaseModel):
     """统一来源定位；允许保留新增 Provider 的扩展定位字段。"""
 
     model_config = ConfigDict(extra="allow")
+    __pydantic_extra__: dict[str, JsonValue] = Field(init=False)
 
     source_id: str | None = None
     document_id: str | None = None
@@ -189,13 +205,30 @@ class SourceLocator(BaseModel):
     local_file_id: str | None = None
 
     @model_validator(mode="after")
-    def validate_time_range(self) -> "SourceLocator":
+    def validate_locator(self) -> "SourceLocator":
         if (
             self.time_start_seconds is not None
             and self.time_end_seconds is not None
             and self.time_end_seconds < self.time_start_seconds
         ):
             raise ValueError("time_end_seconds 不能早于 time_start_seconds")
+
+        required_identity: tuple[str, ...] | None = None
+        provider_label = self.provider.value if self.provider else None
+        if self.provider == Provider.GOOGLE_FORMS:
+            required_identity = ("provider_form_id",)
+        elif self.provider == Provider.GOOGLE_DRIVE:
+            required_identity = ("file_id", "drive_file_id")
+        elif self.provider == Provider.YOUTUBE:
+            required_identity = ("video_id",)
+        elif self.provider in {Provider.EXCEL, Provider.LOCAL_UPLOAD}:
+            required_identity = ("file_id", "local_file_id")
+
+        if required_identity and not any(
+            getattr(self, field_name) for field_name in required_identity
+        ):
+            joined = " 或 ".join(required_identity)
+            raise ValueError(f"{provider_label} 来源定位必须提供 {joined}")
         return self
 
 
@@ -222,10 +255,10 @@ class ResearchSource(ContractModel):
     provider: Provider
     original_name: str = ""
     original_url: str | None = None
-    owner_ref: str = Field(min_length=1)
+    owner_ref: _OwnerRef
     created_at: datetime
     acquisition_status: ProcessingStatus = ProcessingStatus.PENDING
-    access_status: AccessStatus = AccessStatus.ACCESSIBLE
+    access_status: AccessStatus = AccessStatus.UNKNOWN
     warnings: list[ImportWarning] = Field(default_factory=list)
     issues: list[ImportIssue] = Field(default_factory=list)
 
@@ -260,7 +293,7 @@ class ResearchAsset(ContractModel):
     provider: Provider
     provider_resource_id: str | None = None
     provider_version: str | None = None
-    access_status: AccessStatus = AccessStatus.ACCESSIBLE
+    access_status: AccessStatus = AccessStatus.UNKNOWN
     processing_status: ProcessingStatus = ProcessingStatus.PENDING
     sensitivity_status: SensitivityStatus = SensitivityStatus.UNKNOWN
     export_policy: ExportPolicy = ExportPolicy.MANUAL_CONFIRMATION
@@ -275,7 +308,8 @@ class AssetReference(ContractModel):
     context_type: AssetContextType
     context_id: str = Field(min_length=1)
     role: AssetRole
-    option_key: str | None = None
+    option_key: str | None = Field(default=None, min_length=1)
+    row_key: str | None = Field(default=None, min_length=1)
     source_locator: SourceLocator
     binding_status: BindingStatus = BindingStatus.PROPOSED
     binding_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
@@ -290,13 +324,30 @@ class AssetDerivative(ContractModel):
     model: str | None = None
     model_version: str | None = None
     created_at: datetime
-    payload: dict[str, Any] = Field(default_factory=dict)
+    payload: dict[str, JsonValue] = Field(default_factory=dict)
     review_status: ReviewStatus = ReviewStatus.PENDING
-    revised_from_derivative_id: str | None = None
+    created_by_ref: str | None = Field(default=None, min_length=1)
+    revised_from_derivative_id: str | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def validate_human_revision(self) -> "AssetDerivative":
+        if self.derivative_type != DerivativeType.HUMAN_REVISION:
+            return self
+        if self.created_by_ref is None:
+            raise ValueError("human_revision 必须记录 created_by_ref")
+        if self.revised_from_derivative_id is None:
+            raise ValueError(
+                "human_revision 必须记录 revised_from_derivative_id"
+            )
+        if self.revised_from_derivative_id == self.derivative_id:
+            raise ValueError("human_revision 不能引用自身作为父派生版本")
+        return self
 
 
 class ResearchAssetCollection(ContractModel):
-    schema_version: int = Field(default=1, ge=1)
+    schema_version: Literal[1] = 1
+    collection_id: str = Field(min_length=1)
+    owner_ref: _OwnerRef
     sources: list[ResearchSource] = Field(default_factory=list)
     documents: list[ResearchDocument] = Field(default_factory=list)
     assets: list[ResearchAsset] = Field(default_factory=list)
