@@ -1,0 +1,449 @@
+{
+  "snapshot": {
+    "schema_version": 1,
+    "snapshot_id": "qsn_google_demo",
+    "document_id": "doc_google_demo",
+    "provider": "google_forms",
+    "provider_form_id": "form_demo_001",
+    "source_mode": "official_api",
+    "title": "脱敏概念测试",
+    "retrieved_at": "2026-08-12T04:00:00Z",
+    "provider_modified_at": null,
+    "provider_revision": "opaque-revision",
+    "content_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "collection_state": "closed",
+    "question_count": 4,
+    "asset_count": 2,
+    "mapping_status": "exact",
+    "provider_raw_definition": {
+      "formId": "form_demo_001",
+      "revisionId": "opaque-revision",
+      "publishSettings": {
+        "isPublished": false
+      },
+      "custom_provider_field": {
+        "must_survive_round_trip": true
+      }
+    },
+    "provider_questions": [
+      {
+        "provider": "google_forms",
+        "provider_question_id": "section-1",
+        "provider_item_id": "item-section-1",
+        "provider_question_type": "pageBreakItem",
+        "provider_position": 0,
+        "raw_definition": {
+          "itemId": "item-section-1",
+          "title": "第一部分",
+          "pageBreakItem": {}
+        },
+        "source_locator": {
+          "provider": "google_forms",
+          "provider_form_id": "form_demo_001",
+          "provider_item_id": "item-section-1",
+          "question_position": 0
+        }
+      },
+      {
+        "provider": "google_forms",
+        "provider_question_id": "google-q1",
+        "provider_item_id": "item-q1",
+        "provider_question_type": "RADIO",
+        "provider_position": 1,
+        "raw_definition": {
+          "itemId": "item-q1",
+          "questionItem": {
+            "question": {
+              "questionId": "google-q1",
+              "required": true,
+              "choiceQuestion": {
+                "type": "RADIO",
+                "options": [
+                  {
+                    "value": "方案 A",
+                    "image": {
+                      "contentUri": "https://example.invalid/temporary-image-a",
+                      "altText": "方案 A"
+                    },
+                    "goToSectionId": "item-section-2"
+                  },
+                  {
+                    "value": "方案 B"
+                  }
+                ]
+              }
+            },
+            "image": {
+              "contentUri": "https://example.invalid/temporary-question-image",
+              "altText": "题目说明图"
+            }
+          }
+        },
+        "source_locator": {
+          "provider": "google_forms",
+          "provider_form_id": "form_demo_001",
+          "provider_question_id": "google-q1",
+          "provider_item_id": "item-q1",
+          "question_position": 1
+        }
+      },
+      {
+        "provider": "google_forms",
+        "provider_question_id": "google-grid-row-1",
+        "provider_item_id": "item-grid-1",
+        "provider_question_type": "questionGroupItem.grid",
+        "provider_position": 2,
+        "raw_definition": {
+          "itemId": "item-grid-1",
+          "questionGroupItem": {
+            "questions": [
+              {
+                "questionId": "google-grid-row-1",
+                "rowQuestion": {
+                  "title": "易用性"
+                }
+              },
+              {
+                "questionId": "google-grid-row-2",
+                "rowQuestion": {
+                  "title": "美术表现"
+                }
+              }
+            ],
+            "grid": {
+              "columns": {
+                "type": "RADIO",
+                "options": [
+                  {
+                    "value": "满意"
+                  },
+                  {
+                    "value": "不满意"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "source_locator": {
+          "provider": "google_forms",
+          "provider_form_id": "form_demo_001",
+          "provider_question_id": "google-grid-row-1",
+          "provider_item_id": "item-grid-1",
+          "question_position": 2
+        }
+      }
+    ],
+    "canonical_questions": [
+      {
+        "question_id": "q_section_1",
+        "provider_question_id": "section-1",
+        "canonical_type": "section",
+        "title": "第一部分",
+        "description": "",
+        "required": false,
+        "rows": [],
+        "options": [],
+        "branching": [],
+        "asset_reference_ids": [],
+        "mapping_status": "exact",
+        "mapping_confidence": 1.0,
+        "warnings": []
+      },
+      {
+        "question_id": "q_concept_choice",
+        "provider_question_id": "google-q1",
+        "canonical_type": "single_choice",
+        "title": "你更喜欢哪个方案？",
+        "description": "请结合配图选择",
+        "required": true,
+        "rows": [],
+        "options": [
+          {
+            "option_key": "A",
+            "value": "方案 A",
+            "label": "方案 A",
+            "asset_reference_ids": [
+              "aref_option_a"
+            ],
+            "provider_option_id": null
+          },
+          {
+            "option_key": "B",
+            "value": "方案 B",
+            "label": "方案 B",
+            "asset_reference_ids": [],
+            "provider_option_id": null
+          }
+        ],
+        "branching": [
+          {
+            "option_key": "A",
+            "action": "go_to_section",
+            "target_section_id": "q_section_2",
+            "provider_raw_action": "item-section-2"
+          }
+        ],
+        "asset_reference_ids": [
+          "aref_question_image"
+        ],
+        "mapping_status": "exact",
+        "mapping_confidence": 1.0,
+        "warnings": []
+      },
+      {
+        "question_id": "q_grid",
+        "provider_question_id": "google-grid-row-1",
+        "canonical_type": "matrix_single",
+        "title": "功能评价",
+        "description": "",
+        "required": true,
+        "rows": [
+          {
+            "row_key": "row-1",
+            "label": "易用性",
+            "provider_question_id": "google-grid-row-1",
+            "asset_reference_ids": []
+          },
+          {
+            "row_key": "row-2",
+            "label": "美术表现",
+            "provider_question_id": "google-grid-row-2",
+            "asset_reference_ids": []
+          }
+        ],
+        "options": [
+          {
+            "option_key": "satisfied",
+            "value": "满意",
+            "label": "满意",
+            "asset_reference_ids": [],
+            "provider_option_id": null
+          },
+          {
+            "option_key": "unsatisfied",
+            "value": "不满意",
+            "label": "不满意",
+            "asset_reference_ids": [],
+            "provider_option_id": null
+          }
+        ],
+        "branching": [],
+        "asset_reference_ids": [
+          "aref_reused_instruction"
+        ],
+        "mapping_status": "normalized",
+        "mapping_confidence": 1.0,
+        "warnings": []
+      },
+      {
+        "question_id": "q_section_2",
+        "provider_question_id": null,
+        "canonical_type": "section",
+        "title": "第二部分",
+        "description": "",
+        "required": false,
+        "rows": [],
+        "options": [],
+        "branching": [],
+        "asset_reference_ids": [],
+        "mapping_status": "partial",
+        "mapping_confidence": 0.8,
+        "warnings": [
+          {
+            "code": "fixture_target_only",
+            "message": "脱敏样例仅保留跳转目标",
+            "field_path": "canonical_questions[3]",
+            "blocking": false,
+            "source_locator": null
+          }
+        ]
+      }
+    ],
+    "response_column_mappings": [
+      {
+        "question_id": "q_concept_choice",
+        "provider_question_id": "google-q1",
+        "response_key": "google-q1",
+        "column_indexes": [],
+        "column_headers": [],
+        "mapping_status": "exact",
+        "mapping_confidence": 1.0,
+        "warnings": []
+      }
+    ],
+    "warnings": []
+  },
+  "collection": {
+    "schema_version": 1,
+    "sources": [
+      {
+        "source_id": "src_google_demo",
+        "source_kind": "provider_connection",
+        "provider": "google_forms",
+        "original_name": "脱敏概念测试",
+        "original_url": "https://docs.google.com/forms/d/form_demo_001/edit",
+        "owner_ref": "fixture-user",
+        "created_at": "2026-08-12T04:00:00Z",
+        "acquisition_status": "completed",
+        "access_status": "accessible",
+        "warnings": [],
+        "issues": []
+      }
+    ],
+    "documents": [
+      {
+        "document_id": "doc_google_demo",
+        "source_id": "src_google_demo",
+        "document_type": "questionnaire",
+        "title": "脱敏概念测试",
+        "filename": null,
+        "mime_type": "application/vnd.google-apps.form",
+        "size_bytes": null,
+        "content_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "provider_modified_at": null,
+        "retrieved_at": "2026-08-12T04:00:00Z",
+        "snapshot_policy": "full_copy",
+        "parse_status": "completed",
+        "source_locator": {
+          "source_id": "src_google_demo",
+          "document_id": "doc_google_demo",
+          "provider": "google_forms",
+          "provider_form_id": "form_demo_001",
+          "provider_revision": "opaque-revision"
+        },
+        "warnings": [],
+        "issues": []
+      }
+    ],
+    "assets": [
+      {
+        "asset_id": "asset_question_image",
+        "document_id": "doc_google_demo",
+        "media_type": "image",
+        "mime_type": "image/png",
+        "filename": "question-image.png",
+        "display_name": "题目说明图",
+        "size_bytes": 1200,
+        "content_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "provider": "google_forms",
+        "provider_resource_id": "google-image-question",
+        "provider_version": "opaque-revision",
+        "access_status": "accessible",
+        "processing_status": "completed",
+        "sensitivity_status": "internal",
+        "export_policy": "manual_confirmation",
+        "source_locator": {
+          "provider": "google_forms",
+          "provider_form_id": "form_demo_001",
+          "provider_question_id": "google-q1",
+          "provider_item_id": "item-q1",
+          "question_position": 1
+        },
+        "warnings": [],
+        "issues": []
+      },
+      {
+        "asset_id": "asset_option_a",
+        "document_id": "doc_google_demo",
+        "media_type": "image",
+        "mime_type": "image/png",
+        "filename": "option-a.png",
+        "display_name": "方案 A",
+        "size_bytes": 2400,
+        "content_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "provider": "google_forms",
+        "provider_resource_id": "google-image-option-a",
+        "provider_version": "opaque-revision",
+        "access_status": "accessible",
+        "processing_status": "completed",
+        "sensitivity_status": "internal",
+        "export_policy": "manual_confirmation",
+        "source_locator": {
+          "provider": "google_forms",
+          "provider_form_id": "form_demo_001",
+          "provider_question_id": "google-q1",
+          "provider_option_id": "A",
+          "provider_item_id": "item-q1",
+          "question_position": 1
+        },
+        "warnings": [],
+        "issues": []
+      }
+    ],
+    "references": [
+      {
+        "reference_id": "aref_question_image",
+        "asset_id": "asset_question_image",
+        "context_type": "survey_question",
+        "context_id": "q_concept_choice",
+        "role": "question_instruction",
+        "option_key": null,
+        "source_locator": {
+          "provider": "google_forms",
+          "provider_form_id": "form_demo_001",
+          "provider_question_id": "google-q1",
+          "provider_item_id": "item-q1",
+          "question_position": 1
+        },
+        "binding_status": "confirmed",
+        "binding_confidence": 1.0,
+        "warnings": []
+      },
+      {
+        "reference_id": "aref_option_a",
+        "asset_id": "asset_option_a",
+        "context_type": "survey_option",
+        "context_id": "q_concept_choice",
+        "role": "option_stimulus",
+        "option_key": "A",
+        "source_locator": {
+          "provider": "google_forms",
+          "provider_form_id": "form_demo_001",
+          "provider_question_id": "google-q1",
+          "provider_option_id": "A",
+          "provider_item_id": "item-q1",
+          "question_position": 1
+        },
+        "binding_status": "confirmed",
+        "binding_confidence": 1.0,
+        "warnings": []
+      },
+      {
+        "reference_id": "aref_reused_instruction",
+        "asset_id": "asset_option_a",
+        "context_type": "survey_question",
+        "context_id": "q_grid",
+        "role": "question_instruction",
+        "option_key": null,
+        "source_locator": {
+          "provider": "google_forms",
+          "provider_form_id": "form_demo_001",
+          "provider_question_id": "google-grid-row-1",
+          "provider_item_id": "item-grid-1",
+          "question_position": 2
+        },
+        "binding_status": "confirmed",
+        "binding_confidence": 1.0,
+        "warnings": []
+      }
+    ],
+    "derivatives": [
+      {
+        "derivative_id": "der_question_thumbnail",
+        "asset_id": "asset_question_image",
+        "derivative_type": "thumbnail",
+        "status": "completed",
+        "model": null,
+        "model_version": null,
+        "created_at": "2026-08-12T04:01:00Z",
+        "payload": {
+          "width": 320,
+          "height": 180
+        },
+        "review_status": "not_required",
+        "revised_from_derivative_id": null
+      }
+    ]
+  }
+}

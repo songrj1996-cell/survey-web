@@ -1,0 +1,174 @@
+{
+  "snapshot": {
+    "schema_version": 1,
+    "snapshot_id": "qsn_bested_demo",
+    "document_id": "doc_bested_demo",
+    "provider": "bested",
+    "provider_form_id": "bested-demo-001",
+    "source_mode": "original_questionnaire_upload",
+    "title": "脱敏倍市得问卷",
+    "retrieved_at": "2026-08-12T04:00:00Z",
+    "provider_modified_at": null,
+    "provider_revision": null,
+    "content_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "collection_state": "unknown",
+    "question_count": 1,
+    "asset_count": 0,
+    "mapping_status": "normalized",
+    "provider_raw_definition": {
+      "sheet_name": "问卷内容",
+      "provider_only_export_metadata": {
+        "matrix_layout": "rows_after_options",
+        "must_survive_round_trip": true
+      }
+    },
+    "provider_questions": [
+      {
+        "provider": "bested",
+        "provider_question_id": "Q1",
+        "provider_item_id": null,
+        "provider_question_type": "矩阵单选题",
+        "provider_position": 0,
+        "raw_definition": {
+          "source_cell": "问卷内容!A2",
+          "raw_heading": "Q1[矩阵单选题]",
+          "raw_options": [
+            "满意",
+            "一般",
+            "不满意"
+          ],
+          "raw_rows": [
+            "易用性",
+            "稳定性"
+          ]
+        },
+        "source_locator": {
+          "provider": "bested",
+          "provider_form_id": "bested-demo-001",
+          "provider_question_id": "Q1",
+          "file_id": "fixture-questionnaire.xlsx",
+          "sheet_name": "问卷内容",
+          "cell": "A2",
+          "question_position": 0
+        }
+      }
+    ],
+    "canonical_questions": [
+      {
+        "question_id": "q_bested_matrix",
+        "provider_question_id": "Q1",
+        "canonical_type": "matrix_single",
+        "title": "功能评价",
+        "description": "",
+        "required": false,
+        "rows": [
+          {
+            "row_key": "row-1",
+            "label": "易用性",
+            "provider_question_id": "Q1-row-1",
+            "asset_reference_ids": []
+          },
+          {
+            "row_key": "row-2",
+            "label": "稳定性",
+            "provider_question_id": "Q1-row-2",
+            "asset_reference_ids": []
+          }
+        ],
+        "options": [
+          {
+            "option_key": "1",
+            "value": "满意",
+            "label": "满意",
+            "asset_reference_ids": [],
+            "provider_option_id": "1"
+          },
+          {
+            "option_key": "2",
+            "value": "一般",
+            "label": "一般",
+            "asset_reference_ids": [],
+            "provider_option_id": "2"
+          },
+          {
+            "option_key": "3",
+            "value": "不满意",
+            "label": "不满意",
+            "asset_reference_ids": [],
+            "provider_option_id": "3"
+          }
+        ],
+        "branching": [],
+        "asset_reference_ids": [],
+        "mapping_status": "normalized",
+        "mapping_confidence": 1.0,
+        "warnings": []
+      }
+    ],
+    "response_column_mappings": [
+      {
+        "question_id": "q_bested_matrix",
+        "provider_question_id": "Q1",
+        "response_key": "Q1",
+        "column_indexes": [
+          2,
+          3
+        ],
+        "column_headers": [
+          "功能评价__易用性",
+          "功能评价__稳定性"
+        ],
+        "mapping_status": "exact",
+        "mapping_confidence": 1.0,
+        "warnings": []
+      }
+    ],
+    "warnings": []
+  },
+  "collection": {
+    "schema_version": 1,
+    "sources": [
+      {
+        "source_id": "src_bested_demo",
+        "source_kind": "local_upload",
+        "provider": "bested",
+        "original_name": "fixture-questionnaire.xlsx",
+        "original_url": null,
+        "owner_ref": "fixture-user",
+        "created_at": "2026-08-12T04:00:00Z",
+        "acquisition_status": "completed",
+        "access_status": "accessible",
+        "warnings": [],
+        "issues": []
+      }
+    ],
+    "documents": [
+      {
+        "document_id": "doc_bested_demo",
+        "source_id": "src_bested_demo",
+        "document_type": "questionnaire",
+        "title": "脱敏倍市得问卷",
+        "filename": "fixture-questionnaire.xlsx",
+        "mime_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "size_bytes": 4096,
+        "content_hash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "provider_modified_at": null,
+        "retrieved_at": "2026-08-12T04:00:00Z",
+        "snapshot_policy": "full_copy",
+        "parse_status": "completed",
+        "source_locator": {
+          "source_id": "src_bested_demo",
+          "document_id": "doc_bested_demo",
+          "provider": "bested",
+          "file_id": "fixture-questionnaire.xlsx",
+          "sheet_name": "问卷内容"
+        },
+        "warnings": [],
+        "issues": []
+      }
+    ],
+    "assets": [],
+    "references": [],
+    "derivatives": []
+  }
+}
