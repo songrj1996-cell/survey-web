@@ -1,15 +1,16 @@
-"""问卷快照上传与查询接口的安全响应契约。"""
+"""问卷快照上传、查询与低可信材料接口的安全响应契约。"""
 
+from enum import Enum
 from typing import Annotated, Literal
 
-from pydantic import Field, StringConstraints
+from pydantic import Field, StringConstraints, model_validator
 
 from app.schemas.questionnaire import (
     CollectionState,
     MappingStatus,
     QuestionnaireSourceMode,
 )
-from app.schemas.research_assets import ContractModel, Provider
+from app.schemas.research_assets import ContractModel, ProcessingStatus, Provider
 
 
 GoogleFormId = Annotated[
@@ -43,3 +44,52 @@ class QuestionnaireSnapshotSummary(ContractModel):
     asset_count: int = Field(ge=0)
     image_asset_count: int = Field(ge=0)
     asset_reference_count: int = Field(ge=0)
+
+
+class QuestionnaireMaterialTrustLevel(str, Enum):
+    """材料恢复问卷结构时采用的保守可信等级。"""
+
+    LOW = "low"
+    MEDIUM = "medium"
+
+
+SCREENSHOT_MATERIAL_REVIEW_WARNING_CODE = (
+    "screenshot_material_requires_review"
+)
+
+
+class QuestionnaireMaterialUploadSummary(ContractModel):
+    """不暴露文件名、哈希、路径或原始媒体的材料上传摘要。"""
+
+    schema_version: Literal[1] = 1
+    snapshot_id: str = Field(min_length=1)
+    provider: Literal[Provider.LOCAL_UPLOAD] = Provider.LOCAL_UPLOAD
+    source_mode: Literal[QuestionnaireSourceMode.MATERIAL_UPLOAD] = (
+        QuestionnaireSourceMode.MATERIAL_UPLOAD
+    )
+    mapping_status: Literal[MappingStatus.NEEDS_REVIEW] = (
+        MappingStatus.NEEDS_REVIEW
+    )
+    processing_status: Literal[ProcessingStatus.NEEDS_REVIEW] = (
+        ProcessingStatus.NEEDS_REVIEW
+    )
+    trust_level: Literal[QuestionnaireMaterialTrustLevel.LOW] = (
+        QuestionnaireMaterialTrustLevel.LOW
+    )
+    file_count: int = Field(ge=1)
+    total_size_bytes: int = Field(ge=1)
+    image_count: int = Field(ge=1)
+    requires_human_review: Literal[True] = True
+    warning_codes: list[str] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_material_counts(self) -> "QuestionnaireMaterialUploadSummary":
+        if self.file_count != self.image_count:
+            raise ValueError("截图材料的 file_count 必须等于 image_count")
+        if len(self.warning_codes) != len(set(self.warning_codes)):
+            raise ValueError("warning_codes 不能重复")
+        if any(not code.strip() for code in self.warning_codes):
+            raise ValueError("warning_codes 不能包含空值")
+        if self.warning_codes != [SCREENSHOT_MATERIAL_REVIEW_WARNING_CODE]:
+            raise ValueError("截图材料必须返回稳定的人工复核告警")
+        return self

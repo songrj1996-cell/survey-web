@@ -15,6 +15,7 @@ from starlette.responses import StreamingResponse
 from app.core.security import _owner_from_login
 from app.schemas.questionnaire_source_api import (
     GoogleFormsSnapshotImportRequest,
+    QuestionnaireMaterialUploadSummary,
     QuestionnaireSnapshotSummary,
 )
 from app.services.auth import _require_feature
@@ -35,6 +36,17 @@ from app.services.google_forms_snapshot_api import (
     GoogleFormsQuestionnaireProviderError,
     GoogleFormsQuestionnaireRetryableError,
     GoogleFormsQuestionnaireSnapshotApi,
+)
+from app.services.questionnaire_material_snapshot_api import (
+    MAX_MATERIAL_SCREENSHOT_BYTES,
+    MAX_MATERIAL_SCREENSHOT_FILES,
+    MAX_MATERIAL_SCREENSHOTS_TOTAL_BYTES,
+    SUPPORTED_MATERIAL_SCREENSHOT_MIME_TYPES,
+    QuestionnaireMaterialConflictError,
+    QuestionnaireMaterialInternalError,
+    QuestionnaireMaterialInvalidError,
+    QuestionnaireMaterialScreenshot,
+    QuestionnaireMaterialSnapshotApi,
 )
 from app.services.questionnaire_snapshot_api import (
     MAX_SNAPSHOT_UPLOAD_BYTES,
@@ -59,6 +71,11 @@ _MAX_CONCURRENT_GOOGLE_IMPORTS = 1
 _GOOGLE_REQUEST_MAX_BYTES = 4 * 1024
 _GOOGLE_REQUEST_TIMEOUT_SECONDS = 15.0
 _GOOGLE_IMPORT_TIMEOUT_SECONDS = 180.0
+_MAX_CONCURRENT_MATERIAL_IMPORTS = 1
+_MAX_CONCURRENT_MATERIAL_UPLOADS = 1
+_MATERIAL_MULTIPART_OVERHEAD_BYTES = 256 * 1024
+_MATERIAL_UPLOAD_TIMEOUT_SECONDS = 120.0
+_MATERIAL_IMPORT_TIMEOUT_SECONDS = 180.0
 
 
 class _SnapshotRequestTooLarge(MultiPartException):
@@ -237,6 +254,28 @@ def _raise_google_http_error(error: Exception) -> None:
     raise HTTPException(
         status_code=500,
         detail="Google Forms 问卷导入暂时不可用",
+    ) from error
+
+
+def _raise_material_http_error(error: Exception) -> None:
+    if isinstance(error, QuestionnaireMaterialInvalidError):
+        raise HTTPException(
+            status_code=422,
+            detail="问卷截图材料无效或不受支持",
+        ) from error
+    if isinstance(error, QuestionnaireMaterialConflictError):
+        raise HTTPException(
+            status_code=409,
+            detail="同一截图材料快照 ID 已存在不同内容",
+        ) from error
+    if isinstance(error, QuestionnaireMaterialInternalError):
+        raise HTTPException(
+            status_code=500,
+            detail="问卷截图材料导入暂时不可用",
+        ) from error
+    raise HTTPException(
+        status_code=500,
+        detail="问卷截图材料导入暂时不可用",
     ) from error
 
 
@@ -427,6 +466,100 @@ async def _parse_bested_upload(request: Request) -> FormData:
         invalid_detail="倍市得原问卷上传请求无效",
         internal_detail="倍市得问卷导入暂时不可用",
     )
+
+
+async def _bounded_material_request_stream(
+    request: Request,
+) -> AsyncIterator[bytes]:
+    limit = (
+        MAX_MATERIAL_SCREENSHOTS_TOTAL_BYTES
+        + _MATERIAL_MULTIPART_OVERHEAD_BYTES
+    )
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        try:
+            declared_length = int(declared)
+        except ValueError as error:
+            raise HTTPException(
+                status_code=422,
+                detail="问卷截图材料上传请求无效",
+            ) from error
+        if declared_length < 0:
+            raise HTTPException(
+                status_code=422,
+                detail="问卷截图材料上传请求无效",
+            )
+        if declared_length > limit:
+            raise HTTPException(
+                status_code=413,
+                detail="问卷截图材料超过上传大小限制",
+            )
+
+    total = 0
+    try:
+        async for chunk in request.stream():
+            total += len(chunk)
+            if total > limit:
+                raise _SnapshotRequestTooLarge("request too large")
+            yield chunk
+    except (_SnapshotRequestTooLarge, HTTPException):
+        raise
+    except ClientDisconnect as error:
+        raise HTTPException(
+            status_code=400,
+            detail="问卷截图材料上传未完整发送",
+        ) from error
+
+
+async def _parse_material_upload(request: Request) -> FormData:
+    media_type = request.headers.get("content-type", "").split(";", 1)[0]
+    if media_type.strip().casefold() != "multipart/form-data":
+        raise HTTPException(
+            status_code=415,
+            detail="问卷截图材料必须使用 multipart/form-data 上传",
+        )
+    parser = MultiPartParser(
+        headers=request.headers,
+        stream=_bounded_material_request_stream(request),
+        max_files=MAX_MATERIAL_SCREENSHOT_FILES,
+        max_fields=0,
+    )
+    succeeded = False
+    try:
+        form = await parser.parse()
+        retained_file_ids = {
+            id(value.file)
+            for _, value in form.multi_items()
+            if isinstance(value, UploadFile)
+        }
+        _close_parser_temporaries(
+            parser,
+            retained_file_ids=retained_file_ids,
+        )
+        succeeded = True
+        return form
+    except _SnapshotRequestTooLarge as error:
+        raise HTTPException(
+            status_code=413,
+            detail="问卷截图材料超过上传大小限制",
+        ) from error
+    except HTTPException:
+        raise
+    except (MultiPartException, MultipartParseError, KeyError) as error:
+        raise HTTPException(
+            status_code=422,
+            detail="问卷截图材料上传请求无效",
+        ) from error
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail="问卷截图材料导入暂时不可用",
+        ) from error
+    finally:
+        if not succeeded:
+            _close_parser_temporaries(parser)
 
 
 def create_questionnaire_sources_router(
@@ -759,5 +892,160 @@ def create_google_forms_questionnaire_sources_router(
         finally:
             if not release_deferred:
                 lease.release()
+
+    return router
+
+
+def create_questionnaire_material_sources_router(
+    api: QuestionnaireMaterialSnapshotApi,
+) -> APIRouter:
+    """创建连续截图材料到低可信快照的独立路由。"""
+    if not isinstance(api, QuestionnaireMaterialSnapshotApi):
+        raise TypeError("api 必须是 QuestionnaireMaterialSnapshotApi")
+
+    router = APIRouter()
+    import_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_MATERIAL_IMPORTS)
+    upload_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_MATERIAL_UPLOADS)
+
+    @router.post(
+        "/api/questionnaire-sources/materials/snapshots",
+        response_model=QuestionnaireMaterialUploadSummary,
+    )
+    async def upload_questionnaire_material_screenshots(
+        request: Request,
+    ) -> QuestionnaireMaterialUploadSummary:
+        login = await _require_feature(request, "survey")
+        owner_ref = _owner_key(login)
+        if import_semaphore.locked() or upload_semaphore.locked():
+            raise HTTPException(
+                status_code=429,
+                detail="已有问卷截图材料正在导入，请稍后重试",
+            )
+
+        await upload_semaphore.acquire()
+        upload_lease = _DownloadLease(upload_semaphore)
+        import_lease: _DownloadLease | None = None
+        form: FormData | None = None
+        release_deferred = False
+        try:
+            try:
+                form = await asyncio.wait_for(
+                    _parse_material_upload(request),
+                    timeout=_MATERIAL_UPLOAD_TIMEOUT_SECONDS,
+                )
+            except TimeoutError as error:
+                raise HTTPException(
+                    status_code=408,
+                    detail="问卷截图材料上传超时，请重试",
+                ) from error
+
+            items = form.multi_items()
+            if (
+                not items
+                or len(items) > MAX_MATERIAL_SCREENSHOT_FILES
+                or any(
+                    key != "files" or not isinstance(value, UploadFile)
+                    for key, value in items
+                )
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "问卷截图材料上传请求只能包含 1 至 "
+                        f"{MAX_MATERIAL_SCREENSHOT_FILES} 个 files 文件字段"
+                    ),
+                )
+
+            screenshots: list[QuestionnaireMaterialScreenshot] = []
+            total_size = 0
+            for _, value in items:
+                assert isinstance(value, UploadFile)
+                mime_type = str(value.content_type or "").split(";", 1)[0]
+                mime_type = mime_type.strip().casefold()
+                if mime_type not in SUPPORTED_MATERIAL_SCREENSHOT_MIME_TYPES:
+                    raise HTTPException(
+                        status_code=415,
+                        detail="仅支持 PNG、JPEG 或 WebP 问卷截图",
+                    )
+                try:
+                    content = await value.read(
+                        MAX_MATERIAL_SCREENSHOT_BYTES + 1
+                    )
+                except Exception as error:
+                    raise HTTPException(
+                        status_code=500,
+                        detail="问卷截图材料导入暂时不可用",
+                    ) from error
+                if not content:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="问卷截图文件不能为空",
+                    )
+                if len(content) > MAX_MATERIAL_SCREENSHOT_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="问卷截图材料超过上传大小限制",
+                    )
+                total_size += len(content)
+                if total_size > MAX_MATERIAL_SCREENSHOTS_TOTAL_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="问卷截图材料超过上传大小限制",
+                    )
+                screenshots.append(QuestionnaireMaterialScreenshot(
+                    filename=str(value.filename or ""),
+                    mime_type=mime_type,
+                    content=content,
+                ))
+
+            await form.close()
+            form = None
+            await import_semaphore.acquire()
+            import_lease = _DownloadLease(import_semaphore)
+            upload_lease.release()
+
+            import_task = asyncio.create_task(
+                api.import_screenshots(owner_ref, tuple(screenshots))
+            )
+            try:
+                return await asyncio.wait_for(
+                    asyncio.shield(import_task),
+                    timeout=_MATERIAL_IMPORT_TIMEOUT_SECONDS,
+                )
+            except TimeoutError as error:
+                release_deferred = True
+                import_task.cancel()
+                assert import_lease is not None
+                if import_task.done():
+                    _release_after_task(import_task, import_lease)
+                else:
+                    import_task.add_done_callback(
+                        lambda task: _release_after_task(task, import_lease)
+                    )
+                raise HTTPException(
+                    status_code=504,
+                    detail="问卷截图材料处理超时，请稍后重试",
+                ) from error
+            except asyncio.CancelledError:
+                release_deferred = True
+                assert import_lease is not None
+                if import_task.done():
+                    _release_after_task(import_task, import_lease)
+                else:
+                    import_task.add_done_callback(
+                        lambda task: _release_after_task(task, import_lease)
+                    )
+                raise
+            except Exception as error:
+                _raise_material_http_error(error)
+                raise AssertionError("unreachable")
+        finally:
+            try:
+                if form is not None:
+                    await form.close()
+            finally:
+                upload_lease.release()
+                if import_lease is not None and not release_deferred:
+                    import_lease.release()
 
     return router
