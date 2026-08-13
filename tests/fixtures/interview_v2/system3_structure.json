@@ -1,0 +1,32 @@
+{
+  "schema_version": "interview-workbook-physical-truth/1.0-draft",
+  "source": {
+    "fixture_id": "system3",
+    "sha256": "80cb6c538ad6fd76c7846e301f12f5b9c116dd9b1d412c74b4d210be8901984e",
+    "contains_raw_interview_text": false,
+    "validation_mode": "read_only"
+  },
+  "workbook": {
+    "sheet_count": 1,
+    "formula_count": 0,
+    "sheets": [
+      {
+        "sheet_id": "sheet_01",
+        "source_sheet_name_redacted": "records",
+        "used_range": "A1:O84",
+        "row_count": 84,
+        "column_count": 15,
+        "structure_columns": "A:C",
+        "spacer_columns": "D:D",
+        "candidate_participant_columns": "E:O",
+        "candidate_participant_count": 11
+      }
+    ]
+  },
+  "decisions": {
+    "sheet_roles": "record_sheets_confirmed",
+    "group_mapping": "single_sheet_no_cross_sheet_mapping",
+    "participant_bindings": "one_column_one_participant_acknowledgement_required",
+    "automatic_column_position_binding_allowed": false
+  }
+}

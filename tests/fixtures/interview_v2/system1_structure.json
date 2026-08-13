@@ -1,0 +1,43 @@
+{
+  "schema_version": "interview-workbook-physical-truth/1.0-draft",
+  "source": {
+    "fixture_id": "system1",
+    "sha256": "740517a58f685ce5d92f053c06b012650fa150fd56180fa5560751c1456cca4b",
+    "contains_raw_interview_text": false,
+    "validation_mode": "read_only"
+  },
+  "workbook": {
+    "sheet_count": 2,
+    "formula_count": 0,
+    "sheets": [
+      {
+        "sheet_id": "sheet_01",
+        "source_sheet_name_redacted": "recorder_a",
+        "used_range": "A1:S102",
+        "row_count": 102,
+        "column_count": 19,
+        "structure_columns": "A:C",
+        "spacer_columns": null,
+        "candidate_participant_columns": "D:S",
+        "candidate_participant_count": 16
+      },
+      {
+        "sheet_id": "sheet_02",
+        "source_sheet_name_redacted": "recorder_b",
+        "used_range": "A1:T86",
+        "row_count": 86,
+        "column_count": 20,
+        "structure_columns": "A:C",
+        "spacer_columns": "D:G",
+        "candidate_participant_columns": "H:T",
+        "candidate_participant_count": 13
+      }
+    ]
+  },
+  "decisions": {
+    "sheet_roles": "record_sheets_confirmed",
+    "group_mapping": "research_confirmation_required",
+    "participant_bindings": "research_confirmation_required",
+    "automatic_column_position_binding_allowed": false
+  }
+}
