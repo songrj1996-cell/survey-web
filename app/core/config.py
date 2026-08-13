@@ -261,6 +261,52 @@ INTERVIEW_MAX_REPAIR_ROUNDS = min(
     max(1, _env_int("INTERVIEW_MAX_REPAIR_ROUNDS", 2)),
 )
 
+# 访谈报告 V2：批次 1 仅启用确定性文件预检与物理解析。
+INTERVIEW_V2_ENABLED = _env_bool("INTERVIEW_V2_ENABLED", False)
+INTERVIEW_V2_FILE_CONTRACT_VERSION = (
+    os.getenv(
+        "INTERVIEW_V2_FILE_CONTRACT_VERSION",
+        "interview-file-contract/1.0-draft",
+    ).strip()
+    or "interview-file-contract/1.0-draft"
+)
+INTERVIEW_V2_MAX_FILE_BYTES = max(
+    1,
+    _env_int("INTERVIEW_V2_MAX_FILE_BYTES", 50 * 1024 * 1024),
+)
+INTERVIEW_V2_MAX_ZIP_ENTRIES = max(
+    1,
+    _env_int("INTERVIEW_V2_MAX_ZIP_ENTRIES", 5000),
+)
+INTERVIEW_V2_MAX_UNCOMPRESSED_BYTES = max(
+    1,
+    _env_int("INTERVIEW_V2_MAX_UNCOMPRESSED_BYTES", 250 * 1024 * 1024),
+)
+INTERVIEW_V2_MAX_COMPRESSION_RATIO = max(
+    1.0,
+    _env_float("INTERVIEW_V2_MAX_COMPRESSION_RATIO", 100.0),
+)
+INTERVIEW_V2_MAX_SHEETS = max(
+    1,
+    _env_int("INTERVIEW_V2_MAX_SHEETS", 64),
+)
+INTERVIEW_V2_MAX_ROWS_PER_SHEET = max(
+    1,
+    _env_int("INTERVIEW_V2_MAX_ROWS_PER_SHEET", 5000),
+)
+INTERVIEW_V2_MAX_COLUMNS_PER_SHEET = max(
+    1,
+    _env_int("INTERVIEW_V2_MAX_COLUMNS_PER_SHEET", 256),
+)
+INTERVIEW_V2_MAX_NON_EMPTY_CELLS = max(
+    1,
+    _env_int("INTERVIEW_V2_MAX_NON_EMPTY_CELLS", 250000),
+)
+INTERVIEW_V2_MAX_TEXT_CHARS = max(
+    1,
+    _env_int("INTERVIEW_V2_MAX_TEXT_CHARS", 5000000),
+)
+
 
 # Google Form Responses 不含原表单跳转配置。小样本要求完全吻合；只有达到此回答量后，
 # 才允许按比例容忍少量分支外异常数据。样本量本身不作为拒绝识别跳转的条件。
@@ -304,6 +350,13 @@ COOKIE_NAME = "fs_sess"
 # ── 数据目录 ──────────────────────────────────────────────────
 DATA_DIR = os.getenv("DATA_DIR") or os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "data")
 os.makedirs(DATA_DIR, exist_ok=True)
+
+_interview_v2_data_dir = os.getenv("INTERVIEW_V2_DATA_DIR", "").strip()
+INTERVIEW_V2_DATA_DIR = (
+    Path(_interview_v2_data_dir)
+    if _interview_v2_data_dir
+    else Path(DATA_DIR) / "interview_v2"
+)
 
 PROMPTS_FILE   = os.path.join(DATA_DIR, "prompts.json")
 WHITELIST_FILE = os.path.join(DATA_DIR, "whitelist.json")
