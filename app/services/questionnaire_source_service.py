@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 from app.core.research_assets import (
@@ -22,7 +22,13 @@ from app.schemas.research_assets import (
     ImportIssue,
     ProcessingStatus,
 )
-from app.storage.research_assets import ResearchAssetBundle, ResearchAssetStorage
+from app.storage.research_assets import (
+    ResearchAssetBundle,
+    ResearchAssetStorage,
+    ResearchSnapshotStorage,
+    SnapshotPackage,
+    parse_snapshot_package,
+)
 
 
 _USABLE_STATUSES = {
@@ -350,3 +356,42 @@ def save_questionnaire_source_result(
         result.collection.owner_ref,
         ResearchAssetBundle(result.snapshot, result.collection),
     )
+
+
+def save_questionnaire_source_snapshot(
+    result: QuestionnaireSourceResult,
+    media: Mapping[str, bytes],
+    storage: ResearchSnapshotStorage,
+) -> SnapshotPackage:
+    """原子保存问卷结果及其完整媒体，并返回未经改写的快照聚合。"""
+    validate_research_contract(result.snapshot, result.collection)
+    package = SnapshotPackage(
+        bundle=ResearchAssetBundle(result.snapshot, result.collection),
+        media=dict(media),
+    )
+    storage.save_snapshot_package(result.collection.owner_ref, package)
+    return package
+
+
+def import_questionnaire_snapshot_package(
+    owner_ref: str,
+    archive: bytes,
+    storage: ResearchSnapshotStorage,
+) -> SnapshotPackage:
+    """安全解析 owner-bound 平台快照 ZIP，并将校验结果原子保存。
+
+    平台快照包仅是获取与传输方式；解析后的 ``source_mode``、provider 和
+    Provider 来源定位均保持包内原始溯源，不会被改写为平台来源。
+    """
+    package = parse_snapshot_package(owner_ref, archive)
+    storage.save_snapshot_package(owner_ref, package)
+    return package
+
+
+def load_questionnaire_source_snapshot(
+    owner_ref: str,
+    snapshot_id: str,
+    storage: ResearchSnapshotStorage,
+) -> SnapshotPackage | None:
+    """按 owner 范围加载包含完整媒体的问卷快照。"""
+    return storage.load_snapshot_package(owner_ref, snapshot_id)

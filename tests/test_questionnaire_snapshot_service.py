@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 from pathlib import Path
+import tempfile
 import unittest
+import zipfile
 
 from pydantic import ValidationError
 
@@ -14,9 +18,11 @@ from app.schemas.questionnaire_sources import (
     QuestionnaireConflictResolution,
     QuestionnaireMergeCandidate,
     QuestionnaireSourceConflict,
+    QuestionnaireSourceResult,
     QuestionnaireSourceValue,
 )
 from app.schemas.research_assets import (
+    MediaType,
     ProcessingStatus,
     ResearchAssetCollection,
 )
@@ -24,10 +30,19 @@ from app.services.questionnaire_source_service import (
     QuestionnaireSourceScopeError,
     QuestionnaireSourceSelectionRequiredError,
     QuestionnaireSourceUnavailableError,
+    import_questionnaire_snapshot_package,
+    load_questionnaire_source_snapshot,
     resolve_questionnaire_sources,
     save_questionnaire_source_result,
+    save_questionnaire_source_snapshot,
 )
-from app.storage.research_assets import ResearchAssetBundle
+from app.storage.research_assets import (
+    FileResearchAssetStorage,
+    ResearchAssetBundle,
+    SnapshotConflictError,
+    SnapshotPackageError,
+    build_snapshot_package,
+)
 
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "research_assets"
@@ -57,6 +72,58 @@ def _candidate(
         collection=bundle.collection,
         status=status,
     )
+
+
+def _result_with_media() -> tuple[QuestionnaireSourceResult, dict[str, bytes]]:
+    bundle = _bundle("google_forms.json")
+    media: dict[str, bytes] = {}
+    assets = []
+    for index, asset in enumerate(bundle.collection.assets):
+        if asset.media_type == MediaType.IMAGE:
+            content = f"questionnaire-snapshot-image-{index}".encode("utf-8")
+            content_hash = hashlib.sha256(content).hexdigest()
+            media[content_hash] = content
+            asset = asset.model_copy(update={
+                "content_hash": content_hash,
+                "size_bytes": len(content),
+            })
+        assets.append(asset)
+    collection = bundle.collection.model_copy(update={"assets": assets})
+    candidate = QuestionnaireMergeCandidate(
+        source_id="src_google_demo",
+        source_mode=bundle.snapshot.source_mode,
+        priority=2,
+        snapshot=bundle.snapshot,
+        collection=collection,
+        status=ProcessingStatus.COMPLETED,
+    )
+    return (
+        resolve_questionnaire_sources(
+            [candidate],
+            owner_ref=collection.owner_ref,
+        ),
+        media,
+    )
+
+
+def _replace_zip_member(
+    archive: bytes,
+    member_name: str,
+    content: bytes,
+) -> bytes:
+    output = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(archive), "r") as source:
+        with zipfile.ZipFile(
+            output,
+            "w",
+            compression=zipfile.ZIP_DEFLATED,
+        ) as target:
+            for info in source.infolist():
+                target.writestr(
+                    info,
+                    content if info.filename == member_name else source.read(info),
+                )
+    return output.getvalue()
 
 
 class _RecordingStorage:
@@ -321,6 +388,147 @@ class QuestionnaireSourceServiceTests(unittest.TestCase):
         )
 
         self.assertTrue(result.partial_success)
+
+
+class QuestionnaireSnapshotPersistenceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory(
+            prefix="questionnaire-snapshot-service-test-"
+        )
+        self.storage = FileResearchAssetStorage(self.temporary.name)
+        self.result, self.media = _result_with_media()
+        self.owner_ref = self.result.collection.owner_ref
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def _archive(self) -> bytes:
+        return build_snapshot_package(
+            self.owner_ref,
+            ResearchAssetBundle(self.result.snapshot, self.result.collection),
+            self.media,
+        )
+
+    def test_save_and_load_round_trip_includes_media(self):
+        saved = save_questionnaire_source_snapshot(
+            self.result,
+            self.media,
+            self.storage,
+        )
+
+        loaded = load_questionnaire_source_snapshot(
+            self.owner_ref,
+            self.result.snapshot.snapshot_id,
+            self.storage,
+        )
+
+        self.assertEqual(saved.bundle.snapshot, self.result.snapshot)
+        self.assertEqual(saved.media, self.media)
+        self.assertEqual(loaded, saved)
+
+    def test_import_keeps_original_source_mode_and_provider_provenance(self):
+        original_sources = self.result.collection.sources
+
+        imported = import_questionnaire_snapshot_package(
+            self.owner_ref,
+            self._archive(),
+            self.storage,
+        )
+
+        self.assertEqual(
+            imported.bundle.snapshot.source_mode,
+            QuestionnaireSourceMode.OFFICIAL_API,
+        )
+        self.assertNotEqual(
+            imported.bundle.snapshot.source_mode,
+            QuestionnaireSourceMode.PLATFORM_SNAPSHOT,
+        )
+        self.assertEqual(
+            imported.bundle.snapshot.provider,
+            self.result.snapshot.provider,
+        )
+        self.assertEqual(imported.bundle.collection.sources, original_sources)
+        self.assertEqual(
+            load_questionnaire_source_snapshot(
+                self.owner_ref,
+                self.result.snapshot.snapshot_id,
+                self.storage,
+            ),
+            imported,
+        )
+
+    def test_import_rejects_wrong_owner_and_tampered_media(self):
+        archive = self._archive()
+        with self.assertRaisesRegex(SnapshotPackageError, "owner_ref"):
+            import_questionnaire_snapshot_package(
+                "another-owner",
+                archive,
+                self.storage,
+            )
+
+        media_hash = next(iter(self.media))
+        tampered = _replace_zip_member(
+            archive,
+            f"media/{media_hash}",
+            b"tampered",
+        )
+        with self.assertRaisesRegex(SnapshotPackageError, "哈希不一致"):
+            import_questionnaire_snapshot_package(
+                self.owner_ref,
+                tampered,
+                self.storage,
+            )
+
+        self.assertIsNone(
+            load_questionnaire_source_snapshot(
+                self.owner_ref,
+                self.result.snapshot.snapshot_id,
+                self.storage,
+            )
+        )
+
+    def test_repeated_import_of_identical_package_is_idempotent(self):
+        archive = self._archive()
+
+        first = import_questionnaire_snapshot_package(
+            self.owner_ref,
+            archive,
+            self.storage,
+        )
+        second = import_questionnaire_snapshot_package(
+            self.owner_ref,
+            archive,
+            self.storage,
+        )
+
+        self.assertEqual(second, first)
+        self.assertEqual(
+            load_questionnaire_source_snapshot(
+                self.owner_ref,
+                self.result.snapshot.snapshot_id,
+                self.storage,
+            ),
+            first,
+        )
+
+    def test_same_snapshot_id_with_different_content_propagates_conflict(self):
+        save_questionnaire_source_snapshot(
+            self.result,
+            self.media,
+            self.storage,
+        )
+        changed_result = self.result.model_copy(update={
+            "snapshot": self.result.snapshot.model_copy(update={
+                "title": "same ID, different content",
+            }),
+        })
+
+        with self.assertRaises(SnapshotConflictError):
+            save_questionnaire_source_snapshot(
+                changed_result,
+                self.media,
+                self.storage,
+            )
 
 
 class QuestionnaireSourceContractTests(unittest.TestCase):

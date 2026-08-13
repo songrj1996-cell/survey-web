@@ -15,6 +15,8 @@ import stat
 import tempfile
 import threading
 from collections.abc import Mapping
+from contextlib import contextmanager
+import fcntl
 from typing import Any, NamedTuple, Protocol, runtime_checkable
 import zipfile
 
@@ -43,6 +45,10 @@ _MANIFEST_PATH = "manifest.json"
 
 class ResearchAssetStorageError(RuntimeError):
     """快照持久化内容无效、损坏或无法安全读写。"""
+
+
+class SnapshotConflictError(ResearchAssetStorageError):
+    """同一 owner 与 snapshot_id 已存在不同的不可变快照内容。"""
 
 
 class SnapshotPackageError(ResearchAssetStorageError):
@@ -82,6 +88,25 @@ class ResearchAssetStorage(Protocol):
         self,
         owner_ref: str,
         bundle: ResearchAssetBundle,
+    ) -> None:
+        ...
+
+
+@runtime_checkable
+class ResearchSnapshotStorage(Protocol):
+    """按用户隔离、以确定性 ZIP 单文件保存完整离线快照的端口。"""
+
+    def load_snapshot_package(
+        self,
+        owner_ref: str,
+        snapshot_id: str,
+    ) -> SnapshotPackage | None:
+        ...
+
+    def save_snapshot_package(
+        self,
+        owner_ref: str,
+        package: SnapshotPackage,
     ) -> None:
         ...
 
@@ -202,7 +227,10 @@ def _identity_hash(value: str) -> str:
 
 
 class FileResearchAssetStorage:
-    """显式根目录下、按 owner 隔离的单文件原子 Bundle 存储。"""
+    """显式根目录下、按 owner 隔离的不可变 Bundle 与 ZIP 快照存储。"""
+
+    _locks_guard = threading.Lock()
+    _root_locks: dict[Path, threading.RLock] = {}
 
     def __init__(self, root: str | os.PathLike[str]):
         if root is None:
@@ -211,7 +239,11 @@ class FileResearchAssetStorage:
         if not isinstance(raw_root, str) or not raw_root.strip():
             raise ValueError("root 必须是非空路径")
         self._root = Path(raw_root).absolute()
-        self._lock = threading.RLock()
+        with self._locks_guard:
+            self._lock = self._root_locks.setdefault(
+                self._root,
+                threading.RLock(),
+            )
 
     @property
     def root(self) -> Path:
@@ -230,35 +262,88 @@ class FileResearchAssetStorage:
         )
         return self._root / _identity_hash(owner) / f"{_identity_hash(snapshot)}.json"
 
-    def load_bundle(
-        self,
-        owner_ref: str,
-        snapshot_id: str,
-    ) -> ResearchAssetBundle | None:
+    def _package_path(self, owner_ref: str, snapshot_id: str) -> Path:
         owner = _require_nonblank(
             owner_ref,
             "owner_ref",
             ResearchAssetStorageError,
         )
-        requested_snapshot_id = _require_stable_id(
+        snapshot = _require_stable_id(
             snapshot_id,
             "snapshot_id",
             ResearchAssetStorageError,
         )
-        target = self._bundle_path(owner, requested_snapshot_id)
-        with self._lock:
-            try:
-                size = target.stat().st_size
-            except FileNotFoundError:
-                return None
-            except OSError as error:
-                raise ResearchAssetStorageError("快照文件状态读取失败") from error
-            if size > _MAX_STORED_BUNDLE_BYTES:
-                raise ResearchAssetStorageError("快照文件超过安全读取上限")
-            try:
-                content = target.read_bytes()
-            except OSError as error:
-                raise ResearchAssetStorageError("快照文件读取失败") from error
+        return self._root / _identity_hash(owner) / f"{_identity_hash(snapshot)}.zip"
+
+    def _lock_path(self, owner_ref: str, snapshot_id: str) -> Path:
+        owner = _require_nonblank(
+            owner_ref,
+            "owner_ref",
+            ResearchAssetStorageError,
+        )
+        snapshot = _require_stable_id(
+            snapshot_id,
+            "snapshot_id",
+            ResearchAssetStorageError,
+        )
+        return (
+            self._root
+            / _identity_hash(owner)
+            / f".{_identity_hash(snapshot)}.lock"
+        )
+
+    @staticmethod
+    def _bundle_identity(bundle: ResearchAssetBundle) -> bytes:
+        return _canonical_bytes(_bundle_value(bundle))
+
+    @classmethod
+    def _same_bundle(
+        cls,
+        first: ResearchAssetBundle,
+        second: ResearchAssetBundle,
+    ) -> bool:
+        return cls._bundle_identity(first) == cls._bundle_identity(second)
+
+    @classmethod
+    def _same_package(
+        cls,
+        first: SnapshotPackage,
+        second: SnapshotPackage,
+    ) -> bool:
+        return cls._same_bundle(first.bundle, second.bundle) and first.media == second.media
+
+    @staticmethod
+    def _read_bytes(
+        target: Path,
+        *,
+        max_bytes: int,
+        label: str,
+    ) -> bytes | None:
+        try:
+            size = target.stat().st_size
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            raise ResearchAssetStorageError(f"{label}状态读取失败") from error
+        if size > max_bytes:
+            raise ResearchAssetStorageError(f"{label}超过安全读取上限")
+        try:
+            return target.read_bytes()
+        except OSError as error:
+            raise ResearchAssetStorageError(f"{label}读取失败") from error
+
+    def _load_bundle_file(
+        self,
+        owner: str,
+        snapshot_id: str,
+    ) -> ResearchAssetBundle | None:
+        content = self._read_bytes(
+            self._bundle_path(owner, snapshot_id),
+            max_bytes=_MAX_STORED_BUNDLE_BYTES,
+            label="快照文件",
+        )
+        if content is None:
+            return None
 
         envelope = _require_exact_keys(
             _load_json_bytes(
@@ -283,7 +368,7 @@ class FileResearchAssetStorage:
             raise ResearchAssetStorageError("快照存储版本不受支持")
         if envelope["owner_ref"] != owner:
             raise ResearchAssetStorageError("快照 owner_ref 与读取范围不一致")
-        if envelope["snapshot_id"] != requested_snapshot_id:
+        if envelope["snapshot_id"] != snapshot_id:
             raise ResearchAssetStorageError("快照 ID 与读取路径不一致")
         bundle_content = _canonical_bytes(envelope["bundle"])
         if envelope["bundle_sha256"] != _sha256(bundle_content):
@@ -295,9 +380,58 @@ class FileResearchAssetStorage:
             ResearchAssetStorageError,
         )
         _validated_bundle(owner, bundle, ResearchAssetStorageError)
-        if bundle.snapshot.snapshot_id != requested_snapshot_id:
+        if bundle.snapshot.snapshot_id != snapshot_id:
             raise ResearchAssetStorageError("bundle.snapshot_id 与读取范围不一致")
         return bundle
+
+    def _load_package_file(
+        self,
+        owner: str,
+        snapshot_id: str,
+    ) -> SnapshotPackage | None:
+        content = self._read_bytes(
+            self._package_path(owner, snapshot_id),
+            max_bytes=SNAPSHOT_PACKAGE_MAX_ARCHIVE_BYTES,
+            label="快照包文件",
+        )
+        if content is None:
+            return None
+        package = parse_snapshot_package(owner, content)
+        if package.bundle.snapshot.snapshot_id != snapshot_id:
+            raise SnapshotPackageError("快照包 snapshot_id 与读取路径不一致")
+        return package
+
+    def load_bundle(
+        self,
+        owner_ref: str,
+        snapshot_id: str,
+    ) -> ResearchAssetBundle | None:
+        owner = _require_nonblank(
+            owner_ref,
+            "owner_ref",
+            ResearchAssetStorageError,
+        )
+        requested_snapshot_id = _require_stable_id(
+            snapshot_id,
+            "snapshot_id",
+            ResearchAssetStorageError,
+        )
+        with self._lock, self._exclusive_snapshot(owner, requested_snapshot_id):
+            bundle = self._load_bundle_file(owner, requested_snapshot_id)
+            package = self._load_package_file(owner, requested_snapshot_id)
+            if (
+                bundle is not None
+                and package is not None
+                and not self._same_bundle(bundle, package.bundle)
+            ):
+                raise SnapshotConflictError(
+                    "同一 owner_ref 与 snapshot_id 的 bundle 和快照包内容冲突"
+                )
+            if bundle is not None:
+                return bundle
+            if package is not None:
+                return package.bundle
+            return None
 
     def save_bundle(
         self,
@@ -324,35 +458,132 @@ class FileResearchAssetStorage:
         if len(content) > _MAX_STORED_BUNDLE_BYTES:
             raise ResearchAssetStorageError("快照文件超过安全保存上限")
 
-        with self._lock:
-            try:
-                target.parent.mkdir(parents=True, exist_ok=True)
-            except OSError as error:
-                raise ResearchAssetStorageError("快照目录创建失败") from error
-            try:
-                descriptor, temporary_path = tempfile.mkstemp(
-                    dir=target.parent,
-                    prefix=f".{target.name}.",
-                    suffix=".tmp",
+        with self._lock, self._exclusive_snapshot(owner, snapshot_id):
+            package = self._load_package_file(owner, snapshot_id)
+            if package is not None and not self._same_bundle(bundle, package.bundle):
+                raise SnapshotConflictError(
+                    "同一 owner_ref 与 snapshot_id 已存在不同 bundle 的快照包"
                 )
-            except OSError as error:
-                raise ResearchAssetStorageError("快照临时文件创建失败") from error
+            stored_bundle = self._load_bundle_file(owner, snapshot_id)
+            if stored_bundle is not None:
+                if self._same_bundle(bundle, stored_bundle):
+                    return
+                raise SnapshotConflictError(
+                    "同一 owner_ref 与 snapshot_id 已存在不同 bundle"
+                )
+            self._atomic_write(target, content, "快照")
+
+    def load_snapshot_package(
+        self,
+        owner_ref: str,
+        snapshot_id: str,
+    ) -> SnapshotPackage | None:
+        owner = _require_nonblank(
+            owner_ref,
+            "owner_ref",
+            ResearchAssetStorageError,
+        )
+        requested_snapshot_id = _require_stable_id(
+            snapshot_id,
+            "snapshot_id",
+            ResearchAssetStorageError,
+        )
+        with self._lock, self._exclusive_snapshot(owner, requested_snapshot_id):
+            package = self._load_package_file(owner, requested_snapshot_id)
+            if package is None:
+                return None
+            bundle = self._load_bundle_file(owner, requested_snapshot_id)
+            if bundle is not None and not self._same_bundle(bundle, package.bundle):
+                raise SnapshotConflictError(
+                    "同一 owner_ref 与 snapshot_id 的 bundle 和快照包内容冲突"
+                )
+            return package
+
+    def save_snapshot_package(
+        self,
+        owner_ref: str,
+        package: SnapshotPackage,
+    ) -> None:
+        if not isinstance(package, SnapshotPackage):
+            raise SnapshotPackageError("package 类型无效")
+        content = build_snapshot_package(owner_ref, package.bundle, package.media)
+        normalized = parse_snapshot_package(owner_ref, content)
+        owner = normalized.bundle.collection.owner_ref
+        snapshot_id = normalized.bundle.snapshot.snapshot_id
+        target = self._package_path(owner, snapshot_id)
+
+        with self._lock, self._exclusive_snapshot(owner, snapshot_id):
+            bundle = self._load_bundle_file(owner, snapshot_id)
+            if bundle is not None and not self._same_bundle(bundle, normalized.bundle):
+                raise SnapshotConflictError(
+                    "同一 owner_ref 与 snapshot_id 已存在不同 bundle"
+                )
+            stored_package = self._load_package_file(owner, snapshot_id)
+            if stored_package is not None:
+                if self._same_package(normalized, stored_package):
+                    return
+                raise SnapshotConflictError(
+                    "同一 owner_ref 与 snapshot_id 已存在不同快照包内容"
+                )
+            self._atomic_write(target, content, "快照包")
+
+    @contextmanager
+    def _exclusive_snapshot(self, owner_ref: str, snapshot_id: str):
+        lock_path = self._lock_path(owner_ref, snapshot_id)
+        try:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            descriptor = os.open(
+                lock_path,
+                os.O_CREAT | os.O_RDWR,
+                0o600,
+            )
+        except OSError as error:
+            raise ResearchAssetStorageError("快照进程锁创建失败") from error
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+        except OSError as error:
+            os.close(descriptor)
+            raise ResearchAssetStorageError("快照进程锁获取失败") from error
+        try:
+            yield
+        finally:
             try:
-                with os.fdopen(descriptor, "wb") as temporary:
-                    temporary.write(content)
-                    temporary.flush()
-                    os.fsync(temporary.fileno())
-                os.replace(temporary_path, target)
-                temporary_path = ""
-                self._fsync_directory(target.parent)
-            except OSError as error:
-                raise ResearchAssetStorageError("快照原子保存失败") from error
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            except OSError:
+                pass
             finally:
-                if temporary_path:
-                    try:
-                        os.unlink(temporary_path)
-                    except FileNotFoundError:
-                        pass
+                os.close(descriptor)
+
+    @classmethod
+    def _atomic_write(cls, target: Path, content: bytes, label: str) -> None:
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            raise ResearchAssetStorageError(f"{label}目录创建失败") from error
+        try:
+            descriptor, temporary_path = tempfile.mkstemp(
+                dir=target.parent,
+                prefix=f".{target.name}.",
+                suffix=".tmp",
+            )
+        except OSError as error:
+            raise ResearchAssetStorageError(f"{label}临时文件创建失败") from error
+        try:
+            with os.fdopen(descriptor, "wb") as temporary:
+                temporary.write(content)
+                temporary.flush()
+                os.fsync(temporary.fileno())
+            os.replace(temporary_path, target)
+            temporary_path = ""
+            cls._fsync_directory(target.parent)
+        except OSError as error:
+            raise ResearchAssetStorageError(f"{label}原子保存失败") from error
+        finally:
+            if temporary_path:
+                try:
+                    os.unlink(temporary_path)
+                except FileNotFoundError:
+                    pass
 
     @staticmethod
     def _fsync_directory(directory: Path) -> None:
