@@ -1,8 +1,8 @@
 """问卷快照上传与查询接口的安全响应契约。"""
 
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import Field
+from pydantic import Field, StringConstraints
 
 from app.schemas.questionnaire import (
     CollectionState,
@@ -10,6 +10,23 @@ from app.schemas.questionnaire import (
     QuestionnaireSourceMode,
 )
 from app.schemas.research_assets import ContractModel, Provider
+
+
+GoogleFormId = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=1,
+        max_length=256,
+        pattern=r"^[A-Za-z0-9_-]+$",
+    ),
+]
+
+
+class GoogleFormsSnapshotImportRequest(ContractModel):
+    """Google Forms 授权导入请求；授权信息只来自服务端连接。"""
+
+    form_id: GoogleFormId
 
 
 class QuestionnaireSnapshotSummary(ContractModel):

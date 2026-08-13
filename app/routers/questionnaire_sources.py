@@ -2,15 +2,21 @@
 
 import asyncio
 from collections.abc import AsyncIterator
+import json
 
 from fastapi import APIRouter, HTTPException, Request
 from multipart.exceptions import MultipartParseError
+from pydantic import ValidationError
 from starlette.datastructures import FormData, UploadFile
 from starlette.formparsers import MultiPartException, MultiPartParser
+from starlette.requests import ClientDisconnect
 from starlette.responses import StreamingResponse
 
 from app.core.security import _owner_from_login
-from app.schemas.questionnaire_source_api import QuestionnaireSnapshotSummary
+from app.schemas.questionnaire_source_api import (
+    GoogleFormsSnapshotImportRequest,
+    QuestionnaireSnapshotSummary,
+)
 from app.services.auth import _require_feature
 from app.services.bested_questionnaire_snapshot_api import (
     MAX_BESTED_QUESTIONNAIRE_UPLOAD_BYTES,
@@ -18,6 +24,17 @@ from app.services.bested_questionnaire_snapshot_api import (
     BestedQuestionnaireInternalError,
     BestedQuestionnaireInvalidError,
     BestedQuestionnaireSnapshotApi,
+)
+from app.services.google_forms_snapshot_api import (
+    GoogleFormsQuestionnaireAuthRequiredError,
+    GoogleFormsQuestionnaireConflictError,
+    GoogleFormsQuestionnaireInternalError,
+    GoogleFormsQuestionnaireInvalidError,
+    GoogleFormsQuestionnaireNotFoundError,
+    GoogleFormsQuestionnairePermissionError,
+    GoogleFormsQuestionnaireProviderError,
+    GoogleFormsQuestionnaireRetryableError,
+    GoogleFormsQuestionnaireSnapshotApi,
 )
 from app.services.questionnaire_snapshot_api import (
     MAX_SNAPSHOT_UPLOAD_BYTES,
@@ -38,10 +55,18 @@ _MAX_CONCURRENT_DOWNLOADS = 1
 _MAX_CONCURRENT_BESTED_IMPORTS = 1
 _MAX_CONCURRENT_BESTED_UPLOADS = 1
 _BESTED_UPLOAD_TIMEOUT_SECONDS = 120.0
+_MAX_CONCURRENT_GOOGLE_IMPORTS = 1
+_GOOGLE_REQUEST_MAX_BYTES = 4 * 1024
+_GOOGLE_REQUEST_TIMEOUT_SECONDS = 15.0
+_GOOGLE_IMPORT_TIMEOUT_SECONDS = 180.0
 
 
 class _SnapshotRequestTooLarge(MultiPartException):
     """multipart 请求在解析阶段超过总字节上限。"""
+
+
+class _DuplicateJsonKey(ValueError):
+    """JSON 请求不能依赖重复键的解析器覆盖顺序。"""
 
 
 class _DownloadLease:
@@ -166,6 +191,144 @@ def _raise_bested_http_error(error: Exception) -> None:
         status_code=500,
         detail="倍市得问卷导入暂时不可用",
     ) from error
+
+
+def _raise_google_http_error(error: Exception) -> None:
+    if isinstance(error, GoogleFormsQuestionnaireInvalidError):
+        raise HTTPException(
+            status_code=422,
+            detail="Google Forms 问卷 ID 无效",
+        ) from error
+    if isinstance(error, GoogleFormsQuestionnaireAuthRequiredError):
+        raise HTTPException(
+            status_code=401,
+            detail="请连接或重新授权 Google Forms",
+        ) from error
+    if isinstance(error, GoogleFormsQuestionnairePermissionError):
+        raise HTTPException(
+            status_code=403,
+            detail="当前 Google 账号无权读取该问卷",
+        ) from error
+    if isinstance(error, GoogleFormsQuestionnaireNotFoundError):
+        raise HTTPException(
+            status_code=404,
+            detail="Google Forms 问卷不存在",
+        ) from error
+    if isinstance(error, GoogleFormsQuestionnaireRetryableError):
+        raise HTTPException(
+            status_code=503,
+            detail="Google Forms 暂时不可用，请稍后重试",
+        ) from error
+    if isinstance(error, GoogleFormsQuestionnaireProviderError):
+        raise HTTPException(
+            status_code=502,
+            detail="Google Forms 返回了无法处理的问卷数据",
+        ) from error
+    if isinstance(error, GoogleFormsQuestionnaireConflictError):
+        raise HTTPException(
+            status_code=409,
+            detail="同一 Google Forms 快照 ID 已存在不同内容",
+        ) from error
+    if isinstance(error, GoogleFormsQuestionnaireInternalError):
+        raise HTTPException(
+            status_code=500,
+            detail="Google Forms 问卷导入暂时不可用",
+        ) from error
+    raise HTTPException(
+        status_code=500,
+        detail="Google Forms 问卷导入暂时不可用",
+    ) from error
+
+
+def _reject_duplicate_json_keys(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise _DuplicateJsonKey()
+        result[key] = value
+    return result
+
+
+async def _read_google_request_body(request: Request) -> bytes:
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared_length = int(content_length)
+        except ValueError as error:
+            raise HTTPException(
+                status_code=422,
+                detail="Google Forms 导入请求无效",
+            ) from error
+        if declared_length < 0:
+            raise HTTPException(
+                status_code=422,
+                detail="Google Forms 导入请求无效",
+            )
+        if declared_length > _GOOGLE_REQUEST_MAX_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail="Google Forms 导入请求超过大小限制",
+            )
+
+    content = bytearray()
+    try:
+        async for chunk in request.stream():
+            content.extend(chunk)
+            if len(content) > _GOOGLE_REQUEST_MAX_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail="Google Forms 导入请求超过大小限制",
+                )
+    except HTTPException:
+        raise
+    except ClientDisconnect as error:
+        raise HTTPException(
+            status_code=400,
+            detail="Google Forms 导入请求未完整发送",
+        ) from error
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail="Google Forms 问卷导入暂时不可用",
+        ) from error
+    return bytes(content)
+
+
+async def _parse_google_request(
+    request: Request,
+) -> GoogleFormsSnapshotImportRequest:
+    media_type = request.headers.get("content-type", "").split(";", 1)[0]
+    if media_type.strip().casefold() != "application/json":
+        raise HTTPException(
+            status_code=415,
+            detail="Google Forms 导入请求必须使用 JSON",
+        )
+    content = await _read_google_request_body(request)
+    if not content:
+        raise HTTPException(
+            status_code=422,
+            detail="Google Forms 导入请求不能为空",
+        )
+    try:
+        value = json.loads(
+            content.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_json_keys,
+        )
+        return GoogleFormsSnapshotImportRequest.model_validate(value)
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        _DuplicateJsonKey,
+        ValidationError,
+    ) as error:
+        raise HTTPException(
+            status_code=422,
+            detail="Google Forms 导入请求无效",
+        ) from error
 
 
 async def _bounded_request_stream(
@@ -517,5 +680,84 @@ def create_bested_questionnaire_sources_router(
                 upload_lease.release()
                 if import_lease is not None and not release_deferred:
                     import_lease.release()
+
+    return router
+
+
+def create_google_forms_questionnaire_sources_router(
+    api: GoogleFormsQuestionnaireSnapshotApi,
+) -> APIRouter:
+    """创建 Google Forms 授权读取并保存完整快照的独立路由。"""
+    if not isinstance(api, GoogleFormsQuestionnaireSnapshotApi):
+        raise TypeError("api 必须是 GoogleFormsQuestionnaireSnapshotApi")
+
+    router = APIRouter()
+    import_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_GOOGLE_IMPORTS)
+
+    @router.post(
+        "/api/questionnaire-sources/google-forms/snapshots",
+        response_model=QuestionnaireSnapshotSummary,
+    )
+    async def import_google_forms_questionnaire(
+        request: Request,
+    ) -> QuestionnaireSnapshotSummary:
+        login = await _require_feature(request, "survey")
+        owner_ref = _owner_key(login)
+        if import_semaphore.locked():
+            raise HTTPException(
+                status_code=429,
+                detail="已有 Google Forms 问卷正在导入，请稍后重试",
+            )
+        await import_semaphore.acquire()
+        lease = _DownloadLease(import_semaphore)
+        release_deferred = False
+        try:
+            try:
+                payload = await asyncio.wait_for(
+                    _parse_google_request(request),
+                    timeout=_GOOGLE_REQUEST_TIMEOUT_SECONDS,
+                )
+            except TimeoutError as error:
+                raise HTTPException(
+                    status_code=408,
+                    detail="Google Forms 导入请求发送超时，请重试",
+                ) from error
+
+            import_task = asyncio.create_task(
+                api.import_questionnaire(owner_ref, payload.form_id)
+            )
+            try:
+                return await asyncio.wait_for(
+                    asyncio.shield(import_task),
+                    timeout=_GOOGLE_IMPORT_TIMEOUT_SECONDS,
+                )
+            except TimeoutError as error:
+                release_deferred = True
+                import_task.cancel()
+                if import_task.done():
+                    _release_after_task(import_task, lease)
+                else:
+                    import_task.add_done_callback(
+                        lambda task: _release_after_task(task, lease)
+                    )
+                raise HTTPException(
+                    status_code=504,
+                    detail="Google Forms 问卷导入超时，请稍后重试",
+                ) from error
+            except asyncio.CancelledError:
+                release_deferred = True
+                if import_task.done():
+                    _release_after_task(import_task, lease)
+                else:
+                    import_task.add_done_callback(
+                        lambda task: _release_after_task(task, lease)
+                    )
+                raise
+            except Exception as error:
+                _raise_google_http_error(error)
+                raise AssertionError("unreachable")
+        finally:
+            if not release_deferred:
+                lease.release()
 
     return router
