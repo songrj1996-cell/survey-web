@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.core.config import COOKIE_NAME, FEISHU_LOGIN_REQUIRED
+from app.core.config import COOKIE_NAME, FEISHU_LOGIN_REQUIRED, INTERVIEW_V2_ENABLED
 from app.core.security import _forbidden_response, _is_public_path, _safe_next_path, _unauthorized_response
 from app.services.auth import _current_login, _login_allowed
 from app.storage.sessions import _sweep_old_sessions
@@ -80,3 +80,8 @@ app.include_router(export.router)
 app.include_router(comment_analysis.router)
 app.include_router(annotate.router)
 app.include_router(interview.router)
+
+if INTERVIEW_V2_ENABLED:
+    from app.routers import interview_v2
+
+    app.include_router(interview_v2.router)
