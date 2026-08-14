@@ -63,7 +63,7 @@ class ResearchAssetBundle(NamedTuple):
 
 
 class SnapshotPackage(NamedTuple):
-    """已校验的快照聚合与按内容哈希索引的图片字节。"""
+    """已校验的快照聚合与按内容哈希索引的媒体字节。"""
 
     bundle: ResearchAssetBundle
     media: dict[str, bytes]
@@ -609,30 +609,49 @@ def _require_sha256(
     return value
 
 
-def _image_media_requirements(
+_SNAPSHOT_MEDIA_TYPES = frozenset({MediaType.IMAGE, MediaType.DOCUMENT})
+
+
+def _snapshot_media_labels(media_types: set[MediaType]) -> tuple[str, str]:
+    if media_types == {MediaType.IMAGE}:
+        return "图片素材", "图片"
+    if media_types == {MediaType.DOCUMENT}:
+        return "文档素材", "文档"
+    return "图片或文档素材", "媒体"
+
+
+def _snapshot_media_requirements(
     collection: ResearchAssetCollection,
-) -> dict[str, set[int]]:
+) -> tuple[dict[str, set[int]], str]:
     requirements: dict[str, set[int]] = {}
+    media_types: set[MediaType] = set()
     for asset in collection.assets:
-        if asset.media_type != MediaType.IMAGE:
+        if asset.media_type not in _SNAPSHOT_MEDIA_TYPES:
             continue
+        media_types.add(asset.media_type)
+        asset_label = (
+            "图片素材"
+            if asset.media_type == MediaType.IMAGE
+            else "文档素材"
+        )
         if asset.content_hash is None:
             raise SnapshotPackageError(
-                f"图片素材 {asset.asset_id} 缺少 content_hash"
+                f"{asset_label} {asset.asset_id} 缺少 content_hash"
             )
         content_hash = _require_sha256(
             asset.content_hash,
-            f"图片素材 {asset.asset_id} 的 content_hash",
+            f"{asset_label} {asset.asset_id} 的 content_hash",
         )
         sizes = requirements.setdefault(content_hash, set())
         if asset.size_bytes is not None:
             sizes.add(asset.size_bytes)
+    media_label, hash_label = _snapshot_media_labels(media_types)
     for content_hash, sizes in requirements.items():
         if len(sizes) > 1:
             raise SnapshotPackageError(
-                f"同一图片哈希 {content_hash} 的 size_bytes 不一致"
+                f"同一{hash_label}哈希 {content_hash} 的 size_bytes 不一致"
             )
-    return requirements
+    return requirements, media_label
 
 
 def _validated_media(
@@ -641,7 +660,7 @@ def _validated_media(
 ) -> dict[str, bytes]:
     if not isinstance(media, Mapping):
         raise SnapshotPackageError("media 必须是按内容哈希索引的映射")
-    requirements = _image_media_requirements(collection)
+    requirements, media_label = _snapshot_media_requirements(collection)
     normalized: dict[str, bytes] = {}
     for raw_hash, raw_content in media.items():
         content_hash = _require_sha256(raw_hash, "media key")
@@ -660,12 +679,13 @@ def _validated_media(
     unexpected = provided_hashes - expected_hashes
     if unexpected:
         raise SnapshotPackageError(
-            "快照包含未被图片素材引用的媒体：" + "、".join(sorted(unexpected))
+            f"快照包含未被{media_label}引用的媒体："
+            + "、".join(sorted(unexpected))
         )
     missing = expected_hashes - provided_hashes
     if missing:
         raise SnapshotPackageError(
-            "快照缺少图片素材媒体：" + "、".join(sorted(missing))
+            f"快照缺少{media_label}媒体：" + "、".join(sorted(missing))
         )
     for content_hash, sizes in requirements.items():
         if sizes and len(normalized[content_hash]) not in sizes:
@@ -691,7 +711,7 @@ def build_snapshot_package(
     bundle: ResearchAssetBundle,
     media: Mapping[str, bytes],
 ) -> bytes:
-    """创建内容哈希命名的 API JSON + 图片 ZIP 快照包。"""
+    """创建内容哈希命名的 API JSON + 媒体 ZIP 快照包。"""
     owner = _validated_bundle(owner_ref, bundle, SnapshotPackageError)
     normalized_media = _validated_media(bundle.collection, media)
     bundle_content = _canonical_bytes(_bundle_value(bundle))
@@ -822,7 +842,7 @@ def parse_snapshot_package(
     owner_ref: str,
     package: bytes,
 ) -> SnapshotPackage:
-    """安全解析并校验 API JSON + 图片 ZIP 快照包。"""
+    """安全解析并校验 API JSON + 媒体 ZIP 快照包。"""
     owner = _require_nonblank(owner_ref, "owner_ref", SnapshotPackageError)
     if not isinstance(package, bytes):
         raise SnapshotPackageError("package 必须是 bytes")

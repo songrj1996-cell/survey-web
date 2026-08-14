@@ -50,6 +50,40 @@ def _bundle_with_media() -> tuple[ResearchAssetBundle, dict[str, bytes]]:
     return ResearchAssetBundle(snapshot, collection), media
 
 
+def _bundle_with_image_and_document_media() -> tuple[
+    ResearchAssetBundle,
+    dict[str, bytes],
+    str,
+]:
+    bundle, media = _bundle_with_media()
+    document_content = (
+        b"%PDF-1.4\n"
+        b"1 0 obj<</Type/Catalog>>endobj\n"
+        b"trailer<</Root 1 0 R>>\n%%EOF\n"
+    )
+    document_hash = hashlib.sha256(document_content).hexdigest()
+    image_asset = next(
+        asset
+        for asset in bundle.collection.assets
+        if asset.media_type == MediaType.IMAGE
+    )
+    document_asset = image_asset.model_copy(update={
+        "asset_id": "asset_offline_research_document",
+        "media_type": MediaType.DOCUMENT,
+        "mime_type": "application/pdf",
+        "filename": "research-material.pdf",
+        "display_name": "离线研究文档",
+        "provider_resource_id": "fixture-research-document",
+        "size_bytes": len(document_content),
+        "content_hash": document_hash,
+    })
+    assets = [*bundle.collection.assets, document_asset]
+    collection = bundle.collection.model_copy(update={"assets": assets})
+    snapshot = bundle.snapshot.model_copy(update={"asset_count": len(assets)})
+    media[document_hash] = document_content
+    return ResearchAssetBundle(snapshot, collection), media, document_hash
+
+
 def _rewrite_zip(
     package: bytes,
     *,
@@ -86,6 +120,37 @@ def _package_with_different_media(
     collection = bundle.collection.model_copy(update={"assets": assets})
     replacement_media = dict(media)
     replacement_media.pop(original_hash)
+    replacement_media[replacement_hash] = replacement_content
+    return SnapshotPackage(
+        ResearchAssetBundle(bundle.snapshot, collection),
+        replacement_media,
+    )
+
+
+def _package_with_different_document_media(
+    bundle: ResearchAssetBundle,
+    media: dict[str, bytes],
+) -> SnapshotPackage:
+    document_asset = next(
+        asset
+        for asset in bundle.collection.assets
+        if asset.media_type == MediaType.DOCUMENT
+    )
+    assert document_asset.content_hash is not None
+    replacement_content = b"%PDF-1.4\n%different-document\n%%EOF\n"
+    replacement_hash = hashlib.sha256(replacement_content).hexdigest()
+    assets = [
+        asset.model_copy(update={
+            "content_hash": replacement_hash,
+            "size_bytes": len(replacement_content),
+        })
+        if asset.asset_id == document_asset.asset_id
+        else asset
+        for asset in bundle.collection.assets
+    ]
+    collection = bundle.collection.model_copy(update={"assets": assets})
+    replacement_media = dict(media)
+    replacement_media.pop(document_asset.content_hash)
     replacement_media[replacement_hash] = replacement_content
     return SnapshotPackage(
         ResearchAssetBundle(bundle.snapshot, collection),
@@ -330,7 +395,13 @@ class SnapshotPackageTests(unittest.TestCase):
             self.media,
         )
 
-    def test_package_round_trip_uses_content_hash_member_names(self):
+    def test_legacy_image_only_package_round_trip_uses_content_hash_member_names(self):
+        self.assertFalse(
+            any(
+                asset.media_type == MediaType.DOCUMENT
+                for asset in self.bundle.collection.assets
+            )
+        )
         self.assertEqual(
             build_snapshot_package(self.owner_ref, self.bundle, self.media),
             self.package,
@@ -348,6 +419,95 @@ class SnapshotPackageTests(unittest.TestCase):
                 {f"media/{content_hash}" for content_hash in self.media},
                 names - {"manifest.json", f"bundle/{bundle_hash}.json"},
             )
+
+    def test_image_and_document_media_round_trip_in_one_package(self):
+        bundle, media, document_hash = _bundle_with_image_and_document_media()
+
+        package = build_snapshot_package(self.owner_ref, bundle, media)
+        restored = parse_snapshot_package(self.owner_ref, package)
+
+        self.assertEqual(restored.bundle, bundle)
+        self.assertEqual(restored.media, media)
+        self.assertEqual(restored.media[document_hash], media[document_hash])
+        with zipfile.ZipFile(io.BytesIO(package), "r") as archive:
+            self.assertIn(f"media/{document_hash}", archive.namelist())
+
+    def test_build_requires_exact_document_media_closure(self):
+        bundle, media, document_hash = _bundle_with_image_and_document_media()
+        missing = dict(media)
+        missing.pop(document_hash)
+        with self.assertRaisesRegex(
+            SnapshotPackageError,
+            "缺少图片或文档素材媒体",
+        ):
+            build_snapshot_package(self.owner_ref, bundle, missing)
+
+        unrelated_content = b"unreferenced-document-bytes"
+        unrelated_hash = hashlib.sha256(unrelated_content).hexdigest()
+        with self.assertRaisesRegex(
+            SnapshotPackageError,
+            "未被图片或文档素材引用",
+        ):
+            build_snapshot_package(
+                self.owner_ref,
+                bundle,
+                {**media, unrelated_hash: unrelated_content},
+            )
+
+    def test_build_rejects_document_hash_or_declared_size_mismatch(self):
+        bundle, media, document_hash = _bundle_with_image_and_document_media()
+        with self.assertRaisesRegex(SnapshotPackageError, "内容哈希不一致"):
+            build_snapshot_package(
+                self.owner_ref,
+                bundle,
+                {**media, document_hash: b"tampered-document"},
+            )
+
+        assets = [
+            asset.model_copy(update={"size_bytes": asset.size_bytes + 1})
+            if asset.media_type == MediaType.DOCUMENT
+            and asset.size_bytes is not None
+            else asset
+            for asset in bundle.collection.assets
+        ]
+        wrong_size_bundle = ResearchAssetBundle(
+            bundle.snapshot,
+            bundle.collection.model_copy(update={"assets": assets}),
+        )
+        with self.assertRaisesRegex(SnapshotPackageError, "size_bytes 不一致"):
+            build_snapshot_package(self.owner_ref, wrong_size_bundle, media)
+
+    def test_parse_rejects_document_content_and_manifest_size_tampering(self):
+        bundle, media, document_hash = _bundle_with_image_and_document_media()
+        package = build_snapshot_package(self.owner_ref, bundle, media)
+        media_path = f"media/{document_hash}"
+        content_tampered = _rewrite_zip(
+            package,
+            replacements={media_path: b"tampered-document"},
+        )
+        with self.assertRaisesRegex(SnapshotPackageError, "哈希不一致"):
+            parse_snapshot_package(self.owner_ref, content_tampered)
+
+        with zipfile.ZipFile(io.BytesIO(package), "r") as archive:
+            manifest = json.loads(archive.read("manifest.json"))
+        document_entry = next(
+            entry
+            for entry in manifest["media"]
+            if entry["sha256"] == document_hash
+        )
+        document_entry["size"] += 1
+        manifest_tampered = _rewrite_zip(
+            package,
+            replacements={
+                "manifest.json": json.dumps(
+                    manifest,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            },
+        )
+        with self.assertRaisesRegex(SnapshotPackageError, "大小或内容哈希不一致"):
+            parse_snapshot_package(self.owner_ref, manifest_tampered)
 
     def test_build_rejects_missing_unreferenced_or_mismatched_media(self):
         missing = dict(self.media)
@@ -465,6 +625,45 @@ class FileResearchSnapshotStorageTests(unittest.TestCase):
         )
         self.assertNotIn(self.owner_ref, str(files[0]))
         self.assertNotIn(self.snapshot_id, str(files[0]))
+
+    def test_document_package_save_and_load_preserve_all_media(self):
+        bundle, media, document_hash = _bundle_with_image_and_document_media()
+        package = SnapshotPackage(bundle, media)
+
+        self.storage.save_snapshot_package(self.owner_ref, package)
+        restored = self.storage.load_snapshot_package(
+            self.owner_ref,
+            bundle.snapshot.snapshot_id,
+        )
+
+        self.assertEqual(restored, package)
+        assert restored is not None
+        self.assertEqual(restored.media[document_hash], media[document_hash])
+
+    def test_document_package_owner_isolation_and_immutable_conflict(self):
+        bundle, media, _ = _bundle_with_image_and_document_media()
+        package = SnapshotPackage(bundle, media)
+        self.storage.save_snapshot_package(self.owner_ref, package)
+
+        self.assertIsNone(
+            self.storage.load_snapshot_package(
+                "another-owner",
+                bundle.snapshot.snapshot_id,
+            )
+        )
+        with self.assertRaisesRegex(SnapshotPackageError, "owner_ref"):
+            self.storage.save_snapshot_package("another-owner", package)
+
+        different = _package_with_different_document_media(bundle, media)
+        with self.assertRaises(SnapshotConflictError):
+            self.storage.save_snapshot_package(self.owner_ref, different)
+        self.assertEqual(
+            self.storage.load_snapshot_package(
+                self.owner_ref,
+                bundle.snapshot.snapshot_id,
+            ),
+            package,
+        )
 
     def test_same_package_is_idempotent_without_replacing_file(self):
         self.storage.save_snapshot_package(self.owner_ref, self.package)
