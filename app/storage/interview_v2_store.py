@@ -7,8 +7,10 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -16,15 +18,23 @@ import tempfile
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 from app.core import config
 
 
 _STORE_LOCK = threading.RLock()
+_MAPPING_LOCK_TIMEOUT_SECONDS = 10.0
+_MAPPING_LOCK_POLL_SECONDS = 0.025
 _ID_RE = re.compile(
-    r"^(?:upload|job|project|import|workbook)_[0-9a-f]{32}$"
+    r"^(?:upload|job|project|import|workbook|mapping)_[0-9a-f]{32}$"
 )
 
 
@@ -606,3 +616,516 @@ def load_physical_snapshot(
     )
     with _STORE_LOCK:
         return _read_json(path)
+
+
+def load_project(project_id: str) -> dict[str, Any] | None:
+    project_id = validate_resource_id(project_id, "project")
+    with _STORE_LOCK:
+        return _read_json(
+            _safe_child("projects", project_id, "project.json")
+        )
+
+
+def load_mapping_input_bundle(import_id: str) -> dict[str, Any] | None:
+    """Load and cross-check one import's immutable Batch 2 inputs atomically."""
+
+    import_id = validate_resource_id(import_id, "import")
+    projects_dir = _safe_child("projects")
+    with _STORE_LOCK:
+        if not projects_dir.is_dir():
+            return None
+        for project_dir in projects_dir.iterdir():
+            if (
+                not project_dir.is_dir()
+                or not re.fullmatch(r"project_[0-9a-f]{32}", project_dir.name)
+            ):
+                continue
+            interview_import = _read_json(
+                project_dir / "imports" / f"{import_id}.json"
+            )
+            if interview_import is None:
+                continue
+            project = _read_json(project_dir / "project.json")
+            project_id = str(interview_import.get("project_id") or "")
+            workbook_revision_id = str(
+                interview_import.get("workbook_revision_id") or ""
+            )
+            validate_resource_id(project_id, "project")
+            validate_resource_id(workbook_revision_id, "workbook")
+            if project_id != project_dir.name or project is None:
+                raise ValueError("mapping input project mismatch")
+            workbook_dir = (
+                project_dir / "workbook_revisions" / workbook_revision_id
+            )
+            workbook_revision = _read_json(workbook_dir / "metadata.json")
+            physical_snapshot = _read_json(
+                workbook_dir / "physical_snapshot.json"
+            )
+            if workbook_revision is None or physical_snapshot is None:
+                raise ValueError("mapping input bundle is incomplete")
+            workbook_content_sha256 = str(
+                workbook_revision.get("content_sha256") or ""
+            )
+            snapshot_content_sha256 = str(
+                physical_snapshot.get("content_sha256") or ""
+            )
+            workbook_snapshot_version = str(
+                workbook_revision.get("physical_snapshot_version") or ""
+            )
+            snapshot_schema_version = str(
+                physical_snapshot.get("schema_version") or ""
+            )
+            snapshot_sha256 = str(
+                physical_snapshot.get("snapshot_sha256") or ""
+            )
+            calculated_snapshot_sha256 = physical_snapshot_sha256(
+                physical_snapshot
+            )
+            import_snapshot_version = str(
+                interview_import.get("physical_snapshot_version") or ""
+            )
+            if (
+                interview_import.get("import_id") != import_id
+                or project.get("project_id") != project_id
+                or workbook_revision.get("project_id") != project_id
+                or workbook_revision.get("workbook_revision_id")
+                != workbook_revision_id
+                or project.get("current_workbook_revision_id")
+                != workbook_revision_id
+                or project.get("current_import_id") != import_id
+                or str(workbook_revision.get("snapshot_sha256") or "")
+                != snapshot_sha256
+                or calculated_snapshot_sha256 != snapshot_sha256
+                or not re.fullmatch(r"[0-9a-f]{64}", snapshot_sha256)
+                or not re.fullmatch(r"[0-9a-f]{64}", workbook_content_sha256)
+                or not re.fullmatch(r"[0-9a-f]{64}", snapshot_content_sha256)
+                or workbook_content_sha256 != snapshot_content_sha256
+                or not workbook_snapshot_version
+                or not snapshot_schema_version
+                or not import_snapshot_version
+                or workbook_snapshot_version != snapshot_schema_version
+                or import_snapshot_version != snapshot_schema_version
+            ):
+                raise ValueError("mapping input bundle integrity check failed")
+            return {
+                "interview_import": interview_import,
+                "project": project,
+                "workbook_revision": workbook_revision,
+                "physical_snapshot": physical_snapshot,
+            }
+    return None
+
+
+def physical_snapshot_sha256(snapshot: dict[str, Any]) -> str:
+    """Recompute the canonical Batch 1 physical snapshot digest."""
+
+    payload = {
+        key: value
+        for key, value in snapshot.items()
+        if key not in {"original_filename", "snapshot_sha256"}
+    }
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _mapping_state_path(project_id: str) -> Path:
+    project_id = validate_resource_id(project_id, "project")
+    return _safe_child("projects", project_id, "mapping_state.json")
+
+
+def _mapping_revision_path(project_id: str, mapping_revision_id: str) -> Path:
+    project_id = validate_resource_id(project_id, "project")
+    mapping_revision_id = validate_resource_id(mapping_revision_id, "mapping")
+    return _safe_child(
+        "projects",
+        project_id,
+        "mapping_revisions",
+        f"{mapping_revision_id}.json",
+    )
+
+
+def mapping_revision_payload_sha256(revision: dict[str, Any]) -> str:
+    """Digest every immutable revision field except the digest itself."""
+
+    payload = {
+        key: value
+        for key, value in revision.items()
+        if key != "revision_payload_sha256"
+    }
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def mapping_state_payload_sha256(state: dict[str, Any]) -> str:
+    """Digest the complete mutable mapping state except the digest itself."""
+
+    payload = {
+        key: value
+        for key, value in state.items()
+        if key != "state_payload_sha256"
+    }
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _require_mapping_state_integrity(state: dict[str, Any]) -> None:
+    declared = str(state.get("state_payload_sha256") or "")
+    if (
+        not re.fullmatch(r"[0-9a-f]{64}", declared)
+        or mapping_state_payload_sha256(state) != declared
+    ):
+        raise ValueError("mapping state payload digest mismatch")
+
+
+def _mapping_lock_path(project_id: str) -> Path:
+    project_id = validate_resource_id(project_id, "project")
+    return _safe_child("projects", project_id, ".mapping.lock")
+
+
+def _try_acquire_file_lock(handle: Any) -> None:
+    handle.seek(0)
+    if os.name == "nt":
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        return
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _release_file_lock(handle: Any) -> None:
+    handle.seek(0)
+    if os.name == "nt":
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _is_file_lock_contention(exc: OSError) -> bool:
+    return exc.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK} or getattr(
+        exc, "winerror", None
+    ) in {33, 36}
+
+
+@contextmanager
+def _mapping_process_lock(
+    project_id: str,
+    *,
+    timeout_seconds: float | None = None,
+) -> Iterator[None]:
+    """Serialize mapping state changes across application processes.
+
+    The byte-range lock is kept in the existing V2 project directory. Any
+    inability to create, acquire, or release it raises and prevents the
+    caller from entering or silently completing the critical section.
+    """
+
+    project_id = validate_resource_id(project_id, "project")
+    lock_path = _mapping_lock_path(project_id)
+    project_dir = lock_path.parent
+    if not project_dir.is_dir():
+        raise FileNotFoundError(project_id)
+    timeout = (
+        _MAPPING_LOCK_TIMEOUT_SECONDS
+        if timeout_seconds is None
+        else float(timeout_seconds)
+    )
+    if not math.isfinite(timeout) or timeout < 0:
+        raise ValueError("invalid mapping lock timeout")
+    deadline = time.monotonic() + timeout
+
+    with lock_path.open("a+b", buffering=0) as handle:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        acquired = False
+        while not acquired:
+            try:
+                _try_acquire_file_lock(handle)
+                acquired = True
+            except OSError as exc:
+                if not _is_file_lock_contention(exc):
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"timed out acquiring mapping lock for {project_id}"
+                    ) from exc
+                time.sleep(min(_MAPPING_LOCK_POLL_SECONDS, remaining))
+
+        try:
+            yield
+        finally:
+            _release_file_lock(handle)
+
+
+def load_mapping_state(project_id: str) -> dict[str, Any] | None:
+    """Load the authoritative mapping head for one project."""
+
+    state_path = _mapping_state_path(project_id)
+    with _STORE_LOCK:
+        if not state_path.is_file():
+            return None
+        with _mapping_process_lock(project_id):
+            state = _read_json(state_path)
+            if state is not None:
+                _require_mapping_state_integrity(state)
+            return state
+
+
+def load_mapping_revision(
+    project_id: str, mapping_revision_id: str
+) -> dict[str, Any] | None:
+    """Load one immutable mapping revision by its deterministic ID."""
+
+    revision_path = _mapping_revision_path(project_id, mapping_revision_id)
+    with _STORE_LOCK:
+        if not _safe_child("projects", project_id).is_dir():
+            return None
+        with _mapping_process_lock(project_id):
+            return _read_json(revision_path)
+
+
+def save_mapping_revision_cas(
+    *,
+    project_id: str,
+    import_id: str,
+    base_mapping_revision: int,
+    revision: dict[str, Any],
+    updated_at: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Publish an immutable revision, then advance the authoritative head.
+
+    The revision file is written first. A crash before the state write leaves
+    an unreferenced but deterministic revision that the same request can reuse.
+    The integer base revision is compared while holding the store lock.
+    """
+
+    project_id = validate_resource_id(project_id, "project")
+    import_id = validate_resource_id(import_id, "import")
+    mapping_revision_id = validate_resource_id(
+        str(revision.get("mapping_revision_id") or ""), "mapping"
+    )
+    revision_number = int(revision.get("revision_number", -1))
+    base_mapping_revision = int(base_mapping_revision)
+    if base_mapping_revision < 0 or revision_number != base_mapping_revision + 1:
+        raise ValueError("invalid mapping revision sequence")
+    if (
+        revision.get("project_id") != project_id
+        or revision.get("import_id") != import_id
+    ):
+        raise ValueError("mapping revision resource mismatch")
+    revision_payload_sha256 = str(
+        revision.get("revision_payload_sha256") or ""
+    )
+    if (
+        len(revision_payload_sha256) != 64
+        or mapping_revision_payload_sha256(revision) != revision_payload_sha256
+    ):
+        raise ValueError("mapping revision payload digest mismatch")
+
+    state_path = _mapping_state_path(project_id)
+    revision_path = _mapping_revision_path(project_id, mapping_revision_id)
+    with _STORE_LOCK:
+        with _mapping_process_lock(project_id):
+            state = _read_json(state_path)
+            if state is None:
+                state = {
+                    "project_id": project_id,
+                    "import_id": import_id,
+                    "current_revision_number": 0,
+                    "current_mapping_revision_id": None,
+                    "current_mapping_sha256": None,
+                    "current_revision_payload_sha256": None,
+                    "effective_status": "GROUP_CONFIRMATION_REQUIRED",
+                    "confirmed_mapping_revision_id": None,
+                    "confirmed_mapping_sha256": None,
+                    "confirmed_mapping_revision_number": None,
+                    "revision_history": [],
+                    "confirmation_events": [],
+                }
+            else:
+                _require_mapping_state_integrity(state)
+            if state.get("import_id") != import_id:
+                raise ValueError("mapping state import mismatch")
+            current_number = int(state.get("current_revision_number") or 0)
+            if current_number != base_mapping_revision:
+                raise FileExistsError("mapping revision conflict")
+
+            existing = _read_json(revision_path)
+            if existing is not None and (
+                str(existing.get("revision_payload_sha256") or "")
+                != mapping_revision_payload_sha256(existing)
+            ):
+                raise ValueError("existing mapping revision payload digest mismatch")
+            identity_keys = (
+                "project_id",
+                "import_id",
+                "revision_number",
+                "mapping_sha256",
+                "change_kind",
+                "change_reason",
+                "created_by",
+                "restored_from_mapping_revision_id",
+                "restored_from_revision_number",
+            )
+            if existing is not None and any(
+                existing.get(key) != revision.get(key) for key in identity_keys
+            ):
+                raise FileExistsError("mapping revision identity collision")
+            durable_revision = existing or revision
+            durable_revision_payload_sha256 = str(
+                durable_revision.get("revision_payload_sha256") or ""
+            )
+            if existing is None:
+                _atomic_write_json(revision_path, revision)
+
+            history = list(state.get("revision_history") or [])
+            history_entry = {
+                "revision_number": revision_number,
+                "mapping_revision_id": mapping_revision_id,
+                "mapping_sha256": str(durable_revision.get("mapping_sha256") or ""),
+                "revision_payload_sha256": durable_revision_payload_sha256,
+                "change_kind": str(
+                    durable_revision.get("change_kind") or "manual_edit"
+                ),
+                "change_reason": str(
+                    durable_revision.get("change_reason") or ""
+                ),
+                "restored_from_mapping_revision_id": durable_revision.get(
+                    "restored_from_mapping_revision_id"
+                ),
+                "restored_from_revision_number": durable_revision.get(
+                    "restored_from_revision_number"
+                ),
+                "created_at": str(durable_revision.get("created_at") or updated_at),
+            }
+            if not any(
+                item.get("mapping_revision_id") == mapping_revision_id
+                for item in history
+                if isinstance(item, dict)
+            ):
+                history.append(history_entry)
+            state.update(
+                {
+                    "current_revision_number": revision_number,
+                    "current_mapping_revision_id": mapping_revision_id,
+                    "current_mapping_sha256": history_entry["mapping_sha256"],
+                    "current_revision_payload_sha256": (
+                        durable_revision_payload_sha256
+                    ),
+                    "effective_status": "GROUP_CONFIRMATION_REQUIRED",
+                    "confirmed_mapping_revision_id": None,
+                    "confirmed_mapping_sha256": None,
+                    "confirmed_mapping_revision_number": None,
+                    "revision_history": history,
+                    "confirmation_events": list(
+                        state.get("confirmation_events") or []
+                    ),
+                    "updated_at": updated_at,
+                }
+            )
+            state["state_payload_sha256"] = mapping_state_payload_sha256(state)
+            _atomic_write_json(state_path, state)
+            return durable_revision, state
+
+
+def confirm_mapping_revision_cas(
+    *,
+    project_id: str,
+    import_id: str,
+    base_mapping_revision: int,
+    mapping_sha256: str,
+    confirmed_by: str,
+    confirmed_at: str,
+) -> dict[str, Any]:
+    """Confirm only the current mapping head, preserving confirmation history."""
+
+    project_id = validate_resource_id(project_id, "project")
+    import_id = validate_resource_id(import_id, "import")
+    state_path = _mapping_state_path(project_id)
+    with _STORE_LOCK:
+        with _mapping_process_lock(project_id):
+            state = _read_json(state_path)
+            if state is None:
+                raise FileNotFoundError("mapping state does not exist")
+            _require_mapping_state_integrity(state)
+            if state.get("import_id") != import_id:
+                raise ValueError("mapping state import mismatch")
+            if (
+                int(state.get("current_revision_number") or 0)
+                != int(base_mapping_revision)
+                or str(state.get("current_mapping_sha256") or "")
+                != str(mapping_sha256 or "")
+            ):
+                raise FileExistsError("mapping revision conflict")
+
+            revision_id = validate_resource_id(
+                str(state.get("current_mapping_revision_id") or ""), "mapping"
+            )
+            revision = _read_json(
+                _mapping_revision_path(project_id, revision_id)
+            )
+            state_revision_payload_sha256 = str(
+                state.get("current_revision_payload_sha256") or ""
+            )
+            if (
+                revision is None
+                or not state_revision_payload_sha256
+                or str(revision.get("revision_payload_sha256") or "")
+                != state_revision_payload_sha256
+                or mapping_revision_payload_sha256(revision)
+                != state_revision_payload_sha256
+            ):
+                raise ValueError("mapping revision payload integrity check failed")
+            events = list(state.get("confirmation_events") or [])
+            already_confirmed = any(
+                isinstance(event, dict)
+                and event.get("mapping_revision_id") == revision_id
+                and event.get("mapping_sha256") == mapping_sha256
+                for event in events
+            )
+            if already_confirmed:
+                return state
+            events.append(
+                {
+                    "mapping_revision_id": revision_id,
+                    "revision_number": int(base_mapping_revision),
+                    "mapping_sha256": mapping_sha256,
+                    "confirmed_by": str(confirmed_by or ""),
+                    "confirmed_at": confirmed_at,
+                }
+            )
+            state.update(
+                {
+                    "effective_status": "GROUP_MAPPING_CONFIRMED",
+                    "confirmed_mapping_revision_id": revision_id,
+                    "confirmed_mapping_sha256": mapping_sha256,
+                    "confirmed_mapping_revision_number": int(
+                        base_mapping_revision
+                    ),
+                    "confirmation_events": events,
+                    "updated_at": confirmed_at,
+                }
+            )
+            state["state_payload_sha256"] = mapping_state_payload_sha256(state)
+            _atomic_write_json(state_path, state)
+            return state

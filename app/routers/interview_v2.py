@@ -1,8 +1,10 @@
-"""访谈报告 V2 批次 1：上传隔离、后台预检与导入状态查询。"""
+"""访谈报告 V2：上传预检与 Sheet/玩家映射 HTTP 边界。"""
+import json
 from uuid import uuid4
 
 from fastapi import APIRouter, BackgroundTasks, Request
 from fastapi.responses import JSONResponse
+from pydantic import ValidationError
 from starlette.datastructures import UploadFile
 from starlette.formparsers import MultiPartException, MultiPartParser
 
@@ -15,14 +17,27 @@ from app.schemas.interview_v2 import (
     InterviewV2ImportResponse,
     InterviewV2UploadAttemptResponse,
 )
+from app.schemas.interview_v2_mapping import (
+    InterviewV2GroupMappingConfirmRequest,
+    InterviewV2GroupMappingDraftRequest,
+    InterviewV2GroupMappingRestoreRequest,
+    InterviewV2GroupMappingResponse,
+    InterviewV2GroupProposalResponse,
+)
 from app.services.auth import _require_feature
 from app.services.interview_v2_import_service import (
     InterviewV2ImportError,
     create_upload_attempt,
-    get_interview_import,
     get_upload_attempt,
     run_upload_precheck,
     upload_attempt_needs_precheck,
+)
+from app.services.interview_v2_mapping_service import (
+    confirm_group_mapping,
+    get_group_proposals,
+    get_interview_import_with_mapping_status as get_interview_import,
+    restore_group_mapping,
+    save_group_mapping,
 )
 
 router = APIRouter()
@@ -30,6 +45,7 @@ _UPLOAD_READ_CHUNK_BYTES = 1024 * 1024
 _MULTIPART_OVERHEAD_BYTES = 64 * 1024
 _MULTIPART_FIELD_MAX_BYTES = 20 * 1024
 _MULTIPART_LIMIT_MESSAGE = "INTERVIEW_V2_MULTIPART_LIMIT_EXCEEDED"
+_MAPPING_JSON_MAX_BYTES = 1024 * 1024
 
 
 def _trace_id(request: Request) -> str:
@@ -108,6 +124,48 @@ async def _read_upload_limited(file: UploadFile) -> bytes:
             break
         content.extend(chunk)
     return bytes(content)
+
+
+async def _read_mapping_json(request: Request) -> dict:
+    content_type = (
+        request.headers.get("content-type", "")
+        .split(";", 1)[0]
+        .strip()
+        .lower()
+    )
+    if content_type != "application/json" and not (
+        content_type.startswith("application/") and content_type.endswith("+json")
+    ):
+        raise ValueError("mapping request must use application/json")
+    content_length = request.headers.get("content-length", "").strip()
+    if content_length.isdigit() and int(content_length) > _MAPPING_JSON_MAX_BYTES:
+        raise OverflowError("mapping request exceeds size limit")
+    content = bytearray()
+    async for chunk in request.stream():
+        if len(content) + len(chunk) > _MAPPING_JSON_MAX_BYTES:
+            raise OverflowError("mapping request exceeds size limit")
+        content.extend(chunk)
+    value = json.loads(bytes(content).decode("utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError("mapping request must be a JSON object")
+    return value
+
+
+def _mapping_request_error(
+    request: Request, *, too_large: bool = False
+) -> JSONResponse:
+    return _error_response(
+        request,
+        status_code=413 if too_large else 422,
+        code="MAPPING_REQUEST_INVALID",
+        message=(
+            "分组映射请求超过 1MB 上限。"
+            if too_large
+            else "分组映射请求格式无效。"
+        ),
+        suggested_action="review_group_mapping",
+        context={"limit_bytes": _MAPPING_JSON_MAX_BYTES} if too_large else {},
+    )
 
 
 def _disabled_response(request: Request) -> JSONResponse:
@@ -298,5 +356,143 @@ async def get_interview_import_status(import_id: str, request: Request):
         return _disabled_response(request)
     try:
         return get_interview_import(import_id, login)
+    except InterviewV2ImportError as exc:
+        return _service_error_response(request, exc)
+
+
+@router.get(
+    "/api/v1/interview-imports/{import_id}/group-proposals",
+    response_model=InterviewV2GroupProposalResponse,
+    responses={
+        400: {"model": InterviewV2ErrorResponse},
+        403: {"description": "沿用平台现有功能权限错误响应"},
+        404: {"model": InterviewV2ErrorResponse},
+        500: {"model": InterviewV2ErrorResponse},
+        503: {"model": InterviewV2ErrorResponse},
+    },
+)
+async def get_interview_group_proposals(import_id: str, request: Request):
+    login = await _require_feature(request, "interview")
+    if not INTERVIEW_V2_ENABLED:
+        return _disabled_response(request)
+    try:
+        return get_group_proposals(import_id, login)
+    except InterviewV2ImportError as exc:
+        return _service_error_response(request, exc)
+
+
+@router.put(
+    "/api/v1/interview-imports/{import_id}/group-mapping",
+    response_model=InterviewV2GroupMappingResponse,
+    responses={
+        400: {"model": InterviewV2ErrorResponse},
+        403: {"description": "沿用平台现有功能权限错误响应"},
+        404: {"model": InterviewV2ErrorResponse},
+        409: {"model": InterviewV2ErrorResponse},
+        413: {"model": InterviewV2ErrorResponse},
+        422: {"model": InterviewV2ErrorResponse},
+        500: {"model": InterviewV2ErrorResponse},
+        503: {"model": InterviewV2ErrorResponse},
+    },
+)
+async def put_interview_group_mapping(import_id: str, request: Request):
+    login = await _require_feature(request, "interview")
+    if not INTERVIEW_V2_ENABLED:
+        return _disabled_response(request)
+    try:
+        raw = await _read_mapping_json(request)
+        payload = InterviewV2GroupMappingDraftRequest.model_validate(raw).model_dump(
+            mode="json"
+        )
+    except OverflowError:
+        return _mapping_request_error(request, too_large=True)
+    except (
+        json.JSONDecodeError,
+        UnicodeDecodeError,
+        ValidationError,
+        ValueError,
+        RecursionError,
+    ):
+        return _mapping_request_error(request)
+    try:
+        return save_group_mapping(import_id, payload, login)
+    except InterviewV2ImportError as exc:
+        return _service_error_response(request, exc)
+
+
+@router.post(
+    "/api/v1/interview-imports/{import_id}/group-mapping:restore",
+    response_model=InterviewV2GroupMappingResponse,
+    responses={
+        400: {"model": InterviewV2ErrorResponse},
+        403: {"description": "沿用平台现有功能权限错误响应"},
+        404: {"model": InterviewV2ErrorResponse},
+        409: {"model": InterviewV2ErrorResponse},
+        413: {"model": InterviewV2ErrorResponse},
+        422: {"model": InterviewV2ErrorResponse},
+        500: {"model": InterviewV2ErrorResponse},
+        503: {"model": InterviewV2ErrorResponse},
+    },
+)
+async def restore_interview_group_mapping(import_id: str, request: Request):
+    login = await _require_feature(request, "interview")
+    if not INTERVIEW_V2_ENABLED:
+        return _disabled_response(request)
+    try:
+        raw = await _read_mapping_json(request)
+        payload = InterviewV2GroupMappingRestoreRequest.model_validate(raw).model_dump(
+            mode="json"
+        )
+    except OverflowError:
+        return _mapping_request_error(request, too_large=True)
+    except (
+        json.JSONDecodeError,
+        UnicodeDecodeError,
+        ValidationError,
+        ValueError,
+        RecursionError,
+    ):
+        return _mapping_request_error(request)
+    try:
+        return restore_group_mapping(import_id, payload, login)
+    except InterviewV2ImportError as exc:
+        return _service_error_response(request, exc)
+
+
+@router.post(
+    "/api/v1/interview-imports/{import_id}/group-mapping:confirm",
+    response_model=InterviewV2GroupMappingResponse,
+    responses={
+        400: {"model": InterviewV2ErrorResponse},
+        403: {"description": "沿用平台现有功能权限错误响应"},
+        404: {"model": InterviewV2ErrorResponse},
+        409: {"model": InterviewV2ErrorResponse},
+        413: {"model": InterviewV2ErrorResponse},
+        422: {"model": InterviewV2ErrorResponse},
+        500: {"model": InterviewV2ErrorResponse},
+        503: {"model": InterviewV2ErrorResponse},
+    },
+)
+async def confirm_interview_group_mapping(import_id: str, request: Request):
+    login = await _require_feature(request, "interview")
+    if not INTERVIEW_V2_ENABLED:
+        return _disabled_response(request)
+    try:
+        raw = await _read_mapping_json(request)
+        payload = InterviewV2GroupMappingConfirmRequest.model_validate(raw).model_dump(
+            mode="json"
+        )
+    except OverflowError:
+        return _mapping_request_error(request, too_large=True)
+    except (
+        json.JSONDecodeError,
+        UnicodeDecodeError,
+        ValidationError,
+        ValueError,
+        RecursionError,
+    ):
+        return _mapping_request_error(request)
+    try:
+        return confirm_group_mapping(import_id, payload, login)
     except InterviewV2ImportError as exc:
         return _service_error_response(request, exc)
