@@ -2,6 +2,7 @@
 const ivPanels = [1, 2, 3].map(n => $(`iv-panel-${n}`));
 const ivState = {
   currentStep: 1,
+  track: 'v1',
   selectedFile: null,
   sessionId: null,
   filename: '',
@@ -9,8 +10,11 @@ const ivState = {
   reportMd: '',
   reportNo: '',
   fromHistory: false,
+  uploading: false,
   running: false,
+  restoreBusy: false,
   eventSource: null,
+  requestToken: 0,
   audit: {},
   reviewSelections: new Map(),
   reviewConfirming: new Set(),
@@ -21,7 +25,19 @@ const ivState = {
 
 const IV_STAGE_ORDER = ['upload', 'extract', 'write', 'audit', 'completed'];
 
+function ivV2Api() {
+  return window.interviewV2Feature || null;
+}
+
+function ivTrackIsV2() {
+  return ivState.track === 'v2';
+}
+
 function ivRenderStepBars() {
+  if (ivTrackIsV2()) {
+    ivV2Api()?.renderStepBars?.();
+    return;
+  }
   const canReviewAll = Boolean(ivState.reportMd) && !ivState.fromHistory;
   document.querySelectorAll('[data-iv-step]').forEach(button => {
     const step = Number(button.dataset.ivStep);
@@ -36,6 +52,10 @@ function ivRenderStepBars() {
 }
 
 function ivGoStep(step) {
+  if (ivTrackIsV2()) {
+    ivV2Api()?.goStep?.();
+    return;
+  }
   ivState.currentStep = step;
   ivPanels.forEach((panel, index) => {
     if (panel) panel.classList.toggle('panel--hidden', index + 1 !== step);
@@ -48,6 +68,10 @@ function ivGoStep(step) {
 }
 
 function ivPreviewStep(step) {
+  if (ivTrackIsV2()) {
+    ivV2Api()?.previewStep?.(step);
+    return;
+  }
   if (step === ivState.currentStep) return;
   if (ivState.fromHistory) {
     showToast('历史记录只保留最终报告，无法回看当时的上传与生成页面', 'info');
@@ -154,7 +178,12 @@ function ivSetLiveState(status) {
 }
 
 function ivReset() {
+  if (ivTrackIsV2()) {
+    ivV2Api()?.reset?.();
+    return;
+  }
   if (ivState.eventSource) ivState.eventSource.close();
+  ivState.requestToken += 1;
   ivState.currentStep = 1;
   ivState.selectedFile = null;
   ivState.sessionId = null;
@@ -163,13 +192,16 @@ function ivReset() {
   ivState.reportMd = '';
   ivState.reportNo = '';
   ivState.fromHistory = false;
+  ivState.uploading = false;
   ivState.running = false;
+  ivState.restoreBusy = false;
   ivState.eventSource = null;
   ivState.audit = {};
   ivState.reviewSelections.clear();
   ivState.reviewConfirming.clear();
   ivState.reviewBatchRunning = false;
   ivState.reviewBatchMessage = '';
+  ivV2Api()?.syncTrackToggle?.();
   $('iv-file-input').value = '';
   $('iv-research-focus').value = '';
   $('iv-selected-file').hidden = true;
@@ -498,7 +530,9 @@ function ivRenderReport(data, { fromHistory = false } = {}) {
   ivState.sheets = data.sheets || ivState.sheets;
   ivState.reportNo = data.report_no || data.interview_report_no || ivState.reportNo;
   ivState.fromHistory = fromHistory;
+  ivState.uploading = false;
   ivState.running = false;
+  ivV2Api()?.syncTrackToggle?.();
   $('iv-start-report').classList.remove('btn--loading');
   $('iv-report-content').innerHTML = renderMarkdown(ivState.reportMd);
   const title = data.title || ivTitleFromMarkdown(ivState.reportMd);
@@ -575,7 +609,9 @@ function ivHandleStreamEvent(data) {
   if (data.type === 'error') {
     if (ivState.eventSource) ivState.eventSource.close();
     ivState.eventSource = null;
+    ivState.uploading = false;
     ivState.running = false;
+    ivV2Api()?.syncTrackToggle?.();
     ivSetPercent(data.percent);
     ivUpdateStage(data.stage, true);
     ivApplyModelsUsed(data.models_used);
@@ -588,12 +624,21 @@ function ivHandleStreamEvent(data) {
 
 function ivRunReport() {
   if (!ivState.sessionId || ivState.running) return;
+  const requestToken = ivState.requestToken;
   ivState.running = true;
   $('iv-progress-actions').hidden = true;
   ivSetLiveState('running');
-  const source = new EventSource(`/api/interview/run/${ivState.sessionId}`);
+  let source;
+  try {
+    source = new EventSource(`/api/interview/run/${ivState.sessionId}`);
+  } catch (error) {
+    ivState.running = false;
+    ivV2Api()?.syncTrackToggle?.();
+    throw error;
+  }
   ivState.eventSource = source;
   source.onmessage = event => {
+    if (requestToken !== ivState.requestToken || ivState.eventSource !== source) return;
     try {
       ivHandleStreamEvent(JSON.parse(event.data));
     } catch (error) {
@@ -602,11 +647,15 @@ function ivRunReport() {
   };
   source.onerror = async () => {
     source.close();
+    if (requestToken !== ivState.requestToken || ivState.eventSource !== source) return;
     if (ivState.eventSource === source) ivState.eventSource = null;
     ivState.running = false;
+    ivState.uploading = true;
+    ivV2Api()?.syncTrackToggle?.();
     try {
       const response = await fetch(`/api/interview/status/${ivState.sessionId}`);
       const status = await response.json();
+      if (requestToken !== ivState.requestToken) return;
       if (response.ok && status.status === 'completed' && status.report_md) {
         ivRenderReport(status);
         showToast('连接恢复成功，报告已经生成完成', 'success');
@@ -621,6 +670,9 @@ function ivRunReport() {
           status.message || '生成连接中断，可从已完成进度继续';
       }
     } catch { }
+    if (requestToken !== ivState.requestToken) return;
+    ivState.uploading = false;
+    ivV2Api()?.syncTrackToggle?.();
     ivSetLiveState('error');
     $('iv-progress-actions').hidden = false;
     showToast('生成连接中断，可以从已完成进度继续', 'error');
@@ -633,6 +685,11 @@ async function ivUploadAndStart() {
     showToast('请先选择访谈 Excel', 'error');
     return;
   }
+  if (ivState.uploading || ivState.running) return;
+  ivState.requestToken += 1;
+  const requestToken = ivState.requestToken;
+  ivState.uploading = true;
+  ivV2Api()?.syncTrackToggle?.();
   const button = $('iv-start-report');
   button.disabled = true;
   button.classList.add('btn--loading');
@@ -647,6 +704,7 @@ async function ivUploadAndStart() {
   try {
     const response = await fetch('/api/interview/upload', { method: 'POST', body });
     const data = await response.json();
+    if (requestToken !== ivState.requestToken) return;
     if (!response.ok) throw new Error(data.detail || '上传失败');
     ivState.sessionId = data.session_id;
     ivState.filename = data.filename;
@@ -657,8 +715,12 @@ async function ivUploadAndStart() {
       <span>${esc(ivState.sheets.length)} 个 Sheet · ${esc(data.total_cells)} 个非空单元格</span>`;
     ivSetPercent(5);
     ivUpdateStage('extract');
+    ivState.uploading = false;
     ivRunReport();
   } catch (error) {
+    if (requestToken !== ivState.requestToken) return;
+    ivState.uploading = false;
+    ivV2Api()?.syncTrackToggle?.();
     button.disabled = false;
     button.classList.remove('btn--loading');
     ivGoStep(1);
@@ -667,10 +729,15 @@ async function ivUploadAndStart() {
 }
 
 async function ivRestoreStatus() {
-  if (!ivState.sessionId) return;
+  if (!ivState.sessionId || ivState.restoreBusy || ivState.uploading || ivState.running) return;
+  ivState.requestToken += 1;
+  const requestToken = ivState.requestToken;
+  ivState.restoreBusy = true;
+  ivV2Api()?.syncTrackToggle?.();
   try {
     const response = await fetch(`/api/interview/status/${ivState.sessionId}`);
     const data = await response.json();
+    if (requestToken !== ivState.requestToken) return;
     if (!response.ok) throw new Error(data.detail || '无法恢复进度');
     if (data.status === 'completed' && data.report_md) {
       ivRenderReport(data);
@@ -683,7 +750,13 @@ async function ivRestoreStatus() {
     if (data.partial_report_md) ivRenderPartial(data.partial_report_md);
     ivRunReport();
   } catch (error) {
+    if (requestToken !== ivState.requestToken) return;
     showToast(`恢复失败：${error.message}`, 'error');
+  } finally {
+    if (requestToken === ivState.requestToken) {
+      ivState.restoreBusy = false;
+      ivV2Api()?.syncTrackToggle?.();
+    }
   }
 }
 
@@ -808,8 +881,11 @@ async function ivSubmitReviewBatch() {
   ) return;
   const selections = Array.from(ivState.reviewSelections.values())
     .sort((left, right) => left.issueIndex - right.issueIndex);
+  ivState.requestToken += 1;
+  const requestToken = ivState.requestToken;
   ivState.reviewBatchRunning = true;
   ivState.reviewBatchMessage = `准备处理 ${selections.length} 项修订…`;
+  ivV2Api()?.syncTrackToggle?.();
   ivRenderAuditReview();
   let finalData = null;
   try {
@@ -824,6 +900,7 @@ async function ivSubmitReviewBatch() {
         })),
       },
       data => {
+        if (requestToken !== ivState.requestToken) return;
         if (data.type === 'interview_review_progress') {
           ivState.reviewBatchMessage = data.message || '正在批量修订…';
           ivRenderAuditReview();
@@ -832,21 +909,25 @@ async function ivSubmitReviewBatch() {
         }
       },
     );
+    if (requestToken !== ivState.requestToken) return;
     if (!finalData?.report_md) throw new Error('批量修订完成后未返回有效报告');
     ivState.reviewSelections.clear();
-    ivState.reviewBatchRunning = false;
-    ivState.reviewBatchMessage = '';
     ivRenderReport(finalData, { fromHistory: ivState.fromHistory });
     showToast(finalData.message || '所选内容已全部修订并统一复审', 'success', 5000);
   } catch (error) {
-    ivState.reviewBatchRunning = false;
-    ivState.reviewBatchMessage = '';
-    ivRenderAuditReview();
+    if (requestToken !== ivState.requestToken) return;
     const message = String(error.message || error);
     if (message.includes('会话不存在或已过期')) {
       showToast('原始证据会话已过期，请重新上传访谈记录后生成报告', 'error', 8000);
     } else {
       showToast(`批量修订失败，原报告未修改：${message}`, 'error', 8000);
+    }
+  } finally {
+    if (requestToken === ivState.requestToken) {
+      ivState.reviewBatchRunning = false;
+      ivState.reviewBatchMessage = '';
+      ivRenderAuditReview();
+      ivV2Api()?.syncTrackToggle?.();
     }
   }
 }
@@ -857,7 +938,9 @@ async function ivConfirmAuditIssue(issueIndex) {
   const issue = issues[issueIndex];
   if (!issue || ivIssueConfirmed(issue)) return;
   const key = ivAuditIssueKey(issue, issueIndex, issues);
+  const requestToken = ivState.requestToken;
   ivState.reviewConfirming.add(key);
+  ivV2Api()?.syncTrackToggle?.();
   ivRenderAuditReview();
   try {
     const response = await fetch(
@@ -865,18 +948,25 @@ async function ivConfirmAuditIssue(issueIndex) {
       { method: 'PATCH' },
     );
     const data = await response.json();
+    if (requestToken !== ivState.requestToken) return;
     if (!response.ok) throw new Error(data.detail || '确认失败');
     ivState.audit = data.interview_audit || {};
     showToast('已确认当前内容，原始审校记录已保留', 'success');
   } catch (error) {
+    if (requestToken !== ivState.requestToken) return;
     showToast(`确认失败：${error.message}`, 'error', 8000);
   } finally {
-    ivState.reviewConfirming.delete(key);
-    ivRenderAuditReview();
+    if (requestToken === ivState.requestToken) {
+      ivState.reviewConfirming.delete(key);
+      ivRenderAuditReview();
+      ivV2Api()?.syncTrackToggle?.();
+    }
   }
 }
 
 function ivLoadHistoryEntry(entry) {
+  ivState.track = 'v1';
+  ivV2Api()?.syncTrackToggle?.();
   switchMode('interview');
   ivState.sessionId = entry.id;
   ivState.filename = entry.filename || '';
@@ -961,3 +1051,5 @@ document.querySelectorAll('[data-iv-step]').forEach(button => {
 document.addEventListener('click', event => {
   if (!event.target.closest('#iv-export-dropdown')) $('iv-export-menu')?.classList.remove('open');
 });
+
+window.ivState = ivState;

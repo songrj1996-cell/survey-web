@@ -11,7 +11,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/style.css?v=43" />
+  <link rel="stylesheet" href="/static/style.css?v=44" />
 </head>
 
 <body>
@@ -692,6 +692,11 @@
            ====================================================== -->
 
       <section class="panel panel--hidden" id="iv-panel-1">
+        <div class="iv-track-switch" role="group" aria-label="访谈流程版本">
+          <button class="iv-track-switch__btn iv-track-switch__btn--active" type="button" data-iv-track="v1" aria-pressed="true">V1 直接生成报告</button>
+          <button class="iv-track-switch__btn" type="button" data-iv-track="v2" aria-pressed="false">V2 先确认分组映射</button>
+        </div>
+        <div data-iv-track-content="v1">
         <div class="step-bar">
           <button class="step-bar__item step-bar__item--active" data-iv-step="1"><span class="step-bar__num">1</span><span
               class="step-bar__label">上传记录</span></button>
@@ -770,9 +775,89 @@
             </div>
           </aside>
         </div>
+        </div>
+        <div data-iv-track-content="v2" hidden>
+          <div class="step-bar">
+            <button class="step-bar__item step-bar__item--active" data-iv-v2-step="1"><span class="step-bar__num">1</span><span class="step-bar__label">上传预检</span></button>
+            <button class="step-bar__item" data-iv-v2-step="2"><span class="step-bar__num">2</span><span class="step-bar__label">分组映射</span></button>
+            <button class="step-bar__item" data-iv-v2-step="3"><span class="step-bar__num">3</span><span class="step-bar__label">确认检查点</span></button>
+          </div>
+          <div class="panel__header">
+            <div class="iv-eyebrow">INTERVIEW REPORT V2</div>
+            <h1 class="panel__title">先确认 Sheet 分组与玩家绑定，再进入检查点</h1>
+            <p class="panel__desc">V2 不会调用旧版 <code>/api/interview/run</code>。工作簿预检通过后，先由你确认记录页、参考页、记录员和玩家列绑定，再停在 <code>GROUP_MAPPING_CONFIRMED</code>。</p>
+          </div>
+          <div class="iv-upload-layout iv-v2-upload-layout">
+            <div>
+              <div class="upload-zone iv-upload-zone" id="iv-v2-upload-zone" role="button" tabindex="0" aria-label="选择访谈 V2 Excel 文件">
+                <input type="file" id="iv-v2-file-input" accept=".xlsx" hidden />
+                <div class="iv-upload-empty" id="iv-v2-upload-empty">
+                  <div class="upload-zone__icon">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                      <polyline points="17 8 12 3 7 8" />
+                      <line x1="12" y1="3" x2="12" y2="15" />
+                    </svg>
+                  </div>
+                  <div class="upload-zone__text">
+                    <span class="upload-zone__primary">拖放 V2 工作簿到这里，或点击选择</span>
+                    <span class="upload-zone__secondary">仅支持 .xlsx，预检通过后进入分组映射编辑</span>
+                  </div>
+                </div>
+                <div class="iv-selected-file" id="iv-v2-selected-file" hidden>
+                  <div class="upload-zone__icon upload-zone__icon--complete">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+                      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                      <polyline points="14 2 14 8 20 8" />
+                      <polyline points="9 15 11 17 15 13" />
+                    </svg>
+                  </div>
+                  <div class="upload-zone__text">
+                    <span class="upload-zone__primary" id="iv-v2-selected-file-name"></span>
+                    <span class="upload-zone__secondary" id="iv-v2-selected-file-size"></span>
+                  </div>
+                  <button type="button" class="iv-selected-file__remove" id="iv-v2-remove-file" aria-label="移除文件">×</button>
+                </div>
+              </div>
+              <label class="iv-focus-field" for="iv-v2-research-focus">
+                <span>本次研究重点 <em>选填</em></span>
+                <textarea id="iv-v2-research-focus" rows="3" maxlength="4000" placeholder="例如：先确认哪些 Sheet 只作为提纲参考，哪些列需要合并为同一位玩家。"></textarea>
+                <small>最多 4000 字；该字段会随上传一起保存，不会跳过映射确认。</small>
+              </label>
+              <label class="iv-v2-contract">
+                <input type="checkbox" id="iv-v2-contract-check" />
+                <span>我已确认：该文件是同一轮访谈工作簿，只包含需要进入本次映射确认的 Sheet。</span>
+              </label>
+              <div class="iv-upload-actions">
+                <button class="btn btn--primary iv-start-btn" id="iv-v2-start-import" type="button" disabled>上传并进入映射确认</button>
+              </div>
+              <div class="iv-v2-upload-status" id="iv-v2-upload-status" role="status" aria-live="polite" hidden></div>
+            </div>
+            <aside class="iv-guide-card">
+              <div class="iv-guide-card__title">V2 预检后会检查这些内容</div>
+              <div class="iv-guide-step">
+                <span>1</span>
+                <div><strong>文件结构预检</strong><p>先读取 Sheet 数量、候选玩家列、隐藏行列和异常告警，失败会直接停在上传页。</p></div>
+              </div>
+              <div class="iv-guide-step">
+                <span>2</span>
+                <div><strong>你来确认映射</strong><p>分组、记录页/参考页、记录员和玩家列绑定都在前端可见，可多次保存草稿、撤销和恢复历史版本。</p></div>
+              </div>
+              <div class="iv-guide-step">
+                <span>3</span>
+                <div><strong>停在确认检查点</strong><p>点击确认后仅写入 <code>GROUP_MAPPING_CONFIRMED</code>，不会继续触发旧版报告生成。</p></div>
+              </div>
+            </aside>
+          </div>
+        </div>
       </section>
 
       <section class="panel panel--hidden" id="iv-panel-2">
+        <div class="iv-track-switch" role="group" aria-label="访谈流程版本">
+          <button class="iv-track-switch__btn iv-track-switch__btn--active" type="button" data-iv-track="v1" aria-pressed="true">V1 直接生成报告</button>
+          <button class="iv-track-switch__btn" type="button" data-iv-track="v2" aria-pressed="false">V2 先确认分组映射</button>
+        </div>
+        <div data-iv-track-content="v1">
         <div class="step-bar">
           <button class="step-bar__item step-bar__item--done" data-iv-step="1"><span class="step-bar__num">1</span><span
               class="step-bar__label">上传记录</span></button>
@@ -820,9 +905,57 @@
             <div class="markdown-body iv-live-preview" id="iv-live-preview"></div>
           </aside>
         </div>
+        </div>
+        <div data-iv-track-content="v2" hidden>
+          <div class="step-bar">
+            <button class="step-bar__item step-bar__item--done" data-iv-v2-step="1"><span class="step-bar__num">1</span><span class="step-bar__label">上传预检</span></button>
+            <button class="step-bar__item step-bar__item--active" data-iv-v2-step="2"><span class="step-bar__num">2</span><span class="step-bar__label">分组映射</span></button>
+            <button class="step-bar__item" data-iv-v2-step="3"><span class="step-bar__num">3</span><span class="step-bar__label">确认检查点</span></button>
+          </div>
+          <div class="iv-v2-editor-shell" id="iv-v2-editor-shell">
+            <div class="iv-v2-toolbar">
+              <div class="iv-v2-toolbar__actions">
+                <button class="btn btn--ghost" id="iv-v2-refresh" type="button">刷新状态</button>
+                <button class="btn btn--ghost" id="iv-v2-add-group" type="button">新建分组</button>
+                <button class="btn btn--ghost" id="iv-v2-undo" type="button">撤销到上一版</button>
+                <button class="btn btn--ghost" id="iv-v2-redo" type="button">重做到较新版</button>
+              </div>
+              <div class="iv-v2-toolbar__actions">
+                <button class="btn btn--ghost" id="iv-v2-save-draft" type="button">保存草稿</button>
+                <button class="btn btn--primary" id="iv-v2-confirm-mapping" type="button">确认分组并停在检查点</button>
+              </div>
+            </div>
+            <div id="iv-v2-editor-status" role="status" aria-live="polite"></div>
+            <div id="iv-v2-import-meta"></div>
+            <div class="iv-v2-editor-layout">
+              <div class="iv-v2-editor-main">
+                <section class="iv-v2-side-card">
+                  <div class="iv-v2-side-card__title">分组与玩家绑定</div>
+                  <div id="iv-v2-group-list"></div>
+                </section>
+              </div>
+              <aside class="iv-v2-editor-side">
+                <section class="iv-v2-side-card">
+                  <div class="iv-v2-side-card__title">待处理提示</div>
+                  <div id="iv-v2-issues"></div>
+                </section>
+                <div id="iv-v2-unassigned-sheets"></div>
+                <section class="iv-v2-side-card">
+                  <div class="iv-v2-side-card__title">映射历史</div>
+                  <div id="iv-v2-history-list"></div>
+                </section>
+              </aside>
+            </div>
+          </div>
+        </div>
       </section>
 
       <section class="panel panel--hidden" id="iv-panel-3">
+        <div class="iv-track-switch" role="group" aria-label="访谈流程版本">
+          <button class="iv-track-switch__btn iv-track-switch__btn--active" type="button" data-iv-track="v1" aria-pressed="true">V1 直接生成报告</button>
+          <button class="iv-track-switch__btn" type="button" data-iv-track="v2" aria-pressed="false">V2 先确认分组映射</button>
+        </div>
+        <div data-iv-track-content="v1">
         <div class="step-bar">
           <button class="step-bar__item step-bar__item--done" data-iv-step="1"><span class="step-bar__num">1</span><span
               class="step-bar__label">上传记录</span></button>
@@ -897,6 +1030,34 @@
           </nav>
           <div class="report-body">
             <article class="report-content markdown-body iv-report-content" id="iv-report-content"></article>
+          </div>
+        </div>
+        </div>
+        <div data-iv-track-content="v2" hidden>
+          <div class="step-bar">
+            <button class="step-bar__item step-bar__item--done" data-iv-v2-step="1"><span class="step-bar__num">1</span><span class="step-bar__label">上传预检</span></button>
+            <button class="step-bar__item step-bar__item--done" data-iv-v2-step="2"><span class="step-bar__num">2</span><span class="step-bar__label">分组映射</span></button>
+            <button class="step-bar__item step-bar__item--active" data-iv-v2-step="3"><span class="step-bar__num">3</span><span class="step-bar__label">确认检查点</span></button>
+          </div>
+          <div class="panel__header">
+            <div class="iv-eyebrow">GROUP_MAPPING_CONFIRMED</div>
+            <h1 class="panel__title">分组映射已确认，停在 V2 检查点</h1>
+            <p class="panel__desc">这里展示当前确认版摘要。若仍需调整，可返回编辑器继续修改并再次保存或确认。</p>
+          </div>
+          <div class="iv-v2-confirmed-shell" id="iv-v2-confirmed-shell">
+            <div id="iv-v2-confirmed-meta"></div>
+            <section class="iv-v2-side-card">
+              <div class="iv-v2-side-card__title">最终玩家预览</div>
+              <div id="iv-v2-confirmed-preview"></div>
+            </section>
+            <section class="iv-v2-side-card">
+              <div class="iv-v2-side-card__title">版本历史</div>
+              <div id="iv-v2-confirmed-history"></div>
+            </section>
+            <div class="iv-v2-confirmed-actions">
+              <button class="btn btn--ghost" id="iv-v2-back-to-editor" type="button">返回映射编辑器</button>
+              <button class="btn btn--primary" id="iv-v2-start-over" type="button">重新上传新工作簿</button>
+            </div>
           </div>
         </div>
       </section>
@@ -1506,7 +1667,8 @@
   <script src="/static/js/features/report.js?v=38"></script>
   <script src="/static/js/features/settings.js?v=34"></script>
   <script src="/static/js/features/history.js?v=33"></script>
-  <script src="/static/js/features/interview.js?v=9"></script>
+  <script src="/static/js/features/interview.js?v=10"></script>
+  <script src="/static/js/features/interview-v2.js?v=1"></script>
   <script src="/static/js/features/nav.js?v=37"></script>
   <script src="/static/js/features/comment.js?v=29"></script>
 <script src="/static/js/features/annotate.js?v=34"></script>
