@@ -40,6 +40,7 @@ CAPABILITY_KEYS = {
     "bested_original_questionnaire_upload",
     "screenshot_material_upload",
     "pdf_material_upload",
+    "asset_review_projection",
 }
 
 SOURCE_CONTRACTS = {
@@ -454,7 +455,10 @@ class QuestionnaireSourceFrontendContractTests(unittest.TestCase):
         blocks = _source_definition_blocks(self.javascript)
         self.assertEqual(
             set(blocks),
-            CAPABILITY_KEYS - {"snapshot_catalog"},
+            CAPABILITY_KEYS - {
+                "snapshot_catalog",
+                "asset_review_projection",
+            },
         )
         self.assertEqual(
             {

@@ -1,0 +1,364 @@
+.qar-drawer {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+}
+
+.qar-drawer[hidden] {
+  display: none !important;
+}
+
+.qar-overlay {
+  position: absolute;
+  inset: 0;
+  border: 0;
+  background: rgba(15, 23, 42, 0.38);
+  cursor: pointer;
+}
+
+.qar-panel {
+  position: absolute;
+  top: 0;
+  right: 0;
+  display: flex;
+  flex-direction: column;
+  width: min(720px, 100vw);
+  height: 100%;
+  padding: 24px 24px 20px;
+  border-left: 1px solid var(--border);
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--surface-2) 94%, transparent), color-mix(in srgb, var(--surface) 98%, transparent));
+  box-shadow: -18px 0 42px rgba(15, 23, 42, 0.18);
+  overflow: hidden;
+}
+
+.qar-header,
+.qar-banner,
+.qar-toolbar,
+.qar-item,
+.qar-item__top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.qar-header {
+  margin-bottom: 14px;
+}
+
+.qar-header__text,
+.qar-item__content,
+.qar-item__title-wrap {
+  min-width: 0;
+}
+
+.qar-title {
+  margin: 0;
+  color: var(--text);
+  font-size: 18px;
+  line-height: 1.35;
+}
+
+.qar-subtitle {
+  margin: 8px 0 0;
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.qar-close,
+.qar-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 36px;
+  padding: 0 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
+  color: var(--text-2);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: transform 0.2s ease, border-color 0.2s ease, background 0.2s ease;
+}
+
+.qar-close:hover,
+.qar-close:focus-visible,
+.qar-btn:hover:not(:disabled),
+.qar-btn:focus-visible {
+  border-color: var(--border-act);
+  background: color-mix(in srgb, var(--accent-soft) 24%, var(--surface));
+  transform: translateY(-1px);
+}
+
+.qar-btn:disabled {
+  opacity: 0.56;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.qar-btn--ghost {
+  background: color-mix(in srgb, var(--surface-2) 88%, transparent);
+}
+
+.qar-banner,
+.qar-notice,
+.qar-toolbar {
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--surface) 90%, transparent);
+}
+
+.qar-banner {
+  align-items: center;
+}
+
+.qar-note,
+.qar-status,
+.qar-notice,
+.qar-summary,
+.qar-empty,
+.qar-item__meta {
+  font-size: 12px;
+  line-height: 1.65;
+}
+
+.qar-note,
+.qar-summary {
+  color: var(--text-2);
+}
+
+.qar-status {
+  color: var(--text-3);
+  text-align: right;
+}
+
+.qar-status.is-loading {
+  color: var(--accent-2);
+}
+
+.qar-status.is-ready {
+  color: var(--green);
+}
+
+.qar-status.is-error {
+  color: var(--red);
+}
+
+.qar-status.is-empty {
+  color: var(--amber);
+}
+
+.qar-notice {
+  margin-top: 12px;
+  color: var(--text-3);
+}
+
+.qar-notice.is-review {
+  color: var(--amber);
+}
+
+.qar-notice.is-stale,
+.qar-notice.is-abort {
+  color: var(--accent-2);
+}
+
+.qar-toolbar {
+  align-items: center;
+  margin-top: 12px;
+}
+
+.qar-body {
+  min-height: 0;
+  margin-top: 14px;
+  padding-right: 4px;
+  overflow: auto;
+}
+
+.qar-empty {
+  padding: 18px 16px;
+  border: 1px dashed color-mix(in srgb, var(--border) 90%, transparent);
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--surface-2) 84%, transparent);
+  color: var(--text-2);
+}
+
+.qar-list {
+  display: grid;
+  gap: 12px;
+}
+
+.qar-item {
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: color-mix(in srgb, var(--surface) 92%, transparent);
+}
+
+.qar-item.is-review-required {
+  border-color: color-mix(in srgb, var(--amber) 42%, var(--border));
+}
+
+.qar-thumb {
+  position: relative;
+  flex: 0 0 132px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 132px;
+  height: 96px;
+  border: 1px solid color-mix(in srgb, var(--border) 86%, transparent);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--surface-2) 86%, transparent);
+  overflow: hidden;
+}
+
+.qar-thumb:focus-visible {
+  outline: 2px solid var(--accent-2);
+  outline-offset: 2px;
+}
+
+.qar-thumb.is-error,
+.qar-thumb.is-unavailable {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.qar-thumb__controls {
+  display: grid;
+  gap: 8px;
+  width: 100%;
+  padding: 10px;
+}
+
+.qar-thumb__button {
+  width: 100%;
+  min-height: 32px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+
+.qar-thumb__status {
+  color: var(--text-3);
+  font-size: 11px;
+  line-height: 1.5;
+  text-align: center;
+}
+
+.qar-thumb__status.is-error {
+  color: var(--red);
+}
+
+.qar-thumb__image {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.qar-thumb__fallback {
+  padding: 0 10px;
+  color: var(--text-3);
+  font-size: 12px;
+  line-height: 1.6;
+  text-align: center;
+}
+
+.qar-item__content {
+  display: grid;
+  gap: 10px;
+  flex: 1 1 auto;
+}
+
+.qar-item__title {
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.qar-item__meta {
+  margin-top: 4px;
+  color: var(--text-2);
+}
+
+.qar-badge,
+.qar-pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 0 10px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--green) 10%, transparent);
+  color: var(--green);
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.qar-badge.is-review {
+  background: color-mix(in srgb, var(--amber) 12%, transparent);
+  color: var(--amber);
+}
+
+.qar-item__warnings {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.qar-pill {
+  background: color-mix(in srgb, var(--amber) 12%, transparent);
+  color: var(--amber);
+}
+
+.qar-pill.is-neutral {
+  background: color-mix(in srgb, var(--surface-2) 92%, transparent);
+  color: var(--text-3);
+}
+
+@media (max-width: 900px) {
+  .qar-panel {
+    width: min(100vw, 100%);
+    padding: 20px 18px 16px;
+  }
+}
+
+@media (max-width: 640px) {
+  .qar-panel,
+  .qar-header,
+  .qar-banner,
+  .qar-toolbar,
+  .qar-item,
+  .qar-item__top {
+    gap: 12px;
+  }
+
+  .qar-header,
+  .qar-banner,
+  .qar-toolbar,
+  .qar-item {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .qar-status {
+    text-align: left;
+  }
+
+  .qar-close,
+  .qar-btn,
+  .qar-thumb {
+    width: 100%;
+  }
+
+  .qar-thumb {
+    flex-basis: auto;
+    height: 168px;
+  }
+}

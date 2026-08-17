@@ -9,6 +9,9 @@
   const CAPABILITIES_URL = '/api/questionnaire-sources/capabilities';
   const SNAPSHOTS_ENDPOINT = '/api/questionnaire-sources/snapshots';
   const SNAPSHOT_ANALYSIS_INTERFACE_KEY = 'questionnaireSnapshotAnalysisSelection';
+  const ASSET_REVIEW_INTERFACE_KEY = 'questionnaireAssetReview';
+  const ASSET_REVIEW_SCRIPT_ID = 'qar-script';
+  const ASSET_REVIEW_SCRIPT_URL = '/static/js/features/research-asset-review.js?v=1';
   const HTTP_HIDE_STATUSES = new Set([401, 403, 404]);
   const CAPABILITY_KEYS = [
     'snapshot_catalog',
@@ -16,6 +19,7 @@
     'bested_original_questionnaire_upload',
     'screenshot_material_upload',
     'pdf_material_upload',
+    'asset_review_projection',
   ];
 
   const SOURCE_DEFS = [
@@ -139,6 +143,7 @@
   let catalogStatus = null;
   let catalogLoadMoreButton = null;
   let refreshButton = null;
+  let assetReviewModulePromise = null;
 
   function ensureStylesheet() {
     if (document.getElementById(STYLE_ID)) return;
@@ -288,6 +293,14 @@
 
   function canUseSnapshotForAnalysis(entry) {
     return snapshotAnalysisEnabled() && Number(entry?.question_count || 0) > 0;
+  }
+
+  function canReviewSnapshotAssets(entry) {
+    return !!(
+      panelState.capabilities
+      && panelState.capabilities.asset_review_projection === true
+      && Number(entry?.asset_reference_count || 0) > 0
+    );
   }
 
   function isSelectedForAnalysis(snapshotId) {
@@ -508,9 +521,11 @@
       hasLoaded: false,
     };
     panelState.selectedSnapshotId = '';
+    closeAssetReview();
   }
 
   function hidePanel(reason) {
+    closeAssetReview();
     reset();
     resetCatalogState();
     panelState.capabilities = null;
@@ -648,6 +663,42 @@
         top.append(titleWrap, badge);
         const metrics = el('div', 'qsrc-catalog__item-metrics', catalogMetrics(entry).join(' · ') || '仅保留安全摘要');
         row.append(top, metrics);
+        if (canReviewSnapshotAssets(entry)) {
+          const reviewActions = el('div', 'qsrc-catalog__item-actions');
+          const reviewNote = el(
+            'div',
+            'qsrc-catalog__item-selection-note',
+            '只读预览素材安全摘要；缩略图需逐项手动加载，确认结果尚未保存。',
+          );
+          const reviewButton = el(
+            'button',
+            'qsrc-btn qsrc-btn--ghost qsrc-catalog__item-action',
+            '查看素材',
+          );
+          reviewButton.type = 'button';
+          reviewButton.addEventListener('click', async () => {
+            reviewButton.disabled = true;
+            try {
+              const review = await loadAssetReviewModule();
+              if (!review || typeof review.openForSnapshot !== 'function') {
+                throw new Error('素材审阅模块暂时不可用');
+              }
+              if (!canReviewSnapshotAssets(entry)) {
+                throw new Error('素材审阅模块暂时不可用');
+              }
+              review.openForSnapshot(entry.snapshot_id, { trigger: reviewButton });
+            } catch (error) {
+              const message = error instanceof Error && error.message
+                ? error.message
+                : '素材审阅模块暂时不可用';
+              showUploadToast(message, 'error');
+            } finally {
+              reviewButton.disabled = false;
+            }
+          });
+          reviewActions.append(reviewNote, reviewButton);
+          row.appendChild(reviewActions);
+        }
         if (canUseSnapshotForAnalysis(entry)) {
           const actionWrap = el('div', 'qsrc-catalog__item-actions');
           const actionText = el(
@@ -820,6 +871,64 @@
     }
   }
 
+  function assetReviewApi() {
+    const candidate = window[ASSET_REVIEW_INTERFACE_KEY];
+    if (!candidate || typeof candidate !== 'object') return null;
+    return candidate;
+  }
+
+  function closeAssetReview() {
+    const review = assetReviewApi();
+    if (review && typeof review.close === 'function') {
+      review.close();
+    }
+  }
+
+  function removeAssetReviewScriptNode() {
+    const existing = document.getElementById(ASSET_REVIEW_SCRIPT_ID);
+    if (existing && existing.parentNode) existing.parentNode.removeChild(existing);
+  }
+
+  function loadAssetReviewModule() {
+    const ready = assetReviewApi();
+    if (ready) return Promise.resolve(ready);
+    if (assetReviewModulePromise) return assetReviewModulePromise;
+    assetReviewModulePromise = new Promise((resolve, reject) => {
+      removeAssetReviewScriptNode();
+      const script = document.createElement('script');
+      script.id = ASSET_REVIEW_SCRIPT_ID;
+      script.src = ASSET_REVIEW_SCRIPT_URL;
+      script.async = true;
+      const cleanup = () => {
+        script.removeEventListener('load', handleLoad);
+        script.removeEventListener('error', handleError);
+      };
+      const fail = message => {
+        cleanup();
+        assetReviewModulePromise = null;
+        removeAssetReviewScriptNode();
+        reject(new Error(message));
+      };
+      const handleLoad = () => {
+        const review = assetReviewApi();
+        if (!review) {
+          fail('素材审阅模块未正确注册');
+          return;
+        }
+        cleanup();
+        assetReviewModulePromise = Promise.resolve(review);
+        resolve(review);
+      };
+      const handleError = () => {
+        fail('素材审阅资源加载失败');
+      };
+      script.addEventListener('load', handleLoad, { once: true });
+      script.addEventListener('error', handleError, { once: true });
+      document.head.appendChild(script);
+    });
+    return assetReviewModulePromise;
+  }
+
   function responseErrorMessage(response, fallback) {
     return response.json()
       .then(parsed => (
@@ -987,18 +1096,23 @@
       const result = await fetchCapabilities(abortController.signal);
       if (panelState.capabilityRequestSerial !== requestSerial) return;
       if (result.hidden || !result.capabilities) {
+        closeAssetReview();
         panelState.capabilities = null;
         resetCatalogState();
         setPanelVisibility(false);
         return;
       }
       panelState.capabilities = result.capabilities;
+      if (panelState.capabilities.asset_review_projection !== true) {
+        closeAssetReview();
+      }
       renderCards();
       renderCatalog();
       setPanelVisibility(shouldShowPanel());
       if (shouldShowCatalog()) {
         refreshCatalog();
       } else {
+        closeAssetReview();
         resetCatalogState();
         renderCatalog();
       }
@@ -1006,6 +1120,7 @@
       if (abortController.signal.aborted || (error instanceof DOMException && error.name === 'AbortError')) {
         return;
       }
+      closeAssetReview();
       panelState.capabilities = null;
       resetCatalogState();
       setPanelVisibility(false);
