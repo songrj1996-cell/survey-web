@@ -315,6 +315,16 @@ APP_SETTINGS_FILE = os.path.join(DATA_DIR, "app_settings.json")
 UI_TEXTS_FILE = os.path.join(DATA_DIR, "ui_texts.json")
 GLOSSARY_FILE = os.path.join(DATA_DIR, "glossary.json")
 ANNOTATE_RESULT_DIR = Path(DATA_DIR) / "annotate_results"
+QUESTIONNAIRE_LOCAL_SOURCE_PREVIEW_ENABLED = _env_bool(
+    "QUESTIONNAIRE_LOCAL_SOURCE_PREVIEW_ENABLED",
+    False,
+)
+_research_asset_storage_dir = os.getenv("RESEARCH_ASSET_STORAGE_DIR", "").strip()
+RESEARCH_ASSET_STORAGE_DIR = (
+    Path(_research_asset_storage_dir)
+    if _research_asset_storage_dir
+    else Path(DATA_DIR) / "research_assets"
+)
 MAX_HISTORY  = 20
 MAX_REPORT_VERSIONS = 5
 MAX_AUDIT_LOGS = max(200, _env_int("AUDIT_LOG_MAX", 5000))

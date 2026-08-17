@@ -10,6 +10,10 @@ from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.core.config import COOKIE_NAME, FEISHU_LOGIN_REQUIRED
+from app.core.config import (
+    QUESTIONNAIRE_LOCAL_SOURCE_PREVIEW_ENABLED,
+    RESEARCH_ASSET_STORAGE_DIR,
+)
 from app.core.security import _forbidden_response, _is_public_path, _safe_next_path, _unauthorized_response
 from app.services.auth import _current_login, _login_allowed
 from app.storage.sessions import _sweep_old_sessions
@@ -69,6 +73,23 @@ from app.routers import (
     settings_api,
     survey,
 )
+
+if QUESTIONNAIRE_LOCAL_SOURCE_PREVIEW_ENABLED:
+    from app.routers.questionnaire_source_runtime import (
+        create_questionnaire_source_runtime_router,
+    )
+    from app.services.questionnaire_source_runtime import (
+        create_questionnaire_source_runtime,
+    )
+
+    _questionnaire_source_runtime = create_questionnaire_source_runtime(
+        RESEARCH_ASSET_STORAGE_DIR,
+    )
+    app.include_router(
+        create_questionnaire_source_runtime_router(
+            _questionnaire_source_runtime,
+        ),
+    )
 
 app.include_router(survey.router)
 app.include_router(settings_api.router)
