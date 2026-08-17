@@ -12,6 +12,7 @@ import httpx
 from pydantic import ValidationError
 
 from app.routers import (
+    questionnaire_asset_reviews as asset_review_router_module,
     questionnaire_pdf_materials as pdf_router_module,
     questionnaire_source_runtime as runtime_router_module,
     questionnaire_sources as sources_router_module,
@@ -31,6 +32,9 @@ from app.services.questionnaire_snapshot_api import (
 )
 from app.services.questionnaire_snapshot_analysis_api import (
     QuestionnaireSnapshotAnalysisApi,
+)
+from app.services.questionnaire_asset_review_api import (
+    QuestionnaireAssetReviewApi,
 )
 from app.services.questionnaire_source_runtime import (
     QuestionnaireSourceRuntime,
@@ -54,6 +58,7 @@ EXPECTED_CAPABILITIES = {
     "snapshot_package_upload": True,
     "snapshot_catalog": True,
     "snapshot_analysis_session": True,
+    "asset_review_projection": True,
     "bested_original_questionnaire_upload": True,
     "screenshot_material_upload": True,
     "pdf_material_upload": True,
@@ -68,6 +73,15 @@ EXPECTED_ROUTES = {
     (
         "POST",
         "/api/questionnaire-sources/snapshots/{snapshot_id}/analysis-sessions",
+    ),
+    (
+        "GET",
+        "/api/questionnaire-sources/snapshots/{snapshot_id}/asset-review",
+    ),
+    (
+        "GET",
+        "/api/questionnaire-sources/snapshots/{snapshot_id}"
+        "/asset-review/thumbnails/{asset_token}.png",
     ),
     ("GET", "/api/questionnaire-sources/snapshots/{snapshot_id}"),
     (
@@ -151,6 +165,7 @@ class QuestionnaireSourceRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "snapshot_package_upload": False,
             "snapshot_catalog": False,
             "snapshot_analysis_session": False,
+            "asset_review_projection": False,
             "bested_original_questionnaire_upload": False,
             "screenshot_material_upload": False,
             "pdf_material_upload": False,
@@ -183,6 +198,7 @@ class QuestionnaireSourceRuntimeTests(unittest.IsolatedAsyncioTestCase):
         for api in (
             self.runtime.snapshot_api,
             self.runtime.snapshot_analysis_api,
+            self.runtime.asset_review_api,
             self.runtime.bested_api,
             self.runtime.screenshot_material_api,
             self.runtime.pdf_material_api,
@@ -218,6 +234,7 @@ class QuestionnaireSourceRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 storage=self.runtime.storage,
                 snapshot_api=QuestionnaireSnapshotApi(other_storage),
                 snapshot_analysis_api=self.runtime.snapshot_analysis_api,
+                asset_review_api=self.runtime.asset_review_api,
                 bested_api=self.runtime.bested_api,
                 screenshot_material_api=self.runtime.screenshot_material_api,
                 pdf_material_api=self.runtime.pdf_material_api,
@@ -227,6 +244,7 @@ class QuestionnaireSourceRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 storage=self.runtime.storage,
                 snapshot_api=object(),
                 snapshot_analysis_api=self.runtime.snapshot_analysis_api,
+                asset_review_api=self.runtime.asset_review_api,
                 bested_api=self.runtime.bested_api,
                 screenshot_material_api=self.runtime.screenshot_material_api,
                 pdf_material_api=self.runtime.pdf_material_api,
@@ -238,6 +256,7 @@ class QuestionnaireSourceRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 snapshot_analysis_api=QuestionnaireSnapshotAnalysisApi(
                     other_storage
                 ),
+                asset_review_api=self.runtime.asset_review_api,
                 bested_api=self.runtime.bested_api,
                 screenshot_material_api=self.runtime.screenshot_material_api,
                 pdf_material_api=self.runtime.pdf_material_api,
@@ -247,6 +266,27 @@ class QuestionnaireSourceRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 storage=self.runtime.storage,
                 snapshot_api=self.runtime.snapshot_api,
                 snapshot_analysis_api=object(),
+                asset_review_api=self.runtime.asset_review_api,
+                bested_api=self.runtime.bested_api,
+                screenshot_material_api=self.runtime.screenshot_material_api,
+                pdf_material_api=self.runtime.pdf_material_api,
+            )
+        with self.assertRaisesRegex(ValueError, "共享 runtime.storage"):
+            QuestionnaireSourceRuntime(
+                storage=self.runtime.storage,
+                snapshot_api=self.runtime.snapshot_api,
+                snapshot_analysis_api=self.runtime.snapshot_analysis_api,
+                asset_review_api=QuestionnaireAssetReviewApi(other_storage),
+                bested_api=self.runtime.bested_api,
+                screenshot_material_api=self.runtime.screenshot_material_api,
+                pdf_material_api=self.runtime.pdf_material_api,
+            )
+        with self.assertRaisesRegex(TypeError, "asset_review_api"):
+            QuestionnaireSourceRuntime(
+                storage=self.runtime.storage,
+                snapshot_api=self.runtime.snapshot_api,
+                snapshot_analysis_api=self.runtime.snapshot_analysis_api,
+                asset_review_api=object(),
                 bested_api=self.runtime.bested_api,
                 screenshot_material_api=self.runtime.screenshot_material_api,
                 pdf_material_api=self.runtime.pdf_material_api,
@@ -383,6 +423,40 @@ class QuestionnaireSourceRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pdf_response.json(), {"detail": "pdf route denied"})
         deny_pdf.assert_awaited_once()
         self.assertEqual(deny_pdf.await_args.args[1], "survey")
+
+        deny_review = AsyncMock(side_effect=HTTPException(
+            status_code=403,
+            detail="asset review denied",
+        ))
+        review_requests = (
+            (
+                "/api/questionnaire-sources/snapshots/missing/asset-review"
+            ),
+            (
+                "/api/questionnaire-sources/snapshots/missing"
+                "/asset-review/thumbnails/"
+                f"{'0' * 64}.png"
+            ),
+        )
+        with patch.object(
+            asset_review_router_module,
+            "_require_feature",
+            new=deny_review,
+        ):
+            review_responses = [
+                await self._request("GET", path)
+                for path in review_requests
+            ]
+        self.assertTrue(all(
+            response.status_code == 403
+            and response.json() == {"detail": "asset review denied"}
+            for response in review_responses
+        ))
+        self.assertEqual(deny_review.await_count, len(review_requests))
+        self.assertTrue(all(
+            call.args[1] == "survey"
+            for call in deny_review.await_args_list
+        ))
 
     async def test_snapshot_storage_is_owner_isolated_through_runtime_api(self):
         archive, snapshot_id = _snapshot_archive(OWNER_REF)

@@ -6,6 +6,9 @@ from app.core.security import _owner_from_login
 from app.routers.questionnaire_pdf_materials import (
     create_questionnaire_pdf_material_sources_router,
 )
+from app.routers.questionnaire_asset_reviews import (
+    create_questionnaire_asset_reviews_router,
+)
 from app.routers.questionnaire_sources import (
     create_bested_questionnaire_sources_router,
     create_questionnaire_material_sources_router,
@@ -41,6 +44,9 @@ def create_questionnaire_source_runtime_router(
     ))
     router.include_router(create_questionnaire_snapshot_analysis_router(
         runtime.snapshot_analysis_api,
+    ))
+    router.include_router(create_questionnaire_asset_reviews_router(
+        runtime.asset_review_api,
     ))
     router.include_router(create_bested_questionnaire_sources_router(
         runtime.bested_api,

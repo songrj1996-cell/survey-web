@@ -14,6 +14,9 @@ from app.services.bested_questionnaire_snapshot_api import (
 from app.services.questionnaire_material_snapshot_api import (
     QuestionnaireMaterialSnapshotApi,
 )
+from app.services.questionnaire_asset_review_api import (
+    QuestionnaireAssetReviewApi,
+)
 from app.services.questionnaire_pdf_material_snapshot_api import (
     QuestionnairePdfMaterialSnapshotApi,
 )
@@ -31,6 +34,7 @@ class QuestionnaireSourceRuntime:
     storage: FileResearchAssetStorage
     snapshot_api: QuestionnaireSnapshotApi
     snapshot_analysis_api: QuestionnaireSnapshotAnalysisApi
+    asset_review_api: QuestionnaireAssetReviewApi
     bested_api: BestedQuestionnaireSnapshotApi
     screenshot_material_api: QuestionnaireMaterialSnapshotApi
     pdf_material_api: QuestionnairePdfMaterialSnapshotApi
@@ -48,6 +52,11 @@ class QuestionnaireSourceRuntime:
                 "snapshot_analysis_api",
                 self.snapshot_analysis_api,
                 QuestionnaireSnapshotAnalysisApi,
+            ),
+            (
+                "asset_review_api",
+                self.asset_review_api,
+                QuestionnaireAssetReviewApi,
             ),
             ("bested_api", self.bested_api, BestedQuestionnaireSnapshotApi),
             (
@@ -86,6 +95,7 @@ def create_questionnaire_source_runtime(
         storage=storage,
         snapshot_api=QuestionnaireSnapshotApi(storage),
         snapshot_analysis_api=QuestionnaireSnapshotAnalysisApi(storage),
+        asset_review_api=QuestionnaireAssetReviewApi(storage),
         bested_api=BestedQuestionnaireSnapshotApi(storage),
         screenshot_material_api=QuestionnaireMaterialSnapshotApi(storage),
         pdf_material_api=QuestionnairePdfMaterialSnapshotApi(storage),

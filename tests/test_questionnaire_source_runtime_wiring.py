@@ -22,6 +22,15 @@ EXPECTED_LOCAL_ROUTES = {
         "POST",
         "/api/questionnaire-sources/snapshots/{snapshot_id}/analysis-sessions",
     ),
+    (
+        "GET",
+        "/api/questionnaire-sources/snapshots/{snapshot_id}/asset-review",
+    ),
+    (
+        "GET",
+        "/api/questionnaire-sources/snapshots/{snapshot_id}"
+        "/asset-review/thumbnails/{asset_token}.png",
+    ),
     ("GET", "/api/questionnaire-sources/snapshots/{snapshot_id}"),
     (
         "GET",
@@ -214,7 +223,7 @@ class QuestionnaireSourceRuntimeWiringTests(unittest.TestCase):
         self.assertTrue(payload["runtime_bound"])
         self.assertTrue(payload["runtime_router_loaded"])
         self.assertTrue(payload["runtime_service_loaded"])
-        self.assertEqual(len(routes), 9)
+        self.assertEqual(len(routes), 11)
         self.assertEqual(len(routes), len(set(routes)))
         self.assertEqual(set(routes), EXPECTED_LOCAL_ROUTES)
         self.assertNotIn(
