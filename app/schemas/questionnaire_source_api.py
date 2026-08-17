@@ -23,6 +23,15 @@ GoogleFormId = Annotated[
     ),
 ]
 
+QuestionnaireSnapshotCatalogCursor = Annotated[
+    str,
+    StringConstraints(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    ),
+]
+
 
 class GoogleFormsSnapshotImportRequest(ContractModel):
     """Google Forms 授权导入请求；授权信息只来自服务端连接。"""
@@ -44,6 +53,14 @@ class QuestionnaireSnapshotSummary(ContractModel):
     asset_count: int = Field(ge=0)
     image_asset_count: int = Field(ge=0)
     asset_reference_count: int = Field(ge=0)
+
+
+class QuestionnaireSnapshotCatalogResponse(ContractModel):
+    """按当前用户隔离、且不暴露存储细节的快照目录。"""
+
+    schema_version: Literal[1] = 1
+    items: list[QuestionnaireSnapshotSummary] = Field(max_length=50)
+    next_cursor: QuestionnaireSnapshotCatalogCursor | None = None
 
 
 class QuestionnaireMaterialTrustLevel(str, Enum):

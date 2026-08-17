@@ -16,6 +16,7 @@ from app.core.security import _owner_from_login
 from app.schemas.questionnaire_source_api import (
     GoogleFormsSnapshotImportRequest,
     QuestionnaireMaterialUploadSummary,
+    QuestionnaireSnapshotCatalogResponse,
     QuestionnaireSnapshotSummary,
 )
 from app.services.auth import _require_feature
@@ -49,8 +50,11 @@ from app.services.questionnaire_material_snapshot_api import (
     QuestionnaireMaterialSnapshotApi,
 )
 from app.services.questionnaire_snapshot_api import (
+    DEFAULT_SNAPSHOT_CATALOG_LIMIT,
     MAX_SNAPSHOT_UPLOAD_BYTES,
+    MAX_SNAPSHOT_CATALOG_LIMIT,
     QuestionnaireSnapshotApi,
+    QuestionnaireSnapshotCatalogInvalidError,
     QuestionnaireSnapshotConflictError,
     QuestionnaireSnapshotInvalidError,
     QuestionnaireSnapshotNotFoundError,
@@ -76,6 +80,9 @@ _MAX_CONCURRENT_MATERIAL_UPLOADS = 1
 _MATERIAL_MULTIPART_OVERHEAD_BYTES = 256 * 1024
 _MATERIAL_UPLOAD_TIMEOUT_SECONDS = 120.0
 _MATERIAL_IMPORT_TIMEOUT_SECONDS = 180.0
+_CATALOG_INVALID_DETAIL = "问卷快照目录查询参数无效"
+_MAX_CONCURRENT_CATALOG_READS = 1
+_CATALOG_TIMEOUT_SECONDS = 30.0
 
 
 class _SnapshotRequestTooLarge(MultiPartException):
@@ -179,6 +186,11 @@ def _owner_key(login: dict | None) -> str:
 
 
 def _raise_http_error(error: Exception) -> None:
+    if isinstance(error, QuestionnaireSnapshotCatalogInvalidError):
+        raise HTTPException(
+            status_code=422,
+            detail=_CATALOG_INVALID_DETAIL,
+        ) from error
     if isinstance(error, QuestionnaireSnapshotInvalidError):
         raise HTTPException(status_code=422, detail=_INVALID_DETAIL) from error
     if isinstance(error, QuestionnaireSnapshotConflictError):
@@ -186,6 +198,50 @@ def _raise_http_error(error: Exception) -> None:
     if isinstance(error, QuestionnaireSnapshotNotFoundError):
         raise HTTPException(status_code=404, detail="问卷快照不存在") from error
     raise HTTPException(status_code=500, detail=_INTERNAL_DETAIL) from error
+
+
+def _parse_catalog_query(request: Request) -> tuple[str | None, int]:
+    values: dict[str, str] = {}
+    for key, value in request.query_params.multi_items():
+        if key not in {"cursor", "limit"} or key in values:
+            raise HTTPException(
+                status_code=422,
+                detail=_CATALOG_INVALID_DETAIL,
+            )
+        values[key] = value
+
+    cursor = values.get("cursor")
+    if (
+        cursor is not None
+        and (
+            len(cursor) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in cursor
+            )
+        )
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=_CATALOG_INVALID_DETAIL,
+        )
+
+    limit_value = values.get("limit")
+    if limit_value is None:
+        limit = DEFAULT_SNAPSHOT_CATALOG_LIMIT
+    elif not limit_value.isascii() or not limit_value.isdigit():
+        raise HTTPException(
+            status_code=422,
+            detail=_CATALOG_INVALID_DETAIL,
+        )
+    else:
+        limit = int(limit_value)
+        if limit < 1 or limit > MAX_SNAPSHOT_CATALOG_LIMIT:
+            raise HTTPException(
+                status_code=422,
+                detail=_CATALOG_INVALID_DETAIL,
+            )
+    return cursor, limit
 
 
 def _raise_bested_http_error(error: Exception) -> None:
@@ -571,6 +627,65 @@ def create_questionnaire_sources_router(
 
     router = APIRouter()
     package_read_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_DOWNLOADS)
+    catalog_read_semaphore = asyncio.Semaphore(
+        _MAX_CONCURRENT_CATALOG_READS
+    )
+
+    @router.get(
+        "/api/questionnaire-sources/snapshots",
+        response_model=QuestionnaireSnapshotCatalogResponse,
+    )
+    async def list_questionnaire_snapshots(
+        request: Request,
+    ) -> QuestionnaireSnapshotCatalogResponse:
+        login = await _require_feature(request, "survey")
+        owner_ref = _owner_key(login)
+        cursor, limit = _parse_catalog_query(request)
+        if catalog_read_semaphore.locked():
+            raise HTTPException(
+                status_code=429,
+                detail="已有问卷快照目录正在读取，请稍后重试",
+            )
+        await catalog_read_semaphore.acquire()
+        lease = _DownloadLease(catalog_read_semaphore)
+        list_task = asyncio.create_task(api.list_snapshots(
+            owner_ref,
+            cursor=cursor,
+            limit=limit,
+        ))
+        try:
+            result = await asyncio.wait_for(
+                asyncio.shield(list_task),
+                timeout=_CATALOG_TIMEOUT_SECONDS,
+            )
+        except TimeoutError as error:
+            if list_task.done():
+                _release_after_task(list_task, lease)
+            else:
+                list_task.add_done_callback(
+                    lambda task: _release_after_task(task, lease)
+                )
+            raise HTTPException(
+                status_code=504,
+                detail="问卷快照目录读取超时，请稍后重试",
+            ) from error
+        except asyncio.CancelledError:
+            if list_task.done():
+                _release_after_task(list_task, lease)
+            else:
+                list_task.add_done_callback(
+                    lambda task: _release_after_task(task, lease)
+                )
+            raise
+        except Exception as error:
+            lease.release()
+            _raise_http_error(error)
+            raise AssertionError("unreachable")
+        except BaseException:
+            lease.release()
+            raise
+        lease.release()
+        return result
 
     @router.post(
         "/api/questionnaire-sources/snapshots",

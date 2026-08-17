@@ -19,16 +19,23 @@ from app.routers.questionnaire_sources import (
 )
 from app.routers import questionnaire_sources as questionnaire_sources_router
 from app.schemas.questionnaire import QuestionnaireSnapshot
+from app.schemas.questionnaire_source_api import (
+    QuestionnaireSnapshotCatalogResponse,
+)
 from app.schemas.research_assets import MediaType, ResearchAssetCollection
 from app.services import questionnaire_snapshot_api as snapshot_api_module
 from app.services.questionnaire_snapshot_api import (
     QuestionnaireSnapshotApi,
+    QuestionnaireSnapshotCatalogInvalidError,
     QuestionnaireSnapshotInternalError,
     QuestionnaireSnapshotNotFoundError,
 )
 from app.storage.research_assets import (
     FileResearchAssetStorage,
+    ResearchAssetStorageError,
     ResearchAssetBundle,
+    SnapshotCatalogEntry,
+    SnapshotCatalogPage,
     SnapshotPackage,
     SnapshotPackageError,
     build_snapshot_package,
@@ -44,12 +51,15 @@ OWNER_REF = "email:snapshot-user@example.com"
 def _package_archive(
     owner_ref: str = OWNER_REF,
     *,
+    snapshot_id: str | None = None,
     title: str | None = None,
 ) -> tuple[bytes, SnapshotPackage]:
     payload = json.loads(
         (FIXTURE_DIR / "google_forms.json").read_text(encoding="utf-8")
     )
     snapshot = QuestionnaireSnapshot.model_validate(payload["snapshot"])
+    if snapshot_id is not None:
+        snapshot = snapshot.model_copy(update={"snapshot_id": snapshot_id})
     if title is not None:
         snapshot = snapshot.model_copy(update={"title": title})
     collection = ResearchAssetCollection.model_validate(payload["collection"])
@@ -76,6 +86,33 @@ def _package_archive(
     bundle = ResearchAssetBundle(snapshot, collection)
     package = SnapshotPackage(bundle, media)
     return build_snapshot_package(owner_ref, bundle, media), package
+
+
+def _catalog_entry(
+    package: SnapshotPackage,
+    owner_ref: str = OWNER_REF,
+) -> SnapshotCatalogEntry:
+    snapshot = package.bundle.snapshot
+    collection = package.bundle.collection
+    return SnapshotCatalogEntry(
+        owner_ref=owner_ref,
+        storage_key=hashlib.sha256(
+            snapshot.snapshot_id.encode("utf-8")
+        ).hexdigest(),
+        snapshot_id=snapshot.snapshot_id,
+        provider=snapshot.provider,
+        source_mode=snapshot.source_mode,
+        collection_state=snapshot.collection_state,
+        mapping_status=snapshot.mapping_status,
+        item_count=snapshot.item_count,
+        question_count=snapshot.question_count,
+        asset_count=snapshot.asset_count,
+        image_asset_count=sum(
+            asset.media_type == MediaType.IMAGE
+            for asset in collection.assets
+        ),
+        asset_reference_count=snapshot.asset_reference_count,
+    )
 
 
 class _SlowStorage:
@@ -132,6 +169,44 @@ class _CorruptLoadingStorage:
         package: SnapshotPackage,
     ) -> None:
         return None
+
+
+class _CatalogReturningStorage:
+    def __init__(
+        self,
+        page: object | None = None,
+        *,
+        error: Exception | None = None,
+        packages: dict[str, object] | None = None,
+    ) -> None:
+        self.page = page
+        self.error = error
+        self.packages = packages or {}
+        self.list_calls: list[tuple[str, str | None, int]] = []
+        self.load_calls: list[tuple[str, str]] = []
+
+    def load_snapshot_package(self, owner_ref: str, snapshot_id: str):
+        self.load_calls.append((owner_ref, snapshot_id))
+        return self.packages.get(snapshot_id)
+
+    def save_snapshot_package(
+        self,
+        owner_ref: str,
+        package: SnapshotPackage,
+    ) -> None:
+        return None
+
+    def list_snapshot_catalog(
+        self,
+        owner_ref: str,
+        *,
+        cursor: str | None = None,
+        limit: int = 20,
+    ):
+        self.list_calls.append((owner_ref, cursor, limit))
+        if self.error is not None:
+            raise self.error
+        return self.page
 
 
 class _ChunkedReceive:
@@ -254,6 +329,14 @@ class QuestionnaireSourceApiTests(unittest.IsolatedAsyncioTestCase):
             if route.path == path and "GET" in route.methods
         )
 
+    def _catalog_endpoint(self):
+        path = "/api/questionnaire-sources/snapshots"
+        return next(
+            route.endpoint
+            for route in self.router.routes
+            if route.path == path and "GET" in route.methods
+        )
+
     @staticmethod
     def _download_request() -> Request:
         return Request({
@@ -325,6 +408,517 @@ class QuestionnaireSourceApiTests(unittest.IsolatedAsyncioTestCase):
             self.temporary.name.casefold(),
         ):
             self.assertNotIn(forbidden.casefold(), serialized)
+
+    async def test_catalog_empty_pagination_owner_isolation_and_safe_fields(self):
+        empty = await self._request_api(
+            "GET",
+            "/api/questionnaire-sources/snapshots",
+        )
+        self.assertEqual(empty.status_code, 200)
+        self.assertEqual(empty.json(), {
+            "schema_version": 1,
+            "items": [],
+            "next_cursor": None,
+        })
+
+        _, second_package = _package_archive(
+            snapshot_id="qsn_catalog_second",
+        )
+        _, foreign_package = _package_archive(
+            "email:other@example.com",
+            snapshot_id="qsn_catalog_foreign",
+        )
+        self.storage.save_snapshot_package(OWNER_REF, self.package)
+        self.storage.save_snapshot_package(OWNER_REF, second_package)
+        self.storage.save_snapshot_package(
+            "email:other@example.com",
+            foreign_package,
+        )
+
+        first = await self._request_api(
+            "GET",
+            "/api/questionnaire-sources/snapshots?limit=1",
+        )
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(set(first.json()), {
+            "schema_version",
+            "items",
+            "next_cursor",
+        })
+        self.assertEqual(len(first.json()["items"]), 1)
+        cursor = first.json()["next_cursor"]
+        self.assertRegex(cursor, r"^[0-9a-f]{64}$")
+
+        second = await self._request_api(
+            "GET",
+            "/api/questionnaire-sources/snapshots",
+            params={"limit": "1", "cursor": cursor},
+        )
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(len(second.json()["items"]), 1)
+        self.assertIsNone(second.json()["next_cursor"])
+        summaries = first.json()["items"] + second.json()["items"]
+        self.assertEqual(
+            {item["snapshot_id"] for item in summaries},
+            {
+                self.package.bundle.snapshot.snapshot_id,
+                second_package.bundle.snapshot.snapshot_id,
+            },
+        )
+        expected_summary_fields = {
+            "schema_version",
+            "snapshot_id",
+            "provider",
+            "source_mode",
+            "collection_state",
+            "mapping_status",
+            "item_count",
+            "question_count",
+            "asset_count",
+            "image_asset_count",
+            "asset_reference_count",
+        }
+        self.assertTrue(all(
+            set(item) == expected_summary_fields
+            for item in summaries
+        ))
+
+        transport = httpx.ASGITransport(app=self.app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://test",
+        ) as client:
+            with patch(
+                "app.routers.questionnaire_sources._require_feature",
+                new=AsyncMock(return_value={"email": "other@example.com"}),
+            ):
+                foreign = await client.get(
+                    "/api/questionnaire-sources/snapshots"
+                )
+        self.assertEqual(foreign.status_code, 200)
+        self.assertEqual(
+            [item["snapshot_id"] for item in foreign.json()["items"]],
+            [foreign_package.bundle.snapshot.snapshot_id],
+        )
+
+        serialized = json.dumps(
+            first.json() | {"second": second.json()},
+            ensure_ascii=False,
+        ).casefold()
+        for forbidden in (
+            "owner_ref",
+            OWNER_REF,
+            "other@example.com",
+            "provider_raw_definition",
+            "manifest.json",
+            "media/",
+            self.temporary.name.casefold(),
+        ):
+            self.assertNotIn(forbidden.casefold(), serialized)
+
+    async def test_catalog_query_is_strict_and_forwards_valid_values(self):
+        cursor = "a" * 64
+        invalid_paths = (
+            "/api/questionnaire-sources/snapshots?unknown=1",
+            "/api/questionnaire-sources/snapshots?limit=1&limit=2",
+            (
+                "/api/questionnaire-sources/snapshots?cursor="
+                f"{cursor}&cursor={'b' * 64}"
+            ),
+            "/api/questionnaire-sources/snapshots?limit=",
+            "/api/questionnaire-sources/snapshots?limit=0",
+            "/api/questionnaire-sources/snapshots?limit=51",
+            "/api/questionnaire-sources/snapshots?limit=-1",
+            "/api/questionnaire-sources/snapshots?limit=1.0",
+            "/api/questionnaire-sources/snapshots?limit=%EF%BC%91",
+            "/api/questionnaire-sources/snapshots?cursor=",
+            "/api/questionnaire-sources/snapshots?cursor=ABCDEF",
+            "/api/questionnaire-sources/snapshots?cursor=not-opaque",
+        )
+        list_snapshots = AsyncMock()
+        with patch.object(
+            QuestionnaireSnapshotApi,
+            "list_snapshots",
+            new=list_snapshots,
+        ):
+            for path in invalid_paths:
+                with self.subTest(path=path):
+                    response = await self._request_api("GET", path)
+                    self.assertEqual(response.status_code, 422)
+                    self.assertEqual(response.json(), {
+                        "detail": "问卷快照目录查询参数无效",
+                    })
+        list_snapshots.assert_not_awaited()
+
+        response = QuestionnaireSnapshotCatalogResponse(items=[])
+        list_snapshots = AsyncMock(return_value=response)
+        with patch.object(
+            QuestionnaireSnapshotApi,
+            "list_snapshots",
+            new=list_snapshots,
+        ):
+            valid = await self._request_api(
+                "GET",
+                "/api/questionnaire-sources/snapshots",
+                params={"cursor": cursor, "limit": "7"},
+            )
+        self.assertEqual(valid.status_code, 200)
+        list_snapshots.assert_awaited_once_with(
+            OWNER_REF,
+            cursor=cursor,
+            limit=7,
+        )
+
+    async def test_catalog_service_rejects_invalid_cursor_and_limit(self):
+        storage = _CatalogReturningStorage(SnapshotCatalogPage((), None))
+        api = QuestionnaireSnapshotApi(storage)
+        empty = await api.list_snapshots(OWNER_REF)
+        self.assertEqual(empty, QuestionnaireSnapshotCatalogResponse(items=[]))
+        self.assertEqual(storage.list_calls, [(OWNER_REF, None, 20)])
+        storage.list_calls.clear()
+
+        invalid_arguments = (
+            {"cursor": ""},
+            {"cursor": "A" * 64},
+            {"cursor": "g" * 64},
+            {"cursor": "a" * 63},
+            {"limit": 0},
+            {"limit": 51},
+            {"limit": True},
+            {"limit": "20"},
+        )
+        for arguments in invalid_arguments:
+            with self.subTest(arguments=arguments):
+                with self.assertRaises(
+                    QuestionnaireSnapshotCatalogInvalidError
+                ):
+                    await api.list_snapshots(OWNER_REF, **arguments)
+        self.assertEqual(storage.list_calls, [])
+
+    async def test_catalog_service_consumes_lightweight_entries_without_load(self):
+        _, second_package = _package_archive(
+            snapshot_id="qsn_catalog_lightweight_second",
+        )
+        entries = sorted(
+            (_catalog_entry(self.package), _catalog_entry(second_package)),
+            key=lambda entry: entry.storage_key,
+        )
+        storage = _CatalogReturningStorage(
+            SnapshotCatalogPage(tuple(entries), None),
+            packages={
+                entry.snapshot_id: self.package
+                for entry in entries
+            },
+        )
+
+        response = await QuestionnaireSnapshotApi(storage).list_snapshots(
+            OWNER_REF,
+            limit=2,
+        )
+
+        self.assertEqual(
+            [item.snapshot_id for item in response.items],
+            [entry.snapshot_id for entry in entries],
+        )
+        self.assertEqual(storage.load_calls, [])
+
+    async def test_catalog_fails_closed_for_corrupt_storage_output(self):
+        _, foreign_package = _package_archive(
+            "email:other@example.com",
+            snapshot_id="qsn_catalog_foreign_corrupt",
+        )
+        local_entry = _catalog_entry(self.package)
+        foreign_entry = _catalog_entry(
+            foreign_package,
+            "email:other@example.com",
+        )
+        cases = (
+            _CatalogReturningStorage(
+                {"private": "/secret/catalog"},
+            ),
+            _CatalogReturningStorage(
+                SnapshotCatalogPage((foreign_entry,), None),
+            ),
+            _CatalogReturningStorage(
+                SnapshotCatalogPage((local_entry._replace(
+                    storage_key="0" * 64,
+                ),), None),
+            ),
+            _CatalogReturningStorage(
+                SnapshotCatalogPage((local_entry, local_entry), None),
+            ),
+            _CatalogReturningStorage(
+                SnapshotCatalogPage(("private-invalid-entry",), None),
+            ),
+            _CatalogReturningStorage(
+                SnapshotCatalogPage((local_entry,), "invalid-private-cursor"),
+            ),
+        )
+        for storage in cases:
+            with self.subTest(page_type=type(storage.page).__name__):
+                api = QuestionnaireSnapshotApi(storage)
+                with self.assertRaises(QuestionnaireSnapshotInternalError):
+                    await api.list_snapshots(OWNER_REF)
+
+        app = FastAPI()
+        app.include_router(create_questionnaire_sources_router(
+            QuestionnaireSnapshotApi(_CatalogReturningStorage(
+                SnapshotCatalogPage((foreign_entry,), None),
+            )),
+        ))
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://test",
+        ) as client:
+            with patch(
+                "app.routers.questionnaire_sources._require_feature",
+                new=AsyncMock(return_value=LOGIN),
+            ):
+                response = await client.get(
+                    "/api/questionnaire-sources/snapshots"
+                )
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json(), {
+            "detail": "问卷快照服务暂时不可用",
+        })
+        self.assertNotIn("other@example.com", response.text)
+
+    async def test_catalog_storage_failure_returns_generic_500(self):
+        storage = _CatalogReturningStorage(error=ResearchAssetStorageError(
+            "private catalog storage path",
+        ))
+        app = FastAPI()
+        app.include_router(create_questionnaire_sources_router(
+            QuestionnaireSnapshotApi(storage),
+        ))
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://test",
+        ) as client:
+            with patch(
+                "app.routers.questionnaire_sources._require_feature",
+                new=AsyncMock(return_value=LOGIN),
+            ):
+                response = await client.get(
+                    "/api/questionnaire-sources/snapshots"
+                )
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json(), {
+            "detail": "问卷快照服务暂时不可用",
+        })
+        self.assertNotIn("private catalog storage path", response.text)
+
+    async def test_catalog_authentication_precedes_query_and_storage(self):
+        storage = _CatalogReturningStorage(SnapshotCatalogPage((), None))
+        app = FastAPI()
+        app.include_router(create_questionnaire_sources_router(
+            QuestionnaireSnapshotApi(storage),
+        ))
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://test",
+        ) as client:
+            for status, login_or_error in (
+                (401, None),
+                (403, HTTPException(status_code=403, detail="denied")),
+            ):
+                with self.subTest(status=status):
+                    authorize = (
+                        AsyncMock(return_value=login_or_error)
+                        if status == 401
+                        else AsyncMock(side_effect=login_or_error)
+                    )
+                    with patch(
+                        "app.routers.questionnaire_sources._require_feature",
+                        new=authorize,
+                    ):
+                        response = await client.get(
+                            "/api/questionnaire-sources/snapshots"
+                            "?unknown=private-query"
+                        )
+                    self.assertEqual(response.status_code, status)
+        self.assertEqual(storage.list_calls, [])
+
+    async def test_catalog_admission_rejects_concurrent_read_without_new_task(self):
+        endpoint = self._catalog_endpoint()
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls: list[str] = []
+
+        async def fake_list(
+            api,
+            owner_ref: str,
+            cursor: str | None = None,
+            limit: int = 20,
+        ) -> QuestionnaireSnapshotCatalogResponse:
+            calls.append(owner_ref)
+            started.set()
+            await release.wait()
+            return QuestionnaireSnapshotCatalogResponse(items=[])
+
+        with (
+            patch.object(
+                QuestionnaireSnapshotApi,
+                "list_snapshots",
+                new=fake_list,
+            ),
+            patch(
+                "app.routers.questionnaire_sources._require_feature",
+                new=AsyncMock(return_value=LOGIN),
+            ),
+        ):
+            first = asyncio.create_task(endpoint(self._download_request()))
+            await asyncio.wait_for(started.wait(), timeout=1)
+            with self.assertRaises(HTTPException) as rejected:
+                await endpoint(self._download_request())
+            self.assertEqual(rejected.exception.status_code, 429)
+            self.assertEqual(
+                rejected.exception.detail,
+                "已有问卷快照目录正在读取，请稍后重试",
+            )
+            self.assertEqual(calls, [OWNER_REF])
+
+            release.set()
+            self.assertEqual(
+                await asyncio.wait_for(first, timeout=1),
+                QuestionnaireSnapshotCatalogResponse(items=[]),
+            )
+
+    async def test_cancelled_catalog_read_holds_admission_until_task_finishes(self):
+        endpoint = self._catalog_endpoint()
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls: list[str] = []
+
+        async def fake_list(
+            api,
+            owner_ref: str,
+            cursor: str | None = None,
+            limit: int = 20,
+        ) -> QuestionnaireSnapshotCatalogResponse:
+            calls.append(owner_ref)
+            if len(calls) == 1:
+                started.set()
+                await release.wait()
+            return QuestionnaireSnapshotCatalogResponse(items=[])
+
+        with (
+            patch.object(
+                QuestionnaireSnapshotApi,
+                "list_snapshots",
+                new=fake_list,
+            ),
+            patch(
+                "app.routers.questionnaire_sources._require_feature",
+                new=AsyncMock(return_value=LOGIN),
+            ),
+        ):
+            first = asyncio.create_task(endpoint(self._download_request()))
+            await asyncio.wait_for(started.wait(), timeout=1)
+            first.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await first
+
+            with self.assertRaises(HTTPException) as rejected:
+                await endpoint(self._download_request())
+            self.assertEqual(rejected.exception.status_code, 429)
+            self.assertEqual(
+                rejected.exception.detail,
+                "已有问卷快照目录正在读取，请稍后重试",
+            )
+            self.assertEqual(calls, [OWNER_REF])
+
+            release.set()
+            for _ in range(100):
+                await asyncio.sleep(0.005)
+                try:
+                    result = await endpoint(self._download_request())
+                except HTTPException as error:
+                    if error.status_code == 429:
+                        continue
+                    raise
+                break
+            else:
+                self.fail("catalog admission was not released")
+            self.assertEqual(
+                result,
+                QuestionnaireSnapshotCatalogResponse(items=[]),
+            )
+            self.assertEqual(calls, [OWNER_REF, OWNER_REF])
+
+    async def test_catalog_timeout_keeps_admission_until_task_finishes(self):
+        endpoint = self._catalog_endpoint()
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls: list[str] = []
+
+        async def fake_list(
+            api,
+            owner_ref: str,
+            cursor: str | None = None,
+            limit: int = 20,
+        ) -> QuestionnaireSnapshotCatalogResponse:
+            calls.append(owner_ref)
+            if len(calls) == 1:
+                started.set()
+                await release.wait()
+            return QuestionnaireSnapshotCatalogResponse(items=[])
+
+        with (
+            patch.object(
+                QuestionnaireSnapshotApi,
+                "list_snapshots",
+                new=fake_list,
+            ),
+            patch.object(
+                questionnaire_sources_router,
+                "_CATALOG_TIMEOUT_SECONDS",
+                0.02,
+            ),
+            patch(
+                "app.routers.questionnaire_sources._require_feature",
+                new=AsyncMock(return_value=LOGIN),
+            ),
+        ):
+            with self.assertRaises(HTTPException) as timed_out:
+                await endpoint(self._download_request())
+            self.assertEqual(timed_out.exception.status_code, 504)
+            self.assertEqual(
+                timed_out.exception.detail,
+                "问卷快照目录读取超时，请稍后重试",
+            )
+            self.assertTrue(started.is_set())
+
+            with self.assertRaises(HTTPException) as rejected:
+                await endpoint(self._download_request())
+            self.assertEqual(rejected.exception.status_code, 429)
+            self.assertEqual(
+                rejected.exception.detail,
+                "已有问卷快照目录正在读取，请稍后重试",
+            )
+            self.assertEqual(calls, [OWNER_REF])
+
+            release.set()
+            for _ in range(100):
+                await asyncio.sleep(0.005)
+                try:
+                    result = await endpoint(self._download_request())
+                except HTTPException as error:
+                    if error.status_code == 429:
+                        continue
+                    raise
+                break
+            else:
+                self.fail("timed-out catalog task did not release admission")
+            self.assertEqual(
+                result,
+                QuestionnaireSnapshotCatalogResponse(items=[]),
+            )
+            self.assertEqual(calls, [OWNER_REF, OWNER_REF])
 
     async def test_download_roundtrips_full_bundle_and_is_deterministic(self):
         created = await self._request_api(

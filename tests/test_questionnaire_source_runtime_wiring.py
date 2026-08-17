@@ -16,6 +16,7 @@ QUESTIONNAIRE_SOURCE_PREFIX = "/api/questionnaire-sources"
 
 EXPECTED_LOCAL_ROUTES = {
     ("GET", "/api/questionnaire-sources/capabilities"),
+    ("GET", "/api/questionnaire-sources/snapshots"),
     ("POST", "/api/questionnaire-sources/snapshots"),
     ("GET", "/api/questionnaire-sources/snapshots/{snapshot_id}"),
     (
@@ -209,7 +210,7 @@ class QuestionnaireSourceRuntimeWiringTests(unittest.TestCase):
         self.assertTrue(payload["runtime_bound"])
         self.assertTrue(payload["runtime_router_loaded"])
         self.assertTrue(payload["runtime_service_loaded"])
-        self.assertEqual(len(routes), 7)
+        self.assertEqual(len(routes), 8)
         self.assertEqual(len(routes), len(set(routes)))
         self.assertEqual(set(routes), EXPECTED_LOCAL_ROUTES)
         self.assertNotIn(

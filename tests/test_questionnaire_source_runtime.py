@@ -49,6 +49,7 @@ OTHER_OWNER_REF = "email:other-runtime-owner@example.com"
 EXPECTED_CAPABILITIES = {
     "schema_version": 1,
     "snapshot_package_upload": True,
+    "snapshot_catalog": True,
     "bested_original_questionnaire_upload": True,
     "screenshot_material_upload": True,
     "pdf_material_upload": True,
@@ -58,6 +59,7 @@ EXPECTED_CAPABILITIES = {
 
 EXPECTED_ROUTES = {
     ("GET", "/api/questionnaire-sources/capabilities"),
+    ("GET", "/api/questionnaire-sources/snapshots"),
     ("POST", "/api/questionnaire-sources/snapshots"),
     ("GET", "/api/questionnaire-sources/snapshots/{snapshot_id}"),
     (
@@ -139,6 +141,7 @@ class QuestionnaireSourceRuntimeTests(unittest.IsolatedAsyncioTestCase):
         invalid_values = {
             "schema_version": 2,
             "snapshot_package_upload": False,
+            "snapshot_catalog": False,
             "bested_original_questionnaire_upload": False,
             "screenshot_material_upload": False,
             "pdf_material_upload": False,
@@ -301,6 +304,7 @@ class QuestionnaireSourceRuntimeTests(unittest.IsolatedAsyncioTestCase):
             detail="source route denied",
         ))
         source_requests = (
+            ("GET", "/api/questionnaire-sources/snapshots"),
             ("POST", "/api/questionnaire-sources/snapshots"),
             ("GET", "/api/questionnaire-sources/snapshots/missing"),
             (
@@ -374,6 +378,17 @@ class QuestionnaireSourceRuntimeTests(unittest.IsolatedAsyncioTestCase):
             snapshot_id,
         )
         self.assertEqual(loaded, imported)
+
+        owner_catalog = await self.runtime.snapshot_api.list_snapshots(
+            OWNER_REF,
+        )
+        other_catalog = await self.runtime.snapshot_api.list_snapshots(
+            OTHER_OWNER_REF,
+        )
+        self.assertEqual(owner_catalog.items, [imported])
+        self.assertIsNone(owner_catalog.next_cursor)
+        self.assertEqual(other_catalog.items, [])
+        self.assertIsNone(other_catalog.next_cursor)
 
 
 if __name__ == "__main__":

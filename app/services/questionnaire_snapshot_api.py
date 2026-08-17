@@ -4,16 +4,29 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+import hashlib
+import re
 
-from app.schemas.questionnaire_source_api import QuestionnaireSnapshotSummary
-from app.schemas.research_assets import MediaType
+from app.schemas.questionnaire import (
+    CollectionState,
+    MappingStatus,
+    QuestionnaireSourceMode,
+)
+from app.schemas.questionnaire_source_api import (
+    QuestionnaireSnapshotCatalogResponse,
+    QuestionnaireSnapshotSummary,
+)
+from app.schemas.research_assets import MediaType, Provider
 from app.services.questionnaire_source_service import (
     load_questionnaire_source_snapshot,
 )
 from app.storage.research_assets import (
     SNAPSHOT_PACKAGE_MAX_ARCHIVE_BYTES,
     ResearchAssetStorageError,
+    ResearchSnapshotCatalogStorage,
     ResearchSnapshotStorage,
+    SnapshotCatalogEntry,
+    SnapshotCatalogPage,
     SnapshotConflictError,
     SnapshotPackage,
     SnapshotPackageError,
@@ -25,6 +38,9 @@ from app.storage.research_assets import (
 
 
 MAX_SNAPSHOT_UPLOAD_BYTES = SNAPSHOT_PACKAGE_MAX_ARCHIVE_BYTES
+MAX_SNAPSHOT_CATALOG_LIMIT = 50
+DEFAULT_SNAPSHOT_CATALOG_LIMIT = 20
+_SNAPSHOT_CATALOG_CURSOR_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
 class QuestionnaireSnapshotApiError(RuntimeError):
@@ -45,6 +61,10 @@ class QuestionnaireSnapshotNotFoundError(QuestionnaireSnapshotApiError):
 
 class QuestionnaireSnapshotInternalError(QuestionnaireSnapshotApiError):
     """不应向 HTTP 响应暴露细节的内部失败。"""
+
+
+class QuestionnaireSnapshotCatalogInvalidError(QuestionnaireSnapshotApiError):
+    """快照目录查询参数不满足稳定公开合同。"""
 
 
 def _require_owner(owner_ref: str) -> str:
@@ -137,6 +157,113 @@ def _validated_summary(
         expected_snapshot_id,
     )
     return _summary(validated)
+
+
+def _list_snapshot_summaries(
+    owner_ref: str,
+    cursor: str | None,
+    limit: int,
+    storage: ResearchSnapshotCatalogStorage,
+) -> QuestionnaireSnapshotCatalogResponse:
+    page = storage.list_snapshot_catalog(
+        owner_ref,
+        cursor=cursor,
+        limit=limit,
+    )
+    if not isinstance(page, SnapshotCatalogPage):
+        raise QuestionnaireSnapshotInternalError()
+    if (
+        not isinstance(page.entries, tuple)
+        or len(page.entries) > limit
+    ):
+        raise QuestionnaireSnapshotInternalError()
+    if (
+        page.next_cursor is not None
+        and (
+            not isinstance(page.next_cursor, str)
+            or _SNAPSHOT_CATALOG_CURSOR_PATTERN.fullmatch(
+                page.next_cursor
+            ) is None
+            or not page.entries
+            or (cursor is not None and page.next_cursor <= cursor)
+        )
+    ):
+        raise QuestionnaireSnapshotInternalError()
+
+    items: list[QuestionnaireSnapshotSummary] = []
+    storage_keys: list[str] = []
+    snapshot_ids: list[str] = []
+    for entry in page.entries:
+        if not isinstance(entry, SnapshotCatalogEntry):
+            raise QuestionnaireSnapshotInternalError()
+        if (
+            entry.owner_ref != owner_ref
+            or not isinstance(entry.snapshot_id, str)
+            or not entry.snapshot_id.strip()
+            or entry.snapshot_id != entry.snapshot_id.strip()
+            or not isinstance(entry.storage_key, str)
+            or _SNAPSHOT_CATALOG_CURSOR_PATTERN.fullmatch(
+                entry.storage_key
+            ) is None
+            or hashlib.sha256(entry.snapshot_id.encode("utf-8")).hexdigest()
+            != entry.storage_key
+            or not isinstance(entry.provider, Provider)
+            or not isinstance(entry.source_mode, QuestionnaireSourceMode)
+            or not isinstance(entry.collection_state, CollectionState)
+            or not isinstance(entry.mapping_status, MappingStatus)
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+                for value in (
+                    entry.item_count,
+                    entry.question_count,
+                    entry.asset_count,
+                    entry.image_asset_count,
+                    entry.asset_reference_count,
+                )
+            )
+        ):
+            raise QuestionnaireSnapshotInternalError()
+        storage_keys.append(entry.storage_key)
+        snapshot_ids.append(entry.snapshot_id)
+        try:
+            items.append(QuestionnaireSnapshotSummary(
+                snapshot_id=entry.snapshot_id,
+                provider=entry.provider,
+                source_mode=entry.source_mode,
+                collection_state=entry.collection_state,
+                mapping_status=entry.mapping_status,
+                item_count=entry.item_count,
+                question_count=entry.question_count,
+                asset_count=entry.asset_count,
+                image_asset_count=entry.image_asset_count,
+                asset_reference_count=entry.asset_reference_count,
+            ))
+        except Exception as error:
+            raise QuestionnaireSnapshotInternalError() from error
+    if (
+        storage_keys != sorted(storage_keys)
+        or len(storage_keys) != len(set(storage_keys))
+        or len(snapshot_ids) != len(set(snapshot_ids))
+        or (
+            cursor is not None
+            and storage_keys
+            and storage_keys[0] <= cursor
+        )
+        or (
+            page.next_cursor is not None
+            and page.next_cursor != storage_keys[-1]
+        )
+    ):
+        raise QuestionnaireSnapshotInternalError()
+    try:
+        return QuestionnaireSnapshotCatalogResponse(
+            items=items,
+            next_cursor=page.next_cursor,
+        )
+    except Exception as error:
+        raise QuestionnaireSnapshotInternalError() from error
 
 
 def _validated_package_bytes(
@@ -289,6 +416,43 @@ class QuestionnaireSnapshotApi:
         except Exception as error:
             raise QuestionnaireSnapshotInternalError() from error
         return summary
+
+    async def list_snapshots(
+        self,
+        owner_ref: str,
+        cursor: str | None = None,
+        limit: int = DEFAULT_SNAPSHOT_CATALOG_LIMIT,
+    ) -> QuestionnaireSnapshotCatalogResponse:
+        owner = _require_owner(owner_ref)
+        if (
+            cursor is not None
+            and (
+                not isinstance(cursor, str)
+                or _SNAPSHOT_CATALOG_CURSOR_PATTERN.fullmatch(cursor) is None
+            )
+        ):
+            raise QuestionnaireSnapshotCatalogInvalidError()
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or limit < 1
+            or limit > MAX_SNAPSHOT_CATALOG_LIMIT
+        ):
+            raise QuestionnaireSnapshotCatalogInvalidError()
+        if not isinstance(self.storage, ResearchSnapshotCatalogStorage):
+            raise QuestionnaireSnapshotInternalError()
+        try:
+            return await asyncio.to_thread(
+                _list_snapshot_summaries,
+                owner,
+                cursor,
+                limit,
+                self.storage,
+            )
+        except QuestionnaireSnapshotApiError:
+            raise
+        except Exception as error:
+            raise QuestionnaireSnapshotInternalError() from error
 
     async def get_snapshot(
         self,
