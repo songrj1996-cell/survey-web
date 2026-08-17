@@ -14,10 +14,17 @@ SCRIPT_PATH = (
     PROJECT_ROOT / "static" / "js" / "features"
     / "questionnaire-sources.js"
 )
+SURVEY_SCRIPT_PATH = (
+    PROJECT_ROOT / "static" / "js" / "features"
+    / "survey.js"
+)
 STYLESHEET_PATH = PROJECT_ROOT / "static" / "questionnaire-sources.css"
 
 SCRIPT_URL = "/static/js/features/questionnaire-sources.js"
 STYLESHEET_URL = "/static/questionnaire-sources.css"
+SNAPSHOT_ANALYSIS_UPLOAD_PATH = (
+    "/api/questionnaire-sources/snapshots/{snapshot_id}/analysis-sessions"
+)
 
 CAPABILITIES_URL = "/api/questionnaire-sources/capabilities"
 SNAPSHOTS_URL = "/api/questionnaire-sources/snapshots"
@@ -341,6 +348,7 @@ class QuestionnaireSourceFrontendContractTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.index_html = INDEX_PATH.read_text(encoding="utf-8")
         cls.javascript = SCRIPT_PATH.read_text(encoding="utf-8")
+        cls.survey_javascript = SURVEY_SCRIPT_PATH.read_text(encoding="utf-8")
         cls.stylesheet = STYLESHEET_PATH.read_text(encoding="utf-8")
 
     def test_index_loads_single_independent_script_in_safe_order(self):
@@ -745,6 +753,62 @@ class QuestionnaireSourceFrontendContractTests(unittest.TestCase):
             "当前报告已引用",
         ):
             self.assertNotIn(misleading, self.javascript)
+
+    def test_snapshot_analysis_selection_interface_is_minimal_and_frozen(self):
+        self.assertIn("snapshot_analysis_session", self.javascript)
+        self.assertIn(
+            "Object.defineProperty(window, SNAPSHOT_ANALYSIS_INTERFACE_KEY",
+            self.javascript,
+        )
+        self.assertIn("Object.freeze({", self.javascript)
+        self.assertIn("getSelectedSnapshotId", self.javascript)
+        self.assertIn("reset: () => resetAnalysisSelection()", self.javascript)
+        for forbidden in ("owner", "raw", "media", "token"):
+            self.assertNotRegex(
+                self.javascript,
+                rf"\b{forbidden}\b",
+            )
+
+    def test_catalog_selection_copy_requires_structure_and_excludes_images(self):
+        self.assertIn("用于本次分析", self.javascript)
+        self.assertIn("取消使用", self.javascript)
+        self.assertIn("图片不会自动进入报告", self.javascript)
+        self.assertRegex(
+            self.javascript,
+            r"Number\(entry\?\.(?:question_count|question_count)\s*\|\|\s*0\)\s*>\s*0",
+        )
+        self.assertIn("'aria-pressed'", self.javascript)
+
+    def test_survey_upload_uses_snapshot_analysis_endpoint_when_selected(self):
+        self.assertIn(
+            "encodeURIComponent(normalized)",
+            self.survey_javascript,
+        )
+        self.assertIn("/analysis-sessions", self.survey_javascript)
+        self.assertIn("selectedSnapshotIdForAnalysis()", self.survey_javascript)
+        self.assertIn("currentUploadEndpoint(snapshotId)", self.survey_javascript)
+        self.assertIn(
+            "if (!snapshotId) {\n    fd.append('source_type', sourceType);\n    if (questionnaireFile) fd.append('questionnaire_file', questionnaireFile);\n  }",
+            self.survey_javascript,
+        )
+        self.assertIn("resetSelectedSnapshotAnalysis();", self.survey_javascript)
+        self.assertIn("已选择问卷结构快照", self.survey_javascript)
+        self.assertIn("图片不会自动进入报告", self.survey_javascript)
+
+    def test_survey_upload_guards_duplicates_abort_and_safe_errors(self):
+        self.assertIn("abortSurveyUpload();", self.survey_javascript)
+        self.assertIn("new AbortController()", self.survey_javascript)
+        self.assertIn("signal: abortController.signal", self.survey_javascript)
+        self.assertGreaterEqual(
+            len(re.findall(
+                r"surveyUploadRequestSerial\s*!==\s*requestSerial",
+                self.survey_javascript,
+            )),
+            3,
+        )
+        self.assertIn("responseDetailMessage(resp, fallback)", self.survey_javascript)
+        self.assertIn("resp.status === 409", self.survey_javascript)
+        self.assertIn("resp.status === 422", self.survey_javascript)
 
     def test_snapshot_catalog_contract_is_safe_and_paged(self):
         self.assertIn("snapshot_catalog", self.javascript)

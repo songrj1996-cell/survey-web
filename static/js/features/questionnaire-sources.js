@@ -8,6 +8,7 @@
   const SNAPSHOT_CATALOG_LIMIT = 20;
   const CAPABILITIES_URL = '/api/questionnaire-sources/capabilities';
   const SNAPSHOTS_ENDPOINT = '/api/questionnaire-sources/snapshots';
+  const SNAPSHOT_ANALYSIS_INTERFACE_KEY = 'questionnaireSnapshotAnalysisSelection';
   const HTTP_HIDE_STATUSES = new Set([401, 403, 404]);
   const CAPABILITY_KEYS = [
     'snapshot_catalog',
@@ -128,6 +129,7 @@
     },
     capabilityRequestSerial: 0,
     capabilityAbortController: null,
+    selectedSnapshotId: '',
   };
 
   let panel = null;
@@ -260,6 +262,66 @@
     return !!(panelState.capabilities && panelState.capabilities.snapshot_catalog === true);
   }
 
+  function snapshotAnalysisEnabled() {
+    return !!(panelState.capabilities && panelState.capabilities.snapshot_analysis_session === true);
+  }
+
+  function selectedSnapshotId() {
+    return typeof panelState.selectedSnapshotId === 'string' ? panelState.selectedSnapshotId : '';
+  }
+
+  function resetAnalysisSelection() {
+    if (!selectedSnapshotId()) return;
+    panelState.selectedSnapshotId = '';
+    renderCatalog();
+  }
+
+  function setSelectedSnapshotId(snapshotId) {
+    const normalized = typeof snapshotId === 'string' ? snapshotId.trim() : '';
+    if (!normalized) {
+      resetAnalysisSelection();
+      return;
+    }
+    panelState.selectedSnapshotId = normalized;
+    renderCatalog();
+  }
+
+  function canUseSnapshotForAnalysis(entry) {
+    return snapshotAnalysisEnabled() && Number(entry?.question_count || 0) > 0;
+  }
+
+  function isSelectedForAnalysis(snapshotId) {
+    return selectedSnapshotId() === snapshotId;
+  }
+
+  function catalogSelectionHintText() {
+    if (!snapshotAnalysisEnabled()) {
+      return '当前批次仍只负责独立保存快照，不会自动进入报告流程。';
+    }
+    if (!selectedSnapshotId()) {
+      return '可为本次标准分析选 1 份结构快照；当前批次只接结构，图片不会自动进入报告。';
+    }
+    return `已选择快照 ${selectedSnapshotId()}：后续上传回答数据时会按这份结构创建标准分析 session，图片不会自动进入报告。`;
+  }
+
+  function exposeSnapshotAnalysisSelection() {
+    const api = Object.freeze({
+      getSelectedSnapshotId: () => selectedSnapshotId(),
+      reset: () => resetAnalysisSelection(),
+    });
+    const descriptor = Object.getOwnPropertyDescriptor(
+      window,
+      SNAPSHOT_ANALYSIS_INTERFACE_KEY,
+    );
+    if (descriptor && descriptor.value === api) return;
+    Object.defineProperty(window, SNAPSHOT_ANALYSIS_INTERFACE_KEY, {
+      value: api,
+      configurable: true,
+      enumerable: false,
+      writable: false,
+    });
+  }
+
   function shouldShowPanel() {
     return supportedSources().length > 0 || shouldShowCatalog();
   }
@@ -278,6 +340,7 @@
       if (typeof payload[key] !== 'boolean') return null;
       normalized[key] = payload[key];
     }
+    normalized.snapshot_analysis_session = payload.snapshot_analysis_session === true;
     return normalized;
   }
 
@@ -444,6 +507,7 @@
       abortController: null,
       hasLoaded: false,
     };
+    panelState.selectedSnapshotId = '';
   }
 
   function hidePanel(reason) {
@@ -566,8 +630,13 @@
       const empty = el('div', 'qsrc-catalog__empty', catalogState.phase === 'loading' ? '正在读取已保存快照…' : '当前还没有可显示的已保存快照');
       catalogList.appendChild(empty);
     } else {
+      const availableIds = new Set(catalogState.items.map(entry => entry.snapshot_id));
+      if (selectedSnapshotId() && !availableIds.has(selectedSnapshotId())) {
+        panelState.selectedSnapshotId = '';
+      }
       const items = catalogState.items.map(entry => {
         const row = el('article', 'qsrc-catalog__item');
+        if (isSelectedForAnalysis(entry.snapshot_id)) row.classList.add('is-selected');
         const top = el('div', 'qsrc-catalog__item-top');
         const titleWrap = el('div', 'qsrc-catalog__item-title-wrap');
         titleWrap.append(
@@ -579,6 +648,37 @@
         top.append(titleWrap, badge);
         const metrics = el('div', 'qsrc-catalog__item-metrics', catalogMetrics(entry).join(' · ') || '仅保留安全摘要');
         row.append(top, metrics);
+        if (canUseSnapshotForAnalysis(entry)) {
+          const actionWrap = el('div', 'qsrc-catalog__item-actions');
+          const actionText = el(
+            'div',
+            'qsrc-catalog__item-selection-note',
+            isSelectedForAnalysis(entry.snapshot_id)
+              ? '当前回答文件会按这份快照结构进入标准分析，图片不会自动进入报告。'
+              : '仅把这份快照的结构用于本次标准分析，图片不会自动进入报告。',
+          );
+          const actionButton = el(
+            'button',
+            isSelectedForAnalysis(entry.snapshot_id)
+              ? 'qsrc-btn qsrc-btn--ghost qsrc-catalog__item-action'
+              : 'qsrc-btn qsrc-btn--primary qsrc-catalog__item-action',
+            isSelectedForAnalysis(entry.snapshot_id) ? '取消使用' : '用于本次分析',
+          );
+          actionButton.type = 'button';
+          actionButton.setAttribute(
+            'aria-pressed',
+            isSelectedForAnalysis(entry.snapshot_id) ? 'true' : 'false',
+          );
+          actionButton.addEventListener('click', () => {
+            if (isSelectedForAnalysis(entry.snapshot_id)) {
+              resetAnalysisSelection();
+            } else {
+              setSelectedSnapshotId(entry.snapshot_id);
+            }
+          });
+          actionWrap.append(actionText, actionButton);
+          row.appendChild(actionWrap);
+        }
         return row;
       });
       catalogList.replaceChildren(...items);
@@ -591,7 +691,7 @@
       catalogStatus.textContent = catalogState.message;
       catalogStatus.classList.add('is-error');
     } else if (catalogState.hasLoaded && !catalogState.nextCursor) {
-      catalogStatus.textContent = catalogState.items.length ? '已显示当前可读取的快照摘要' : '目录为空，可先保存一个本地快照';
+      catalogStatus.textContent = catalogState.items.length ? catalogSelectionHintText() : '目录为空，可先保存一个本地快照';
     }
 
     if (catalogState.nextCursor) {
@@ -922,6 +1022,7 @@
 
   function bootstrap() {
     ensureStylesheet();
+    exposeSnapshotAnalysisSelection();
     if (!mountPanel()) return;
     refresh();
   }

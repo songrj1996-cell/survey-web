@@ -7,11 +7,15 @@ from unittest.mock import patch
 
 import openpyxl
 from fastapi import HTTPException
+from survey_plan import expand_confirmed_to_columns
+from survey_stats import compute
 
 from app.services.questionnaire_import import (
+    BestedResponseQuestionDefinition,
     BestedQuestionnaireParseResult,
     apply_questionnaire_translations,
     build_questionnaire_translation_query,
+    match_bested_response_workbook,
     parse_bested_questionnaire,
     parse_bested_qualitative_upload,
     parse_questionnaire_translations,
@@ -170,6 +174,48 @@ class BestedQuestionnaireImportTests(unittest.TestCase):
         self.assertIsInstance(imported["questionnaire_text"], str)
         self.assertEqual(imported["matched_questions"], 3)
 
+    def test_public_response_matcher_reuses_legacy_alignment_without_changing_output(self):
+        legacy = parse_bested_qualitative_upload(
+            _response_bytes(),
+            _questionnaire_bytes(),
+        )
+        matched = match_bested_response_workbook(
+            _response_bytes(),
+            [
+                BestedResponseQuestionDefinition(
+                    question_id="canonical-q1",
+                    qid=1,
+                    title="常用模式",
+                    role="multi_choice",
+                    options=("排位", "经典"),
+                ),
+                BestedResponseQuestionDefinition(
+                    question_id="canonical-q2",
+                    qid=2,
+                    title="功能评价",
+                    role="matrix_single",
+                    options=("满意", "一般", "不满意"),
+                    rows=("易用性", "稳定性"),
+                ),
+                BestedResponseQuestionDefinition(
+                    question_id="canonical-q3",
+                    qid=3,
+                    title="WhatsApp 联系方式",
+                    role="open_text",
+                ),
+            ],
+            questionnaire_text=legacy["questionnaire_text"],
+        )
+
+        self.assertEqual(
+            {key: matched[key] for key in legacy},
+            legacy,
+        )
+        self.assertEqual(
+            [binding["question_id"] for binding in matched["bindings"]],
+            ["canonical-q1", "canonical-q2", "canonical-q3"],
+        )
+
     def test_same_column_multi_choice_matches_full_options_with_commas(self):
         questionnaire = _workbook_bytes({
             "问卷内容": [
@@ -223,6 +269,131 @@ class BestedQuestionnaireImportTests(unittest.TestCase):
                 _response_bytes("功能评价__速度"),
                 _questionnaire_bytes(),
             )
+
+    def test_legacy_duplicate_titles_follow_response_cursor_order(self):
+        questionnaire = _workbook_bytes({
+            "问卷内容": [
+                ["题号", "题目"],
+                ["Q1[填空题]", "补充建议"],
+                ["Q2[填空题]", "补充建议"],
+            ],
+        })
+        response = _workbook_bytes({
+            "data": [
+                ["补充建议", "补充建议"],
+                ["第一列", "第二列"],
+            ],
+            "code": [
+                ["1", "Q1.补充建议"],
+                ["2", "Q2.补充建议"],
+            ],
+        })
+
+        imported = parse_bested_qualitative_upload(response, questionnaire)
+
+        self.assertEqual(imported["rows"], [
+            ["补充建议", "补充建议"],
+            ["第一列", "第二列"],
+        ])
+        self.assertEqual(imported["matched_questions"], 2)
+
+    def test_strict_snapshot_match_rejects_duplicate_normalized_headers(self):
+        response = _workbook_bytes({
+            "data": [
+                ["补充建议", "  补充建议  "],
+                ["第一列", "第二列"],
+            ],
+            "code": [["1", "Q1.补充建议"]],
+        })
+        with self.assertRaisesRegex(ValueError, "多个规范化同名回答列"):
+            match_bested_response_workbook(
+                response,
+                [BestedResponseQuestionDefinition(
+                    question_id="canonical-q1",
+                    qid=1,
+                    title="补充建议",
+                    role="open_text",
+                )],
+                questionnaire_text="Q1 补充建议",
+                strict_snapshot_binding=True,
+            )
+
+    def test_legacy_response_may_cover_questionnaire_subset(self):
+        response = _workbook_bytes({
+            "data": [
+                ["WhatsApp 联系方式"],
+                ["123"],
+            ],
+            "code": [
+                ["编码", "题目"],
+                ["3", "Q3.WhatsApp 联系方式"],
+            ],
+        })
+
+        imported = parse_bested_qualitative_upload(
+            response,
+            _questionnaire_bytes(),
+        )
+
+        self.assertEqual(imported["matched_questions"], 1)
+        self.assertEqual(imported["rows"], [
+            ["WhatsApp 联系方式"],
+            ["123"],
+        ])
+
+    def test_matrix_multi_values_are_normalized_before_stats_split(self):
+        questionnaire = _workbook_bytes({
+            "问卷内容": [
+                ["题号", "题目"],
+                ["Q1[矩阵多选题]", "功能偏好"],
+                ["选项", ""],
+                ["1", "流畅"],
+                ["2", "经典, 娱乐"],
+                ["矩阵行", ""],
+                ["1", "客户端"],
+                ["2", "服务器"],
+            ],
+        })
+        response = _workbook_bytes({
+            "data": [
+                ["功能偏好__客户端", "功能偏好__服务器"],
+                ["流畅,经典, 娱乐", "经典, 娱乐"],
+                ["流畅", ""],
+            ],
+            "code": [["1", "Q1.功能偏好"]],
+        })
+
+        imported = parse_bested_qualitative_upload(response, questionnaire)
+
+        self.assertEqual(imported["rows"][1], ["流畅\n经典, 娱乐", "经典, 娱乐"])
+        columns = expand_confirmed_to_columns(imported["questions"])
+        stats, _open_text = compute(imported["rows"], {
+            "columns": columns,
+            "parts": [{"name": "偏好", "column_indexes": [0, 1]}],
+        })
+        self.assertIn("矩阵多选", stats)
+        self.assertIn("| 客户端 | 2 (100.0%) | 1 (50.0%) | 2 |", stats)
+        self.assertIn("| 服务器 | 0 (0.0%) | 1 (100.0%) | 1 |", stats)
+
+    def test_matrix_multi_unknown_value_fails_closed(self):
+        questionnaire = _workbook_bytes({
+            "问卷内容": [
+                ["题号", "题目"],
+                ["Q1[矩阵多选题]", "功能偏好"],
+                ["选项", ""],
+                ["1", "流畅"],
+                ["2", "经典"],
+                ["矩阵行", ""],
+                ["1", "客户端"],
+            ],
+        })
+        response = _workbook_bytes({
+            "data": [["功能偏好__客户端"], ["流畅,未知"]],
+            "code": [["1", "Q1.功能偏好"]],
+        })
+
+        with self.assertRaisesRegex(ValueError, "多选答案无法按原问卷选项匹配"):
+            parse_bested_qualitative_upload(response, questionnaire)
 
     def test_translation_changes_only_text_and_keeps_original_value_aliases(self):
         questions = [{

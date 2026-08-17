@@ -14,6 +14,12 @@ from fastapi import HTTPException
 from app.routers import survey as survey_router
 from app.schemas.requests import QualitativeContextRequest, ReportVersionRequest
 from app.services import report_history, report_versions, survey_service
+from app.services.questionnaire_snapshot_binding import (
+    SnapshotDetectedColumn,
+    SnapshotProvenance,
+    SnapshotResponseBinding,
+    SnapshotSurveyBinding,
+)
 from app.storage import history as history_storage
 from app.storage import sessions as session_storage
 
@@ -203,6 +209,86 @@ class DuplicateUploadAndMatchTests(
             hashlib.sha256(questionnaire_bytes).hexdigest(),
         )
         self.assertTrue(bested_session["questionnaire_used"])
+
+    async def test_saved_snapshot_binding_persists_safe_identity_and_columns(self):
+        package_sha256 = "a" * 64
+        binding = SnapshotSurveyBinding(
+            rows=(("反馈", "role_id"), ("很好", "player-1")),
+            columns_detected=(
+                SnapshotDetectedColumn(
+                    name_zh="反馈",
+                    role="open_text",
+                    column_indexes=(0,),
+                    source_question_id="question-1",
+                ),
+                SnapshotDetectedColumn(
+                    name_zh="role_id",
+                    role="id",
+                    column_indexes=(1,),
+                ),
+            ),
+            questionnaire_text="question-1 [open_text] 反馈",
+            matched_questions=1,
+            package_sha256=package_sha256,
+            provenance=SnapshotProvenance(
+                snapshot_id="snapshot-safe-1",
+                package_sha256=package_sha256,
+                definition_sha256="b" * 64,
+                provider="google_forms",
+                source_mode="official_api",
+                mapping_status="exact",
+                question_count=1,
+                asset_count=0,
+                asset_reference_count=0,
+            ),
+            response_bindings=(
+                SnapshotResponseBinding(
+                    question_id="question-1",
+                    column_indexes=(0,),
+                    mapping_method="provider_response_key",
+                    mapping_status="exact",
+                    confidence=1.0,
+                ),
+            ),
+            provider="google_forms",
+            source_type="google",
+        )
+
+        uploaded = await survey_service.handle_survey_upload(
+            "responses.csv",
+            FILE_BYTES,
+            LOGIN,
+            bound_questionnaire=binding,
+        )
+        session = session_storage.get_session(uploaded["session_id"])
+
+        self.assertEqual(uploaded["questionnaire_snapshot_id"], "snapshot-safe-1")
+        self.assertEqual(uploaded["matched_questions"], 1)
+        self.assertEqual(session["rows"], [["反馈", "role_id"], ["很好", "player-1"]])
+        self.assertEqual(session["questionnaire_sha256"], package_sha256)
+        self.assertEqual(session["questionnaire_input_kind"], "saved_snapshot")
+        self.assertEqual(session["column_provider"], "questionnaire")
+        self.assertEqual(
+            session["questionnaire_snapshot_ref"],
+            binding.session_snapshot_ref(),
+        )
+        self.assertEqual(
+            session["questionnaire_response_bindings"],
+            binding.session_response_bindings(),
+        )
+        self.assertNotIn("owner_ref", session["questionnaire_snapshot_ref"])
+        self.assertNotIn("media", session["questionnaire_snapshot_ref"])
+
+        with self.assertRaises(HTTPException) as raised:
+            await survey_service.handle_survey_upload(
+                "responses.csv",
+                FILE_BYTES,
+                LOGIN,
+                questionnaire_filename="questionnaire.xlsx",
+                questionnaire_content=b"questionnaire",
+                bound_questionnaire=binding,
+            )
+        self.assertEqual(raised.exception.status_code, 400)
 
     async def test_context_match_uses_owner_file_and_normalized_background(self):
         history_id, _ = self._archive_v1()

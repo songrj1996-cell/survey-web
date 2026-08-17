@@ -15,6 +15,7 @@ class QuestionnaireSourceCapabilities(ContractModel):
     schema_version: Literal[1] = 1
     snapshot_package_upload: Literal[True] = True
     snapshot_catalog: Literal[True] = True
+    snapshot_analysis_session: Literal[True] = True
     bested_original_questionnaire_upload: Literal[True] = True
     screenshot_material_upload: Literal[True] = True
     pdf_material_upload: Literal[True] = True

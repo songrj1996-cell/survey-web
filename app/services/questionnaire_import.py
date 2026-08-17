@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import csv
 import io
 import json
 import re
+from dataclasses import dataclass
+from typing import Sequence
 
 import openpyxl
 
@@ -13,6 +16,10 @@ from app.integrations.bested_questionnaire_client import (
     BestedQuestionnaireImage,
     BestedQuestionnaireParseResult,
     BestedQuestionnaireQuestion,
+    _XLSX_MAX_CELLS_PER_SHEET,
+    _XLSX_MAX_COLUMNS_PER_SHEET,
+    _XLSX_MAX_ROWS_PER_SHEET,
+    _validate_xlsx_package,
     parse_bested_questionnaire,
 )
 
@@ -24,11 +31,24 @@ _CHINESE_RE = re.compile(r"[\u4e00-\u9fff]")
 _LATIN_RE = re.compile(r"[A-Za-z]")
 
 
+@dataclass(frozen=True, slots=True)
+class BestedResponseQuestionDefinition:
+    """匹配倍市得回答导出所需的最小、不可变题目定义。"""
+
+    question_id: str
+    qid: int
+    title: str
+    role: str
+    options: tuple[str, ...] = ()
+    rows: tuple[str, ...] = ()
+
+
 def _cell_text(value) -> str:
     return "" if value is None else str(value).strip()
 
 
 def _load_workbook(content: bytes):
+    _validate_xlsx_package(content)
     try:
         return openpyxl.load_workbook(
             io.BytesIO(content),
@@ -78,6 +98,63 @@ def _parse_response_workbook(content: bytes) -> tuple[list[list[str]], list[tupl
     return data_rows, code_questions
 
 
+def parse_questionnaire_response_rows(
+    filename: str,
+    content: bytes,
+) -> list[list[str]]:
+    """安全解析快照绑定入口的 CSV/XLSX 回答表。"""
+    if not isinstance(filename, str) or not filename.strip():
+        raise ValueError("回答文件名不能为空")
+    if not isinstance(content, bytes) or not content:
+        raise ValueError("回答文件内容为空")
+    normalized_name = filename.strip().casefold()
+    if normalized_name.endswith(".csv"):
+        rows = _parse_bounded_response_csv(content)
+    elif normalized_name.endswith(".xlsx"):
+        workbook = _load_workbook(content)
+        try:
+            rows = _worksheet_rows(workbook.active)
+        finally:
+            workbook.close()
+    else:
+        raise ValueError("回答文件仅支持 .csv 或 .xlsx")
+    if len(rows) <= 1:
+        raise ValueError("回答文件为空或只有表头")
+    if not any(header for header in rows[0]):
+        raise ValueError("回答文件缺少有效表头")
+    return rows
+
+
+def _parse_bounded_response_csv(content: bytes) -> list[list[str]]:
+    text: str | None = None
+    for encoding in ("utf-8-sig", "utf-8", "gbk", "gb2312"):
+        try:
+            text = content.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    if text is None:
+        raise ValueError("无法解析 CSV 文件，请确认文件编码为 UTF-8 或 GBK")
+
+    rows: list[list[str]] = []
+    total_cells = 0
+    try:
+        for row_number, row in enumerate(csv.reader(io.StringIO(text)), start=1):
+            if row_number > _XLSX_MAX_ROWS_PER_SHEET:
+                raise ValueError("CSV 回答行数超过安全上限")
+            if len(row) > _XLSX_MAX_COLUMNS_PER_SHEET:
+                raise ValueError("CSV 回答列数超过安全上限")
+            total_cells += len(row)
+            if total_cells > _XLSX_MAX_CELLS_PER_SHEET:
+                raise ValueError("CSV 回答单元格数量超过安全上限")
+            rows.append([_cell_text(cell) for cell in row])
+    except csv.Error as exc:
+        raise ValueError("无法解析 CSV 文件，请确认文件格式正确") from exc
+    while rows and not any(rows[-1]):
+        rows.pop()
+    return rows
+
+
 def _norm(value: str) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip().casefold()
 
@@ -87,15 +164,20 @@ def _find_exact_header(
     title: str,
     used: set[int],
     cursor: int,
+    *,
+    strict_unique_headers: bool,
 ) -> int | None:
     wanted = _norm(title)
-    for index in range(cursor, len(headers)):
-        if index not in used and _norm(headers[index]) == wanted:
-            return index
+    if not strict_unique_headers:
+        for index in range(cursor, len(headers)):
+            if index not in used and _norm(headers[index]) == wanted:
+                return index
     matches = [
         index for index, header in enumerate(headers)
         if index not in used and _norm(header) == wanted
     ]
+    if strict_unique_headers and len(matches) > 1:
+        raise ValueError(f"题目「{title}」存在多个规范化同名回答列")
     return matches[0] if len(matches) == 1 else None
 
 
@@ -327,13 +409,48 @@ def apply_questionnaire_translations(
     return translated_questions
 
 
-def parse_bested_qualitative_upload(
+def match_bested_response_workbook(
     response_content: bytes,
-    questionnaire_content: bytes,
+    questions: Sequence[BestedResponseQuestionDefinition],
+    *,
+    questionnaire_text: str,
+    strict_snapshot_binding: bool = False,
 ) -> dict:
-    """返回标准化 rows 与确定性题型，供定性报告后续流程直接复用。"""
-    source_questions, questionnaire_text = _parse_bested_questionnaire(questionnaire_content)
+    """匹配倍市得回答导出；严格全集模式仅供新快照入口使用。"""
+    source_questions = list(questions)
+    if not source_questions:
+        raise ValueError("问卷中没有可匹配的题目")
+    if any(
+        not isinstance(question, BestedResponseQuestionDefinition)
+        for question in source_questions
+    ):
+        raise TypeError("questions 必须是 BestedResponseQuestionDefinition 序列")
+    qids = [question.qid for question in source_questions]
+    if any(qid < 1 for qid in qids) or len(qids) != len(set(qids)):
+        raise ValueError("问卷题号必须是互不重复的正整数")
+    if any(not question.question_id.strip() for question in source_questions):
+        raise ValueError("问卷 question_id 不能为空")
+    if len({question.question_id for question in source_questions}) != len(
+        source_questions
+    ):
+        raise ValueError("问卷 question_id 不能重复")
+
     data_rows, code_questions = _parse_response_workbook(response_content)
+    code_qids = [qid for qid, _title in code_questions]
+    if strict_snapshot_binding:
+        if len(code_qids) != len(set(code_qids)):
+            raise ValueError("code 工作表中的 Q 号不能重复")
+        expected_qids = set(qids)
+        actual_qids = set(code_qids)
+        if actual_qids != expected_qids:
+            missing = sorted(expected_qids - actual_qids)
+            extra = sorted(actual_qids - expected_qids)
+            details: list[str] = []
+            if missing:
+                details.append("缺少 " + "、".join(f"Q{qid}" for qid in missing))
+            if extra:
+                details.append("多出 " + "、".join(f"Q{qid}" for qid in extra))
+            raise ValueError("code 工作表题号与问卷不一致：" + "；".join(details))
     source_by_qid = {question.qid: question for question in source_questions}
     headers = data_rows[0]
     body = data_rows[1:]
@@ -341,6 +458,7 @@ def parse_bested_qualitative_upload(
     normalized_headers: list[str] = []
     normalized_columns: list[list[str]] = []
     detected_questions: list[dict] = []
+    response_bindings: list[dict] = []
     used_indexes: set[int] = set()
     cursor = 0
 
@@ -363,6 +481,7 @@ def parse_bested_qualitative_upload(
             ]
             same_column_index = _find_exact_header(
                 headers, code_title, used_indexes, cursor,
+                strict_unique_headers=strict_snapshot_binding,
             )
             if split_candidates and same_column_index is not None:
                 raise ValueError(
@@ -414,6 +533,15 @@ def parse_bested_qualitative_upload(
                 "options_original": list(question.options),
                 "source_question_id": f"Q{qid}",
             })
+            response_bindings.append({
+                "question_id": question.question_id,
+                "column_indexes": [target_index],
+                "source_column_indexes": list(source_indexes),
+                "mapping_method": "bested_code_and_header",
+                "mapping_status": "normalized",
+                "confidence": 0.95,
+                "warning_codes": [],
+            })
             used_indexes.update(source_indexes)
             cursor = max(cursor, max(source_indexes) + 1)
             continue
@@ -427,9 +555,24 @@ def parse_bested_qualitative_upload(
                 target_index = len(normalized_headers)
                 target_indexes.append(target_index)
                 normalized_headers.append(f"{question.title} [{row_label}]")
-                normalized_columns.append([
-                    _row_value(row, source_index) for row in body
-                ])
+                if question.role == "matrix_multi":
+                    values: list[str] = []
+                    for row_number, row in enumerate(body, start=2):
+                        selected = _parse_same_column_multi_value(
+                            _row_value(row, source_index),
+                            list(question.options),
+                        )
+                        if selected is None:
+                            raise ValueError(
+                                f"题目「{code_title}」矩阵行「{row_label}」"
+                                f"第 {row_number} 行的多选答案无法按原问卷选项匹配"
+                            )
+                        values.append("\n".join(selected))
+                    normalized_columns.append(values)
+                else:
+                    normalized_columns.append([
+                        _row_value(row, source_index) for row in body
+                    ])
             detected = {
                 "name_zh": question.title,
                 "role": role,
@@ -446,11 +589,26 @@ def parse_bested_qualitative_upload(
                 detected["scale_min"] = 1
                 detected["scale_max"] = max(5, len(question.options))
             detected_questions.append(detected)
+            response_bindings.append({
+                "question_id": question.question_id,
+                "column_indexes": list(target_indexes),
+                "source_column_indexes": list(source_indexes),
+                "mapping_method": "bested_code_and_matrix_headers",
+                "mapping_status": "normalized",
+                "confidence": 0.95,
+                "warning_codes": [],
+            })
             used_indexes.update(source_indexes)
             cursor = max(cursor, max(source_indexes) + 1)
             continue
 
-        source_index = _find_exact_header(headers, code_title, used_indexes, cursor)
+        source_index = _find_exact_header(
+            headers,
+            code_title,
+            used_indexes,
+            cursor,
+            strict_unique_headers=strict_snapshot_binding,
+        )
         if source_index is None:
             raise ValueError(f"未找到 Q{qid}「{code_title}」对应的回答列")
         target_index = len(normalized_headers)
@@ -468,6 +626,15 @@ def parse_bested_qualitative_upload(
             detected["options"] = list(question.options)
             detected["options_original"] = list(question.options)
         detected_questions.append(detected)
+        response_bindings.append({
+            "question_id": question.question_id,
+            "column_indexes": [target_index],
+            "source_column_indexes": [source_index],
+            "mapping_method": "bested_code_and_header",
+            "mapping_status": "normalized",
+            "confidence": 0.95,
+            "warning_codes": [],
+        })
         used_indexes.add(source_index)
         cursor = source_index + 1
 
@@ -501,4 +668,37 @@ def parse_bested_qualitative_upload(
         "questions": detected_questions,
         "questionnaire_text": questionnaire_text,
         "matched_questions": len(code_questions),
+        "bindings": response_bindings,
+    }
+
+
+def parse_bested_qualitative_upload(
+    response_content: bytes,
+    questionnaire_content: bytes,
+) -> dict:
+    """返回标准化 rows 与确定性题型，保持旧上传路径的返回协议。"""
+    source_questions, questionnaire_text = _parse_bested_questionnaire(
+        questionnaire_content
+    )
+    definitions = [
+        BestedResponseQuestionDefinition(
+            question_id=f"Q{question.qid}",
+            qid=question.qid,
+            title=question.title,
+            role=question.role,
+            options=tuple(question.options),
+            rows=tuple(question.rows),
+        )
+        for question in source_questions
+    ]
+    matched = match_bested_response_workbook(
+        response_content,
+        definitions,
+        questionnaire_text=questionnaire_text,
+    )
+    return {
+        "rows": matched["rows"],
+        "questions": matched["questions"],
+        "questionnaire_text": matched["questionnaire_text"],
+        "matched_questions": matched["matched_questions"],
     }

@@ -9,6 +9,55 @@ const bestedUpload = $('survey-bested-upload');
 const bestedResultInput = $('bested-result-file');
 const bestedQuestionnaireInput = $('bested-questionnaire-file');
 const bestedUploadButton = $('btn-bested-upload');
+const SNAPSHOT_ANALYSIS_INTERFACE_KEY = 'questionnaireSnapshotAnalysisSelection';
+const SNAPSHOT_ANALYSIS_UPLOAD_PREFIX = '/api/questionnaire-sources/snapshots/';
+let surveyUploadRequestSerial = 0;
+let surveyUploadAbortController = null;
+
+function questionnaireSnapshotSelection() {
+  const api = window[SNAPSHOT_ANALYSIS_INTERFACE_KEY];
+  if (!api || typeof api !== 'object') return null;
+  if (typeof api.getSelectedSnapshotId !== 'function' || typeof api.reset !== 'function') return null;
+  return api;
+}
+
+function selectedSnapshotIdForAnalysis() {
+  const api = questionnaireSnapshotSelection();
+  if (!api) return '';
+  const snapshotId = api.getSelectedSnapshotId();
+  return typeof snapshotId === 'string' ? snapshotId.trim() : '';
+}
+
+function resetSelectedSnapshotAnalysis() {
+  questionnaireSnapshotSelection()?.reset();
+}
+
+function currentUploadEndpoint(snapshotId) {
+  const normalized = typeof snapshotId === 'string' ? snapshotId.trim() : '';
+  if (!normalized) return '/api/upload';
+  return `${SNAPSHOT_ANALYSIS_UPLOAD_PREFIX}${encodeURIComponent(normalized)}/analysis-sessions`;
+}
+
+function currentUploadLoadingLabel(fileName, snapshotId) {
+  if (snapshotId) return `正在按已选快照结构读取 ${esc(fileName)}…`;
+  return `正在上传 ${esc(fileName)}…`;
+}
+
+function abortSurveyUpload() {
+  surveyUploadRequestSerial += 1;
+  if (surveyUploadAbortController) {
+    surveyUploadAbortController.abort();
+    surveyUploadAbortController = null;
+  }
+}
+
+async function responseDetailMessage(response, fallback) {
+  const data = await response.json().catch(() => ({}));
+  if (data && typeof data.detail === 'string' && data.detail.trim()) {
+    return data.detail.trim();
+  }
+  return fallback;
+}
 
 function updateSurveySource(source) {
   if (surveyUploadIsLocked()) return;
@@ -94,32 +143,61 @@ async function handleUpload(file, { sourceType = 'google', questionnaireFile = n
     showToast('调研问卷超过 50MB 上限', 'error');
     return;
   }
+  const snapshotId = selectedSnapshotIdForAnalysis();
+  if (snapshotId && questionnaireFile) {
+    showToast('已选择本地快照结构，本次不会提交额外调研问卷；图片也不会自动进入报告。', 'info');
+  }
   const uploadSignature = contextFileSignature(file);
+  abortSurveyUpload();
+  const requestSerial = surveyUploadRequestSerial;
+  const abortController = new AbortController();
+  surveyUploadAbortController = abortController;
 
   if (sourceType === 'google') {
     uploadZone.innerHTML = `
       <div class="upload-zone__icon"><div class="spinner" style="width:40px;height:40px;border-width:3px"></div></div>
       <div class="upload-zone__text">
-        <span class="upload-zone__primary">正在上传 ${esc(file.name)}…</span>
+        <span class="upload-zone__primary">${currentUploadLoadingLabel(file.name, snapshotId)}</span>
+        <span class="upload-zone__secondary">${snapshotId ? '仅使用已选快照的结构，图片不会自动进入报告' : ''}</span>
       </div>`;
   } else {
     bestedUploadButton.disabled = true;
-    bestedUploadButton.textContent = questionnaireFile ? '正在读取问卷并匹配…' : '正在上传并解析…';
+    bestedUploadButton.textContent = snapshotId
+      ? '正在按快照结构创建分析…'
+      : questionnaireFile ? '正在读取问卷并匹配…' : '正在上传并解析…';
   }
 
   const fd = new FormData();
   fd.append('file', file);
-  fd.append('source_type', sourceType);
-  if (questionnaireFile) fd.append('questionnaire_file', questionnaireFile);
+  if (!snapshotId) {
+    fd.append('source_type', sourceType);
+    if (questionnaireFile) fd.append('questionnaire_file', questionnaireFile);
+  }
 
   try {
-    const resp = await fetch('/api/upload', { method: 'POST', body: fd });
-    const data = await resp.json();
-    if (!resp.ok) throw new Error(data.detail || '上传失败');
+    const resp = await fetch(currentUploadEndpoint(snapshotId), {
+      method: 'POST',
+      body: fd,
+      signal: abortController.signal,
+    });
+    if (surveyUploadRequestSerial !== requestSerial) return;
+    if (!resp.ok) {
+      const fallback = resp.status === 409
+        ? '当前快照与回答数据暂时无法建立分析会话'
+        : resp.status === 422
+          ? '回答数据或快照结构不符合当前要求'
+          : '上传失败';
+      throw new Error(await responseDetailMessage(resp, fallback));
+    }
+    const data = await resp.json().catch(() => ({}));
+    if (surveyUploadRequestSerial !== requestSerial) return;
+    if (!data || typeof data.session_id !== 'string' || !data.session_id.trim()) {
+      throw new Error('上传成功，但返回结果缺少会话编号');
+    }
 
     state.sessionId = data.session_id;
-    state.surveySource = data.source_type || sourceType;
-    state.questionnaireUsed = !!data.questionnaire_used;
+    state.surveySource = data.source_type || (snapshotId ? 'google' : sourceType);
+    state.questionnaireUsed = snapshotId ? data.questionnaire_used !== false : !!data.questionnaire_used;
     state.viewMode = 'session';
     state.historyId = null;
     state.reportVersionLoading = false;
@@ -149,22 +227,38 @@ async function handleUpload(file, { sourceType = 'google', questionnaireFile = n
     renderUploadedFileState(
       data.filename,
       state.surveySource,
-      questionnaireFile?.name || '',
+      snapshotId ? '' : questionnaireFile?.name || '',
+      snapshotId,
     );
     renderPreview(data);
     goStep(2);
-    const successMessage = data.questionnaire_used
+    const successMessage = snapshotId
+      ? `成功创建标准分析会话，将按快照 ${snapshotId} 的结构继续；图片不会自动进入报告`
+      : data.questionnaire_used
       ? `成功读取 ${data.total_rows} 行数据，并匹配 ${data.matched_questions} 道原问卷题目`
       : `成功读取 ${data.total_rows} 行数据`;
     showToast(successMessage, 'success');
     loadColumns();
   } catch (e) {
+    if (abortController.signal.aborted || (e instanceof DOMException && e.name === 'AbortError')) {
+      return;
+    }
+    if (surveyUploadRequestSerial !== requestSerial) return;
     showToast(`上传失败：${e.message}`, 'error');
     resetUploadZone();
+  } finally {
+    if (surveyUploadAbortController === abortController) {
+      surveyUploadAbortController = null;
+    }
   }
 }
 
-function renderUploadedFileState(filename, sourceType = 'google', questionnaireFilename = '') {
+function renderUploadedFileState(
+  filename,
+  sourceType = 'google',
+  questionnaireFilename = '',
+  snapshotId = '',
+) {
   state.uploadedFilename = String(filename || '').trim();
   document.querySelectorAll('[data-survey-source]').forEach(card => {
     card.disabled = true;
@@ -175,10 +269,15 @@ function renderUploadedFileState(filename, sourceType = 'google', questionnaireF
     bestedUploadButton.disabled = true;
     bestedUploadButton.textContent = '已上传';
     const hint = $('survey-questionnaire-hint');
-    hint.classList.toggle('survey-questionnaire-hint--deterministic', !!questionnaireFilename);
-    hint.textContent = questionnaireFilename
-      ? `已上传调研问卷：${questionnaireFilename}`
-      : '未上传调研问卷，本次使用 AI 识别题型。';
+    hint.classList.toggle(
+      'survey-questionnaire-hint--deterministic',
+      !!questionnaireFilename || !!snapshotId,
+    );
+    hint.textContent = snapshotId
+      ? `已选择问卷结构快照：${snapshotId}；图片不会自动进入报告。`
+      : questionnaireFilename
+        ? `已上传调研问卷：${questionnaireFilename}`
+        : '未上传调研问卷，本次使用 AI 识别题型。';
     return;
   }
   fileInput.disabled = true;
@@ -200,8 +299,10 @@ function renderUploadedFileState(filename, sourceType = 'google', questionnaireF
 }
 
 function resetUploadZone() {
+  abortSurveyUpload();
   state.uploadedFilename = '';
   state.questionnaireUsed = false;
+  resetSelectedSnapshotAnalysis();
   document.querySelectorAll('[data-survey-source]').forEach(card => {
     card.disabled = false;
   });

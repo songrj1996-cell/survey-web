@@ -63,6 +63,24 @@ class QuestionnaireSnapshotCatalogResponse(ContractModel):
     next_cursor: QuestionnaireSnapshotCatalogCursor | None = None
 
 
+class QuestionnaireSnapshotAnalysisSessionResponse(ContractModel):
+    """复用旧问卷上传结果、但只增加安全快照引用的响应。"""
+
+    session_id: str = Field(
+        min_length=32,
+        max_length=36,
+        pattern=r"^[0-9a-f-]{32,36}$",
+    )
+    filename: str = Field(min_length=1, max_length=255)
+    total_rows: int = Field(ge=1)
+    headers: list[str] = Field(min_length=1)
+    preview: list[list[str]] = Field(max_length=5)
+    source_type: Literal["google", "bested"]
+    questionnaire_used: Literal[True] = True
+    matched_questions: int = Field(ge=0)
+    questionnaire_snapshot_id: str = Field(min_length=1, max_length=1024)
+
+
 class QuestionnaireMaterialTrustLevel(str, Enum):
     """材料恢复问卷结构时采用的保守可信等级。"""
 

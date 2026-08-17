@@ -29,6 +29,9 @@ from app.services.questionnaire_snapshot_api import (
     QuestionnaireSnapshotInternalError,
     QuestionnaireSnapshotNotFoundError,
 )
+from app.services.questionnaire_snapshot_analysis_api import (
+    QuestionnaireSnapshotAnalysisApi,
+)
 from app.services.questionnaire_source_runtime import (
     QuestionnaireSourceRuntime,
     create_questionnaire_source_runtime,
@@ -50,6 +53,7 @@ EXPECTED_CAPABILITIES = {
     "schema_version": 1,
     "snapshot_package_upload": True,
     "snapshot_catalog": True,
+    "snapshot_analysis_session": True,
     "bested_original_questionnaire_upload": True,
     "screenshot_material_upload": True,
     "pdf_material_upload": True,
@@ -61,6 +65,10 @@ EXPECTED_ROUTES = {
     ("GET", "/api/questionnaire-sources/capabilities"),
     ("GET", "/api/questionnaire-sources/snapshots"),
     ("POST", "/api/questionnaire-sources/snapshots"),
+    (
+        "POST",
+        "/api/questionnaire-sources/snapshots/{snapshot_id}/analysis-sessions",
+    ),
     ("GET", "/api/questionnaire-sources/snapshots/{snapshot_id}"),
     (
         "GET",
@@ -142,6 +150,7 @@ class QuestionnaireSourceRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "schema_version": 2,
             "snapshot_package_upload": False,
             "snapshot_catalog": False,
+            "snapshot_analysis_session": False,
             "bested_original_questionnaire_upload": False,
             "screenshot_material_upload": False,
             "pdf_material_upload": False,
@@ -173,6 +182,7 @@ class QuestionnaireSourceRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
         for api in (
             self.runtime.snapshot_api,
+            self.runtime.snapshot_analysis_api,
             self.runtime.bested_api,
             self.runtime.screenshot_material_api,
             self.runtime.pdf_material_api,
@@ -207,6 +217,7 @@ class QuestionnaireSourceRuntimeTests(unittest.IsolatedAsyncioTestCase):
             QuestionnaireSourceRuntime(
                 storage=self.runtime.storage,
                 snapshot_api=QuestionnaireSnapshotApi(other_storage),
+                snapshot_analysis_api=self.runtime.snapshot_analysis_api,
                 bested_api=self.runtime.bested_api,
                 screenshot_material_api=self.runtime.screenshot_material_api,
                 pdf_material_api=self.runtime.pdf_material_api,
@@ -215,6 +226,27 @@ class QuestionnaireSourceRuntimeTests(unittest.IsolatedAsyncioTestCase):
             QuestionnaireSourceRuntime(
                 storage=self.runtime.storage,
                 snapshot_api=object(),
+                snapshot_analysis_api=self.runtime.snapshot_analysis_api,
+                bested_api=self.runtime.bested_api,
+                screenshot_material_api=self.runtime.screenshot_material_api,
+                pdf_material_api=self.runtime.pdf_material_api,
+            )
+        with self.assertRaisesRegex(ValueError, "共享 runtime.storage"):
+            QuestionnaireSourceRuntime(
+                storage=self.runtime.storage,
+                snapshot_api=self.runtime.snapshot_api,
+                snapshot_analysis_api=QuestionnaireSnapshotAnalysisApi(
+                    other_storage
+                ),
+                bested_api=self.runtime.bested_api,
+                screenshot_material_api=self.runtime.screenshot_material_api,
+                pdf_material_api=self.runtime.pdf_material_api,
+            )
+        with self.assertRaisesRegex(TypeError, "snapshot_analysis_api"):
+            QuestionnaireSourceRuntime(
+                storage=self.runtime.storage,
+                snapshot_api=self.runtime.snapshot_api,
+                snapshot_analysis_api=object(),
                 bested_api=self.runtime.bested_api,
                 screenshot_material_api=self.runtime.screenshot_material_api,
                 pdf_material_api=self.runtime.pdf_material_api,
