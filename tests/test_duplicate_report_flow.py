@@ -91,6 +91,40 @@ def _fingerprint_session(*, rows: list | None = None, include_plan: bool = False
     return sess
 
 
+def _with_saved_snapshot(
+    sess: dict,
+    *,
+    snapshot_id: str = "snapshot-safe-1",
+    package_sha256: str = "a" * 64,
+) -> dict:
+    sess["questionnaire_input_kind"] = "saved_snapshot"
+    sess["questionnaire_sha256"] = package_sha256
+    sess["questionnaire_used"] = True
+    sess["questionnaire_snapshot_ref"] = {
+        "schema_version": 1,
+        "snapshot_id": snapshot_id,
+        "package_sha256": package_sha256,
+        "definition_sha256": "b" * 64,
+        "provider": "google_forms",
+        "source_mode": "official_api",
+        "mapping_status": "exact",
+        "question_count": 1,
+        "asset_count": 0,
+        "asset_reference_count": 0,
+    }
+    sess["questionnaire_response_bindings"] = [
+        {
+            "question_id": "question-1",
+            "column_indexes": [0],
+            "mapping_method": "provider_response_key",
+            "mapping_status": "exact",
+            "confidence": 1.0,
+            "warning_codes": [],
+        }
+    ]
+    return sess
+
+
 def _event_payloads(events: list[str]) -> list[dict]:
     payloads = []
     for event in events:
@@ -394,6 +428,91 @@ class DuplicateUploadAndMatchTests(
             report_history.find_exact_survey_duplicate_report(fresh, LOGIN)
         )
 
+    async def test_saved_snapshot_duplicate_requires_same_safe_snapshot_trace(self):
+        history_id = str(uuid.uuid4())
+        archived = _with_saved_snapshot(_fingerprint_session(include_plan=True))
+        report_versions.append_report_version(
+            archived,
+            _snapshot("快照结构原报告"),
+            kind="initial",
+        )
+        report_history.save_to_history(history_id, archived)
+
+        same = _with_saved_snapshot(_fingerprint_session())
+        matched = report_history.find_exact_survey_duplicate_report(same, LOGIN)
+        self.assertEqual(matched["id"], history_id)
+
+        changed_package = _with_saved_snapshot(
+            _fingerprint_session(),
+            snapshot_id="snapshot-safe-2",
+            package_sha256="c" * 64,
+        )
+        self.assertIsNone(
+            report_history.find_exact_survey_duplicate_report(
+                changed_package,
+                LOGIN,
+            )
+        )
+
+        partial = _with_saved_snapshot(_fingerprint_session())
+        partial.pop("questionnaire_response_bindings")
+        self.assertFalse(
+            report_history._has_complete_survey_duplicate_fingerprint(partial)
+        )
+        self.assertIsNone(
+            report_history.find_exact_survey_duplicate_report(partial, LOGIN)
+        )
+
+        injected = _with_saved_snapshot(_fingerprint_session())
+        injected["questionnaire_snapshot_ref"]["owner_ref"] = "forged-owner"
+        self.assertFalse(
+            report_history._has_complete_survey_duplicate_fingerprint(injected)
+        )
+        self.assertIsNone(
+            report_history.find_exact_survey_duplicate_report(injected, LOGIN)
+        )
+
+    async def test_stale_save_preserves_snapshot_only_for_same_questionnaire_hash(self):
+        history_id = str(uuid.uuid4())
+        archived = _with_saved_snapshot(_fingerprint_session(include_plan=True))
+        report_versions.append_report_version(
+            archived,
+            _snapshot("快照结构原报告"),
+            kind="initial",
+        )
+        report_history.save_to_history(history_id, archived)
+
+        stale_same_hash = deepcopy(archived)
+        for field in (
+            "questionnaire_input_kind",
+            "questionnaire_snapshot_ref",
+            "questionnaire_response_bindings",
+        ):
+            stale_same_hash.pop(field)
+        report_history.save_to_history(history_id, stale_same_hash)
+        preserved = history_storage._load_history()[0]
+        self.assertEqual(
+            preserved["questionnaire_snapshot_ref"]["package_sha256"],
+            "a" * 64,
+        )
+
+        stale_changed_hash = deepcopy(stale_same_hash)
+        stale_changed_hash["questionnaire_sha256"] = "c" * 64
+        report_history.save_to_history(history_id, stale_changed_hash)
+        replaced = history_storage._load_history()[0]
+        self.assertNotIn("questionnaire_input_kind", replaced)
+        self.assertNotIn("questionnaire_snapshot_ref", replaced)
+        self.assertNotIn("questionnaire_response_bindings", replaced)
+
+        report_history.save_to_history(history_id, archived)
+        stale_missing_hash = deepcopy(stale_same_hash)
+        stale_missing_hash.pop("questionnaire_sha256")
+        report_history.save_to_history(history_id, stale_missing_hash)
+        missing = history_storage._load_history()[0]
+        self.assertNotIn("questionnaire_input_kind", missing)
+        self.assertNotIn("questionnaire_snapshot_ref", missing)
+        self.assertNotIn("questionnaire_response_bindings", missing)
+
     async def test_each_exact_match_dimension_rejects_independently(self):
         self._archive_v1()
         mutations = {
@@ -467,6 +586,49 @@ class DuplicatePrepareAndGenerationTests(
     TemporaryDuplicateRuntimeMixin,
     unittest.IsolatedAsyncioTestCase,
 ):
+    async def test_append_rerun_rejects_changed_or_injected_snapshot_provenance(self):
+        history_id = str(uuid.uuid4())
+        archived = _with_saved_snapshot(_fingerprint_session(include_plan=True))
+        report_versions.append_report_version(
+            archived,
+            _snapshot("快照结构原报告"),
+            kind="initial",
+        )
+        report_history.save_to_history(history_id, archived)
+
+        changed_package = _with_saved_snapshot(
+            _fingerprint_session(include_plan=True),
+            snapshot_id="snapshot-safe-2",
+            package_sha256="c" * 64,
+        )
+        with self.assertRaises(HTTPException) as changed:
+            report_history.append_exact_rerun_to_history(
+                history_id,
+                changed_package,
+                _snapshot("不应写入"),
+                base_version=1,
+                instruction="重跑",
+                login=LOGIN,
+            )
+        self.assertEqual(changed.exception.status_code, 409)
+
+        injected = _with_saved_snapshot(_fingerprint_session(include_plan=True))
+        injected["questionnaire_snapshot_ref"]["owner_ref"] = "forged-owner"
+        with self.assertRaises(HTTPException) as forged:
+            report_history.append_exact_rerun_to_history(
+                history_id,
+                injected,
+                _snapshot("不应写入"),
+                base_version=1,
+                instruction="重跑",
+                login=LOGIN,
+            )
+        self.assertEqual(forged.exception.status_code, 409)
+        self.assertEqual(
+            len(history_storage._load_history()[0]["report_versions"]),
+            1,
+        )
+
     async def test_prepare_revalidates_and_copies_plan_with_default_note(self):
         history_id, _ = self._archive_v1()
         session_id = self._new_session(_fingerprint_session(rows=[["反馈"], ["new answer"]]))
@@ -543,7 +705,10 @@ class DuplicatePrepareAndGenerationTests(
         history_id, _ = self._archive_v1(
             qa_messages=[{"role": "user", "content": "生成前问题"}],
         )
-        fresh = _fingerprint_session(rows=[["反馈"], ["new answer"]])
+        stored = history_storage._load_history()
+        stored[0].update(_with_saved_snapshot({}))
+        history_storage._save_history(stored)
+        fresh = _with_saved_snapshot(_fingerprint_session(rows=[["反馈"], ["new answer"]]))
         session_id = self._new_session(fresh)
         survey_service.prepare_duplicate_report_rerun(
             session_id,
@@ -674,6 +839,14 @@ class DuplicatePrepareAndGenerationTests(
             report_history.DEFAULT_RERUN_VERSION_INSTRUCTION,
         )
         self.assertIn("new answer", second["qa_context_md"])
+        self.assertEqual(
+            stored_history[0]["questionnaire_snapshot_ref"]["snapshot_id"],
+            "snapshot-safe-1",
+        )
+        self.assertEqual(
+            stored_history[0]["questionnaire_response_bindings"][0]["question_id"],
+            "question-1",
+        )
 
         rerun_session = session_storage.get_session(session_id)
         self.assertEqual(rerun_session["active_report_version"], 2)

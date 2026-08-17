@@ -3,6 +3,10 @@ from copy import deepcopy
 
 from app.core.config import MAX_REPORT_VERSIONS
 from app.core.security import _find_history_for_login, _visible_to_owner
+from app.services.questionnaire_snapshot_history import (
+    snapshot_history_fields,
+    snapshot_history_summary,
+)
 from app.services.report_history import (
     _history_effective_row_count,
     _qa_user_count,
@@ -105,6 +109,7 @@ def get_history_list(login: dict | None, mode: str = "") -> list[dict]:
             "annotate_confirmed_ai_count": h.get("annotate_confirmed_ai_count", 0),
             "annotate_quality_count": h.get("annotate_quality_count", 0),
             "annotate_has_download": bool(h.get("annotate_result_path")),
+            **snapshot_history_summary(h),
             **_history_version_metadata(h, login),
         })
     return result
@@ -122,8 +127,17 @@ def get_history_entry(
         return None
 
     result = deepcopy(entry)
+    for field in (
+        "questionnaire_input_kind",
+        "questionnaire_snapshot_ref",
+        "questionnaire_response_bindings",
+        "questionnaire_snapshot_summary",
+        "has_questionnaire_snapshot",
+    ):
+        result.pop(field, None)
     metadata = _history_version_metadata(entry, login)
     result.update(metadata)
+    result.update(snapshot_history_fields(entry))
     if metadata["version_count"]:
         selected = resolve_report_version(
             entry,

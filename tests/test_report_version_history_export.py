@@ -54,6 +54,44 @@ def _versioned_session(session_id: str = "version-history-id") -> dict:
     return source
 
 
+def _with_snapshot(source: dict) -> dict:
+    source["source_type"] = "google"
+    source["questionnaire_input_kind"] = "saved_snapshot"
+    source["questionnaire_sha256"] = "a" * 64
+    source["questionnaire_used"] = True
+    source["questionnaire_snapshot_ref"] = {
+        "schema_version": 1,
+        "snapshot_id": "snapshot-safe-1",
+        "package_sha256": "a" * 64,
+        "definition_sha256": "b" * 64,
+        "provider": "google_forms",
+        "source_mode": "official_api",
+        "mapping_status": "exact",
+        "question_count": 2,
+        "asset_count": 0,
+        "asset_reference_count": 0,
+    }
+    source["questionnaire_response_bindings"] = [
+        {
+            "question_id": "question-1",
+            "column_indexes": [0],
+            "mapping_method": "provider_response_key",
+            "mapping_status": "exact",
+            "confidence": 1.0,
+            "warning_codes": [],
+        },
+        {
+            "question_id": "question-2",
+            "column_indexes": [1],
+            "mapping_method": "provider_response_key",
+            "mapping_status": "exact",
+            "confidence": 1.0,
+            "warning_codes": [],
+        },
+    ]
+    return source
+
+
 class TemporaryHistoryMixin:
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory(prefix="version-history-integration-")
@@ -79,7 +117,7 @@ class TemporaryHistoryMixin:
 
 class HistoryVersionIntegrationTests(TemporaryHistoryMixin, unittest.TestCase):
     def test_history_list_and_detail_return_selected_metadata_without_other_bodies(self):
-        sess = _versioned_session()
+        sess = _with_snapshot(_versioned_session())
         saved = report_history.save_to_history(sess["id"], sess)
         self.assertEqual(saved["active_report_version"], 2)
         self.assertEqual(saved["next_report_version"], 6)
@@ -98,6 +136,18 @@ class HistoryVersionIntegrationTests(TemporaryHistoryMixin, unittest.TestCase):
         self.assertEqual(item["next_version"], 6)
         self.assertEqual(item["max_versions"], 2)
         self.assertFalse(item["can_generate_version"])
+        self.assertEqual(
+            item["questionnaire_snapshot_summary"],
+            {
+                "provider": "google_forms",
+                "question_count": 2,
+                "asset_count": 0,
+            },
+        )
+        self.assertNotIn("questionnaire_input_kind", item)
+        self.assertNotIn("questionnaire_snapshot_ref", item)
+        self.assertNotIn("questionnaire_response_bindings", item)
+        self.assertNotIn("has_questionnaire_snapshot", item)
         self.assertEqual([v["version"] for v in item["report_versions"]], [1, 2])
         self.assertNotIn("report_md", item["report_versions"][0])
         self.assertNotIn("qa_context_md", item["report_versions"][0])
@@ -109,10 +159,70 @@ class HistoryVersionIntegrationTests(TemporaryHistoryMixin, unittest.TestCase):
         self.assertEqual(selected["active_version"], 2)
         self.assertEqual(selected["next_version"], 6)
         self.assertEqual(selected["version_created_at"], "2026-08-01T10:00:00")
+        self.assertEqual(selected["questionnaire_input_kind"], "saved_snapshot")
+        self.assertEqual(
+            selected["questionnaire_snapshot_ref"]["provider"],
+            "google_forms",
+        )
+        self.assertEqual(
+            selected["questionnaire_response_bindings"][0]["question_id"],
+            "question-1",
+        )
+        self.assertNotIn("questionnaire_snapshot_summary", selected)
+        self.assertNotIn("has_questionnaire_snapshot", selected)
 
         with patch.object(history_service, "get_session", return_value=sess):
             with self.assertRaisesRegex(ValueError, "V9 不存在"):
                 history_service.get_history_entry(sess["id"], None, 9)
+
+    def test_history_detail_fail_closed_when_snapshot_detail_is_malformed(self):
+        sess = _with_snapshot(_versioned_session("broken-snapshot-history"))
+        report_history.save_to_history(sess["id"], sess)
+        stored = history_storage._load_history()
+        stored[0]["questionnaire_snapshot_ref"] = {
+            **stored[0]["questionnaire_snapshot_ref"],
+            "package_sha256": "invalid",
+            "owner_ref": "forbidden",
+        }
+        stored[0]["questionnaire_response_bindings"] = [
+            {
+                **stored[0]["questionnaire_response_bindings"][0],
+                "column_indexes": ["oops"],
+                "header_name": "forbidden",
+            }
+        ]
+        history_storage._save_history(stored)
+
+        listed = history_service.get_history_list(None)
+        self.assertIsNone(listed[0]["questionnaire_snapshot_summary"])
+        self.assertNotIn("has_questionnaire_snapshot", listed[0])
+        with self.assertRaisesRegex(
+            ValueError,
+            "^问卷快照历史来源无效$",
+        ):
+            history_service.get_history_entry(sess["id"], None)
+
+    def test_legacy_survey_history_without_snapshot_fields_remains_readable(self):
+        sess = _versioned_session("legacy-survey-history")
+        report_history.save_to_history(sess["id"], sess)
+        stored = history_storage._load_history()
+        stored[0]["questionnaire_snapshot_summary"] = {
+            "provider": "forged-provider",
+        }
+        stored[0]["has_questionnaire_snapshot"] = True
+        history_storage._save_history(stored)
+
+        listed = history_service.get_history_list(None)
+        detail = history_service.get_history_entry(sess["id"], None)
+
+        self.assertIsNone(listed[0]["questionnaire_snapshot_summary"])
+        self.assertNotIn("has_questionnaire_snapshot", listed[0])
+        self.assertNotIn("questionnaire_input_kind", detail)
+        self.assertNotIn("questionnaire_snapshot_ref", detail)
+        self.assertNotIn("questionnaire_response_bindings", detail)
+        self.assertNotIn("questionnaire_snapshot_summary", detail)
+        self.assertNotIn("has_questionnaire_snapshot", detail)
+        self.assertEqual(detail["report_md"], "# 第二版\n\n第二版正文")
 
     def test_comment_and_interview_history_keep_non_versioned_behavior(self):
         comment = {

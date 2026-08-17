@@ -11,6 +11,10 @@ const historyState = {
   },
 };
 let historyEntryLoadSerial = 0;
+const HISTORY_SNAPSHOT_PROVIDER_LABELS = Object.freeze({
+  google_forms: 'Google Forms',
+  bested: '倍市得',
+});
 
 function openHistoryDrawer() {
   openDrawer('history-drawer');
@@ -180,6 +184,7 @@ function renderHistoryCard(h) {
     || (h.id ? `R-${String(h.id).slice(0, 4).toUpperCase()}` : 'R-?');
   const source = historySourceMeta(h.mode);
   const qa = historyQaMeta(h);
+  const snapshotSummary = historySnapshotSummaryMeta(h);
   const quantity = historyQuantityText(h);
   const versionCount = Number(h.version_count || h.report_versions?.length || 0);
   const action = h.mode === 'annotate'
@@ -227,6 +232,10 @@ function renderHistoryCard(h) {
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg>
           ${esc(qa.label)}
         </span>
+        ${snapshotSummary ? `<span class="hist-card__qa hist-card__qa--done" title="${esc(snapshotSummary.title)}">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3l7 4v5c0 5-3.2 7.8-7 9-3.8-1.2-7-4-7-9V7l7-4Z"/><path d="M9 12.5l2 2 4-4"/></svg>
+          ${esc(snapshotSummary.label)}
+        </span>` : ""}
         ${action}
       </div>
     </div>`;
@@ -246,6 +255,17 @@ function historyQaMeta(h) {
   if (h.mode === 'annotate') return { key: 'disabled', label: '无追问功能' };
   if (Number(h.qa_count || 0) > 0) return { key: 'done', label: '已追问' };
   return { key: 'pending', label: '未追问' };
+}
+
+function historySnapshotSummaryMeta(h) {
+  const summary = h && typeof h === 'object' ? h.questionnaire_snapshot_summary : null;
+  if (!summary || typeof summary !== 'object') return null;
+  const providerLabel = HISTORY_SNAPSHOT_PROVIDER_LABELS[String(summary.provider || '').trim()] || '';
+  if (!providerLabel) return null;
+  return {
+    label: `快照结构 · ${providerLabel}`,
+    title: `本次报告使用已保存问卷快照结构：${providerLabel}`,
+  };
 }
 
 function historyQuantityText(h) {
