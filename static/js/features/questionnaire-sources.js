@@ -5,9 +5,12 @@
   const PANEL_ID = 'qsrc-panel';
   const INPUT_PREFIX = 'qsrc-input-';
   const MAX_IMAGE_COUNT = 20;
+  const SNAPSHOT_CATALOG_LIMIT = 20;
   const CAPABILITIES_URL = '/api/questionnaire-sources/capabilities';
+  const SNAPSHOTS_ENDPOINT = '/api/questionnaire-sources/snapshots';
   const HTTP_HIDE_STATUSES = new Set([401, 403, 404]);
   const CAPABILITY_KEYS = [
+    'snapshot_catalog',
     'snapshot_package_upload',
     'bested_original_questionnaire_upload',
     'screenshot_material_upload',
@@ -18,7 +21,7 @@
     {
       key: 'snapshot_package_upload',
       type: 'snapshot',
-      endpoint: '/api/questionnaire-sources/snapshots',
+      endpoint: SNAPSHOTS_ENDPOINT,
       fieldName: 'file',
       accept: '.zip,application/zip',
       multiple: false,
@@ -114,12 +117,25 @@
     capabilities: null,
     loadingCapabilities: false,
     cardStates: {},
+    catalog: {
+      items: [],
+      nextCursor: '',
+      phase: 'idle',
+      message: '',
+      requestSerial: 0,
+      abortController: null,
+      hasLoaded: false,
+    },
     capabilityRequestSerial: 0,
     capabilityAbortController: null,
   };
 
   let panel = null;
   let cardsHost = null;
+  let catalogSection = null;
+  let catalogList = null;
+  let catalogStatus = null;
+  let catalogLoadMoreButton = null;
   let refreshButton = null;
 
   function ensureStylesheet() {
@@ -160,8 +176,12 @@
     return panelState.cardStates[type];
   }
 
+  function getCatalogState() {
+    return panelState.catalog;
+  }
+
   function mountPanel() {
-    if (panel && cardsHost && refreshButton) return true;
+    if (panel && cardsHost && refreshButton && catalogSection && catalogList && catalogStatus && catalogLoadMoreButton) return true;
     const uploadArea = document.getElementById('upload-area');
     const bestedUpload = document.getElementById('survey-bested-upload');
     if (!uploadArea || !bestedUpload) return false;
@@ -170,8 +190,12 @@
     if (existing) {
       panel = existing;
       cardsHost = existing.querySelector('.qsrc-panel__cards');
+      catalogSection = existing.querySelector('.qsrc-catalog');
+      catalogList = existing.querySelector('.qsrc-catalog__list');
+      catalogStatus = existing.querySelector('.qsrc-catalog__status');
+      catalogLoadMoreButton = existing.querySelector('.qsrc-catalog__load-more');
       refreshButton = existing.querySelector('.qsrc-panel__refresh');
-      return !!(cardsHost && refreshButton);
+      return !!(cardsHost && refreshButton && catalogSection && catalogList && catalogStatus && catalogLoadMoreButton);
     }
 
     panel = el('section', 'qsrc-panel');
@@ -193,10 +217,31 @@
     head.append(titleWrap, refreshButton);
 
     cardsHost = el('div', 'qsrc-panel__cards');
+    catalogSection = el('section', 'qsrc-catalog');
+    catalogSection.hidden = true;
+    catalogSection.setAttribute('aria-labelledby', 'qsrc-catalog-title');
+
+    const catalogHead = el('div', 'qsrc-catalog__head');
+    const catalogTitleWrap = el('div', 'qsrc-catalog__title-wrap');
+    catalogTitleWrap.append(
+      Object.assign(el('h3', 'qsrc-catalog__title', '已保存快照'), { id: 'qsrc-catalog-title' }),
+      el('p', 'qsrc-catalog__desc', '仅显示安全摘要，不展示原始文件路径、媒体内容或其他敏感字段。快照不会自动绑定到当前报告。'),
+    );
+    catalogLoadMoreButton = el('button', 'qsrc-btn qsrc-btn--ghost qsrc-catalog__load-more', '加载更多');
+    catalogLoadMoreButton.type = 'button';
+    catalogLoadMoreButton.hidden = true;
+    catalogLoadMoreButton.addEventListener('click', () => refreshCatalog({ append: true }));
+    catalogHead.append(catalogTitleWrap, catalogLoadMoreButton);
+
+    catalogList = el('div', 'qsrc-catalog__list');
+    catalogStatus = el('div', 'qsrc-catalog__status');
+    catalogStatus.setAttribute('aria-live', 'polite');
+    catalogSection.append(catalogHead, catalogList, catalogStatus);
+
     const disclaimer = el('div', 'qsrc-card__disclaimer', '提示：本区域只负责独立保存本地问卷快照。保存成功后，需要在后续单独选择或导入，当前问卷分析流程不会自动改用这些快照。');
     const foot = el('div', 'qsrc-panel__foot', '支持能力由服务端显式声明；未开放的入口不会展示。');
 
-    panel.append(head, cardsHost, disclaimer, foot);
+    panel.append(head, cardsHost, catalogSection, disclaimer, foot);
     bestedUpload.insertAdjacentElement('afterend', panel);
     return true;
   }
@@ -209,6 +254,14 @@
   function supportedSources() {
     if (!panelState.capabilities) return [];
     return SOURCE_DEFS.filter(def => panelState.capabilities[def.key] === true);
+  }
+
+  function shouldShowCatalog() {
+    return !!(panelState.capabilities && panelState.capabilities.snapshot_catalog === true);
+  }
+
+  function shouldShowPanel() {
+    return supportedSources().length > 0 || shouldShowCatalog();
   }
 
   function setRefreshLoading(loading) {
@@ -228,6 +281,43 @@
     return normalized;
   }
 
+  function normalizeCatalogEntry(entry) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null;
+    const snapshotId = typeof entry.snapshot_id === 'string' ? entry.snapshot_id.trim() : '';
+    if (!snapshotId) return null;
+    return {
+      snapshot_id: snapshotId,
+      provider: typeof entry.provider === 'string' ? entry.provider : '',
+      source_mode: typeof entry.source_mode === 'string' ? entry.source_mode : '',
+      collection_state: typeof entry.collection_state === 'string' ? entry.collection_state : '',
+      mapping_status: typeof entry.mapping_status === 'string' ? entry.mapping_status : '',
+      processing_status: typeof entry.processing_status === 'string' ? entry.processing_status : '',
+      question_count: Number.isFinite(entry.question_count) ? entry.question_count : null,
+      item_count: Number.isFinite(entry.item_count) ? entry.item_count : null,
+      asset_count: Number.isFinite(entry.asset_count) ? entry.asset_count : null,
+      image_asset_count: Number.isFinite(entry.image_asset_count) ? entry.image_asset_count : null,
+      asset_reference_count: Number.isFinite(entry.asset_reference_count) ? entry.asset_reference_count : null,
+      file_count: Number.isFinite(entry.file_count) ? entry.file_count : null,
+      image_count: Number.isFinite(entry.image_count) ? entry.image_count : null,
+      document_count: Number.isFinite(entry.document_count) ? entry.document_count : null,
+      page_count: Number.isFinite(entry.page_count) ? entry.page_count : null,
+      total_size_bytes: Number.isFinite(entry.total_size_bytes) ? entry.total_size_bytes : null,
+      trust_level: typeof entry.trust_level === 'string' ? entry.trust_level : '',
+      requires_human_review: entry.requires_human_review === true,
+    };
+  }
+
+  function normalizeCatalogPayload(payload) {
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null;
+    if (payload.schema_version !== 1 || !Array.isArray(payload.items)) return null;
+    const items = payload.items.map(normalizeCatalogEntry).filter(Boolean);
+    const nextCursor = typeof payload.next_cursor === 'string' ? payload.next_cursor : '';
+    return {
+      items,
+      next_cursor: nextCursor,
+    };
+  }
+
   async function fetchCapabilities(signal) {
     const response = await fetch(CAPABILITIES_URL, { method: 'GET', signal });
     if (HTTP_HIDE_STATUSES.has(response.status)) return { hidden: true };
@@ -241,6 +331,36 @@
     const capabilities = normalizeCapabilities(payload);
     if (!capabilities) return { hidden: true };
     return { hidden: false, capabilities };
+  }
+
+  function snapshotCatalogUrl(cursor) {
+    const trimmedCursor = typeof cursor === 'string' ? cursor.trim() : '';
+    const cursorQuery = trimmedCursor ? `&cursor=${encodeURIComponent(trimmedCursor)}` : '';
+    return `${SNAPSHOTS_ENDPOINT}?limit=${SNAPSHOT_CATALOG_LIMIT}${cursorQuery}`;
+  }
+
+  async function fetchCatalog(cursor, signal) {
+    const response = await fetch(snapshotCatalogUrl(cursor), {
+      method: 'GET',
+      signal,
+    });
+    if (HTTP_HIDE_STATUSES.has(response.status)) return { hidden: true };
+    if (!response.ok) {
+      const fallback = response.status === 429
+        ? '快照目录读取过于频繁，请稍后重试'
+        : '快照目录暂时不可用';
+      const detail = await responseErrorMessage(response, fallback);
+      return { hidden: false, error: detail };
+    }
+    let payload;
+    try {
+      payload = await response.json();
+    } catch {
+      return { hidden: false, error: '快照目录返回结果无法识别' };
+    }
+    const normalized = normalizeCatalogPayload(payload);
+    if (!normalized) return { hidden: false, error: '快照目录返回结果缺少安全摘要字段' };
+    return { hidden: false, payload: normalized };
   }
 
   function setFiles(def, files) {
@@ -308,6 +428,39 @@
     renderCards();
   }
 
+  function resetCatalogState() {
+    const catalogState = getCatalogState();
+    catalogState.requestSerial += 1;
+    if (catalogState.abortController) {
+      catalogState.abortController.abort();
+      catalogState.abortController = null;
+    }
+    panelState.catalog = {
+      items: [],
+      nextCursor: '',
+      phase: 'idle',
+      message: '',
+      requestSerial: catalogState.requestSerial,
+      abortController: null,
+      hasLoaded: false,
+    };
+  }
+
+  function hidePanel(reason) {
+    reset();
+    resetCatalogState();
+    panelState.capabilities = null;
+    if (panelState.capabilityAbortController) {
+      panelState.capabilityAbortController.abort();
+      panelState.capabilityAbortController = null;
+    }
+    panelState.capabilityRequestSerial += 1;
+    panelState.loadingCapabilities = false;
+    setRefreshLoading(false);
+    setPanelVisibility(false);
+    if (reason) showUploadToast(reason, 'error');
+  }
+
   function setCardMessage(messageNode, message, extra, phase) {
     messageNode.textContent = '';
     messageNode.className = 'qsrc-card__status';
@@ -354,6 +507,100 @@
     };
   }
 
+  function sourceModeLabel(value) {
+    if (value === 'material_upload') return '材料快照';
+    if (value === 'local_upload') return '本地快照';
+    return value || '快照';
+  }
+
+  function mappingStatusLabel(value) {
+    if (value === 'exact') return '映射准确';
+    if (value === 'partial') return '映射部分可用';
+    if (value === 'normalized') return '映射已归一';
+    if (value === 'needs_review') return '待人工复核';
+    if (value === 'unsupported') return '待补充处理';
+    return value || '状态未知';
+  }
+
+  function reviewLabel(entry) {
+    if (entry.requires_human_review || entry.mapping_status === 'needs_review' || entry.processing_status === 'needs_review') {
+      return '待人工复核';
+    }
+    if (entry.collection_state === 'ready') return '可复用';
+    return '已保存';
+  }
+
+  function catalogMeta(entry) {
+    return [
+      entry.source_mode ? sourceModeLabel(entry.source_mode) : '',
+      entry.provider || '',
+      entry.mapping_status ? mappingStatusLabel(entry.mapping_status) : '',
+    ].filter(Boolean);
+  }
+
+  function catalogMetrics(entry) {
+    return [
+      Number.isFinite(entry.question_count) ? `题目 ${entry.question_count}` : '',
+      Number.isFinite(entry.item_count) ? `条目 ${entry.item_count}` : '',
+      Number.isFinite(entry.asset_count) ? `素材 ${entry.asset_count}` : '',
+      Number.isFinite(entry.image_count) ? `图片 ${entry.image_count}` : '',
+      Number.isFinite(entry.page_count) ? `页数 ${entry.page_count}` : '',
+      Number.isFinite(entry.total_size_bytes) ? formatBytes(entry.total_size_bytes) : '',
+    ].filter(Boolean);
+  }
+
+  function renderCatalog() {
+    if (!catalogSection || !catalogList || !catalogStatus || !catalogLoadMoreButton) return;
+    const catalogState = getCatalogState();
+    const visible = shouldShowCatalog();
+    catalogSection.hidden = !visible;
+    catalogList.replaceChildren();
+    catalogStatus.textContent = '';
+    catalogStatus.className = 'qsrc-catalog__status';
+    catalogLoadMoreButton.hidden = true;
+    catalogLoadMoreButton.disabled = false;
+    catalogLoadMoreButton.textContent = '加载更多';
+    if (!visible) return;
+
+    if (!catalogState.items.length) {
+      const empty = el('div', 'qsrc-catalog__empty', catalogState.phase === 'loading' ? '正在读取已保存快照…' : '当前还没有可显示的已保存快照');
+      catalogList.appendChild(empty);
+    } else {
+      const items = catalogState.items.map(entry => {
+        const row = el('article', 'qsrc-catalog__item');
+        const top = el('div', 'qsrc-catalog__item-top');
+        const titleWrap = el('div', 'qsrc-catalog__item-title-wrap');
+        titleWrap.append(
+          el('div', 'qsrc-catalog__item-id', entry.snapshot_id),
+          el('div', 'qsrc-catalog__item-meta', catalogMeta(entry).join(' · ')),
+        );
+        const badge = el('span', 'qsrc-catalog__item-badge', reviewLabel(entry));
+        if (reviewLabel(entry) === '待人工复核') badge.classList.add('is-review');
+        top.append(titleWrap, badge);
+        const metrics = el('div', 'qsrc-catalog__item-metrics', catalogMetrics(entry).join(' · ') || '仅保留安全摘要');
+        row.append(top, metrics);
+        return row;
+      });
+      catalogList.replaceChildren(...items);
+    }
+
+    if (catalogState.phase === 'loading' && catalogState.items.length) {
+      catalogStatus.textContent = '正在读取更多快照…';
+      catalogStatus.classList.add('is-loading');
+    } else if (catalogState.phase === 'error' && catalogState.message) {
+      catalogStatus.textContent = catalogState.message;
+      catalogStatus.classList.add('is-error');
+    } else if (catalogState.hasLoaded && !catalogState.nextCursor) {
+      catalogStatus.textContent = catalogState.items.length ? '已显示当前可读取的快照摘要' : '目录为空，可先保存一个本地快照';
+    }
+
+    if (catalogState.nextCursor) {
+      catalogLoadMoreButton.hidden = false;
+      catalogLoadMoreButton.disabled = catalogState.phase === 'loading';
+      catalogLoadMoreButton.textContent = catalogState.phase === 'loading' ? '读取中…' : '加载更多';
+    }
+  }
+
   function pickerClassName(cardState) {
     const classes = ['qsrc-card__picker'];
     if (cardState.phase === 'ready') classes.push('is-ready');
@@ -390,7 +637,8 @@
     chooseButton.disabled = cardState.phase === 'loading';
     submitButton.disabled = cardState.phase === 'loading' || cardState.phase === 'error' || !fileCount;
     submitButton.textContent = cardState.phase === 'loading' ? def.loadingLabel : def.submitLabel;
-    resetButton.disabled = cardState.phase === 'loading' || !fileCount;
+    resetButton.disabled = cardState.phase !== 'loading' && !fileCount;
+    resetButton.textContent = cardState.phase === 'loading' ? '取消上传' : '重置';
 
     const summary = summaryMeta(def, cardState.summary);
     if (summary) {
@@ -419,6 +667,7 @@
     input.accept = def.accept;
     input.multiple = !!def.multiple;
     input.className = 'qsrc-sr-only';
+    input.setAttribute('aria-label', `${def.title}文件选择`);
     input.addEventListener('change', () => {
       const files = Array.from(input.files || []);
       setFiles(def, files);
@@ -514,6 +763,10 @@
         signal: abortController.signal,
       });
       if (cardState.requestSerial !== requestSerial) return;
+      if (HTTP_HIDE_STATUSES.has(response.status)) {
+        hidePanel('当前账号暂无本地问卷快照权限');
+        return;
+      }
       if (!response.ok) {
         const fallback = response.status === 429
           ? '当前入口繁忙，请稍后重试'
@@ -540,6 +793,7 @@
       cardState.phase = meta ? meta.phase : 'success';
       cardState.message = meta ? meta.message : '已保存独立快照';
       renderCard(def);
+      refreshCatalog();
       showUploadToast(cardState.phase === 'review' ? '已保存，后续请人工复核' : '已保存独立快照', cardState.phase === 'review' ? 'info' : 'success');
     } catch (error) {
       if (abortController.signal.aborted || (error instanceof DOMException && error.name === 'AbortError')) {
@@ -555,6 +809,64 @@
     } finally {
       if (cardState.abortController === abortController) {
         cardState.abortController = null;
+      }
+    }
+  }
+
+  async function refreshCatalog(options) {
+    if (!catalogSection || !shouldShowCatalog()) return;
+    const append = !!(options && options.append);
+    const catalogState = getCatalogState();
+    if (catalogState.abortController) {
+      catalogState.abortController.abort();
+      catalogState.abortController = null;
+    }
+    catalogState.requestSerial += 1;
+    const requestSerial = catalogState.requestSerial;
+    const abortController = new AbortController();
+    catalogState.abortController = abortController;
+    catalogState.phase = 'loading';
+    catalogState.message = '';
+    renderCatalog();
+    try {
+      const result = await fetchCatalog(append ? catalogState.nextCursor : '', abortController.signal);
+      if (catalogState.requestSerial !== requestSerial) return;
+      if (result.hidden) {
+        hidePanel('当前账号暂无本地问卷快照权限');
+        return;
+      }
+      if (result.error) {
+        catalogState.phase = 'error';
+        catalogState.message = result.error;
+        renderCatalog();
+        return;
+      }
+      if (!result.payload) {
+        catalogState.phase = 'error';
+        catalogState.message = '快照目录暂时不可用';
+        renderCatalog();
+        return;
+      }
+      catalogState.items = append
+        ? catalogState.items.concat(result.payload.items)
+        : result.payload.items.slice();
+      catalogState.nextCursor = result.payload.next_cursor;
+      catalogState.phase = 'idle';
+      catalogState.message = '';
+      catalogState.hasLoaded = true;
+      renderCatalog();
+    } catch (error) {
+      if (abortController.signal.aborted || (error instanceof DOMException && error.name === 'AbortError')) {
+        return;
+      }
+      if (catalogState.requestSerial !== requestSerial) return;
+      const message = error instanceof Error && error.message ? error.message : '快照目录暂时不可用';
+      catalogState.phase = 'error';
+      catalogState.message = message;
+      renderCatalog();
+    } finally {
+      if (catalogState.abortController === abortController) {
+        catalogState.abortController = null;
       }
     }
   }
@@ -576,17 +888,26 @@
       if (panelState.capabilityRequestSerial !== requestSerial) return;
       if (result.hidden || !result.capabilities) {
         panelState.capabilities = null;
+        resetCatalogState();
         setPanelVisibility(false);
         return;
       }
       panelState.capabilities = result.capabilities;
       renderCards();
-      setPanelVisibility(supportedSources().length > 0);
+      renderCatalog();
+      setPanelVisibility(shouldShowPanel());
+      if (shouldShowCatalog()) {
+        refreshCatalog();
+      } else {
+        resetCatalogState();
+        renderCatalog();
+      }
     } catch (error) {
       if (abortController.signal.aborted || (error instanceof DOMException && error.name === 'AbortError')) {
         return;
       }
       panelState.capabilities = null;
+      resetCatalogState();
       setPanelVisibility(false);
     } finally {
       if (panelState.capabilityAbortController === abortController) {

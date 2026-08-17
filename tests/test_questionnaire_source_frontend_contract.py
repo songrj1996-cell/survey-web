@@ -20,13 +20,15 @@ SCRIPT_URL = "/static/js/features/questionnaire-sources.js"
 STYLESHEET_URL = "/static/questionnaire-sources.css"
 
 CAPABILITIES_URL = "/api/questionnaire-sources/capabilities"
+SNAPSHOTS_URL = "/api/questionnaire-sources/snapshots"
 POST_URLS = {
-    "/api/questionnaire-sources/snapshots",
+    SNAPSHOTS_URL,
     "/api/questionnaire-sources/bested/snapshots",
     "/api/questionnaire-sources/materials/snapshots",
     "/api/questionnaire-sources/materials/pdf/snapshots",
 }
 CAPABILITY_KEYS = {
+    "snapshot_catalog",
     "snapshot_package_upload",
     "bested_original_questionnaire_upload",
     "screenshot_material_upload",
@@ -35,7 +37,7 @@ CAPABILITY_KEYS = {
 
 SOURCE_CONTRACTS = {
     "snapshot_package_upload": {
-        "endpoint": "/api/questionnaire-sources/snapshots",
+        "endpoint": SNAPSHOTS_URL,
         "field_name": "file",
         "accept": {".zip", "application/zip"},
         "multiple": False,
@@ -213,6 +215,27 @@ def _string_property(block: str, name: str) -> str:
     if match is None:
         raise AssertionError(f"missing string property {name}")
     return match.group(2)
+
+
+def _string_or_constant_property(source: str, block: str, name: str) -> str:
+    match = re.search(
+        rf"\b{re.escape(name)}\s*:\s*([A-Za-z_$][\w$]*|['\"].*?['\"])",
+        block,
+        re.DOTALL,
+    )
+    if match is None:
+        raise AssertionError(f"missing string property {name}")
+    token = match.group(1).strip()
+    if token[:1] in {"'", '"'}:
+        return token[1:-1]
+    constant = re.search(
+        rf"\bconst\s+{re.escape(token)}\s*=\s*(['\"])(.*?)\1\s*;",
+        source,
+        re.DOTALL,
+    )
+    if constant is None:
+        raise AssertionError(f"{name} references non-string constant {token}")
+    return constant.group(2)
 
 
 def _boolean_property(block: str, name: str) -> bool:
@@ -393,6 +416,10 @@ class QuestionnaireSourceFrontendContractTests(unittest.TestCase):
         )
         self.assertRegex(
             self.javascript,
+            r"fetch\s*\(\s*snapshotCatalogUrl\s*\(",
+        )
+        self.assertRegex(
+            self.javascript,
             r"fetch\s*\(\s*def\.endpoint\s*,\s*"
             r"\{\s*method\s*:\s*['\"]POST['\"]",
         )
@@ -417,9 +444,19 @@ class QuestionnaireSourceFrontendContractTests(unittest.TestCase):
         self.assertEqual(set(keys), CAPABILITY_KEYS)
 
         blocks = _source_definition_blocks(self.javascript)
-        self.assertEqual(set(blocks), CAPABILITY_KEYS)
         self.assertEqual(
-            {_string_property(block, "endpoint") for block in blocks.values()},
+            set(blocks),
+            CAPABILITY_KEYS - {"snapshot_catalog"},
+        )
+        self.assertEqual(
+            {
+                _string_or_constant_property(
+                    self.javascript,
+                    block,
+                    "endpoint",
+                )
+                for block in blocks.values()
+            },
             POST_URLS,
         )
 
@@ -535,6 +572,23 @@ class QuestionnaireSourceFrontendContractTests(unittest.TestCase):
         )
         self.assertIn("abortController.signal.aborted", refresh)
 
+        refresh_catalog = _function_body(self.javascript, "refreshCatalog")
+        self.assertRegex(
+            refresh_catalog,
+            r"catalogState\.requestSerial\s*\+=\s*1",
+        )
+        self.assertRegex(
+            refresh_catalog,
+            r"const\s+requestSerial\s*=\s*catalogState\.requestSerial",
+        )
+        self.assertIn("new AbortController()", refresh_catalog)
+        self.assertIn("fetchCatalog(", refresh_catalog)
+        self.assertRegex(
+            refresh_catalog,
+            r"catalogState\.requestSerial\s*!==\s*requestSerial",
+        )
+        self.assertIn("abortController.signal.aborted", refresh_catalog)
+
     def test_reset_aborts_in_flight_uploads_and_invalidates_serials(self):
         reset = _function_body(self.javascript, "reset")
         self.assertGreaterEqual(
@@ -607,12 +661,9 @@ class QuestionnaireSourceFrontendContractTests(unittest.TestCase):
         )
         self.assertRegex(
             refresh,
-            r"setPanelVisibility\s*\(\s*supportedSources\(\)\.length\s*>\s*0\s*\)",
+            r"setPanelVisibility\s*\(\s*shouldShowPanel\(\)\s*\)",
         )
-        self.assertNotRegex(
-            self.javascript,
-            r"setPanelVisibility\s*\(\s*true\s*\)",
-        )
+        self.assertIn("shouldShowPanel()", self.javascript)
 
     def test_file_accept_multiple_and_count_contracts_are_exact(self):
         blocks = _source_definition_blocks(self.javascript)
@@ -620,7 +671,11 @@ class QuestionnaireSourceFrontendContractTests(unittest.TestCase):
             with self.subTest(key=key):
                 block = blocks[key]
                 self.assertEqual(
-                    _string_property(block, "endpoint"),
+                    _string_or_constant_property(
+                        self.javascript,
+                        block,
+                        "endpoint",
+                    ),
                     expected["endpoint"],
                 )
                 self.assertEqual(
@@ -690,6 +745,45 @@ class QuestionnaireSourceFrontendContractTests(unittest.TestCase):
             "当前报告已引用",
         ):
             self.assertNotIn(misleading, self.javascript)
+
+    def test_snapshot_catalog_contract_is_safe_and_paged(self):
+        self.assertIn("snapshot_catalog", self.javascript)
+        self.assertRegex(
+            self.javascript,
+            r"\bconst\s+SNAPSHOT_CATALOG_LIMIT\s*=\s*20\s*;",
+        )
+        self.assertRegex(
+            self.javascript,
+            r"fetch\s*\(\s*snapshotCatalogUrl\s*\(",
+        )
+        self.assertIn("encodeURIComponent(trimmedCursor)", self.javascript)
+        self.assertIn("next_cursor", self.javascript)
+        self.assertIn("catalogLoadMoreButton", self.javascript)
+        self.assertIn("加载更多", self.javascript)
+        self.assertIn(
+            ".qsrc-catalog__load-more[hidden]",
+            self.stylesheet,
+        )
+        self.assertNotRegex(
+            self.javascript,
+            r"\b(?:owner_ref|path|media|hash|raw_text|original_text)\b",
+        )
+
+    def test_upload_loading_copy_and_accessibility_contract(self):
+        create_card = _function_body(self.javascript, "createCard")
+        render_card = _function_body(self.javascript, "renderCard")
+        upload = _function_body(self.javascript, "upload")
+        self.assertIn("input.setAttribute('aria-label'", create_card)
+        self.assertIn("取消上传", render_card)
+        self.assertRegex(
+            render_card,
+            r"resetButton\.disabled\s*=\s*cardState\.phase\s*!==\s*['\"]loading['\"]\s*&&\s*!fileCount",
+        )
+        self.assertRegex(
+            upload,
+            r"HTTP_HIDE_STATUSES\.has\(response\.status\)",
+        )
+        self.assertIn("hidePanel('当前账号暂无本地问卷快照权限')", self.javascript)
 
     def test_stylesheet_rules_and_keyframes_are_qsrc_namespaced(self):
         self.assertTrue(STYLESHEET_PATH.is_file())
