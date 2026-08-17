@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import multiprocessing
+import os
 from pathlib import Path
 import tempfile
 import threading
@@ -12,13 +13,17 @@ from unittest.mock import patch
 import warnings
 import zipfile
 
+from app.storage import research_assets as research_assets_storage
 from app.schemas.questionnaire import QuestionnaireSnapshot
 from app.schemas.research_assets import MediaType, ResearchAssetCollection
 from app.storage.research_assets import (
     FileResearchAssetStorage,
     ResearchAssetBundle,
     ResearchAssetStorageError,
+    ResearchSnapshotCatalogStorage,
     ResearchSnapshotStorage,
+    SnapshotCatalogEntry,
+    SnapshotCatalogPage,
     SnapshotConflictError,
     SnapshotPackage,
     SnapshotPackageError,
@@ -89,12 +94,16 @@ def _rewrite_zip(
     *,
     replacements: dict[str, bytes] | None = None,
     additions: list[tuple[str, bytes]] | None = None,
+    removals: set[str] | None = None,
 ) -> bytes:
     replacements = replacements or {}
+    removals = removals or set()
     output = io.BytesIO()
     with zipfile.ZipFile(io.BytesIO(package), "r") as source:
         with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as target:
             for info in source.infolist():
+                if info.filename in removals:
+                    continue
                 target.writestr(info, replacements.get(info.filename, source.read(info)))
             for name, content in additions or []:
                 target.writestr(name, content)
@@ -156,6 +165,52 @@ def _package_with_different_document_media(
         ResearchAssetBundle(bundle.snapshot, collection),
         replacement_media,
     )
+
+
+def _package_for_snapshot_id(
+    bundle: ResearchAssetBundle,
+    media: dict[str, bytes],
+    snapshot_id: str,
+) -> SnapshotPackage:
+    return SnapshotPackage(
+        ResearchAssetBundle(
+            bundle.snapshot.model_copy(update={"snapshot_id": snapshot_id}),
+            bundle.collection,
+        ),
+        dict(media),
+    )
+
+
+def _package_for_owner(
+    bundle: ResearchAssetBundle,
+    media: dict[str, bytes],
+    owner_ref: str,
+) -> SnapshotPackage:
+    collection = bundle.collection.model_copy(update={
+        "owner_ref": owner_ref,
+        "sources": [
+            source.model_copy(update={"owner_ref": owner_ref})
+            for source in bundle.collection.sources
+        ],
+    })
+    return SnapshotPackage(
+        ResearchAssetBundle(bundle.snapshot, collection),
+        dict(media),
+    )
+
+
+class _LegacySnapshotStorage:
+    """只实现增加 catalog 前的快照存储端口。"""
+
+    def load_snapshot_package(self, owner_ref: str, snapshot_id: str):
+        return None
+
+    def save_snapshot_package(
+        self,
+        owner_ref: str,
+        package: SnapshotPackage,
+    ) -> None:
+        return None
 
 
 def _save_bundle_in_process(
@@ -625,6 +680,520 @@ class FileResearchSnapshotStorageTests(unittest.TestCase):
         )
         self.assertNotIn(self.owner_ref, str(files[0]))
         self.assertNotIn(self.snapshot_id, str(files[0]))
+
+    def test_catalog_protocol_keeps_legacy_snapshot_protocol_compatible(self):
+        legacy = _LegacySnapshotStorage()
+
+        self.assertIsInstance(legacy, ResearchSnapshotStorage)
+        self.assertNotIsInstance(legacy, ResearchSnapshotCatalogStorage)
+        self.assertIsInstance(self.storage, ResearchSnapshotStorage)
+        self.assertIsInstance(self.storage, ResearchSnapshotCatalogStorage)
+
+    def test_catalog_empty_and_other_owner_scopes_are_read_only(self):
+        before = set(self.root.rglob("*"))
+
+        empty = self.storage.list_snapshot_catalog(self.owner_ref)
+
+        self.assertEqual(empty, SnapshotCatalogPage((), None))
+        self.assertEqual(set(self.root.rglob("*")), before)
+
+        self.storage.save_snapshot_package(self.owner_ref, self.package)
+        owner_files_before = {
+            path.relative_to(self.root) for path in self.root.rglob("*")
+        }
+        other_owner_page = self.storage.list_snapshot_catalog("another-owner")
+        self.assertEqual(other_owner_page, SnapshotCatalogPage((), None))
+        self.assertEqual(
+            {path.relative_to(self.root) for path in self.root.rglob("*")},
+            owner_files_before,
+        )
+
+    def test_catalog_has_stable_two_page_hash_order_and_opaque_cursor(self):
+        snapshot_ids = [
+            "catalog-snapshot-a",
+            "catalog-snapshot-b",
+            "catalog-snapshot-c",
+            "catalog-snapshot-d",
+            "catalog-snapshot-e",
+        ]
+        for snapshot_id in reversed(snapshot_ids):
+            self.storage.save_snapshot_package(
+                self.owner_ref,
+                _package_for_snapshot_id(self.bundle, self.media, snapshot_id),
+            )
+        expected_ids = sorted(
+            snapshot_ids,
+            key=lambda value: hashlib.sha256(value.encode("utf-8")).hexdigest(),
+        )
+
+        first = self.storage.list_snapshot_catalog(self.owner_ref, limit=2)
+        repeated_first = self.storage.list_snapshot_catalog(
+            self.owner_ref,
+            limit=2,
+        )
+
+        self.assertEqual(first, repeated_first)
+        self.assertEqual(
+            list(first.snapshot_ids),
+            expected_ids[:2],
+        )
+        self.assertIsNotNone(first.next_cursor)
+        assert first.next_cursor is not None
+        self.assertRegex(first.next_cursor, r"^[0-9a-f]{64}$")
+        self.assertNotIn(self.owner_ref, first.next_cursor)
+        self.assertNotIn(expected_ids[1], first.next_cursor)
+
+        second = self.storage.list_snapshot_catalog(
+            self.owner_ref,
+            cursor=first.next_cursor,
+            limit=2,
+        )
+        self.assertEqual(
+            list(second.snapshot_ids),
+            expected_ids[2:4],
+        )
+        self.assertIsNotNone(second.next_cursor)
+        third = self.storage.list_snapshot_catalog(
+            self.owner_ref,
+            cursor=second.next_cursor,
+            limit=2,
+        )
+        self.assertEqual(
+            list(third.snapshot_ids),
+            expected_ids[4:],
+        )
+        self.assertIsNone(third.next_cursor)
+
+    def test_catalog_does_not_parse_or_decompress_real_large_media(self):
+        large_media = b"large-catalog-media" * (8 * 1024 * 1024 // 19)
+        large_hash = hashlib.sha256(large_media).hexdigest()
+        assets = [
+            asset.model_copy(update={
+                "content_hash": large_hash,
+                "size_bytes": len(large_media),
+            })
+            if asset.media_type == MediaType.IMAGE
+            else asset
+            for asset in self.bundle.collection.assets
+        ]
+        package = SnapshotPackage(
+            ResearchAssetBundle(
+                self.bundle.snapshot,
+                self.bundle.collection.model_copy(update={"assets": assets}),
+            ),
+            {large_hash: large_media},
+        )
+        self.storage.save_snapshot_package(self.owner_ref, package)
+        original_member_read = research_assets_storage._read_zip_member
+        read_names: list[str] = []
+
+        def record_member_read(archive, info, limit):
+            read_names.append(info.filename)
+            return original_member_read(archive, info, limit)
+
+        with (
+            patch(
+                "app.storage.research_assets.parse_snapshot_package"
+            ) as full_parser,
+            patch(
+                "app.storage.research_assets._read_zip_member",
+                side_effect=record_member_read,
+            ),
+        ):
+            page = self.storage.list_snapshot_catalog(self.owner_ref, limit=20)
+
+        full_parser.assert_not_called()
+        self.assertEqual(page.snapshot_ids, (self.snapshot_id,))
+        self.assertEqual(page._fields, ("entries", "next_cursor"))
+        self.assertIsInstance(page.entries[0], SnapshotCatalogEntry)
+        self.assertFalse(hasattr(page.entries[0], "bundle"))
+        self.assertFalse(hasattr(page.entries[0], "media"))
+        self.assertEqual(read_names[0], "manifest.json")
+        self.assertEqual(len(read_names), 2)
+        self.assertFalse(any(name.startswith("media/") for name in read_names))
+
+    def test_catalog_page_metadata_budget_includes_optional_sidecar(self):
+        self.storage.save_snapshot_package(self.owner_ref, self.package)
+        self.storage.save_bundle(self.owner_ref, self.bundle)
+        package_path = self.storage._package_path(
+            self.owner_ref,
+            self.snapshot_id,
+        )
+        sidecar_path = self.storage._bundle_path(
+            self.owner_ref,
+            self.snapshot_id,
+        )
+        with zipfile.ZipFile(package_path, "r") as archive:
+            manifest = json.loads(archive.read("manifest.json"))
+            package_metadata_bytes = (
+                archive.getinfo("manifest.json").file_size
+                + archive.getinfo(manifest["bundle"]["path"]).file_size
+            )
+        budget_without_last_sidecar_byte = (
+            package_metadata_bytes + sidecar_path.stat().st_size - 1
+        )
+
+        with (
+            patch.object(
+                research_assets_storage,
+                "_SNAPSHOT_CATALOG_MAX_PAGE_METADATA_BYTES",
+                budget_without_last_sidecar_byte,
+            ),
+            self.assertRaisesRegex(
+                ResearchAssetStorageError,
+                "安全读取上限",
+            ),
+        ):
+            self.storage.list_snapshot_catalog(self.owner_ref)
+
+    def test_blocked_catalog_metadata_does_not_block_other_owner_save_and_load(self):
+        self.storage.save_snapshot_package(self.owner_ref, self.package)
+        other_owner = "catalog-other-owner"
+        other_package = _package_for_owner(
+            self.bundle,
+            self.media,
+            other_owner,
+        )
+        metadata_started = threading.Event()
+        release_metadata = threading.Event()
+        catalog_results: list[SnapshotCatalogPage] = []
+        other_results: list[SnapshotPackage | None] = []
+        errors: list[Exception] = []
+
+        original_metadata_reader = (
+            research_assets_storage._read_snapshot_package_bundle_metadata
+        )
+
+        def blocking_metadata(owner_ref, package_file, *, metadata_budget):
+            if owner_ref == self.owner_ref:
+                metadata_started.set()
+                if not release_metadata.wait(timeout=5):
+                    raise TimeoutError("catalog metadata release timed out")
+            return original_metadata_reader(
+                owner_ref,
+                package_file,
+                metadata_budget=metadata_budget,
+            )
+
+        def list_catalog() -> None:
+            try:
+                catalog_results.append(
+                    self.storage.list_snapshot_catalog(self.owner_ref, limit=1)
+                )
+            except Exception as error:  # pragma: no cover - asserted below
+                errors.append(error)
+
+        def save_and_load_other_owner() -> None:
+            try:
+                storage = FileResearchAssetStorage(self.root)
+                storage.save_snapshot_package(other_owner, other_package)
+                other_results.append(
+                    storage.load_snapshot_package(
+                        other_owner,
+                        other_package.bundle.snapshot.snapshot_id,
+                    )
+                )
+            except Exception as error:  # pragma: no cover - asserted below
+                errors.append(error)
+
+        with patch(
+            "app.storage.research_assets._read_snapshot_package_bundle_metadata",
+            side_effect=blocking_metadata,
+        ):
+            catalog_thread = threading.Thread(target=list_catalog)
+            other_thread = threading.Thread(target=save_and_load_other_owner)
+            catalog_thread.start()
+            try:
+                self.assertTrue(metadata_started.wait(timeout=2))
+                other_thread.start()
+                other_thread.join(timeout=2)
+                self.assertFalse(
+                    other_thread.is_alive(),
+                    "另一 owner 的保存/读取被 catalog metadata 阻塞",
+                )
+                self.assertEqual(other_results, [other_package])
+            finally:
+                release_metadata.set()
+                catalog_thread.join(timeout=5)
+                if other_thread.is_alive():
+                    other_thread.join(timeout=5)
+
+        self.assertFalse(catalog_thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(len(catalog_results), 1)
+        self.assertEqual(catalog_results[0].snapshot_ids, (self.snapshot_id,))
+
+    def test_catalog_reads_complete_version_during_same_owner_atomic_replace(self):
+        self.storage.save_snapshot_package(self.owner_ref, self.package)
+        target = self.storage._package_path(self.owner_ref, self.snapshot_id)
+        alternate = SnapshotPackage(
+            ResearchAssetBundle(
+                self.bundle.snapshot.model_copy(update={"title": "alternate"}),
+                self.bundle.collection,
+            ),
+            self.media,
+        )
+        alternate_content = build_snapshot_package(
+            self.owner_ref,
+            alternate.bundle,
+            alternate.media,
+        )
+        read_started = threading.Event()
+        replace_finished = threading.Event()
+        replace_errors: list[Exception] = []
+        original_metadata_reader = (
+            research_assets_storage._read_snapshot_package_bundle_metadata
+        )
+
+        def pause_metadata(owner_ref, package_file, *, metadata_budget):
+            read_started.set()
+            if not replace_finished.wait(timeout=5):
+                raise TimeoutError("atomic replace timed out")
+            return original_metadata_reader(
+                owner_ref,
+                package_file,
+                metadata_budget=metadata_budget,
+            )
+
+        def replace_complete_package() -> None:
+            try:
+                if not read_started.wait(timeout=2):
+                    raise TimeoutError("catalog read did not start")
+                temporary = target.parent / f".{target.name}.replacement.tmp"
+                temporary.write_bytes(alternate_content)
+                os.replace(temporary, target)
+            except Exception as error:  # pragma: no cover - asserted below
+                replace_errors.append(error)
+            finally:
+                replace_finished.set()
+
+        replace_thread = threading.Thread(target=replace_complete_package)
+        replace_thread.start()
+        with patch(
+            "app.storage.research_assets._read_snapshot_package_bundle_metadata",
+            side_effect=pause_metadata,
+        ):
+            page = self.storage.list_snapshot_catalog(self.owner_ref, limit=1)
+        replace_thread.join(timeout=5)
+
+        self.assertFalse(replace_thread.is_alive())
+        self.assertEqual(replace_errors, [])
+        self.assertEqual(page.snapshot_ids, (self.snapshot_id,))
+        self.assertEqual(
+            self.storage.load_snapshot_package(
+                self.owner_ref,
+                self.snapshot_id,
+            ),
+            alternate,
+        )
+
+    def test_catalog_parses_only_current_page_not_cursor_before_or_page_after(self):
+        packages = [
+            _package_for_snapshot_id(
+                self.bundle,
+                self.media,
+                f"lazy-catalog-{index}",
+            )
+            for index in range(3)
+        ]
+        for package in packages:
+            self.storage.save_snapshot_package(self.owner_ref, package)
+        ordered = sorted(
+            (
+                hashlib.sha256(
+                    package.bundle.snapshot.snapshot_id.encode("utf-8")
+                ).hexdigest(),
+                package.bundle.snapshot.snapshot_id,
+            )
+            for package in packages
+        )
+
+        first_key, first_snapshot_id = ordered[0]
+        first_path = self.storage._package_path(
+            self.owner_ref,
+            first_snapshot_id,
+        )
+        first_content = first_path.read_bytes()
+        first_path.write_bytes(b"corrupt-before-cursor")
+
+        after_corrupt_cursor = self.storage.list_snapshot_catalog(
+            self.owner_ref,
+            cursor=first_key,
+            limit=2,
+        )
+        self.assertEqual(
+            after_corrupt_cursor.snapshot_ids,
+            tuple(snapshot_id for _, snapshot_id in ordered[1:]),
+        )
+        with self.assertRaises(SnapshotPackageError):
+            self.storage.list_snapshot_catalog(self.owner_ref, limit=1)
+
+        first_path.write_bytes(first_content)
+        last_key, _ = ordered[-1]
+        last_path = first_path.parent / f"{last_key}.zip"
+        last_path.write_bytes(b"corrupt-after-page")
+
+        first_page = self.storage.list_snapshot_catalog(self.owner_ref, limit=1)
+        self.assertEqual(first_page.snapshot_ids, (ordered[0][1],))
+        second_page = self.storage.list_snapshot_catalog(
+            self.owner_ref,
+            cursor=first_page.next_cursor,
+            limit=1,
+        )
+        self.assertEqual(second_page.snapshot_ids, (ordered[1][1],))
+        with self.assertRaises(SnapshotPackageError):
+            self.storage.list_snapshot_catalog(
+                self.owner_ref,
+                cursor=second_page.next_cursor,
+                limit=1,
+            )
+
+    def test_catalog_validates_limit_and_cursor_before_storage_access(self):
+        for invalid_limit in (0, 51, True, 1.5, "20"):
+            with self.subTest(limit=invalid_limit):
+                with self.assertRaisesRegex(ResearchAssetStorageError, "limit"):
+                    self.storage.list_snapshot_catalog(
+                        self.owner_ref,
+                        limit=invalid_limit,  # type: ignore[arg-type]
+                    )
+        for invalid_cursor in (
+            "",
+            "a" * 63,
+            "A" * 64,
+            "g" * 64,
+            1,
+        ):
+            with self.subTest(cursor=invalid_cursor):
+                with self.assertRaisesRegex(ResearchAssetStorageError, "cursor"):
+                    self.storage.list_snapshot_catalog(
+                        self.owner_ref,
+                        cursor=invalid_cursor,  # type: ignore[arg-type]
+                    )
+        self.assertEqual(list(self.root.rglob("*")), [])
+
+    def test_catalog_ignores_normal_sidecars_and_returns_no_extra_cursor(self):
+        self.storage.save_snapshot_package(self.owner_ref, self.package)
+        owner_directory = self.storage._package_path(
+            self.owner_ref,
+            self.snapshot_id,
+        ).parent
+        (owner_directory / "normal.json").write_text("{}", encoding="utf-8")
+        (owner_directory / ".catalog.lock").write_text("", encoding="utf-8")
+        (owner_directory / ".catalog.tmp").write_text("", encoding="utf-8")
+
+        page = self.storage.list_snapshot_catalog(self.owner_ref, limit=1)
+
+        self.assertEqual(page.snapshot_ids, (self.snapshot_id,))
+        self.assertIsNone(page.next_cursor)
+
+    def test_catalog_fails_closed_for_corrupt_symlink_or_nonregular_zip(self):
+        self.storage.save_snapshot_package(self.owner_ref, self.package)
+        package_path = self.storage._package_path(
+            self.owner_ref,
+            self.snapshot_id,
+        )
+        valid_content = package_path.read_bytes()
+        package_path.write_bytes(b"corrupt-package")
+        with self.assertRaises(SnapshotPackageError):
+            self.storage.list_snapshot_catalog(self.owner_ref)
+
+        package_path.write_bytes(valid_content)
+        unsafe_path = package_path.parent / f"{'0' * 64}.zip"
+        unsafe_path.symlink_to(package_path.name)
+        with self.assertRaisesRegex(SnapshotPackageError, "普通文件"):
+            self.storage.list_snapshot_catalog(self.owner_ref)
+
+        unsafe_path.unlink()
+        unsafe_path.mkdir()
+        with self.assertRaisesRegex(SnapshotPackageError, "普通文件"):
+            self.storage.list_snapshot_catalog(self.owner_ref)
+
+    def test_catalog_revalidates_media_closure_and_split_brain_bundle(self):
+        self.storage.save_snapshot_package(self.owner_ref, self.package)
+        package_path = self.storage._package_path(
+            self.owner_ref,
+            self.snapshot_id,
+        )
+        media_path = f"media/{next(iter(self.media))}"
+        with zipfile.ZipFile(io.BytesIO(package_path.read_bytes()), "r") as archive:
+            manifest = json.loads(archive.read("manifest.json"))
+        manifest["media"] = [
+            entry for entry in manifest["media"] if entry["path"] != media_path
+        ]
+        package_path.write_bytes(
+            _rewrite_zip(
+                package_path.read_bytes(),
+                replacements={
+                    "manifest.json": json.dumps(
+                        manifest,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                },
+                removals={media_path},
+            )
+        )
+        with self.assertRaisesRegex(SnapshotPackageError, "缺少图片素材媒体"):
+            self.storage.list_snapshot_catalog(self.owner_ref)
+
+        package_path.unlink()
+        self.storage.save_bundle(self.owner_ref, self.bundle)
+        different_package = SnapshotPackage(
+            ResearchAssetBundle(
+                self.bundle.snapshot.model_copy(update={"title": "different"}),
+                self.bundle.collection,
+            ),
+            self.media,
+        )
+        package_path.write_bytes(
+            build_snapshot_package(
+                self.owner_ref,
+                different_package.bundle,
+                different_package.media,
+            )
+        )
+        with self.assertRaises(SnapshotConflictError):
+            self.storage.list_snapshot_catalog(self.owner_ref)
+
+    def test_catalog_after_concurrent_saves_contains_every_complete_package(self):
+        packages = [
+            _package_for_snapshot_id(
+                self.bundle,
+                self.media,
+                f"concurrent-catalog-{index}",
+            )
+            for index in range(8)
+        ]
+        barrier = threading.Barrier(len(packages))
+        errors: list[Exception] = []
+
+        def save(package: SnapshotPackage) -> None:
+            try:
+                barrier.wait(timeout=2)
+                FileResearchAssetStorage(self.root).save_snapshot_package(
+                    self.owner_ref,
+                    package,
+                )
+            except Exception as error:  # pragma: no cover - asserted below
+                errors.append(error)
+
+        threads = [
+            threading.Thread(target=save, args=(package,))
+            for package in packages
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        page = self.storage.list_snapshot_catalog(self.owner_ref, limit=50)
+        self.assertCountEqual(
+            page.snapshot_ids,
+            [package.bundle.snapshot.snapshot_id for package in packages],
+        )
+        self.assertIsNone(page.next_cursor)
 
     def test_document_package_save_and_load_preserve_all_media(self):
         bundle, media, document_hash = _bundle_with_image_and_document_media()

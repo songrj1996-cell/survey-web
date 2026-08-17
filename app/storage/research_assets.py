@@ -17,7 +17,7 @@ import threading
 from collections.abc import Mapping
 from contextlib import contextmanager
 import fcntl
-from typing import Any, NamedTuple, Protocol, runtime_checkable
+from typing import Any, BinaryIO, NamedTuple, Protocol, runtime_checkable
 import zipfile
 
 from pydantic import ValidationError
@@ -27,8 +27,17 @@ from app.core.research_assets import (
     canonical_json,
     validate_research_contract,
 )
-from app.schemas.questionnaire import QuestionnaireSnapshot
-from app.schemas.research_assets import MediaType, ResearchAssetCollection
+from app.schemas.questionnaire import (
+    CollectionState,
+    MappingStatus,
+    QuestionnaireSnapshot,
+    QuestionnaireSourceMode,
+)
+from app.schemas.research_assets import (
+    MediaType,
+    Provider,
+    ResearchAssetCollection,
+)
 
 
 _STORAGE_SCHEMA_VERSION = 1
@@ -39,7 +48,10 @@ SNAPSHOT_PACKAGE_MAX_MEMBER_BYTES = 64 * 1024 * 1024
 SNAPSHOT_PACKAGE_MAX_TOTAL_BYTES = 256 * 1024 * 1024
 SNAPSHOT_PACKAGE_MAX_MANIFEST_BYTES = 1024 * 1024
 _MAX_STORED_BUNDLE_BYTES = 64 * 1024 * 1024
+_SNAPSHOT_CATALOG_MAX_LIMIT = 50
+_SNAPSHOT_CATALOG_MAX_PAGE_METADATA_BYTES = 128 * 1024 * 1024
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_SNAPSHOT_PACKAGE_FILENAME_PATTERN = re.compile(r"^([0-9a-f]{64})\.zip$")
 _MANIFEST_PATH = "manifest.json"
 
 
@@ -67,6 +79,34 @@ class SnapshotPackage(NamedTuple):
 
     bundle: ResearchAssetBundle
     media: dict[str, bytes]
+
+
+class SnapshotCatalogEntry(NamedTuple):
+    """不持有 bundle 或媒体内容的 owner-scoped 快照目录元数据。"""
+
+    owner_ref: str
+    storage_key: str
+    snapshot_id: str
+    provider: Provider
+    source_mode: QuestionnaireSourceMode
+    collection_state: CollectionState
+    mapping_status: MappingStatus
+    item_count: int
+    question_count: int
+    asset_count: int
+    image_asset_count: int
+    asset_reference_count: int
+
+
+class SnapshotCatalogPage(NamedTuple):
+    """按不透明存储键分页、只持有轻量条目的快照目录。"""
+
+    entries: tuple[SnapshotCatalogEntry, ...]
+    next_cursor: str | None
+
+    @property
+    def snapshot_ids(self) -> tuple[str, ...]:
+        return tuple(entry.snapshot_id for entry in self.entries)
 
 
 @runtime_checkable
@@ -108,6 +148,20 @@ class ResearchSnapshotStorage(Protocol):
         owner_ref: str,
         package: SnapshotPackage,
     ) -> None:
+        ...
+
+
+@runtime_checkable
+class ResearchSnapshotCatalogStorage(ResearchSnapshotStorage, Protocol):
+    """在旧快照端口上增加 owner 隔离的只读目录能力。"""
+
+    def list_snapshot_catalog(
+        self,
+        owner_ref: str,
+        *,
+        cursor: str | None = None,
+        limit: int = 20,
+    ) -> SnapshotCatalogPage:
         ...
 
 
@@ -345,6 +399,14 @@ class FileResearchAssetStorage:
         if content is None:
             return None
 
+        return self._bundle_from_stored_content(owner, snapshot_id, content)
+
+    @staticmethod
+    def _bundle_from_stored_content(
+        owner: str,
+        snapshot_id: str,
+        content: bytes,
+    ) -> ResearchAssetBundle:
         envelope = _require_exact_keys(
             _load_json_bytes(
                 content,
@@ -526,6 +588,296 @@ class FileResearchAssetStorage:
                     "同一 owner_ref 与 snapshot_id 已存在不同快照包内容"
                 )
             self._atomic_write(target, content, "快照包")
+
+    def list_snapshot_catalog(
+        self,
+        owner_ref: str,
+        *,
+        cursor: str | None = None,
+        limit: int = 20,
+    ) -> SnapshotCatalogPage:
+        """按哈希存储键稳定枚举 owner 范围内的轻量快照元数据。
+
+        方法只读取最终 ``.zip`` / 可选 ``.json`` 文件，不创建
+        owner 目录或读锁文件。扫描时只保留 ``limit + 1`` 个存储键；
+        当前页逐项只读取 central directory、manifest 与 bundle，并在投影为
+        轻量条目后立即释放完整 bundle；媒体成员内容留给显式加载/下载校验。
+        """
+        owner = _require_nonblank(
+            owner_ref,
+            "owner_ref",
+            ResearchAssetStorageError,
+        )
+        if cursor is not None:
+            cursor = _require_sha256(
+                cursor,
+                "cursor",
+                ResearchAssetStorageError,
+            )
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or limit < 1
+            or limit > _SNAPSHOT_CATALOG_MAX_LIMIT
+        ):
+            raise ResearchAssetStorageError("limit 必须是 1 到 50 的整数")
+
+        selected_keys: list[str] = []
+        selection_capacity = limit + 1
+        with self._open_owner_directory(owner) as directory:
+            if directory is None:
+                return SnapshotCatalogPage(entries=(), next_cursor=None)
+            try:
+                entries = os.scandir(directory)
+            except OSError as error:
+                raise ResearchAssetStorageError("快照包目录枚举失败") from error
+            with entries:
+                for entry in entries:
+                    name = entry.name
+                    if not name.endswith(".zip"):
+                        continue
+                    match = _SNAPSHOT_PACKAGE_FILENAME_PATTERN.fullmatch(name)
+                    if match is None:
+                        raise SnapshotPackageError("快照包未按小写哈希存储键命名")
+                    try:
+                        mode = entry.stat(follow_symlinks=False).st_mode
+                    except OSError as error:
+                        raise ResearchAssetStorageError(
+                            "快照包目录项状态读取失败"
+                        ) from error
+                    if not stat.S_ISREG(mode):
+                        raise SnapshotPackageError("快照包目录项必须是普通文件")
+
+                    storage_key = match.group(1)
+                    if cursor is not None and storage_key <= cursor:
+                        continue
+                    if (
+                        len(selected_keys) == selection_capacity
+                        and storage_key >= selected_keys[-1]
+                    ):
+                        continue
+                    position = 0
+                    while (
+                        position < len(selected_keys)
+                        and selected_keys[position] < storage_key
+                    ):
+                        position += 1
+                    selected_keys.insert(position, storage_key)
+                    if len(selected_keys) > selection_capacity:
+                        selected_keys.pop()
+
+            has_more = len(selected_keys) > limit
+            page_keys = selected_keys[:limit]
+            catalog_entries: list[SnapshotCatalogEntry] = []
+            metadata_bytes = 0
+            for storage_key in page_keys:
+                entry, consumed_bytes = self._catalog_entry_from_package(
+                    owner,
+                    storage_key,
+                    directory,
+                    metadata_budget=(
+                        _SNAPSHOT_CATALOG_MAX_PAGE_METADATA_BYTES
+                        - metadata_bytes
+                    ),
+                )
+                metadata_bytes += consumed_bytes
+                catalog_entries.append(entry)
+
+        return SnapshotCatalogPage(
+            entries=tuple(catalog_entries),
+            next_cursor=(page_keys[-1] if has_more else None),
+        )
+
+    @contextmanager
+    def _open_owner_directory(self, owner_ref: str):
+        directory_path = self._root / _identity_hash(owner_ref)
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            descriptor = os.open(directory_path, flags)
+        except FileNotFoundError:
+            yield None
+            return
+        except OSError as error:
+            raise ResearchAssetStorageError("快照包 owner 目录打开失败") from error
+        try:
+            try:
+                mode = os.fstat(descriptor).st_mode
+            except OSError as error:
+                raise ResearchAssetStorageError(
+                    "快照包 owner 目录状态读取失败"
+                ) from error
+            if not stat.S_ISDIR(mode):
+                raise ResearchAssetStorageError("快照包 owner 路径必须是目录")
+            yield descriptor
+        finally:
+            os.close(descriptor)
+
+    @classmethod
+    def _catalog_entry_from_package(
+        cls,
+        owner: str,
+        storage_key: str,
+        directory: int,
+        *,
+        metadata_budget: int,
+    ) -> tuple[SnapshotCatalogEntry, int]:
+        with cls._open_directory_file(
+            directory,
+            f"{storage_key}.zip",
+            max_bytes=SNAPSHOT_PACKAGE_MAX_ARCHIVE_BYTES,
+            label="快照包文件",
+            required=True,
+        ) as package_file:
+            assert package_file is not None
+            package_bundle, metadata_bytes = _read_snapshot_package_bundle_metadata(
+                owner,
+                package_file,
+                metadata_budget=metadata_budget,
+            )
+        snapshot = package_bundle.snapshot
+        collection = package_bundle.collection
+        snapshot_id = snapshot.snapshot_id
+        if _identity_hash(snapshot_id) != storage_key:
+            raise SnapshotPackageError("快照包 snapshot_id 与存储键不一致")
+
+        bundle_content = cls._read_directory_file(
+            directory,
+            f"{storage_key}.json",
+            max_bytes=min(
+                _MAX_STORED_BUNDLE_BYTES,
+                metadata_budget - metadata_bytes,
+            ),
+            label="快照文件",
+            required=False,
+        )
+        if bundle_content is not None:
+            metadata_bytes += len(bundle_content)
+            stored_bundle = cls._bundle_from_stored_content(
+                owner,
+                snapshot_id,
+                bundle_content,
+            )
+            if not cls._same_bundle(stored_bundle, package_bundle):
+                raise SnapshotConflictError(
+                    "同一 owner_ref 与 snapshot_id 的 bundle 和快照包内容冲突"
+                )
+        entry = SnapshotCatalogEntry(
+            owner_ref=owner,
+            storage_key=storage_key,
+            snapshot_id=snapshot_id,
+            provider=snapshot.provider,
+            source_mode=snapshot.source_mode,
+            collection_state=snapshot.collection_state,
+            mapping_status=snapshot.mapping_status,
+            item_count=snapshot.item_count,
+            question_count=snapshot.question_count,
+            asset_count=snapshot.asset_count,
+            image_asset_count=sum(
+                asset.media_type == MediaType.IMAGE
+                for asset in collection.assets
+            ),
+            asset_reference_count=snapshot.asset_reference_count,
+        )
+        return entry, metadata_bytes
+
+    @staticmethod
+    @contextmanager
+    def _open_directory_file(
+        directory: int,
+        name: str,
+        *,
+        max_bytes: int,
+        label: str,
+        required: bool,
+    ):
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(name, flags, dir_fd=directory)
+        except FileNotFoundError as error:
+            if not required:
+                yield None
+                return
+            raise ResearchAssetStorageError(f"{label}在枚举期间消失") from error
+        except OSError as error:
+            raise ResearchAssetStorageError(f"{label}打开失败") from error
+        try:
+            try:
+                file_status = os.fstat(descriptor)
+            except OSError as error:
+                raise ResearchAssetStorageError(f"{label}状态读取失败") from error
+            if not stat.S_ISREG(file_status.st_mode):
+                raise SnapshotPackageError(f"{label}必须是普通文件")
+            if file_status.st_size > max_bytes:
+                raise ResearchAssetStorageError(f"{label}超过安全读取上限")
+            with os.fdopen(descriptor, "rb", closefd=False) as source:
+                yield source
+            try:
+                current_status = os.fstat(descriptor)
+            except OSError as error:
+                raise ResearchAssetStorageError(f"{label}状态读取失败") from error
+            if (
+                current_status.st_dev != file_status.st_dev
+                or current_status.st_ino != file_status.st_ino
+                or current_status.st_size != file_status.st_size
+                or current_status.st_mtime_ns != file_status.st_mtime_ns
+            ):
+                raise ResearchAssetStorageError(f"{label}在读取期间发生变化")
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def _read_directory_file(
+        directory: int,
+        name: str,
+        *,
+        max_bytes: int,
+        label: str,
+        required: bool,
+    ) -> bytes | None:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(name, flags, dir_fd=directory)
+        except FileNotFoundError as error:
+            if not required:
+                return None
+            raise ResearchAssetStorageError(f"{label}在枚举期间消失") from error
+        except OSError as error:
+            raise ResearchAssetStorageError(f"{label}打开失败") from error
+        try:
+            try:
+                file_status = os.fstat(descriptor)
+            except OSError as error:
+                raise ResearchAssetStorageError(f"{label}状态读取失败") from error
+            if not stat.S_ISREG(file_status.st_mode):
+                raise SnapshotPackageError(f"{label}必须是普通文件")
+            if file_status.st_size > max_bytes:
+                raise ResearchAssetStorageError(f"{label}超过安全读取上限")
+
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                try:
+                    chunk = os.read(
+                        descriptor,
+                        min(1024 * 1024, max_bytes - total + 1),
+                    )
+                except OSError as error:
+                    raise ResearchAssetStorageError(f"{label}读取失败") from error
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise ResearchAssetStorageError(f"{label}超过安全读取上限")
+                chunks.append(chunk)
+            if total != file_status.st_size:
+                raise ResearchAssetStorageError(f"{label}在读取期间发生变化")
+            return b"".join(chunks)
+        finally:
+            os.close(descriptor)
 
     @contextmanager
     def _exclusive_snapshot(self, owner_ref: str, snapshot_id: str):
@@ -838,6 +1190,190 @@ def _manifest_entry(value: Any, label: str) -> tuple[str, str, int]:
     return path, digest, size
 
 
+class _SnapshotArchiveMetadata(NamedTuple):
+    bundle: ResearchAssetBundle
+    media_descriptors: dict[str, tuple[str, int]]
+    info_by_name: dict[str, zipfile.ZipInfo]
+    metadata_bytes: int
+
+
+def _validate_media_descriptor_closure(
+    collection: ResearchAssetCollection,
+    media_descriptors: Mapping[str, tuple[str, int]],
+) -> None:
+    requirements, media_label = _snapshot_media_requirements(collection)
+    provided_hashes = set(media_descriptors)
+    expected_hashes = set(requirements)
+    unexpected = provided_hashes - expected_hashes
+    if unexpected:
+        raise SnapshotPackageError(
+            f"快照包含未被{media_label}引用的媒体："
+            + "、".join(sorted(unexpected))
+        )
+    missing = expected_hashes - provided_hashes
+    if missing:
+        raise SnapshotPackageError(
+            f"快照缺少{media_label}媒体：" + "、".join(sorted(missing))
+        )
+    for content_hash, sizes in requirements.items():
+        declared_size = media_descriptors[content_hash][1]
+        if sizes and declared_size not in sizes:
+            raise SnapshotPackageError(
+                f"媒体 {content_hash} 与素材 size_bytes 不一致"
+            )
+
+
+def _snapshot_archive_metadata(
+    owner: str,
+    archive: zipfile.ZipFile,
+    *,
+    metadata_budget: int | None = None,
+) -> _SnapshotArchiveMetadata:
+    infos = archive.infolist()
+    if not infos or len(infos) > SNAPSHOT_PACKAGE_MAX_MEMBERS:
+        raise SnapshotPackageError("快照包成员数量无效")
+    names = [info.filename for info in infos]
+    if len(names) != len(set(names)):
+        raise SnapshotPackageError("快照包包含重复成员")
+    total_declared_size = 0
+    info_by_name: dict[str, zipfile.ZipInfo] = {}
+    for info in infos:
+        _validate_zip_member(info)
+        total_declared_size += info.file_size
+        if total_declared_size > SNAPSHOT_PACKAGE_MAX_TOTAL_BYTES:
+            raise SnapshotPackageError("快照包声明的解压总大小超过安全上限")
+        info_by_name[info.filename] = info
+    manifest_info = info_by_name.get(_MANIFEST_PATH)
+    if manifest_info is None:
+        raise SnapshotPackageError("快照包缺少 manifest.json")
+    if (
+        metadata_budget is not None
+        and manifest_info.file_size > metadata_budget
+    ):
+        raise SnapshotPackageError("快照目录页元数据超过安全读取预算")
+    manifest = _require_exact_keys(
+        _load_json_bytes(
+            _read_zip_member(
+                archive,
+                manifest_info,
+                SNAPSHOT_PACKAGE_MAX_MANIFEST_BYTES,
+            ),
+            "manifest.json",
+            SnapshotPackageError,
+        ),
+        {"schema_version", "owner_ref", "snapshot_id", "bundle", "media"},
+        "manifest.json",
+        SnapshotPackageError,
+    )
+    if (
+        isinstance(manifest["schema_version"], bool)
+        or manifest["schema_version"] != SNAPSHOT_PACKAGE_SCHEMA_VERSION
+    ):
+        raise SnapshotPackageError("快照包版本不受支持")
+    if manifest["owner_ref"] != owner:
+        raise SnapshotPackageError("快照包 owner_ref 与导入范围不一致")
+    manifest_snapshot_id = _require_stable_id(
+        manifest["snapshot_id"],
+        "manifest.snapshot_id",
+        SnapshotPackageError,
+    )
+
+    bundle_path, bundle_hash, bundle_size = _manifest_entry(
+        manifest["bundle"],
+        "manifest.bundle",
+    )
+    if bundle_path != f"bundle/{bundle_hash}.json":
+        raise SnapshotPackageError("bundle 未按内容哈希命名")
+    raw_media_entries = manifest["media"]
+    if not isinstance(raw_media_entries, list):
+        raise SnapshotPackageError("manifest.media 必须是列表")
+    if len(raw_media_entries) > SNAPSHOT_PACKAGE_MAX_MEMBERS - 2:
+        raise SnapshotPackageError("manifest.media 成员数量超过安全上限")
+    media_descriptors: dict[str, tuple[str, int]] = {}
+    media_paths: set[str] = set()
+    for index, raw_entry in enumerate(raw_media_entries):
+        path, digest, size = _manifest_entry(
+            raw_entry,
+            f"manifest.media[{index}]",
+        )
+        if path != f"media/{digest}":
+            raise SnapshotPackageError("媒体未按内容哈希命名")
+        if digest in media_descriptors or path in media_paths:
+            raise SnapshotPackageError("manifest.media 包含重复媒体")
+        media_descriptors[digest] = (path, size)
+        media_paths.add(path)
+
+    expected_members = {_MANIFEST_PATH, bundle_path, *media_paths}
+    if set(info_by_name) != expected_members:
+        raise SnapshotPackageError("快照包包含缺失或未声明成员")
+    bundle_info = info_by_name[bundle_path]
+    if bundle_info.file_size != bundle_size:
+        raise SnapshotPackageError("bundle JSON 大小或内容哈希不一致")
+    metadata_bytes = manifest_info.file_size + bundle_size
+    if metadata_budget is not None and metadata_bytes > metadata_budget:
+        raise SnapshotPackageError("快照目录页元数据超过安全读取预算")
+    for digest, (path, declared_size) in media_descriptors.items():
+        if info_by_name[path].file_size != declared_size:
+            raise SnapshotPackageError(
+                f"媒体 {digest} 大小或内容哈希不一致"
+            )
+
+    bundle_content = _read_zip_member(
+        archive,
+        bundle_info,
+        SNAPSHOT_PACKAGE_MAX_MEMBER_BYTES,
+    )
+    if _sha256(bundle_content) != bundle_hash:
+        raise SnapshotPackageError("bundle JSON 大小或内容哈希不一致")
+    bundle = _bundle_from_value(
+        _load_json_bytes(
+            bundle_content,
+            "bundle JSON",
+            SnapshotPackageError,
+        ),
+        "bundle JSON",
+        SnapshotPackageError,
+    )
+    _validated_bundle(owner, bundle, SnapshotPackageError)
+    if bundle.snapshot.snapshot_id != manifest_snapshot_id:
+        raise SnapshotPackageError("bundle.snapshot_id 与 manifest 不一致")
+    _validate_media_descriptor_closure(bundle.collection, media_descriptors)
+    return _SnapshotArchiveMetadata(
+        bundle=bundle,
+        media_descriptors=media_descriptors,
+        info_by_name=info_by_name,
+        metadata_bytes=metadata_bytes,
+    )
+
+
+def _read_snapshot_package_bundle_metadata(
+    owner_ref: str,
+    package_file: BinaryIO,
+    *,
+    metadata_budget: int,
+) -> tuple[ResearchAssetBundle, int]:
+    """只读取 manifest 与 bundle，媒体内容留给显式快照加载。"""
+    owner = _require_nonblank(owner_ref, "owner_ref", SnapshotPackageError)
+    if (
+        isinstance(metadata_budget, bool)
+        or not isinstance(metadata_budget, int)
+        or metadata_budget < 0
+    ):
+        raise SnapshotPackageError("快照目录页元数据预算无效")
+    try:
+        with zipfile.ZipFile(package_file, "r") as archive:
+            metadata = _snapshot_archive_metadata(
+                owner,
+                archive,
+                metadata_budget=metadata_budget,
+            )
+    except SnapshotPackageError:
+        raise
+    except (OSError, RuntimeError, zipfile.BadZipFile) as error:
+        raise SnapshotPackageError("快照包不是有效 ZIP") from error
+    return metadata.bundle, metadata.metadata_bytes
+
+
 def parse_snapshot_package(
     owner_ref: str,
     package: bytes,
@@ -855,104 +1391,12 @@ def parse_snapshot_package(
         raise SnapshotPackageError("快照包不是有效 ZIP") from error
 
     with archive:
-        infos = archive.infolist()
-        if not infos or len(infos) > SNAPSHOT_PACKAGE_MAX_MEMBERS:
-            raise SnapshotPackageError("快照包成员数量无效")
-        names = [info.filename for info in infos]
-        if len(names) != len(set(names)):
-            raise SnapshotPackageError("快照包包含重复成员")
-        total_declared_size = 0
-        info_by_name: dict[str, zipfile.ZipInfo] = {}
-        for info in infos:
-            _validate_zip_member(info)
-            total_declared_size += info.file_size
-            if total_declared_size > SNAPSHOT_PACKAGE_MAX_TOTAL_BYTES:
-                raise SnapshotPackageError("快照包声明的解压总大小超过安全上限")
-            info_by_name[info.filename] = info
-        manifest_info = info_by_name.get(_MANIFEST_PATH)
-        if manifest_info is None:
-            raise SnapshotPackageError("快照包缺少 manifest.json")
-        manifest = _require_exact_keys(
-            _load_json_bytes(
-                _read_zip_member(
-                    archive,
-                    manifest_info,
-                    SNAPSHOT_PACKAGE_MAX_MANIFEST_BYTES,
-                ),
-                "manifest.json",
-                SnapshotPackageError,
-            ),
-            {"schema_version", "owner_ref", "snapshot_id", "bundle", "media"},
-            "manifest.json",
-            SnapshotPackageError,
-        )
-        if (
-            isinstance(manifest["schema_version"], bool)
-            or manifest["schema_version"] != SNAPSHOT_PACKAGE_SCHEMA_VERSION
-        ):
-            raise SnapshotPackageError("快照包版本不受支持")
-        if manifest["owner_ref"] != owner:
-            raise SnapshotPackageError("快照包 owner_ref 与导入范围不一致")
-        manifest_snapshot_id = _require_stable_id(
-            manifest["snapshot_id"],
-            "manifest.snapshot_id",
-            SnapshotPackageError,
-        )
-
-        bundle_path, bundle_hash, bundle_size = _manifest_entry(
-            manifest["bundle"],
-            "manifest.bundle",
-        )
-        if bundle_path != f"bundle/{bundle_hash}.json":
-            raise SnapshotPackageError("bundle 未按内容哈希命名")
-        raw_media_entries = manifest["media"]
-        if not isinstance(raw_media_entries, list):
-            raise SnapshotPackageError("manifest.media 必须是列表")
-        if len(raw_media_entries) > SNAPSHOT_PACKAGE_MAX_MEMBERS - 2:
-            raise SnapshotPackageError("manifest.media 成员数量超过安全上限")
-        media_descriptors: dict[str, tuple[str, int]] = {}
-        media_paths: set[str] = set()
-        for index, raw_entry in enumerate(raw_media_entries):
-            path, digest, size = _manifest_entry(
-                raw_entry,
-                f"manifest.media[{index}]",
-            )
-            if path != f"media/{digest}":
-                raise SnapshotPackageError("媒体未按内容哈希命名")
-            if digest in media_descriptors or path in media_paths:
-                raise SnapshotPackageError("manifest.media 包含重复媒体")
-            media_descriptors[digest] = (path, size)
-            media_paths.add(path)
-
-        expected_members = {_MANIFEST_PATH, bundle_path, *media_paths}
-        if set(info_by_name) != expected_members:
-            raise SnapshotPackageError("快照包包含缺失或未声明成员")
-        bundle_info = info_by_name[bundle_path]
-        bundle_content = _read_zip_member(
-            archive,
-            bundle_info,
-            SNAPSHOT_PACKAGE_MAX_MEMBER_BYTES,
-        )
-        if len(bundle_content) != bundle_size or _sha256(bundle_content) != bundle_hash:
-            raise SnapshotPackageError("bundle JSON 大小或内容哈希不一致")
-        bundle = _bundle_from_value(
-            _load_json_bytes(
-                bundle_content,
-                "bundle JSON",
-                SnapshotPackageError,
-            ),
-            "bundle JSON",
-            SnapshotPackageError,
-        )
-        _validated_bundle(owner, bundle, SnapshotPackageError)
-        if bundle.snapshot.snapshot_id != manifest_snapshot_id:
-            raise SnapshotPackageError("bundle.snapshot_id 与 manifest 不一致")
-
+        metadata = _snapshot_archive_metadata(owner, archive)
         media: dict[str, bytes] = {}
-        for digest, (path, declared_size) in media_descriptors.items():
+        for digest, (path, declared_size) in metadata.media_descriptors.items():
             content = _read_zip_member(
                 archive,
-                info_by_name[path],
+                metadata.info_by_name[path],
                 SNAPSHOT_PACKAGE_MAX_MEMBER_BYTES,
             )
             if len(content) != declared_size or _sha256(content) != digest:
@@ -961,5 +1405,5 @@ def parse_snapshot_package(
                 )
             media[digest] = content
 
-    normalized_media = _validated_media(bundle.collection, media)
-    return SnapshotPackage(bundle=bundle, media=normalized_media)
+    normalized_media = _validated_media(metadata.bundle.collection, media)
+    return SnapshotPackage(bundle=metadata.bundle, media=normalized_media)
