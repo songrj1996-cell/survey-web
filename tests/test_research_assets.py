@@ -8,6 +8,7 @@ import unittest
 
 from pydantic import ValidationError
 
+from app.core import research_assets as research_assets_module
 from app.core.research_assets import (
     ResearchContractError,
     build_asset_dedupe_key,
@@ -86,6 +87,19 @@ def _asset(collection: ResearchAssetCollection, asset_id: str):
     return next(
         asset for asset in collection.assets if asset.asset_id == asset_id
     )
+
+
+class _CountingList(list):
+    """Track yielded elements so reference lookup complexity is testable."""
+
+    def __init__(self, values) -> None:
+        super().__init__(values)
+        self.yield_count = 0
+
+    def __iter__(self):
+        for value in super().__iter__():
+            self.yield_count += 1
+            yield value
 
 
 class ResearchAssetFixtureTests(unittest.TestCase):
@@ -517,6 +531,188 @@ class ResearchAssetIntegrityTests(unittest.TestCase):
         rows[1].asset_reference_ids.append("aref_grid_row_usability")
         with self.assertRaisesRegex(ResearchContractError, "声明位置"):
             validate_research_contract(wrong_canonical, original_collection)
+
+    def test_reference_option_and_row_provider_ids_keep_exact_semantics(self):
+        original_snapshot, original_collection = _contracts("google_forms.json")
+
+        matching_option_snapshot = original_snapshot.model_copy(deep=True)
+        matching_option_collection = original_collection.model_copy(deep=True)
+        option = _question(
+            matching_option_snapshot,
+            "q_concept_choice",
+        ).options[0]
+        option.provider_option_id = "provider-option-a"
+        _reference(
+            matching_option_collection,
+            "aref_option_a",
+        ).source_locator.provider_option_id = "provider-option-a"
+        validate_research_contract(
+            matching_option_snapshot,
+            matching_option_collection,
+        )
+
+        wrong_option_collection = matching_option_collection.model_copy(deep=True)
+        _reference(
+            wrong_option_collection,
+            "aref_option_a",
+        ).source_locator.provider_option_id = "provider-option-other"
+        with self.assertRaisesRegex(ResearchContractError, "Provider 选项不一致"):
+            validate_research_contract(
+                matching_option_snapshot,
+                wrong_option_collection,
+            )
+
+        wrong_row_question = original_collection.model_copy(deep=True)
+        _reference(
+            wrong_row_question,
+            "aref_grid_row_usability",
+        ).source_locator.provider_question_id = "gf-q-grid-art"
+        with self.assertRaisesRegex(ResearchContractError, "Provider 题目不一致"):
+            validate_research_contract(original_snapshot, wrong_row_question)
+
+        wrong_question = original_collection.model_copy(deep=True)
+        _reference(
+            wrong_question,
+            "aref_option_a",
+        ).source_locator.provider_question_id = "gf-q-grid-art"
+        with self.assertRaisesRegex(ResearchContractError, "指向其他题目"):
+            validate_research_contract(original_snapshot, wrong_question)
+
+        wrong_item = original_collection.model_copy(deep=True)
+        _reference(
+            wrong_item,
+            "aref_option_a",
+        ).source_locator.provider_item_id = "item-grid"
+        with self.assertRaisesRegex(ResearchContractError, "Provider Item 不一致"):
+            validate_research_contract(original_snapshot, wrong_item)
+
+    def test_option_reference_validation_scans_options_linearly(self):
+        snapshot, collection = _contracts("google_forms.json")
+        question = _question(snapshot, "q_concept_choice").model_copy(deep=True)
+        base_option = question.options[1]
+        base_reference = _reference(collection, "aref_option_a")
+        option_count = 128
+        reference_count = 64
+        reference_ids = [
+            f"aref-linear-option-{index}"
+            for index in range(reference_count)
+        ]
+        options = [
+            base_option.model_copy(update={
+                "option_key": f"option-{index}",
+                "value": f"选项 {index}",
+                "label": f"选项 {index}",
+                "asset_reference_ids": [],
+                "provider_option_id": f"provider-option-{index}",
+            })
+            for index in range(option_count - 1)
+        ]
+        options.append(base_option.model_copy(update={
+            "option_key": "target-option",
+            "value": "目标选项",
+            "label": "目标选项",
+            "asset_reference_ids": reference_ids,
+            "provider_option_id": "provider-target-option",
+        }))
+        counted_options = _CountingList(options)
+        question.options = counted_options
+        question.asset_reference_ids = []
+        question.rows = []
+
+        references = []
+        for reference_id in reference_ids:
+            locator = base_reference.source_locator.model_copy(update={
+                "provider_option_id": "provider-target-option",
+            })
+            references.append(base_reference.model_copy(update={
+                "reference_id": reference_id,
+                "option_key": "target-option",
+                "source_locator": locator,
+            }))
+        isolated_collection = collection.model_copy(
+            update={"references": references},
+            deep=True,
+        )
+        isolated_snapshot = snapshot.model_copy(
+            update={"canonical_questions": [question]},
+            deep=False,
+        )
+
+        research_assets_module._validate_references(
+            isolated_snapshot,
+            isolated_collection,
+            {question.question_id: question},
+        )
+
+        self.assertGreaterEqual(counted_options.yield_count, option_count)
+        self.assertLessEqual(
+            counted_options.yield_count,
+            option_count * 2 + 2,
+            "每条引用不得重新线性扫描全部选项",
+        )
+
+    def test_row_reference_validation_scans_rows_linearly(self):
+        snapshot, collection = _contracts("google_forms.json")
+        question = _question(snapshot, "q_grid").model_copy(deep=True)
+        base_row = question.rows[1]
+        base_reference = _reference(collection, "aref_grid_row_usability")
+        row_count = 128
+        reference_count = 64
+        reference_ids = [
+            f"aref-linear-row-{index}"
+            for index in range(reference_count)
+        ]
+        rows = [
+            base_row.model_copy(update={
+                "row_key": f"row-{index}",
+                "label": f"行 {index}",
+                "provider_question_id": f"provider-row-{index}",
+                "asset_reference_ids": [],
+            })
+            for index in range(row_count - 1)
+        ]
+        rows.append(base_row.model_copy(update={
+            "row_key": "target-row",
+            "label": "目标行",
+            "provider_question_id": "provider-target-row",
+            "asset_reference_ids": reference_ids,
+        }))
+        counted_rows = _CountingList(rows)
+        question.rows = counted_rows
+        question.asset_reference_ids = []
+        question.options = []
+
+        references = []
+        for reference_id in reference_ids:
+            locator = base_reference.source_locator.model_copy(update={
+                "provider_question_id": "provider-target-row",
+            })
+            references.append(base_reference.model_copy(update={
+                "reference_id": reference_id,
+                "row_key": "target-row",
+                "source_locator": locator,
+            }))
+        isolated_collection = collection.model_copy(
+            update={"references": references},
+            deep=True,
+        )
+        isolated_snapshot = snapshot.model_copy(
+            update={"canonical_questions": [question]},
+            deep=False,
+        )
+
+        research_assets_module._validate_references(
+            isolated_snapshot,
+            isolated_collection,
+            {question.question_id: question},
+        )
+
+        self.assertGreaterEqual(counted_rows.yield_count, row_count)
+        self.assertLessEqual(
+            counted_rows.yield_count,
+            row_count * 2 + 2,
+            "每条引用不得重新扫描全部矩阵行或 Provider questionId",
+        )
 
     def test_contract_rejects_provider_item_position_and_question_ownership(self):
         original_snapshot, collection = _contracts("google_forms.json")

@@ -1070,6 +1070,9 @@ def _validate_references(
         str,
         set[tuple[str, str, str | None, str | None]],
     ] = {}
+    options_by_question: dict[str, dict[str, Any]] = {}
+    rows_by_question: dict[str, dict[str, Any]] = {}
+    provider_ids_by_question: dict[str, set[str]] = {}
 
     def add_sites(
         label: str,
@@ -1081,6 +1084,11 @@ def _validate_references(
             expected_sites.setdefault(reference_id, set()).add(site)
 
     for question in snapshot.canonical_questions:
+        option_index: dict[str, Any] = {}
+        row_index: dict[str, Any] = {}
+        provider_ids: set[str] = set()
+        if question.provider_question_id is not None:
+            provider_ids.add(question.provider_question_id)
         add_sites(
             f"题目 {question.question_id} 的素材引用",
             question.asset_reference_ids,
@@ -1090,6 +1098,7 @@ def _validate_references(
             ),
         )
         for option in question.options:
+            option_index.setdefault(option.option_key, option)
             add_sites(
                 f"题目 {question.question_id} 选项 {option.option_key} 的素材引用",
                 option.asset_reference_ids,
@@ -1100,6 +1109,9 @@ def _validate_references(
                 ),
             )
         for row in question.rows:
+            row_index.setdefault(row.row_key, row)
+            if row.provider_question_id is not None:
+                provider_ids.add(row.provider_question_id)
             add_sites(
                 f"题目 {question.question_id} 行 {row.row_key} 的素材引用",
                 row.asset_reference_ids,
@@ -1109,6 +1121,9 @@ def _validate_references(
                     row_key=row.row_key,
                 ),
             )
+        options_by_question[question.question_id] = option_index
+        rows_by_question[question.question_id] = row_index
+        provider_ids_by_question[question.question_id] = provider_ids
 
     missing_references = set(expected_sites) - set(references)
     if missing_references:
@@ -1172,7 +1187,7 @@ def _validate_references(
             raise ResearchContractError(
                 f"素材引用 {reference.reference_id} 与问卷快照来源不一致"
             )
-        allowed_provider_ids = _provider_ids_for_question(question)
+        allowed_provider_ids = provider_ids_by_question[question.question_id]
         located_provider_id = reference.source_locator.provider_question_id
         if (
             located_provider_id is not None
@@ -1192,10 +1207,9 @@ def _validate_references(
             )
 
         if reference.context_type == AssetContextType.SURVEY_OPTION:
-            option = next(
-                item for item in question.options
-                if item.option_key == reference.option_key
-            )
+            option = options_by_question[question.question_id][
+                reference.option_key
+            ]
             if (
                 option.provider_option_id
                 and reference.source_locator.provider_option_id
@@ -1206,10 +1220,7 @@ def _validate_references(
                     f"选项素材引用 {reference.reference_id} 的 Provider 选项不一致"
                 )
         elif reference.context_type == AssetContextType.SURVEY_ROW:
-            row = next(
-                item for item in question.rows
-                if item.row_key == reference.row_key
-            )
+            row = rows_by_question[question.question_id][reference.row_key]
             if (
                 row.provider_question_id
                 and reference.source_locator.provider_question_id
