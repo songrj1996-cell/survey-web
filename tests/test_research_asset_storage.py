@@ -21,12 +21,14 @@ from app.storage.research_assets import (
     ResearchAssetBundle,
     ResearchAssetStorageError,
     ResearchSnapshotCatalogStorage,
+    ResearchSnapshotIdentityStorage,
     ResearchSnapshotStorage,
     SnapshotCatalogEntry,
     SnapshotCatalogPage,
     SnapshotConflictError,
     SnapshotPackage,
     SnapshotPackageError,
+    StoredSnapshotPackage,
     build_snapshot_package,
     parse_snapshot_package,
 )
@@ -685,9 +687,323 @@ class FileResearchSnapshotStorageTests(unittest.TestCase):
         legacy = _LegacySnapshotStorage()
 
         self.assertIsInstance(legacy, ResearchSnapshotStorage)
+        self.assertNotIsInstance(legacy, ResearchSnapshotIdentityStorage)
         self.assertNotIsInstance(legacy, ResearchSnapshotCatalogStorage)
         self.assertIsInstance(self.storage, ResearchSnapshotStorage)
+        self.assertIsInstance(self.storage, ResearchSnapshotIdentityStorage)
         self.assertIsInstance(self.storage, ResearchSnapshotCatalogStorage)
+
+    def test_identity_load_uses_exact_persisted_zip_bytes(self):
+        self.storage.save_snapshot_package(self.owner_ref, self.package)
+        package_path = self.storage._package_path(
+            self.owner_ref,
+            self.snapshot_id,
+        )
+        persisted_bytes = package_path.read_bytes()
+
+        stored = self.storage.load_snapshot_package_with_identity(
+            self.owner_ref,
+            self.snapshot_id,
+        )
+
+        self.assertEqual(
+            stored,
+            StoredSnapshotPackage(
+                package=self.package,
+                package_sha256=hashlib.sha256(persisted_bytes).hexdigest(),
+                archive_size_bytes=len(persisted_bytes),
+            ),
+        )
+        assert stored is not None
+        self.assertEqual(
+            self.storage.load_snapshot_package(
+                self.owner_ref,
+                self.snapshot_id,
+            ),
+            stored.package,
+        )
+
+    def test_identity_load_never_rebuilds_persisted_package(self):
+        self.storage.save_snapshot_package(self.owner_ref, self.package)
+
+        with patch(
+            "app.storage.research_assets.build_snapshot_package",
+            side_effect=AssertionError("load must not rebuild package identity"),
+        ):
+            stored = self.storage.load_snapshot_package_with_identity(
+                self.owner_ref,
+                self.snapshot_id,
+            )
+            restored = self.storage.load_snapshot_package(
+                self.owner_ref,
+                self.snapshot_id,
+            )
+
+        assert stored is not None
+        self.assertEqual(stored.package, self.package)
+        self.assertEqual(restored, self.package)
+
+    def test_identity_load_missing_package_returns_none(self):
+        before = set(self.root.rglob("*"))
+        self.assertIsNone(
+            self.storage.load_snapshot_package_with_identity(
+                self.owner_ref,
+                "missing-snapshot",
+            )
+        )
+        self.assertEqual(set(self.root.rglob("*")), before)
+
+    def test_identity_load_missing_ids_do_not_leave_locks_in_existing_owner(self):
+        self.storage.save_snapshot_package(self.owner_ref, self.package)
+        before = {
+            path.relative_to(self.root)
+            for path in self.root.rglob("*")
+        }
+
+        for index in range(20):
+            self.assertIsNone(
+                self.storage.load_snapshot_package_with_identity(
+                    self.owner_ref,
+                    f"missing-snapshot-{index}",
+                )
+            )
+
+        self.assertEqual(
+            {
+                path.relative_to(self.root)
+                for path in self.root.rglob("*")
+            },
+            before,
+        )
+
+    def test_identity_load_rejects_symlink_fifo_and_oversize_package(self):
+        self.storage.save_snapshot_package(self.owner_ref, self.package)
+        package_path = self.storage._package_path(
+            self.owner_ref,
+            self.snapshot_id,
+        )
+        persisted_bytes = package_path.read_bytes()
+        safe_target = package_path.with_suffix(".safe")
+        safe_target.write_bytes(persisted_bytes)
+
+        package_path.unlink()
+        package_path.symlink_to(safe_target.name)
+        with self.assertRaisesRegex(SnapshotPackageError, "普通文件"):
+            self.storage.load_snapshot_package_with_identity(
+                self.owner_ref,
+                self.snapshot_id,
+            )
+
+        package_path.unlink()
+        os.mkfifo(package_path)
+        with self.assertRaisesRegex(SnapshotPackageError, "普通文件"):
+            self.storage.load_snapshot_package_with_identity(
+                self.owner_ref,
+                self.snapshot_id,
+            )
+
+        package_path.unlink()
+        package_path.write_bytes(persisted_bytes)
+        with (
+            patch.object(
+                research_assets_storage,
+                "SNAPSHOT_PACKAGE_MAX_ARCHIVE_BYTES",
+                len(persisted_bytes) - 1,
+            ),
+            self.assertRaisesRegex(SnapshotPackageError, "安全读取上限"),
+        ):
+            self.storage.load_snapshot_package_with_identity(
+                self.owner_ref,
+                self.snapshot_id,
+            )
+
+    def test_identity_load_rejects_hardlinked_package_and_paired_json(self):
+        self.storage.save_snapshot_package(self.owner_ref, self.package)
+        self.storage.save_bundle(self.owner_ref, self.bundle)
+        package_path = self.storage._package_path(
+            self.owner_ref,
+            self.snapshot_id,
+        )
+        package_hardlink = package_path.with_suffix(".hardlink")
+        os.link(package_path, package_hardlink)
+
+        with self.assertRaisesRegex(SnapshotPackageError, "硬链接"):
+            self.storage.load_snapshot_package_with_identity(
+                self.owner_ref,
+                self.snapshot_id,
+            )
+
+        package_hardlink.unlink()
+        bundle_path = self.storage._bundle_path(
+            self.owner_ref,
+            self.snapshot_id,
+        )
+        bundle_hardlink = bundle_path.with_suffix(".hardlink")
+        os.link(bundle_path, bundle_hardlink)
+        with self.assertRaisesRegex(ResearchAssetStorageError, "硬链接"):
+            self.storage.load_snapshot_package_with_identity(
+                self.owner_ref,
+                self.snapshot_id,
+            )
+
+    def test_identity_load_rejects_symlinked_owner_directory(self):
+        self.storage.save_snapshot_package(self.owner_ref, self.package)
+        package_path = self.storage._package_path(
+            self.owner_ref,
+            self.snapshot_id,
+        )
+        owner_directory = package_path.parent
+        moved_directory = self.root / "moved-owner-directory"
+        owner_directory.rename(moved_directory)
+        owner_directory.symlink_to(moved_directory.name, target_is_directory=True)
+
+        with self.assertRaisesRegex(
+            ResearchAssetStorageError,
+            "owner 目录打开失败",
+        ):
+            self.storage.load_snapshot_package_with_identity(
+                self.owner_ref,
+                self.snapshot_id,
+            )
+
+    def test_identity_load_rejects_package_changed_while_reading(self):
+        self.storage.save_snapshot_package(self.owner_ref, self.package)
+        package_path = self.storage._package_path(
+            self.owner_ref,
+            self.snapshot_id,
+        )
+        original_read = os.read
+        changed = False
+
+        def racing_read(descriptor: int, size: int) -> bytes:
+            nonlocal changed
+            chunk = original_read(descriptor, size)
+            if chunk and not changed:
+                changed = True
+                package_path.write_bytes(package_path.read_bytes() + b"changed")
+            return chunk
+
+        with (
+            patch("app.storage.research_assets.os.read", side_effect=racing_read),
+            self.assertRaisesRegex(SnapshotPackageError, "读取期间发生变化"),
+        ):
+            self.storage.load_snapshot_package_with_identity(
+                self.owner_ref,
+                self.snapshot_id,
+            )
+
+    def test_identity_load_rejects_same_size_change_with_restored_mtime(self):
+        self.storage.save_snapshot_package(self.owner_ref, self.package)
+        package_path = self.storage._package_path(
+            self.owner_ref,
+            self.snapshot_id,
+        )
+        original_status = package_path.stat()
+        original_read = os.read
+        changed = False
+
+        def racing_read(descriptor: int, size: int) -> bytes:
+            nonlocal changed
+            chunk = original_read(descriptor, size)
+            if chunk and not changed:
+                changed = True
+                with package_path.open("r+b") as target:
+                    first_byte = target.read(1)
+                    target.seek(0)
+                    target.write(bytes([first_byte[0] ^ 0x01]))
+                    target.flush()
+                    os.fsync(target.fileno())
+                os.utime(
+                    package_path,
+                    ns=(
+                        original_status.st_atime_ns,
+                        original_status.st_mtime_ns,
+                    ),
+                )
+            return chunk
+
+        with (
+            patch("app.storage.research_assets.os.read", side_effect=racing_read),
+            self.assertRaisesRegex(SnapshotPackageError, "读取期间发生变化"),
+        ):
+            self.storage.load_snapshot_package_with_identity(
+                self.owner_ref,
+                self.snapshot_id,
+            )
+
+    def test_blocked_identity_parse_does_not_block_another_owner(self):
+        self.storage.save_snapshot_package(self.owner_ref, self.package)
+        other_owner = "identity-other-owner"
+        other_package = _package_for_owner(
+            self.bundle,
+            self.media,
+            other_owner,
+        )
+        self.storage.save_snapshot_package(other_owner, other_package)
+
+        parse_started = threading.Event()
+        release_parse = threading.Event()
+        other_finished = threading.Event()
+        results: dict[str, StoredSnapshotPackage | None] = {}
+        errors: list[Exception] = []
+        original_parser = FileResearchAssetStorage._stored_package_from_content
+
+        def blocking_parser(owner_ref, snapshot_id, content):
+            if owner_ref == self.owner_ref:
+                parse_started.set()
+                if not release_parse.wait(timeout=5):
+                    raise TimeoutError("identity parse release timed out")
+            return original_parser(owner_ref, snapshot_id, content)
+
+        def load_owner(label, owner_ref, snapshot_id):
+            try:
+                storage = FileResearchAssetStorage(self.root)
+                results[label] = storage.load_snapshot_package_with_identity(
+                    owner_ref,
+                    snapshot_id,
+                )
+            except Exception as error:  # pragma: no cover - asserted below
+                errors.append(error)
+            finally:
+                if label == "other":
+                    other_finished.set()
+
+        with patch.object(
+            FileResearchAssetStorage,
+            "_stored_package_from_content",
+            new=staticmethod(blocking_parser),
+        ):
+            blocked_thread = threading.Thread(
+                target=load_owner,
+                args=("blocked", self.owner_ref, self.snapshot_id),
+            )
+            other_thread = threading.Thread(
+                target=load_owner,
+                args=(
+                    "other",
+                    other_owner,
+                    other_package.bundle.snapshot.snapshot_id,
+                ),
+            )
+            blocked_thread.start()
+            try:
+                self.assertTrue(parse_started.wait(timeout=2))
+                other_thread.start()
+                self.assertTrue(
+                    other_finished.wait(timeout=2),
+                    "owner A 的 identity parse 阻塞了 owner B",
+                )
+                self.assertFalse(other_thread.is_alive())
+            finally:
+                release_parse.set()
+                blocked_thread.join(timeout=5)
+                if other_thread.is_alive():
+                    other_thread.join(timeout=5)
+
+        self.assertFalse(blocked_thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(results["blocked"].package, self.package)
+        self.assertEqual(results["other"].package, other_package)
 
     def test_catalog_empty_and_other_owner_scopes_are_read_only(self):
         before = set(self.root.rglob("*"))

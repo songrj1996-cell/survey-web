@@ -16,6 +16,7 @@ import tempfile
 import threading
 from collections.abc import Mapping
 from contextlib import contextmanager
+from dataclasses import dataclass
 import fcntl
 from typing import Any, BinaryIO, NamedTuple, Protocol, runtime_checkable
 import zipfile
@@ -79,6 +80,15 @@ class SnapshotPackage(NamedTuple):
 
     bundle: ResearchAssetBundle
     media: dict[str, bytes]
+
+
+@dataclass(frozen=True, slots=True)
+class StoredSnapshotPackage:
+    """从同一份持久化 ZIP 字节得到的快照内容与不可变身份。"""
+
+    package: SnapshotPackage
+    package_sha256: str
+    archive_size_bytes: int
 
 
 class SnapshotCatalogEntry(NamedTuple):
@@ -148,6 +158,18 @@ class ResearchSnapshotStorage(Protocol):
         owner_ref: str,
         package: SnapshotPackage,
     ) -> None:
+        ...
+
+
+@runtime_checkable
+class ResearchSnapshotIdentityStorage(Protocol):
+    """读取实际持久化 ZIP 内容及其字节级身份的独立端口。"""
+
+    def load_snapshot_package_with_identity(
+        self,
+        owner_ref: str,
+        snapshot_id: str,
+    ) -> StoredSnapshotPackage | None:
         ...
 
 
@@ -372,19 +394,76 @@ class FileResearchAssetStorage:
         *,
         max_bytes: int,
         label: str,
+        error_type: type[ResearchAssetStorageError] = ResearchAssetStorageError,
     ) -> bytes | None:
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
         try:
-            size = target.stat().st_size
+            descriptor = os.open(target, flags)
         except FileNotFoundError:
             return None
         except OSError as error:
-            raise ResearchAssetStorageError(f"{label}状态读取失败") from error
-        if size > max_bytes:
-            raise ResearchAssetStorageError(f"{label}超过安全读取上限")
+            raise error_type(f"{label}打开失败") from error
         try:
-            return target.read_bytes()
-        except OSError as error:
-            raise ResearchAssetStorageError(f"{label}读取失败") from error
+            try:
+                initial_status = os.fstat(descriptor)
+            except OSError as error:
+                raise error_type(f"{label}状态读取失败") from error
+            if not stat.S_ISREG(initial_status.st_mode):
+                raise error_type(f"{label}必须是普通文件")
+            if initial_status.st_nlink != 1:
+                raise error_type(f"{label}不能是硬链接")
+            if initial_status.st_size > max_bytes:
+                raise error_type(f"{label}超过安全读取上限")
+
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                try:
+                    chunk = os.read(
+                        descriptor,
+                        min(1024 * 1024, max_bytes - total + 1),
+                    )
+                except OSError as error:
+                    raise error_type(f"{label}读取失败") from error
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise error_type(f"{label}超过安全读取上限")
+                chunks.append(chunk)
+
+            try:
+                final_status = os.fstat(descriptor)
+            except OSError as error:
+                raise error_type(f"{label}状态读取失败") from error
+            try:
+                path_status = os.stat(target, follow_symlinks=False)
+            except OSError as error:
+                raise error_type(f"{label}在读取期间发生变化") from error
+            if (
+                total != initial_status.st_size
+                or final_status.st_dev != initial_status.st_dev
+                or final_status.st_ino != initial_status.st_ino
+                or final_status.st_mode != initial_status.st_mode
+                or final_status.st_size != initial_status.st_size
+                or final_status.st_mtime_ns != initial_status.st_mtime_ns
+                or final_status.st_ctime_ns != initial_status.st_ctime_ns
+                or final_status.st_nlink != 1
+                or path_status.st_dev != initial_status.st_dev
+                or path_status.st_ino != initial_status.st_ino
+                or path_status.st_mode != initial_status.st_mode
+                or path_status.st_size != initial_status.st_size
+                or path_status.st_mtime_ns != initial_status.st_mtime_ns
+                or path_status.st_ctime_ns != initial_status.st_ctime_ns
+            ):
+                raise error_type(f"{label}在读取期间发生变化")
+            return b"".join(chunks)
+        finally:
+            os.close(descriptor)
 
     def _load_bundle_file(
         self,
@@ -451,17 +530,38 @@ class FileResearchAssetStorage:
         owner: str,
         snapshot_id: str,
     ) -> SnapshotPackage | None:
+        stored_package = self._load_package_file_with_identity(owner, snapshot_id)
+        return None if stored_package is None else stored_package.package
+
+    def _load_package_file_with_identity(
+        self,
+        owner: str,
+        snapshot_id: str,
+    ) -> StoredSnapshotPackage | None:
         content = self._read_bytes(
             self._package_path(owner, snapshot_id),
             max_bytes=SNAPSHOT_PACKAGE_MAX_ARCHIVE_BYTES,
             label="快照包文件",
+            error_type=SnapshotPackageError,
         )
         if content is None:
             return None
+        return self._stored_package_from_content(owner, snapshot_id, content)
+
+    @staticmethod
+    def _stored_package_from_content(
+        owner: str,
+        snapshot_id: str,
+        content: bytes,
+    ) -> StoredSnapshotPackage:
         package = parse_snapshot_package(owner, content)
         if package.bundle.snapshot.snapshot_id != snapshot_id:
             raise SnapshotPackageError("快照包 snapshot_id 与读取路径不一致")
-        return package
+        return StoredSnapshotPackage(
+            package=package,
+            package_sha256=_sha256(content),
+            archive_size_bytes=len(content),
+        )
 
     def load_bundle(
         self,
@@ -540,6 +640,17 @@ class FileResearchAssetStorage:
         owner_ref: str,
         snapshot_id: str,
     ) -> SnapshotPackage | None:
+        stored_package = self.load_snapshot_package_with_identity(
+            owner_ref,
+            snapshot_id,
+        )
+        return None if stored_package is None else stored_package.package
+
+    def load_snapshot_package_with_identity(
+        self,
+        owner_ref: str,
+        snapshot_id: str,
+    ) -> StoredSnapshotPackage | None:
         owner = _require_nonblank(
             owner_ref,
             "owner_ref",
@@ -550,16 +661,71 @@ class FileResearchAssetStorage:
             "snapshot_id",
             ResearchAssetStorageError,
         )
-        with self._lock, self._exclusive_snapshot(owner, requested_snapshot_id):
-            package = self._load_package_file(owner, requested_snapshot_id)
-            if package is None:
+        storage_key = _identity_hash(requested_snapshot_id)
+        # The descriptor-relative per-snapshot ``flock`` below is the actual
+        # serialization boundary.  Do not hold the root-wide in-process lock
+        # while reading and validating a potentially large package: unrelated
+        # owners must remain independent.
+        with self._open_owner_directory(owner) as directory:
+            if directory is None:
                 return None
-            bundle = self._load_bundle_file(owner, requested_snapshot_id)
+            package_name = f"{storage_key}.zip"
+            try:
+                package_status = os.stat(
+                    package_name,
+                    dir_fd=directory,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                return None
+            except OSError as error:
+                raise SnapshotPackageError("快照包文件状态读取失败") from error
+            if not stat.S_ISREG(package_status.st_mode):
+                raise SnapshotPackageError("快照包文件必须是普通文件")
+            if package_status.st_nlink != 1:
+                raise SnapshotPackageError("快照包文件不能是硬链接")
+            if package_status.st_size > SNAPSHOT_PACKAGE_MAX_ARCHIVE_BYTES:
+                raise SnapshotPackageError("快照包文件超过安全读取上限")
+            with self._exclusive_snapshot_in_directory(
+                directory,
+                requested_snapshot_id,
+            ):
+                content = self._read_directory_file(
+                    directory,
+                    package_name,
+                    max_bytes=SNAPSHOT_PACKAGE_MAX_ARCHIVE_BYTES,
+                    label="快照包文件",
+                    required=False,
+                    error_type=SnapshotPackageError,
+                )
+                if content is None:
+                    return None
+                stored_package = self._stored_package_from_content(
+                    owner,
+                    requested_snapshot_id,
+                    content,
+                )
+                bundle_content = self._read_directory_file(
+                    directory,
+                    f"{storage_key}.json",
+                    max_bytes=_MAX_STORED_BUNDLE_BYTES,
+                    label="快照文件",
+                    required=False,
+                )
+            if bundle_content is not None:
+                bundle = self._bundle_from_stored_content(
+                    owner,
+                    requested_snapshot_id,
+                    bundle_content,
+                )
+            else:
+                bundle = None
+            package = stored_package.package
             if bundle is not None and not self._same_bundle(bundle, package.bundle):
                 raise SnapshotConflictError(
                     "同一 owner_ref 与 snapshot_id 的 bundle 和快照包内容冲突"
                 )
-            return package
+            return stored_package
 
     def save_snapshot_package(
         self,
@@ -837,25 +1003,32 @@ class FileResearchAssetStorage:
         max_bytes: int,
         label: str,
         required: bool,
+        error_type: type[ResearchAssetStorageError] = ResearchAssetStorageError,
     ) -> bytes | None:
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
         try:
             descriptor = os.open(name, flags, dir_fd=directory)
         except FileNotFoundError as error:
             if not required:
                 return None
-            raise ResearchAssetStorageError(f"{label}在枚举期间消失") from error
+            raise error_type(f"{label}在枚举期间消失") from error
         except OSError as error:
-            raise ResearchAssetStorageError(f"{label}打开失败") from error
+            raise error_type(f"{label}打开失败") from error
         try:
             try:
                 file_status = os.fstat(descriptor)
             except OSError as error:
-                raise ResearchAssetStorageError(f"{label}状态读取失败") from error
+                raise error_type(f"{label}状态读取失败") from error
             if not stat.S_ISREG(file_status.st_mode):
-                raise SnapshotPackageError(f"{label}必须是普通文件")
+                raise error_type(f"{label}必须是普通文件")
+            if file_status.st_nlink != 1:
+                raise error_type(f"{label}不能是硬链接")
             if file_status.st_size > max_bytes:
-                raise ResearchAssetStorageError(f"{label}超过安全读取上限")
+                raise error_type(f"{label}超过安全读取上限")
 
             chunks: list[bytes] = []
             total = 0
@@ -866,16 +1039,77 @@ class FileResearchAssetStorage:
                         min(1024 * 1024, max_bytes - total + 1),
                     )
                 except OSError as error:
-                    raise ResearchAssetStorageError(f"{label}读取失败") from error
+                    raise error_type(f"{label}读取失败") from error
                 if not chunk:
                     break
                 total += len(chunk)
                 if total > max_bytes:
-                    raise ResearchAssetStorageError(f"{label}超过安全读取上限")
+                    raise error_type(f"{label}超过安全读取上限")
                 chunks.append(chunk)
-            if total != file_status.st_size:
-                raise ResearchAssetStorageError(f"{label}在读取期间发生变化")
+            try:
+                final_status = os.fstat(descriptor)
+                path_status = os.stat(
+                    name,
+                    dir_fd=directory,
+                    follow_symlinks=False,
+                )
+            except OSError as error:
+                raise error_type(f"{label}在读取期间发生变化") from error
+            if (
+                total != file_status.st_size
+                or final_status.st_dev != file_status.st_dev
+                or final_status.st_ino != file_status.st_ino
+                or final_status.st_mode != file_status.st_mode
+                or final_status.st_size != file_status.st_size
+                or final_status.st_mtime_ns != file_status.st_mtime_ns
+                or final_status.st_ctime_ns != file_status.st_ctime_ns
+                or final_status.st_nlink != 1
+                or path_status.st_dev != file_status.st_dev
+                or path_status.st_ino != file_status.st_ino
+                or path_status.st_mode != file_status.st_mode
+                or path_status.st_size != file_status.st_size
+                or path_status.st_mtime_ns != file_status.st_mtime_ns
+                or path_status.st_ctime_ns != file_status.st_ctime_ns
+            ):
+                raise error_type(f"{label}在读取期间发生变化")
             return b"".join(chunks)
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    @contextmanager
+    def _exclusive_snapshot_in_directory(
+        directory: int,
+        snapshot_id: str,
+    ):
+        lock_name = f".{_identity_hash(snapshot_id)}.lock"
+        flags = (
+            os.O_CREAT
+            | os.O_RDWR
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            descriptor = os.open(lock_name, flags, 0o600, dir_fd=directory)
+        except OSError as error:
+            raise ResearchAssetStorageError("快照进程锁创建失败") from error
+        try:
+            try:
+                lock_status = os.fstat(descriptor)
+            except OSError as error:
+                raise ResearchAssetStorageError("快照进程锁状态读取失败") from error
+            if not stat.S_ISREG(lock_status.st_mode) or lock_status.st_nlink != 1:
+                raise ResearchAssetStorageError("快照进程锁必须是单链接普通文件")
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+            except OSError as error:
+                raise ResearchAssetStorageError("快照进程锁获取失败") from error
+            try:
+                yield
+            finally:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                except OSError:
+                    pass
         finally:
             os.close(descriptor)
 
