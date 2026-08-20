@@ -9558,6 +9558,202 @@ body {
   background: rgba(16, 185, 129, 0.1);
 }
 
+.iv-v2-badge--danger {
+  color: #b91c1c;
+  background: rgba(239, 68, 68, 0.12);
+}
+
+.iv-v2-badge--warning {
+  color: #b45309;
+  background: rgba(245, 158, 11, 0.12);
+}
+
+.iv-v2-badge--info {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.iv-v2-review-shell,
+.iv-v2-issue-detail,
+.iv-v2-structure-tree {
+  margin-top: 14px;
+}
+
+.iv-v2-review-head,
+.iv-v2-issue-detail__head,
+.iv-v2-context-card__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.iv-v2-review-head__desc,
+.iv-v2-issue-detail__head p,
+.iv-v2-context-card__body p,
+.iv-v2-suggestion p {
+  margin-top: 6px;
+  color: var(--text-3);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.iv-v2-filter-row {
+  margin-top: 14px;
+}
+
+.iv-v2-filter-field,
+.iv-v2-inline-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.iv-v2-filter-field span,
+.iv-v2-inline-field span {
+  color: var(--text-3);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.iv-v2-review-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.iv-v2-review-item {
+  width: 100%;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface-2);
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color var(--transition), background var(--transition), transform var(--transition);
+}
+
+.iv-v2-review-item:hover {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent-soft) 65%, var(--surface-2));
+  transform: translateY(-1px);
+}
+
+.iv-v2-review-item--active {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent-soft) 82%, var(--surface-2));
+  box-shadow: 0 0 0 3px rgba(124, 58, 237, 0.08);
+}
+
+.iv-v2-review-item__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.iv-v2-review-item strong,
+.iv-v2-tree-node__head strong,
+.iv-v2-context-list__item strong,
+.iv-v2-head-list strong {
+  color: var(--text);
+  font-size: 12px;
+}
+
+.iv-v2-review-item p,
+.iv-v2-review-item span,
+.iv-v2-tree-node p,
+.iv-v2-tree-node__head span,
+.iv-v2-tree-leaf span,
+.iv-v2-head-list p,
+.iv-v2-issue-meta span {
+  color: var(--text-3);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.iv-v2-issue-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  margin-top: 12px;
+}
+
+.iv-v2-context-card,
+.iv-v2-resolution-card,
+.iv-v2-tree-node,
+.iv-v2-tree-leaf,
+.iv-v2-context-list__item {
+  margin-top: 14px;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface-2);
+}
+
+.iv-v2-context-card__body,
+.iv-v2-context-list,
+.iv-v2-head-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.iv-v2-resolution-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.iv-v2-inline-field--full {
+  grid-column: 1 / -1;
+}
+
+.iv-v2-inline-field textarea,
+.iv-v2-inline-field select,
+.iv-v2-filter-field select {
+  width: 100%;
+  min-height: 38px;
+  padding: 9px 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  color: var(--text);
+  background: var(--input-bg);
+  font: inherit;
+}
+
+.iv-v2-inline-field textarea:focus,
+.iv-v2-inline-field select:focus,
+.iv-v2-filter-field select:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.iv-v2-inline-field em {
+  align-self: flex-end;
+  color: var(--text-3);
+  font-size: 11px;
+  font-style: normal;
+}
+
+.iv-v2-suggestion strong,
+.iv-v2-context-card__head strong {
+  color: var(--text);
+  font-size: 12px;
+}
+
+.iv-v2-tree-children {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 12px;
+}
+
 @media (max-width: 1100px) {
   .iv-upload-layout,
   .iv-progress-shell { grid-template-columns: 1fr; }
@@ -9569,7 +9765,8 @@ body {
   .iv-live-card { min-height: 440px; }
   .iv-v2-editor-layout,
   .iv-v2-status-grid,
-  .iv-v2-sheet-row__controls {
+  .iv-v2-sheet-row__controls,
+  .iv-v2-resolution-grid {
     grid-template-columns: 1fr;
   }
 }

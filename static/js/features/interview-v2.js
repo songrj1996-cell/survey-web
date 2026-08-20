@@ -20,16 +20,26 @@ const ivV2State = {
   saveBusy: false,
   confirmBusy: false,
   restoreBusy: false,
+  buildBusy: false,
+  reviewBusy: false,
   pendingPoll: 0,
   requestToken: 0,
   importData: null,
   mappingResponse: null,
+  structureResponse: null,
+  reviewIssuesResponse: null,
   draft: null,
   sheetCatalog: {},
   statusNote: '',
   draftDirty: false,
   idempotencyKey: '',
   idempotencyFingerprint: '',
+  reviewFilter: 'open',
+  selectedIssueId: '',
+  issueDrafts: {},
+  evidenceContextCache: {},
+  contextBusyIssueId: '',
+  contextToken: 0,
 };
 
 function ivV2$(id) {
@@ -64,6 +74,8 @@ function ivV2ResetPoll() {
 function ivV2InvalidateAsync() {
   ivV2NextToken();
   ivV2ResetPoll();
+  ivV2State.contextToken += 1;
+  ivV2State.contextBusyIssueId = '';
 }
 
 function ivV2OperationBusy() {
@@ -72,6 +84,8 @@ function ivV2OperationBusy() {
     || ivV2State.saveBusy
     || ivV2State.restoreBusy
     || ivV2State.confirmBusy
+    || ivV2State.buildBusy
+    || ivV2State.reviewBusy
   );
 }
 
@@ -97,10 +111,59 @@ function ivV2FormatSize(bytes) {
 }
 
 function ivV2StatusTone(status) {
-  if (status === 'GROUP_MAPPING_CONFIRMED' || status === 'ACCEPTED') return 'success';
+  if (['GROUP_MAPPING_CONFIRMED', 'READY_FOR_DOSSIERS', 'ACCEPTED'].includes(status)) return 'success';
+  if (status === 'STRUCTURE_REVIEW_REQUIRED') return 'warning';
   if (status === 'REJECTED') return 'danger';
   if (status === 'PRECHECKING' || status === 'loading') return 'info';
   return 'warning';
+}
+
+function ivV2HasStructureCheckpoint(status = ivV2State.status) {
+  return ['STRUCTURE_REVIEW_REQUIRED', 'READY_FOR_DOSSIERS'].includes(String(status || ''));
+}
+
+function ivV2HasConfirmedMapping(status = ivV2State.status) {
+  return ['GROUP_MAPPING_CONFIRMED', 'STRUCTURE_REVIEW_REQUIRED', 'READY_FOR_DOSSIERS'].includes(String(status || ''));
+}
+
+function ivV2CurrentStructureRevisionId() {
+  return String(
+    ivV2State.structureResponse?.structure_revision_id
+    || ivV2State.reviewIssuesResponse?.structure_revision_id
+    || ''
+  );
+}
+
+function ivV2CurrentEvidenceRevisionId() {
+  return String(
+    ivV2State.structureResponse?.evidence_revision_id
+    || ivV2State.reviewIssuesResponse?.evidence_revision_id
+    || ''
+  );
+}
+
+function ivV2HeadPairFromPayload(payload) {
+  return {
+    structure_revision_id: String(payload?.structure_revision_id || ''),
+    evidence_revision_id: String(payload?.evidence_revision_id || ''),
+  };
+}
+
+function ivV2HeadsMatch(left, right) {
+  return (
+    String(left?.structure_revision_id || '') === String(right?.structure_revision_id || '')
+    && String(left?.evidence_revision_id || '') === String(right?.evidence_revision_id || '')
+  );
+}
+
+function ivV2CurrentReviewIssues() {
+  return Array.isArray(ivV2State.reviewIssuesResponse?.issues)
+    ? ivV2State.reviewIssuesResponse.issues
+    : [];
+}
+
+function ivV2CurrentStructurePayload() {
+  return ivV2State.structureResponse?.structure || null;
 }
 
 function ivV2ShowToastFromError(error, fallback) {
@@ -157,6 +220,56 @@ function ivV2ClearStatusError() {
   ivV2State.statusCode = '';
   ivV2State.statusTraceId = '';
   ivV2RenderUploadStatus();
+}
+
+function ivV2ResetStructureWorkspace() {
+  ivV2State.structureResponse = null;
+  ivV2State.reviewIssuesResponse = null;
+  ivV2State.selectedIssueId = '';
+  ivV2State.issueDrafts = {};
+  ivV2InvalidateEvidenceContext();
+}
+
+function ivV2InvalidateEvidenceContext() {
+  ivV2State.contextToken += 1;
+  ivV2State.evidenceContextCache = {};
+  ivV2State.contextBusyIssueId = '';
+}
+
+function ivV2SetReviewError(payload, status, fallback) {
+  ivV2SetStatusError(payload, status, fallback);
+  ivV2RenderEditor();
+  ivV2RenderConfirmed();
+}
+
+function ivV2Step3Shell() {
+  return ivV2$('iv-v2-confirmed-shell')?.closest('[data-iv-track-content="v2"]') || null;
+}
+
+function ivV2RenderStep3Header() {
+  const shell = ivV2Step3Shell();
+  document.querySelectorAll('[data-iv-v2-step="3"] .step-bar__label').forEach(node => {
+    node.textContent = '结构与证据复核';
+  });
+  if (!shell) return;
+  const eyebrow = shell.querySelector('.iv-eyebrow');
+  const title = shell.querySelector('.panel__title');
+  const desc = shell.querySelector('.panel__desc');
+  const previewTitle = ivV2$('iv-v2-confirmed-preview')?.closest('section')?.querySelector('.iv-v2-side-card__title');
+  const historyTitle = ivV2$('iv-v2-confirmed-history')?.closest('section')?.querySelector('.iv-v2-side-card__title');
+  if (eyebrow) eyebrow.textContent = ivV2HasStructureCheckpoint() ? String(ivV2State.status || 'STRUCTURE_REVIEW_REQUIRED') : 'GROUP_MAPPING_CONFIRMED';
+  if (title) {
+    title.textContent = ivV2HasStructureCheckpoint()
+      ? '结构与证据复核'
+      : '分组映射已确认，正在准备结构复核';
+  }
+  if (desc) {
+    desc.textContent = ivV2HasStructureCheckpoint()
+      ? '逐项处理结构问题，确认结构树和证据归属；当前阶段只开放复核，不开放玩家档案。'
+      : '确认映射后会自动尝试生成结构复核工作台。若失败，可在此重试或返回映射编辑器。';
+  }
+  if (previewTitle) previewTitle.textContent = '结构与证据复核工作台';
+  if (historyTitle) historyTitle.textContent = '版本与映射历史';
 }
 
 function ivV2MarkDirty(note = '当前编辑尚未保存') {
@@ -610,6 +723,7 @@ async function ivV2LoadImportBundle(importId, { keepStep = false, token = ivV2Ne
   ivV2State.requestBusy = true;
   ivV2State.status = 'loading';
   ivV2State.loadingMessage = '正在读取预检结果与分组建议';
+  ivV2ResetStructureWorkspace();
   ivV2RenderEditor();
   try {
     const [importResp, proposalResp] = await Promise.all([
@@ -632,11 +746,14 @@ async function ivV2LoadImportBundle(importId, { keepStep = false, token = ivV2Ne
     ivV2State.status = importData.status || proposalData.status || 'loaded';
     ivV2State.loadingMessage = '';
     ivV2ClearStatusError();
-    const confirmed = proposalData.status === 'GROUP_MAPPING_CONFIRMED';
+    const confirmed = ivV2HasConfirmedMapping(proposalData.status) || ivV2HasConfirmedMapping(importData.status);
     ivV2ClearDirty(confirmed ? '当前处于已确认版本' : '已加载最新映射版本');
     if (!keepStep) ivV2SetStep(confirmed ? 3 : 2);
     ivV2RenderEditor();
     ivV2RenderConfirmed();
+    if (confirmed && (ivV2HasStructureCheckpoint(importData.status) || ivV2HasStructureCheckpoint(proposalData.status))) {
+      await ivV2LoadStructureWorkspace({ token, silentConflictRefresh: true });
+    }
   } catch (error) {
     if (!ivV2IsTokenCurrent(token)) return;
     ivV2State.status = 'error';
@@ -1168,55 +1285,800 @@ function ivV2RenderEditor() {
   ivV2SyncTrackToggle();
 }
 
+function ivV2EnsureIssueDraft(issue) {
+  if (!issue?.issue_id) return null;
+  if (!ivV2State.issueDrafts[issue.issue_id]) {
+    const allowed = Array.isArray(issue.allowed_resolutions) ? issue.allowed_resolutions : [];
+    const suggested = issue.suggested_resolution || {};
+    ivV2State.issueDrafts[issue.issue_id] = {
+      resolution: String(suggested.resolution || allowed[0] || ''),
+      target_id: String(suggested.target_id || ''),
+      row_role: String(suggested.row_role || ''),
+      evidence_type: String(suggested.evidence_type || ''),
+      comment: '',
+    };
+  }
+  return ivV2State.issueDrafts[issue.issue_id];
+}
+
+function ivV2IssueById(issueId) {
+  return ivV2CurrentReviewIssues().find(issue => issue.issue_id === issueId) || null;
+}
+
+function ivV2CurrentIssue() {
+  return ivV2IssueById(ivV2State.selectedIssueId);
+}
+
+function ivV2SelectIssue(issueId) {
+  const issue = ivV2IssueById(issueId);
+  ivV2State.selectedIssueId = issue?.issue_id || '';
+  if (issue) {
+    ivV2EnsureIssueDraft(issue);
+    ivV2EnsureEvidenceContext(issue);
+  }
+  ivV2RenderConfirmed();
+}
+
+function ivV2IssueSeverityTone(issue) {
+  const severity = String(issue?.severity || '');
+  if (severity === 'blocking') return 'danger';
+  if (severity === 'recommended') return 'warning';
+  return 'info';
+}
+
+function ivV2IssueStatusText(issue) {
+  const status = String(issue?.status || 'open');
+  if (status === 'resolved') return '已解决';
+  if (status === 'dismissed') return '已忽略';
+  return '待处理';
+}
+
+function ivV2VisibleReviewIssues() {
+  const issues = ivV2CurrentReviewIssues();
+  const filter = ivV2State.reviewFilter || 'open';
+  if (filter === 'all') return issues;
+  if (filter === 'resolved') {
+    return issues.filter(issue => !ivV2IssueIsOpen(issue));
+  }
+  if (filter === 'blocking') {
+    return issues.filter(issue => issue.status !== 'resolved' && issue.status !== 'dismissed' && issue.severity === 'blocking');
+  }
+  if (filter === 'recommended') {
+    return issues.filter(issue => issue.status !== 'resolved' && issue.status !== 'dismissed' && issue.severity === 'recommended');
+  }
+  return issues.filter(issue => issue.status !== 'resolved' && issue.status !== 'dismissed');
+}
+
+function ivV2SyncSelectedIssue({ preserveAll = false } = {}) {
+  const visible = ivV2VisibleReviewIssues();
+  const currentVisible = visible.find(issue => issue.issue_id === ivV2State.selectedIssueId) || null;
+  if (currentVisible) return currentVisible;
+  if (preserveAll && ivV2State.reviewFilter === 'all') {
+    const currentAny = ivV2IssueById(ivV2State.selectedIssueId);
+    if (currentAny) return currentAny;
+  }
+  const nextIssue = visible[0] || null;
+  ivV2State.selectedIssueId = nextIssue?.issue_id || '';
+  return nextIssue;
+}
+
+function ivV2ReviewFilterOptions() {
+  const summary = ivV2State.structureResponse?.review_summary || {};
+  const open = Number(summary.open_issue_count ?? ivV2CurrentReviewIssues().length);
+  const blocking = Number(summary.blocking_issue_count ?? 0);
+  const recommended = Number(summary.recommended_issue_count ?? 0);
+  const all = ivV2CurrentReviewIssues().length;
+  const resolved = Math.max(0, all - open);
+  return [
+    { value: 'open', label: `待处理 ${open}` },
+    { value: 'blocking', label: `阻塞 ${blocking}` },
+    { value: 'recommended', label: `建议 ${recommended}` },
+    { value: 'resolved', label: `已处理 ${resolved}` },
+    { value: 'all', label: `全部 ${all}` },
+  ];
+}
+
+function ivV2Modules() {
+  return Array.isArray(ivV2CurrentStructurePayload()?.modules)
+    ? ivV2CurrentStructurePayload().modules
+    : [];
+}
+
+function ivV2MainQuestions() {
+  return Array.isArray(ivV2CurrentStructurePayload()?.main_questions)
+    ? ivV2CurrentStructurePayload().main_questions
+    : [];
+}
+
+function ivV2Occurrences() {
+  return Array.isArray(ivV2CurrentStructurePayload()?.occurrences)
+    ? ivV2CurrentStructurePayload().occurrences
+    : [];
+}
+
+function ivV2FormatResolutionLabel(action) {
+  return {
+    assign_row_role: '指定行角色',
+    assign_module: '改绑模块',
+    assign_main_question: '改绑主问题',
+    set_evidence_identity: '确认身份与类型',
+    exclude_evidence: '排除此证据',
+    accept_suggestion: '接受系统建议',
+  }[action] || action || '未命名动作';
+}
+
+function ivV2FormatRowRoleLabel(role) {
+  return {
+    module_header: '模块标题',
+    main_question: '主问题',
+    follow_up: '追问',
+    observation_row: '观察记录',
+  }[role] || role || '未指定';
+}
+
+function ivV2FormatEvidenceTypeLabel(type) {
+  return {
+    participant_self_report: '玩家自述',
+    researcher_observation: '研究员观察',
+  }[type] || type || '未指定';
+}
+
+function ivV2IssueEvidenceTargets(issue) {
+  const ids = new Set();
+  const suggested = String(issue?.suggested_resolution?.target_id || '');
+  if (suggested.startsWith('ev_')) ids.add(suggested);
+  (issue?.affected_ids?.evidence_ids || []).forEach(id => {
+    if (String(id || '').startsWith('ev_')) ids.add(String(id));
+  });
+  return Array.from(ids);
+}
+
+function ivV2IssueHasResolvableAction(issue) {
+  return Array.isArray(issue?.allowed_resolutions) && issue.allowed_resolutions.length > 0;
+}
+
+function ivV2IssueIsOpen(issue) {
+  return !['resolved', 'dismissed'].includes(String(issue?.status || 'open'));
+}
+
+function ivV2IssueContextTarget(issue) {
+  const draft = ivV2EnsureIssueDraft(issue) || {};
+  if (String(draft.target_id || '').startsWith('ev_')) return String(draft.target_id);
+  return ivV2IssueEvidenceTargets(issue)[0] || '';
+}
+
+function ivV2EvidenceContextKey(issue, evidenceId) {
+  return `${issue?.issue_id || ''}:${evidenceId || ''}`;
+}
+
+async function ivV2EnsureEvidenceContext(issue, { force = false, retryOnHeadMismatch = true } = {}) {
+  const evidenceId = ivV2IssueContextTarget(issue);
+  if (!issue?.issue_id || !evidenceId) return;
+  const cacheKey = ivV2EvidenceContextKey(issue, evidenceId);
+  if (!force && ivV2State.evidenceContextCache[cacheKey]) return;
+  const token = ++ivV2State.contextToken;
+  ivV2State.contextBusyIssueId = issue.issue_id;
+  ivV2RenderConfirmed();
+  try {
+    const response = await fetch(`/api/v1/interview-evidence/${evidenceId}/context`);
+    const data = await response.json();
+    if (token !== ivV2State.contextToken) return;
+    if (!response.ok) {
+      if (response.status === 409) {
+        await ivV2LoadStructureWorkspace({ token: ivV2State.requestToken, silentConflictRefresh: true });
+        return;
+      }
+      ivV2SetReviewError(data, response.status, '读取证据上下文失败');
+      return;
+    }
+    const payloadHeads = ivV2HeadPairFromPayload(data);
+    const currentHeads = {
+      structure_revision_id: ivV2CurrentStructureRevisionId(),
+      evidence_revision_id: ivV2CurrentEvidenceRevisionId(),
+    };
+    if (!ivV2HeadsMatch(payloadHeads, currentHeads)) {
+      ivV2InvalidateEvidenceContext();
+      if (retryOnHeadMismatch) {
+        const loaded = await ivV2LoadStructureWorkspace({
+          token: ivV2State.requestToken,
+          silentConflictRefresh: true,
+          headRetry: 0,
+        });
+        if (!loaded || !ivV2IsTokenCurrent(ivV2State.requestToken)) {
+          ivV2SetReviewError(
+            { error: { code: 'STRUCTURE_REVISION_CONFLICT', message: '证据上下文版本已变化，请刷新后重试。' } },
+            409,
+            '证据上下文版本已变化，请刷新后重试。'
+          );
+          return;
+        }
+        const refreshedIssue = ivV2IssueById(issue.issue_id);
+        if (!refreshedIssue) {
+          ivV2SetReviewError(
+            { error: { code: 'STRUCTURE_REVISION_CONFLICT', message: '证据上下文版本已变化，请刷新后重试。' } },
+            409,
+            '证据上下文版本已变化，请刷新后重试。'
+          );
+          return;
+        }
+        await ivV2EnsureEvidenceContext(refreshedIssue, {
+          force: true,
+          retryOnHeadMismatch: false,
+        });
+        return;
+      }
+      ivV2SetReviewError(
+        { error: { code: 'STRUCTURE_REVISION_CONFLICT', message: '证据上下文版本已变化，请刷新后重试。' } },
+        409,
+        '证据上下文版本已变化，请刷新后重试。'
+      );
+      return;
+    }
+    ivV2State.evidenceContextCache[cacheKey] = {
+      token,
+      evidence_id: evidenceId,
+      payload: data,
+    };
+    ivV2ClearStatusError();
+  } catch (error) {
+    if (token !== ivV2State.contextToken) return;
+    ivV2State.errorMessage = String(error?.message || '读取证据上下文失败');
+  } finally {
+    if (token === ivV2State.contextToken) {
+      ivV2State.contextBusyIssueId = '';
+      ivV2RenderConfirmed();
+    }
+  }
+}
+
+async function ivV2LoadStructureWorkspace({ token = ivV2State.requestToken, silentConflictRefresh = false, headRetry = 1 } = {}) {
+  if (!ivV2State.importId) return false;
+  try {
+    const previousEvidenceRevisionId = ivV2CurrentEvidenceRevisionId();
+    const [structureResp, issuesResp] = await Promise.all([
+      fetch(`/api/v1/interview-imports/${ivV2State.importId}/structure`),
+      fetch(`/api/v1/interview-imports/${ivV2State.importId}/review-issues`),
+    ]);
+    const structureData = await structureResp.json();
+    const issuesData = await issuesResp.json();
+    if (!ivV2IsTokenCurrent(token)) return false;
+    if (!structureResp.ok || !issuesResp.ok) {
+      const payload = !structureResp.ok ? structureData : issuesData;
+      const status = !structureResp.ok ? structureResp.status : issuesResp.status;
+      const code = String(payload?.error?.code || '');
+      if (status === 409 && ['STRUCTURE_INPUT_CONFLICT', 'STRUCTURE_INPUT_NOT_READY'].includes(code)) {
+        ivV2ResetStructureWorkspace();
+        await ivV2LoadImportBundle(ivV2State.importId, { keepStep: false, token });
+        if (!ivV2IsTokenCurrent(token)) return false;
+        ivV2State.currentStep = 2;
+        ivV2SetStep(2);
+        ivV2SetReviewError(payload, status, '分组映射已变化，请先确认最新映射');
+        return false;
+      }
+      if (status === 409 && ['STRUCTURE_NOT_BUILT', 'STRUCTURE_INPUT_STALE'].includes(code)) {
+        ivV2ResetStructureWorkspace();
+        ivV2State.status = 'GROUP_MAPPING_CONFIRMED';
+        ivV2SetReviewError(payload, status, code === 'STRUCTURE_NOT_BUILT' ? '当前尚未生成结构复核结果' : '结构复核已过期');
+        return false;
+      }
+      if (status === 409 && code === 'STRUCTURE_REVISION_CONFLICT') {
+        if (!silentConflictRefresh) {
+          ivV2SetReviewError(payload, status, '结构版本已变化');
+        }
+        return false;
+      }
+      ivV2SetReviewError(payload, status, '读取结构复核状态失败');
+      return false;
+    }
+    const structureHeads = ivV2HeadPairFromPayload(structureData);
+    const issuesHeads = ivV2HeadPairFromPayload(issuesData);
+    if (!ivV2HeadsMatch(structureHeads, issuesHeads)) {
+      if (headRetry > 0) {
+        return await ivV2LoadStructureWorkspace({ token, silentConflictRefresh, headRetry: headRetry - 1 });
+      }
+      ivV2SetReviewError(
+        { error: { code: 'STRUCTURE_REVISION_CONFLICT', message: '结构与问题列表版本不一致，请刷新后重试。' } },
+        409,
+        '结构与问题列表版本不一致，请刷新后重试。'
+      );
+      return false;
+    }
+    ivV2State.structureResponse = structureData;
+    ivV2State.reviewIssuesResponse = issuesData;
+    if (
+      String(issuesHeads.evidence_revision_id || '')
+      && String(issuesHeads.evidence_revision_id) !== previousEvidenceRevisionId
+    ) {
+      ivV2InvalidateEvidenceContext();
+    }
+    ivV2State.status = structureData.status || issuesData.status || ivV2State.status;
+    const selected = ivV2SyncSelectedIssue({ preserveAll: true });
+    if (selected) ivV2EnsureIssueDraft(selected);
+    return true;
+  } catch (error) {
+    if (!ivV2IsTokenCurrent(token)) return false;
+    ivV2State.errorMessage = String(error?.message || '读取结构复核状态失败');
+    return false;
+  } finally {
+    if (ivV2IsTokenCurrent(token)) ivV2RenderConfirmed();
+  }
+}
+
+function ivV2StructureBuildPayload() {
+  return {
+    base_mapping_revision_id: String(ivV2State.mappingResponse?.mapping_revision_id || ivV2State.mappingResponse?.revision_id || ''),
+    base_mapping_sha256: String(ivV2State.mappingResponse?.mapping_sha256 || ''),
+  };
+}
+
+async function ivV2EnsureStructureWorkspace({ forceRebuild = false, trigger = 'manual' } = {}) {
+  if (!ivV2State.importId || !ivV2State.mappingResponse || ivV2OperationBusy()) return false;
+  const token = ivV2NextToken();
+  ivV2State.buildBusy = true;
+  ivV2State.statusNote = forceRebuild || !ivV2HasStructureCheckpoint()
+    ? '正在构建结构与证据复核结果'
+    : '正在刷新结构与证据复核结果';
+  ivV2ClearStatusError();
+  ivV2RenderConfirmed();
+  try {
+    if (!forceRebuild && ivV2HasStructureCheckpoint()) {
+      return await ivV2LoadStructureWorkspace({ token });
+    }
+    const response = await fetch(`/api/v1/interview-imports/${ivV2State.importId}/structure:build`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(ivV2StructureBuildPayload()),
+    });
+    const data = await response.json();
+    if (!ivV2IsTokenCurrent(token)) return false;
+    if (!response.ok) {
+      const code = String(data?.error?.code || '');
+      if (response.status === 409 && code === 'STRUCTURE_INPUT_CONFLICT') {
+        await ivV2LoadImportBundle(ivV2State.importId, { keepStep: false, token });
+        if (!ivV2IsTokenCurrent(token)) return false;
+        ivV2State.currentStep = 2;
+        ivV2SetStep(2);
+        ivV2State.errorMessage = '分组映射已更新，结构复核未落盘。请先确认最新映射，再重新开始结构复核。';
+        ivV2State.statusCode = code;
+        ivV2RenderConfirmed();
+        return false;
+      }
+      if (response.status === 409 && code === 'STRUCTURE_INPUT_NOT_READY') {
+        await ivV2LoadImportBundle(ivV2State.importId, { keepStep: false, token });
+        if (!ivV2IsTokenCurrent(token)) return false;
+        ivV2State.currentStep = 2;
+        ivV2SetStep(2);
+        return false;
+      }
+      ivV2SetReviewError(data, response.status, '生成结构复核失败');
+      return false;
+    }
+    ivV2State.structureResponse = data;
+    ivV2State.status = data.status || 'STRUCTURE_REVIEW_REQUIRED';
+    const loaded = await ivV2LoadStructureWorkspace({ token, silentConflictRefresh: trigger === 'auto' });
+    if (loaded && ivV2IsTokenCurrent(token)) {
+      showToast(ivV2State.status === 'READY_FOR_DOSSIERS' ? '结构复核已完成，当前仅开放检查结果' : '结构复核工作台已准备完成', 'success');
+    }
+    return loaded;
+  } catch (error) {
+    if (!ivV2IsTokenCurrent(token)) return false;
+    ivV2State.errorMessage = String(error?.message || '生成结构复核失败');
+    ivV2RenderConfirmed();
+    return false;
+  } finally {
+    if (ivV2IsTokenCurrent(token)) {
+      ivV2State.buildBusy = false;
+      ivV2RenderConfirmed();
+    }
+  }
+}
+
+function ivV2ReviewSummaryHtml() {
+  const response = ivV2State.mappingResponse;
+  if (!response) {
+    return '<div class="iv-v2-empty">确认完成后，这里会显示结构复核摘要。</div>';
+  }
+  const previewSource = response.final_participant_preview?.participants?.length
+    ? response.final_participant_preview
+    : (response.proposals?.final_participant_preview || {});
+  const participants = previewSource.participants || [];
+  const structure = ivV2State.structureResponse;
+  const review = structure?.review_summary || {};
+  const evidence = structure?.evidence_summary || {};
+  const confirmedAt = response.history?.at(-1)?.confirmed_at || ivV2State.importData?.updated_at || '';
+  return `
+    ${ivV2State.errorMessage ? `
+      <div class="iv-v2-status-banner iv-v2-status-banner--danger">
+        <strong>${ivV2Esc(ivV2StatusBannerText())}</strong>
+        <p>${ivV2Esc('可直接使用下方重试按钮继续处理；错误信息会在成功刷新、成功构建或成功加载证据上下文后清除。')}</p>
+      </div>
+    ` : ''}
+    <div class="iv-v2-status-grid">
+      <div class="iv-v2-status-card iv-v2-status-card--${ivV2StatusTone(ivV2State.status)}">
+        <strong>${ivV2Esc(ivV2State.status || 'GROUP_MAPPING_CONFIRMED')}</strong>
+        <p>映射版 ${ivV2Esc(response.revision_number || '--')} · SHA ${ivV2Esc((response.mapping_sha256 || '').slice(0, 12) || '--')}</p>
+      </div>
+      <div class="iv-v2-status-card">
+        <strong>${ivV2Esc(participants.length)} 名玩家</strong>
+        <p>结构版 ${ivV2Esc(ivV2CurrentStructureRevisionId().slice(0, 18) || '--')} · 证据版 ${ivV2Esc(ivV2CurrentEvidenceRevisionId().slice(0, 18) || '--')}</p>
+      </div>
+      <div class="iv-v2-status-card">
+        <strong>${ivV2Esc(ivV2FormatTime(confirmedAt))}</strong>
+        <p>阻塞 ${ivV2Esc(review.blocking_issue_count ?? 0)} · 待处理 ${ivV2Esc(review.open_issue_count ?? 0)} · 证据 ${ivV2Esc(evidence.evidence_count ?? 0)}</p>
+      </div>
+    </div>
+    <div class="iv-v2-status-banner iv-v2-status-banner--info">
+      <strong>当前阶段只开放结构与证据复核</strong>
+      <p>玩家档案与后续 dossier 工作台尚未开放；当状态为 READY_FOR_DOSSIERS 时，仅表示结构头部已稳定。</p>
+    </div>
+  `;
+}
+
+function ivV2IssueListHtml() {
+  const issues = ivV2VisibleReviewIssues();
+  const filters = ivV2ReviewFilterOptions();
+  const operationBusy = ivV2OperationBusy();
+  return `
+    <section class="iv-v2-side-card iv-v2-review-shell">
+      <div class="iv-v2-review-head">
+        <div>
+          <div class="iv-v2-side-card__title">问题队列</div>
+          <p class="iv-v2-review-head__desc">优先处理阻塞项；单项修复会基于结构版与证据版双头校验。</p>
+        </div>
+        <div class="iv-v2-toolbar__actions">
+          <button class="btn btn--ghost btn--sm" type="button" data-iv-v2-action="refresh-structure-review"${operationBusy ? ' disabled' : ''}>刷新状态</button>
+          <button class="btn btn--primary btn--sm" type="button" data-iv-v2-action="retry-structure-build"${operationBusy ? ' disabled' : ''}>${ivV2HasStructureCheckpoint() ? '重新生成结构' : '开始结构复核'}</button>
+        </div>
+      </div>
+      <div class="iv-v2-filter-row">
+        <label class="iv-v2-filter-field">
+          <span>显示范围</span>
+          <select data-iv-v2-action="review-filter"${operationBusy ? ' disabled' : ''}>
+            ${filters.map(item => `<option value="${ivV2Esc(item.value)}"${item.value === ivV2State.reviewFilter ? ' selected' : ''}>${ivV2Esc(item.label)}</option>`).join('')}
+          </select>
+        </label>
+      </div>
+      <div class="iv-v2-review-list">
+        ${issues.length ? issues.map(issue => `
+          <button class="iv-v2-review-item${issue.issue_id === ivV2State.selectedIssueId ? ' iv-v2-review-item--active' : ''}" type="button" data-iv-v2-action="select-review-issue" data-issue-id="${ivV2Esc(issue.issue_id)}">
+            <div class="iv-v2-review-item__head">
+              <strong>${ivV2Esc(issue.code || 'REVIEW_ISSUE')}</strong>
+              <span class="iv-v2-badge iv-v2-badge--${ivV2IssueSeverityTone(issue)}">${ivV2Esc(ivV2IssueStatusText(issue))}</span>
+            </div>
+            <p>${ivV2Esc(issue.message || '')}</p>
+            <span>${ivV2Esc(issue.report_impact || issue.reason || '请打开详情处理')}</span>
+          </button>
+        `).join('') : '<div class="iv-v2-empty">当前筛选下没有待处理问题。</div>'}
+      </div>
+    </section>
+  `;
+}
+
+function ivV2StructureTreeHtml() {
+  const structure = ivV2CurrentStructurePayload();
+  if (!structure) {
+    return '<div class="iv-v2-empty">结构结果尚未生成。</div>';
+  }
+  const modules = ivV2Modules();
+  const mainQuestions = ivV2MainQuestions();
+  const occurrences = ivV2Occurrences();
+  return `
+    <section class="iv-v2-side-card iv-v2-structure-tree">
+      <div class="iv-v2-side-card__title">只读结构树</div>
+      ${modules.length ? modules.map(module => {
+        const questions = mainQuestions.filter(item => item.module_id === module.module_id);
+        const linkedOccurrences = occurrences.filter(item => item.canonical_module_id === module.module_id);
+        return `
+          <div class="iv-v2-tree-node">
+            <div class="iv-v2-tree-node__head">
+              <strong>${ivV2Esc(module.canonical_name || module.module_id)}</strong>
+              <span>${ivV2Esc(linkedOccurrences.length)} 行</span>
+            </div>
+            <p>${ivV2Esc(module.decision_status || '')} · ${ivV2Esc(module.mapping_method || '')}</p>
+            <div class="iv-v2-tree-children">
+              ${questions.length ? questions.map(question => `
+                <div class="iv-v2-tree-leaf">
+                  <strong>${ivV2Esc(question.canonical_text || question.main_question_id)}</strong>
+                  <span>${ivV2Esc(question.occurrence_ids?.length || 0)} 个 occurrence</span>
+                </div>
+              `).join('') : '<div class="iv-v2-empty">当前模块下没有主问题。</div>'}
+            </div>
+          </div>
+        `;
+      }).join('') : '<div class="iv-v2-empty">当前没有模块节点。</div>'}
+    </section>
+  `;
+}
+
+function ivV2ReviewTargetOptions(kind, selected) {
+  if (kind === 'module') {
+    return ivV2Modules().map(module => `<option value="${ivV2Esc(module.module_id)}"${module.module_id === selected ? ' selected' : ''}>${ivV2Esc(module.canonical_name || module.module_id)}</option>`).join('');
+  }
+  if (kind === 'question') {
+    return ivV2MainQuestions().map(question => `<option value="${ivV2Esc(question.main_question_id)}"${question.main_question_id === selected ? ' selected' : ''}>${ivV2Esc(question.canonical_text || question.main_question_id)}</option>`).join('');
+  }
+  return '';
+}
+
+function ivV2ReviewEvidenceTargetOptions(issue, selected) {
+  return ivV2IssueEvidenceTargets(issue).map(id => `<option value="${ivV2Esc(id)}"${id === selected ? ' selected' : ''}>${ivV2Esc(id)}</option>`).join('');
+}
+
+function ivV2ReviewResolutionFieldsHtml(issue) {
+  const draft = ivV2EnsureIssueDraft(issue);
+  const allowed = Array.isArray(issue.allowed_resolutions) ? issue.allowed_resolutions : [];
+  if (!allowed.length) {
+    return '<div class="iv-v2-empty">该问题当前没有允许的前端修复动作。需要修正源文件并重新上传，或先调整映射后重新构建结构复核。</div>';
+  }
+  const action = String(draft?.resolution || allowed[0] || '');
+  const suggestion = issue.suggested_resolution || {};
+  const canLinkQuestion = ['follow_up', 'observation_row'].includes(String(draft?.row_role || ''));
+  let extra = '';
+  if (action === 'assign_row_role') {
+    extra = `
+      <label class="iv-v2-inline-field">
+        <span>行角色</span>
+        <select data-iv-v2-action="review-draft-row-role" data-issue-id="${ivV2Esc(issue.issue_id)}">
+          <option value="">请选择</option>
+          ${['module_header', 'main_question', 'follow_up', 'observation_row'].map(role => `<option value="${role}"${role === draft.row_role ? ' selected' : ''}>${ivV2Esc(ivV2FormatRowRoleLabel(role))}</option>`).join('')}
+        </select>
+      </label>
+      ${canLinkQuestion ? `
+        <label class="iv-v2-inline-field">
+          <span>关联主问题（可选）</span>
+          <select data-iv-v2-action="review-draft-target" data-issue-id="${ivV2Esc(issue.issue_id)}">
+            <option value="">不关联主问题</option>
+            ${ivV2ReviewTargetOptions('question', draft.target_id)}
+          </select>
+        </label>
+      ` : ''}
+    `;
+  } else if (action === 'assign_module') {
+    extra = `
+      <label class="iv-v2-inline-field">
+        <span>目标模块</span>
+        <select data-iv-v2-action="review-draft-target" data-issue-id="${ivV2Esc(issue.issue_id)}">
+          <option value="">请选择模块</option>
+          ${ivV2ReviewTargetOptions('module', draft.target_id)}
+        </select>
+      </label>
+    `;
+  } else if (action === 'assign_main_question') {
+    extra = `
+      <label class="iv-v2-inline-field">
+        <span>目标主问题</span>
+        <select data-iv-v2-action="review-draft-target" data-issue-id="${ivV2Esc(issue.issue_id)}">
+          <option value="">请选择主问题</option>
+          ${ivV2ReviewTargetOptions('question', draft.target_id)}
+        </select>
+      </label>
+    `;
+  } else if (action === 'set_evidence_identity') {
+    extra = `
+      <label class="iv-v2-inline-field">
+        <span>证据目标</span>
+        <select data-iv-v2-action="review-draft-target" data-issue-id="${ivV2Esc(issue.issue_id)}">
+          <option value="">请选择证据</option>
+          ${ivV2ReviewEvidenceTargetOptions(issue, draft.target_id)}
+        </select>
+      </label>
+      <label class="iv-v2-inline-field">
+        <span>证据类型</span>
+        <select data-iv-v2-action="review-draft-evidence-type" data-issue-id="${ivV2Esc(issue.issue_id)}">
+          <option value="">请选择</option>
+          ${['participant_self_report', 'researcher_observation'].map(type => `<option value="${type}"${type === draft.evidence_type ? ' selected' : ''}>${ivV2Esc(ivV2FormatEvidenceTypeLabel(type))}</option>`).join('')}
+        </select>
+      </label>
+    `;
+  } else if (action === 'exclude_evidence') {
+    extra = `
+      <label class="iv-v2-inline-field">
+        <span>证据目标</span>
+        <select data-iv-v2-action="review-draft-target" data-issue-id="${ivV2Esc(issue.issue_id)}">
+          <option value="">请选择证据</option>
+          ${ivV2ReviewEvidenceTargetOptions(issue, draft.target_id)}
+        </select>
+      </label>
+    `;
+  } else if (action === 'accept_suggestion') {
+    extra = `
+      <div class="iv-v2-suggestion">
+        <strong>系统建议</strong>
+        <p>${ivV2Esc([
+          suggestion.resolution ? `动作：${ivV2FormatResolutionLabel(suggestion.resolution)}` : '',
+          suggestion.row_role ? `行角色：${ivV2FormatRowRoleLabel(suggestion.row_role)}` : '',
+          suggestion.evidence_type ? `证据类型：${ivV2FormatEvidenceTypeLabel(suggestion.evidence_type)}` : '',
+          suggestion.target_id ? `目标：${suggestion.target_id}` : '',
+        ].filter(Boolean).join(' · ') || '当前没有结构化建议，仅记录接受意见。')}</p>
+      </div>
+    `;
+  }
+  return `
+    <div class="iv-v2-resolution-grid">
+      <label class="iv-v2-inline-field">
+        <span>修复动作</span>
+        <select data-iv-v2-action="review-draft-resolution" data-issue-id="${ivV2Esc(issue.issue_id)}">
+          ${allowed.map(item => `<option value="${ivV2Esc(item)}"${item === action ? ' selected' : ''}>${ivV2Esc(ivV2FormatResolutionLabel(item))}</option>`).join('')}
+        </select>
+      </label>
+      ${extra}
+      <label class="iv-v2-inline-field iv-v2-inline-field--full">
+        <span>处理备注</span>
+        <textarea rows="4" maxlength="500" data-iv-v2-action="review-draft-comment" data-issue-id="${ivV2Esc(issue.issue_id)}" placeholder="说明为什么这样处理，最多 500 字">${ivV2Esc(draft.comment || '')}</textarea>
+        <em>${ivV2Esc((draft.comment || '').length)}/500</em>
+      </label>
+    </div>
+  `;
+}
+
+function ivV2IssueDetailHtml() {
+  const issue = ivV2CurrentIssue();
+  if (!issue) {
+    return '<div class="iv-v2-empty">从左侧选择一个问题后，可查看证据上下文并提交单项修复。</div>';
+  }
+  const draft = ivV2EnsureIssueDraft(issue);
+  const evidenceId = ivV2IssueContextTarget(issue);
+  const cache = evidenceId ? ivV2State.evidenceContextCache[ivV2EvidenceContextKey(issue, evidenceId)] : null;
+  const evidence = cache?.payload?.evidence || null;
+  const context = cache?.payload?.source_context || null;
+  const operationBusy = ivV2OperationBusy();
+  const canSubmit = ivV2IssueHasResolvableAction(issue) && ivV2IssueIsOpen(issue);
+  return `
+    <section class="iv-v2-side-card iv-v2-issue-detail">
+      <div class="iv-v2-issue-detail__head">
+        <div>
+          <div class="iv-v2-side-card__title">${ivV2Esc(issue.code || 'REVIEW_ISSUE')}</div>
+          <p>${ivV2Esc(issue.message || '')}</p>
+        </div>
+        <span class="iv-v2-badge iv-v2-badge--${ivV2IssueSeverityTone(issue)}">${ivV2Esc(issue.severity || 'info')}</span>
+      </div>
+      <div class="iv-v2-issue-meta">
+        <span>状态：${ivV2Esc(ivV2IssueStatusText(issue))}</span>
+        <span>影响：${ivV2Esc(issue.report_impact || '待确认')}</span>
+        <span>建议动作：${ivV2Esc(issue.suggested_action || 'review_structure_issue')}</span>
+      </div>
+      <div class="iv-v2-context-card">
+        <div class="iv-v2-context-card__head">
+          <strong>证据上下文</strong>
+          <div class="iv-v2-toolbar__actions">
+            ${evidenceId ? `<button class="btn btn--ghost btn--sm" type="button" data-iv-v2-action="load-evidence-context" data-issue-id="${ivV2Esc(issue.issue_id)}"${operationBusy ? ' disabled' : ''}>${ivV2State.contextBusyIssueId === issue.issue_id ? '加载中...' : '刷新上下文'}</button>` : ''}
+          </div>
+        </div>
+        ${evidenceId ? (
+          (evidence || context) ? `
+            <div class="iv-v2-context-card__body">
+              ${evidence ? `
+                <p>Context #${ivV2Esc(cache.token)} · ${ivV2Esc(evidence.sheet_name || evidence.sheet_id || '')} · ${ivV2Esc(evidence.cell_address || '')}</p>
+                <p>玩家 ${ivV2Esc(evidence.participant_label || '--')} · 记录员 ${ivV2Esc(evidence.recorder_label || '--')} · 证据类型 ${ivV2Esc(ivV2FormatEvidenceTypeLabel(evidence.evidence_type || ''))}</p>
+                <p>Prompt：${ivV2Esc(evidence.prompt_text || '无')}</p>
+                <p>Raw：${ivV2Esc(evidence.raw_content || '')}</p>
+                <p>Display：${ivV2Esc(evidence.display_content || '')}</p>
+                <p>Normalized：${ivV2Esc(evidence.normalized_content || '')}</p>
+                <p>身份状态 ${ivV2Esc(evidence.identity_decision_status || '--')} · 公式缓存 ${ivV2Esc(evidence.formula_cache_status || '--')}</p>
+              ` : ''}
+              ${context ? `
+                <p>行 ${ivV2Esc(context.row ?? '--')} / 列 ${ivV2Esc(context.column ?? '--')} · source_cell_id ${ivV2Esc(context.source_cell_id || '--')}</p>
+              ` : ''}
+              <div class="iv-v2-context-list">
+                ${((context?.neighboring_occurrences) || []).length ? context.neighboring_occurrences.map(item => `
+                  <div class="iv-v2-context-list__item">
+                    <strong>${ivV2Esc(ivV2FormatRowRoleLabel(item.row_role || 'unknown'))}</strong>
+                    <span>${ivV2Esc(item.sheet_name || item.sheet_id || '')} · 第 ${ivV2Esc(item.row)} 行</span>
+                    <p>${ivV2Esc(item.raw_prompt_text || item.raw_module_text || item.raw_type_text || '无额外文本')}</p>
+                  </div>
+                `).join('') : '<div class="iv-v2-empty">附近没有可公开的结构邻近项。</div>'}
+              </div>
+            </div>
+          ` : `<div class="iv-v2-empty">${ivV2State.contextBusyIssueId === issue.issue_id ? '正在按证据目标懒加载上下文...' : '当前尚未加载上下文。'}</div>`
+        ) : '<div class="iv-v2-empty">该问题没有可公开的证据目标，无法展开上下文。</div>'}
+      </div>
+      <div class="iv-v2-resolution-card">
+        <div class="iv-v2-context-card__head">
+          <strong>单项修复</strong>
+          <button class="btn btn--primary btn--sm" type="button" data-iv-v2-action="submit-review-issue" data-issue-id="${ivV2Esc(issue.issue_id)}"${operationBusy || !canSubmit ? ' disabled' : ''}>${ivV2State.reviewBusy ? '提交中...' : '提交此项修复'}</button>
+        </div>
+        ${ivV2ReviewResolutionFieldsHtml(issue)}
+      </div>
+    </section>
+  `;
+}
+
+function ivV2SyncConfirmedControls() {
+  const confirmedShell = ivV2$('iv-v2-confirmed-shell');
+  if (!confirmedShell) return;
+  const operationBusy = ivV2OperationBusy();
+  confirmedShell.setAttribute('aria-busy', operationBusy ? 'true' : 'false');
+  confirmedShell.querySelectorAll('input, select, textarea, button').forEach(control => {
+    const action = control.dataset?.ivV2Action || '';
+    if (action === 'submit-review-issue') {
+      const issue = ivV2IssueById(control.dataset.issueId || '');
+      control.disabled = operationBusy || !(ivV2IssueHasResolvableAction(issue) && ivV2IssueIsOpen(issue));
+      return;
+    }
+    control.disabled = operationBusy;
+  });
+}
+
+function ivV2SyncCommentCounter(textarea) {
+  if (!textarea) return;
+  const counter = textarea.parentElement?.querySelector('em');
+  if (counter) counter.textContent = `${String(textarea.value || '').length}/500`;
+}
+
+function ivV2HeadsHtml() {
+  const response = ivV2State.mappingResponse;
+  return `
+    <section class="iv-v2-side-card">
+      <div class="iv-v2-side-card__title">版本头信息</div>
+      <div class="iv-v2-head-list">
+        <div class="iv-v2-history-item">
+          <div>
+            <strong>映射头</strong>
+            <p>${ivV2Esc(response?.mapping_revision_id || '--')} · SHA ${ivV2Esc((response?.mapping_sha256 || '').slice(0, 12) || '--')}</p>
+          </div>
+          <span class="iv-v2-badge">第 ${ivV2Esc(response?.revision_number || '--')} 版</span>
+        </div>
+        <div class="iv-v2-history-item">
+          <div>
+            <strong>结构头</strong>
+            <p>${ivV2Esc(ivV2CurrentStructureRevisionId() || '--')}</p>
+          </div>
+          <span class="iv-v2-badge">${ivV2Esc(ivV2State.status || '--')}</span>
+        </div>
+        <div class="iv-v2-history-item">
+          <div>
+            <strong>证据头</strong>
+            <p>${ivV2Esc(ivV2CurrentEvidenceRevisionId() || '--')}</p>
+          </div>
+          <span class="iv-v2-badge">${ivV2Esc(ivV2State.statusCode || 'CAS')}</span>
+        </div>
+      </div>
+      <div class="iv-v2-status-banner iv-v2-status-banner--warning">
+        <strong>冲突恢复说明</strong>
+        <p>单项修复会同时提交 structure/evidence 双版本头。若任一头变化，前端会刷新当前工作台，避免跨版本写入。</p>
+      </div>
+    </section>
+    <section class="iv-v2-side-card">
+      <div class="iv-v2-side-card__title">映射历史</div>
+      <div>${ivV2HistoryHtml()}</div>
+    </section>
+  `;
+}
+
 function ivV2RenderConfirmed() {
   const meta = ivV2$('iv-v2-confirmed-meta');
   const preview = ivV2$('iv-v2-confirmed-preview');
   const history = ivV2$('iv-v2-confirmed-history');
   if (!meta || !preview || !history) return;
+  ivV2RenderStep3Header();
 
   const response = ivV2State.mappingResponse;
   if (!response) {
-    meta.innerHTML = '<div class="iv-v2-empty">确认完成后，这里会显示最终摘要。</div>';
+    meta.innerHTML = '<div class="iv-v2-empty">确认完成后，这里会显示结构复核工作台。</div>';
     preview.innerHTML = '';
     history.innerHTML = '';
     return;
   }
 
-  const previewSource = response.final_participant_preview?.participants?.length
-    ? response.final_participant_preview
-    : (response.proposals?.final_participant_preview || {});
-  const participants = previewSource.participants || [];
-
-  meta.innerHTML = `
-    <div class="iv-v2-status-grid">
-      <div class="iv-v2-status-card iv-v2-status-card--success">
-        <strong>${ivV2Esc(response.status || 'GROUP_MAPPING_CONFIRMED')}</strong>
-        <p>版本 ${ivV2Esc(response.revision_number || '--')} · SHA ${ivV2Esc((response.mapping_sha256 || '').slice(0, 12) || '--')}</p>
-      </div>
-      <div class="iv-v2-status-card">
-        <strong>${ivV2Esc(participants.length)} 名玩家</strong>
-        <p>确认后不会触发旧版报告生成流</p>
-      </div>
-      <div class="iv-v2-status-card">
-        <strong>${ivV2Esc(ivV2FormatTime(response.history?.at(-1)?.confirmed_at || ivV2State.importData?.updated_at || ''))}</strong>
-        <p>可返回编辑器继续修改并再次保存</p>
-      </div>
-    </div>
+  meta.innerHTML = ivV2ReviewSummaryHtml();
+  preview.innerHTML = `
+    ${ivV2IssueListHtml()}
+    ${ivV2IssueDetailHtml()}
+    ${ivV2StructureTreeHtml()}
   `;
-
-  preview.innerHTML = participants.length ? participants.map(item => `
-    <div class="iv-v2-preview-row">
-      <strong>${ivV2Esc(item.participant_label || '未命名玩家')}</strong>
-      <span>${ivV2Esc(item.group_display_name || '未分组')}</span>
-      <p>${(item.sources || []).map(source => ivV2Esc(`${ivV2SheetName(source.sheet_id)} · ${source.column_letter || source.column_index || ''}`)).join(' / ') || '无来源列'}</p>
-    </div>
-  `).join('') : '<div class="iv-v2-empty">当前没有最终玩家预览。</div>';
-  history.innerHTML = ivV2HistoryHtml();
+  history.innerHTML = ivV2HeadsHtml();
   const operationBusy = ivV2OperationBusy();
   const backButton = ivV2$('iv-v2-back-to-editor');
   const startOverButton = ivV2$('iv-v2-start-over');
-  if (backButton) backButton.disabled = operationBusy;
-  if (startOverButton) startOverButton.disabled = operationBusy;
+  if (backButton) {
+    backButton.disabled = operationBusy;
+    backButton.textContent = '返回分组映射';
+  }
+  if (startOverButton) {
+    startOverButton.disabled = operationBusy;
+    startOverButton.textContent = '重新上传工作簿';
+  }
+  ivV2SyncConfirmedControls();
   ivV2SyncTrackToggle();
 }
 
@@ -1353,6 +2215,7 @@ async function ivV2ConfirmMapping() {
   ) return;
   const token = ivV2NextToken();
   ivV2State.confirmBusy = true;
+  ivV2ResetStructureWorkspace();
   ivV2ClearStatusError();
   ivV2State.statusNote = '正在确认分组版本';
   ivV2RenderEditor();
@@ -1383,12 +2246,14 @@ async function ivV2ConfirmMapping() {
     ivV2State.draft = ivV2BuildDraft(data);
     ivV2State.status = data.status || 'GROUP_MAPPING_CONFIRMED';
     ivV2ClearStatusError();
-    ivV2ClearDirty('已停在 GROUP_MAPPING_CONFIRMED 检查点');
+    ivV2ClearDirty('已确认映射，正在准备结构复核');
     ivV2State.currentStep = 3;
     ivV2SetStep(3);
     ivV2RenderEditor();
     ivV2RenderConfirmed();
-    showToast('分组确认完成，已停在检查点', 'success');
+    showToast('分组确认完成，正在准备结构复核', 'success');
+    ivV2State.confirmBusy = false;
+    await ivV2EnsureStructureWorkspace({ trigger: 'auto' });
   } catch (error) {
     if (!ivV2IsTokenCurrent(token)) return;
     ivV2ShowToastFromError(error, '确认分组失败');
@@ -1396,6 +2261,122 @@ async function ivV2ConfirmMapping() {
     if (ivV2IsTokenCurrent(token)) {
       ivV2State.confirmBusy = false;
       ivV2RenderEditor();
+      ivV2RenderConfirmed();
+    }
+  }
+}
+
+function ivV2UpdateIssueDraft(issueId, patch) {
+  const issue = ivV2IssueById(issueId);
+  if (!issue) return;
+  const current = ivV2EnsureIssueDraft(issue);
+  ivV2State.issueDrafts[issueId] = { ...current, ...patch };
+}
+
+function ivV2NormalizeIssueDraft(issue) {
+  const draft = { ...ivV2EnsureIssueDraft(issue) };
+  if (draft.resolution !== 'assign_row_role') {
+    draft.row_role = '';
+  }
+  if (!['assign_row_role', 'assign_module', 'assign_main_question', 'set_evidence_identity', 'exclude_evidence'].includes(draft.resolution)) {
+    draft.target_id = '';
+  }
+  if (draft.resolution !== 'set_evidence_identity') {
+    draft.evidence_type = '';
+  }
+  if (draft.resolution === 'assign_row_role' && !['follow_up', 'observation_row'].includes(draft.row_role)) {
+    draft.target_id = '';
+  }
+  return draft;
+}
+
+function ivV2ValidateIssueDraft(issue) {
+  const draft = ivV2NormalizeIssueDraft(issue);
+  const allowed = Array.isArray(issue.allowed_resolutions) ? issue.allowed_resolutions : [];
+  if (!allowed.includes(draft.resolution)) return { ok: false, message: '当前问题不允许该修复动作' };
+  if (!String(draft.comment || '').trim()) return { ok: false, message: '请填写处理备注' };
+  if (String(draft.comment || '').trim().length > 500) return { ok: false, message: '处理备注不能超过 500 字' };
+  if (draft.resolution === 'assign_row_role' && !draft.row_role) return { ok: false, message: '请选择行角色' };
+  if (draft.resolution === 'assign_module' && !String(draft.target_id || '').startsWith('module_')) return { ok: false, message: '请选择目标模块' };
+  if (draft.resolution === 'assign_main_question' && !String(draft.target_id || '').startsWith('question_')) return { ok: false, message: '请选择目标主问题' };
+  if (draft.resolution === 'set_evidence_identity') {
+    if (!String(draft.target_id || '').startsWith('ev_')) return { ok: false, message: '请选择证据目标' };
+    if (!draft.evidence_type) return { ok: false, message: '请选择证据类型' };
+  }
+  if (draft.resolution === 'exclude_evidence' && !String(draft.target_id || '').startsWith('ev_')) {
+    return { ok: false, message: '请选择要排除的证据' };
+  }
+  return { ok: true, draft };
+}
+
+async function ivV2SubmitIssueResolution(issueId) {
+  const issue = ivV2IssueById(issueId);
+  if (!issue || ivV2OperationBusy()) return;
+  const validation = ivV2ValidateIssueDraft(issue);
+  if (!validation.ok) {
+    showToast(validation.message, 'error');
+    return;
+  }
+  if (validation.draft.resolution === 'exclude_evidence') {
+    const confirmed = window.confirm('确认排除此证据吗？排除后它不会进入报告；如果这是该玩家最后一条证据，后端也可能拒绝此次排除。');
+    if (!confirmed) return;
+  }
+  const token = ivV2NextToken();
+  const previousEvidenceRevisionId = ivV2CurrentEvidenceRevisionId();
+  ivV2State.reviewBusy = true;
+  ivV2State.statusNote = '正在提交单项修复';
+  ivV2ClearStatusError();
+  ivV2RenderConfirmed();
+  try {
+    const draft = validation.draft;
+    const response = await fetch(`/api/v1/interview-review-issues/${issueId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        base_structure_revision_id: ivV2CurrentStructureRevisionId(),
+        base_evidence_revision_id: ivV2CurrentEvidenceRevisionId(),
+        resolution: draft.resolution,
+        target_id: draft.target_id || null,
+        row_role: draft.row_role || null,
+        evidence_type: draft.evidence_type || null,
+        comment: String(draft.comment || '').trim(),
+      }),
+    });
+    const data = await response.json();
+    if (!ivV2IsTokenCurrent(token)) return;
+    if (!response.ok) {
+      const code = String(data?.error?.code || '');
+      if (response.status === 409) {
+        if (['STRUCTURE_INPUT_CONFLICT', 'STRUCTURE_INPUT_NOT_READY'].includes(code)) {
+          ivV2ResetStructureWorkspace();
+          await ivV2LoadImportBundle(ivV2State.importId, { keepStep: false, token });
+          if (!ivV2IsTokenCurrent(token)) return;
+          ivV2State.currentStep = 2;
+          ivV2SetStep(2);
+          ivV2SetReviewError(data, response.status, '分组映射已变化，请先确认最新映射');
+          return;
+        }
+        await ivV2LoadStructureWorkspace({ token, silentConflictRefresh: true });
+        if (!ivV2IsTokenCurrent(token)) return;
+        ivV2SetReviewError(data, response.status, code === 'STRUCTURE_REVISION_CONFLICT' ? '结构版本已更新，已刷新最新结果' : '结构状态已变化');
+        return;
+      }
+      ivV2SetReviewError(data, response.status, '提交单项修复失败');
+      return;
+    }
+    delete ivV2State.issueDrafts[issueId];
+    if (String(data?.evidence_revision_id || '') && String(data.evidence_revision_id) !== previousEvidenceRevisionId) {
+      ivV2InvalidateEvidenceContext();
+    }
+    await ivV2LoadStructureWorkspace({ token, silentConflictRefresh: true });
+    if (ivV2IsTokenCurrent(token)) showToast('单项修复已提交', 'success');
+  } catch (error) {
+    if (!ivV2IsTokenCurrent(token)) return;
+    ivV2State.errorMessage = String(error?.message || '提交单项修复失败');
+    ivV2RenderConfirmed();
+  } finally {
+    if (ivV2IsTokenCurrent(token)) {
+      ivV2State.reviewBusy = false;
       ivV2RenderConfirmed();
     }
   }
@@ -1461,14 +2442,78 @@ function ivV2HandleEditorClick(event) {
     ivV2State.draft.ignoredSheetIds = ivV2State.draft.ignoredSheetIds.filter(id => id !== button.dataset.sheetId);
     ivV2MarkDirty();
     ivV2RenderEditor();
+    return;
+  }
+
+  if (action === 'select-review-issue') {
+    ivV2SelectIssue(button.dataset.issueId);
+    return;
+  }
+
+  if (action === 'retry-structure-build') {
+    ivV2EnsureStructureWorkspace({ forceRebuild: true });
+    return;
+  }
+
+  if (action === 'refresh-structure-review') {
+    ivV2EnsureStructureWorkspace({ forceRebuild: false });
+    return;
+  }
+
+  if (action === 'load-evidence-context') {
+    ivV2EnsureEvidenceContext(ivV2IssueById(button.dataset.issueId), { force: true });
+    return;
+  }
+
+  if (action === 'submit-review-issue') {
+    ivV2SubmitIssueResolution(button.dataset.issueId);
   }
 }
 
 function ivV2HandleEditorInputOrChange(event) {
-  if (ivV2OperationBusy()) return;
   const target = event.target;
   const action = target.dataset.ivV2Action;
   if (!action) return;
+  if (action.startsWith('review-')) {
+    if (ivV2OperationBusy()) return;
+    const issueId = target.dataset.issueId;
+    if (action === 'review-filter') {
+      ivV2State.reviewFilter = target.value || 'open';
+      const selected = ivV2SyncSelectedIssue({ preserveAll: true });
+      if (selected) ivV2EnsureIssueDraft(selected);
+      ivV2RenderConfirmed();
+      return;
+    }
+    if (!issueId) return;
+    if (action === 'review-draft-resolution') {
+      ivV2UpdateIssueDraft(issueId, { resolution: target.value || '', target_id: '', row_role: '', evidence_type: '' });
+      ivV2RenderConfirmed();
+      return;
+    }
+    if (action === 'review-draft-row-role') {
+      ivV2UpdateIssueDraft(issueId, { row_role: target.value || '', target_id: '' });
+      ivV2RenderConfirmed();
+      return;
+    }
+    if (action === 'review-draft-target') {
+      ivV2UpdateIssueDraft(issueId, { target_id: target.value || '' });
+      ivV2EnsureEvidenceContext(ivV2IssueById(issueId));
+      ivV2RenderConfirmed();
+      return;
+    }
+    if (action === 'review-draft-evidence-type') {
+      ivV2UpdateIssueDraft(issueId, { evidence_type: target.value || '' });
+      ivV2RenderConfirmed();
+      return;
+    }
+    if (action === 'review-draft-comment') {
+      ivV2UpdateIssueDraft(issueId, { comment: target.value || '' });
+      ivV2SyncCommentCounter(target);
+      return;
+    }
+    return;
+  }
+  if (ivV2OperationBusy()) return;
 
   if (action === 'group-name') {
     const group = ivV2FindGroup(target.dataset.groupId);
@@ -1542,11 +2587,15 @@ function ivV2Reset() {
   ivV2State.saveBusy = false;
   ivV2State.confirmBusy = false;
   ivV2State.restoreBusy = false;
+  ivV2State.buildBusy = false;
+  ivV2State.reviewBusy = false;
   ivV2State.importData = null;
   ivV2State.mappingResponse = null;
   ivV2State.draft = null;
   ivV2State.sheetCatalog = {};
   ivV2State.statusNote = '';
+  ivV2State.reviewFilter = 'open';
+  ivV2ResetStructureWorkspace();
   ivV2ClearStatusError();
   ivV2ClearDirty();
   ivV2ClearFile();
@@ -1627,6 +2676,11 @@ function ivV2Mount() {
     ivV2HandleEditorInputOrChange(event);
   });
   ivV2$('iv-v2-confirmed-shell')?.addEventListener('click', ivV2HandleEditorClick);
+  ivV2$('iv-v2-confirmed-shell')?.addEventListener('change', ivV2HandleEditorInputOrChange);
+  ivV2$('iv-v2-confirmed-shell')?.addEventListener('input', event => {
+    if (event.target.tagName === 'SELECT') return;
+    ivV2HandleEditorInputOrChange(event);
+  });
   ivV2$('iv-v2-back-to-editor')?.addEventListener('click', () => {
     if (ivV2OperationBusy()) return;
     ivV2State.currentStep = 2;
