@@ -3,6 +3,14 @@ import re
 import unittest
 from pathlib import Path
 
+from pydantic import ValidationError
+
+from app.schemas.interview_v2_structure import (
+    InterviewV2ReviewIssueBatchRequest,
+    InterviewV2ReviewIssuePatchRequest,
+    InterviewV2StructureBuildRequest,
+)
+
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "interview_v2"
 RANGE_RE = re.compile(r"^[A-Z]+[1-9][0-9]*:[A-Z]+[1-9][0-9]*$")
@@ -134,6 +142,56 @@ class InterviewV2ContractTests(unittest.TestCase):
             and item["applicability"] == "applicable"
         }
         self.assertEqual(denominator, {"group_01-P01"})
+
+    def test_structure_build_is_bound_to_an_exact_confirmed_mapping_head(self):
+        request = InterviewV2StructureBuildRequest.model_validate(
+            {
+                "base_mapping_revision_id": "mapping_" + "1" * 32,
+                "base_mapping_sha256": "a" * 64,
+            }
+        )
+        self.assertTrue(request.base_mapping_revision_id.startswith("mapping_"))
+        with self.assertRaises(ValidationError):
+            InterviewV2StructureBuildRequest.model_validate(
+                {
+                    "base_mapping_revision_id": "mapping_" + "1" * 32,
+                    "base_mapping_sha256": "a" * 64,
+                    "force_rebuild": True,
+                }
+            )
+
+    def test_review_resolution_requires_both_structure_and_evidence_heads(self):
+        valid = {
+            "base_structure_revision_id": "structure_" + "2" * 32,
+            "base_evidence_revision_id": "evidence_" + "3" * 32,
+            "resolution": "assign_row_role",
+            "row_role": "follow_up",
+            "comment": "确认现场追问",
+        }
+        InterviewV2ReviewIssuePatchRequest.model_validate(valid)
+        for missing in (
+            "base_structure_revision_id",
+            "base_evidence_revision_id",
+        ):
+            malformed = dict(valid)
+            malformed.pop(missing)
+            with self.subTest(missing=missing), self.assertRaises(ValidationError):
+                InterviewV2ReviewIssuePatchRequest.model_validate(malformed)
+
+    def test_batch_review_contract_rejects_duplicate_issue_ids(self):
+        resolution = {
+            "issue_id": "issue_" + "4" * 32,
+            "resolution": "accept_suggestion",
+            "comment": "接受确定性建议",
+        }
+        with self.assertRaises(ValidationError):
+            InterviewV2ReviewIssueBatchRequest.model_validate(
+                {
+                    "base_structure_revision_id": "structure_" + "2" * 32,
+                    "base_evidence_revision_id": "evidence_" + "3" * 32,
+                    "resolutions": [resolution, resolution],
+                }
+            )
 
 
 if __name__ == "__main__":
