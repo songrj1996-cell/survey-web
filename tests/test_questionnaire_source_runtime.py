@@ -40,6 +40,9 @@ from app.services.questionnaire_source_runtime import (
     QuestionnaireSourceRuntime,
     create_questionnaire_source_runtime,
 )
+from app.storage.questionnaire_asset_reviews import (
+    FileQuestionnaireAssetReviewStorage,
+)
 from app.storage.research_assets import (
     FileResearchAssetStorage,
     ResearchAssetBundle,
@@ -59,6 +62,7 @@ EXPECTED_CAPABILITIES = {
     "snapshot_catalog": True,
     "snapshot_analysis_session": True,
     "asset_review_projection": True,
+    "asset_review_decisions": True,
     "bested_original_questionnaire_upload": True,
     "screenshot_material_upload": True,
     "pdf_material_upload": True,
@@ -77,6 +81,11 @@ EXPECTED_ROUTES = {
     (
         "GET",
         "/api/questionnaire-sources/snapshots/{snapshot_id}/asset-review",
+    ),
+    (
+        "POST",
+        "/api/questionnaire-sources/snapshots/{snapshot_id}"
+        "/asset-review/decisions",
     ),
     (
         "GET",
@@ -166,6 +175,7 @@ class QuestionnaireSourceRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "snapshot_catalog": False,
             "snapshot_analysis_session": False,
             "asset_review_projection": False,
+            "asset_review_decisions": False,
             "bested_original_questionnaire_upload": False,
             "screenshot_material_upload": False,
             "pdf_material_upload": False,
@@ -183,6 +193,12 @@ class QuestionnaireSourceRuntimeTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValidationError):
             QuestionnaireSourceCapabilities.model_validate({
                 **EXPECTED_CAPABILITIES,
+                "asset_review_decisions": 1,
+            })
+
+        with self.assertRaises(ValidationError):
+            QuestionnaireSourceCapabilities.model_validate({
+                **EXPECTED_CAPABILITIES,
                 "storage_root": "/private/runtime/path",
             })
         with self.assertRaises(ValidationError):
@@ -194,6 +210,18 @@ class QuestionnaireSourceRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             self.runtime.storage.root,
             self.storage_root.absolute(),
+        )
+        self.assertIsInstance(
+            self.runtime.review_storage,
+            FileQuestionnaireAssetReviewStorage,
+        )
+        self.assertEqual(
+            self.runtime.review_storage.root,
+            self.runtime.storage.root,
+        )
+        self.assertIs(
+            self.runtime.asset_review_api.review_storage,
+            self.runtime.review_storage,
         )
         for api in (
             self.runtime.snapshot_api,
@@ -229,9 +257,13 @@ class QuestionnaireSourceRuntimeTests(unittest.IsolatedAsyncioTestCase):
         other_storage = FileResearchAssetStorage(
             Path(self.temporary.name) / "other-storage"
         )
+        other_review_storage = FileQuestionnaireAssetReviewStorage(
+            Path(self.temporary.name) / "other-storage"
+        )
         with self.assertRaisesRegex(ValueError, "共享 runtime.storage"):
             QuestionnaireSourceRuntime(
                 storage=self.runtime.storage,
+                review_storage=self.runtime.review_storage,
                 snapshot_api=QuestionnaireSnapshotApi(other_storage),
                 snapshot_analysis_api=self.runtime.snapshot_analysis_api,
                 asset_review_api=self.runtime.asset_review_api,
@@ -242,6 +274,7 @@ class QuestionnaireSourceRuntimeTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(TypeError, "snapshot_api"):
             QuestionnaireSourceRuntime(
                 storage=self.runtime.storage,
+                review_storage=self.runtime.review_storage,
                 snapshot_api=object(),
                 snapshot_analysis_api=self.runtime.snapshot_analysis_api,
                 asset_review_api=self.runtime.asset_review_api,
@@ -252,6 +285,7 @@ class QuestionnaireSourceRuntimeTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "共享 runtime.storage"):
             QuestionnaireSourceRuntime(
                 storage=self.runtime.storage,
+                review_storage=self.runtime.review_storage,
                 snapshot_api=self.runtime.snapshot_api,
                 snapshot_analysis_api=QuestionnaireSnapshotAnalysisApi(
                     other_storage
@@ -264,6 +298,7 @@ class QuestionnaireSourceRuntimeTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(TypeError, "snapshot_analysis_api"):
             QuestionnaireSourceRuntime(
                 storage=self.runtime.storage,
+                review_storage=self.runtime.review_storage,
                 snapshot_api=self.runtime.snapshot_api,
                 snapshot_analysis_api=object(),
                 asset_review_api=self.runtime.asset_review_api,
@@ -274,9 +309,13 @@ class QuestionnaireSourceRuntimeTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "共享 runtime.storage"):
             QuestionnaireSourceRuntime(
                 storage=self.runtime.storage,
+                review_storage=self.runtime.review_storage,
                 snapshot_api=self.runtime.snapshot_api,
                 snapshot_analysis_api=self.runtime.snapshot_analysis_api,
-                asset_review_api=QuestionnaireAssetReviewApi(other_storage),
+                asset_review_api=QuestionnaireAssetReviewApi(
+                    other_storage,
+                    other_review_storage,
+                ),
                 bested_api=self.runtime.bested_api,
                 screenshot_material_api=self.runtime.screenshot_material_api,
                 pdf_material_api=self.runtime.pdf_material_api,
@@ -284,9 +323,52 @@ class QuestionnaireSourceRuntimeTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(TypeError, "asset_review_api"):
             QuestionnaireSourceRuntime(
                 storage=self.runtime.storage,
+                review_storage=self.runtime.review_storage,
                 snapshot_api=self.runtime.snapshot_api,
                 snapshot_analysis_api=self.runtime.snapshot_analysis_api,
                 asset_review_api=object(),
+                bested_api=self.runtime.bested_api,
+                screenshot_material_api=self.runtime.screenshot_material_api,
+                pdf_material_api=self.runtime.pdf_material_api,
+            )
+        with self.assertRaisesRegex(
+            ValueError,
+            "review_storage 必须共享 runtime.storage 根目录",
+        ):
+            QuestionnaireSourceRuntime(
+                storage=self.runtime.storage,
+                review_storage=other_review_storage,
+                snapshot_api=self.runtime.snapshot_api,
+                snapshot_analysis_api=self.runtime.snapshot_analysis_api,
+                asset_review_api=self.runtime.asset_review_api,
+                bested_api=self.runtime.bested_api,
+                screenshot_material_api=self.runtime.screenshot_material_api,
+                pdf_material_api=self.runtime.pdf_material_api,
+            )
+        with self.assertRaisesRegex(TypeError, "review_storage"):
+            QuestionnaireSourceRuntime(
+                storage=self.runtime.storage,
+                review_storage=object(),
+                snapshot_api=self.runtime.snapshot_api,
+                snapshot_analysis_api=self.runtime.snapshot_analysis_api,
+                asset_review_api=self.runtime.asset_review_api,
+                bested_api=self.runtime.bested_api,
+                screenshot_material_api=self.runtime.screenshot_material_api,
+                pdf_material_api=self.runtime.pdf_material_api,
+            )
+        same_root_other_review_storage = FileQuestionnaireAssetReviewStorage(
+            self.runtime.storage.root,
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "共享 runtime.review_storage",
+        ):
+            QuestionnaireSourceRuntime(
+                storage=self.runtime.storage,
+                review_storage=same_root_other_review_storage,
+                snapshot_api=self.runtime.snapshot_api,
+                snapshot_analysis_api=self.runtime.snapshot_analysis_api,
+                asset_review_api=self.runtime.asset_review_api,
                 bested_api=self.runtime.bested_api,
                 screenshot_material_api=self.runtime.screenshot_material_api,
                 pdf_material_api=self.runtime.pdf_material_api,

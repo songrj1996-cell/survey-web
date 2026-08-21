@@ -303,6 +303,13 @@
     );
   }
 
+  function canSubmitSnapshotAssetReviewDecisions() {
+    return !!(
+      panelState.capabilities
+      && panelState.capabilities.asset_review_decisions === true
+    );
+  }
+
   function isSelectedForAnalysis(snapshotId) {
     return selectedSnapshotId() === snapshotId;
   }
@@ -354,6 +361,7 @@
       normalized[key] = payload[key];
     }
     normalized.snapshot_analysis_session = payload.snapshot_analysis_session === true;
+    normalized.asset_review_decisions = payload.asset_review_decisions === true;
     return normalized;
   }
 
@@ -664,11 +672,14 @@
         const metrics = el('div', 'qsrc-catalog__item-metrics', catalogMetrics(entry).join(' · ') || '仅保留安全摘要');
         row.append(top, metrics);
         if (canReviewSnapshotAssets(entry)) {
+          const writable = canSubmitSnapshotAssetReviewDecisions();
           const reviewActions = el('div', 'qsrc-catalog__item-actions');
           const reviewNote = el(
             'div',
             'qsrc-catalog__item-selection-note',
-            '只读预览素材安全摘要；缩略图需逐项手动加载，确认结果尚未保存。',
+            writable
+              ? '可查看素材安全摘要并逐项确认；缩略图仍需手动加载。'
+              : '只读预览素材安全摘要；缩略图需逐项手动加载，当前账号不能提交确认。',
           );
           const reviewButton = el(
             'button',
@@ -686,7 +697,10 @@
               if (!canReviewSnapshotAssets(entry)) {
                 throw new Error('素材审阅模块暂时不可用');
               }
-              review.openForSnapshot(entry.snapshot_id, { trigger: reviewButton });
+              review.openForSnapshot(entry.snapshot_id, {
+                trigger: reviewButton,
+                writable: canSubmitSnapshotAssetReviewDecisions(),
+              });
             } catch (error) {
               const message = error instanceof Error && error.message
                 ? error.message
@@ -1103,7 +1117,10 @@
         return;
       }
       panelState.capabilities = result.capabilities;
-      if (panelState.capabilities.asset_review_projection !== true) {
+      if (
+        panelState.capabilities.asset_review_projection !== true
+        || panelState.capabilities.asset_review_decisions !== true
+      ) {
         closeAssetReview();
       }
       renderCards();

@@ -20,6 +20,9 @@ from app.schemas.research_assets import (
     ContractModel,
     MediaType,
 )
+from app.schemas.questionnaire_asset_review_state import (
+    MAX_QUESTIONNAIRE_ASSET_REVIEW_EVENTS,
+)
 
 
 MAX_QUESTIONNAIRE_ASSET_THUMBNAIL_BYTES = 16 * 1024 * 1024
@@ -51,6 +54,62 @@ class QuestionnaireAssetPreviewStatus(str, Enum):
     UNAVAILABLE = "unavailable"
 
 
+class QuestionnaireAssetReviewDecision(str, Enum):
+    """One public review command; reset restores the snapshot binding."""
+
+    CONFIRMED = "confirmed"
+    REJECTED = "rejected"
+    RESET = "reset"
+
+
+class QuestionnaireAssetActiveReviewDecision(str, Enum):
+    """An effective persisted override; reset is represented by ``None``."""
+
+    CONFIRMED = "confirmed"
+    REJECTED = "rejected"
+
+
+class QuestionnaireAssetReviewDecisionRequest(_FrozenReviewDto):
+    """Strict optimistic command using only owner-bound opaque tokens."""
+
+    schema_version: Literal[1]
+    expected_revision: int = Field(
+        ge=0,
+        le=MAX_QUESTIONNAIRE_ASSET_REVIEW_EVENTS,
+    )
+    idempotency_key: QuestionnaireAssetToken
+    base_version_token: QuestionnaireAssetToken
+    reference_token: QuestionnaireAssetToken
+    asset_token: QuestionnaireAssetToken
+    decision: QuestionnaireAssetReviewDecision
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_schema_version_type(cls, value: object) -> object:
+        if type(value) is not int or value != 1:
+            raise ValueError("schema_version 必须是整数 1")
+        return value
+
+    @field_validator("expected_revision", mode="before")
+    @classmethod
+    def validate_expected_revision_type(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("expected_revision 必须是整数")
+        return value
+
+    @field_validator("decision", mode="before")
+    @classmethod
+    def validate_decision_type(cls, value: object) -> object:
+        if isinstance(value, QuestionnaireAssetReviewDecision):
+            return value
+        if type(value) is str:
+            try:
+                return QuestionnaireAssetReviewDecision(value)
+            except ValueError:
+                pass
+        raise ValueError("decision 必须是支持的审阅决定")
+
+
 class QuestionnaireAssetReviewItem(_FrozenReviewDto):
     """One safe reference projection with opaque local review tokens."""
 
@@ -60,6 +119,7 @@ class QuestionnaireAssetReviewItem(_FrozenReviewDto):
     context_label: str = Field(min_length=1, max_length=500)
     role: AssetRole
     binding_status: BindingStatus
+    active_review_decision: QuestionnaireAssetActiveReviewDecision | None
     binding_confidence: float = Field(ge=0.0, le=1.0)
     review_required: bool
     media_type: MediaType
@@ -85,6 +145,18 @@ class QuestionnaireAssetReviewItem(_FrozenReviewDto):
 
     @model_validator(mode="after")
     def validate_safe_projection(self) -> "QuestionnaireAssetReviewItem":
+        if (
+            self.active_review_decision
+            == QuestionnaireAssetActiveReviewDecision.CONFIRMED
+            and self.binding_status != BindingStatus.CONFIRMED
+        ):
+            raise ValueError("confirmed 审阅决定与 binding_status 不一致")
+        if (
+            self.active_review_decision
+            == QuestionnaireAssetActiveReviewDecision.REJECTED
+            and self.binding_status != BindingStatus.REJECTED
+        ):
+            raise ValueError("rejected 审阅决定与 binding_status 不一致")
         if self.review_required != (
             self.binding_status
             in {BindingStatus.PROPOSED, BindingStatus.NEEDS_REVIEW}
@@ -104,6 +176,11 @@ class QuestionnaireAssetReviewProjection(_FrozenReviewDto):
     """Review-safe projection that excludes raw provider and storage fields."""
 
     schema_version: Literal[1] = 1
+    review_revision: int = Field(
+        ge=0,
+        le=MAX_QUESTIONNAIRE_ASSET_REVIEW_EVENTS,
+    )
+    base_version_token: QuestionnaireAssetToken
     total_references: int = Field(ge=0, le=2000)
     review_required_references: int = Field(ge=0, le=2000)
     items: tuple[QuestionnaireAssetReviewItem, ...] = Field(max_length=2000)
@@ -116,6 +193,7 @@ class QuestionnaireAssetReviewProjection(_FrozenReviewDto):
         return value
 
     @field_validator(
+        "review_revision",
         "total_references",
         "review_required_references",
         mode="before",

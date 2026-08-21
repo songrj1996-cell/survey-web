@@ -27,6 +27,11 @@ EXPECTED_LOCAL_ROUTES = {
         "/api/questionnaire-sources/snapshots/{snapshot_id}/asset-review",
     ),
     (
+        "POST",
+        "/api/questionnaire-sources/snapshots/{snapshot_id}"
+        "/asset-review/decisions",
+    ),
+    (
         "GET",
         "/api/questionnaire-sources/snapshots/{snapshot_id}"
         "/asset-review/thumbnails/{asset_token}.png",
@@ -70,6 +75,9 @@ MAIN_PROBE = textwrap.dedent(
         ),
         "runtime_service_loaded": (
             "app.services.questionnaire_source_runtime" in sys.modules
+        ),
+        "review_storage_loaded": (
+            "app.storage.questionnaire_asset_reviews" in sys.modules
         ),
         "storage_root": str(storage_root.resolve()),
         "storage_root_exists": storage_root.exists(),
@@ -198,6 +206,7 @@ class QuestionnaireSourceRuntimeWiringTests(unittest.TestCase):
                 self.assertFalse(payload["runtime_bound"])
                 self.assertFalse(payload["runtime_router_loaded"])
                 self.assertFalse(payload["runtime_service_loaded"])
+                self.assertFalse(payload["review_storage_loaded"])
                 self.assertEqual(Path(payload["data_dir"]), data_dir.resolve())
                 self.assertTrue(payload["data_dir_exists"])
                 self.assertEqual(
@@ -223,7 +232,8 @@ class QuestionnaireSourceRuntimeWiringTests(unittest.TestCase):
         self.assertTrue(payload["runtime_bound"])
         self.assertTrue(payload["runtime_router_loaded"])
         self.assertTrue(payload["runtime_service_loaded"])
-        self.assertEqual(len(routes), 11)
+        self.assertTrue(payload["review_storage_loaded"])
+        self.assertEqual(len(routes), 12)
         self.assertEqual(len(routes), len(set(routes)))
         self.assertEqual(set(routes), EXPECTED_LOCAL_ROUTES)
         self.assertNotIn(

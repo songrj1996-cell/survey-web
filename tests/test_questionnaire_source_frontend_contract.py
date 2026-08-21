@@ -42,6 +42,10 @@ CAPABILITY_KEYS = {
     "pdf_material_upload",
     "asset_review_projection",
 }
+OPTIONAL_CAPABILITY_KEYS = {
+    "snapshot_analysis_session",
+    "asset_review_decisions",
+}
 
 SOURCE_CONTRACTS = {
     "snapshot_package_upload": {
@@ -471,6 +475,88 @@ class QuestionnaireSourceFrontendContractTests(unittest.TestCase):
             },
             POST_URLS,
         )
+
+    def test_asset_review_decision_capability_is_optional_and_boolean_safe(self):
+        capability_array = re.search(
+            r"\bconst\s+CAPABILITY_KEYS\s*=\s*\[(.*?)\];",
+            self.javascript,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(capability_array)
+        required_keys = set(re.findall(
+            r"['\"]([^'\"]+)['\"]",
+            capability_array.group(1),
+        ))
+        self.assertTrue(OPTIONAL_CAPABILITY_KEYS.isdisjoint(required_keys))
+
+        normalize = _function_body(self.javascript, "normalizeCapabilities")
+        self.assertIn(
+            "normalized.asset_review_decisions = "
+            "payload.asset_review_decisions === true",
+            normalize,
+        )
+        self.assertIn(
+            "normalized.snapshot_analysis_session = "
+            "payload.snapshot_analysis_session === true",
+            normalize,
+        )
+        self.assertNotRegex(
+            normalize,
+            r"typeof\s+payload\.asset_review_decisions\s*!==\s*"
+            r"['\"]boolean['\"]",
+        )
+
+    def test_asset_review_launch_uses_latest_projection_and_write_capabilities(self):
+        projection_gate = _function_body(
+            self.javascript,
+            "canReviewSnapshotAssets",
+        )
+        self.assertIn(
+            "panelState.capabilities.asset_review_projection === true",
+            projection_gate,
+        )
+        self.assertNotIn("asset_review_decisions", projection_gate)
+
+        write_gate = _function_body(
+            self.javascript,
+            "canSubmitSnapshotAssetReviewDecisions",
+        )
+        self.assertIn(
+            "panelState.capabilities.asset_review_decisions === true",
+            write_gate,
+        )
+        self.assertNotIn("asset_review_projection", write_gate)
+
+        render = _function_body(self.javascript, "renderCatalog")
+        module_ready = render.index("await loadAssetReviewModule()")
+        projection_recheck = render.index(
+            "if (!canReviewSnapshotAssets(entry))",
+            module_ready,
+        )
+        open_review = render.index(
+            "review.openForSnapshot(entry.snapshot_id, {",
+            projection_recheck,
+        )
+        latest_write_check = render.index(
+            "writable: canSubmitSnapshotAssetReviewDecisions()",
+            open_review,
+        )
+        self.assertLess(module_ready, projection_recheck)
+        self.assertLess(projection_recheck, open_review)
+        self.assertLess(open_review, latest_write_check)
+        self.assertNotIn("writable: writable", render[open_review:])
+
+        refresh = _function_body(self.javascript, "refresh")
+        capability_assignment = refresh.index(
+            "panelState.capabilities = result.capabilities",
+        )
+        revoke_check = refresh.index(
+            "panelState.capabilities.asset_review_decisions !== true",
+            capability_assignment,
+        )
+        close_review = refresh.index("closeAssetReview()", revoke_check)
+        self.assertLess(capability_assignment, revoke_check)
+        self.assertLess(revoke_check, close_review)
 
     def test_component_has_no_interview_storage_or_unsafe_global_patterns(self):
         forbidden = {

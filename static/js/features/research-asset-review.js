@@ -6,6 +6,15 @@
   const STYLE_URL = '/static/research-asset-review.css?v=1';
   const DRAWER_ID = 'qar-drawer';
   const HIDE_STATUSES = new Set([401, 403]);
+  const ACTIVE_DECISIONS = new Set([
+    'confirmed',
+    'rejected',
+  ]);
+  const DECISIONS = new Set([
+    'confirmed',
+    'rejected',
+    'reset',
+  ]);
   const MAX_THUMBNAIL_BYTES = 16 * 1024 * 1024;
   const MAX_CACHED_THUMBNAILS = 24;
   const MAX_CACHED_THUMBNAIL_BYTES = 64 * 1024 * 1024;
@@ -56,10 +65,14 @@
     requestSerial: 0,
     abortController: null,
     projection: null,
+    writable: false,
     errorMessage: '',
     notice: '',
     noticePhase: '',
     restoreFocusTarget: null,
+    decisionViews: Object.create(null),
+    decisionRequest: null,
+    uncertainDecisionCommands: Object.create(null),
     openSequence: 0,
     thumbnailStates: Object.create(null),
     activeThumbnailRequests: new Set(),
@@ -147,6 +160,12 @@
   function thumbnailEndpoint(snapshotId, assetToken) {
     return sameOriginUrl(
       `/api/questionnaire-sources/snapshots/${encodeURIComponent(snapshotId)}/asset-review/thumbnails/${encodeURIComponent(assetToken)}.png`,
+    ).toString();
+  }
+
+  function decisionEndpoint(snapshotId) {
+    return sameOriginUrl(
+      `/api/questionnaire-sources/snapshots/${encodeURIComponent(snapshotId)}/asset-review/decisions`,
     ).toString();
   }
 
@@ -246,6 +265,50 @@
     return !!root && root.hidden === false;
   }
 
+  function activeReviewDecisionValue(value) {
+    if (value === null) return null;
+    return typeof value === 'string' && ACTIVE_DECISIONS.has(value) ? value : null;
+  }
+
+  function effectiveDecision(item) {
+    if (!item) return '';
+    if (item.active_review_decision === 'confirmed') return 'confirmed';
+    if (item.active_review_decision === 'rejected') return 'rejected';
+    if (item.binding_status === 'confirmed') return 'confirmed';
+    if (item.binding_status === 'rejected') return 'rejected';
+    return '';
+  }
+
+  function decisionStatusLabel(item) {
+    if (item.active_review_decision === 'confirmed') return '已人工确认';
+    if (item.active_review_decision === 'rejected') return '已人工排除';
+    if (item.review_required) return '待人工复核';
+    if (item.binding_status === 'confirmed') return '已确认';
+    if (item.binding_status === 'rejected') return '已排除';
+    return '状态未知';
+  }
+
+  function isPendingReviewDecision(item) {
+    return !!(item && item.review_required && item.active_review_decision === null);
+  }
+
+  function sameDecisionTarget(command, item, decision) {
+    return !!(
+      command
+      && item
+      && command.snapshotId === state.snapshotId
+      && command.reference_token === item.reference_token
+      && command.asset_token === item.asset_token
+      && command.decision === decision
+    );
+  }
+
+  function generateHexToken() {
+    const bytes = new Uint8Array(32);
+    window.crypto.getRandomValues(bytes);
+    return Array.from(bytes, value => value.toString(16).padStart(2, '0')).join('');
+  }
+
   function resetThumbnailState(entry) {
     if (!entry) return;
     if (entry.controller) {
@@ -315,12 +378,49 @@
     state.thumbnailLru = [];
   }
 
+  function clearDecisionViews() {
+    state.decisionViews = Object.create(null);
+  }
+
+  function getUncertainDecisionCommand(snapshotId) {
+    if (typeof snapshotId !== 'string' || !snapshotId) return null;
+    return state.uncertainDecisionCommands[snapshotId] || null;
+  }
+
+  function setUncertainDecisionCommand(command) {
+    if (!command || typeof command.snapshotId !== 'string' || !command.snapshotId) return;
+    state.uncertainDecisionCommands[command.snapshotId] = command;
+  }
+
+  function clearUncertainDecisionCommand(snapshotId) {
+    if (typeof snapshotId !== 'string' || !snapshotId) return;
+    delete state.uncertainDecisionCommands[snapshotId];
+  }
+
+  function clearInFlightDecision(options) {
+    const settings = options || {};
+    const request = state.decisionRequest;
+    if (request && request.sent === true && request.command) {
+      setUncertainDecisionCommand(request.command);
+    }
+    if (request && request.controller) {
+      request.controller.abort();
+    }
+    state.decisionRequest = null;
+    if (settings.clearUncertain === true && request && request.command) {
+      clearUncertainDecisionCommand(request.command.snapshotId);
+    }
+  }
+
   function resetProjectionState() {
+    clearInFlightDecision();
     state.projection = null;
     state.snapshotId = '';
+    state.writable = false;
     state.errorMessage = '';
     state.notice = '';
     state.noticePhase = '';
+    clearDecisionViews();
     resetAllThumbnails();
     if (listNode) listNode.replaceChildren();
     if (emptyNode) emptyNode.hidden = true;
@@ -407,7 +507,7 @@
     const headerText = el('div', 'qar-header__text');
     titleNode = el('h3', 'qar-title', '问卷素材审阅');
     titleNode.id = 'qar-title';
-    subtitleNode = el('p', 'qar-subtitle', '仅预览，确认结果尚未保存');
+    subtitleNode = el('p', 'qar-subtitle', '仅预览素材安全摘要');
     headerText.append(titleNode, subtitleNode);
     closeButton = el('button', 'qar-close', '关闭');
     closeButton.type = 'button';
@@ -417,7 +517,7 @@
     header.append(headerText, closeButton);
 
     const banner = el('div', 'qar-banner');
-    const note = el('div', 'qar-note', '仅预览，确认结果尚未保存');
+    const note = el('div', 'qar-note', '仅展示安全摘要，缩略图需手动逐项加载');
     statusNode = el('div', 'qar-status');
     statusNode.setAttribute('aria-live', 'polite');
     banner.append(note, statusNode);
@@ -435,6 +535,7 @@
       openForSnapshot(state.snapshotId, {
         preserveRestoreFocus: true,
         preserveNotice: false,
+        writable: state.writable,
       });
     });
     toolbar.append(summaryNode, retryButton);
@@ -541,12 +642,19 @@
 
   function normalizeReviewItem(raw) {
     if (!isPlainObject(raw)) return null;
+    const hasActiveReviewDecision = Object.prototype.hasOwnProperty.call(
+      raw,
+      'active_review_decision',
+    );
     const referenceToken = boundedString(raw.reference_token, 64, 64);
     const assetToken = boundedString(raw.asset_token, 64, 64);
     const contextType = enumValue(raw.context_type, CONTEXT_TYPES);
     const contextLabel = boundedString(raw.context_label, 1, 500);
     const role = enumValue(raw.role, ROLES);
     const bindingStatus = enumValue(raw.binding_status, BINDING_STATUSES);
+    const activeReviewDecision = activeReviewDecisionValue(
+      hasActiveReviewDecision ? raw.active_review_decision : null,
+    );
     const bindingConfidence = normalizedConfidence(raw.binding_confidence);
     const reviewRequired = normalizedBool(raw.review_required);
     const mediaType = enumValue(raw.media_type, MEDIA_TYPES);
@@ -560,6 +668,11 @@
       || !contextLabel
       || !role
       || !bindingStatus
+      || !hasActiveReviewDecision
+      || (
+        raw.active_review_decision !== null
+        && activeReviewDecision === null
+      )
       || bindingConfidence === null
       || reviewRequired === null
       || !mediaType
@@ -567,6 +680,12 @@
       || !Array.isArray(raw.warning_codes)
       || raw.warning_codes.length > 64
     ) {
+      return null;
+    }
+    if (activeReviewDecision === 'confirmed' && bindingStatus !== 'confirmed') {
+      return null;
+    }
+    if (activeReviewDecision === 'rejected' && bindingStatus !== 'rejected') {
       return null;
     }
     if (reviewRequired !== (bindingStatus === 'proposed' || bindingStatus === 'needs_review')) {
@@ -589,6 +708,7 @@
       context_label: contextLabel,
       role,
       binding_status: bindingStatus,
+      active_review_decision: activeReviewDecision,
       binding_confidence: bindingConfidence,
       review_required: reviewRequired,
       media_type: mediaType,
@@ -600,18 +720,37 @@
   function normalizeProjection(payload) {
     if (!isPlainObject(payload)) return null;
     const schemaVersion = exactInt(payload.schema_version, 1, 1);
+    const reviewRevision = Object.prototype.hasOwnProperty.call(payload, 'review_revision')
+      ? exactInt(payload.review_revision, 0, 10000)
+      : null;
+    const baseVersionToken = Object.prototype.hasOwnProperty.call(payload, 'base_version_token')
+      ? boundedString(payload.base_version_token, 64, 64)
+      : null;
     const totalReferences = exactInt(payload.total_references, 0, 2000);
     const reviewRequiredReferences = exactInt(payload.review_required_references, 0, 2000);
-    if (schemaVersion !== 1 || totalReferences === null || reviewRequiredReferences === null || !Array.isArray(payload.items) || payload.items.length > 2000) {
+    if (
+      schemaVersion !== 1
+      || reviewRevision === null
+      || !baseVersionToken
+      || !TOKEN_PATTERN.test(baseVersionToken)
+      || totalReferences === null
+      || reviewRequiredReferences === null
+      || !Array.isArray(payload.items)
+      || payload.items.length > 2000
+    ) {
       return null;
     }
     const items = payload.items.map(normalizeReviewItem);
     if (items.some(item => item === null)) return null;
     if (items.length !== totalReferences) return null;
+    const referenceTokens = items.map(item => item.reference_token);
+    if (new Set(referenceTokens).size !== referenceTokens.length) return null;
     const reviewCount = items.filter(item => item.review_required).length;
     if (reviewCount !== reviewRequiredReferences) return null;
     return {
       schema_version: 1,
+      review_revision: reviewRevision,
+      base_version_token: baseVersionToken,
       total_references: totalReferences,
       review_required_references: reviewRequiredReferences,
       items,
@@ -621,7 +760,9 @@
   function renderStatus() {
     if (!statusNode || !noticeNode || !summaryNode || !retryButton || !emptyNode || !titleNode || !subtitleNode) return;
     titleNode.textContent = `问卷素材审阅 · ${activeSnapshotLabel()}`;
-    subtitleNode.textContent = '仅预览，确认结果尚未保存';
+    subtitleNode.textContent = state.writable
+      ? '可逐项确认、拒绝或恢复待复核'
+      : '仅预览素材安全摘要，当前账号不能提交确认';
     summaryNode.textContent = summaryText();
     statusNode.className = 'qar-status';
     noticeNode.className = 'qar-notice';
@@ -652,8 +793,18 @@
       retryButton.disabled = false;
       return;
     }
+    if (state.decisionRequest) {
+      statusNode.textContent = '正在提交当前素材决定…';
+      statusNode.classList.add('is-loading');
+      retryButton.disabled = true;
+      return;
+    }
     statusNode.textContent = state.projection
-      ? '只读预览已更新，缩略图需要逐项手动加载'
+      ? (
+        state.writable
+          ? '安全摘要已更新，可逐项确认，缩略图仍需手动加载'
+          : '只读预览已更新，缩略图需要逐项手动加载'
+      )
       : '打开后将按需读取当前快照的素材安全摘要';
     if (state.phase === 'ready') statusNode.classList.add('is-ready');
     retryButton.disabled = !state.snapshotId;
@@ -755,10 +906,260 @@
     restoreThumbnailFocus(assetToken, focusState);
   }
 
+  function getDecisionViews(referenceToken) {
+    if (!state.decisionViews[referenceToken]) {
+      state.decisionViews[referenceToken] = [];
+    }
+    return state.decisionViews[referenceToken];
+  }
+
+  function registerDecisionView(referenceToken, view) {
+    const views = getDecisionViews(referenceToken);
+    views.push(view);
+  }
+
+  function rememberDecisionFocus(views) {
+    const active = document.activeElement;
+    if (!active) return { shouldRestore: false };
+    for (let index = 0; index < views.length; index += 1) {
+      const view = views[index];
+      if (!view || !view.wrap || !view.wrap.contains(active)) continue;
+      if (view.buttons.confirm === active) return { shouldRestore: true, index, action: 'confirmed' };
+      if (view.buttons.reject === active) return { shouldRestore: true, index, action: 'rejected' };
+      if (view.buttons.reset === active) return { shouldRestore: true, index, action: 'reset' };
+      return { shouldRestore: true, index, action: '' };
+    }
+    return { shouldRestore: false };
+  }
+
+  function restoreDecisionFocus(referenceToken, focusState) {
+    if (!focusState || !focusState.shouldRestore) return;
+    const views = getDecisionViews(referenceToken);
+    const view = views[focusState.index] || views[0];
+    if (!view) return;
+    const target = focusState.action
+      ? (
+        focusState.action === 'confirmed'
+          ? view.buttons.confirm
+          : focusState.action === 'rejected'
+            ? view.buttons.reject
+            : view.buttons.reset
+      )
+      : null;
+    if (target && !target.disabled && typeof target.focus === 'function') {
+      target.focus();
+      if (document.activeElement === target) return;
+    }
+    if (typeof view.wrap.focus === 'function') {
+      view.wrap.focus();
+    }
+  }
+
+  function rerenderDecisionViews(referenceToken) {
+    const views = getDecisionViews(referenceToken).filter(
+      view => view && view.wrap && view.wrap.isConnected,
+    );
+    state.decisionViews[referenceToken] = views;
+    if (!views.length || !state.projection) return;
+    const focusState = rememberDecisionFocus(views);
+    const nextViews = [];
+    for (const view of views) {
+      const currentWrap = view.wrap;
+      if (!currentWrap.isConnected) continue;
+      const nextWrap = renderDecisionActions(view.item, { registerView: false });
+      currentWrap.replaceWith(nextWrap);
+      nextViews.push({
+        wrap: nextWrap,
+        buttons: nextWrap._qarButtons || view.buttons,
+        item: view.item,
+      });
+    }
+    state.decisionViews[referenceToken] = nextViews;
+    restoreDecisionFocus(referenceToken, focusState);
+  }
+
+  function rerenderAllDecisionViews() {
+    const referenceTokens = Object.keys(state.decisionViews);
+    for (const referenceToken of referenceTokens) {
+      rerenderDecisionViews(referenceToken);
+    }
+  }
+
+  function decisionButtonLabel(item, decision) {
+    const pendingRetry = getUncertainDecisionCommand(state.snapshotId);
+    if (sameDecisionTarget(pendingRetry, item, decision)) {
+      if (decision === 'confirmed') return '重试确认';
+      if (decision === 'rejected') return '重试拒绝';
+      return '重试恢复待复核';
+    }
+    if (decision === 'confirmed') return '确认';
+    if (decision === 'rejected') return '拒绝';
+    return '恢复待复核';
+  }
+
+  function decisionButtonPressed(item, decision) {
+    if (decision === 'reset') return isPendingReviewDecision(item);
+    return effectiveDecision(item) === decision;
+  }
+
+  function decisionStatusMessage(item) {
+    if (state.decisionRequest && sameDecisionTarget(state.decisionRequest.command, item, state.decisionRequest.command.decision)) {
+      return '正在提交当前决定…';
+    }
+    const pendingRetry = getUncertainDecisionCommand(state.snapshotId);
+    if (sameDecisionTarget(pendingRetry, item, pendingRetry && pendingRetry.decision)) {
+      return '上次请求结果未确认，可重试同一操作';
+    }
+    return decisionStatusLabel(item);
+  }
+
+  function buildDecisionCommand(item, decision) {
+    if (!state.projection) return null;
+    try {
+      const command = {
+        snapshotId: state.snapshotId,
+        schema_version: 1,
+        expected_revision: state.projection.review_revision,
+        idempotency_key: generateHexToken(),
+        base_version_token: state.projection.base_version_token,
+        reference_token: item.reference_token,
+        asset_token: item.asset_token,
+        decision,
+      };
+      const serializedBody = JSON.stringify(commandPayload(command));
+      return Object.freeze({
+        ...command,
+        serialized_body: serializedBody,
+      });
+    } catch {
+      showToast('无法创建审阅决定请求，请刷新后重试', 'error');
+      return null;
+    }
+  }
+
+  function commandPayload(command) {
+    return {
+      schema_version: command.schema_version,
+      expected_revision: command.expected_revision,
+      idempotency_key: command.idempotency_key,
+      base_version_token: command.base_version_token,
+      reference_token: command.reference_token,
+      asset_token: command.asset_token,
+      decision: command.decision,
+    };
+  }
+
+  function isSuccessfulDecisionProjection(projection, command) {
+    if (!projection || !command) return false;
+    if (projection.base_version_token !== command.base_version_token) {
+      return false;
+    }
+    if (!Number.isInteger(projection.review_revision)) {
+      return false;
+    }
+    if (projection.review_revision < command.expected_revision + 1) {
+      return false;
+    }
+    return projection.items.some(item => (
+      item.reference_token === command.reference_token
+      && item.asset_token === command.asset_token
+    ));
+  }
+
+  function projectionHasCommandPair(projection, command) {
+    if (!projection || !command) return false;
+    return projection.items.some(item => (
+      item.reference_token === command.reference_token
+      && item.asset_token === command.asset_token
+    ));
+  }
+
+  function reconcileUncertainDecisionCommand(snapshotId, projection) {
+    const pendingCommand = getUncertainDecisionCommand(snapshotId);
+    if (!pendingCommand) return { command: null, phase: '' };
+    if (!projection || projection.base_version_token !== pendingCommand.base_version_token) {
+      clearUncertainDecisionCommand(snapshotId);
+      return { command: null, phase: 'rebase' };
+    }
+    if (!projectionHasCommandPair(projection, pendingCommand)) {
+      return { command: pendingCommand, phase: 'missing_pair' };
+    }
+    return { command: pendingCommand, phase: 'retry' };
+  }
+
+  async function refreshAfterConflict(focusState) {
+    if (!state.snapshotId) return;
+    const snapshotId = state.snapshotId;
+    const writable = state.writable;
+    if (state.decisionRequest && state.decisionRequest.command && state.decisionRequest.command.snapshotId === snapshotId) {
+      state.decisionRequest.sent = false;
+    }
+    clearUncertainDecisionCommand(snapshotId);
+    setNotice('另一页面已更新当前快照，请以最新结果为准', 'conflict');
+    await openForSnapshot(snapshotId, {
+      preserveRestoreFocus: true,
+      preserveNotice: true,
+      writable,
+      focusState,
+    });
+  }
+
+  function renderDecisionActions(item, options) {
+    const settings = options || {};
+    const wrap = el('div', 'qar-decision');
+    wrap.tabIndex = -1;
+    wrap.setAttribute('aria-label', `${item.context_label} 素材审阅操作`);
+    const actions = el('div', 'qar-decision__actions');
+    const buttons = {};
+    const busy = !!state.decisionRequest;
+    const pendingRetry = getUncertainDecisionCommand(state.snapshotId);
+    const disabled = !state.writable || !state.projection || busy;
+    for (const decision of ['confirmed', 'rejected', 'reset']) {
+      const button = el(
+        'button',
+        `qar-btn qar-decision__button qar-decision__button--${decision === 'reset' ? 'reset' : decision}`,
+        decisionButtonLabel(item, decision),
+      );
+      button.type = 'button';
+      button.disabled = disabled || (
+        !!pendingRetry && !sameDecisionTarget(pendingRetry, item, decision)
+      );
+      button.setAttribute('aria-pressed', decisionButtonPressed(item, decision) ? 'true' : 'false');
+      button.setAttribute('aria-busy', busy ? 'true' : 'false');
+      button.addEventListener('click', () => submitDecision(item, decision));
+      actions.appendChild(button);
+      if (decision === 'confirmed') buttons.confirm = button;
+      else if (decision === 'rejected') buttons.reject = button;
+      else buttons.reset = button;
+    }
+    const status = el('div', 'qar-decision__status', decisionStatusMessage(item));
+    if (!state.writable) {
+      status.classList.add('is-readonly');
+    } else if (state.decisionRequest && sameDecisionTarget(state.decisionRequest.command, item, state.decisionRequest.command.decision)) {
+      status.classList.add('is-busy');
+    } else {
+      const pendingRetry = getUncertainDecisionCommand(state.snapshotId);
+      if (sameDecisionTarget(pendingRetry, item, pendingRetry && pendingRetry.decision)) {
+        status.classList.add('is-conflict');
+      }
+    }
+    wrap.append(actions, status);
+    wrap._qarButtons = buttons;
+    if (settings.registerView !== false) {
+      registerDecisionView(item.reference_token, {
+        wrap,
+        buttons,
+        item,
+      });
+    }
+    return wrap;
+  }
+
   function renderItems() {
     if (!listNode || !emptyNode) return;
     listNode.replaceChildren();
     state.thumbnailViews = Object.create(null);
+    clearDecisionViews();
     const projection = state.projection;
     if (!projection || !projection.items.length) {
       emptyNode.hidden = false;
@@ -781,8 +1182,11 @@
       const badge = el(
         'span',
         item.review_required ? 'qar-badge is-review' : 'qar-badge',
-        item.review_required ? '待人工复核' : '已确认',
+        decisionStatusLabel(item),
       );
+      if (item.active_review_decision === 'rejected' || item.binding_status === 'rejected') {
+        badge.classList.add('is-rejected');
+      }
       top.append(titleWrap, badge);
 
       const warningWrap = el('div', 'qar-item__warnings');
@@ -794,7 +1198,7 @@
         warningWrap.appendChild(el('span', 'qar-pill is-neutral', '未返回额外警告'));
       }
 
-      content.append(top, warningWrap);
+      content.append(top, warningWrap, renderDecisionActions(item));
       row.append(thumb, content);
       fragment.appendChild(row);
     }
@@ -845,6 +1249,168 @@
     return normalized;
   }
 
+  async function postDecision(command, signal) {
+    const response = await fetch(decisionEndpoint(command.snapshotId), {
+      method: 'POST',
+      signal,
+      cache: 'no-store',
+      credentials: 'same-origin',
+      redirect: 'error',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: command.serialized_body,
+    });
+    if (HIDE_STATUSES.has(response.status)) {
+      const hiddenError = new Error('当前账号已切换为只读，请刷新后继续查看');
+      hiddenError.code = 'readonly';
+      throw hiddenError;
+    }
+    if (!response.ok) {
+      const fallback = response.status === 408
+        ? '审阅决定提交超时，请重试'
+        : response.status === 409
+          ? '当前快照已被其他页面更新'
+          : response.status === 422
+            ? '当前审阅决定被安全策略阻止'
+            : response.status === 429
+              ? '已有另一条审阅决定正在处理，请稍后重试'
+              : response.status >= 500
+                ? '审阅决定结果暂未确认，请重试同一操作'
+              : response.status === 504
+                ? '审阅决定处理超时，结果暂未确认'
+                : '审阅决定暂时不可用';
+      const error = new Error(await responseErrorMessage(response, fallback));
+      error.code = response.status >= 500 ? 'uncertain' : String(response.status);
+      throw error;
+    }
+    let payload = null;
+    try {
+      payload = await response.json();
+    } catch {
+      const error = new Error('审阅决定返回结果无法识别');
+      error.code = 'uncertain';
+      throw error;
+    }
+    const normalized = normalizeProjection(payload);
+    if (!normalized) {
+      const error = new Error('审阅决定返回结果无法识别');
+      error.code = 'uncertain';
+      throw error;
+    }
+    return normalized;
+  }
+
+  async function submitDecision(item, decision) {
+    if (!state.snapshotId || !state.projection || state.writable !== true) return;
+    if (!DECISIONS.has(decision)) return;
+    if (state.decisionRequest) {
+      rerenderDecisionViews(item.reference_token);
+      return;
+    }
+    const pendingRetry = getUncertainDecisionCommand(state.snapshotId);
+    if (
+      pendingRetry
+      && !sameDecisionTarget(pendingRetry, item, decision)
+    ) {
+      showToast('上次审阅结果未确认，请先重试同一操作', 'error');
+      rerenderDecisionViews(item.reference_token);
+      return;
+    }
+
+    const command = sameDecisionTarget(pendingRetry, item, decision)
+      ? pendingRetry
+      : buildDecisionCommand(item, decision);
+    if (!command) return;
+    const wasUncertainRetry = command === pendingRetry;
+    const requestSerial = state.requestSerial;
+    const controller = new AbortController();
+    const focusState = {
+      shouldRestore: true,
+      index: 0,
+      referenceToken: item.reference_token,
+      action: decision,
+    };
+    state.decisionRequest = {
+      controller,
+      command,
+      sent: true,
+      focusState,
+    };
+    setNotice('', '');
+    renderStatus();
+    rerenderAllDecisionViews();
+    try {
+      const projection = await postDecision(command, controller.signal);
+      if (state.requestSerial !== requestSerial || controller.signal.aborted || !hasOpenDrawer()) {
+        return;
+      }
+      if (!isSuccessfulDecisionProjection(projection, command)) {
+        const error = new Error('审阅决定返回结果无法识别');
+        error.code = 'uncertain';
+        throw error;
+      }
+      clearUncertainDecisionCommand(command.snapshotId);
+      state.projection = projection;
+      setPhase(projection.items.length ? 'ready' : 'empty', '');
+      if (projection.review_required_references > 0) {
+        setNotice('已按服务端最新结果更新，可继续逐项复核', 'review');
+      } else {
+        setNotice('素材决定已保存并同步到最新快照', 'info');
+      }
+      render();
+      restoreDecisionFocus(item.reference_token, focusState);
+    } catch (error) {
+      if (controller.signal.aborted || state.requestSerial !== requestSerial || !hasOpenDrawer()) {
+        return;
+      }
+      const code = error && typeof error === 'object' ? error.code : '';
+      const message = error instanceof Error && error.message
+        ? error.message
+        : '审阅决定暂时不可用';
+      if (code === 'readonly') {
+        if (wasUncertainRetry) {
+          setUncertainDecisionCommand(command);
+        }
+        state.writable = false;
+        setNotice(message, 'abort');
+        render();
+        rerenderAllDecisionViews();
+        return;
+      }
+      if (code === '409') {
+        clearUncertainDecisionCommand(command.snapshotId);
+        await refreshAfterConflict(focusState);
+        return;
+      }
+      if (
+        code === '504'
+        || code === 'uncertain'
+        || error instanceof TypeError
+      ) {
+        setUncertainDecisionCommand(command);
+        setNotice('当前决定结果未确认，请重试同一操作确认最终状态', 'conflict');
+      } else {
+        if (wasUncertainRetry) {
+          setUncertainDecisionCommand(command);
+          setNotice('当前决定仍未确认，请继续重试同一操作', 'conflict');
+        } else {
+          clearUncertainDecisionCommand(command.snapshotId);
+          setNotice(message, 'abort');
+        }
+      }
+      renderStatus();
+      rerenderAllDecisionViews();
+    } finally {
+      if (state.decisionRequest && state.decisionRequest.controller === controller) {
+        state.decisionRequest = null;
+        renderStatus();
+        rerenderAllDecisionViews();
+        restoreDecisionFocus(focusState.referenceToken, focusState);
+      }
+    }
+  }
+
   async function loadThumbnail(item) {
     if (!state.snapshotId || !state.projection) return;
     const serialAtStart = state.requestSerial;
@@ -872,7 +1438,7 @@
     rerenderThumbnailViews(item.asset_token);
 
     const controller = new AbortController();
-    const requestKey = Symbol(item.asset_token);
+    const requestKey = Symbol();
     state.activeThumbnailRequests.add(requestKey);
     thumbState.controller = controller;
     try {
@@ -952,16 +1518,34 @@
     openDrawer(options || {});
     if (!(options && options.preserveNotice)) setNotice('', '');
 
+    const writable = !!(options && options.writable === true);
+    const previousWritable = state.writable;
     const previousSnapshot = state.snapshotId;
     state.requestSerial += 1;
     const requestSerial = state.requestSerial;
     clearInFlightProjection();
+    clearInFlightDecision();
     resetAllThumbnails();
     state.snapshotId = normalized;
+    state.writable = writable;
     state.projection = null;
     setPhase('loading', '');
     if (previousSnapshot && previousSnapshot !== normalized) {
       setNotice('已切换到新的快照请求，旧结果会被忽略', 'stale');
+    } else if (previousSnapshot === normalized && writable !== previousWritable) {
+      setNotice(
+        writable
+          ? '当前快照已切换到可写审阅模式'
+          : '当前快照已切换到只读预览模式',
+        'stale',
+      );
+    } else if (getUncertainDecisionCommand(normalized)) {
+      setNotice(
+        writable
+          ? '上次审阅结果未确认，请原样重试同一操作'
+          : '上次审阅结果未确认；当前为只读模式，请保留原命令待可写时重试',
+        'conflict',
+      );
     }
     render();
 
@@ -970,12 +1554,35 @@
     try {
       const payload = await loadProjection(normalized, abortController.signal);
       if (state.requestSerial !== requestSerial || abortController.signal.aborted || !hasOpenDrawer()) return;
+      const preserveNotice = !!(options && options.preserveNotice);
       state.projection = payload;
       setPhase(payload.items.length ? 'ready' : 'empty', '');
-      if (payload.review_required_references > 0) {
-        setNotice('当前只展示安全摘要；如需确认绑定，请结合后续主流程人工核对', 'review');
+      const reconciliation = reconcileUncertainDecisionCommand(state.snapshotId, payload);
+      if (reconciliation.phase === 'rebase') {
+        setNotice('快照版本已变化，请重新审阅', 'conflict');
+      } else if (reconciliation.phase === 'missing_pair') {
+        state.projection = null;
+        setPhase('error', '待重试的素材引用暂未恢复，请重新读取当前快照');
+        setNotice('已保留原重试命令；仅当同版本素材引用恢复后才能继续提交', 'conflict');
+      } else if (reconciliation.command) {
+        setNotice(
+          state.writable
+            ? '上次审阅结果未确认，请原样重试同一操作'
+            : '上次审阅结果未确认；当前为只读模式，请保留原命令待可写时重试',
+          'conflict',
+        );
+      } else if (payload.review_required_references > 0 && !(preserveNotice && state.notice)) {
+        setNotice(
+          state.writable
+            ? '请逐项确认、拒绝或恢复待复核；结果以服务端返回为准'
+            : '当前只展示安全摘要；如需确认绑定，请使用具备权限的账号复核',
+          'review',
+        );
       }
       render();
+      if (options && options.focusState && options.focusState.referenceToken) {
+        restoreDecisionFocus(options.focusState.referenceToken, options.focusState);
+      }
     } catch (error) {
       if (abortController.signal.aborted || state.requestSerial !== requestSerial) return;
       resetAllThumbnails();

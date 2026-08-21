@@ -166,6 +166,10 @@
   color: var(--accent-2);
 }
 
+.qar-notice.is-conflict {
+  color: var(--amber);
+}
+
 .qar-toolbar {
   align-items: center;
   margin-top: 12px;
@@ -306,10 +310,72 @@
   color: var(--amber);
 }
 
+.qar-badge.is-rejected {
+  background: color-mix(in srgb, var(--red) 12%, transparent);
+  color: var(--red);
+}
+
 .qar-item__warnings {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+}
+
+.qar-decision {
+  display: grid;
+  gap: 8px;
+}
+
+.qar-decision:focus-visible {
+  outline: 2px solid var(--accent-2);
+  outline-offset: 3px;
+  border-radius: 12px;
+}
+
+.qar-decision__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.qar-decision__button[aria-pressed="true"] {
+  border-color: var(--border-act);
+  background: color-mix(in srgb, var(--accent-soft) 22%, var(--surface));
+  color: var(--text);
+}
+
+.qar-decision__button[aria-busy="true"] {
+  cursor: progress;
+}
+
+.qar-decision__button--confirmed[aria-pressed="true"] {
+  border-color: color-mix(in srgb, var(--green) 44%, var(--border-act));
+  background: color-mix(in srgb, var(--green) 14%, var(--surface));
+  color: var(--green);
+}
+
+.qar-decision__button--rejected[aria-pressed="true"] {
+  border-color: color-mix(in srgb, var(--red) 46%, var(--border-act));
+  background: color-mix(in srgb, var(--red) 12%, var(--surface));
+  color: var(--red);
+}
+
+.qar-decision__status {
+  color: var(--text-3);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.qar-decision__status.is-busy {
+  color: var(--accent-2);
+}
+
+.qar-decision__status.is-conflict {
+  color: var(--amber);
+}
+
+.qar-decision__status.is-readonly {
+  color: var(--text-2);
 }
 
 .qar-pill {
@@ -355,6 +421,11 @@
   .qar-btn,
   .qar-thumb {
     width: 100%;
+  }
+
+  .qar-decision__actions {
+    display: grid;
+    grid-template-columns: 1fr;
   }
 
   .qar-thumb {

@@ -1,8 +1,9 @@
-"""Owner-scoped, review-safe projections for questionnaire assets.
+"""Owner-scoped projections and review decisions for questionnaire assets.
 
-The service loads and validates a complete snapshot package inside a
-worker thread.  Public DTOs deliberately expose neither storage/provider
-locators nor raw domain identifiers.  Thumbnail generation is in-memory only.
+The service loads one actual persisted ZIP identity and its append-only review
+sidecar inside a worker thread.  Public DTOs deliberately expose neither ZIP
+identity, storage/provider locators, raw domain identifiers, nor event history.
+Thumbnail generation is in-memory only.
 """
 
 from __future__ import annotations
@@ -23,10 +24,19 @@ from app.schemas.questionnaire import (
     QuestionnaireSourceMode,
 )
 from app.schemas.questionnaire_asset_review import (
+    QuestionnaireAssetActiveReviewDecision,
     QuestionnaireAssetPreviewStatus,
+    QuestionnaireAssetReviewDecisionRequest,
     QuestionnaireAssetReviewItem,
     QuestionnaireAssetReviewProjection,
     QuestionnaireAssetThumbnailResult,
+)
+from app.schemas.questionnaire_asset_review_state import (
+    MAX_QUESTIONNAIRE_ASSET_REVIEW_EVENTS,
+    QuestionnaireAssetReviewCommand,
+    QuestionnaireAssetReviewDecision,
+    QuestionnaireAssetReviewEvent,
+    QuestionnaireAssetReviewState,
 )
 from app.schemas.research_assets import (
     AccessStatus,
@@ -47,9 +57,17 @@ from app.services.research_image_preprocessing import (
 from app.storage.research_assets import (
     ResearchAssetBundle,
     ResearchSnapshotCatalogStorage,
+    ResearchSnapshotIdentityStorage,
+    SNAPSHOT_PACKAGE_MAX_ARCHIVE_BYTES,
     SnapshotCatalogEntry,
     SnapshotCatalogPage,
     SnapshotPackage,
+    StoredSnapshotPackage,
+)
+from app.storage.questionnaire_asset_reviews import (
+    QuestionnaireAssetReviewConflictError as ReviewStorageConflictError,
+    QuestionnaireAssetReviewStateStorage,
+    QuestionnaireAssetReviewStorageError,
 )
 
 
@@ -59,6 +77,7 @@ _MAX_PUBLIC_IDENTIFIER_BYTES = 4096
 _TOKEN_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _WARNING_CODE_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
 _TOKEN_ROOT_DOMAIN = b"questionnaire-asset-review-token:v1"
+_REVIEWER_TOKEN_DOMAIN = b"questionnaire-asset-review-reviewer-token:v1"
 _NESTED_CONTEXT_QUESTION_MAX_CHARS = 249
 _NESTED_CONTEXT_DETAIL_MAX_CHARS = 248
 _TEXT_SCAN_BUDGET_MULTIPLIER = 8
@@ -93,6 +112,34 @@ class QuestionnaireAssetReviewNotFoundError(QuestionnaireAssetReviewApiError):
     """The owner-scoped snapshot or previewable image does not exist."""
 
     _safe_message = "问卷素材审阅资源不存在"
+
+
+class QuestionnaireAssetReviewConflictError(QuestionnaireAssetReviewApiError):
+    """A safe optimistic-write conflict."""
+
+    _safe_message = "问卷素材审阅状态已变化"
+
+
+class QuestionnaireAssetReviewBaseVersionConflictError(
+    QuestionnaireAssetReviewConflictError
+):
+    """The client command targets a different persisted ZIP identity."""
+
+    _safe_message = "问卷素材版本已变化"
+
+
+class QuestionnaireAssetReviewRevisionConflictError(
+    QuestionnaireAssetReviewConflictError
+):
+    """The sidecar revision changed before this command was appended."""
+
+
+class QuestionnaireAssetReviewIdempotencyConflictError(
+    QuestionnaireAssetReviewConflictError
+):
+    """An idempotency key is already bound to a different command."""
+
+    _safe_message = "问卷素材审阅幂等键已被使用"
 
 
 class QuestionnaireAssetReviewInternalError(QuestionnaireAssetReviewApiError):
@@ -181,28 +228,67 @@ def _reference_token(
     )
 
 
-def _load_validated_package(
-    storage: ResearchSnapshotCatalogStorage,
+def _base_version_token(
     owner_ref: str,
     snapshot_id: str,
-) -> SnapshotPackage:
-    _require_catalog_match(storage, owner_ref, snapshot_id)
+    stored_package: StoredSnapshotPackage,
+) -> str:
+    return _opaque_token(
+        b"base-version",
+        owner_ref=owner_ref,
+        snapshot_id=snapshot_id,
+        raw_identifier=(
+            f"{stored_package.package_sha256}:"
+            f"{stored_package.archive_size_bytes}"
+        ),
+    )
+
+
+def _reviewer_token(owner_ref: str) -> str:
+    encoded = owner_ref.encode("utf-8")
+    digest = hashlib.sha256()
+    digest.update(_REVIEWER_TOKEN_DOMAIN)
+    digest.update(len(encoded).to_bytes(8, "big"))
+    digest.update(encoded)
+    return digest.hexdigest()
+
+
+def _load_validated_package(
+    catalog_storage: ResearchSnapshotCatalogStorage,
+    identity_storage: ResearchSnapshotIdentityStorage,
+    owner_ref: str,
+    snapshot_id: str,
+) -> StoredSnapshotPackage:
+    _require_catalog_match(catalog_storage, owner_ref, snapshot_id)
     try:
-        loaded = storage.load_snapshot_package(owner_ref, snapshot_id)
+        loaded = identity_storage.load_snapshot_package_with_identity(
+            owner_ref,
+            snapshot_id,
+        )
     except Exception:
         raise QuestionnaireAssetReviewInternalError() from None
     if loaded is None:
         raise QuestionnaireAssetReviewInternalError()
-    if not isinstance(loaded, SnapshotPackage):
+    if not isinstance(loaded, StoredSnapshotPackage):
         raise QuestionnaireAssetReviewInternalError()
 
     try:
-        if not isinstance(loaded.bundle, ResearchAssetBundle):
+        if (
+            type(loaded.package_sha256) is not str
+            or _TOKEN_PATTERN.fullmatch(loaded.package_sha256) is None
+            or type(loaded.archive_size_bytes) is not int
+            or loaded.archive_size_bytes < 1
+            or loaded.archive_size_bytes > SNAPSHOT_PACKAGE_MAX_ARCHIVE_BYTES
+            or not isinstance(loaded.package, SnapshotPackage)
+        ):
             raise QuestionnaireAssetReviewInternalError()
-        if type(loaded.media) is not dict:
+        package = loaded.package
+        if not isinstance(package.bundle, ResearchAssetBundle):
             raise QuestionnaireAssetReviewInternalError()
-        snapshot = loaded.bundle.snapshot
-        collection = loaded.bundle.collection
+        if type(package.media) is not dict:
+            raise QuestionnaireAssetReviewInternalError()
+        snapshot = package.bundle.snapshot
+        collection = package.bundle.collection
         if (
             not isinstance(snapshot, QuestionnaireSnapshot)
             or not isinstance(collection, ResearchAssetCollection)
@@ -335,6 +421,122 @@ def _tokenized_assets(
         by_token[token] = asset
         by_id[asset.asset_id] = token
     return by_token, by_id
+
+
+@dataclass(frozen=True, slots=True)
+class _ReviewReferenceBinding:
+    reference: AssetReference
+    asset: ResearchAsset
+    reference_token: str
+    asset_token: str
+
+
+def _reference_bindings(
+    package: SnapshotPackage,
+    *,
+    owner_ref: str,
+    snapshot_id: str,
+) -> tuple[
+    tuple[_ReviewReferenceBinding, ...],
+    dict[str, _ReviewReferenceBinding],
+]:
+    assets_by_token, asset_tokens_by_id = _tokenized_assets(
+        package,
+        owner_ref=owner_ref,
+        snapshot_id=snapshot_id,
+    )
+    assets_by_id = {
+        asset.asset_id: asset for asset in package.bundle.collection.assets
+    }
+    token_identity: dict[str, str] = {}
+    bindings: list[_ReviewReferenceBinding] = []
+    by_reference_token: dict[str, _ReviewReferenceBinding] = {}
+    for reference in package.bundle.collection.references:
+        asset = assets_by_id.get(reference.asset_id)
+        asset_token = asset_tokens_by_id.get(reference.asset_id)
+        if asset is None or asset_token is None:
+            raise QuestionnaireAssetReviewInternalError()
+        reference_token = _reference_token(
+            owner_ref,
+            snapshot_id,
+            reference.reference_id,
+        )
+        if reference_token in assets_by_token:
+            raise QuestionnaireAssetReviewInternalError()
+        prior_identity = token_identity.get(reference_token)
+        if prior_identity is not None:
+            if prior_identity != reference.reference_id:
+                raise QuestionnaireAssetReviewInternalError()
+            if reference_token in by_reference_token:
+                raise QuestionnaireAssetReviewInternalError()
+        token_identity[reference_token] = reference.reference_id
+        binding = _ReviewReferenceBinding(
+            reference=reference,
+            asset=asset,
+            reference_token=reference_token,
+            asset_token=asset_token,
+        )
+        bindings.append(binding)
+        by_reference_token[reference_token] = binding
+    return tuple(bindings), by_reference_token
+
+
+def _load_review_state(
+    review_storage: QuestionnaireAssetReviewStateStorage,
+    owner_ref: str,
+    snapshot_id: str,
+    stored_package: StoredSnapshotPackage,
+) -> QuestionnaireAssetReviewState:
+    try:
+        state = review_storage.load_state(
+            owner_ref,
+            snapshot_id,
+            base_package_sha256=stored_package.package_sha256,
+            base_package_size_bytes=stored_package.archive_size_bytes,
+        )
+    except QuestionnaireAssetReviewStorageError:
+        raise QuestionnaireAssetReviewInternalError() from None
+    except Exception:
+        raise QuestionnaireAssetReviewInternalError() from None
+    if (
+        not isinstance(state, QuestionnaireAssetReviewState)
+        or state.base_package_sha256 != stored_package.package_sha256
+        or state.base_package_size_bytes != stored_package.archive_size_bytes
+    ):
+        raise QuestionnaireAssetReviewInternalError()
+    return state
+
+
+def _fold_review_events(
+    state: QuestionnaireAssetReviewState,
+    bindings_by_token: dict[str, _ReviewReferenceBinding],
+    *,
+    reviewer_token: str,
+) -> dict[str, QuestionnaireAssetActiveReviewDecision]:
+    active: dict[str, QuestionnaireAssetActiveReviewDecision] = {}
+    for event in state.events:
+        if not isinstance(event, QuestionnaireAssetReviewEvent):
+            raise QuestionnaireAssetReviewInternalError()
+        binding = bindings_by_token.get(event.reference_token)
+        if (
+            binding is None
+            or binding.asset_token != event.asset_token
+            or event.reviewer_token != reviewer_token
+        ):
+            raise QuestionnaireAssetReviewInternalError()
+        if event.decision == QuestionnaireAssetReviewDecision.CONFIRMED:
+            active[event.reference_token] = (
+                QuestionnaireAssetActiveReviewDecision.CONFIRMED
+            )
+        elif event.decision == QuestionnaireAssetReviewDecision.REJECTED:
+            active[event.reference_token] = (
+                QuestionnaireAssetActiveReviewDecision.REJECTED
+            )
+        elif event.decision == QuestionnaireAssetReviewDecision.RESET:
+            active.pop(event.reference_token, None)
+        else:  # pragma: no cover - strict internal schema rejects this
+            raise QuestionnaireAssetReviewInternalError()
+    return active
 
 
 def _bounded_normalized_text(
@@ -593,22 +795,24 @@ def _image_is_previewable(asset: ResearchAsset, media: dict[str, bytes]) -> bool
     return type(content) is bytes and len(content) == asset.size_bytes
 
 
-def _project_package(
-    storage: ResearchSnapshotCatalogStorage,
-    owner_ref: object,
-    snapshot_id: object,
+def _project_stored_package(
+    stored_package: StoredSnapshotPackage,
+    state: QuestionnaireAssetReviewState,
+    *,
+    owner_ref: str,
+    snapshot_id: str,
 ) -> QuestionnaireAssetReviewProjection:
-    owner = _require_owner_ref(owner_ref)
-    target_snapshot_id = _require_snapshot_id(snapshot_id)
-    package = _load_validated_package(storage, owner, target_snapshot_id)
-    _assets_by_token, asset_tokens_by_id = _tokenized_assets(
+    package = stored_package.package
+    bindings, bindings_by_token = _reference_bindings(
         package,
-        owner_ref=owner,
-        snapshot_id=target_snapshot_id,
+        owner_ref=owner_ref,
+        snapshot_id=snapshot_id,
     )
-    assets_by_id = {
-        asset.asset_id: asset for asset in package.bundle.collection.assets
-    }
+    active_decisions = _fold_review_events(
+        state,
+        bindings_by_token,
+        reviewer_token=_reviewer_token(owner_ref),
+    )
     questions = {
         question.question_id: question
         for question in package.bundle.snapshot.canonical_questions
@@ -618,24 +822,19 @@ def _project_package(
         questions,
     )
 
-    reference_token_identity: dict[str, str] = {}
     asset_warning_codes: dict[str, tuple[str, ...]] = {}
     question_labels: dict[str, str] = {}
     items: list[QuestionnaireAssetReviewItem] = []
-    for reference in package.bundle.collection.references:
-        asset = assets_by_id.get(reference.asset_id)
-        asset_token = asset_tokens_by_id.get(reference.asset_id)
-        if asset is None or asset_token is None:
-            raise QuestionnaireAssetReviewInternalError()
-        opaque_reference_token = _reference_token(
-            owner,
-            target_snapshot_id,
-            reference.reference_id,
-        )
-        prior_identity = reference_token_identity.get(opaque_reference_token)
-        if prior_identity is not None and prior_identity != reference.reference_id:
-            raise QuestionnaireAssetReviewInternalError()
-        reference_token_identity[opaque_reference_token] = reference.reference_id
+    for binding in bindings:
+        reference = binding.reference
+        asset = binding.asset
+        active_decision = active_decisions.get(binding.reference_token)
+        if active_decision == QuestionnaireAssetActiveReviewDecision.CONFIRMED:
+            effective_binding_status = BindingStatus.CONFIRMED
+        elif active_decision == QuestionnaireAssetActiveReviewDecision.REJECTED:
+            effective_binding_status = BindingStatus.REJECTED
+        else:
+            effective_binding_status = reference.binding_status
         preview_status = (
             QuestionnaireAssetPreviewStatus.AVAILABLE
             if _image_is_previewable(asset, package.media)
@@ -643,8 +842,8 @@ def _project_package(
         )
         items.append(
             QuestionnaireAssetReviewItem(
-                reference_token=opaque_reference_token,
-                asset_token=asset_token,
+                reference_token=binding.reference_token,
+                asset_token=binding.asset_token,
                 context_type=reference.context_type,
                 context_label=_context_label(
                     reference,
@@ -653,10 +852,11 @@ def _project_package(
                     question_labels,
                 ),
                 role=reference.role,
-                binding_status=reference.binding_status,
+                binding_status=effective_binding_status,
+                active_review_decision=active_decision,
                 binding_confidence=reference.binding_confidence,
                 review_required=(
-                    reference.binding_status
+                    effective_binding_status
                     in {BindingStatus.PROPOSED, BindingStatus.NEEDS_REVIEW}
                 ),
                 media_type=asset.media_type,
@@ -670,6 +870,12 @@ def _project_package(
         )
 
     return QuestionnaireAssetReviewProjection(
+        review_revision=state.revision,
+        base_version_token=_base_version_token(
+            owner_ref,
+            snapshot_id,
+            stored_package,
+        ),
         total_references=len(items),
         review_required_references=sum(
             item.review_required for item in items
@@ -678,8 +884,38 @@ def _project_package(
     )
 
 
+def _project_package(
+    catalog_storage: ResearchSnapshotCatalogStorage,
+    identity_storage: ResearchSnapshotIdentityStorage,
+    review_storage: QuestionnaireAssetReviewStateStorage,
+    owner_ref: object,
+    snapshot_id: object,
+) -> QuestionnaireAssetReviewProjection:
+    owner = _require_owner_ref(owner_ref)
+    target_snapshot_id = _require_snapshot_id(snapshot_id)
+    stored_package = _load_validated_package(
+        catalog_storage,
+        identity_storage,
+        owner,
+        target_snapshot_id,
+    )
+    state = _load_review_state(
+        review_storage,
+        owner,
+        target_snapshot_id,
+        stored_package,
+    )
+    return _project_stored_package(
+        stored_package,
+        state,
+        owner_ref=owner,
+        snapshot_id=target_snapshot_id,
+    )
+
+
 def _thumbnail_from_package(
-    storage: ResearchSnapshotCatalogStorage,
+    catalog_storage: ResearchSnapshotCatalogStorage,
+    identity_storage: ResearchSnapshotIdentityStorage,
     owner_ref: object,
     snapshot_id: object,
     asset_token: object,
@@ -687,7 +923,13 @@ def _thumbnail_from_package(
     owner = _require_owner_ref(owner_ref)
     target_snapshot_id = _require_snapshot_id(snapshot_id)
     target_token = _require_asset_token(asset_token)
-    package = _load_validated_package(storage, owner, target_snapshot_id)
+    stored_package = _load_validated_package(
+        catalog_storage,
+        identity_storage,
+        owner,
+        target_snapshot_id,
+    )
+    package = stored_package.package
     assets_by_token, _asset_tokens_by_id = _tokenized_assets(
         package,
         owner_ref=owner,
@@ -738,6 +980,221 @@ def _thumbnail_from_package(
     )
 
 
+def _require_decision_request(
+    value: object,
+) -> QuestionnaireAssetReviewDecisionRequest:
+    if not isinstance(value, QuestionnaireAssetReviewDecisionRequest):
+        raise QuestionnaireAssetReviewInvalidError()
+    return value
+
+
+def _event_matches_request(
+    event: QuestionnaireAssetReviewEvent,
+    request: QuestionnaireAssetReviewDecisionRequest,
+    *,
+    reviewer_token: str,
+) -> bool:
+    return (
+        event.reference_token == request.reference_token
+        and event.asset_token == request.asset_token
+        and event.decision.value == request.decision.value
+        and event.reviewer_token == reviewer_token
+    )
+
+
+def _idempotency_event(
+    state: QuestionnaireAssetReviewState,
+    idempotency_key: str,
+) -> QuestionnaireAssetReviewEvent | None:
+    for event in state.events:
+        if event.idempotency_key == idempotency_key:
+            return event
+    return None
+
+
+def _classify_command_against_state(
+    state: QuestionnaireAssetReviewState,
+    request: QuestionnaireAssetReviewDecisionRequest,
+    *,
+    reviewer_token: str,
+) -> bool:
+    """Return true for an exact replay or raise a typed public conflict."""
+
+    existing = _idempotency_event(state, request.idempotency_key)
+    if existing is not None:
+        if _event_matches_request(
+            existing,
+            request,
+            reviewer_token=reviewer_token,
+        ):
+            return True
+        raise QuestionnaireAssetReviewIdempotencyConflictError()
+    if request.expected_revision != state.revision:
+        raise QuestionnaireAssetReviewRevisionConflictError()
+    if state.revision >= MAX_QUESTIONNAIRE_ASSET_REVIEW_EVENTS:
+        raise QuestionnaireAssetReviewConflictError()
+    return False
+
+
+def _require_returned_state(
+    value: object,
+    stored_package: StoredSnapshotPackage,
+) -> QuestionnaireAssetReviewState:
+    if (
+        not isinstance(value, QuestionnaireAssetReviewState)
+        or value.base_package_sha256 != stored_package.package_sha256
+        or value.base_package_size_bytes != stored_package.archive_size_bytes
+    ):
+        raise QuestionnaireAssetReviewInternalError()
+    return value
+
+
+def _submit_decision(
+    catalog_storage: ResearchSnapshotCatalogStorage,
+    identity_storage: ResearchSnapshotIdentityStorage,
+    review_storage: QuestionnaireAssetReviewStateStorage,
+    owner_ref: object,
+    snapshot_id: object,
+    raw_request: object,
+) -> QuestionnaireAssetReviewProjection:
+    owner = _require_owner_ref(owner_ref)
+    target_snapshot_id = _require_snapshot_id(snapshot_id)
+    request = _require_decision_request(raw_request)
+    stored_package = _load_validated_package(
+        catalog_storage,
+        identity_storage,
+        owner,
+        target_snapshot_id,
+    )
+    current_base_token = _base_version_token(
+        owner,
+        target_snapshot_id,
+        stored_package,
+    )
+    if request.base_version_token != current_base_token:
+        raise QuestionnaireAssetReviewBaseVersionConflictError()
+
+    _bindings, bindings_by_token = _reference_bindings(
+        stored_package.package,
+        owner_ref=owner,
+        snapshot_id=target_snapshot_id,
+    )
+    requested_binding = bindings_by_token.get(request.reference_token)
+    if (
+        requested_binding is None
+        or requested_binding.asset_token != request.asset_token
+    ):
+        raise QuestionnaireAssetReviewNotFoundError()
+
+    reviewer = _reviewer_token(owner)
+    state = _load_review_state(
+        review_storage,
+        owner,
+        target_snapshot_id,
+        stored_package,
+    )
+    active_decisions = _fold_review_events(
+        state,
+        bindings_by_token,
+        reviewer_token=reviewer,
+    )
+    if _classify_command_against_state(
+        state,
+        request,
+        reviewer_token=reviewer,
+    ):
+        return _project_stored_package(
+            stored_package,
+            state,
+            owner_ref=owner,
+            snapshot_id=target_snapshot_id,
+        )
+    current_decision = active_decisions.get(request.reference_token)
+    requested_decision = request.decision.value
+    if (
+        (
+            requested_decision == QuestionnaireAssetReviewDecision.RESET.value
+            and current_decision is None
+        )
+        or (
+            requested_decision
+            == QuestionnaireAssetReviewDecision.CONFIRMED.value
+            and current_decision
+            == QuestionnaireAssetActiveReviewDecision.CONFIRMED
+        )
+        or (
+            requested_decision
+            == QuestionnaireAssetReviewDecision.REJECTED.value
+            and current_decision
+            == QuestionnaireAssetActiveReviewDecision.REJECTED
+        )
+    ):
+        raise QuestionnaireAssetReviewConflictError()
+
+    command = QuestionnaireAssetReviewCommand(
+        expected_revision=request.expected_revision,
+        idempotency_key=request.idempotency_key,
+        reference_token=request.reference_token,
+        asset_token=request.asset_token,
+        decision=QuestionnaireAssetReviewDecision(request.decision.value),
+        reviewer_token=reviewer,
+        base_package_sha256=stored_package.package_sha256,
+        base_package_size_bytes=stored_package.archive_size_bytes,
+    )
+    try:
+        appended = review_storage.append(owner, target_snapshot_id, command)
+    except ReviewStorageConflictError:
+        latest_state = _load_review_state(
+            review_storage,
+            owner,
+            target_snapshot_id,
+            stored_package,
+        )
+        _fold_review_events(
+            latest_state,
+            bindings_by_token,
+            reviewer_token=reviewer,
+        )
+        if _classify_command_against_state(
+            latest_state,
+            request,
+            reviewer_token=reviewer,
+        ):
+            appended = latest_state
+        else:  # pragma: no cover - classifier returns or raises
+            raise QuestionnaireAssetReviewConflictError()
+    except QuestionnaireAssetReviewStorageError:
+        raise QuestionnaireAssetReviewInternalError() from None
+    except Exception:
+        raise QuestionnaireAssetReviewInternalError() from None
+
+    new_state = _require_returned_state(appended, stored_package)
+    _fold_review_events(
+        new_state,
+        bindings_by_token,
+        reviewer_token=reviewer,
+    )
+    committed_event = _idempotency_event(
+        new_state,
+        request.idempotency_key,
+    )
+    if (
+        committed_event is None
+        or not _event_matches_request(
+            committed_event,
+            request,
+            reviewer_token=reviewer,
+        )
+    ):
+        raise QuestionnaireAssetReviewInternalError()
+    return _project_stored_package(
+        stored_package,
+        new_state,
+        owner_ref=owner,
+        snapshot_id=target_snapshot_id,
+    )
+
+
 _ResultT = TypeVar("_ResultT")
 
 
@@ -774,13 +1231,24 @@ async def _run_in_thread_cancellation_safe(
 
 @dataclass(frozen=True, slots=True)
 class QuestionnaireAssetReviewApi:
-    """Load safe projections and deterministic image thumbnails by owner."""
+    """Project and append owner-scoped review state over persisted ZIPs."""
 
     storage: ResearchSnapshotCatalogStorage
+    review_storage: QuestionnaireAssetReviewStateStorage
 
     def __post_init__(self) -> None:
         if not isinstance(self.storage, ResearchSnapshotCatalogStorage):
             raise TypeError("storage 必须实现 ResearchSnapshotCatalogStorage")
+        if not isinstance(self.storage, ResearchSnapshotIdentityStorage):
+            raise TypeError("storage 必须实现 ResearchSnapshotIdentityStorage")
+        if not isinstance(
+            self.review_storage,
+            QuestionnaireAssetReviewStateStorage,
+        ):
+            raise TypeError(
+                "review_storage 必须实现 "
+                "QuestionnaireAssetReviewStateStorage"
+            )
 
     async def get_projection(
         self,
@@ -791,6 +1259,8 @@ class QuestionnaireAssetReviewApi:
             return await _run_in_thread_cancellation_safe(
                 _project_package,
                 self.storage,
+                self.storage,
+                self.review_storage,
                 owner_ref,
                 snapshot_id,
             )
@@ -809,9 +1279,31 @@ class QuestionnaireAssetReviewApi:
             return await _run_in_thread_cancellation_safe(
                 _thumbnail_from_package,
                 self.storage,
+                self.storage,
                 owner_ref,
                 snapshot_id,
                 asset_token,
+            )
+        except QuestionnaireAssetReviewApiError:
+            raise
+        except Exception:
+            raise QuestionnaireAssetReviewInternalError() from None
+
+    async def submit_decision(
+        self,
+        owner_ref: str,
+        snapshot_id: str,
+        request: QuestionnaireAssetReviewDecisionRequest,
+    ) -> QuestionnaireAssetReviewProjection:
+        try:
+            return await _run_in_thread_cancellation_safe(
+                _submit_decision,
+                self.storage,
+                self.storage,
+                self.review_storage,
+                owner_ref,
+                snapshot_id,
+                request,
             )
         except QuestionnaireAssetReviewApiError:
             raise

@@ -31,6 +31,7 @@ from app.services.questionnaire_asset_review_api import (
     QuestionnaireAssetReviewInternalError,
     QuestionnaireAssetReviewNotFoundError,
 )
+from app.services import questionnaire_asset_review_api as review_api_module
 from app.services.questionnaire_material_snapshot_api import (
     QuestionnaireMaterialScreenshot,
     QuestionnaireMaterialSnapshotApi,
@@ -44,6 +45,11 @@ from app.storage.research_assets import (
     SnapshotCatalogEntry,
     SnapshotCatalogPage,
     SnapshotPackage,
+    StoredSnapshotPackage,
+    build_snapshot_package,
+)
+from app.storage.questionnaire_asset_reviews import (
+    FileQuestionnaireAssetReviewStorage,
 )
 
 
@@ -149,6 +155,14 @@ class _CatalogStorage:
         owner_ref: str,
         snapshot_id: str,
     ) -> SnapshotPackage | None:
+        stored = self.load_snapshot_package_with_identity(owner_ref, snapshot_id)
+        return None if stored is None else stored.package
+
+    def load_snapshot_package_with_identity(
+        self,
+        owner_ref: str,
+        snapshot_id: str,
+    ) -> StoredSnapshotPackage | None:
         self.load_calls += 1
         if self.disappear_after_catalog:
             return None
@@ -156,7 +170,16 @@ class _CatalogStorage:
             return None
         if self.package.bundle.snapshot.snapshot_id != snapshot_id:
             return None
-        return self.package
+        content = build_snapshot_package(
+            owner_ref,
+            self.package.bundle,
+            self.package.media,
+        )
+        return StoredSnapshotPackage(
+            package=self.package,
+            package_sha256=hashlib.sha256(content).hexdigest(),
+            archive_size_bytes=len(content),
+        )
 
     def save_snapshot_package(
         self,
@@ -173,6 +196,7 @@ class QuestionnaireAssetReviewApiTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name) / "snapshots"
         self.storage = FileResearchAssetStorage(self.root)
+        self.review_storage = FileQuestionnaireAssetReviewStorage(self.root)
         screenshot_api = QuestionnaireMaterialSnapshotApi(
             self.storage,
             clock=lambda: FIXED_TIME,
@@ -186,7 +210,10 @@ class QuestionnaireAssetReviewApiTests(unittest.IsolatedAsyncioTestCase):
             ),),
         )
         self.snapshot_id = summary.snapshot_id
-        self.api = QuestionnaireAssetReviewApi(self.storage)
+        self.api = QuestionnaireAssetReviewApi(
+            self.storage,
+            self.review_storage,
+        )
         self.app = FastAPI()
         self.app.include_router(create_questionnaire_asset_reviews_router(self.api))
 
@@ -218,6 +245,7 @@ class QuestionnaireAssetReviewApiTests(unittest.IsolatedAsyncioTestCase):
         item = projection.items[0]
         self.assertIsInstance(item.warning_codes, tuple)
         self.assertEqual(item.binding_status, BindingStatus.NEEDS_REVIEW)
+        self.assertIsNone(item.active_review_decision)
         self.assertTrue(item.review_required)
         self.assertEqual(item.preview_status, QuestionnaireAssetPreviewStatus.AVAILABLE)
         self.assertEqual(item.media_type, MediaType.IMAGE)
@@ -239,6 +267,8 @@ class QuestionnaireAssetReviewApiTests(unittest.IsolatedAsyncioTestCase):
             set(payload),
             {
                 "schema_version",
+                "review_revision",
+                "base_version_token",
                 "total_references",
                 "review_required_references",
                 "items",
@@ -253,6 +283,7 @@ class QuestionnaireAssetReviewApiTests(unittest.IsolatedAsyncioTestCase):
                 "context_label",
                 "role",
                 "binding_status",
+                "active_review_decision",
                 "binding_confidence",
                 "review_required",
                 "media_type",
@@ -349,14 +380,22 @@ class QuestionnaireAssetReviewApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(after, before)
 
         fresh_root = Path(self.temporary.name) / "fresh"
-        fresh_api = QuestionnaireAssetReviewApi(FileResearchAssetStorage(fresh_root))
+        fresh_api = QuestionnaireAssetReviewApi(
+            FileResearchAssetStorage(fresh_root),
+            FileQuestionnaireAssetReviewStorage(fresh_root),
+        )
         with self.assertRaises(QuestionnaireAssetReviewNotFoundError):
             await fresh_api.get_projection(OWNER_REF, "never-existed")
         self.assertFalse(fresh_root.exists())
 
     async def test_catalog_miss_never_loads_and_catalog_to_load_race_fails_closed(self) -> None:
         missing_storage = _CatalogStorage(OWNER_REF, None)
-        missing_api = QuestionnaireAssetReviewApi(missing_storage)
+        missing_api = QuestionnaireAssetReviewApi(
+            missing_storage,
+            FileQuestionnaireAssetReviewStorage(
+                Path(self.temporary.name) / "missing-review"
+            ),
+        )
         with self.assertRaises(QuestionnaireAssetReviewNotFoundError):
             await missing_api.get_projection(OWNER_REF, "missing")
         self.assertEqual(missing_storage.load_calls, 0)
@@ -369,7 +408,12 @@ class QuestionnaireAssetReviewApiTests(unittest.IsolatedAsyncioTestCase):
             package,
             disappear_after_catalog=True,
         )
-        disappearing_api = QuestionnaireAssetReviewApi(disappearing_storage)
+        disappearing_api = QuestionnaireAssetReviewApi(
+            disappearing_storage,
+            FileQuestionnaireAssetReviewStorage(
+                Path(self.temporary.name) / "disappearing-review"
+            ),
+        )
         with self.assertRaises(QuestionnaireAssetReviewInternalError):
             await disappearing_api.get_projection(OWNER_REF, self.snapshot_id)
         self.assertEqual(disappearing_storage.load_calls, 1)
@@ -387,6 +431,23 @@ class QuestionnaireAssetReviewApiTests(unittest.IsolatedAsyncioTestCase):
                 **payload,
                 "review_required_references": 0,
             })
+
+    async def test_cross_domain_token_collision_fails_closed(self) -> None:
+        collision = "a" * 64
+        with (
+            patch.object(
+                review_api_module,
+                "_asset_token",
+                return_value=collision,
+            ),
+            patch.object(
+                review_api_module,
+                "_reference_token",
+                return_value=collision,
+            ),
+        ):
+            with self.assertRaises(QuestionnaireAssetReviewInternalError):
+                await self.api.get_projection(OWNER_REF, self.snapshot_id)
 
     async def test_authentication_and_all_router_errors_have_no_store_headers(self) -> None:
         denied = AsyncMock(side_effect=HTTPException(status_code=403, detail="denied"))
@@ -480,7 +541,12 @@ class QuestionnaireAssetReviewApiTests(unittest.IsolatedAsyncioTestCase):
             block_catalog=started,
             release_catalog=release,
         )
-        api = QuestionnaireAssetReviewApi(storage)
+        api = QuestionnaireAssetReviewApi(
+            storage,
+            FileQuestionnaireAssetReviewStorage(
+                Path(self.temporary.name) / "cancel-review"
+            ),
+        )
         task = asyncio.create_task(api.get_projection(OWNER_REF, self.snapshot_id))
         self.assertTrue(await asyncio.to_thread(started.wait, 2))
         task.cancel()
@@ -492,7 +558,7 @@ class QuestionnaireAssetReviewApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(storage.load_calls, 1)
         self.assertEqual(storage.save_calls, 0)
 
-    def test_router_is_strictly_get_only(self) -> None:
+    def test_router_has_two_read_routes_and_one_decision_write_route(self) -> None:
         router = create_questionnaire_asset_reviews_router(self.api)
         routes = {
             (method, route.path)
@@ -508,6 +574,11 @@ class QuestionnaireAssetReviewApiTests(unittest.IsolatedAsyncioTestCase):
                 "GET",
                 "/api/questionnaire-sources/snapshots/{snapshot_id}"
                 "/asset-review/thumbnails/{asset_token}.png",
+            ),
+            (
+                "POST",
+                "/api/questionnaire-sources/snapshots/{snapshot_id}"
+                "/asset-review/decisions",
             ),
         })
 
