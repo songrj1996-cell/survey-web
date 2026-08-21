@@ -1,0 +1,16 @@
+{
+  "fixture_version": "interview-v2-analysis-boundary-golden/1.0",
+  "expected": {
+    "participant_count": 2,
+    "evaluation_object_count": 3,
+    "source_scope_rule_count": 3,
+    "source_scope_allowed_split_count": 13,
+    "coverage_row_count": 6,
+    "initial_boundary_status": "draft",
+    "initial_scope_type": "interview_body",
+    "label_scope_rule_count": 0,
+    "double_recorder_covered_participant_count": 2,
+    "draft_denominator_reliable": false,
+    "draft_proportion": null
+  }
+}

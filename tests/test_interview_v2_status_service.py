@@ -37,7 +37,7 @@ class InterviewV2StatusServiceTests(unittest.TestCase):
         self.assertEqual(result["status"], "GROUP_CONFIRMATION_REQUIRED")
         load_state.assert_not_called()
 
-    def test_current_structure_checkpoint_overlays_mapping_status(self):
+    def test_ready_structure_without_boundary_requires_analysis_boundary(self):
         public = _mapping_status("GROUP_MAPPING_CONFIRMED")
         with (
             patch.object(
@@ -53,12 +53,110 @@ class InterviewV2StatusServiceTests(unittest.TestCase):
                     "derived_status": "READY_FOR_DOSSIERS",
                 },
             ),
+            patch.object(
+                service.store,
+                "load_analysis_boundary_state",
+                return_value=None,
+            ),
+        ):
+            result = service.get_interview_import_with_structure_status(
+                IMPORT_ID, LOGIN
+            )
+
+        self.assertEqual(result["status"], "ANALYSIS_BOUNDARY_REQUIRED")
+
+    def test_analysis_boundary_review_checkpoint_overlays_ready_structure(self):
+        public = _mapping_status("GROUP_MAPPING_CONFIRMED")
+        with (
+            patch.object(
+                service,
+                "get_interview_import_with_mapping_status",
+                return_value=public,
+            ),
+            patch.object(
+                service.store,
+                "load_structure_state",
+                return_value={
+                    "is_stale": False,
+                    "derived_status": "READY_FOR_DOSSIERS",
+                },
+            ),
+            patch.object(
+                service.store,
+                "load_analysis_boundary_state",
+                return_value={
+                    "is_stale": False,
+                    "derived_status": "ANALYSIS_BOUNDARY_REVIEW_REQUIRED",
+                },
+            ),
+        ):
+            result = service.get_interview_import_with_structure_status(
+                IMPORT_ID, LOGIN
+            )
+
+        self.assertEqual(result["status"], "ANALYSIS_BOUNDARY_REVIEW_REQUIRED")
+
+    def test_confirmed_analysis_boundary_reaches_ready_for_dossiers(self):
+        public = _mapping_status("GROUP_MAPPING_CONFIRMED")
+        with (
+            patch.object(
+                service,
+                "get_interview_import_with_mapping_status",
+                return_value=public,
+            ),
+            patch.object(
+                service.store,
+                "load_structure_state",
+                return_value={
+                    "is_stale": False,
+                    "derived_status": "READY_FOR_DOSSIERS",
+                },
+            ),
+            patch.object(
+                service.store,
+                "load_analysis_boundary_state",
+                return_value={
+                    "is_stale": False,
+                    "derived_status": "READY_FOR_DOSSIERS",
+                },
+            ),
         ):
             result = service.get_interview_import_with_structure_status(
                 IMPORT_ID, LOGIN
             )
 
         self.assertEqual(result["status"], "READY_FOR_DOSSIERS")
+
+    def test_stale_analysis_boundary_returns_required_checkpoint(self):
+        public = _mapping_status("GROUP_MAPPING_CONFIRMED")
+        with (
+            patch.object(
+                service,
+                "get_interview_import_with_mapping_status",
+                return_value=public,
+            ),
+            patch.object(
+                service.store,
+                "load_structure_state",
+                return_value={
+                    "is_stale": False,
+                    "derived_status": "READY_FOR_DOSSIERS",
+                },
+            ),
+            patch.object(
+                service.store,
+                "load_analysis_boundary_state",
+                return_value={
+                    "is_stale": True,
+                    "derived_status": "READY_FOR_DOSSIERS",
+                },
+            ),
+        ):
+            result = service.get_interview_import_with_structure_status(
+                IMPORT_ID, LOGIN
+            )
+
+        self.assertEqual(result["status"], "ANALYSIS_BOUNDARY_REQUIRED")
 
     def test_stale_structure_does_not_override_current_mapping_checkpoint(self):
         public = _mapping_status("GROUP_MAPPING_CONFIRMED")

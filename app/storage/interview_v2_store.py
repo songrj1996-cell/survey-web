@@ -36,7 +36,7 @@ _STORE_LOCK = threading.RLock()
 _MAPPING_LOCK_TIMEOUT_SECONDS = 10.0
 _MAPPING_LOCK_POLL_SECONDS = 0.025
 _ID_RE = re.compile(
-    r"^(?:upload|job|project|import|workbook|mapping|structure|evidence)_[0-9a-f]{32}$"
+    r"^(?:upload|job|project|import|workbook|mapping|structure|evidence|boundary|coverage)_[0-9a-f]{32}$"
 )
 _EVIDENCE_ID_RE = re.compile(r"^(?:ev|evidence)_[0-9a-f]{32}$")
 _REVIEW_ISSUE_ID_RE = re.compile(r"^(?:issue|review)_[0-9a-f]{32}$")
@@ -62,6 +62,22 @@ class StructureInputConflictError(RuntimeError):
         self.current_mapping_revision_id = current_mapping_revision_id
         self.current_mapping_sha256 = current_mapping_sha256
         self.current_mapping_status = current_mapping_status
+
+
+class AnalysisBoundaryInputConflictError(RuntimeError):
+    """The structure/evidence head moved before boundary publication."""
+
+    def __init__(
+        self,
+        *,
+        current_structure_revision_id: str | None,
+        current_evidence_revision_id: str | None,
+        current_structure_status: str,
+    ) -> None:
+        super().__init__("confirmed analysis-boundary input is no longer current")
+        self.current_structure_revision_id = current_structure_revision_id
+        self.current_evidence_revision_id = current_evidence_revision_id
+        self.current_structure_status = current_structure_status
 
 
 def _root() -> Path:
@@ -3469,3 +3485,986 @@ def load_evidence_with_context(
                 "artifact_status": bundle["state"].get("artifact_status"),
                 "is_stale": bundle["state"].get("is_stale"),
             }
+
+
+# ---------------------------------------------------------------------------
+# Batch 3B: immutable analysis-boundary / coverage revision pairs.
+#
+# Boundary persistence deliberately reuses the project-wide mapping lock.  It
+# therefore cannot publish against a structure/evidence head while that head
+# is being advanced in another process.  Proposal generation remains a pure
+# service/core concern and never calls these writers.
+
+
+_ANALYSIS_BOUNDARY_STATUSES = {
+    "ANALYSIS_BOUNDARY_REVIEW_REQUIRED",
+    "READY_FOR_DOSSIERS",
+}
+
+
+def analysis_boundary_revision_payload_sha256(
+    revision: dict[str, Any],
+) -> str:
+    """Digest every immutable boundary revision field except its digest."""
+
+    return _canonical_payload_sha256(
+        {
+            key: value
+            for key, value in revision.items()
+            if key != "revision_payload_sha256"
+        }
+    )
+
+
+def coverage_revision_payload_sha256(revision: dict[str, Any]) -> str:
+    """Digest every immutable coverage revision field except its digest."""
+
+    return _canonical_payload_sha256(
+        {
+            key: value
+            for key, value in revision.items()
+            if key != "revision_payload_sha256"
+        }
+    )
+
+
+def analysis_boundary_state_payload_sha256(state: dict[str, Any]) -> str:
+    """Digest all durable state, excluding only read-time derived fields."""
+
+    return _canonical_payload_sha256(
+        {
+            key: value
+            for key, value in state.items()
+            if key
+            not in {
+                "state_payload_sha256",
+                "is_stale",
+                "artifact_status",
+                "derived_status",
+            }
+        }
+    )
+
+
+def _analysis_boundary_state_path(project_id: str) -> Path:
+    project_id = validate_resource_id(project_id, "project")
+    return _safe_child(
+        "projects", project_id, "analysis_boundary_state.json"
+    )
+
+
+def _analysis_boundary_revision_path(
+    project_id: str, boundary_revision_id: str
+) -> Path:
+    project_id = validate_resource_id(project_id, "project")
+    boundary_revision_id = validate_resource_id(
+        boundary_revision_id, "boundary"
+    )
+    return _safe_child(
+        "projects",
+        project_id,
+        "analysis_boundary_revisions",
+        f"{boundary_revision_id}.json",
+    )
+
+
+def _coverage_revision_path(
+    project_id: str, coverage_revision_id: str
+) -> Path:
+    project_id = validate_resource_id(project_id, "project")
+    coverage_revision_id = validate_resource_id(
+        coverage_revision_id, "coverage"
+    )
+    return _safe_child(
+        "projects",
+        project_id,
+        "coverage_revisions",
+        f"{coverage_revision_id}.json",
+    )
+
+
+def _analysis_boundary_source(revision: dict[str, Any]) -> dict[str, str]:
+    source = revision.get("source")
+    if not isinstance(source, dict):
+        raise ValueError("analysis boundary source must be an object")
+    normalized = {
+        "structure_revision_id": validate_resource_id(
+            str(source.get("structure_revision_id") or ""), "structure"
+        ),
+        "structure_payload_sha256": str(
+            source.get("structure_payload_sha256") or ""
+        ),
+        "evidence_revision_id": validate_resource_id(
+            str(source.get("evidence_revision_id") or ""), "evidence"
+        ),
+        "evidence_payload_sha256": str(
+            source.get("evidence_payload_sha256") or ""
+        ),
+    }
+    for field in (
+        "structure_payload_sha256",
+        "evidence_payload_sha256",
+    ):
+        if not _SHA256_RE.fullmatch(normalized[field]):
+            raise ValueError(f"invalid analysis boundary {field}")
+    if source != normalized:
+        raise ValueError("analysis boundary source is not canonical")
+    return normalized
+
+
+def _require_analysis_boundary_revision(
+    revision: dict[str, Any],
+    *,
+    project_id: str | None = None,
+    import_id: str | None = None,
+) -> tuple[str, int, dict[str, str], str]:
+    if not isinstance(revision, dict):
+        raise ValueError("analysis boundary revision must be an object")
+    revision_project_id = validate_resource_id(
+        str(revision.get("project_id") or ""), "project"
+    )
+    revision_import_id = validate_resource_id(
+        str(revision.get("import_id") or ""), "import"
+    )
+    if project_id is not None and revision_project_id != project_id:
+        raise ValueError("analysis boundary project mismatch")
+    if import_id is not None and revision_import_id != import_id:
+        raise ValueError("analysis boundary import mismatch")
+    revision_id = validate_resource_id(
+        str(revision.get("boundary_revision_id") or ""), "boundary"
+    )
+    revision_number = _validated_revision_number(
+        revision.get("revision_number"), "analysis boundary"
+    )
+    request_fingerprint = str(revision.get("request_fingerprint") or "")
+    if not _SHA256_RE.fullmatch(request_fingerprint):
+        raise ValueError("invalid analysis boundary request fingerprint")
+    if not isinstance(revision.get("analysis_boundary"), dict):
+        raise ValueError("analysis boundary payload must be an object")
+    if not str(revision.get("created_at") or "").strip():
+        raise ValueError("analysis boundary timestamp is required")
+    source = _analysis_boundary_source(revision)
+    declared = str(revision.get("revision_payload_sha256") or "")
+    if (
+        not _SHA256_RE.fullmatch(declared)
+        or analysis_boundary_revision_payload_sha256(revision) != declared
+    ):
+        raise ValueError("analysis boundary revision payload digest mismatch")
+    return revision_id, revision_number, source, declared
+
+
+def _require_coverage_revision(
+    revision: dict[str, Any],
+    *,
+    project_id: str | None = None,
+    import_id: str | None = None,
+) -> tuple[str, int, dict[str, str], str, str, str]:
+    if not isinstance(revision, dict):
+        raise ValueError("coverage revision must be an object")
+    revision_project_id = validate_resource_id(
+        str(revision.get("project_id") or ""), "project"
+    )
+    revision_import_id = validate_resource_id(
+        str(revision.get("import_id") or ""), "import"
+    )
+    if project_id is not None and revision_project_id != project_id:
+        raise ValueError("coverage project mismatch")
+    if import_id is not None and revision_import_id != import_id:
+        raise ValueError("coverage import mismatch")
+    revision_id = validate_resource_id(
+        str(revision.get("coverage_revision_id") or ""), "coverage"
+    )
+    boundary_revision_id = validate_resource_id(
+        str(revision.get("boundary_revision_id") or ""), "boundary"
+    )
+    boundary_payload_sha256 = str(
+        revision.get("boundary_payload_sha256") or ""
+    )
+    if not _SHA256_RE.fullmatch(boundary_payload_sha256):
+        raise ValueError("invalid coverage boundary digest")
+    revision_number = _validated_revision_number(
+        revision.get("revision_number"), "coverage"
+    )
+    request_fingerprint = str(revision.get("request_fingerprint") or "")
+    if not _SHA256_RE.fullmatch(request_fingerprint):
+        raise ValueError("invalid coverage request fingerprint")
+    if not isinstance(revision.get("coverage_preview"), dict):
+        raise ValueError("coverage preview must be an object")
+    if not str(revision.get("created_at") or "").strip():
+        raise ValueError("coverage timestamp is required")
+    source = _analysis_boundary_source(revision)
+    declared = str(revision.get("revision_payload_sha256") or "")
+    if (
+        not _SHA256_RE.fullmatch(declared)
+        or coverage_revision_payload_sha256(revision) != declared
+    ):
+        raise ValueError("coverage revision payload digest mismatch")
+    return (
+        revision_id,
+        revision_number,
+        source,
+        declared,
+        boundary_revision_id,
+        boundary_payload_sha256,
+    )
+
+
+def _require_analysis_boundary_state_digest(state: dict[str, Any]) -> str:
+    declared = str(state.get("state_payload_sha256") or "")
+    if (
+        not _SHA256_RE.fullmatch(declared)
+        or analysis_boundary_state_payload_sha256(state) != declared
+    ):
+        raise ValueError("analysis boundary state payload digest mismatch")
+    return declared
+
+
+def _current_analysis_boundary_source_locked(
+    project_id: str, import_id: str
+) -> dict[str, Any]:
+    state = _read_json(_structure_state_path(project_id))
+    if state is None:
+        return {
+            "source": None,
+            "status": "STRUCTURE_REQUIRED",
+            "is_stale": True,
+        }
+    if state.get("import_id") != import_id:
+        raise ValueError("structure state import mismatch")
+    bundle = _load_structure_head_locked(state)
+    public_state = bundle["state"]
+    return {
+        "source": {
+            "structure_revision_id": str(
+                public_state.get("current_structure_revision_id") or ""
+            ),
+            "structure_payload_sha256": str(
+                public_state.get("current_structure_payload_sha256") or ""
+            ),
+            "evidence_revision_id": str(
+                public_state.get("current_evidence_revision_id") or ""
+            ),
+            "evidence_payload_sha256": str(
+                public_state.get("current_evidence_payload_sha256") or ""
+            ),
+        },
+        "status": str(public_state.get("effective_status") or ""),
+        "is_stale": bool(public_state.get("is_stale")),
+    }
+
+
+def _raise_analysis_boundary_input_conflict(
+    current: dict[str, Any],
+) -> None:
+    source = current.get("source")
+    if not isinstance(source, dict):
+        source = {}
+    raise AnalysisBoundaryInputConflictError(
+        current_structure_revision_id=(
+            str(source.get("structure_revision_id") or "") or None
+        ),
+        current_evidence_revision_id=(
+            str(source.get("evidence_revision_id") or "") or None
+        ),
+        current_structure_status=str(current.get("status") or ""),
+    )
+
+
+def _require_current_analysis_boundary_input_locked(
+    *,
+    project_id: str,
+    import_id: str,
+    expected_source: dict[str, str],
+) -> dict[str, Any]:
+    current = _current_analysis_boundary_source_locked(project_id, import_id)
+    if (
+        current.get("source") != expected_source
+        or current.get("status") != "READY_FOR_DOSSIERS"
+        or current.get("is_stale")
+    ):
+        _raise_analysis_boundary_input_conflict(current)
+    return current
+
+
+def _durable_analysis_boundary_source(state: dict[str, Any]) -> dict[str, str]:
+    return {
+        "structure_revision_id": validate_resource_id(
+            str(state.get("current_structure_revision_id") or ""),
+            "structure",
+        ),
+        "structure_payload_sha256": str(
+            state.get("current_structure_payload_sha256") or ""
+        ),
+        "evidence_revision_id": validate_resource_id(
+            str(state.get("current_evidence_revision_id") or ""),
+            "evidence",
+        ),
+        "evidence_payload_sha256": str(
+            state.get("current_evidence_payload_sha256") or ""
+        ),
+    }
+
+
+def _load_analysis_boundary_head_locked(
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    _require_analysis_boundary_state_digest(state)
+    project_id = validate_resource_id(
+        str(state.get("project_id") or ""), "project"
+    )
+    import_id = validate_resource_id(
+        str(state.get("import_id") or ""), "import"
+    )
+    boundary_revision_id = validate_resource_id(
+        str(state.get("current_boundary_revision_id") or ""), "boundary"
+    )
+    coverage_revision_id = validate_resource_id(
+        str(state.get("current_coverage_revision_id") or ""), "coverage"
+    )
+    boundary_number = _validated_revision_number(
+        state.get("current_boundary_revision_number"),
+        "analysis boundary state",
+    )
+    coverage_number = _validated_revision_number(
+        state.get("current_coverage_revision_number"), "coverage state"
+    )
+    if boundary_number != coverage_number:
+        raise ValueError("analysis boundary and coverage heads are not aligned")
+    effective_status = str(state.get("effective_status") or "")
+    if effective_status not in _ANALYSIS_BOUNDARY_STATUSES:
+        raise ValueError("invalid analysis boundary state status")
+
+    boundary_revision = _read_json(
+        _analysis_boundary_revision_path(project_id, boundary_revision_id)
+    )
+    coverage_revision = _read_json(
+        _coverage_revision_path(project_id, coverage_revision_id)
+    )
+    if boundary_revision is None or coverage_revision is None:
+        raise ValueError("current analysis boundary artifact is missing")
+    (
+        loaded_boundary_id,
+        loaded_boundary_number,
+        boundary_source,
+        boundary_digest,
+    ) = _require_analysis_boundary_revision(
+        boundary_revision, project_id=project_id, import_id=import_id
+    )
+    (
+        loaded_coverage_id,
+        loaded_coverage_number,
+        coverage_source,
+        coverage_digest,
+        coverage_boundary_id,
+        coverage_boundary_digest,
+    ) = _require_coverage_revision(
+        coverage_revision, project_id=project_id, import_id=import_id
+    )
+    durable_source = _durable_analysis_boundary_source(state)
+    for digest in (
+        durable_source["structure_payload_sha256"],
+        durable_source["evidence_payload_sha256"],
+    ):
+        if not _SHA256_RE.fullmatch(digest):
+            raise ValueError("invalid analysis boundary state source digest")
+    if (
+        loaded_boundary_id != boundary_revision_id
+        or loaded_coverage_id != coverage_revision_id
+        or loaded_boundary_number != boundary_number
+        or loaded_coverage_number != coverage_number
+        or boundary_source != coverage_source
+        or boundary_source != durable_source
+        or coverage_boundary_id != boundary_revision_id
+        or coverage_boundary_digest != boundary_digest
+        or state.get("current_boundary_payload_sha256") != boundary_digest
+        or state.get("current_coverage_payload_sha256") != coverage_digest
+    ):
+        raise ValueError("analysis boundary state head reference mismatch")
+
+    history = state.get("revision_history")
+    if not isinstance(history, list) or len(history) != boundary_number:
+        raise ValueError("analysis boundary revision history is invalid")
+    for expected_number, entry in enumerate(history, start=1):
+        if (
+            not isinstance(entry, dict)
+            or entry.get("revision_number") != expected_number
+        ):
+            raise ValueError("analysis boundary history sequence mismatch")
+    head_history = history[-1]
+    if (
+        head_history.get("boundary_revision_id") != boundary_revision_id
+        or head_history.get("coverage_revision_id") != coverage_revision_id
+        or head_history.get("boundary_payload_sha256") != boundary_digest
+        or head_history.get("coverage_payload_sha256") != coverage_digest
+        or head_history.get("source") != durable_source
+        or head_history.get("request_fingerprint")
+        != state.get("current_request_fingerprint")
+    ):
+        raise ValueError("analysis boundary history head mismatch")
+    events = state.get("confirmation_events")
+    if not isinstance(events, list):
+        raise ValueError("analysis boundary confirmation history is invalid")
+    confirmed_values = (
+        state.get("confirmed_boundary_revision_id"),
+        state.get("confirmed_boundary_payload_sha256"),
+        state.get("confirmed_coverage_revision_id"),
+        state.get("confirmed_coverage_payload_sha256"),
+        state.get("confirmed_revision_number"),
+    )
+    if effective_status == "READY_FOR_DOSSIERS":
+        if confirmed_values != (
+            boundary_revision_id,
+            boundary_digest,
+            coverage_revision_id,
+            coverage_digest,
+            boundary_number,
+        ):
+            raise ValueError("analysis boundary confirmation head mismatch")
+        if not any(
+            isinstance(event, dict)
+            and event.get("boundary_revision_id") == boundary_revision_id
+            and event.get("coverage_revision_id") == coverage_revision_id
+            and event.get("boundary_payload_sha256") == boundary_digest
+            and event.get("coverage_payload_sha256") == coverage_digest
+            for event in events
+        ):
+            raise ValueError("analysis boundary confirmation event is missing")
+    elif any(value is not None for value in confirmed_values):
+        raise ValueError("unconfirmed analysis boundary has confirmed head")
+
+    current = _current_analysis_boundary_source_locked(project_id, import_id)
+    is_stale = not (
+        current.get("source") == durable_source
+        and current.get("status") == "READY_FOR_DOSSIERS"
+        and not current.get("is_stale")
+    )
+    public_state = dict(state)
+    public_state["is_stale"] = is_stale
+    public_state["artifact_status"] = "STALE" if is_stale else "CURRENT"
+    public_state["derived_status"] = (
+        "ANALYSIS_BOUNDARY_REQUIRED" if is_stale else effective_status
+    )
+    return {
+        "state": public_state,
+        "boundary_revision": boundary_revision,
+        "coverage_revision": coverage_revision,
+    }
+
+
+def load_analysis_boundary_state(project_id: str) -> dict[str, Any] | None:
+    """Load the verified boundary head with read-time staleness fields."""
+
+    project_id = validate_resource_id(project_id, "project")
+    state_path = _analysis_boundary_state_path(project_id)
+    with _STORE_LOCK:
+        if not state_path.is_file():
+            return None
+        with _mapping_process_lock(project_id):
+            state = _read_json(state_path)
+            if state is None:
+                return None
+            return _load_analysis_boundary_head_locked(state)["state"]
+
+
+def load_analysis_boundary_revision(
+    project_id: str, boundary_revision_id: str
+) -> dict[str, Any] | None:
+    project_id = validate_resource_id(project_id, "project")
+    boundary_revision_id = validate_resource_id(
+        boundary_revision_id, "boundary"
+    )
+    with _STORE_LOCK:
+        if not _safe_child("projects", project_id).is_dir():
+            return None
+        with _mapping_process_lock(project_id):
+            revision = _read_json(
+                _analysis_boundary_revision_path(
+                    project_id, boundary_revision_id
+                )
+            )
+            if revision is not None:
+                loaded_id, _, _, _ = _require_analysis_boundary_revision(
+                    revision, project_id=project_id
+                )
+                if loaded_id != boundary_revision_id:
+                    raise ValueError("analysis boundary revision path mismatch")
+            return revision
+
+
+def load_coverage_revision(
+    project_id: str, coverage_revision_id: str
+) -> dict[str, Any] | None:
+    project_id = validate_resource_id(project_id, "project")
+    coverage_revision_id = validate_resource_id(
+        coverage_revision_id, "coverage"
+    )
+    with _STORE_LOCK:
+        if not _safe_child("projects", project_id).is_dir():
+            return None
+        with _mapping_process_lock(project_id):
+            revision = _read_json(
+                _coverage_revision_path(project_id, coverage_revision_id)
+            )
+            if revision is not None:
+                loaded_id, _, _, _, _, _ = _require_coverage_revision(
+                    revision, project_id=project_id
+                )
+                if loaded_id != coverage_revision_id:
+                    raise ValueError("coverage revision path mismatch")
+            return revision
+
+
+def load_current_analysis_boundary_bundle(
+    project_id: str, import_id: str
+) -> dict[str, Any] | None:
+    """Load the current pair after the service has checked ownership."""
+
+    project_id = validate_resource_id(project_id, "project")
+    import_id = validate_resource_id(import_id, "import")
+    state_path = _analysis_boundary_state_path(project_id)
+    with _STORE_LOCK:
+        if not state_path.is_file():
+            return None
+        with _mapping_process_lock(project_id):
+            state = _read_json(state_path)
+            if state is None:
+                return None
+            if state.get("import_id") != import_id:
+                raise ValueError("analysis boundary state import mismatch")
+            return _load_analysis_boundary_head_locked(state)
+
+
+def _write_or_reuse_analysis_boundary_revision(
+    path: Path,
+    incoming: dict[str, Any],
+    *,
+    project_id: str,
+    import_id: str,
+    request_fingerprint: str,
+) -> dict[str, Any]:
+    existing = _read_json(path)
+    if existing is None:
+        _atomic_write_json(path, incoming)
+        return incoming
+    _require_analysis_boundary_revision(
+        existing, project_id=project_id, import_id=import_id
+    )
+    if existing.get("request_fingerprint") != request_fingerprint:
+        raise FileExistsError("analysis boundary revision identity collision")
+    return existing
+
+
+def _write_or_reuse_coverage_revision(
+    path: Path,
+    incoming: dict[str, Any],
+    *,
+    project_id: str,
+    import_id: str,
+    request_fingerprint: str,
+) -> dict[str, Any]:
+    existing = _read_json(path)
+    if existing is None:
+        _atomic_write_json(path, incoming)
+        return incoming
+    _require_coverage_revision(
+        existing, project_id=project_id, import_id=import_id
+    )
+    if existing.get("request_fingerprint") != request_fingerprint:
+        raise FileExistsError("coverage revision identity collision")
+    return existing
+
+
+def _require_confirmable_analysis_boundary_pair(
+    boundary_revision: dict[str, Any],
+    coverage_revision: dict[str, Any],
+) -> None:
+    boundary = boundary_revision.get("analysis_boundary")
+    if not isinstance(boundary, dict) or boundary.get("status") != "confirmed":
+        raise ValueError("analysis boundary payload is not confirmed")
+    coverage = coverage_revision.get("coverage_preview")
+    if not isinstance(coverage, dict):
+        raise ValueError("coverage preview must be an object")
+    coverage_source = coverage.get("source")
+    if not isinstance(coverage_source, dict):
+        raise ValueError("coverage source must be an object")
+    if coverage_source.get("analysis_boundary_sha256") != (
+        _canonical_payload_sha256(boundary)
+    ):
+        raise ValueError("coverage is not bound to the confirmed boundary")
+    rows = coverage.get("rows")
+    if not isinstance(rows, list) or any(
+        not isinstance(row, dict) for row in rows
+    ):
+        raise ValueError("coverage rows must be a list of objects")
+    if any(row.get("review_status") == "proposed" for row in rows):
+        raise ValueError("confirmed coverage still contains proposed rows")
+
+
+def save_analysis_boundary_bundle_cas(
+    *,
+    project_id: str,
+    import_id: str,
+    base_boundary_revision_id: str | None,
+    base_coverage_revision_id: str | None,
+    boundary_revision: dict[str, Any],
+    coverage_revision: dict[str, Any],
+    request_fingerprint: str,
+    updated_at: str,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Atomically advance the immutable boundary/coverage revision pair."""
+
+    project_id = validate_resource_id(project_id, "project")
+    import_id = validate_resource_id(import_id, "import")
+    if base_boundary_revision_id is not None:
+        base_boundary_revision_id = validate_resource_id(
+            base_boundary_revision_id, "boundary"
+        )
+    if base_coverage_revision_id is not None:
+        base_coverage_revision_id = validate_resource_id(
+            base_coverage_revision_id, "coverage"
+        )
+    if (base_boundary_revision_id is None) != (
+        base_coverage_revision_id is None
+    ):
+        raise ValueError("boundary and coverage bases must be supplied together")
+    request_fingerprint = str(request_fingerprint or "")
+    if not _SHA256_RE.fullmatch(request_fingerprint):
+        raise ValueError("invalid analysis boundary request fingerprint")
+    if not str(updated_at or "").strip():
+        raise ValueError("analysis boundary checkpoint timestamp is required")
+
+    incoming_boundary = dict(boundary_revision)
+    incoming_coverage = dict(coverage_revision)
+    if (
+        incoming_boundary.get("request_fingerprint") != request_fingerprint
+        or incoming_coverage.get("request_fingerprint") != request_fingerprint
+    ):
+        raise ValueError("analysis boundary request fingerprint mismatch")
+    (
+        boundary_revision_id,
+        incoming_boundary_number,
+        boundary_source,
+        boundary_digest,
+    ) = _require_analysis_boundary_revision(
+        incoming_boundary, project_id=project_id, import_id=import_id
+    )
+    (
+        coverage_revision_id,
+        incoming_coverage_number,
+        coverage_source,
+        _,
+        coverage_boundary_id,
+        coverage_boundary_digest,
+    ) = _require_coverage_revision(
+        incoming_coverage, project_id=project_id, import_id=import_id
+    )
+    if (
+        boundary_source != coverage_source
+        or coverage_boundary_id != boundary_revision_id
+        or coverage_boundary_digest != boundary_digest
+    ):
+        raise ValueError("analysis boundary and coverage revisions are not aligned")
+
+    state_path = _analysis_boundary_state_path(project_id)
+    with _STORE_LOCK:
+        with _mapping_process_lock(project_id):
+            _require_current_analysis_boundary_input_locked(
+                project_id=project_id,
+                import_id=import_id,
+                expected_source=boundary_source,
+            )
+            state = _read_json(state_path)
+            current_bundle: dict[str, Any] | None = None
+            if state is not None:
+                if state.get("import_id") != import_id:
+                    raise ValueError("analysis boundary state import mismatch")
+                current_bundle = _load_analysis_boundary_head_locked(state)
+                durable_state = current_bundle["state"]
+                current_boundary_id = str(
+                    durable_state.get("current_boundary_revision_id") or ""
+                )
+                current_coverage_id = str(
+                    durable_state.get("current_coverage_revision_id") or ""
+                )
+                if (
+                    not durable_state.get("is_stale")
+                    and durable_state.get("current_request_fingerprint")
+                    == request_fingerprint
+                    and current_boundary_id == boundary_revision_id
+                    and current_coverage_id == coverage_revision_id
+                ):
+                    return (
+                        current_bundle["boundary_revision"],
+                        current_bundle["coverage_revision"],
+                        durable_state,
+                    )
+            else:
+                current_boundary_id = None
+                current_coverage_id = None
+
+            if (
+                current_boundary_id != base_boundary_revision_id
+                or current_coverage_id != base_coverage_revision_id
+            ):
+                raise FileExistsError("analysis boundary revision conflict")
+            current_number = int(
+                (state or {}).get("current_boundary_revision_number") or 0
+            )
+            expected_number = current_number + 1
+            if (
+                incoming_boundary_number != expected_number
+                or incoming_coverage_number != expected_number
+            ):
+                raise ValueError("invalid boundary/coverage revision sequence")
+
+            durable_boundary = _write_or_reuse_analysis_boundary_revision(
+                _analysis_boundary_revision_path(
+                    project_id, boundary_revision_id
+                ),
+                incoming_boundary,
+                project_id=project_id,
+                import_id=import_id,
+                request_fingerprint=request_fingerprint,
+            )
+            (
+                _,
+                durable_boundary_number,
+                durable_source,
+                durable_boundary_digest,
+            ) = _require_analysis_boundary_revision(
+                durable_boundary, project_id=project_id, import_id=import_id
+            )
+            coverage_to_publish = incoming_coverage
+            if (
+                coverage_to_publish.get("boundary_payload_sha256")
+                != durable_boundary_digest
+            ):
+                coverage_to_publish = dict(coverage_to_publish)
+                coverage_to_publish["boundary_payload_sha256"] = (
+                    durable_boundary_digest
+                )
+                coverage_to_publish["revision_payload_sha256"] = (
+                    coverage_revision_payload_sha256(coverage_to_publish)
+                )
+                (
+                    rebound_coverage_id,
+                    rebound_coverage_number,
+                    rebound_coverage_source,
+                    _,
+                    rebound_boundary_id,
+                    rebound_boundary_digest,
+                ) = _require_coverage_revision(
+                    coverage_to_publish,
+                    project_id=project_id,
+                    import_id=import_id,
+                )
+                if (
+                    rebound_coverage_id != coverage_revision_id
+                    or rebound_coverage_number != incoming_coverage_number
+                    or rebound_coverage_source != boundary_source
+                    or rebound_boundary_id != boundary_revision_id
+                    or rebound_boundary_digest != durable_boundary_digest
+                ):
+                    raise FileExistsError(
+                        "coverage retry could not bind durable boundary"
+                    )
+            durable_coverage = _write_or_reuse_coverage_revision(
+                _coverage_revision_path(project_id, coverage_revision_id),
+                coverage_to_publish,
+                project_id=project_id,
+                import_id=import_id,
+                request_fingerprint=request_fingerprint,
+            )
+            (
+                _,
+                durable_coverage_number,
+                durable_coverage_source,
+                durable_coverage_digest,
+                durable_coverage_boundary_id,
+                durable_coverage_boundary_digest,
+            ) = _require_coverage_revision(
+                durable_coverage, project_id=project_id, import_id=import_id
+            )
+            if (
+                durable_boundary_number != expected_number
+                or durable_coverage_number != expected_number
+                or durable_source != boundary_source
+                or durable_coverage_source != boundary_source
+                or durable_coverage_boundary_id != boundary_revision_id
+                or durable_coverage_boundary_digest != durable_boundary_digest
+            ):
+                raise FileExistsError("durable boundary artifact identity collision")
+
+            history = list((state or {}).get("revision_history") or [])
+            history.append(
+                {
+                    "revision_number": expected_number,
+                    "boundary_revision_id": boundary_revision_id,
+                    "coverage_revision_id": coverage_revision_id,
+                    "boundary_payload_sha256": durable_boundary_digest,
+                    "coverage_payload_sha256": durable_coverage_digest,
+                    "source": durable_source,
+                    "request_fingerprint": request_fingerprint,
+                    "created_at": str(
+                        durable_boundary.get("created_at")
+                        or durable_coverage.get("created_at")
+                        or updated_at
+                    ),
+                }
+            )
+            next_state = {
+                "schema_version": "interview-analysis-boundary-state/1.0",
+                "project_id": project_id,
+                "import_id": import_id,
+                "current_structure_revision_id": durable_source[
+                    "structure_revision_id"
+                ],
+                "current_structure_payload_sha256": durable_source[
+                    "structure_payload_sha256"
+                ],
+                "current_evidence_revision_id": durable_source[
+                    "evidence_revision_id"
+                ],
+                "current_evidence_payload_sha256": durable_source[
+                    "evidence_payload_sha256"
+                ],
+                "current_boundary_revision_number": expected_number,
+                "current_boundary_revision_id": boundary_revision_id,
+                "current_boundary_payload_sha256": durable_boundary_digest,
+                "current_coverage_revision_number": expected_number,
+                "current_coverage_revision_id": coverage_revision_id,
+                "current_coverage_payload_sha256": durable_coverage_digest,
+                "current_request_fingerprint": request_fingerprint,
+                "effective_status": "ANALYSIS_BOUNDARY_REVIEW_REQUIRED",
+                "confirmed_boundary_revision_id": None,
+                "confirmed_boundary_payload_sha256": None,
+                "confirmed_coverage_revision_id": None,
+                "confirmed_coverage_payload_sha256": None,
+                "confirmed_revision_number": None,
+                "revision_history": history,
+                "confirmation_events": list(
+                    (state or {}).get("confirmation_events") or []
+                ),
+                "updated_at": updated_at,
+            }
+            next_state["state_payload_sha256"] = (
+                analysis_boundary_state_payload_sha256(next_state)
+            )
+            _atomic_write_json(state_path, next_state)
+            verified = _load_analysis_boundary_head_locked(next_state)
+            return (
+                durable_boundary,
+                durable_coverage,
+                verified["state"],
+            )
+
+
+def confirm_analysis_boundary_cas(
+    *,
+    project_id: str,
+    import_id: str,
+    boundary_revision_id: str,
+    coverage_revision_id: str,
+    boundary_payload_sha256: str,
+    coverage_payload_sha256: str,
+    confirmed_by: str,
+    confirmed_at: str,
+) -> dict[str, Any]:
+    """Confirm exactly the current, non-stale boundary/coverage head pair."""
+
+    project_id = validate_resource_id(project_id, "project")
+    import_id = validate_resource_id(import_id, "import")
+    boundary_revision_id = validate_resource_id(
+        boundary_revision_id, "boundary"
+    )
+    coverage_revision_id = validate_resource_id(
+        coverage_revision_id, "coverage"
+    )
+    boundary_payload_sha256 = str(boundary_payload_sha256 or "")
+    coverage_payload_sha256 = str(coverage_payload_sha256 or "")
+    if not _SHA256_RE.fullmatch(boundary_payload_sha256):
+        raise ValueError("invalid boundary confirmation digest")
+    if not _SHA256_RE.fullmatch(coverage_payload_sha256):
+        raise ValueError("invalid coverage confirmation digest")
+    if not str(confirmed_by or "").strip():
+        raise ValueError("analysis boundary confirmer is required")
+    if not str(confirmed_at or "").strip():
+        raise ValueError("analysis boundary confirmation timestamp is required")
+
+    state_path = _analysis_boundary_state_path(project_id)
+    with _STORE_LOCK:
+        with _mapping_process_lock(project_id):
+            state = _read_json(state_path)
+            if state is None:
+                raise FileNotFoundError("analysis boundary state does not exist")
+            if state.get("import_id") != import_id:
+                raise ValueError("analysis boundary state import mismatch")
+            bundle = _load_analysis_boundary_head_locked(state)
+            public_state = bundle["state"]
+            _require_confirmable_analysis_boundary_pair(
+                bundle["boundary_revision"], bundle["coverage_revision"]
+            )
+            expected_source = _durable_analysis_boundary_source(state)
+            _require_current_analysis_boundary_input_locked(
+                project_id=project_id,
+                import_id=import_id,
+                expected_source=expected_source,
+            )
+            if (
+                public_state.get("current_boundary_revision_id")
+                != boundary_revision_id
+                or public_state.get("current_coverage_revision_id")
+                != coverage_revision_id
+                or public_state.get("current_boundary_payload_sha256")
+                != boundary_payload_sha256
+                or public_state.get("current_coverage_payload_sha256")
+                != coverage_payload_sha256
+            ):
+                raise FileExistsError("analysis boundary revision conflict")
+            if (
+                public_state.get("effective_status") == "READY_FOR_DOSSIERS"
+                and public_state.get("confirmed_boundary_revision_id")
+                == boundary_revision_id
+                and public_state.get("confirmed_coverage_revision_id")
+                == coverage_revision_id
+            ):
+                return public_state
+
+            events = list(state.get("confirmation_events") or [])
+            events.append(
+                {
+                    "revision_number": int(
+                        state.get("current_boundary_revision_number") or 0
+                    ),
+                    "boundary_revision_id": boundary_revision_id,
+                    "boundary_payload_sha256": boundary_payload_sha256,
+                    "coverage_revision_id": coverage_revision_id,
+                    "coverage_payload_sha256": coverage_payload_sha256,
+                    "confirmed_by": confirmed_by,
+                    "confirmed_at": confirmed_at,
+                }
+            )
+            next_state = dict(state)
+            next_state.update(
+                {
+                    "effective_status": "READY_FOR_DOSSIERS",
+                    "confirmed_boundary_revision_id": boundary_revision_id,
+                    "confirmed_boundary_payload_sha256": (
+                        boundary_payload_sha256
+                    ),
+                    "confirmed_coverage_revision_id": coverage_revision_id,
+                    "confirmed_coverage_payload_sha256": (
+                        coverage_payload_sha256
+                    ),
+                    "confirmed_revision_number": int(
+                        state.get("current_boundary_revision_number") or 0
+                    ),
+                    "confirmation_events": events,
+                    "updated_at": confirmed_at,
+                }
+            )
+            next_state["state_payload_sha256"] = (
+                analysis_boundary_state_payload_sha256(next_state)
+            )
+            _atomic_write_json(state_path, next_state)
+            return _load_analysis_boundary_head_locked(next_state)["state"]

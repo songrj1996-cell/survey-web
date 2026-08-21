@@ -18,6 +18,12 @@ from app.schemas.interview_v2 import (
     InterviewV2ImportResponse,
     InterviewV2UploadAttemptResponse,
 )
+from app.schemas.interview_v2_analysis_boundary import (
+    InterviewV2AnalysisBoundaryConfirmRequest,
+    InterviewV2AnalysisBoundaryPutRequest,
+    InterviewV2AnalysisBoundaryResponse,
+    InterviewV2CoveragePreviewResponse,
+)
 from app.schemas.interview_v2_mapping import (
     InterviewV2GroupMappingConfirmRequest,
     InterviewV2GroupMappingDraftRequest,
@@ -42,6 +48,12 @@ from app.services.interview_v2_import_service import (
     get_upload_attempt,
     run_upload_precheck,
     upload_attempt_needs_precheck,
+)
+from app.services.interview_v2_analysis_boundary_service import (
+    confirm_analysis_boundary,
+    get_analysis_boundary,
+    get_coverage_preview,
+    save_analysis_boundary,
 )
 from app.services.interview_v2_mapping_service import (
     confirm_group_mapping,
@@ -228,6 +240,23 @@ def _structure_request_error(
             else "结构复核请求格式无效。"
         ),
         suggested_action="review_structure_request",
+        context={"limit_bytes": _STRUCTURE_JSON_MAX_BYTES} if too_large else {},
+    )
+
+
+def _analysis_boundary_request_error(
+    request: Request, *, too_large: bool = False
+) -> JSONResponse:
+    return _error_response(
+        request,
+        status_code=413 if too_large else 422,
+        code="ANALYSIS_BOUNDARY_REQUEST_INVALID",
+        message=(
+            "分析边界请求超过 1MB 上限。"
+            if too_large
+            else "分析边界请求格式无效。"
+        ),
+        suggested_action="review_analysis_boundary",
         context={"limit_bytes": _STRUCTURE_JSON_MAX_BYTES} if too_large else {},
     )
 
@@ -751,6 +780,140 @@ async def get_interview_evidence_context(evidence_id: str, request: Request):
     try:
         return await run_in_threadpool(
             get_evidence_context, evidence_id, login
+        )
+    except InterviewV2ImportError as exc:
+        return _service_error_response(request, exc)
+
+
+@router.get(
+    "/api/v1/interview-imports/{import_id}/analysis-boundary",
+    response_model=InterviewV2AnalysisBoundaryResponse,
+    responses={
+        400: {"model": InterviewV2ErrorResponse},
+        403: {"description": "沿用平台现有功能权限错误响应"},
+        404: {"model": InterviewV2ErrorResponse},
+        409: {"model": InterviewV2ErrorResponse},
+        422: {"model": InterviewV2ErrorResponse},
+        500: {"model": InterviewV2ErrorResponse},
+        503: {"model": InterviewV2ErrorResponse},
+    },
+)
+async def get_interview_analysis_boundary(import_id: str, request: Request):
+    login = await _require_feature(request, "interview")
+    if not INTERVIEW_V2_ENABLED:
+        return _disabled_response(request)
+    try:
+        return await run_in_threadpool(
+            get_analysis_boundary, import_id, login
+        )
+    except InterviewV2ImportError as exc:
+        return _service_error_response(request, exc)
+
+
+@router.put(
+    "/api/v1/interview-imports/{import_id}/analysis-boundary",
+    response_model=InterviewV2AnalysisBoundaryResponse,
+    responses={
+        400: {"model": InterviewV2ErrorResponse},
+        403: {"description": "沿用平台现有功能权限错误响应"},
+        404: {"model": InterviewV2ErrorResponse},
+        409: {"model": InterviewV2ErrorResponse},
+        413: {"model": InterviewV2ErrorResponse},
+        422: {"model": InterviewV2ErrorResponse},
+        500: {"model": InterviewV2ErrorResponse},
+        503: {"model": InterviewV2ErrorResponse},
+    },
+)
+async def put_interview_analysis_boundary(import_id: str, request: Request):
+    login = await _require_feature(request, "interview")
+    if not INTERVIEW_V2_ENABLED:
+        return _disabled_response(request)
+    try:
+        raw = await _read_structure_json(request)
+        payload = InterviewV2AnalysisBoundaryPutRequest.model_validate(
+            raw
+        ).model_dump(mode="json")
+    except OverflowError:
+        return _analysis_boundary_request_error(request, too_large=True)
+    except (
+        json.JSONDecodeError,
+        UnicodeDecodeError,
+        ValidationError,
+        ValueError,
+        RecursionError,
+    ):
+        return _analysis_boundary_request_error(request)
+    try:
+        return await run_in_threadpool(
+            save_analysis_boundary, import_id, payload, login
+        )
+    except InterviewV2ImportError as exc:
+        return _service_error_response(request, exc)
+
+
+@router.post(
+    "/api/v1/interview-imports/{import_id}/analysis-boundary:confirm",
+    response_model=InterviewV2AnalysisBoundaryResponse,
+    responses={
+        400: {"model": InterviewV2ErrorResponse},
+        403: {"description": "沿用平台现有功能权限错误响应"},
+        404: {"model": InterviewV2ErrorResponse},
+        409: {"model": InterviewV2ErrorResponse},
+        413: {"model": InterviewV2ErrorResponse},
+        422: {"model": InterviewV2ErrorResponse},
+        500: {"model": InterviewV2ErrorResponse},
+        503: {"model": InterviewV2ErrorResponse},
+    },
+)
+async def confirm_interview_analysis_boundary(
+    import_id: str, request: Request
+):
+    login = await _require_feature(request, "interview")
+    if not INTERVIEW_V2_ENABLED:
+        return _disabled_response(request)
+    try:
+        raw = await _read_structure_json(request)
+        payload = InterviewV2AnalysisBoundaryConfirmRequest.model_validate(
+            raw
+        ).model_dump(mode="json")
+    except OverflowError:
+        return _analysis_boundary_request_error(request, too_large=True)
+    except (
+        json.JSONDecodeError,
+        UnicodeDecodeError,
+        ValidationError,
+        ValueError,
+        RecursionError,
+    ):
+        return _analysis_boundary_request_error(request)
+    try:
+        return await run_in_threadpool(
+            confirm_analysis_boundary, import_id, payload, login
+        )
+    except InterviewV2ImportError as exc:
+        return _service_error_response(request, exc)
+
+
+@router.get(
+    "/api/v1/interview-imports/{import_id}/coverage-preview",
+    response_model=InterviewV2CoveragePreviewResponse,
+    responses={
+        400: {"model": InterviewV2ErrorResponse},
+        403: {"description": "沿用平台现有功能权限错误响应"},
+        404: {"model": InterviewV2ErrorResponse},
+        409: {"model": InterviewV2ErrorResponse},
+        422: {"model": InterviewV2ErrorResponse},
+        500: {"model": InterviewV2ErrorResponse},
+        503: {"model": InterviewV2ErrorResponse},
+    },
+)
+async def get_interview_coverage_preview(import_id: str, request: Request):
+    login = await _require_feature(request, "interview")
+    if not INTERVIEW_V2_ENABLED:
+        return _disabled_response(request)
+    try:
+        return await run_in_threadpool(
+            get_coverage_preview, import_id, login
         )
     except InterviewV2ImportError as exc:
         return _service_error_response(request, exc)

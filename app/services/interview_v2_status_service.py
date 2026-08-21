@@ -15,6 +15,10 @@ _STRUCTURE_STATUSES = {
     "STRUCTURE_REVIEW_REQUIRED",
     "READY_FOR_DOSSIERS",
 }
+_ANALYSIS_BOUNDARY_STATUSES = {
+    "ANALYSIS_BOUNDARY_REVIEW_REQUIRED",
+    "READY_FOR_DOSSIERS",
+}
 
 
 def get_interview_import_with_structure_status(
@@ -62,5 +66,43 @@ def get_interview_import_with_structure_status(
             suggested_action="retry_structure_request",
         )
 
-    public["status"] = status
+    if status != "READY_FOR_DOSSIERS":
+        public["status"] = status
+        return public
+
+    try:
+        boundary_state = store.load_analysis_boundary_state(
+            str(public.get("project_id") or "")
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        raise InterviewV2ImportError(
+            status_code=500,
+            code="ANALYSIS_BOUNDARY_PERSISTENCE_FAILED",
+            message="分析边界状态读取失败，请稍后重试。",
+            retryable=True,
+            suggested_action="retry_analysis_boundary_request",
+        ) from exc
+
+    if boundary_state is None or bool(boundary_state.get("is_stale")):
+        public["status"] = "ANALYSIS_BOUNDARY_REQUIRED"
+        return public
+
+    boundary_status = str(
+        boundary_state.get("derived_status")
+        or boundary_state.get("effective_status")
+        or ""
+    )
+    if boundary_status == "ANALYSIS_BOUNDARY_REQUIRED":
+        public["status"] = boundary_status
+        return public
+    if boundary_status not in _ANALYSIS_BOUNDARY_STATUSES:
+        raise InterviewV2ImportError(
+            status_code=500,
+            code="ANALYSIS_BOUNDARY_PERSISTENCE_FAILED",
+            message="分析边界状态校验失败，请稍后重试。",
+            retryable=True,
+            suggested_action="retry_analysis_boundary_request",
+        )
+
+    public["status"] = boundary_status
     return public

@@ -2,6 +2,9 @@
 
 const IV_V2_FILE_CONTRACT_VERSION = 'interview-file-contract/1.0-draft';
 const IV_V2_POLL_INTERVAL_MS = 1800;
+const IV_V2_SOURCE_SCOPE_TYPES = ['interview_body', 'participant_background', 'excluded'];
+const IV_V2_LABEL_SCOPE_MODES = ['disabled', 'all_analysis', 'selected_modules', 'selected_evaluation_objects'];
+const IV_V2_BOUNDARY_TABS = ['review', 'evaluation_objects', 'analysis_scope', 'coverage'];
 
 const ivV2State = {
   currentStep: 1,
@@ -22,12 +25,20 @@ const ivV2State = {
   restoreBusy: false,
   buildBusy: false,
   reviewBusy: false,
+  boundaryBusy: false,
+  boundaryConfirmBusy: false,
+  coverageBusy: false,
   pendingPoll: 0,
   requestToken: 0,
+  boundaryToken: 0,
+  coverageToken: 0,
   importData: null,
   mappingResponse: null,
   structureResponse: null,
   reviewIssuesResponse: null,
+  boundaryResponse: null,
+  boundaryDraft: null,
+  coverageResponse: null,
   draft: null,
   sheetCatalog: {},
   statusNote: '',
@@ -40,6 +51,14 @@ const ivV2State = {
   evidenceContextCache: {},
   contextBusyIssueId: '',
   contextToken: 0,
+  boundaryTab: 'review',
+  boundaryDirty: false,
+  boundaryConflict: null,
+  boundaryMergeSelection: [],
+  boundaryOccurrenceSelection: {},
+  boundarySplitRows: {},
+  coverageFilter: 'all',
+  selectedCoverageCellKey: '',
 };
 
 function ivV2$(id) {
@@ -76,6 +95,18 @@ function ivV2InvalidateAsync() {
   ivV2ResetPoll();
   ivV2State.contextToken += 1;
   ivV2State.contextBusyIssueId = '';
+  ivV2State.boundaryToken += 1;
+  ivV2State.coverageToken += 1;
+}
+
+function ivV2NextBoundaryToken() {
+  ivV2State.boundaryToken += 1;
+  return ivV2State.boundaryToken;
+}
+
+function ivV2NextCoverageToken() {
+  ivV2State.coverageToken += 1;
+  return ivV2State.coverageToken;
 }
 
 function ivV2OperationBusy() {
@@ -86,6 +117,9 @@ function ivV2OperationBusy() {
     || ivV2State.confirmBusy
     || ivV2State.buildBusy
     || ivV2State.reviewBusy
+    || ivV2State.boundaryBusy
+    || ivV2State.boundaryConfirmBusy
+    || ivV2State.coverageBusy
   );
 }
 
@@ -112,18 +146,29 @@ function ivV2FormatSize(bytes) {
 
 function ivV2StatusTone(status) {
   if (['GROUP_MAPPING_CONFIRMED', 'READY_FOR_DOSSIERS', 'ACCEPTED'].includes(status)) return 'success';
-  if (status === 'STRUCTURE_REVIEW_REQUIRED') return 'warning';
+  if (['STRUCTURE_REVIEW_REQUIRED', 'ANALYSIS_BOUNDARY_REQUIRED', 'ANALYSIS_BOUNDARY_REVIEW_REQUIRED'].includes(status)) return 'warning';
   if (status === 'REJECTED') return 'danger';
   if (status === 'PRECHECKING' || status === 'loading') return 'info';
   return 'warning';
 }
 
 function ivV2HasStructureCheckpoint(status = ivV2State.status) {
-  return ['STRUCTURE_REVIEW_REQUIRED', 'READY_FOR_DOSSIERS'].includes(String(status || ''));
+  return [
+    'STRUCTURE_REVIEW_REQUIRED',
+    'ANALYSIS_BOUNDARY_REQUIRED',
+    'ANALYSIS_BOUNDARY_REVIEW_REQUIRED',
+    'READY_FOR_DOSSIERS',
+  ].includes(String(status || ''));
 }
 
 function ivV2HasConfirmedMapping(status = ivV2State.status) {
-  return ['GROUP_MAPPING_CONFIRMED', 'STRUCTURE_REVIEW_REQUIRED', 'READY_FOR_DOSSIERS'].includes(String(status || ''));
+  return [
+    'GROUP_MAPPING_CONFIRMED',
+    'STRUCTURE_REVIEW_REQUIRED',
+    'ANALYSIS_BOUNDARY_REQUIRED',
+    'ANALYSIS_BOUNDARY_REVIEW_REQUIRED',
+    'READY_FOR_DOSSIERS',
+  ].includes(String(status || ''));
 }
 
 function ivV2CurrentStructureRevisionId() {
@@ -139,6 +184,65 @@ function ivV2CurrentEvidenceRevisionId() {
     ivV2State.structureResponse?.evidence_revision_id
     || ivV2State.reviewIssuesResponse?.evidence_revision_id
     || ''
+  );
+}
+
+function ivV2CurrentBoundaryRevisionId() {
+  return String(ivV2State.boundaryResponse?.boundary_revision_id || '');
+}
+
+function ivV2CurrentCoverageRevisionId() {
+  return String(
+    ivV2State.boundaryResponse?.coverage_revision_id
+    || ivV2State.coverageResponse?.coverage_revision_id
+    || ''
+  );
+}
+
+function ivV2BoundaryConfirmationHeadsReady() {
+  return Boolean(
+    ivV2CurrentBoundaryRevisionId()
+    && ivV2CurrentCoverageRevisionId()
+    && String(ivV2State.boundaryResponse?.boundary_payload_sha256 || '')
+    && String(ivV2State.boundaryResponse?.coverage_payload_sha256 || ivV2State.coverageResponse?.coverage_payload_sha256 || '')
+  );
+}
+
+function ivV2PersistedBoundaryResponseReady(payload) {
+  return Boolean(
+    payload?.boundary_revision_id
+    && payload?.coverage_revision_id
+    && payload?.boundary_payload_sha256
+    && payload?.coverage_payload_sha256
+  );
+}
+
+function ivV2BoundaryHeadSetFromPayload(payload) {
+  const boundarySource = payload?.analysis_boundary?.source || payload?.boundary?.source || {};
+  const coverageSource = payload?.coverage_preview?.source || {};
+  return {
+    structure_revision_id: String(payload?.structure_revision_id || boundarySource.structure_revision_id || coverageSource.structure_revision_id || ''),
+    evidence_revision_id: String(payload?.evidence_revision_id || boundarySource.evidence_revision_id || coverageSource.evidence_revision_id || ''),
+    boundary_revision_id: String(payload?.boundary_revision_id || coverageSource.boundary_revision_id || ''),
+    coverage_revision_id: String(payload?.coverage_revision_id || coverageSource.coverage_revision_id || ''),
+  };
+}
+
+function ivV2BoundaryReferencesCurrentStructure(payload) {
+  const heads = ivV2BoundaryHeadSetFromPayload(payload);
+  return (
+    heads.structure_revision_id === ivV2CurrentStructureRevisionId()
+    && heads.evidence_revision_id === ivV2CurrentEvidenceRevisionId()
+  );
+}
+
+function ivV2CoverageReferencesCurrentBoundary(payload) {
+  const heads = ivV2BoundaryHeadSetFromPayload(payload);
+  const currentBoundary = ivV2BoundaryHeadSetFromPayload(ivV2State.boundaryResponse);
+  return (
+    ivV2BoundaryReferencesCurrentStructure(payload)
+    && heads.boundary_revision_id === currentBoundary.boundary_revision_id
+    && (!currentBoundary.coverage_revision_id || heads.coverage_revision_id === currentBoundary.coverage_revision_id)
   );
 }
 
@@ -222,12 +326,31 @@ function ivV2ClearStatusError() {
   ivV2RenderUploadStatus();
 }
 
+function ivV2ResetAnalysisBoundaryWorkspace({ keepTab = false } = {}) {
+  ivV2State.boundaryToken += 1;
+  ivV2State.coverageToken += 1;
+  ivV2State.boundaryBusy = false;
+  ivV2State.boundaryConfirmBusy = false;
+  ivV2State.coverageBusy = false;
+  ivV2State.boundaryResponse = null;
+  ivV2State.boundaryDraft = null;
+  ivV2State.coverageResponse = null;
+  ivV2State.boundaryDirty = false;
+  ivV2State.boundaryConflict = null;
+  ivV2State.boundaryMergeSelection = [];
+  ivV2State.boundaryOccurrenceSelection = {};
+  ivV2State.boundarySplitRows = {};
+  ivV2State.selectedCoverageCellKey = '';
+  if (!keepTab) ivV2State.boundaryTab = 'review';
+}
+
 function ivV2ResetStructureWorkspace() {
   ivV2State.structureResponse = null;
   ivV2State.reviewIssuesResponse = null;
   ivV2State.selectedIssueId = '';
   ivV2State.issueDrafts = {};
   ivV2InvalidateEvidenceContext();
+  ivV2ResetAnalysisBoundaryWorkspace();
 }
 
 function ivV2InvalidateEvidenceContext() {
@@ -265,7 +388,7 @@ function ivV2RenderStep3Header() {
   }
   if (desc) {
     desc.textContent = ivV2HasStructureCheckpoint()
-      ? '逐项处理结构问题，确认结构树和证据归属；当前阶段只开放复核，不开放玩家档案。'
+      ? '先处理结构问题，再确认被测对象、来源与标签范围，并核对只读覆盖预览。'
       : '确认映射后会自动尝试生成结构复核工作台。若失败，可在此重试或返回映射编辑器。';
   }
   if (previewTitle) previewTitle.textContent = '结构与证据复核工作台';
@@ -282,6 +405,14 @@ function ivV2MarkDirty(note = '当前编辑尚未保存') {
 function ivV2ClearDirty(note = '') {
   ivV2State.draftDirty = false;
   if (note) ivV2State.statusNote = note;
+}
+
+function ivV2HasUnsavedWork() {
+  return Boolean(ivV2State.draftDirty || ivV2State.boundaryDirty);
+}
+
+function ivV2ConfirmDiscardUnsaved(message) {
+  return !ivV2HasUnsavedWork() || window.confirm(message);
 }
 
 function ivV2FocusValue() {
@@ -719,11 +850,15 @@ function ivV2Payload() {
   };
 }
 
-async function ivV2LoadImportBundle(importId, { keepStep = false, token = ivV2NextToken() } = {}) {
+async function ivV2LoadImportBundle(importId, {
+  keepStep = false,
+  token = ivV2NextToken(),
+  resetWorkspace = true,
+} = {}) {
   ivV2State.requestBusy = true;
   ivV2State.status = 'loading';
   ivV2State.loadingMessage = '正在读取预检结果与分组建议';
-  ivV2ResetStructureWorkspace();
+  if (resetWorkspace) ivV2ResetStructureWorkspace();
   ivV2RenderEditor();
   try {
     const [importResp, proposalResp] = await Promise.all([
@@ -769,6 +904,18 @@ async function ivV2LoadImportBundle(importId, { keepStep = false, token = ivV2Ne
   }
 }
 
+async function ivV2RefreshImportBundleFromEditor() {
+  if (!ivV2State.importId || ivV2OperationBusy()) return false;
+  if (!ivV2ConfirmDiscardUnsaved('刷新会丢弃当前未保存的分组映射或分析边界改动，确定继续吗？')) return false;
+  try {
+    await ivV2LoadImportBundle(ivV2State.importId, { keepStep: true });
+    return true;
+  } catch (error) {
+    ivV2ShowToastFromError(error, '刷新失败');
+    return false;
+  }
+}
+
 function ivV2SchedulePoll(token) {
   ivV2ResetPoll();
   ivV2State.pendingPoll = window.setTimeout(() => {
@@ -807,7 +954,7 @@ async function ivV2PollAttempt(token = ivV2State.requestToken) {
     ivV2State.importId = String(data.import_id || '');
     ivV2State.projectId = String(data.project_id || '');
     ivV2State.workbookRevisionId = String(data.workbook_revision_id || '');
-    await ivV2LoadImportBundle(data.import_id, { token });
+    await ivV2LoadImportBundle(data.import_id, { token, resetWorkspace: false });
     if (ivV2IsTokenCurrent(token)) showToast('预检完成，请确认分组与玩家绑定', 'success');
     return;
   }
@@ -837,6 +984,7 @@ async function ivV2StartImport() {
     showToast('本次研究重点不能超过 4000 字', 'error');
     return;
   }
+  if (!ivV2ConfirmDiscardUnsaved('重新上传会丢弃当前未保存的分组映射或分析边界改动，确定继续吗？')) return;
 
   ivV2InvalidateAsync();
   const token = ivV2State.requestToken;
@@ -849,6 +997,7 @@ async function ivV2StartImport() {
   ivV2State.draft = null;
   ivV2State.sheetCatalog = {};
   ivV2State.statusNote = '';
+  ivV2ResetStructureWorkspace();
   ivV2ClearDirty();
   ivV2State.requestBusy = true;
   ivV2State.status = 'uploading';
@@ -904,7 +1053,7 @@ async function ivV2StartImport() {
       ivV2State.importId = String(data.import_id || '');
       ivV2State.projectId = String(data.project_id || '');
       ivV2State.workbookRevisionId = String(data.workbook_revision_id || '');
-      await ivV2LoadImportBundle(data.import_id, { token });
+      await ivV2LoadImportBundle(data.import_id, { token, resetWorkspace: false });
       if (ivV2IsTokenCurrent(token)) showToast('预检完成，请确认分组与玩家绑定', 'success');
       return;
     }
@@ -1396,6 +1545,538 @@ function ivV2Occurrences() {
     : [];
 }
 
+function ivV2MakeResourceId(prefix) {
+  const suffix = window.crypto?.randomUUID
+    ? window.crypto.randomUUID().replaceAll('-', '')
+    : Array.from({ length: 32 }, () => Math.floor(Math.random() * 16).toString(16)).join('');
+  return `${prefix}_${suffix}`;
+}
+
+function ivV2BoundaryText(value) {
+  return String(value ?? '').normalize('NFC').trim();
+}
+
+function ivV2BoundarySource(response = ivV2State.boundaryResponse) {
+  const proposal = response?.proposal;
+  if (response?.analysis_boundary && typeof response.analysis_boundary === 'object') return response.analysis_boundary;
+  if (response?.boundary && typeof response.boundary === 'object') return response.boundary;
+  if (proposal?.analysis_boundary && typeof proposal.analysis_boundary === 'object') return proposal.analysis_boundary;
+  if (proposal?.boundary && typeof proposal.boundary === 'object') return proposal.boundary;
+  if (proposal && typeof proposal === 'object') return proposal;
+  return {};
+}
+
+function ivV2BuildBoundaryDraft(response) {
+  const source = ivV2BoundarySource(response);
+  const evaluationObjects = Array.isArray(source.evaluation_objects) ? source.evaluation_objects : [];
+  const sourceRules = Array.isArray(source.source_scope_rules) ? source.source_scope_rules : [];
+  const labelRules = Array.isArray(source.label_scope_rules) ? source.label_scope_rules : [];
+  return {
+    evaluation_objects: evaluationObjects.map((item, index) => ({
+      evaluation_object_id: String(item.evaluation_object_id || ivV2MakeResourceId('evaluation')),
+      module_id: String(item.module_id || ''),
+      parent_evaluation_object_id: String(item.parent_evaluation_object_id || ''),
+      object_type: String(item.object_type || (item.parent_evaluation_object_id ? 'variant' : 'concept')),
+      display_name: String(item.display_name || `被测对象 ${index + 1}`),
+      display_order: Number.isFinite(Number(item.display_order)) ? Number(item.display_order) : index + 1,
+      main_question_ids: Array.isArray(item.main_question_ids) ? item.main_question_ids.map(String) : [],
+      occurrence_ids: Array.isArray(item.occurrence_ids) ? item.occurrence_ids.map(String) : [],
+      supersedes_evaluation_object_ids: Array.isArray(item.supersedes_evaluation_object_ids)
+        ? item.supersedes_evaluation_object_ids.map(String)
+        : [],
+      decision_status: String(item.decision_status || 'draft'),
+      decision_source: String(item.decision_source || 'user_selection'),
+      _lineage_anchor: true,
+    })),
+    source_scope_rules: sourceRules.map((item, index) => {
+      const compatibleStructureRows = ivV2Occurrences()
+        .filter(occurrence => occurrence.sheet_id === item.sheet_id && Number(occurrence.row) > Number(item.start_row) && Number(occurrence.row) <= Number(item.end_row))
+        .map(occurrence => Number(occurrence.row));
+      return {
+        source_scope_rule_id: String(item.source_scope_rule_id || ivV2MakeResourceId('scope')),
+        group_id: String(item.group_id || ''),
+        sheet_id: String(item.sheet_id || ''),
+        sheet_name: String(item.sheet_name || ivV2SheetName(item.sheet_id) || ''),
+        start_row: Number(item.start_row || 0),
+        end_row: Number(item.end_row || 0),
+        scope_type: String(item.scope_type || 'interview_body'),
+        display_order: Number.isFinite(Number(item.display_order)) ? Number(item.display_order) : index + 1,
+        reason: String(item.reason || ''),
+        allowed_split_rows: Array.isArray(item.allowed_split_rows)
+          ? item.allowed_split_rows.map(Number).filter(Number.isFinite)
+          : [],
+        compatible_structure_rows: Array.isArray(item.allowed_split_rows) ? [] : compatibleStructureRows,
+        decision_status: String(item.decision_status || 'draft'),
+        decision_source: String(item.decision_source || 'user_selection'),
+      };
+    }),
+    label_scope_rules: labelRules.map((item, index) => ({
+      label_scope_rule_id: String(item.label_scope_rule_id || ivV2MakeResourceId('label_scope')),
+      label_key: String(item.label_key || item.label_scope_rule_id || `label_${index + 1}`),
+      label_name: String(item.label_name || item.label_key || `分析标签 ${index + 1}`),
+      scope_mode: String(item.scope_mode || 'disabled'),
+      module_ids: Array.isArray(item.module_ids) ? item.module_ids.map(String) : [],
+      evaluation_object_ids: Array.isArray(item.evaluation_object_ids) ? item.evaluation_object_ids.map(String) : [],
+      reason: String(item.reason || ''),
+      decision_status: String(item.decision_status || 'draft'),
+      decision_source: String(item.decision_source || 'user_selection'),
+    })),
+    coverage_overrides: Array.isArray(source.coverage_overrides)
+      ? source.coverage_overrides.map(item => ({ ...item }))
+      : [],
+  };
+}
+
+function ivV2EvaluationObjectKey(item) {
+  return String(item?.evaluation_object_id || '');
+}
+
+function ivV2EvaluationObjectIsActive(item) {
+  return Boolean(item && item.decision_status !== 'superseded');
+}
+
+function ivV2ActiveEvaluationObjects() {
+  return (ivV2State.boundaryDraft?.evaluation_objects || []).filter(ivV2EvaluationObjectIsActive);
+}
+
+function ivV2EvaluationObjectCanChangeStructure(item) {
+  return Boolean(ivV2EvaluationObjectIsActive(item) && item._lineage_anchor === true);
+}
+
+function ivV2SourceScopeRuleKey(item) {
+  return String(item?.source_scope_rule_id || '');
+}
+
+function ivV2LabelScopeRuleKey(item) {
+  return String(item?.label_scope_rule_id || item?.label_key || '');
+}
+
+function ivV2FindEvaluationObject(key) {
+  return (ivV2State.boundaryDraft?.evaluation_objects || [])
+    .find(item => ivV2EvaluationObjectKey(item) === String(key || '')) || null;
+}
+
+function ivV2FindSourceScopeRule(key) {
+  return (ivV2State.boundaryDraft?.source_scope_rules || [])
+    .find(item => ivV2SourceScopeRuleKey(item) === String(key || '')) || null;
+}
+
+function ivV2FindLabelScopeRule(key) {
+  return (ivV2State.boundaryDraft?.label_scope_rules || [])
+    .find(item => ivV2LabelScopeRuleKey(item) === String(key || '')) || null;
+}
+
+function ivV2MarkBoundaryDirty(note = '分析边界有未保存改动', { render = true } = {}) {
+  ivV2State.boundaryDirty = true;
+  ivV2State.coverageResponse = null;
+  ivV2State.selectedCoverageCellKey = '';
+  ivV2State.statusNote = note;
+  if (render) ivV2RenderConfirmed();
+  else ivV2SyncConfirmedControls();
+}
+
+function ivV2ClearBoundaryDirty(note = '') {
+  ivV2State.boundaryDirty = false;
+  if (note) ivV2State.statusNote = note;
+}
+
+function ivV2NormalizeEvaluationOrder() {
+  const objects = ivV2ActiveEvaluationObjects();
+  const siblingGroups = new Map();
+  objects.forEach(item => {
+    const key = `${item.module_id}\u241f${item.parent_evaluation_object_id || ''}`;
+    if (!siblingGroups.has(key)) siblingGroups.set(key, []);
+    siblingGroups.get(key).push(item);
+  });
+  siblingGroups.forEach(items => {
+    items
+      .sort((left, right) => Number(left.display_order || 0) - Number(right.display_order || 0))
+      .forEach((item, index) => { item.display_order = index + 1; });
+  });
+}
+
+function ivV2MainQuestionIdsForOccurrences(occurrenceIds) {
+  const selected = new Set((occurrenceIds || []).map(String));
+  return Array.from(new Set(
+    ivV2Occurrences()
+      .filter(item => selected.has(String(item.occurrence_id)) && item.canonical_main_question_id)
+      .map(item => String(item.canonical_main_question_id))
+  ));
+}
+
+function ivV2MoveEvaluationObject(key, offset) {
+  const item = ivV2FindEvaluationObject(key);
+  if (!ivV2EvaluationObjectIsActive(item) || !offset) return;
+  const siblings = ivV2ActiveEvaluationObjects()
+    .filter(candidate => (
+      candidate.module_id === item.module_id
+      && String(candidate.parent_evaluation_object_id || '') === String(item.parent_evaluation_object_id || '')
+    ))
+    .sort((left, right) => Number(left.display_order || 0) - Number(right.display_order || 0));
+  const currentIndex = siblings.indexOf(item);
+  const targetIndex = currentIndex + offset;
+  if (currentIndex < 0 || targetIndex < 0 || targetIndex >= siblings.length) return;
+  const target = siblings[targetIndex];
+  const previousOrder = item.display_order;
+  item.display_order = target.display_order;
+  target.display_order = previousOrder;
+  ivV2NormalizeEvaluationOrder();
+  ivV2MarkBoundaryDirty('已调整被测对象顺序');
+}
+
+function ivV2SplitEvaluationObject(key) {
+  const item = ivV2FindEvaluationObject(key);
+  const selected = new Set((ivV2State.boundaryOccurrenceSelection[key] || []).map(String));
+  const selectedOccurrences = (item?.occurrence_ids || []).filter(id => selected.has(String(id)));
+  const remainingOccurrences = (item?.occurrence_ids || []).filter(id => !selected.has(String(id)));
+  if (!item || selectedOccurrences.length === 0 || remainingOccurrences.length === 0) {
+    showToast('拆分时需至少选择一行，并为原对象保留至少一行', 'info');
+    return;
+  }
+  if (!ivV2EvaluationObjectCanChangeStructure(item)) {
+    showToast('该对象是本地新建结果，请先保存版本后再继续拆分', 'info');
+    return;
+  }
+  if (ivV2ActiveEvaluationObjects().some(candidate => candidate.parent_evaluation_object_id === item.evaluation_object_id)) {
+    showToast('包含 variant 的父对象不能直接拆分，请先处理其子方案', 'error');
+    return;
+  }
+  const objects = ivV2State.boundaryDraft.evaluation_objects;
+  const supersedes = item.evaluation_object_id ? [item.evaluation_object_id] : [];
+  const base = {
+    module_id: item.module_id,
+    parent_evaluation_object_id: item.parent_evaluation_object_id || '',
+    object_type: item.object_type,
+    supersedes_evaluation_object_ids: supersedes,
+    decision_status: 'draft',
+    decision_source: 'user_selection',
+    _lineage_anchor: false,
+  };
+  const left = {
+    ...base,
+    evaluation_object_id: ivV2MakeResourceId('evaluation'),
+    display_name: `${ivV2BoundaryText(item.display_name) || '被测对象'} A`,
+    display_order: Number(item.display_order || 1),
+    main_question_ids: ivV2MainQuestionIdsForOccurrences(remainingOccurrences),
+    occurrence_ids: remainingOccurrences,
+  };
+  const right = {
+    ...base,
+    evaluation_object_id: ivV2MakeResourceId('evaluation'),
+    display_name: `${ivV2BoundaryText(item.display_name) || '被测对象'} B`,
+    display_order: Number(item.display_order || 1) + 0.5,
+    main_question_ids: ivV2MainQuestionIdsForOccurrences(selectedOccurrences),
+    occurrence_ids: selectedOccurrences,
+  };
+  item.decision_status = 'superseded';
+  objects.push(left, right);
+  (ivV2State.boundaryDraft.label_scope_rules || []).forEach(rule => {
+    if (rule.scope_mode !== 'selected_evaluation_objects' || !(rule.evaluation_object_ids || []).includes(item.evaluation_object_id)) return;
+    rule.evaluation_object_ids = Array.from(new Set(
+      rule.evaluation_object_ids
+        .filter(id => id !== item.evaluation_object_id)
+        .concat([left.evaluation_object_id, right.evaluation_object_id])
+    ));
+  });
+  delete ivV2State.boundaryOccurrenceSelection[key];
+  ivV2State.boundaryMergeSelection = ivV2State.boundaryMergeSelection.filter(id => id !== key);
+  ivV2NormalizeEvaluationOrder();
+  ivV2MarkBoundaryDirty('已拆分被测对象，请确认名称和顺序');
+}
+
+function ivV2MergeEvaluationObjects() {
+  const selectedKeys = new Set(ivV2State.boundaryMergeSelection.map(String));
+  const selected = ivV2ActiveEvaluationObjects()
+    .filter(item => selectedKeys.has(ivV2EvaluationObjectKey(item)));
+  if (selected.length < 2) {
+    showToast('请至少选择两个被测对象', 'info');
+    return;
+  }
+  const first = selected[0];
+  if (selected.some(item => (
+    item.module_id !== first.module_id
+    || String(item.parent_evaluation_object_id || '') !== String(first.parent_evaluation_object_id || '')
+    || item.object_type !== first.object_type
+  ))) {
+    showToast('只能合并同一模块、同一父级且类型相同的被测对象', 'error');
+    return;
+  }
+  if (selected.some(item => !ivV2EvaluationObjectCanChangeStructure(item))) {
+    showToast('本地新建对象需先保存版本，才能继续合并', 'info');
+    return;
+  }
+  const selectedIds = new Set(selected.map(item => item.evaluation_object_id));
+  if (ivV2ActiveEvaluationObjects().some(item => selectedIds.has(item.parent_evaluation_object_id))) {
+    showToast('包含 variant 的父对象不能直接合并，请先处理其子方案', 'error');
+    return;
+  }
+  const selectedObjectIds = selected.map(item => item.evaluation_object_id).filter(Boolean);
+  const selectedOccurrenceIds = Array.from(new Set(selected.flatMap(item => item.occurrence_ids || []).map(String)));
+  const next = {
+    evaluation_object_id: ivV2MakeResourceId('evaluation'),
+    module_id: first.module_id,
+    parent_evaluation_object_id: first.parent_evaluation_object_id || '',
+    object_type: first.object_type,
+    display_name: selected.map(item => ivV2BoundaryText(item.display_name)).filter(Boolean).join(' + ').slice(0, 300) || '合并被测对象',
+    display_order: Math.min(...selected.map(item => Number(item.display_order || 1))),
+    main_question_ids: Array.from(new Set(selected.flatMap(item => item.main_question_ids || []).map(String))),
+    occurrence_ids: selectedOccurrenceIds,
+    supersedes_evaluation_object_ids: selectedObjectIds,
+    decision_status: 'draft',
+    decision_source: 'user_selection',
+    _lineage_anchor: false,
+  };
+  selected.forEach(item => { item.decision_status = 'superseded'; });
+  ivV2State.boundaryDraft.evaluation_objects.push(next);
+  (ivV2State.boundaryDraft.label_scope_rules || []).forEach(rule => {
+    if (rule.scope_mode !== 'selected_evaluation_objects' || !(rule.evaluation_object_ids || []).some(id => selectedIds.has(id))) return;
+    rule.evaluation_object_ids = Array.from(new Set(
+      rule.evaluation_object_ids.filter(id => !selectedIds.has(id)).concat(next.evaluation_object_id)
+    ));
+  });
+  selectedKeys.forEach(key => { delete ivV2State.boundaryOccurrenceSelection[key]; });
+  ivV2State.boundaryMergeSelection = [];
+  ivV2NormalizeEvaluationOrder();
+  ivV2MarkBoundaryDirty('已合并被测对象，请确认新名称');
+}
+
+function ivV2ChangeEvaluationObjectHierarchy(key, parentKey) {
+  const item = ivV2FindEvaluationObject(key);
+  const nextParentId = String(parentKey || '');
+  if (!ivV2EvaluationObjectCanChangeStructure(item)) {
+    showToast('该对象是本地新建结果，请先保存版本后再改变层级', 'info');
+    return;
+  }
+  if (String(item.parent_evaluation_object_id || '') === nextParentId) return;
+  if (ivV2ActiveEvaluationObjects().some(candidate => candidate.parent_evaluation_object_id === item.evaluation_object_id)) {
+    showToast('包含 active variant 的父对象不能改变层级', 'error');
+    return;
+  }
+  const parent = nextParentId ? ivV2FindEvaluationObject(nextParentId) : null;
+  if (nextParentId && (
+    !ivV2EvaluationObjectIsActive(parent)
+    || parent.object_type !== 'concept'
+    || parent.module_id !== item.module_id
+    || parent.evaluation_object_id === item.evaluation_object_id
+  )) {
+    showToast('只能选择同一模块的 active concept 作为父对象', 'error');
+    return;
+  }
+  const next = {
+    evaluation_object_id: ivV2MakeResourceId('evaluation'),
+    module_id: item.module_id,
+    parent_evaluation_object_id: nextParentId,
+    object_type: nextParentId ? 'variant' : 'concept',
+    display_name: item.display_name,
+    display_order: Number(item.display_order || 1),
+    main_question_ids: [...(item.main_question_ids || [])],
+    occurrence_ids: [...(item.occurrence_ids || [])],
+    supersedes_evaluation_object_ids: [item.evaluation_object_id],
+    decision_status: 'draft',
+    decision_source: 'user_selection',
+    _lineage_anchor: false,
+  };
+  item.decision_status = 'superseded';
+  ivV2State.boundaryDraft.evaluation_objects.push(next);
+  (ivV2State.boundaryDraft.label_scope_rules || []).forEach(rule => {
+    if (rule.scope_mode !== 'selected_evaluation_objects' || !(rule.evaluation_object_ids || []).includes(item.evaluation_object_id)) return;
+    rule.evaluation_object_ids = Array.from(new Set(
+      rule.evaluation_object_ids
+        .filter(id => id !== item.evaluation_object_id)
+        .concat(next.evaluation_object_id)
+    ));
+  });
+  delete ivV2State.boundaryOccurrenceSelection[key];
+  ivV2State.boundaryMergeSelection = ivV2State.boundaryMergeSelection.filter(id => id !== key);
+  ivV2NormalizeEvaluationOrder();
+  ivV2MarkBoundaryDirty(nextParentId ? '已转换为具体方案，请保存新版本' : '已转换为独立被测对象，请保存新版本');
+}
+
+function ivV2SplitSourceScopeRule(key) {
+  const item = ivV2FindSourceScopeRule(key);
+  const splitRow = Number(ivV2State.boundarySplitRows[key]);
+  const allowed = new Set((item?.allowed_split_rows || []).map(Number));
+  if (!item || !allowed.has(splitRow) || splitRow <= item.start_row || splitRow > item.end_row) {
+    showToast('请选择系统允许的安全分段位置', 'error');
+    return;
+  }
+  const rules = ivV2State.boundaryDraft.source_scope_rules;
+  const index = rules.indexOf(item);
+  const shared = {
+    group_id: item.group_id || '',
+    sheet_id: item.sheet_id,
+    sheet_name: item.sheet_name,
+    scope_type: item.scope_type,
+    reason: item.reason,
+    decision_status: 'draft',
+    decision_source: 'user_selection',
+  };
+  const left = {
+    ...shared,
+    source_scope_rule_id: ivV2MakeResourceId('scope'),
+    start_row: item.start_row,
+    end_row: splitRow - 1,
+    display_order: Number(item.display_order || 1),
+    allowed_split_rows: item.allowed_split_rows.filter(row => Number(row) < splitRow),
+  };
+  const right = {
+    ...shared,
+    source_scope_rule_id: ivV2MakeResourceId('scope'),
+    start_row: splitRow,
+    end_row: item.end_row,
+    display_order: Number(item.display_order || 1) + 1,
+    allowed_split_rows: item.allowed_split_rows.filter(row => Number(row) > splitRow),
+  };
+  rules.splice(index, 1, left, right);
+  rules
+    .sort((a, b) => String(a.sheet_id).localeCompare(String(b.sheet_id)) || Number(a.start_row) - Number(b.start_row))
+    .forEach((rule, ruleIndex) => { rule.display_order = ruleIndex + 1; });
+  delete ivV2State.boundarySplitRows[key];
+  ivV2MarkBoundaryDirty('已按安全边界拆分来源范围');
+}
+
+function ivV2ValidateBoundaryDraft() {
+  const draft = ivV2State.boundaryDraft;
+  if (!draft) return { ok: false, message: '分析边界尚未加载' };
+  const objects = draft.evaluation_objects || [];
+  const objectKeys = new Set();
+  for (const item of objects) {
+    const key = ivV2EvaluationObjectKey(item);
+    if (!key || objectKeys.has(key)) return { ok: false, message: '被测对象 ID 为空或重复' };
+    objectKeys.add(key);
+  }
+  const objectByKey = new Map(objects.map(item => [ivV2EvaluationObjectKey(item), item]));
+  const activeObjectKeys = new Set(objects.filter(ivV2EvaluationObjectIsActive).map(ivV2EvaluationObjectKey));
+  const occurrenceOwners = new Map();
+  for (const item of objects) {
+    const name = ivV2BoundaryText(item.display_name);
+    if (!name || name.length > 300) return { ok: false, message: '每个被测对象必须有 1～300 字名称' };
+    if (!item.module_id) return { ok: false, message: `被测对象“${name}”缺少模块归属` };
+    if (!['concept', 'variant'].includes(item.object_type)) return { ok: false, message: `被测对象“${name}”类型无效` };
+    if (item.object_type === 'concept' && item.parent_evaluation_object_id) return { ok: false, message: `概念“${name}”不能有父级` };
+    if (item.object_type === 'variant' && !item.parent_evaluation_object_id) return { ok: false, message: `Variant“${name}”必须有父级概念` };
+    if (item.parent_evaluation_object_id && !objectKeys.has(item.parent_evaluation_object_id)) {
+      return { ok: false, message: `被测对象“${name}”的父级已不存在` };
+    }
+    if (!ivV2EvaluationObjectIsActive(item)) continue;
+    if (item.object_type === 'variant') {
+      const parent = objectByKey.get(item.parent_evaluation_object_id);
+      if (!ivV2EvaluationObjectIsActive(parent) || parent.object_type !== 'concept' || parent.module_id !== item.module_id) {
+        return { ok: false, message: `Variant“${name}”必须绑定同模块的 active concept` };
+      }
+    }
+    if (!(item.main_question_ids || []).length || !(item.occurrence_ids || []).length) {
+      return { ok: false, message: `被测对象“${name}”至少需要一个主问题和一个结构行` };
+    }
+    if (new Set(item.main_question_ids || []).size !== (item.main_question_ids || []).length) {
+      return { ok: false, message: `被测对象“${name}”包含重复主问题` };
+    }
+    if (new Set(item.occurrence_ids || []).size !== (item.occurrence_ids || []).length) {
+      return { ok: false, message: `被测对象“${name}”包含重复结构行` };
+    }
+    for (const occurrenceId of item.occurrence_ids || []) {
+      if (occurrenceOwners.has(occurrenceId)) return { ok: false, message: '同一结构行不能同时属于多个被测对象' };
+      occurrenceOwners.set(occurrenceId, ivV2EvaluationObjectKey(item));
+    }
+  }
+  for (const item of objects.filter(ivV2EvaluationObjectIsActive)) {
+    for (const supersededId of item.supersedes_evaluation_object_ids || []) {
+      if (!objectKeys.has(supersededId) || ivV2EvaluationObjectIsActive(objectByKey.get(supersededId))) {
+        return { ok: false, message: '新对象的 supersedes 必须引用已被替代的历史对象' };
+      }
+    }
+  }
+  for (const item of objects.filter(candidate => !ivV2EvaluationObjectIsActive(candidate))) {
+    if (!objects.some(candidate => (candidate.supersedes_evaluation_object_ids || []).includes(item.evaluation_object_id))) {
+      return { ok: false, message: `历史对象“${ivV2BoundaryText(item.display_name)}”缺少替代关系` };
+    }
+  }
+  for (const item of draft.source_scope_rules || []) {
+    if (!IV_V2_SOURCE_SCOPE_TYPES.includes(item.scope_type)) return { ok: false, message: '存在未确认的来源用途' };
+    if (!item.sheet_id || !Number.isInteger(item.start_row) || !Number.isInteger(item.end_row) || item.start_row < 1 || item.end_row < item.start_row) {
+      return { ok: false, message: '来源范围的 Sheet 或行区间无效' };
+    }
+  }
+  for (const item of draft.label_scope_rules || []) {
+    if (!IV_V2_LABEL_SCOPE_MODES.includes(item.scope_mode)) return { ok: false, message: '存在未确认的标签作用域' };
+    if (['disabled', 'all_analysis'].includes(item.scope_mode) && ((item.module_ids || []).length || (item.evaluation_object_ids || []).length)) {
+      return { ok: false, message: `标签“${ivV2BoundaryText(item.label_name)}”的全局/禁用作用域不能保留具体目标` };
+    }
+    if (item.scope_mode === 'selected_modules' && !(item.module_ids || []).length) {
+      return { ok: false, message: `标签“${ivV2BoundaryText(item.label_name)}”尚未选择模块` };
+    }
+    if (item.scope_mode === 'selected_modules' && (item.evaluation_object_ids || []).length) {
+      return { ok: false, message: `标签“${ivV2BoundaryText(item.label_name)}”的模块作用域不能保留被测对象目标` };
+    }
+    if (item.scope_mode === 'selected_evaluation_objects' && !(item.evaluation_object_ids || []).length) {
+      return { ok: false, message: `标签“${ivV2BoundaryText(item.label_name)}”尚未选择被测对象` };
+    }
+    if (item.scope_mode === 'selected_evaluation_objects' && (
+      (item.module_ids || []).length
+      || (item.evaluation_object_ids || []).some(id => !activeObjectKeys.has(id))
+    )) {
+      return { ok: false, message: `标签“${ivV2BoundaryText(item.label_name)}”引用了失效对象` };
+    }
+  }
+  return { ok: true };
+}
+
+function ivV2BoundaryWritePayload() {
+  const draft = ivV2State.boundaryDraft || {};
+  return {
+    base_structure_revision_id: ivV2CurrentStructureRevisionId(),
+    base_evidence_revision_id: ivV2CurrentEvidenceRevisionId(),
+    base_boundary_revision_id: ivV2CurrentBoundaryRevisionId() || null,
+    base_coverage_revision_id: ivV2CurrentCoverageRevisionId() || null,
+    evaluation_objects: (draft.evaluation_objects || []).map(item => ({
+      evaluation_object_id: item.evaluation_object_id,
+      module_id: item.module_id,
+      parent_evaluation_object_id: item.parent_evaluation_object_id || null,
+      object_type: item.object_type,
+      display_name: ivV2BoundaryText(item.display_name),
+      display_order: Number(item.display_order || 1),
+      main_question_ids: (item.main_question_ids || []).map(String),
+      occurrence_ids: (item.occurrence_ids || []).map(String),
+      supersedes_evaluation_object_ids: (item.supersedes_evaluation_object_ids || []).map(String),
+      decision_status: item.decision_status === 'superseded' ? 'superseded' : 'draft',
+      decision_source: 'user_selection',
+    })),
+    source_scope_rules: (draft.source_scope_rules || []).map(item => ({
+      source_scope_rule_id: item.source_scope_rule_id,
+      group_id: item.group_id || null,
+      sheet_id: item.sheet_id,
+      start_row: Number(item.start_row),
+      end_row: Number(item.end_row),
+      scope_type: item.scope_type,
+      display_order: Number(item.display_order || 1),
+      decision_status: 'draft',
+      decision_source: 'user_selection',
+    })),
+    label_scope_rules: (draft.label_scope_rules || []).map(item => ({
+      label_scope_rule_id: item.label_scope_rule_id,
+      label_key: item.label_key,
+      label_name: ivV2BoundaryText(item.label_name),
+      scope_mode: item.scope_mode,
+      module_ids: (item.module_ids || []).map(String),
+      evaluation_object_ids: (item.evaluation_object_ids || []).map(String),
+      decision_status: 'draft',
+      decision_source: 'user_selection',
+    })),
+    change_reason: ivV2State.boundaryResponse?.boundary_revision_id
+      ? '更新被测对象与分析边界'
+      : '采用并确认分析边界建议',
+  };
+}
+
+function ivV2BoundaryConfirmPayload() {
+  return {
+    boundary_revision_id: ivV2CurrentBoundaryRevisionId(),
+    coverage_revision_id: ivV2CurrentCoverageRevisionId(),
+    boundary_payload_sha256: String(ivV2State.boundaryResponse?.boundary_payload_sha256 || ''),
+    coverage_payload_sha256: String(ivV2State.boundaryResponse?.coverage_payload_sha256 || ivV2State.coverageResponse?.coverage_payload_sha256 || ''),
+  };
+}
+
 function ivV2FormatResolutionLabel(action) {
   return {
     assign_row_role: '指定行角色',
@@ -1531,9 +2212,268 @@ async function ivV2EnsureEvidenceContext(issue, { force = false, retryOnHeadMism
   }
 }
 
+function ivV2BoundaryReadyForEditing() {
+  const blocking = Number(ivV2State.structureResponse?.review_summary?.blocking_issue_count || 0);
+  return Boolean(ivV2CurrentStructurePayload() && blocking === 0);
+}
+
+function ivV2BoundaryConflictMessage(payload, fallback) {
+  const code = String(payload?.error?.code || 'ANALYSIS_BOUNDARY_REVISION_CONFLICT');
+  const message = String(payload?.error?.message || fallback || '分析边界版本已变化');
+  ivV2State.boundaryConflict = {
+    code,
+    message,
+    context: payload?.error?.context || {},
+  };
+  ivV2State.errorMessage = message;
+  ivV2State.statusCode = code;
+  ivV2State.statusAction = String(payload?.error?.suggested_action || 'refresh_analysis_boundary');
+}
+
+async function ivV2LoadAnalysisBoundary({ render = true } = {}) {
+  if (!ivV2State.importId || !ivV2BoundaryReadyForEditing()) return false;
+  const token = ivV2NextBoundaryToken();
+  ivV2State.boundaryBusy = true;
+  if (render) ivV2RenderConfirmed();
+  try {
+    const response = await fetch(`/api/v1/interview-imports/${ivV2State.importId}/analysis-boundary`);
+    const data = await response.json();
+    if (token !== ivV2State.boundaryToken) return false;
+    if (!response.ok) {
+      if (response.status === 409) {
+        ivV2BoundaryConflictMessage(data, '分析边界已过期，请刷新结构后重试');
+      } else {
+        ivV2SetStatusError(data, response.status, '读取分析边界失败');
+      }
+      return false;
+    }
+    if (!ivV2BoundaryReferencesCurrentStructure(data)) {
+      ivV2BoundaryConflictMessage(
+        { error: { code: 'ANALYSIS_BOUNDARY_INPUT_STALE', message: '分析边界引用的结构或证据版本已变化，请刷新后重试。' } },
+        '分析边界版本不一致'
+      );
+      return false;
+    }
+    ivV2State.boundaryResponse = data;
+    ivV2State.boundaryDraft = ivV2BuildBoundaryDraft(data);
+    ivV2State.coverageResponse = data.is_stale ? null : (data.coverage_preview ? data : null);
+    ivV2State.boundaryConflict = null;
+    ivV2State.boundaryMergeSelection = [];
+    ivV2State.boundaryOccurrenceSelection = {};
+    ivV2State.boundarySplitRows = {};
+    ivV2State.selectedCoverageCellKey = '';
+    if (data.is_stale) {
+      ivV2State.boundaryDirty = true;
+      ivV2State.statusNote = '上游结构或证据已变化；当前是新建议，需基于旧双版本头保存为新版本';
+    } else {
+      ivV2ClearBoundaryDirty(data.boundary_revision_id ? '分析边界已加载' : '已加载只读建议，保存后才会形成版本');
+    }
+    ivV2State.status = data.status || ivV2State.status;
+    ivV2ClearStatusError();
+    return true;
+  } catch (error) {
+    if (token !== ivV2State.boundaryToken) return false;
+    ivV2State.errorMessage = String(error?.message || '读取分析边界失败');
+    return false;
+  } finally {
+    if (token === ivV2State.boundaryToken) {
+      ivV2State.boundaryBusy = false;
+      if (render) ivV2RenderConfirmed();
+    }
+  }
+}
+
+async function ivV2SaveAnalysisBoundary() {
+  if (
+    !ivV2State.importId
+    || !ivV2State.boundaryDraft
+    || ivV2State.boundaryConflict
+    || ivV2OperationBusy()
+  ) return false;
+  const validation = ivV2ValidateBoundaryDraft();
+  if (!validation.ok) {
+    showToast(validation.message, 'error');
+    return false;
+  }
+  const token = ivV2NextBoundaryToken();
+  ivV2State.boundaryBusy = true;
+  ivV2State.statusNote = '正在保存分析边界与派生覆盖版本';
+  ivV2State.boundaryConflict = null;
+  ivV2ClearStatusError();
+  ivV2RenderConfirmed();
+  try {
+    const response = await fetch(`/api/v1/interview-imports/${ivV2State.importId}/analysis-boundary`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(ivV2BoundaryWritePayload()),
+    });
+    const data = await response.json();
+    if (token !== ivV2State.boundaryToken) return false;
+    if (!response.ok) {
+      if (response.status === 409) {
+        ivV2BoundaryConflictMessage(data, '分析边界版本已变化；本地草稿仍保留，请决定是否刷新服务端版本。');
+      } else {
+        ivV2SetStatusError(data, response.status, '保存分析边界失败');
+      }
+      return false;
+    }
+    if (!ivV2BoundaryReferencesCurrentStructure(data)) {
+      ivV2BoundaryConflictMessage(
+        { error: { code: 'ANALYSIS_BOUNDARY_INPUT_STALE', message: '保存结果引用了不同的结构或证据版本，本地草稿仍保留。' } },
+        '保存结果版本不一致'
+      );
+      return false;
+    }
+    if (!ivV2PersistedBoundaryResponseReady(data)) {
+      ivV2BoundaryConflictMessage(
+        { error: { code: 'ANALYSIS_BOUNDARY_REVISION_CONFLICT', message: '保存结果缺少成对的分析边界与覆盖版本头，本地草稿仍保留。' } },
+        '保存结果版本头不完整'
+      );
+      return false;
+    }
+    ivV2State.boundaryResponse = data;
+    ivV2State.boundaryDraft = ivV2BuildBoundaryDraft(data);
+    ivV2State.coverageResponse = data.coverage_preview ? data : null;
+    ivV2State.boundaryMergeSelection = [];
+    ivV2State.boundaryOccurrenceSelection = {};
+    ivV2State.boundarySplitRows = {};
+    ivV2State.boundaryConflict = null;
+    ivV2State.status = data.status || 'ANALYSIS_BOUNDARY_REVIEW_REQUIRED';
+    ivV2ClearBoundaryDirty('分析边界已保存');
+    ivV2ClearStatusError();
+    showToast('分析边界已保存，覆盖预览已生成新版本', 'success');
+    return true;
+  } catch (error) {
+    if (token !== ivV2State.boundaryToken) return false;
+    ivV2State.errorMessage = String(error?.message || '保存分析边界失败');
+    return false;
+  } finally {
+    if (token === ivV2State.boundaryToken) {
+      ivV2State.boundaryBusy = false;
+      ivV2RenderConfirmed();
+    }
+  }
+}
+
+async function ivV2LoadCoveragePreview({ switchTab = false } = {}) {
+  if (
+    !ivV2State.importId
+    || !ivV2CurrentBoundaryRevisionId()
+    || ivV2State.boundaryDirty
+    || ivV2State.coverageBusy
+  ) return false;
+  const token = ivV2NextCoverageToken();
+  ivV2State.coverageBusy = true;
+  if (switchTab) ivV2State.boundaryTab = 'coverage';
+  ivV2RenderConfirmed();
+  try {
+    const response = await fetch(`/api/v1/interview-imports/${ivV2State.importId}/coverage-preview`);
+    const data = await response.json();
+    if (token !== ivV2State.coverageToken) return false;
+    if (!response.ok) {
+      if (response.status === 409) {
+        ivV2BoundaryConflictMessage(data, '覆盖预览版本已变化，请刷新分析边界');
+      } else {
+        ivV2SetStatusError(data, response.status, '读取覆盖预览失败');
+      }
+      return false;
+    }
+    if (!ivV2CoverageReferencesCurrentBoundary(data)) {
+      ivV2BoundaryConflictMessage(
+        { error: { code: 'COVERAGE_PREVIEW_STALE', message: '覆盖预览与当前四个版本头不一致，请刷新分析边界。' } },
+        '覆盖预览版本不一致'
+      );
+      return false;
+    }
+    ivV2State.coverageResponse = data;
+    ivV2State.selectedCoverageCellKey = '';
+    ivV2ClearStatusError();
+    return true;
+  } catch (error) {
+    if (token !== ivV2State.coverageToken) return false;
+    ivV2State.errorMessage = String(error?.message || '读取覆盖预览失败');
+    return false;
+  } finally {
+    if (token === ivV2State.coverageToken) {
+      ivV2State.coverageBusy = false;
+      ivV2RenderConfirmed();
+    }
+  }
+}
+
+async function ivV2ConfirmAnalysisBoundary() {
+  if (
+    !ivV2State.importId
+    || !ivV2BoundaryConfirmationHeadsReady()
+    || ivV2State.boundaryDirty
+    || ivV2State.boundaryConflict
+    || ivV2OperationBusy()
+  ) return false;
+  if (!window.confirm('确认当前被测对象、来源范围、标签作用域和覆盖口径吗？确认后才允许进入玩家档案。')) return false;
+  const token = ivV2NextBoundaryToken();
+  const submittedHeads = ivV2BoundaryConfirmPayload();
+  ivV2State.boundaryConfirmBusy = true;
+  ivV2State.boundaryConflict = null;
+  ivV2ClearStatusError();
+  ivV2RenderConfirmed();
+  try {
+    const response = await fetch(`/api/v1/interview-imports/${ivV2State.importId}/analysis-boundary:confirm`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(submittedHeads),
+    });
+    const data = await response.json();
+    if (token !== ivV2State.boundaryToken) return false;
+    if (!response.ok) {
+      if (response.status === 409) {
+        ivV2BoundaryConflictMessage(data, '分析边界或覆盖版本已变化，请刷新后重新确认。');
+      } else {
+        ivV2SetStatusError(data, response.status, '确认分析边界失败');
+      }
+      return false;
+    }
+    const merged = { ...ivV2State.boundaryResponse, ...data };
+    if (!ivV2BoundaryReferencesCurrentStructure(merged)) {
+      ivV2BoundaryConflictMessage(
+        { error: { code: 'ANALYSIS_BOUNDARY_INPUT_STALE', message: '确认结果引用的结构或证据版本不一致，请刷新。' } },
+        '确认结果版本不一致'
+      );
+      return false;
+    }
+    if (
+      !ivV2PersistedBoundaryResponseReady(data)
+      || data.boundary_revision_id === submittedHeads.boundary_revision_id
+      || data.coverage_revision_id === submittedHeads.coverage_revision_id
+    ) {
+      ivV2BoundaryConflictMessage(
+        { error: { code: 'ANALYSIS_BOUNDARY_REVISION_CONFLICT', message: '确认结果未同时返回新的分析边界与覆盖版本头，请刷新后核对。' } },
+        '确认结果版本头无效'
+      );
+      return false;
+    }
+    ivV2State.boundaryResponse = merged;
+    ivV2State.coverageResponse = data.coverage_preview ? data : null;
+    ivV2State.status = data.status || 'READY_FOR_DOSSIERS';
+    ivV2State.boundaryConflict = null;
+    ivV2ClearStatusError();
+    showToast('分析边界与覆盖口径已确认，可以进入玩家档案', 'success');
+    return true;
+  } catch (error) {
+    if (token !== ivV2State.boundaryToken) return false;
+    ivV2State.errorMessage = String(error?.message || '确认分析边界失败');
+    return false;
+  } finally {
+    if (token === ivV2State.boundaryToken) {
+      ivV2State.boundaryConfirmBusy = false;
+      ivV2RenderConfirmed();
+    }
+  }
+}
+
 async function ivV2LoadStructureWorkspace({ token = ivV2State.requestToken, silentConflictRefresh = false, headRetry = 1 } = {}) {
   if (!ivV2State.importId) return false;
   try {
+    const previousStructureRevisionId = ivV2CurrentStructureRevisionId();
     const previousEvidenceRevisionId = ivV2CurrentEvidenceRevisionId();
     const [structureResp, issuesResp] = await Promise.all([
       fetch(`/api/v1/interview-imports/${ivV2State.importId}/structure`),
@@ -1594,6 +2534,30 @@ async function ivV2LoadStructureWorkspace({ token = ivV2State.requestToken, sile
     ivV2State.status = structureData.status || issuesData.status || ivV2State.status;
     const selected = ivV2SyncSelectedIssue({ preserveAll: true });
     if (selected) ivV2EnsureIssueDraft(selected);
+    if (Number(structureData?.review_summary?.blocking_issue_count || 0) === 0) {
+      const upstreamChanged = Boolean(
+        (previousStructureRevisionId && previousStructureRevisionId !== structureHeads.structure_revision_id)
+        || (previousEvidenceRevisionId && previousEvidenceRevisionId !== structureHeads.evidence_revision_id)
+      );
+      if (ivV2State.boundaryDirty && ivV2State.boundaryDraft) {
+        if (upstreamChanged) {
+          ivV2BoundaryConflictMessage(
+            { error: { code: 'ANALYSIS_BOUNDARY_INPUT_STALE', message: '结构或证据版本已变化；本地分析边界草稿仍保留，请检查后决定是否放弃并刷新。' } },
+            '分析边界输入已变化'
+          );
+        }
+      } else {
+        await ivV2LoadAnalysisBoundary({ render: false });
+      }
+    } else if (ivV2State.boundaryDirty && ivV2State.boundaryDraft) {
+      ivV2State.boundaryTab = 'review';
+      ivV2BoundaryConflictMessage(
+        { error: { code: 'ANALYSIS_BOUNDARY_INPUT_STALE', message: '结构复核重新出现阻塞项；本地分析边界草稿仍保留，处理结构问题后再决定是否刷新。' } },
+        '分析边界输入已阻塞'
+      );
+    } else {
+      ivV2ResetAnalysisBoundaryWorkspace({ keepTab: false });
+    }
     return true;
   } catch (error) {
     if (!ivV2IsTokenCurrent(token)) return false;
@@ -1708,8 +2672,8 @@ function ivV2ReviewSummaryHtml() {
       </div>
     </div>
     <div class="iv-v2-status-banner iv-v2-status-banner--info">
-      <strong>当前阶段只开放结构与证据复核</strong>
-      <p>玩家档案与后续 dossier 工作台尚未开放；当状态为 READY_FOR_DOSSIERS 时，仅表示结构头部已稳定。</p>
+      <strong>当前阶段开放结构、被测对象与分析边界复核</strong>
+      <p>玩家档案与后续 dossier 工作台尚未开放；只有分析边界和覆盖口径确认后，状态才会进入 READY_FOR_DOSSIERS。</p>
     </div>
   `;
 }
@@ -1751,6 +2715,649 @@ function ivV2IssueListHtml() {
         `).join('') : '<div class="iv-v2-empty">当前筛选下没有待处理问题。</div>'}
       </div>
     </section>
+  `;
+}
+
+function ivV2BoundaryTabLabel(tab) {
+  return {
+    review: '1 结构问题',
+    evaluation_objects: '2 方案结构',
+    analysis_scope: '3 分析边界',
+    coverage: '4 覆盖预览',
+  }[tab] || tab;
+}
+
+function ivV2BoundaryTabUnlocked(tab) {
+  if (tab === 'review') return true;
+  if (!ivV2BoundaryReadyForEditing() || !ivV2State.boundaryDraft) return false;
+  if (tab === 'coverage') {
+    return Boolean(ivV2CurrentBoundaryRevisionId() && !ivV2State.boundaryDirty);
+  }
+  return true;
+}
+
+function ivV2BoundaryTabsHtml() {
+  return `
+    <nav class="iv-v2-boundary-tabs" aria-label="结构与分析边界复核阶段">
+      ${IV_V2_BOUNDARY_TABS.map(tab => {
+        const unlocked = ivV2BoundaryTabUnlocked(tab);
+        const active = ivV2State.boundaryTab === tab;
+        return `
+          <button class="iv-v2-boundary-tab${active ? ' iv-v2-boundary-tab--active' : ''}" type="button"
+            data-iv-v2-action="boundary-tab" data-boundary-tab="${ivV2Esc(tab)}"
+            data-iv-v2-locked="${unlocked ? 'false' : 'true'}"${unlocked ? '' : ' disabled'}
+            aria-current="${active ? 'step' : 'false'}">${ivV2Esc(ivV2BoundaryTabLabel(tab))}</button>
+        `;
+      }).join('')}
+    </nav>
+  `;
+}
+
+function ivV2BoundaryToolbarHtml() {
+  if (!ivV2State.boundaryDraft) {
+    return `
+      <section class="iv-v2-side-card iv-v2-boundary-toolbar">
+        <div>
+          <div class="iv-v2-side-card__title">分析边界尚未加载</div>
+          <p>结构阻塞项处理完成后，系统会提供只读建议；读取建议不会写入数据。</p>
+        </div>
+        <button class="btn btn--primary btn--sm" type="button" data-iv-v2-action="boundary-refresh"
+          data-iv-v2-locked="${ivV2BoundaryReadyForEditing() ? 'false' : 'true'}"${ivV2BoundaryReadyForEditing() ? '' : ' disabled'}>读取分析边界建议</button>
+      </section>
+    `;
+  }
+  const persisted = Boolean(ivV2CurrentBoundaryRevisionId());
+  const canSave = (!persisted || ivV2State.boundaryDirty) && !ivV2State.boundaryConflict;
+  const responseAllowsConfirm = ivV2State.boundaryResponse?.confirmation_ready !== false;
+  const canConfirm = Boolean(
+    ivV2BoundaryConfirmationHeadsReady()
+    && !ivV2State.boundaryDirty
+    && !ivV2State.boundaryConflict
+    && responseAllowsConfirm
+    && ivV2State.status !== 'READY_FOR_DOSSIERS'
+  );
+  return `
+    ${ivV2State.boundaryConflict ? `
+      <div class="iv-v2-status-banner iv-v2-status-banner--danger iv-v2-boundary-conflict">
+        <strong>${ivV2Esc(ivV2State.boundaryConflict.code || 'ANALYSIS_BOUNDARY_REVISION_CONFLICT')}</strong>
+        <p>${ivV2Esc(ivV2State.boundaryConflict.message || '服务端版本已变化。')} 本地草稿仍保留，不会静默覆盖。</p>
+        <button class="btn btn--ghost btn--sm" type="button" data-iv-v2-action="boundary-discard-and-refresh">放弃本地草稿并刷新</button>
+      </div>
+    ` : ''}
+    <section class="iv-v2-side-card iv-v2-boundary-toolbar">
+      <div>
+        <div class="iv-v2-side-card__title">分析边界版本</div>
+        <p>${persisted
+          ? `第 ${ivV2Esc(ivV2State.boundaryResponse?.boundary_revision_number || ivV2State.boundaryResponse?.revision_number || '--')} 版 · ${ivV2Esc(ivV2CurrentBoundaryRevisionId())}`
+          : '当前是只读系统建议；保存后才会形成不可变版本。'}</p>
+        <span class="iv-v2-badge iv-v2-badge--${ivV2State.boundaryDirty ? 'warning' : (persisted ? 'success' : 'info')}">
+          ${ivV2State.boundaryDirty ? '有未保存改动' : (persisted ? '已保存' : '尚未落盘')}
+        </span>
+      </div>
+      <div class="iv-v2-toolbar__actions">
+        <button class="btn btn--ghost btn--sm" type="button" data-iv-v2-action="boundary-refresh"
+          data-iv-v2-locked="${ivV2State.boundaryDirty ? 'true' : 'false'}"${ivV2State.boundaryDirty ? ' disabled' : ''}>刷新</button>
+        <button class="btn btn--primary btn--sm" type="button" data-iv-v2-action="boundary-save"
+          data-iv-v2-locked="${canSave ? 'false' : 'true'}"${canSave ? '' : ' disabled'}>${ivV2State.boundaryBusy ? '保存中...' : (persisted ? '保存新版本' : '采用建议并保存')}</button>
+        <button class="btn btn--primary btn--sm" type="button" data-iv-v2-action="boundary-confirm"
+          data-iv-v2-locked="${canConfirm ? 'false' : 'true'}"${canConfirm ? '' : ' disabled'}>${ivV2State.boundaryConfirmBusy ? '确认中...' : (ivV2State.status === 'READY_FOR_DOSSIERS' ? '分析边界已确认' : '确认并允许生成玩家档案')}</button>
+      </div>
+    </section>
+  `;
+}
+
+function ivV2OccurrenceLabel(occurrenceId) {
+  const occurrence = ivV2Occurrences().find(item => item.occurrence_id === occurrenceId);
+  if (!occurrence) return { title: occurrenceId, meta: '结构行已不可见' };
+  return {
+    title: occurrence.raw_prompt_text || occurrence.raw_type_text || occurrence.raw_module_text || occurrenceId,
+    meta: `${occurrence.sheet_name || occurrence.sheet_id || '--'} · 第 ${occurrence.row || '--'} 行 · ${ivV2FormatRowRoleLabel(occurrence.row_role)}`,
+  };
+}
+
+function ivV2EvaluationDepth(item, objectByKey) {
+  let depth = 0;
+  let current = item;
+  const visited = new Set();
+  while (current?.parent_evaluation_object_id && depth < 3) {
+    const parentKey = String(current.parent_evaluation_object_id);
+    if (visited.has(parentKey)) break;
+    visited.add(parentKey);
+    current = objectByKey.get(parentKey);
+    if (!current) break;
+    depth += 1;
+  }
+  return depth;
+}
+
+function ivV2OrderedEvaluationObjects(objects) {
+  const byParent = new Map();
+  (objects || []).forEach(item => {
+    const parentId = String(item.parent_evaluation_object_id || '');
+    if (!byParent.has(parentId)) byParent.set(parentId, []);
+    byParent.get(parentId).push(item);
+  });
+  const byOrder = (left, right) => (
+    Number(left.display_order || 0) - Number(right.display_order || 0)
+    || String(left.evaluation_object_id || '').localeCompare(String(right.evaluation_object_id || ''))
+  );
+  const result = [];
+  const included = new Set();
+  (byParent.get('') || []).sort(byOrder).forEach(parent => {
+    result.push(parent);
+    included.add(parent.evaluation_object_id);
+    (byParent.get(parent.evaluation_object_id) || []).sort(byOrder).forEach(child => {
+      result.push(child);
+      included.add(child.evaluation_object_id);
+    });
+  });
+  (objects || []).filter(item => !included.has(item.evaluation_object_id)).sort(byOrder).forEach(item => result.push(item));
+  return result;
+}
+
+function ivV2EvaluationObjectCardHtml(item, siblings, objectByKey) {
+  const key = ivV2EvaluationObjectKey(item);
+  const selectedOccurrences = new Set((ivV2State.boundaryOccurrenceSelection[key] || []).map(String));
+  const mergeSelected = ivV2State.boundaryMergeSelection.includes(key);
+  const siblingIndex = siblings.indexOf(item);
+  const depth = ivV2EvaluationDepth(item, objectByKey);
+  const hasActiveChildren = ivV2ActiveEvaluationObjects().some(candidate => candidate.parent_evaluation_object_id === key);
+  const canChangeStructure = ivV2EvaluationObjectCanChangeStructure(item) && !hasActiveChildren;
+  const parentOptions = ivV2ActiveEvaluationObjects().filter(candidate => (
+    candidate.module_id === item.module_id
+    && candidate.object_type === 'concept'
+    && candidate.evaluation_object_id !== key
+  ));
+  return `
+    <article class="iv-v2-evaluation-card${depth ? ' iv-v2-evaluation-card--nested' : ''}" data-evaluation-object-key="${ivV2Esc(key)}">
+      <div class="iv-v2-evaluation-card__head">
+        <label class="iv-v2-evaluation-merge-check">
+          <input type="checkbox" data-iv-v2-action="boundary-merge-select" data-evaluation-object-key="${ivV2Esc(key)}"${mergeSelected ? ' checked' : ''}
+            data-iv-v2-locked="${canChangeStructure ? 'false' : 'true'}"${canChangeStructure ? '' : ' disabled'}>
+          <span>选择合并</span>
+        </label>
+        <div class="iv-v2-evaluation-order">
+          <button class="btn btn--ghost btn--sm" type="button" data-iv-v2-action="boundary-object-up" data-evaluation-object-key="${ivV2Esc(key)}"
+            data-iv-v2-locked="${siblingIndex <= 0 ? 'true' : 'false'}"${siblingIndex <= 0 ? ' disabled' : ''} aria-label="上移">↑</button>
+          <button class="btn btn--ghost btn--sm" type="button" data-iv-v2-action="boundary-object-down" data-evaluation-object-key="${ivV2Esc(key)}"
+            data-iv-v2-locked="${siblingIndex >= siblings.length - 1 ? 'true' : 'false'}"${siblingIndex >= siblings.length - 1 ? ' disabled' : ''} aria-label="下移">↓</button>
+        </div>
+      </div>
+      <label class="iv-v2-inline-field iv-v2-inline-field--full">
+        <span>${depth ? 'Variant 名称' : '被测对象名称'}</span>
+        <input maxlength="300" value="${ivV2Esc(item.display_name || '')}" data-iv-v2-action="boundary-object-name" data-evaluation-object-key="${ivV2Esc(key)}">
+      </label>
+      <label class="iv-v2-inline-field iv-v2-inline-field--full">
+        <span>对象层级</span>
+        <select data-iv-v2-action="boundary-object-hierarchy" data-evaluation-object-key="${ivV2Esc(key)}"
+          data-iv-v2-locked="${canChangeStructure ? 'false' : 'true'}"${canChangeStructure ? '' : ' disabled'}>
+          <option value=""${item.object_type === 'concept' ? ' selected' : ''}>独立被测对象（concept）</option>
+          ${parentOptions.map(parent => `<option value="${ivV2Esc(parent.evaluation_object_id)}"${item.parent_evaluation_object_id === parent.evaluation_object_id ? ' selected' : ''}>具体方案（父级：${ivV2Esc(parent.display_name || parent.evaluation_object_id)}）</option>`).join('')}
+        </select>
+      </label>
+      <div class="iv-v2-evaluation-meta">
+        <span>ID ${ivV2Esc(item.evaluation_object_id)}</span>
+        <span>类型 ${ivV2Esc(item.object_type)}</span>
+        ${item.parent_evaluation_object_id ? `<span>父级 ${ivV2Esc(item.parent_evaluation_object_id)}</span>` : ''}
+        ${(item.supersedes_evaluation_object_ids || []).length ? `<span>替代 ${ivV2Esc(item.supersedes_evaluation_object_ids.join('、'))}</span>` : ''}
+      </div>
+      <div class="iv-v2-evaluation-occurrences">
+        ${(item.occurrence_ids || []).length ? item.occurrence_ids.map(occurrenceId => {
+          const label = ivV2OccurrenceLabel(occurrenceId);
+          return `
+            <label class="iv-v2-evaluation-occurrence">
+              <input type="checkbox" data-iv-v2-action="boundary-occurrence-select" data-evaluation-object-key="${ivV2Esc(key)}"
+                data-occurrence-id="${ivV2Esc(occurrenceId)}"${selectedOccurrences.has(String(occurrenceId)) ? ' checked' : ''}
+                data-iv-v2-locked="${canChangeStructure ? 'false' : 'true'}"${canChangeStructure ? '' : ' disabled'}>
+              <span><strong>${ivV2Esc(label.title)}</strong><small>${ivV2Esc(label.meta)}</small></span>
+            </label>
+          `;
+        }).join('') : '<div class="iv-v2-empty">当前对象没有直接结构行；如它只是 variant 父级，可保留子对象。</div>'}
+      </div>
+      <div class="iv-v2-evaluation-card__foot">
+        <span>勾选部分结构行后，可拆成两个拥有新 ID 的对象。</span>
+        <button class="btn btn--ghost btn--sm" type="button" data-iv-v2-action="boundary-object-split" data-evaluation-object-key="${ivV2Esc(key)}"
+          data-iv-v2-locked="${canChangeStructure && selectedOccurrences.size > 0 && selectedOccurrences.size < (item.occurrence_ids || []).length ? 'false' : 'true'}"
+          ${canChangeStructure && selectedOccurrences.size > 0 && selectedOccurrences.size < (item.occurrence_ids || []).length ? '' : 'disabled'}>拆出所选</button>
+      </div>
+      ${item._lineage_anchor === true ? '' : '<p class="iv-v2-evaluation-save-note">这是本地新对象；保存版本后才能继续拆分、合并或改变层级。</p>'}
+    </article>
+  `;
+}
+
+function ivV2SupersededEvaluationObjectsHtml(objects, activeObjects) {
+  if (!(objects || []).length) return '';
+  return `
+    <details class="iv-v2-evaluation-history">
+      <summary>已被替代的历史对象 ${ivV2Esc(objects.length)} 个</summary>
+      <div class="iv-v2-evaluation-history__list">
+        ${objects.map(item => {
+          const replacements = (activeObjects || []).filter(candidate => (
+            candidate.supersedes_evaluation_object_ids || []
+          ).includes(item.evaluation_object_id));
+          return `
+            <article class="iv-v2-evaluation-history__item">
+              <strong>${ivV2Esc(item.display_name || item.evaluation_object_id)}</strong>
+              <span>${ivV2Esc(item.evaluation_object_id)} · ${ivV2Esc(item.object_type || '--')} · superseded</span>
+              <p>${replacements.length
+                ? `由 ${ivV2Esc(replacements.map(candidate => candidate.display_name || candidate.evaluation_object_id).join('、'))} 替代`
+                : '已被替代；该历史 ID 只用于版本追溯。'}</p>
+            </article>
+          `;
+        }).join('')}
+      </div>
+    </details>
+  `;
+}
+
+function ivV2EvaluationObjectsHtml() {
+  if (!ivV2State.boundaryDraft) return ivV2BoundaryToolbarHtml();
+  const allObjects = ivV2State.boundaryDraft.evaluation_objects || [];
+  const objects = allObjects.filter(ivV2EvaluationObjectIsActive);
+  const supersededObjects = allObjects.filter(item => !ivV2EvaluationObjectIsActive(item));
+  const objectByKey = new Map(allObjects.map(item => [ivV2EvaluationObjectKey(item), item]));
+  const mergeableSelectionCount = objects.filter(item => (
+    ivV2State.boundaryMergeSelection.includes(ivV2EvaluationObjectKey(item))
+    && ivV2EvaluationObjectCanChangeStructure(item)
+  )).length;
+  return `
+    ${ivV2BoundaryToolbarHtml()}
+    <section class="iv-v2-side-card iv-v2-evaluation-editor">
+      <div class="iv-v2-review-head">
+        <div>
+          <div class="iv-v2-side-card__title">被测对象与具体方案</div>
+          <p class="iv-v2-review-head__desc">模块不等于具体界面或方案。拆分、合并只改变分析结构，不修改原始记录。</p>
+        </div>
+        <button class="btn btn--ghost btn--sm" type="button" data-iv-v2-action="boundary-object-merge"
+          data-iv-v2-locked="${mergeableSelectionCount >= 2 ? 'false' : 'true'}"${mergeableSelectionCount >= 2 ? '' : ' disabled'}>合并所选</button>
+      </div>
+      ${ivV2Modules().map(module => {
+        const moduleObjects = ivV2OrderedEvaluationObjects(
+          objects.filter(item => item.module_id === module.module_id)
+        );
+        return `
+          <div class="iv-v2-evaluation-module">
+            <div class="iv-v2-evaluation-module__head">
+              <strong>${ivV2Esc(module.canonical_name || module.module_id)}</strong>
+              <span>${ivV2Esc(moduleObjects.length)} 个对象/variant</span>
+            </div>
+            ${moduleObjects.length ? moduleObjects.map(item => {
+              const siblings = moduleObjects.filter(candidate => String(candidate.parent_evaluation_object_id || '') === String(item.parent_evaluation_object_id || ''));
+              return ivV2EvaluationObjectCardHtml(item, siblings, objectByKey);
+            }).join('') : '<div class="iv-v2-empty">当前模块尚无被测对象建议，需由后端补充候选后再确认。</div>'}
+          </div>
+        `;
+      }).join('')}
+      ${ivV2SupersededEvaluationObjectsHtml(supersededObjects, objects)}
+    </section>
+  `;
+}
+
+function ivV2SourceScopeTypeLabel(scopeType) {
+  return {
+    interview_body: '访谈正文：进入方案覆盖与正式证据',
+    participant_background: '玩家背景：仅供后续属性事实',
+    excluded: '排除：不进入档案或报告',
+  }[scopeType] || scopeType || '未确认';
+}
+
+function ivV2SourceScopeRulesHtml() {
+  const rules = [...(ivV2State.boundaryDraft?.source_scope_rules || [])]
+    .sort((left, right) => (
+      String(left.sheet_name || left.sheet_id).localeCompare(String(right.sheet_name || right.sheet_id), 'zh-CN')
+      || Number(left.start_row || 0) - Number(right.start_row || 0)
+    ));
+  return `
+    <section class="iv-v2-side-card iv-v2-source-scope">
+      <div class="iv-v2-side-card__title">来源范围</div>
+      <p class="iv-v2-review-head__desc">颜色和样式只形成候选，不会自动确认。范围切分只使用服务端明确列出的安全行边界，保存时仍会再次校验。</p>
+      <div class="iv-v2-source-scope-list">
+        ${rules.length ? rules.map(item => {
+          const key = ivV2SourceScopeRuleKey(item);
+          const splitRow = Number(ivV2State.boundarySplitRows[key] || 0);
+          return `
+            <article class="iv-v2-source-scope-rule">
+              <div>
+                <strong>${ivV2Esc(item.sheet_name || item.sheet_id)}</strong>
+                <p>第 ${ivV2Esc(item.start_row)}～${ivV2Esc(item.end_row)} 行${item.reason ? ` · ${ivV2Esc(item.reason)}` : ''}</p>
+              </div>
+              <label class="iv-v2-inline-field">
+                <span>资料用途</span>
+                <select data-iv-v2-action="boundary-source-scope-type" data-source-rule-key="${ivV2Esc(key)}">
+                  ${IV_V2_SOURCE_SCOPE_TYPES.map(scopeType => `<option value="${ivV2Esc(scopeType)}"${item.scope_type === scopeType ? ' selected' : ''}>${ivV2Esc(ivV2SourceScopeTypeLabel(scopeType))}</option>`).join('')}
+                </select>
+              </label>
+              ${(item.allowed_split_rows || []).length ? `
+                <div class="iv-v2-source-split">
+                  <label class="iv-v2-inline-field">
+                    <span>安全分段位置</span>
+                    <select data-iv-v2-action="boundary-source-split-row" data-source-rule-key="${ivV2Esc(key)}">
+                      <option value="">请选择</option>
+                      ${item.allowed_split_rows.map(row => `<option value="${ivV2Esc(row)}"${Number(row) === splitRow ? ' selected' : ''}>从第 ${ivV2Esc(row)} 行开始新范围</option>`).join('')}
+                    </select>
+                  </label>
+                  <button class="btn btn--ghost btn--sm" type="button" data-iv-v2-action="boundary-source-split" data-source-rule-key="${ivV2Esc(key)}"
+                    data-iv-v2-locked="${splitRow ? 'false' : 'true'}"${splitRow ? '' : ' disabled'}>按此处分段</button>
+                </div>
+              ` : (item.compatible_structure_rows || []).length ? `
+                <p class="iv-v2-source-split-note">识别到 ${ivV2Esc(item.compatible_structure_rows.length)} 个结构行边界，但服务端未明确允许切分；为避免改变来源口径，此处仅显示提示。</p>
+              ` : ''}
+            </article>
+          `;
+        }).join('') : '<div class="iv-v2-empty">当前没有来源范围候选。</div>'}
+      </div>
+    </section>
+  `;
+}
+
+function ivV2LabelScopeTargetsHtml(item) {
+  const selected = new Set((item.scope_mode === 'selected_modules' ? item.module_ids : item.evaluation_object_ids || []).map(String));
+  if (item.scope_mode === 'selected_modules') {
+    return ivV2Modules().map(module => `
+      <label class="iv-v2-scope-check">
+        <input type="checkbox" data-iv-v2-action="boundary-label-target" data-label-rule-key="${ivV2Esc(ivV2LabelScopeRuleKey(item))}"
+          data-target-id="${ivV2Esc(module.module_id)}"${selected.has(module.module_id) ? ' checked' : ''}>
+        <span>${ivV2Esc(module.canonical_name || module.module_id)}</span>
+      </label>
+    `).join('');
+  }
+  if (item.scope_mode === 'selected_evaluation_objects') {
+    return ivV2ActiveEvaluationObjects().map(object => {
+      const key = ivV2EvaluationObjectKey(object);
+      return `
+        <label class="iv-v2-scope-check">
+          <input type="checkbox" data-iv-v2-action="boundary-label-target" data-label-rule-key="${ivV2Esc(ivV2LabelScopeRuleKey(item))}"
+            data-target-id="${ivV2Esc(key)}"${selected.has(key) ? ' checked' : ''}>
+          <span>${ivV2Esc(object.display_name || key)}</span>
+        </label>
+      `;
+    }).join('');
+  }
+  return `<p>${item.scope_mode === 'all_analysis' ? '该标签将用于全部分析范围。' : '该标签不会参与跨玩家分析。'}</p>`;
+}
+
+function ivV2LabelScopeRulesHtml() {
+  const rules = ivV2State.boundaryDraft?.label_scope_rules || [];
+  return `
+    <section class="iv-v2-side-card iv-v2-label-scope">
+      <div class="iv-v2-side-card__title">分析标签作用域</div>
+      <div class="iv-v2-status-banner iv-v2-status-banner--warning">
+        <strong>标签不是玩家事实</strong>
+        <p>标签只控制后续比较可在哪些模块或被测对象中使用，不能改写成“玩家明确表示”。</p>
+      </div>
+      <div class="iv-v2-label-scope-list">
+        ${rules.length ? rules.map(item => {
+          const key = ivV2LabelScopeRuleKey(item);
+          return `
+            <article class="iv-v2-label-scope-rule">
+              <div class="iv-v2-label-scope-rule__head">
+                <div><strong>${ivV2Esc(item.label_name || item.label_key)}</strong><p>${ivV2Esc(item.reason || item.label_key || '')}</p></div>
+                <label class="iv-v2-inline-field">
+                  <span>允许范围</span>
+                  <select data-iv-v2-action="boundary-label-scope-mode" data-label-rule-key="${ivV2Esc(key)}">
+                    <option value="disabled"${item.scope_mode === 'disabled' ? ' selected' : ''}>不参与分析</option>
+                    <option value="all_analysis"${item.scope_mode === 'all_analysis' ? ' selected' : ''}>全部分析</option>
+                    <option value="selected_modules"${item.scope_mode === 'selected_modules' ? ' selected' : ''}>指定模块</option>
+                    <option value="selected_evaluation_objects"${item.scope_mode === 'selected_evaluation_objects' ? ' selected' : ''}>指定被测对象</option>
+                  </select>
+                </label>
+              </div>
+              <div class="iv-v2-label-targets">${ivV2LabelScopeTargetsHtml(item)}</div>
+            </article>
+          `;
+        }).join('') : '<div class="iv-v2-empty">当前没有分析标签候选；没有规则不会被解释为全局可用。</div>'}
+      </div>
+    </section>
+  `;
+}
+
+function ivV2AnalysisScopeHtml() {
+  if (!ivV2State.boundaryDraft) return ivV2BoundaryToolbarHtml();
+  return `
+    ${ivV2BoundaryToolbarHtml()}
+    <div class="iv-v2-analysis-scope-grid">
+      ${ivV2SourceScopeRulesHtml()}
+      ${ivV2LabelScopeRulesHtml()}
+    </div>
+  `;
+}
+
+function ivV2CoveragePayload() {
+  return ivV2State.coverageResponse?.coverage_preview || ivV2State.coverageResponse || null;
+}
+
+function ivV2CoverageParticipants(payload) {
+  const rows = Array.isArray(payload?.rows) ? payload.rows : [];
+  const preview = ivV2State.mappingResponse?.final_participant_preview
+    || ivV2State.mappingResponse?.proposals?.final_participant_preview
+    || {};
+  const labels = new Map((preview.participants || []).map(item => [String(item.participant_id || ''), item]));
+  return Array.from(new Set(rows.map(item => String(item.participant_id || '')).filter(Boolean))).map(participantId => ({
+    participant_id: participantId,
+    participant_label: labels.get(participantId)?.participant_label || labels.get(participantId)?.raw_header || participantId,
+  }));
+}
+
+function ivV2CoverageObjects(payload) {
+  const summaries = Array.isArray(payload?.summaries) ? payload.summaries : [];
+  const rows = Array.isArray(payload?.rows) ? payload.rows : [];
+  const pairs = summaries.length ? summaries : rows;
+  const draftObjects = new Map(ivV2ActiveEvaluationObjects().map(item => [item.evaluation_object_id, item]));
+  const questions = new Map(ivV2MainQuestions().map(item => [item.main_question_id, item]));
+  const seen = new Set();
+  return pairs.reduce((result, item) => {
+    const objectId = String(item.evaluation_object_id || '');
+    const questionId = String(item.main_question_id || '');
+    const key = `${objectId}\u241f${questionId}`;
+    if (!objectId || !questionId || seen.has(key)) return result;
+    seen.add(key);
+    result.push({
+      evaluation_object_id: objectId,
+      main_question_id: questionId,
+      display_name: draftObjects.get(objectId)?.display_name || objectId,
+      question_text: questions.get(questionId)?.canonical_text || questionId,
+    });
+    return result;
+  }, []);
+}
+
+function ivV2CoverageCells(payload) {
+  return Array.isArray(payload?.rows) ? payload.rows : [];
+}
+
+function ivV2CoverageObjectKey(item) {
+  return `${String(item?.evaluation_object_id || '')}\u241f${String(item?.main_question_id || '')}`;
+}
+
+function ivV2CoverageParticipantKey(item) {
+  return String(item?.participant_id || item?.id || '');
+}
+
+function ivV2CoverageCellKey(participantId, evaluationObjectId, mainQuestionId) {
+  return `${participantId}\u241f${evaluationObjectId}\u241f${mainQuestionId}`;
+}
+
+function ivV2CoverageReviewConfirmed(cell) {
+  return ['system_verified', 'confirmed'].includes(String(cell?.review_status || ''));
+}
+
+function ivV2CoverageCellLabel(cell) {
+  if (!cell) return '无覆盖记录';
+  if (!ivV2CoverageReviewConfirmed(cell)) return '待确认';
+  if (cell.applicability === 'not_applicable') return '不适用';
+  if (cell.asked_status === 'not_asked') return '未询问';
+  if (cell.source_presence !== 'present') return '无资料';
+  const selfReports = Number(cell.self_report_count || 0);
+  const observations = Number(cell.observation_count || 0);
+  if (selfReports > 0) return `已回答 ${selfReports}`;
+  if (observations > 0) return `仅观察 ${observations}`;
+  return '已问无回答';
+}
+
+function ivV2CoverageCellTone(cell) {
+  if (!cell || !ivV2CoverageReviewConfirmed(cell)) return 'review';
+  if (cell.applicability === 'not_applicable') return 'na';
+  if (cell.source_presence !== 'present' || cell.asked_status === 'not_asked') return 'missing';
+  if (Number(cell.self_report_count || 0) > 0) return 'covered';
+  if (Number(cell.observation_count || 0) > 0) return 'observation';
+  return 'empty';
+}
+
+function ivV2CoverageObjectSummary(payload, objectId, questionId) {
+  const summaries = Array.isArray(payload?.summaries) ? payload.summaries : [];
+  return summaries.find(item => (
+    String(item.evaluation_object_id || '') === String(objectId || '')
+    && String(item.main_question_id || '') === String(questionId || '')
+  )) || null;
+}
+
+function ivV2CoverageDenominatorText(payload, objectId, questionId) {
+  const summary = ivV2CoverageObjectSummary(payload, objectId, questionId);
+  if (!summary || summary.denominator_reliable !== true) return '口径待确认';
+  const denominator = Number(summary.denominator_participant_count);
+  if (!Number.isFinite(denominator)) return '口径待确认';
+  const numerator = Number(summary.covered_participant_count);
+  return `${Number.isFinite(numerator) ? numerator : '--'}/${denominator}`;
+}
+
+function ivV2CoverageCellNeedsAttention(cell) {
+  return Boolean(
+    !cell
+    || !ivV2CoverageReviewConfirmed(cell)
+    || cell.source_presence !== 'present'
+    || cell.asked_status !== 'asked'
+    || cell.applicability !== 'applicable'
+  );
+}
+
+function ivV2CoverageDetailHtml(payload, cells) {
+  if (!ivV2State.selectedCoverageCellKey) return '';
+  const cell = cells.find(item => ivV2CoverageCellKey(item.participant_id, item.evaluation_object_id, item.main_question_id) === ivV2State.selectedCoverageCellKey);
+  if (!cell) return '';
+  const participant = ivV2CoverageParticipants(payload).find(item => ivV2CoverageParticipantKey(item) === cell.participant_id);
+  const object = ivV2CoverageObjects(payload).find(item => (
+    item.evaluation_object_id === cell.evaluation_object_id
+    && item.main_question_id === cell.main_question_id
+  ));
+  const evidenceIds = Array.from(new Set([
+    ...(cell.self_report_evidence_ids || []),
+    ...(cell.observation_evidence_ids || []),
+  ].map(String)));
+  return `
+    <section class="iv-v2-side-card iv-v2-coverage-detail">
+      <div class="iv-v2-side-card__title">覆盖单元详情</div>
+      <p><strong>${ivV2Esc(participant?.participant_label || participant?.display_name || cell.participant_id)}</strong> · ${ivV2Esc(object?.display_name || cell.evaluation_object_id)} · ${ivV2Esc(object?.question_text || cell.main_question_id)}</p>
+      <div class="iv-v2-issue-meta">
+        <span>资料 ${ivV2Esc(cell.source_presence || 'unknown')}</span>
+        <span>询问 ${ivV2Esc(cell.asked_status || 'unknown')}</span>
+        <span>适用 ${ivV2Esc(cell.applicability || 'unknown')}</span>
+        <span>审核 ${ivV2Esc(cell.review_status || 'unknown')}</span>
+        <span>自述 ${ivV2Esc(cell.self_report_count || 0)} · 追问 ${ivV2Esc(cell.follow_up_count || 0)} · 观察 ${ivV2Esc(cell.observation_count || 0)}</span>
+      </div>
+      ${evidenceIds.length ? `<p>证据：${ivV2Esc(evidenceIds.join('、'))}</p>` : '<p>当前没有可引用证据；这不自动等于“未询问”。</p>'}
+    </section>
+  `;
+}
+
+function ivV2CoveragePreviewHtml() {
+  const payload = ivV2CoveragePayload();
+  if (ivV2State.boundaryDirty) {
+    return `${ivV2BoundaryToolbarHtml()}<div class="iv-v2-empty">分析边界已修改，旧覆盖预览已失效。请先保存新版本。</div>`;
+  }
+  if (!payload) {
+    return `
+      ${ivV2BoundaryToolbarHtml()}
+      <section class="iv-v2-side-card iv-v2-coverage-shell">
+        <div class="iv-v2-review-head">
+          <div><div class="iv-v2-side-card__title">只读覆盖预览</div><p class="iv-v2-review-head__desc">所有人数和分母均由后端确定性计算。</p></div>
+          <button class="btn btn--primary btn--sm" type="button" data-iv-v2-action="boundary-load-coverage">${ivV2State.coverageBusy ? '加载中...' : '加载覆盖预览'}</button>
+        </div>
+      </section>
+    `;
+  }
+  const participants = ivV2CoverageParticipants(payload);
+  const objects = ivV2CoverageObjects(payload);
+  const cells = ivV2CoverageCells(payload);
+  const cellMap = new Map(cells.map(cell => [ivV2CoverageCellKey(cell.participant_id, cell.evaluation_object_id, cell.main_question_id), cell]));
+  const visibleParticipants = participants.filter(participant => {
+    if (ivV2State.coverageFilter === 'all') return true;
+    const participantId = ivV2CoverageParticipantKey(participant);
+    return objects.some(object => {
+      const cell = cellMap.get(ivV2CoverageCellKey(participantId, object.evaluation_object_id, object.main_question_id));
+      if (ivV2State.coverageFilter === 'review') return !cell || !ivV2CoverageReviewConfirmed(cell);
+      return ivV2CoverageCellNeedsAttention(cell);
+    });
+  });
+  return `
+    ${ivV2BoundaryToolbarHtml()}
+    <section class="iv-v2-side-card iv-v2-coverage-shell">
+      <div class="iv-v2-review-head">
+        <div>
+          <div class="iv-v2-side-card__title">只读覆盖预览</div>
+          <p class="iv-v2-review-head__desc">缺少资料不等于未询问；三维状态未确认时不展示分母。</p>
+        </div>
+        <div class="iv-v2-toolbar__actions">
+          <select data-iv-v2-action="boundary-coverage-filter" aria-label="覆盖筛选">
+            <option value="all"${ivV2State.coverageFilter === 'all' ? ' selected' : ''}>全部玩家</option>
+            <option value="gaps"${ivV2State.coverageFilter === 'gaps' ? ' selected' : ''}>仅缺口</option>
+            <option value="review"${ivV2State.coverageFilter === 'review' ? ' selected' : ''}>仅待确认</option>
+          </select>
+          <button class="btn btn--ghost btn--sm" type="button" data-iv-v2-action="boundary-load-coverage">刷新覆盖</button>
+        </div>
+      </div>
+      <div class="iv-v2-coverage-legend" aria-label="覆盖状态图例">
+        <span class="iv-v2-coverage-dot iv-v2-coverage-dot--covered">已回答</span>
+        <span class="iv-v2-coverage-dot iv-v2-coverage-dot--observation">仅观察</span>
+        <span class="iv-v2-coverage-dot iv-v2-coverage-dot--missing">缺少资料/未问</span>
+        <span class="iv-v2-coverage-dot iv-v2-coverage-dot--review">待确认</span>
+      </div>
+      <div class="iv-v2-coverage-wrap">
+        <table class="iv-v2-coverage-table">
+          <thead>
+            <tr>
+              <th scope="col">玩家</th>
+              ${objects.map(object => {
+                const objectId = object.evaluation_object_id;
+                return `<th scope="col"><strong>${ivV2Esc(object.display_name || objectId)}</strong><small>${ivV2Esc(object.question_text || object.main_question_id)} · ${ivV2Esc(ivV2CoverageDenominatorText(payload, objectId, object.main_question_id))}</small></th>`;
+              }).join('')}
+            </tr>
+          </thead>
+          <tbody>
+            ${visibleParticipants.length ? visibleParticipants.map(participant => {
+              const participantId = ivV2CoverageParticipantKey(participant);
+              return `
+                <tr>
+                  <th scope="row">${ivV2Esc(participant.participant_label || participant.display_name || participantId)}</th>
+                  ${objects.map(object => {
+                    const objectId = object.evaluation_object_id;
+                    const key = ivV2CoverageCellKey(participantId, objectId, object.main_question_id);
+                    const cell = cellMap.get(key);
+                    const label = ivV2CoverageCellLabel(cell);
+                    return `
+                      <td><button class="iv-v2-coverage-cell iv-v2-coverage-cell--${ivV2Esc(ivV2CoverageCellTone(cell))}${ivV2State.selectedCoverageCellKey === key ? ' iv-v2-coverage-cell--active' : ''}"
+                        type="button" data-iv-v2-action="boundary-coverage-cell" data-coverage-cell-key="${ivV2Esc(key)}" title="${ivV2Esc(label)}">${ivV2Esc(label)}</button></td>
+                    `;
+                  }).join('')}
+                </tr>
+              `;
+            }).join('') : `<tr><td colspan="${Math.max(1, objects.length + 1)}">当前筛选下没有玩家。</td></tr>`}
+          </tbody>
+        </table>
+      </div>
+    </section>
+    ${ivV2CoverageDetailHtml(payload, cells)}
+  `;
+}
+
+function ivV2BoundaryWorkspaceBodyHtml() {
+  if (ivV2State.boundaryTab === 'evaluation_objects') return ivV2EvaluationObjectsHtml();
+  if (ivV2State.boundaryTab === 'analysis_scope') return ivV2AnalysisScopeHtml();
+  if (ivV2State.boundaryTab === 'coverage') return ivV2CoveragePreviewHtml();
+  return `
+    ${ivV2IssueListHtml()}
+    ${ivV2IssueDetailHtml()}
+    ${ivV2StructureTreeHtml()}
+    ${ivV2BoundaryReadyForEditing() ? ivV2BoundaryToolbarHtml() : ''}
   `;
 }
 
@@ -1995,7 +3602,26 @@ function ivV2SyncConfirmedControls() {
       control.disabled = operationBusy || !(ivV2IssueHasResolvableAction(issue) && ivV2IssueIsOpen(issue));
       return;
     }
+    if (action === 'boundary-save') {
+      const persisted = Boolean(ivV2CurrentBoundaryRevisionId());
+      control.disabled = operationBusy
+        || !ivV2State.boundaryDraft
+        || Boolean(ivV2State.boundaryConflict)
+        || (persisted && !ivV2State.boundaryDirty);
+      return;
+    }
+    if (action === 'boundary-confirm') {
+      control.disabled = operationBusy || !(
+        ivV2BoundaryConfirmationHeadsReady()
+        && !ivV2State.boundaryDirty
+        && !ivV2State.boundaryConflict
+        && ivV2State.boundaryResponse?.confirmation_ready !== false
+        && ivV2State.status !== 'READY_FOR_DOSSIERS'
+      );
+      return;
+    }
     control.disabled = operationBusy;
+    if (!control.disabled && control.dataset?.ivV2Locked === 'true') control.disabled = true;
   });
 }
 
@@ -2032,6 +3658,20 @@ function ivV2HeadsHtml() {
           </div>
           <span class="iv-v2-badge">${ivV2Esc(ivV2State.statusCode || 'CAS')}</span>
         </div>
+        <div class="iv-v2-history-item">
+          <div>
+            <strong>分析边界头</strong>
+            <p>${ivV2Esc(ivV2CurrentBoundaryRevisionId() || '尚未保存')} · SHA ${ivV2Esc((ivV2State.boundaryResponse?.boundary_payload_sha256 || '').slice(0, 12) || '--')}</p>
+          </div>
+          <span class="iv-v2-badge">第 ${ivV2Esc(ivV2State.boundaryResponse?.boundary_revision_number || ivV2State.boundaryResponse?.revision_number || '--')} 版</span>
+        </div>
+        <div class="iv-v2-history-item">
+          <div>
+            <strong>覆盖预览头</strong>
+            <p>${ivV2Esc(ivV2CurrentCoverageRevisionId() || '尚未生成')} · SHA ${ivV2Esc((ivV2State.boundaryResponse?.coverage_payload_sha256 || ivV2State.coverageResponse?.coverage_payload_sha256 || '').slice(0, 12) || '--')}</p>
+          </div>
+          <span class="iv-v2-badge">四头 CAS</span>
+        </div>
       </div>
       <div class="iv-v2-status-banner iv-v2-status-banner--warning">
         <strong>冲突恢复说明</strong>
@@ -2062,9 +3702,8 @@ function ivV2RenderConfirmed() {
 
   meta.innerHTML = ivV2ReviewSummaryHtml();
   preview.innerHTML = `
-    ${ivV2IssueListHtml()}
-    ${ivV2IssueDetailHtml()}
-    ${ivV2StructureTreeHtml()}
+    ${ivV2BoundaryTabsHtml()}
+    ${ivV2BoundaryWorkspaceBodyHtml()}
   `;
   history.innerHTML = ivV2HeadsHtml();
   const operationBusy = ivV2OperationBusy();
@@ -2213,6 +3852,7 @@ async function ivV2ConfirmMapping() {
     || ivV2OperationBusy()
     || ivV2State.draftDirty
   ) return;
+  if (!ivV2ConfirmDiscardUnsaved('重新确认分组会丢弃当前未保存的分析边界改动并重新构建结构，确定继续吗？')) return;
   const token = ivV2NextToken();
   ivV2State.confirmBusy = true;
   ivV2ResetStructureWorkspace();
@@ -2451,6 +4091,7 @@ function ivV2HandleEditorClick(event) {
   }
 
   if (action === 'retry-structure-build') {
+    if ((ivV2CurrentBoundaryRevisionId() || ivV2State.boundaryDirty) && !window.confirm('重新生成结构会使当前分析边界和覆盖预览过期，确定继续吗？')) return;
     ivV2EnsureStructureWorkspace({ forceRebuild: true });
     return;
   }
@@ -2467,6 +4108,72 @@ function ivV2HandleEditorClick(event) {
 
   if (action === 'submit-review-issue') {
     ivV2SubmitIssueResolution(button.dataset.issueId);
+    return;
+  }
+
+  if (action === 'boundary-tab') {
+    const tab = button.dataset.boundaryTab || 'review';
+    if (!IV_V2_BOUNDARY_TABS.includes(tab) || !ivV2BoundaryTabUnlocked(tab)) return;
+    ivV2State.boundaryTab = tab;
+    if (tab === 'coverage' && !ivV2State.coverageResponse) {
+      ivV2LoadCoveragePreview({ switchTab: true });
+    } else {
+      ivV2RenderConfirmed();
+    }
+    return;
+  }
+
+  if (action === 'boundary-refresh') {
+    ivV2LoadAnalysisBoundary();
+    return;
+  }
+
+  if (action === 'boundary-discard-and-refresh') {
+    if (!window.confirm('放弃本地未保存的分析边界草稿，并加载服务端最新版本吗？')) return;
+    ivV2State.boundaryDirty = false;
+    ivV2State.boundaryConflict = null;
+    ivV2LoadAnalysisBoundary();
+    return;
+  }
+
+  if (action === 'boundary-save') {
+    ivV2SaveAnalysisBoundary();
+    return;
+  }
+
+  if (action === 'boundary-confirm') {
+    ivV2ConfirmAnalysisBoundary();
+    return;
+  }
+
+  if (action === 'boundary-object-up' || action === 'boundary-object-down') {
+    ivV2MoveEvaluationObject(button.dataset.evaluationObjectKey, action === 'boundary-object-up' ? -1 : 1);
+    return;
+  }
+
+  if (action === 'boundary-object-split') {
+    ivV2SplitEvaluationObject(button.dataset.evaluationObjectKey);
+    return;
+  }
+
+  if (action === 'boundary-object-merge') {
+    ivV2MergeEvaluationObjects();
+    return;
+  }
+
+  if (action === 'boundary-source-split') {
+    ivV2SplitSourceScopeRule(button.dataset.sourceRuleKey);
+    return;
+  }
+
+  if (action === 'boundary-load-coverage') {
+    ivV2LoadCoveragePreview({ switchTab: true });
+    return;
+  }
+
+  if (action === 'boundary-coverage-cell') {
+    ivV2State.selectedCoverageCellKey = button.dataset.coverageCellKey || '';
+    ivV2RenderConfirmed();
   }
 }
 
@@ -2474,6 +4181,82 @@ function ivV2HandleEditorInputOrChange(event) {
   const target = event.target;
   const action = target.dataset.ivV2Action;
   if (!action) return;
+  if (action.startsWith('boundary-')) {
+    if (ivV2OperationBusy()) return;
+    if (action === 'boundary-object-name') {
+      const item = ivV2FindEvaluationObject(target.dataset.evaluationObjectKey);
+      if (!ivV2EvaluationObjectIsActive(item)) return;
+      item.display_name = target.value;
+      ivV2MarkBoundaryDirty('已修改被测对象名称', { render: false });
+      return;
+    }
+    if (action === 'boundary-object-hierarchy') {
+      ivV2ChangeEvaluationObjectHierarchy(target.dataset.evaluationObjectKey, target.value);
+      return;
+    }
+    if (action === 'boundary-merge-select') {
+      const key = String(target.dataset.evaluationObjectKey || '');
+      const item = ivV2FindEvaluationObject(key);
+      if (!ivV2EvaluationObjectCanChangeStructure(item)) return;
+      const selected = new Set(ivV2State.boundaryMergeSelection);
+      if (target.checked) selected.add(key);
+      else selected.delete(key);
+      ivV2State.boundaryMergeSelection = Array.from(selected);
+      ivV2RenderConfirmed();
+      return;
+    }
+    if (action === 'boundary-occurrence-select') {
+      const key = String(target.dataset.evaluationObjectKey || '');
+      if (!ivV2EvaluationObjectCanChangeStructure(ivV2FindEvaluationObject(key))) return;
+      const occurrenceId = String(target.dataset.occurrenceId || '');
+      const selected = new Set((ivV2State.boundaryOccurrenceSelection[key] || []).map(String));
+      if (target.checked) selected.add(occurrenceId);
+      else selected.delete(occurrenceId);
+      ivV2State.boundaryOccurrenceSelection[key] = Array.from(selected);
+      ivV2RenderConfirmed();
+      return;
+    }
+    if (action === 'boundary-source-scope-type') {
+      const item = ivV2FindSourceScopeRule(target.dataset.sourceRuleKey);
+      if (!item || !IV_V2_SOURCE_SCOPE_TYPES.includes(target.value)) return;
+      item.scope_type = target.value;
+      ivV2MarkBoundaryDirty('已修改来源范围用途');
+      return;
+    }
+    if (action === 'boundary-source-split-row') {
+      const key = String(target.dataset.sourceRuleKey || '');
+      ivV2State.boundarySplitRows[key] = target.value ? Number(target.value) : 0;
+      ivV2RenderConfirmed();
+      return;
+    }
+    if (action === 'boundary-label-scope-mode') {
+      const item = ivV2FindLabelScopeRule(target.dataset.labelRuleKey);
+      if (!item || !IV_V2_LABEL_SCOPE_MODES.includes(target.value)) return;
+      item.scope_mode = target.value;
+      item.module_ids = [];
+      item.evaluation_object_ids = [];
+      ivV2MarkBoundaryDirty('已修改分析标签作用域');
+      return;
+    }
+    if (action === 'boundary-label-target') {
+      const item = ivV2FindLabelScopeRule(target.dataset.labelRuleKey);
+      if (!item) return;
+      const targetId = String(target.dataset.targetId || '');
+      const field = item.scope_mode === 'selected_modules' ? 'module_ids' : 'evaluation_object_ids';
+      const selected = new Set((item[field] || []).map(String));
+      if (target.checked) selected.add(targetId);
+      else selected.delete(targetId);
+      item[field] = Array.from(selected);
+      ivV2MarkBoundaryDirty('已修改标签的具体作用范围');
+      return;
+    }
+    if (action === 'boundary-coverage-filter') {
+      ivV2State.coverageFilter = ['all', 'gaps', 'review'].includes(target.value) ? target.value : 'all';
+      ivV2RenderConfirmed();
+      return;
+    }
+    return;
+  }
   if (action.startsWith('review-')) {
     if (ivV2OperationBusy()) return;
     const issueId = target.dataset.issueId;
@@ -2589,12 +4372,16 @@ function ivV2Reset() {
   ivV2State.restoreBusy = false;
   ivV2State.buildBusy = false;
   ivV2State.reviewBusy = false;
+  ivV2State.boundaryBusy = false;
+  ivV2State.boundaryConfirmBusy = false;
+  ivV2State.coverageBusy = false;
   ivV2State.importData = null;
   ivV2State.mappingResponse = null;
   ivV2State.draft = null;
   ivV2State.sheetCatalog = {};
   ivV2State.statusNote = '';
   ivV2State.reviewFilter = 'open';
+  ivV2State.coverageFilter = 'all';
   ivV2ResetStructureWorkspace();
   ivV2ClearStatusError();
   ivV2ClearDirty();
@@ -2605,6 +4392,13 @@ function ivV2Reset() {
   ivV2RenderEditor();
   ivV2RenderConfirmed();
   ivV2SetStep(1);
+}
+
+function ivV2StartOver() {
+  if (ivV2OperationBusy()) return false;
+  if (!ivV2ConfirmDiscardUnsaved('重新开始会丢弃当前未保存的分组映射或分析边界改动，确定继续吗？')) return false;
+  ivV2Reset();
+  return true;
 }
 
 function ivV2Mount() {
@@ -2646,13 +4440,7 @@ function ivV2Mount() {
     ivV2State.idempotencyFingerprint = '';
   });
   ivV2$('iv-v2-start-import')?.addEventListener('click', ivV2StartImport);
-  ivV2$('iv-v2-refresh')?.addEventListener('click', () => {
-    if (!ivV2State.importId || ivV2OperationBusy()) return;
-    if (ivV2State.draftDirty && !confirm('刷新会丢弃当前未保存改动，确定继续吗？')) return;
-    ivV2LoadImportBundle(ivV2State.importId, { keepStep: true }).catch(error => {
-      ivV2ShowToastFromError(error, '刷新失败');
-    });
-  });
+  ivV2$('iv-v2-refresh')?.addEventListener('click', ivV2RefreshImportBundleFromEditor);
   ivV2$('iv-v2-add-group')?.addEventListener('click', () => {
     if (ivV2OperationBusy()) return;
     ivV2CreateGroup();
@@ -2686,10 +4474,7 @@ function ivV2Mount() {
     ivV2State.currentStep = 2;
     ivV2SetStep(2);
   });
-  ivV2$('iv-v2-start-over')?.addEventListener('click', () => {
-    if (ivV2OperationBusy()) return;
-    ivV2Reset();
-  });
+  ivV2$('iv-v2-start-over')?.addEventListener('click', ivV2StartOver);
 
   ivV2SyncTrackToggle();
   ivV2SyncUploadButton();
