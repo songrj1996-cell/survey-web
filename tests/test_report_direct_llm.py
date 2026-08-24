@@ -36,6 +36,14 @@ def _streamed_chunk_text(events: list[str]) -> str:
     return "".join(chunks)
 
 
+def _event_payloads(events: list[str]) -> list[dict]:
+    return [
+        json.loads(event.removeprefix("data: ").strip())
+        for event in events
+        if event.startswith("data: ")
+    ]
+
+
 VIEWPOINT_STATS_MD = (
     "<subjective_viewpoint_stats>\n"
     "观点：消息会消失；提及情况：1名玩家提及，占相关有效回答玩家的100.0%\n"
@@ -187,6 +195,23 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(direct.await_count, 6)
         self.assertTrue(any('"type": "report_done"' in event for event in events))
+        progress = [
+            payload
+            for payload in _event_payloads(events)
+            if payload.get("type") == "analysis_progress"
+        ]
+        self.assertEqual(
+            {payload.get("phase") for payload in progress},
+            {"themes", "synthesis", "writing", "finalize"},
+        )
+        self.assertTrue(any(
+            payload.get("phase") == "writing" and payload.get("status") == "active"
+            for payload in progress
+        ))
+        self.assertTrue(any(
+            payload.get("phase") == "finalize" and payload.get("status") == "completed"
+            for payload in progress
+        ))
         self.assertEqual(sess["report_writer_provider"], "direct_llm")
         self.assertEqual(sess["report_writer_model"], "model-a")
         self.assertEqual(sess["analyst_conv_id"], "")

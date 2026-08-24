@@ -1518,6 +1518,34 @@ async def report_stream(
                     with suppress(asyncio.CancelledError):
                         await task
 
+        def _analysis_progress(phase: str, status: str, message: str, **extra):
+            phase_indexes = {
+                "themes": 1,
+                "synthesis": 2,
+                "writing": 3,
+                "finalize": 4,
+            }
+            return sse_event({
+                "type": "analysis_progress",
+                "phase": phase,
+                "phase_index": phase_indexes[phase],
+                "phase_total": 4,
+                "status": status,
+                "message": message,
+                "impact": "none",
+                **extra,
+            })
+
+        def _elapsed_suffix(metrics: dict) -> str:
+            seconds = max(0, int(round(float(metrics.get("elapsed_seconds") or 0))))
+            if not seconds:
+                return ""
+            minutes, remaining = divmod(seconds, 60)
+            return (
+                f"，耗时 {minutes} 分 {remaining} 秒"
+                if minutes else f"，耗时 {remaining} 秒"
+            )
+
         if use_large_mode:
             total_open_text = sum(len(v) for v in open_text.values())
             start_msg = (
@@ -1525,9 +1553,10 @@ async def report_stream(
                 if is_crosstab
                 else "检测到超过500条回复，启用批量处理模式"
             )
-            yield sse_event({"type": "progress", "message": start_msg})
+            yield _analysis_progress("themes", "active", start_msg)
             clustered_themes: dict = {}
             cluster_diagnostics: dict = {}
+            cluster_metrics: dict = {}
             async for item in _batch_qualitative_analysis(
                 open_text,
                 plan,
@@ -1537,35 +1566,66 @@ async def report_stream(
             ):
                 if item[0] == "progress":
                     yield sse_event({"type": "progress", "message": item[1]})
+                elif item[0] == "analysis_progress":
+                    yield sse_event({"type": "analysis_progress", **item[1]})
                 elif item[0] == "heartbeat":
                     yield sse_event({"type": "heartbeat"})
                 elif item[0] == "diagnostics":
                     cluster_diagnostics = item[1]
+                elif item[0] == "analysis_metrics":
+                    cluster_metrics = item[1]
                 elif item[0] == "result":
                     clustered_themes = item[1]
 
             failed_cols = [
                 d.get("col_name", f"列{k}") for k, d in (cluster_diagnostics or {}).items()
-                if d.get("status") != "ok"
+                if d.get("status") == "failed"
+            ]
+            degraded_cols = [
+                d.get("col_name", f"列{k}") for k, d in (cluster_diagnostics or {}).items()
+                if d.get("quality_status") == "degraded"
             ]
             latest_session = get_session(session_id)
             latest_session["open_text_cluster_diagnostics"] = cluster_diagnostics
+            latest_session["open_text_cluster_metrics"] = cluster_metrics
             save_session(session_id, latest_session)
             sess = latest_session
-            if failed_cols:
-                msg = "部分主观题聚类未完成，报告将使用原文兜底：" + "、".join(failed_cols[:4])
-                if len(failed_cols) > 4:
-                    msg += f"等 {len(failed_cols)} 列"
-                yield sse_event({"type": "progress", "message": msg})
+            if failed_cols or degraded_cols:
+                if failed_cols:
+                    msg = f"逐题主题分析完成，{len(failed_cols)} 道题将直接使用全部原文撰写"
+                else:
+                    msg = f"逐题主题分析完成，其中 {len(degraded_cols)} 道题使用了部分原文兜底"
+                msg += _elapsed_suffix(cluster_metrics)
+                yield _analysis_progress(
+                    "themes",
+                    "degraded",
+                    msg,
+                    impact=(
+                        "全部原始回答仍会交给报告写作，但失败题目的主题人数、占比和跨题归纳可能不完整"
+                    ),
+                )
+            else:
+                yield _analysis_progress(
+                    "themes",
+                    "completed",
+                    f"逐题主题分析完成，共处理 {len(cluster_diagnostics)} 道题"
+                    + _elapsed_suffix(cluster_metrics),
+                    elapsed_seconds=cluster_metrics.get("elapsed_seconds", 0),
+                    scope_concurrency=cluster_metrics.get("scope_concurrency", 1),
+                )
 
             viewpoint_stats_md = ""
             if not quantitative_first and not is_crosstab:
                 report_viewpoints: list[dict] = []
+                synthesis_event_seen = False
                 async for item in build_report_viewpoint_stats(
                     clustered_themes, open_text, plan, rows[0]
                 ):
                     if item[0] == "progress":
                         yield sse_event({"type": "progress", "message": item[1]})
+                    elif item[0] == "analysis_progress":
+                        synthesis_event_seen = True
+                        yield sse_event({"type": "analysis_progress", **item[1]})
                     elif item[0] == "heartbeat":
                         yield sse_event({"type": "heartbeat"})
                     elif item[0] == "result":
@@ -1573,8 +1633,25 @@ async def report_stream(
                 viewpoint_stats_md = render_viewpoint_stats(
                     clustered_themes, report_viewpoints
                 )
+                if not synthesis_event_seen:
+                    yield _analysis_progress(
+                        "synthesis",
+                        "skipped",
+                        "可用题目不足两道，跳过跨题观点归纳",
+                    )
+            else:
+                yield _analysis_progress(
+                    "synthesis",
+                    "skipped",
+                    "当前报告模式不需要跨题观点归纳",
+                )
 
-            yield sse_event({"type": "progress", "message": "主题分析完成，开始生成报告..."})
+            yield _analysis_progress(
+                "writing",
+                "active",
+                "主题材料已准备完成，正在撰写报告正文",
+                next_steps=["校验并保存"],
+            )
             writer_query = _build_large_sample_writer_query(
                 stats_md, clustered_themes, plan, rows[0], open_text,
                 qualitative_context=qualitative_context,
@@ -1605,16 +1682,24 @@ async def report_stream(
                 yield heartbeat
             full_report, model_used = _writer_call.out
             writer_models_used.append(model_used)
+            yield _analysis_progress(
+                "writing",
+                "completed",
+                "报告正文已生成，准备校验并保存",
+            )
             for event in _content_events(full_report):
                 yield event
         else:
             viewpoint_stats_md = ""
             if not quantitative_first and open_text:
-                yield sse_event({
-                    "type": "progress",
-                    "message": "正在提炼主观题观点并按玩家去重统计提及人数...",
-                })
+                yield _analysis_progress(
+                    "themes",
+                    "active",
+                    "正在逐题提炼主题并按玩家去重统计提及人数",
+                )
                 clustered_themes: dict = {}
+                cluster_diagnostics: dict = {}
+                cluster_metrics: dict = {}
                 async for item in _batch_qualitative_analysis(
                     open_text,
                     plan,
@@ -1624,17 +1709,56 @@ async def report_stream(
                 ):
                     if item[0] == "progress":
                         yield sse_event({"type": "progress", "message": item[1]})
+                    elif item[0] == "analysis_progress":
+                        yield sse_event({"type": "analysis_progress", **item[1]})
                     elif item[0] == "heartbeat":
                         yield sse_event({"type": "heartbeat"})
+                    elif item[0] == "diagnostics":
+                        cluster_diagnostics = item[1]
+                    elif item[0] == "analysis_metrics":
+                        cluster_metrics = item[1]
                     elif item[0] == "result":
                         clustered_themes = item[1]
 
+                sess["open_text_cluster_diagnostics"] = cluster_diagnostics
+                sess["open_text_cluster_metrics"] = cluster_metrics
+
+                failed_count = sum(
+                    1 for item in cluster_diagnostics.values()
+                    if item.get("status") == "failed"
+                )
+                degraded_count = sum(
+                    1 for item in cluster_diagnostics.values()
+                    if item.get("quality_status") == "degraded"
+                )
+                yield _analysis_progress(
+                    "themes",
+                    "degraded" if failed_count or degraded_count else "completed",
+                    (
+                        f"逐题主题分析完成，{failed_count} 道题将使用原文兜底"
+                        if failed_count
+                        else f"逐题主题分析完成，{degraded_count} 道题使用了部分原文兜底"
+                        if degraded_count
+                        else f"逐题主题分析完成，共处理 {len(cluster_diagnostics)} 道题"
+                    ) + _elapsed_suffix(cluster_metrics),
+                    impact=(
+                        "原文完整保留，但兜底题目的主题统计和跨题归纳可能不完整"
+                        if failed_count or degraded_count else "none"
+                    ),
+                    elapsed_seconds=cluster_metrics.get("elapsed_seconds", 0),
+                    scope_concurrency=cluster_metrics.get("scope_concurrency", 1),
+                )
+
                 report_viewpoints: list[dict] = []
+                synthesis_event_seen = False
                 async for item in build_report_viewpoint_stats(
                     clustered_themes, open_text, plan, rows[0]
                 ):
                     if item[0] == "progress":
                         yield sse_event({"type": "progress", "message": item[1]})
+                    elif item[0] == "analysis_progress":
+                        synthesis_event_seen = True
+                        yield sse_event({"type": "analysis_progress", **item[1]})
                     elif item[0] == "heartbeat":
                         yield sse_event({"type": "heartbeat"})
                     elif item[0] == "result":
@@ -1642,6 +1766,30 @@ async def report_stream(
                 viewpoint_stats_md = render_viewpoint_stats(
                     clustered_themes, report_viewpoints
                 )
+                if not synthesis_event_seen:
+                    yield _analysis_progress(
+                        "synthesis",
+                        "skipped",
+                        "可用题目不足两道，跳过跨题观点归纳",
+                    )
+            else:
+                yield _analysis_progress(
+                    "themes",
+                    "skipped",
+                    "当前报告没有需要提炼的开放题",
+                )
+                yield _analysis_progress(
+                    "synthesis",
+                    "skipped",
+                    "没有逐题主题可用于跨题观点归纳",
+                )
+
+            yield _analysis_progress(
+                "writing",
+                "active",
+                "分析材料已准备完成，开始分章撰写报告",
+                next_steps=["校验并保存"],
+            )
             parts_meta = _writer_parts_meta(plan, rows[0])
 
             async def _round(query: str):
@@ -1786,12 +1934,24 @@ async def report_stream(
             for event in _content_events(action_section):
                 yield event
 
+            yield _analysis_progress(
+                "writing",
+                "completed",
+                f"报告正文 {total_rounds}/{total_rounds} 个生成步骤已完成",
+            )
+
             details_divider = "---------------- 以下为详细信息，各位可以按需查看 ----------------"
             assembled = [title_block, core_block, details_divider, *part_sections]
             if bug_section:
                 assembled.append(bug_section)
             assembled.append(action_section)
             full_report = "\n\n".join(b for b in assembled if b)
+
+        yield _analysis_progress(
+            "finalize",
+            "active",
+            "正在核对统计引用、整理格式并保存报告",
+        )
 
         if quantitative_first:
             appendix = render_stats_appendix(
@@ -1878,6 +2038,11 @@ async def report_stream(
             metadata={"session_id": session_id, "filename": sess.get("filename", "unknown"),
                       "large_mode": use_large_mode, "version": committed_version["version"],
                       **({"history_id": rerun_history_id} if rerun_history_id else {})},
+        )
+        yield _analysis_progress(
+            "finalize",
+            "completed",
+            "报告已通过最终处理并保存",
         )
         yield sse_event({
             "type": "report_done",

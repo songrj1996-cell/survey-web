@@ -19,6 +19,11 @@ function resetReportFailureUi() {
   if (count) count.textContent = '正在准备生成步骤';
   if (progress) progress.setAttribute('aria-valuenow', '0');
   if (progressBar) progressBar.style.width = '0%';
+  document.querySelectorAll('[data-report-phase]').forEach(element => {
+    element.className = 'report-phase report-phase--pending';
+  });
+  const remaining = $('report-progress-remaining');
+  if (remaining) remaining.textContent = '正在计算后续处理步骤';
 }
 
 function showReportFailureUi(message) {
@@ -67,29 +72,172 @@ function _parseReportProgress(message) {
   };
 }
 
-function _appendReportPreparationStep(steps, message) {
-  const text = String(message || '').trim();
-  if (!text) return;
-  const previous = steps.at(-1);
-  if (previous?.text === text) return;
-  if (previous) previous.status = 'done';
-  steps.push({ text, status: 'active' });
-  if (steps.length > 80) steps.splice(0, steps.length - 80);
+const REPORT_PHASE_LABELS = {
+  themes: '逐题主题分析',
+  synthesis: '跨题观点归纳',
+  writing: '报告撰写',
+  finalize: '校验并保存',
+};
+
+const REPORT_STATUS_LABELS = {
+  active: '处理中',
+  retrying: '自动修正',
+  recovered: '已恢复',
+  completed: '已完成',
+  degraded: '已降级',
+  skipped: '已跳过',
+};
+
+function _createReportTaskProgress() {
+  return {
+    structured: false,
+    phase: '',
+    phases: {},
+    items: new Map(),
+    current: null,
+    details: [],
+  };
 }
 
-function _renderReportPreparationSteps(element, steps) {
+function _appendReportProgressDetail(progressState, message) {
+  const text = String(message || '').trim();
+  if (!text || progressState.details.at(-1) === text) return;
+  progressState.details.push(text);
+  if (progressState.details.length > 80) progressState.details.shift();
+}
+
+function _reportQuestionLabel(item) {
+  const part = Number(item.part_index) > 0
+    ? `Part ${item.part_index}${item.part_name ? ` · ${item.part_name}` : ''}`
+    : (item.part_name || '未分章开放题');
+  return `${part} · ${item.question_name || '开放题'}`;
+}
+
+function _applyAnalysisProgress(progressState, event) {
+  progressState.structured = true;
+  progressState.phase = event.phase || progressState.phase;
+  progressState.phases[event.phase] = event.status || 'active';
+  progressState.current = event;
+  _appendReportProgressDetail(progressState, event.message);
+
+  if (event.scope_key != null) {
+    const key = String(event.scope_key);
+    progressState.items.set(key, {
+      ...(progressState.items.get(key) || {}),
+      ...event,
+    });
+  }
+
+  const phaseIndex = Number(event.phase_index) || 1;
+  for (const [phase, index] of Object.keys(REPORT_PHASE_LABELS).map((phase, index) => [phase, index + 1])) {
+    if (index < phaseIndex && !progressState.phases[phase]) {
+      progressState.phases[phase] = 'completed';
+    }
+  }
+}
+
+function _reportProgressPercent(progressState) {
+  const current = progressState.current || {};
+  const phaseIndex = Math.max(1, Number(current.phase_index) || 1);
+  const phaseTotal = Math.max(1, Number(current.phase_total) || 4);
+  let withinPhase = ['completed', 'degraded', 'skipped'].includes(current.status) ? 1 : 0.08;
+  if (current.phase === 'themes' && Number(current.item_total)) {
+    const itemTotal = Number(current.item_total);
+    const completedItems = [...progressState.items.values()].filter(item =>
+      ['completed', 'degraded', 'skipped'].includes(item.status)
+    ).length;
+    withinPhase = Math.min(1, completedItems / itemTotal);
+  } else if (Number(current.item_total)) {
+    withinPhase = Math.min(
+      1,
+      Math.max(0, (Number(current.item_index) - 1) / Number(current.item_total)),
+    );
+  }
+  return Math.min(100, Math.round(((phaseIndex - 1 + withinPhase) / phaseTotal) * 100));
+}
+
+function _renderReportPhaseTrack(progressState) {
+  document.querySelectorAll('[data-report-phase]').forEach(element => {
+    const phase = element.dataset.reportPhase;
+    const status = progressState.phases[phase] || 'pending';
+    element.className = `report-phase report-phase--${status}`;
+  });
+}
+
+function _reportRemainingText(progressState) {
+  const current = progressState.current || {};
+  if (current.phase === 'themes') {
+    const total = Number(current.item_total) || 0;
+    const completed = [...progressState.items.values()].filter(item =>
+      ['completed', 'degraded', 'skipped'].includes(item.status)
+    ).length;
+    const remaining = Math.max(0, total - completed);
+    return `后续还需：${remaining} 道题 → 跨题观点归纳 → 报告撰写 → 校验并保存`;
+  }
+  if (current.phase === 'synthesis') return '后续还需：报告撰写 → 校验并保存';
+  if (current.phase === 'writing') return '后续还需：校验并保存';
+  if (current.phase === 'finalize') return current.status === 'completed' ? '全部处理步骤已完成' : '这是最后一个处理阶段';
+  return '正在计算后续处理步骤';
+}
+
+function _renderReportPreparationSteps(element, progressState) {
   if (!element) return;
   element.textContent = '';
   element.classList.add('report-stream-content--waiting');
 
-  const intro = document.createElement('div');
-  intro.className = 'report-preparation__intro';
-  intro.textContent = '报告正文展示前，系统正在完成以下处理与生成步骤：';
-  element.append(intro);
+  _renderReportPhaseTrack(progressState);
+  const remaining = $('report-progress-remaining');
+  if (remaining) remaining.textContent = _reportRemainingText(progressState);
+
+  const current = progressState.current;
+  if (current?.scope_key != null && !['completed', 'skipped'].includes(current.status)) {
+    const currentCard = document.createElement('section');
+    currentCard.className = `report-current-task report-current-task--${current.status || 'active'}`;
+    const eyebrow = document.createElement('span');
+    eyebrow.className = 'report-current-task__eyebrow';
+    eyebrow.textContent = '当前处理';
+    const title = document.createElement('strong');
+    title.className = 'report-current-task__title';
+    title.textContent = _reportQuestionLabel(current);
+    const sample = document.createElement('span');
+    sample.className = 'report-current-task__sample';
+    const unit = current.count_unit === 'players' ? '名玩家' : '条回答';
+    sample.textContent = `${Number(current.respondent_count) || 0} ${unit}`;
+    const message = document.createElement('p');
+    message.textContent = current.message || '正在处理';
+    currentCard.append(eyebrow, title, sample, message);
+    if (current.audience) {
+      const audience = document.createElement('small');
+      audience.textContent = current.audience;
+      currentCard.append(audience);
+    }
+    if (Array.isArray(current.next_steps) && current.next_steps.length) {
+      const next = document.createElement('small');
+      next.textContent = `本题之后还需：${current.next_steps.join(' → ')}`;
+      currentCard.append(next);
+    }
+    if (current.impact && current.impact !== 'none') {
+      const impact = document.createElement('div');
+      impact.className = 'report-quality-impact';
+      impact.textContent = `对报告的影响：${current.impact}`;
+      currentCard.append(impact);
+    }
+    element.append(currentCard);
+  }
+
+  const items = [...progressState.items.values()].sort((a, b) =>
+    (Number(a.item_index) || 0) - (Number(b.item_index) || 0)
+  );
+  if (items.length) {
+    const intro = document.createElement('div');
+    intro.className = 'report-preparation__intro';
+    intro.textContent = `逐题进度（${items.filter(item => ['completed', 'degraded', 'skipped'].includes(item.status)).length}/${Number(items[0]?.item_total) || items.length}）`;
+    element.append(intro);
+  }
 
   const list = document.createElement('ol');
   list.className = 'report-preparation';
-  for (const step of steps) {
+  for (const step of items) {
     const item = document.createElement('li');
     item.className = `report-preparation__item report-preparation__item--${step.status}`;
 
@@ -99,16 +247,42 @@ function _renderReportPreparationSteps(element, steps) {
 
     const copy = document.createElement('span');
     copy.className = 'report-preparation__copy';
-    copy.textContent = step.text;
+    const label = document.createElement('strong');
+    label.textContent = _reportQuestionLabel(step);
+    const unit = step.count_unit === 'players' ? '名玩家' : '条回答';
+    const summary = document.createElement('small');
+    summary.textContent = `${Number(step.respondent_count) || 0} ${unit} · ${step.message || '等待处理'}`;
+    copy.append(label, summary);
+    if (step.impact && step.impact !== 'none') {
+      const impact = document.createElement('small');
+      impact.className = 'report-preparation__impact';
+      impact.textContent = `影响：${step.impact}`;
+      copy.append(impact);
+    }
 
     const status = document.createElement('span');
     status.className = 'report-preparation__status';
-    status.textContent = step.status === 'done' ? '已完成' : '进行中';
+    status.textContent = REPORT_STATUS_LABELS[step.status] || '等待中';
 
     item.append(marker, copy, status);
     list.append(item);
   }
-  element.append(list);
+  if (items.length) element.append(list);
+
+  if (progressState.details.length) {
+    const details = document.createElement('details');
+    details.className = 'report-progress-details';
+    const summary = document.createElement('summary');
+    summary.textContent = `查看处理详情（${progressState.details.length}）`;
+    const detailList = document.createElement('ol');
+    for (const text of progressState.details) {
+      const row = document.createElement('li');
+      row.textContent = text;
+      detailList.append(row);
+    }
+    details.append(summary, detailList);
+    element.append(details);
+  }
   element.scrollTop = element.scrollHeight;
 }
 
@@ -422,7 +596,7 @@ async function runStats(options = {}) {
     let totalSteps = 0;
     let currentTask = '正在准备报告内容';
     let completedSteps = 0;
-    const preparationSteps = [];
+    const taskProgress = _createReportTaskProgress();
     let stepStartedAt = Date.now();
     let lastSignalAt = Date.now();
 
@@ -439,19 +613,36 @@ async function runStats(options = {}) {
       const count = $('report-stream-count');
       const progress = $('report-generation-progress');
       const progressBar = $('report-generation-progress-bar');
-      const titleText = currentStep && totalSteps
-        ? `正在生成 ${currentStep}/${totalSteps}：${currentTask}`
-        : currentTask;
-      const percent = totalSteps ? Math.round((completedSteps / totalSteps) * 100) : 0;
+      const structuredCurrent = taskProgress.structured ? taskProgress.current : null;
+      const titleText = structuredCurrent?.scope_key != null
+        ? _reportQuestionLabel(structuredCurrent)
+        : (structuredCurrent?.message || (
+          currentStep && totalSteps
+            ? `正在生成 ${currentStep}/${totalSteps}：${currentTask}`
+            : currentTask
+        ));
+      const percent = taskProgress.structured
+        ? _reportProgressPercent(taskProgress)
+        : (totalSteps ? Math.round((completedSteps / totalSteps) * 100) : 0);
 
       if (title) title.textContent = titleText;
       if (meta) {
-        meta.textContent = `${waitingText} · ${connectionText} · 已等待 ${_formatReportWaitTime(waitedMs)}`;
+        const statusText = structuredCurrent?.message || waitingText;
+        meta.textContent = `${statusText} · ${connectionText} · 已等待 ${_formatReportWaitTime(waitedMs)}`;
       }
       if (count) {
-        count.textContent = totalSteps
-          ? `已完成 ${completedSteps}/${totalSteps} 个生成步骤`
-          : '正在准备生成步骤';
+        if (structuredCurrent?.phase === 'themes' && Number(structuredCurrent.item_total)) {
+          const done = [...taskProgress.items.values()].filter(item =>
+            ['completed', 'degraded', 'skipped'].includes(item.status)
+          ).length;
+          count.textContent = `已处理 ${done}/${structuredCurrent.item_total} 道题`;
+        } else if (structuredCurrent?.phase_index) {
+          count.textContent = `第 ${structuredCurrent.phase_index}/${structuredCurrent.phase_total || 4} 阶段`;
+        } else {
+          count.textContent = totalSteps
+            ? `已完成 ${completedSteps}/${totalSteps} 个生成步骤`
+            : '正在准备生成步骤';
+        }
       }
       if (progress) progress.setAttribute('aria-valuenow', String(percent));
       if (progressBar) progressBar.style.width = `${percent}%`;
@@ -463,6 +654,17 @@ async function runStats(options = {}) {
     const onReportEvent = ev => {
       if (!isCurrentGeneration()) return;
       lastSignalAt = Date.now();
+      if (ev.type === 'analysis_progress') {
+        _applyAnalysisProgress(taskProgress, ev);
+        _renderReportPhaseTrack(taskProgress);
+        const remaining = $('report-progress-remaining');
+        if (remaining) remaining.textContent = _reportRemainingText(taskProgress);
+        currentTask = ev.message || currentTask;
+        stepStartedAt = Date.now();
+        renderGenerationStatus();
+        const el = $('report-stream-content');
+        if (el && !fullReport) _renderReportPreparationSteps(el, taskProgress);
+      }
       if (ev.type === 'progress') {
         // 服务端按完整章节输出；状态区持续说明当前步骤，避免等待期间像卡死。
         const parsed = _parseReportProgress(ev.message);
@@ -471,15 +673,29 @@ async function runStats(options = {}) {
           totalSteps = parsed.total;
           completedSteps = Math.max(0, currentStep - 1);
           currentTask = parsed.task;
+          if (taskProgress.structured && taskProgress.current?.phase === 'writing') {
+            taskProgress.current = {
+              ...taskProgress.current,
+              message: `正在生成 ${parsed.current}/${parsed.total}：${parsed.task}`,
+              item_index: parsed.current,
+              item_total: parsed.total,
+            };
+          }
         } else {
           currentTask = ev.message || currentTask;
+          if (taskProgress.structured && taskProgress.current?.phase === 'writing') {
+            taskProgress.current = {
+              ...taskProgress.current,
+              message: ev.message || taskProgress.current.message,
+            };
+          }
         }
         stepStartedAt = Date.now();
         renderGenerationStatus();
         const el = $('report-stream-content');
         if (el && !fullReport) {
-          _appendReportPreparationStep(preparationSteps, ev.message);
-          _renderReportPreparationSteps(el, preparationSteps);
+          _appendReportProgressDetail(taskProgress, ev.message);
+          _renderReportPreparationSteps(el, taskProgress);
         }
       }
       if (ev.type === 'heartbeat') renderGenerationStatus();

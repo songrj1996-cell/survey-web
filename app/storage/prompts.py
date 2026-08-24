@@ -181,6 +181,7 @@ DEFAULT_PROMPTS: dict = {
         order=10,
         kind="system",
         current=DEFAULT_THEME_EXTRACT_SYSTEM_PROMPT,
+        version=2,
     ),
     "theme_merge_system": _prompt(
         "theme_merge_system",

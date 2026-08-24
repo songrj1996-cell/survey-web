@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
+
 from app.services import report_engine
 
 
@@ -80,46 +83,127 @@ async def build_report_viewpoint_stats(
     plan: dict,
     headers: list[str],
 ):
-    """跨题合并观点并回跑全部原文；yield progress/heartbeat/result。"""
+    """跨题合并观点并回跑全部原文；yield analysis_progress/heartbeat/result。"""
+    synthesis_started = time.monotonic()
     candidates = _cross_question_candidates(clustered_themes)
     evidence = _flatten_evidence(open_text, plan, headers)
     if len(clustered_themes) < 2 or not candidates or not evidence:
         yield ("result", [])
         return
 
-    yield ("progress", "正在按报告分析结构合并跨题观点")
-    organization = _report_organization(plan)
-    merge_result = await report_engine._direct_json_call(
-        report_engine._get_theme_merge_system_prompt()
-        + (
-            "\n\n跨题观点额外规则：最终主题必须是玩家能够在一条回答中直接表达的具体观点。"
-            "可以合并不同题目里意思相同的玩家说法，但禁止创造‘A影响B’‘A导致B’‘A与B有关’"
-            "等需要比较多题、客观统计或多类证据才能得出的关系、标准、框架或产品判断；"
-            "这类内容属于分析推断，不进入玩家观点目录。"
-        ),
-        report_engine._build_theme_merge_query(
-            f"跨题报告观点；报告组织方式：{organization}",
-            candidates,
-            len(evidence),
-        ),
-        models=(
-            report_engine.LLM_THEME_MERGE_MODEL,
-            *report_engine.LLM_THEME_MERGE_FALLBACK_MODELS,
-        ),
-        max_tokens=report_engine.LLM_THEME_MERGE_MAX_TOKENS,
-        reasoning_effort=report_engine.LLM_THEME_MERGE_REASONING or None,
-        validator=lambda data: report_engine._validate_merged_themes(data, candidates),
+    yield (
+        "analysis_progress",
+        {
+            "phase": "synthesis",
+            "phase_index": 2,
+            "phase_total": 4,
+            "status": "active",
+            "step": "merging",
+            "message": "正在合并不同题目中含义相近的玩家观点",
+            "impact": "none",
+        },
     )
+    organization = _report_organization(plan)
+    repair_events: asyncio.Queue = asyncio.Queue()
+
+    async def _merge():
+        return await report_engine._direct_json_call(
+            report_engine._get_theme_merge_system_prompt()
+            + (
+                "\n\n跨题观点额外规则：最终主题必须是玩家能够在一条回答中直接表达的具体观点。"
+                "可以合并不同题目里意思相同的玩家说法，但禁止创造‘A影响B’‘A导致B’‘A与B有关’"
+                "等需要比较多题、客观统计或多类证据才能得出的关系、标准、框架或产品判断；"
+                "这类内容属于分析推断，不进入玩家观点目录。"
+            ),
+            report_engine._build_theme_merge_query(
+                f"跨题报告观点；报告组织方式：{organization}",
+                candidates,
+                len(evidence),
+            ),
+            models=(
+                report_engine.LLM_THEME_MERGE_MODEL,
+                *report_engine.LLM_THEME_MERGE_FALLBACK_MODELS,
+            ),
+            max_tokens=report_engine.LLM_THEME_MERGE_MAX_TOKENS,
+            reasoning_effort=report_engine.LLM_THEME_MERGE_REASONING or None,
+            validator=lambda data: report_engine._validate_merged_themes(data, candidates),
+            on_repair=lambda error: repair_events.put_nowait({"error": error}),
+        )
+
+    merge_result = None
+    async for event_type, payload in report_engine._run_bounded_calls(
+        [_merge], 1, repair_events
+    ):
+        if event_type == "heartbeat":
+            yield ("heartbeat", "")
+        elif event_type == "call_progress":
+            yield (
+                "analysis_progress",
+                {
+                    "phase": "synthesis",
+                    "phase_index": 2,
+                    "phase_total": 4,
+                    "status": "retrying",
+                    "step": "merging",
+                    "retry_index": 1,
+                    "retry_total": 1,
+                    "message": "跨题归纳未通过校验，正在自动修正并重新调用（1/1）",
+                    "impact": "各题主题和原文仍完整保留",
+                },
+            )
+        else:
+            _batch_index, merge_result = payload
+    merge_result = merge_result or {}
     merged = merge_result.get("data") if isinstance(merge_result, dict) else None
     themes = merged.get("themes", []) if isinstance(merged, dict) else []
     if not themes:
+        yield (
+            "analysis_progress",
+            {
+                "phase": "synthesis",
+                "phase_index": 2,
+                "phase_total": 4,
+                "status": "degraded",
+                "step": "completed",
+                "message": "跨题观点归纳未完成，继续使用各题分析结果撰写报告",
+                "impact": (
+                    "各题主题和原文均保留，但跨题共同观点及其去重人数可能缺失"
+                ),
+                "elapsed_seconds": round(time.monotonic() - synthesis_started, 3),
+            },
+        )
         yield ("result", [])
         return
+    if merge_result.get("repaired"):
+        yield (
+            "analysis_progress",
+            {
+                "phase": "synthesis",
+                "phase_index": 2,
+                "phase_total": 4,
+                "status": "recovered",
+                "step": "merging",
+                "message": "跨题归纳自动修正成功，正在回查全部原文",
+                "impact": "none",
+            },
+        )
 
     batches = [
         evidence[index:index + report_engine.BATCH_SIZE]
         for index in range(0, len(evidence), report_engine.BATCH_SIZE)
     ]
+    yield (
+        "analysis_progress",
+        {
+            "phase": "synthesis",
+            "phase_index": 2,
+            "phase_total": 4,
+            "status": "active",
+            "step": "classifying",
+            "message": f"正在回查全部原文并统计跨题观点（共 {len(batches)} 批）",
+            "impact": "none",
+        },
+    )
     factories = []
     for batch in batches:
         async def _classify(batch=batch):
@@ -188,6 +272,26 @@ async def build_report_viewpoint_stats(
             "quotes": quotes[theme_id],
         })
     result.sort(key=lambda item: item["count"], reverse=True)
+    fallback_count = sum(
+        item.get("fallback_count", 0) for item in classified.values()
+    )
+    yield (
+        "analysis_progress",
+        {
+            "phase": "synthesis",
+            "phase_index": 2,
+            "phase_total": 4,
+            "status": "degraded" if fallback_count else "completed",
+            "step": "completed",
+            "viewpoint_count": len(result),
+            "message": f"跨题归纳完成，共形成 {len(result)} 个跨题观点",
+            "impact": (
+                f"有 {fallback_count} 条回答未能归入跨题观点；单题结果和原文不受影响"
+                if fallback_count else "none"
+            ),
+            "elapsed_seconds": round(time.monotonic() - synthesis_started, 3),
+        },
+    )
     yield ("result", result)
 
 
