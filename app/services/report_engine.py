@@ -5,7 +5,9 @@ planner/writer 问询构建、大样本分批定性分析、开放题兜底、�
 import asyncio
 import json
 import re
+import time
 from contextlib import suppress
+from copy import deepcopy
 
 from app.core.config import (
     BATCH_SIZE,
@@ -16,6 +18,8 @@ from app.core.config import (
     LLM_CLASSIFY_MAX_TOKENS,
     LLM_CLASSIFY_MODEL,
     LLM_CLASSIFY_REASONING,
+    LLM_QUALITATIVE_CALL_TIMEOUT_SECONDS,
+    LLM_QUALITATIVE_SCOPE_CONCURRENCY,
     LLM_STREAM_HEARTBEAT_SECONDS,
     LLM_THEME_EXTRACT_CONCURRENCY,
     LLM_THEME_EXTRACT_FALLBACK_MODELS,
@@ -646,11 +650,23 @@ def _cluster_diag_column(col_idx: int, col_name: str, total: int, batches: int) 
         "phase_b": {},
         "phase_c": [],
         "status": "running",
+        "quality_status": "pending",
         "reason": "",
         "themes": 0,
         "classifications": 0,
         "assignments": 0,
     }
+
+
+def _theme_failure_summary(error: str) -> str:
+    detail = str(error or "")
+    if "引用" in detail or "回答 ID" in detail or "response" in detail.lower():
+        return "主题证据校验未通过"
+    if "json" in detail.lower() or "themes" in detail.lower():
+        return "主题返回格式未通过校验"
+    if "LLM generation failed" in detail or "timeout" in detail.lower():
+        return "模型服务重试后仍未完成"
+    return "主题结果未通过质量校验"
 
 
 def _llm_json_messages(system_prompt: str, query: str) -> list[dict]:
@@ -668,14 +684,20 @@ async def _direct_json_call(
     max_tokens: int,
     reasoning_effort: str | None,
     validator,
+    on_repair=None,
 ) -> dict:
     """调用直连 LLM 并做一次针对 JSON/业务 schema 的纠错重试。"""
+    call_started = time.monotonic()
+    initial_started = call_started
     try:
-        answer, model = await collect_chat_completion(
-            prepare_glossary_messages(_llm_json_messages(system_prompt, query)),
-            models=models,
-            max_tokens=max_tokens,
-            reasoning_effort=reasoning_effort,
+        answer, model = await asyncio.wait_for(
+            collect_chat_completion(
+                prepare_glossary_messages(_llm_json_messages(system_prompt, query)),
+                models=models,
+                max_tokens=max_tokens,
+                reasoning_effort=reasoning_effort,
+            ),
+            timeout=LLM_QUALITATIVE_CALL_TIMEOUT_SECONDS,
         )
     except Exception as exc:
         return {
@@ -683,8 +705,12 @@ async def _direct_json_call(
             "model": "",
             "raw_len": 0,
             "repaired": False,
-            "error": str(exc)[:300],
+            "error": (str(exc).strip() or type(exc).__name__)[:300],
+            "duration_seconds": round(time.monotonic() - call_started, 3),
+            "initial_duration_seconds": round(time.monotonic() - initial_started, 3),
+            "repair_duration_seconds": 0.0,
         }
+    initial_duration = time.monotonic() - initial_started
 
     parsed, parse_error = _json_loads_loose(answer)
     validation_error = validator(parsed) if parsed else (parse_error or "invalid JSON")
@@ -698,7 +724,13 @@ async def _direct_json_call(
             "raw_len": len(answer),
             "repaired": False,
             "error": "",
+            "duration_seconds": round(time.monotonic() - call_started, 3),
+            "initial_duration_seconds": round(initial_duration, 3),
+            "repair_duration_seconds": 0.0,
         }
+
+    if on_repair:
+        on_repair(validation_error)
 
     repair_messages = [
         *_llm_json_messages(system_prompt, query),
@@ -712,12 +744,16 @@ async def _direct_json_call(
         },
     ]
     repair_models = (model, *(m for m in models if m != model))
+    repair_started = time.monotonic()
     try:
-        repaired_answer, repaired_model = await collect_chat_completion(
-            prepare_glossary_messages(repair_messages),
-            models=repair_models,
-            max_tokens=max_tokens,
-            reasoning_effort=reasoning_effort,
+        repaired_answer, repaired_model = await asyncio.wait_for(
+            collect_chat_completion(
+                prepare_glossary_messages(repair_messages),
+                models=repair_models,
+                max_tokens=max_tokens,
+                reasoning_effort=reasoning_effort,
+            ),
+            timeout=LLM_QUALITATIVE_CALL_TIMEOUT_SECONDS,
         )
     except Exception as exc:
         return {
@@ -725,8 +761,12 @@ async def _direct_json_call(
             "model": model,
             "raw_len": len(answer),
             "repaired": True,
-            "error": str(exc)[:300],
+            "error": (str(exc).strip() or type(exc).__name__)[:300],
+            "duration_seconds": round(time.monotonic() - call_started, 3),
+            "initial_duration_seconds": round(initial_duration, 3),
+            "repair_duration_seconds": round(time.monotonic() - repair_started, 3),
         }
+    repair_duration = time.monotonic() - repair_started
 
     repaired, repair_parse_error = _json_loads_loose(repaired_answer)
     repair_validation_error = (
@@ -745,10 +785,17 @@ async def _direct_json_call(
         "raw_len": len(repaired_answer),
         "repaired": True,
         "error": repair_validation_error or "",
+        "duration_seconds": round(time.monotonic() - call_started, 3),
+        "initial_duration_seconds": round(initial_duration, 3),
+        "repair_duration_seconds": round(repair_duration, 3),
     }
 
 
-async def _run_bounded_calls(call_factories: list, concurrency: int):
+async def _run_bounded_calls(
+    call_factories: list,
+    concurrency: int,
+    event_queue: asyncio.Queue | None = None,
+):
     """有限并发执行批次，并在等待期间产生 heartbeat 事件。"""
     semaphore = asyncio.Semaphore(max(1, concurrency))
 
@@ -760,19 +807,30 @@ async def _run_bounded_calls(call_factories: list, concurrency: int):
         asyncio.create_task(_invoke(index, factory))
         for index, factory in enumerate(call_factories)
     }
+    queue_task = asyncio.create_task(event_queue.get()) if event_queue else None
     try:
         while pending:
-            done, pending = await asyncio.wait(
-                pending,
+            waiters = pending | ({queue_task} if queue_task else set())
+            done, _ = await asyncio.wait(
+                waiters,
                 timeout=LLM_STREAM_HEARTBEAT_SECONDS,
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if not done:
                 yield ("heartbeat", None)
                 continue
-            for task in done:
+            if queue_task and queue_task in done:
+                yield ("call_progress", queue_task.result())
+                queue_task = asyncio.create_task(event_queue.get())
+            completed_calls = done & pending
+            pending -= completed_calls
+            for task in completed_calls:
                 yield ("result", task.result())
     finally:
+        if queue_task:
+            queue_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await queue_task
         for task in pending:
             task.cancel()
         for task in pending:
@@ -782,6 +840,10 @@ async def _run_bounded_calls(call_factories: list, concurrency: int):
 
 def _text_key(value: str) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _response_ref(index: int) -> str:
+    return f"r{index + 1:04d}"
 
 
 def _validate_theme_candidates(data: dict | None, source_texts: list[str]) -> str | None:
@@ -810,13 +872,52 @@ def _validate_theme_candidates(data: dict | None, source_texts: list[str]) -> st
             value = theme.get(field)
             if value is not None and not isinstance(value, str):
                 return f"主题「{name}」的 {field} 必须是字符串或 null"
+        response_ids = theme.get("representative_response_ids")
+        if response_ids is not None:
+            valid_ids = {_response_ref(i) for i in range(len(source_texts))}
+            if (
+                not isinstance(response_ids, list)
+                or not 1 <= len(response_ids) <= 3
+                or not all(isinstance(response_id, str) for response_id in response_ids)
+                or len(set(response_ids)) != len(response_ids)
+            ):
+                return f"主题「{name}」必须包含 1–3 个不重复的 representative_response_ids"
+            invalid_ids = [response_id for response_id in response_ids if response_id not in valid_ids]
+            if invalid_ids:
+                return f"主题「{name}」引用了不存在的回答 ID：{invalid_ids[0]}"
+            continue
+
+        # 兼容管理员尚未迁移的旧版自定义提示词。新默认协议使用回答 ID，
+        # 由代码确定性还原原文，避免模型复制标点或空格时导致整批报废。
         quotes = theme.get("representative_quotes")
         if not isinstance(quotes, list) or not quotes or len(quotes) > 3:
-            return f"主题「{name}」必须包含 1–3 条 representative_quotes"
+            return f"主题「{name}」必须包含 1–3 个 representative_response_ids"
         for quote in quotes:
             if _text_key(quote) not in source_set:
                 return f"主题「{name}」包含并非逐字来自输入的引用"
     return None
+
+
+def _hydrate_theme_candidate_quotes(
+    data: dict | None,
+    source_texts: list[str],
+) -> dict | None:
+    """把模型返回的回答 ID 确定性转换成后续流程使用的逐字原文。"""
+    if not isinstance(data, dict):
+        return data
+    hydrated = deepcopy(data)
+    lookup = {_response_ref(index): text for index, text in enumerate(source_texts)}
+    for theme in hydrated.get("themes") or []:
+        if not isinstance(theme, dict):
+            continue
+        response_ids = theme.pop("representative_response_ids", None)
+        if response_ids is not None:
+            theme["representative_quotes"] = [
+                lookup[response_id]
+                for response_id in response_ids
+                if response_id in lookup
+            ]
+    return hydrated
 
 
 def _validate_merged_themes(data: dict | None, candidates: list[dict]) -> str | None:
@@ -933,7 +1034,10 @@ def _build_theme_extract_query(
     batch: list[dict],
 ) -> tuple[str, list[str]]:
     texts = [str(entry.get("text") or "") for entry in batch]
-    responses = "\n".join(f"[{index}] {text}" for index, text in enumerate(texts))
+    responses = "\n".join(
+        f"[{_response_ref(index)}] {text}"
+        for index, text in enumerate(texts)
+    )
     return (
         f"<question>\n{question}\n</question>\n\n"
         f"<response_count>{len(batch)}</response_count>\n"
@@ -1013,6 +1117,7 @@ async def _classify_batch_direct(
     missing_ids = [response_id for response_id in expected_ids if response_id not in normalized]
     repaired_count = 0
     repair_model = ""
+    duration_seconds = float(first.get("duration_seconds") or 0)
 
     if missing_ids:
         miss = await _direct_json_call(
@@ -1034,6 +1139,7 @@ async def _classify_batch_direct(
         normalized.update(repaired)
         repaired_count = len(repaired)
         repair_model = miss.get("model", "")
+        duration_seconds += float(miss.get("duration_seconds") or 0)
 
     fallback_ids = [
         response_id for response_id in expected_ids if response_id not in normalized
@@ -1055,6 +1161,7 @@ async def _classify_batch_direct(
         "repaired_count": repaired_count,
         "fallback_count": len(fallback_ids),
         "error": first.get("error", ""),
+        "duration_seconds": round(duration_seconds, 3),
     }
 
 
@@ -1065,10 +1172,13 @@ async def _batch_qualitative_analysis(
     session_id: str,
     *,
     deduplicate_respondents: bool = False,
+    _scopes_override: list | None = None,
+    _scope_position: tuple[int, int] | None = None,
+    _batch_concurrency_override: int | None = None,
 ):
     """大样本定性分析四阶段批处理。
 
-    异步生成器，yield ("progress", msg) 或 ("result", clustered_themes)。
+    异步生成器，yield ("analysis_progress", payload)、heartbeat、diagnostics 或 result。
     clustered_themes 结构：
     {
         col_idx: {
@@ -1082,15 +1192,119 @@ async def _batch_qualitative_analysis(
         }
     }
     """
+    analysis_started = time.monotonic()
     clustered_themes: dict = {}
     diagnostics: dict[str, dict] = {}
+    scopes = (
+        list(_scopes_override)
+        if _scopes_override is not None
+        else list(_open_text_scopes(open_text, plan))
+    )
 
-    for scope_key, col_idx, part_index, part, entries in _open_text_scopes(open_text, plan):
+    if (
+        _scopes_override is None
+        and len(scopes) > 1
+        and LLM_QUALITATIVE_SCOPE_CONCURRENCY > 1
+    ):
+        event_queue: asyncio.Queue = asyncio.Queue()
+        semaphore = asyncio.Semaphore(LLM_QUALITATIVE_SCOPE_CONCURRENCY)
+
+        async def _consume_scope(scope_index: int, scope):
+            scope_diagnostics: dict = {}
+            scope_result: dict = {}
+            async with semaphore:
+                async for event in _batch_qualitative_analysis(
+                    open_text,
+                    plan,
+                    headers,
+                    session_id,
+                    deduplicate_respondents=deduplicate_respondents,
+                    _scopes_override=[scope],
+                    _scope_position=(scope_index + 1, len(scopes)),
+                    _batch_concurrency_override=1,
+                ):
+                    if event[0] == "diagnostics":
+                        scope_diagnostics = event[1]
+                    elif event[0] == "result":
+                        scope_result = event[1]
+                    elif event[0] != "analysis_metrics":
+                        await event_queue.put(event)
+            return scope_index, scope_diagnostics, scope_result
+
+        tasks = {
+            asyncio.create_task(_consume_scope(scope_index, scope))
+            for scope_index, scope in enumerate(scopes)
+        }
+        completed: dict[int, tuple[dict, dict]] = {}
+        queue_task = None
+        try:
+            while tasks:
+                if not event_queue.empty():
+                    yield await event_queue.get()
+                    continue
+                queue_task = asyncio.create_task(event_queue.get())
+                done, _pending = await asyncio.wait(
+                    tasks | {queue_task},
+                    timeout=LLM_STREAM_HEARTBEAT_SECONDS,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not done:
+                    queue_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await queue_task
+                    queue_task = None
+                    yield ("heartbeat", "")
+                    continue
+                if queue_task in done:
+                    yield queue_task.result()
+                    queue_task = None
+                else:
+                    queue_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await queue_task
+                    queue_task = None
+                for task in done & tasks:
+                    scope_index, scope_diagnostics, scope_result = task.result()
+                    completed[scope_index] = (scope_diagnostics, scope_result)
+                    tasks.remove(task)
+            while not event_queue.empty():
+                yield await event_queue.get()
+        finally:
+            if queue_task is not None:
+                queue_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await queue_task
+            for task in tasks:
+                task.cancel()
+            for task in tasks:
+                with suppress(asyncio.CancelledError):
+                    await task
+
+        for scope_index in sorted(completed):
+            scope_diagnostics, scope_result = completed[scope_index]
+            diagnostics.update(scope_diagnostics)
+            clustered_themes.update(scope_result)
+        yield (
+            "analysis_metrics",
+            {
+                "scope_count": len(scopes),
+                "scope_concurrency": LLM_QUALITATIVE_SCOPE_CONCURRENCY,
+                "elapsed_seconds": round(time.monotonic() - analysis_started, 3),
+            },
+        )
+        yield ("diagnostics", diagnostics)
+        yield ("result", clustered_themes)
+        return
+
+    for item_index, (scope_key, col_idx, part_index, part, entries) in enumerate(scopes, 1):
+        scope_started = time.monotonic()
+        display_index, display_total = _scope_position or (item_index, len(scopes))
         col = next((c for c in plan["columns"] if c["index"] == col_idx), None)
-        col_name = (col and col.get("name")) or (
+        question_name = (col and col.get("name")) or (
             headers[col_idx] if col_idx < len(headers) else f"列{col_idx}"
         )
-        col_name = f"{col_name}{_open_text_source_note(entries)}"
+        question_name = f"{question_name}{_open_text_source_note(entries)}"
+        col_name = question_name
         col_name = _question_name_with_branch(col_name, plan, col_idx)
         filter_desc = _part_filter_desc(part, plan)
         if filter_desc:
@@ -1108,9 +1322,48 @@ async def _batch_qualitative_analysis(
             f"{respondent_total} 名玩家"
             if deduplicate_respondents else f"{respondent_total} 条"
         )
-        yield ("progress", f"【{col_name}】开始分析（共 {count_label}）")
+        progress_base = {
+            "phase": "themes",
+            "phase_index": 1,
+            "phase_total": 4,
+            "scope_key": str(scope_key),
+            "item_index": display_index,
+            "item_total": display_total,
+            "part_index": part_index,
+            "part_name": str(part.get("name") or "未分章开放题"),
+            "question_name": question_name,
+            "audience": filter_desc,
+            "respondent_count": respondent_total,
+            "count_unit": "players" if deduplicate_respondents else "responses",
+        }
+        yield (
+            "analysis_progress",
+            {
+                **progress_base,
+                "status": "active",
+                "step": "started",
+                "message": f"开始分析，共 {count_label}",
+                "impact": "none",
+            },
+        )
         if not entries:
-            diagnostics[str(scope_key)] = _cluster_diag_column(col_idx, col_name, 0, 0)
+            empty_diag = _cluster_diag_column(col_idx, col_name, 0, 0)
+            empty_diag["status"] = "skipped"
+            empty_diag["quality_status"] = "ok"
+            empty_diag["reason"] = "没有符合条件的有效回答"
+            diagnostics[str(scope_key)] = empty_diag
+            empty_diag["elapsed_seconds"] = round(time.monotonic() - scope_started, 3)
+            yield (
+                "analysis_progress",
+                {
+                    **progress_base,
+                    "status": "skipped",
+                    "step": "completed",
+                    "message": "没有符合条件的有效回答，本题已跳过",
+                    "impact": "本题没有可用于报告的开放回答",
+                    "elapsed_seconds": empty_diag["elapsed_seconds"],
+                },
+            )
             continue
 
         # ── Phase A：分批提取主题候选 ──────────────────────────────────────
@@ -1120,15 +1373,29 @@ async def _batch_qualitative_analysis(
         diagnostics[str(scope_key)] = diag
 
         extract_factories = []
+        repair_events: asyncio.Queue = asyncio.Queue()
         for bi, batch in enumerate(batches, 1):
-            yield ("progress", f"【{col_name}】提取主题（批次 {bi}/{len(batches)}）")
+            yield (
+                "analysis_progress",
+                {
+                    **progress_base,
+                    "status": "active",
+                    "step": "extracting",
+                    "batch_index": bi,
+                    "batch_total": len(batches),
+                    "message": f"正在提取主题（批次 {bi}/{len(batches)}）",
+                    "next_steps": ["合并主题", "逐条归类"],
+                    "impact": "none",
+                },
+            )
             query, source_texts = _build_theme_extract_query(col_name, batch)
 
             async def _extract(
                 query=query,
                 source_texts=source_texts,
+                bi=bi,
             ):
-                return await _direct_json_call(
+                result = await _direct_json_call(
                     _get_theme_extract_system_prompt(),
                     query,
                     models=(
@@ -1140,17 +1407,44 @@ async def _batch_qualitative_analysis(
                     validator=lambda data: _validate_theme_candidates(
                         data, source_texts
                     ),
+                    on_repair=lambda error: repair_events.put_nowait(
+                        {"batch": bi, "error": error}
+                    ),
                 )
+                result["data"] = _hydrate_theme_candidate_quotes(
+                    result.get("data"), source_texts
+                )
+                return result
 
             extract_factories.append(_extract)
 
         extracted_by_batch: dict[int, list[dict]] = {}
         async for event_type, payload in _run_bounded_calls(
             extract_factories,
-            LLM_THEME_EXTRACT_CONCURRENCY,
+            _batch_concurrency_override or LLM_THEME_EXTRACT_CONCURRENCY,
+            repair_events,
         ):
             if event_type == "heartbeat":
                 yield ("heartbeat", "")
+                continue
+            if event_type == "call_progress":
+                yield (
+                    "analysis_progress",
+                    {
+                        **progress_base,
+                        "status": "retrying",
+                        "step": "extracting",
+                        "batch_index": payload["batch"],
+                        "batch_total": len(batches),
+                        "retry_index": 1,
+                        "retry_total": 1,
+                        "message": (
+                            f"{_theme_failure_summary(payload.get('error', ''))}，"
+                            "正在自动修正并重新调用（1/1）"
+                        ),
+                        "impact": "当前尚未丢失信息，等待自动修正结果",
+                    },
+                )
                 continue
             batch_index, result = payload
             bi = batch_index + 1
@@ -1164,14 +1458,44 @@ async def _batch_qualitative_analysis(
                 "model": result.get("model", ""),
                 "repaired": bool(result.get("repaired")),
                 "error": result.get("error", ""),
+                "duration_seconds": result.get("duration_seconds", 0),
             }
             diag["phase_a"].append(phase_a)
             if themes:
                 extracted_by_batch[bi] = themes
+                if result.get("repaired"):
+                    yield (
+                        "analysis_progress",
+                        {
+                            **progress_base,
+                            "status": "recovered",
+                            "step": "extracting",
+                            "batch_index": bi,
+                            "batch_total": len(batches),
+                            "message": "自动修正成功，主题已完整保留并继续处理",
+                            "impact": "none",
+                        },
+                    )
             else:
+                failure_summary = _theme_failure_summary(result.get("error", ""))
                 yield (
-                    "progress",
-                    f"【{col_name}】主题提取失败（批次 {bi}），继续处理后续批次",
+                    "analysis_progress",
+                    {
+                        **progress_base,
+                        "status": "degraded",
+                        "step": "extracting",
+                        "batch_index": bi,
+                        "batch_total": len(batches),
+                        "message": (
+                            "自动修正仍未通过，本批次改用原文兜底"
+                            if result.get("repaired")
+                            else f"{failure_summary}，本批次改用原文兜底"
+                        ),
+                        "impact": (
+                            "原始回答完整保留，但本题的主题人数、占比和跨题归纳可能不完整"
+                        ),
+                        "error_summary": failure_summary,
+                    },
                 )
 
         diag["phase_a"].sort(key=lambda item: item["batch"])
@@ -1181,12 +1505,37 @@ async def _batch_qualitative_analysis(
         if not all_candidates:
             diag["status"] = "failed"
             diag["reason"] = diag["reason"] or "主题提取未返回 themes"
-            yield ("progress", f"【{col_name}】没有提取到主题，后续报告将尝试使用原文兜底")
+            diag["elapsed_seconds"] = round(time.monotonic() - scope_started, 3)
+            yield (
+                "analysis_progress",
+                {
+                    **progress_base,
+                    "status": "degraded",
+                    "step": "completed",
+                    "message": "本题未形成可用主题，报告写作将直接分析全部原文",
+                    "impact": (
+                        "不会丢失玩家原文，但本题无法提供结构化主题人数与占比，"
+                        "内容覆盖完整性可能下降"
+                    ),
+                    "elapsed_seconds": diag["elapsed_seconds"],
+                },
+            )
             continue
 
         # ── Phase B：合并去重 ──────────────────────────────────────────────
-        yield ("progress", f"【{col_name}】合并主题候选（共 {len(all_candidates)} 个）")
+        yield (
+            "analysis_progress",
+            {
+                **progress_base,
+                "status": "active",
+                "step": "merging",
+                "message": f"正在合并 {len(all_candidates)} 个主题候选",
+                "next_steps": ["逐条归类"],
+                "impact": "none",
+            },
+        )
         merge_result = None
+        merge_repair_events: asyncio.Queue = asyncio.Queue()
 
         async def _merge():
             return await _direct_json_call(
@@ -1201,11 +1550,29 @@ async def _batch_qualitative_analysis(
                 validator=lambda data: _validate_merged_themes(
                     data, all_candidates
                 ),
+                on_repair=lambda error: merge_repair_events.put_nowait(
+                    {"error": error}
+                ),
             )
 
-        async for event_type, payload in _run_bounded_calls([_merge], 1):
+        async for event_type, payload in _run_bounded_calls(
+            [_merge], 1, merge_repair_events
+        ):
             if event_type == "heartbeat":
                 yield ("heartbeat", "")
+            elif event_type == "call_progress":
+                yield (
+                    "analysis_progress",
+                    {
+                        **progress_base,
+                        "status": "retrying",
+                        "step": "merging",
+                        "retry_index": 1,
+                        "retry_total": 1,
+                        "message": "主题合并结果未通过校验，正在自动修正并重新调用（1/1）",
+                        "impact": "当前各批次主题和原文仍完整保留",
+                    },
+                )
             else:
                 _batch_index, merge_result = payload
 
@@ -1219,6 +1586,7 @@ async def _batch_qualitative_analysis(
             "model": merge_result.get("model", ""),
             "repaired": bool(merge_result.get("repaired")),
             "error": merge_result.get("error", ""),
+            "duration_seconds": merge_result.get("duration_seconds", 0),
         }
         diag["themes"] = len(final_themes)
 
@@ -1227,8 +1595,32 @@ async def _batch_qualitative_analysis(
             diag["reason"] = (
                 f"主题合并失败：{diag['phase_b']['error'] or '未返回 themes'}"
             )
-            yield ("progress", f"【{col_name}】主题合并为空，后续报告将尝试使用原文兜底")
+            diag["elapsed_seconds"] = round(time.monotonic() - scope_started, 3)
+            yield (
+                "analysis_progress",
+                {
+                    **progress_base,
+                    "status": "degraded",
+                    "step": "completed",
+                    "message": "主题合并未完成，报告写作将直接分析全部原文",
+                    "impact": (
+                        "原始回答和已提取候选仍保留，但统一主题人数、占比和跨题归纳可能不完整"
+                    ),
+                    "elapsed_seconds": diag["elapsed_seconds"],
+                },
+            )
             continue
+        if merge_result.get("repaired"):
+            yield (
+                "analysis_progress",
+                {
+                    **progress_base,
+                    "status": "recovered",
+                    "step": "merging",
+                    "message": "主题合并自动修正成功，继续逐条归类",
+                    "impact": "none",
+                },
+            )
 
         # ── Phase C：回跑分类 ──────────────────────────────────────────────
         # counts[theme_id] = {"total": int, "pos": int, "neg": int, "neutral": int, "mixed": int}
@@ -1240,7 +1632,19 @@ async def _batch_qualitative_analysis(
 
         classify_factories = []
         for bi, batch in enumerate(batches, 1):
-            yield ("progress", f"【{col_name}】分类回复（批次 {bi}/{len(batches)}）")
+            yield (
+                "analysis_progress",
+                {
+                    **progress_base,
+                    "status": "active",
+                    "step": "classifying",
+                    "batch_index": bi,
+                    "batch_total": len(batches),
+                    "message": f"正在逐条归类（批次 {bi}/{len(batches)}）",
+                    "next_steps": [],
+                    "impact": "none",
+                },
+            )
 
             async def _classify(batch=batch):
                 return await _classify_batch_direct(col_name, final_themes, batch)
@@ -1250,7 +1654,7 @@ async def _batch_qualitative_analysis(
         classified_by_batch: dict[int, dict] = {}
         async for event_type, payload in _run_bounded_calls(
             classify_factories,
-            LLM_CLASSIFY_CONCURRENCY,
+            _batch_concurrency_override or LLM_CLASSIFY_CONCURRENCY,
         ):
             if event_type == "heartbeat":
                 yield ("heartbeat", "")
@@ -1274,6 +1678,7 @@ async def _batch_qualitative_analysis(
                 "missing_repaired": result.get("repaired_count", 0),
                 "missing_fallback": result.get("fallback_count", 0),
                 "error": result.get("error", ""),
+                "duration_seconds": result.get("duration_seconds", 0),
             }
             diag["classifications"] += len(classifications)
 
@@ -1322,7 +1727,20 @@ async def _batch_qualitative_analysis(
         if classified_responses == 0 or total == 0:
             diag["status"] = "failed"
             diag["reason"] = "分类阶段未产生任何主题归属"
-            yield ("progress", f"【{col_name}】分类未产生有效归属，后续报告将尝试使用原文兜底")
+            diag["elapsed_seconds"] = round(time.monotonic() - scope_started, 3)
+            yield (
+                "analysis_progress",
+                {
+                    **progress_base,
+                    "status": "degraded",
+                    "step": "completed",
+                    "message": "回答归类未完成，报告写作将直接分析全部原文",
+                    "impact": (
+                        "原始回答完整保留，但主题提及人数、占比和情感分布不可用"
+                    ),
+                    "elapsed_seconds": diag["elapsed_seconds"],
+                },
+            )
             continue
         diag["percentage_basis"] = (
             "unique_respondent_coverage"
@@ -1395,8 +1813,46 @@ async def _batch_qualitative_analysis(
         }
         diag["status"] = "ok"
         diag["reason"] = ""
-        yield ("progress", f"【{col_name}】分析完成，识别 {len(themes_out)} 个主要主题")
+        failed_extract_batches = len(batches) - len(extracted_by_batch)
+        fallback_count = sum(
+            item.get("missing_fallback", 0) for item in diag["phase_c"]
+        )
+        degraded_reasons = []
+        if failed_extract_batches:
+            degraded_reasons.append(
+                f"{failed_extract_batches} 个主题提取批次改用原文兜底"
+            )
+        if fallback_count:
+            degraded_reasons.append(
+                f"{fallback_count} 条回答未能归入具体主题"
+            )
+        diag["quality_status"] = "degraded" if degraded_reasons else "ok"
+        diag["elapsed_seconds"] = round(time.monotonic() - scope_started, 3)
+        yield (
+            "analysis_progress",
+            {
+                **progress_base,
+                "status": "degraded" if degraded_reasons else "completed",
+                "step": "completed",
+                "theme_count": len(themes_out),
+                "message": f"分析完成，识别 {len(themes_out)} 个主要主题",
+                "impact": (
+                    "；".join(degraded_reasons)
+                    + "；原文完整保留，但主题统计可能略低估"
+                    if degraded_reasons else "none"
+                ),
+                "elapsed_seconds": diag["elapsed_seconds"],
+            },
+        )
 
+    yield (
+        "analysis_metrics",
+        {
+            "scope_count": len(scopes),
+            "scope_concurrency": 1,
+            "elapsed_seconds": round(time.monotonic() - analysis_started, 3),
+        },
+    )
     yield ("diagnostics", diagnostics)
     yield ("result", clustered_themes)
 
