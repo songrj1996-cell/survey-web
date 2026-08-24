@@ -9,6 +9,7 @@ from contextlib import suppress
 from copy import deepcopy
 from datetime import datetime
 import hashlib
+import re
 
 import crosstab_parser
 import survey_plan
@@ -146,6 +147,8 @@ from app.storage.sessions import get_session, new_session, save_session
 _REPORT_GENERATION_LOCKS: dict[str, asyncio.Lock] = {}
 _REPORT_RERUN_TARGET_LOCKS: dict[str, asyncio.Lock] = {}
 _NON_VERSIONED_REPORT_MODES = {"comment", "interview", "annotate"}
+_CHINESE_CHARACTER_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
+_LATIN_WORD_RE = re.compile(r"[A-Za-z]+")
 
 
 def _report_generation_lock(session_id: str) -> asyncio.Lock:
@@ -181,6 +184,19 @@ def _normalize_questionnaire_translation_texts(
         copied["name_zh"] = normalize_glossary_terms(copied.get("name_zh", ""))
         normalized[question_id] = copied
     return normalized
+
+
+def _questionnaire_titles_are_chinese(questions: list[dict]) -> bool:
+    """按中文字符与拉丁词数量判断题干主体语言，保留英文产品名。"""
+    source_titles = [
+        str(question.get("name_zh") or "").strip()
+        for question in questions
+        if str(question.get("source_question_id") or "").strip()
+    ]
+    text = "\n".join(source_titles)
+    chinese_units = len(_CHINESE_CHARACTER_RE.findall(text))
+    latin_units = len(_LATIN_WORD_RE.findall(text))
+    return chinese_units > 0 and chinese_units >= latin_units
 
 
 def _normalize_question_display_texts(questions: list[dict]) -> list[dict]:
@@ -368,6 +384,13 @@ async def columns_stream(session_id: str, request: Request):
     try:
         if sess.get("column_provider") == "questionnaire":
             questions = sess.get("columns_detected") or []
+            if (
+                sess.get("questionnaire_translation_status") != "translated"
+                and _questionnaire_titles_are_chinese(questions)
+            ):
+                sess["questionnaire_translation_status"] = "translated"
+                sess["questionnaire_translation_model"] = ""
+                save_session(session_id, sess)
             if sess.get("questionnaire_translation_status") != "translated":
                 yield sse_event({
                     "type": "chunk",
@@ -432,9 +455,18 @@ async def columns_stream(session_id: str, request: Request):
                 sess["questionnaire_translation_status"] = "translated"
                 sess["questionnaire_translation_model"] = used_model
                 save_session(session_id, sess)
+            source_text_preserved = not bool(
+                sess.get("questionnaire_translation_model")
+            )
             yield sse_event({
                 "type": "chunk",
-                "content": "已从调研问卷读取题型和结构，并完成中文翻译；AI 未参与题型判断。\n",
+                "content": (
+                    "已从中文调研问卷读取题型、题干和选项；"
+                    "AI 未参与题型判断或文本改写。\n"
+                    if source_text_preserved
+                    else "已从调研问卷读取题型和结构，并完成中文翻译；"
+                    "AI 未参与题型判断。\n"
+                ),
             })
             await audit_log(
                 request, "survey", "读取问卷题型",
@@ -2254,10 +2286,12 @@ def validate_columns_ready(session_id: str) -> None:
 
 
 def columns_require_llm(session_id: str) -> bool:
-    """原问卷结构不需模型判断，但首次展示前仍需模型完成纯文本翻译。"""
+    """原问卷结构不需模型判断；中文原文直出，其他语言首次需翻译。"""
     sess = get_session(session_id)
     if sess.get("column_provider") != "questionnaire":
         return True
+    if _questionnaire_titles_are_chinese(sess.get("columns_detected") or []):
+        return False
     return sess.get("questionnaire_translation_status") != "translated"
 
 

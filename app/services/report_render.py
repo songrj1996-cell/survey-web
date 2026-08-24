@@ -594,7 +594,22 @@ def _html_to_pdf_with_browser_cmd(doc: str, browser: str, headless_arg: str) -> 
                 })
                 height_px = int(height_result.get("result", {}).get("value") or 1200)
                 width_in = 10.0
-                height_in = max(6.0, min((height_px + 24) / 96, 500.0))
+                height_in = round(max(6.0, min((height_px + 24) / 96, 500.0)), 2)
+                page_rule = f"@page {{ size: {width_in:g}in {height_in:g}in; margin: 0; }}"
+                cdp("Runtime.evaluate", {
+                    "expression": (
+                        "(() => {"
+                        " const previous = document.getElementById('survey-pdf-long-page');"
+                        " if (previous) previous.remove();"
+                        " const style = document.createElement('style');"
+                        " style.id = 'survey-pdf-long-page';"
+                        f" style.textContent = {json.dumps(page_rule)};"
+                        " document.head.appendChild(style);"
+                        " return true;"
+                        "})()"
+                    ),
+                    "returnByValue": True,
+                })
                 pdf_params = {
                     "printBackground": True,
                     "paperWidth": width_in,
@@ -603,7 +618,7 @@ def _html_to_pdf_with_browser_cmd(doc: str, browser: str, headless_arg: str) -> 
                     "marginBottom": 0,
                     "marginLeft": 0,
                     "marginRight": 0,
-                    "preferCSSPageSize": False,
+                    "preferCSSPageSize": True,
                     "scale": 1,
                     "generateDocumentOutline": True,
                 }
