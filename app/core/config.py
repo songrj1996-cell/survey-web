@@ -97,6 +97,12 @@ LLM_THEME_EXTRACT_MAX_TOKENS = max(
 LLM_THEME_EXTRACT_CONCURRENCY = max(
     1, _env_int("LLM_THEME_EXTRACT_CONCURRENCY", 2)
 )
+LLM_QUALITATIVE_SCOPE_CONCURRENCY = min(
+    4, max(1, _env_int("LLM_QUALITATIVE_SCOPE_CONCURRENCY", 2))
+)
+LLM_QUALITATIVE_CALL_TIMEOUT_SECONDS = max(
+    30, _env_int("LLM_QUALITATIVE_CALL_TIMEOUT_SECONDS", 300)
+)
 LLM_THEME_MERGE_MODEL = os.getenv(
     "LLM_THEME_MERGE_MODEL", "claude-sonnet-5"
 ).strip()
@@ -612,8 +618,8 @@ DEFAULT_THEME_EXTRACT_SYSTEM_PROMPT = """\
 2. 宁多勿少，边缘但有实质内容的观点也要提取，合并由后续步骤负责。
 3. 每批提取 5–15 个主题；若整批真实有效内容确实不足以形成 5 个主题，不得虚构凑数。
 4. 每个主题分别概括正面和负面观点，没有某个方向时填 null。
-5. 每个主题附 2–3 条原文引用，必须逐字复制 <responses> 中的完整回答，不得翻译、
-   改写、拼接或总结；不足 2 条时保留所有可用原文。
+5. 每个主题附 2–3 个 representative_response_ids，只能选择 <responses> 中方括号里的
+   回答 ID（例如 r0001）；不得复制、翻译或改写回答正文。证据不足 2 条时保留所有可用 ID。
 6. 纯表情、乱码、无实质内容的回复直接忽略，不基于此类内容创建主题。
 7. 不得把界面、性能、匹配、奖励等不同讨论对象合成“整体体验”一类宽泛主题。
 
@@ -625,7 +631,7 @@ DEFAULT_THEME_EXTRACT_SYSTEM_PROMPT = """\
       "description": "一句话说明主题范围",
       "positive_summary": "正面观点核心概括，没有则为 null",
       "negative_summary": "负面观点核心概括，没有则为 null",
-      "representative_quotes": ["逐字原文1", "逐字原文2"]
+      "representative_response_ids": ["r0001", "r0002"]
     }
   ]
 }\
