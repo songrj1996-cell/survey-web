@@ -22,6 +22,14 @@ GoogleFormId = Annotated[
         pattern=r"^[A-Za-z0-9_-]+$",
     ),
 ]
+GoogleFormEditLink = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=1,
+        max_length=2048,
+    ),
+]
 
 QuestionnaireSnapshotCatalogCursor = Annotated[
     str,
@@ -36,7 +44,14 @@ QuestionnaireSnapshotCatalogCursor = Annotated[
 class GoogleFormsSnapshotImportRequest(ContractModel):
     """Google Forms 授权导入请求；授权信息只来自服务端连接。"""
 
-    form_id: GoogleFormId
+    form_url: GoogleFormEditLink | None = None
+    form_id: GoogleFormId | None = None
+
+    @model_validator(mode="after")
+    def validate_exactly_one_source(self) -> "GoogleFormsSnapshotImportRequest":
+        if (self.form_url is None) == (self.form_id is None):
+            raise ValueError("form_url 与 form_id 必须且只能提供一个")
+        return self
 
 
 class QuestionnaireSnapshotSummary(ContractModel):

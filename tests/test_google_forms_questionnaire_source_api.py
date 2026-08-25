@@ -45,6 +45,9 @@ from app.storage.research_assets import FileResearchAssetStorage
 LOGIN = {"email": "google-user@example.com", "name": "Google User"}
 OWNER_REF = "email:google-user@example.com"
 FORM_ID = "FORM_SYNTHETIC_001"
+SERVICE_ACCOUNT_EMAIL = (
+    "forms-reader@example-project.iam.gserviceaccount.com"
+)
 FIXED_TIME = datetime(2026, 8, 13, 10, 0, tzinfo=timezone.utc)
 GOOGLE_FIXTURE = (
     Path(__file__).parent
@@ -150,8 +153,13 @@ class _CaptureClient:
 
 
 class _ErrorClient:
-    def __init__(self, error: Exception) -> None:
+    def __init__(
+        self,
+        error: Exception,
+        service_account_email: str = SERVICE_ACCOUNT_EMAIL,
+    ) -> None:
         self.error = error
+        self.service_account_email = service_account_email
 
     async def fetch_form(
         self,
@@ -433,17 +441,17 @@ class GoogleFormsQuestionnaireSourceApiTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_connector_errors_map_to_stable_safe_http_statuses(self):
         cases = (
-            (GoogleFormsErrorCode.INVALID_FORM_ID, False, None, 422),
-            (GoogleFormsErrorCode.AUTHENTICATION_REQUIRED, False, 401, 401),
-            (GoogleFormsErrorCode.AUTHORIZATION_FAILED, False, None, 401),
-            (GoogleFormsErrorCode.PERMISSION_DENIED, False, 403, 403),
-            (GoogleFormsErrorCode.FORM_NOT_FOUND, False, 404, 404),
-            (GoogleFormsErrorCode.RATE_LIMITED, True, 429, 503),
-            (GoogleFormsErrorCode.PROVIDER_UNAVAILABLE, True, 503, 503),
-            (GoogleFormsErrorCode.FORMS_INVALID_JSON, False, 200, 502),
-            (GoogleFormsErrorCode.INVALID_CONFIGURATION, False, None, 500),
+            (GoogleFormsErrorCode.INVALID_FORM_ID, False, None, 422, "google_forms_invalid"),
+            (GoogleFormsErrorCode.AUTHENTICATION_REQUIRED, False, 401, 401, "google_forms_auth_required"),
+            (GoogleFormsErrorCode.AUTHORIZATION_FAILED, False, None, 401, "google_forms_auth_required"),
+            (GoogleFormsErrorCode.PERMISSION_DENIED, False, 403, 403, "google_forms_permission_denied"),
+            (GoogleFormsErrorCode.FORM_NOT_FOUND, False, 404, 404, "google_forms_not_found"),
+            (GoogleFormsErrorCode.RATE_LIMITED, True, 429, 503, "google_forms_retryable"),
+            (GoogleFormsErrorCode.PROVIDER_UNAVAILABLE, True, 503, 503, "google_forms_retryable"),
+            (GoogleFormsErrorCode.FORMS_INVALID_JSON, False, 200, 502, "google_forms_provider_error"),
+            (GoogleFormsErrorCode.INVALID_CONFIGURATION, False, None, 500, "google_forms_internal"),
         )
-        for code, retryable, provider_status, expected in cases:
+        for code, retryable, provider_status, expected, expected_code in cases:
             with self.subTest(code=code):
                 error = GoogleFormsConnectorError(
                     code,
@@ -475,14 +483,27 @@ class GoogleFormsQuestionnaireSourceApiTests(unittest.IsolatedAsyncioTestCase):
                             json={"form_id": FORM_ID},
                         )
                 self.assertEqual(response.status_code, expected)
+                detail = response.json()["detail"]
+                self.assertEqual(detail["code"], expected_code)
+                self.assertIsInstance(detail["message"], str)
                 self.assertNotIn("private", response.text)
                 self.assertNotIn("secret", response.text)
+                if code in {
+                    GoogleFormsErrorCode.PERMISSION_DENIED,
+                    GoogleFormsErrorCode.FORM_NOT_FOUND,
+                }:
+                    self.assertIn(SERVICE_ACCOUNT_EMAIL, detail["message"])
+                    self.assertIn("PDF", detail["message"])
 
     async def test_request_contract_rejects_token_url_duplicates_and_oversize(self):
         cases = (
             ({"form_id": FORM_ID, "access_token": "secret"}, 422),
             ({"form_id": "https://docs.google.com/forms/d/demo/edit"}, 422),
             ({"form_id": "bad id"}, 422),
+            ({
+                "form_id": FORM_ID,
+                "form_url": f"https://docs.google.com/forms/d/{FORM_ID}/edit",
+            }, 422),
             ({}, 422),
         )
         for payload, expected in cases:
@@ -499,6 +520,30 @@ class GoogleFormsQuestionnaireSourceApiTests(unittest.IsolatedAsyncioTestCase):
             headers={"Content-Type": "application/json"},
         )
         self.assertEqual(oversized.status_code, 413)
+        self.assertEqual(self.client.calls, [])
+
+    async def test_editor_link_request_extracts_form_id_before_provider_call(self):
+        response = await self._request(json={
+            "form_url": (
+                f"https://docs.google.com/forms/d/{FORM_ID}/edit"
+                "?usp=sharing"
+            ),
+        })
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.client.calls, [(OWNER_REF, FORM_ID)])
+
+    async def test_non_api_links_return_material_upload_fallback(self):
+        cases = (
+            "https://forms.gle/short-id",
+            "https://docs.google.com/forms/d/e/public-id/viewform",
+        )
+        for form_url in cases:
+            with self.subTest(form_url=form_url):
+                response = await self._request(json={"form_url": form_url})
+                self.assertEqual(response.status_code, 422)
+                self.assertIn("编辑链接", response.json()["detail"])
+                self.assertIn("PDF", response.json()["detail"])
         self.assertEqual(self.client.calls, [])
 
     async def test_auth_and_owner_rejection_happen_before_body_or_provider(self):

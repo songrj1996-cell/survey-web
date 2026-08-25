@@ -8,6 +8,7 @@
   const SNAPSHOT_CATALOG_LIMIT = 20;
   const CAPABILITIES_URL = '/api/questionnaire-sources/capabilities';
   const SNAPSHOTS_ENDPOINT = '/api/questionnaire-sources/snapshots';
+  const GOOGLE_FORMS_SNAPSHOTS_ENDPOINT = '/api/questionnaire-sources/google-forms/snapshots';
   const SNAPSHOT_ANALYSIS_INTERFACE_KEY = 'questionnaireSnapshotAnalysisSelection';
   const ASSET_REVIEW_INTERFACE_KEY = 'questionnaireAssetReview';
   const ASSET_REVIEW_SCRIPT_ID = 'qar-script';
@@ -21,8 +22,44 @@
     'pdf_material_upload',
     'asset_review_projection',
   ];
+  const OPTIONAL_CAPABILITY_KEYS = [
+    'snapshot_analysis_session',
+    'asset_review_decisions',
+    'google_forms_connection',
+    'source_workflow',
+  ];
 
   const SOURCE_DEFS = [
+    {
+      key: 'google_forms_connection',
+      type: 'google_forms',
+      endpoint: GOOGLE_FORMS_SNAPSHOTS_ENDPOINT,
+      title: 'Google Forms 原问卷',
+      badge: '编辑链接',
+      description: '粘贴 Google Forms 编辑链接，由部署账号读取问卷结构并保存为独立快照。',
+      note: '仅支持 https://docs.google.com/forms/d/.../edit；公开填写链接或 forms.gle 请改用 PDF、截图或快照包。',
+      placeholder: '粘贴 Google Forms 编辑链接',
+      submitLabel: '读取并保存问卷',
+      loadingLabel: '正在读取 Google Forms…',
+      emptyLabel: '未填写编辑链接',
+      validateValue(value) {
+        try {
+          const trimmed = typeof value === 'string' ? value.trim() : '';
+          parseGoogleFormsEditorLink(trimmed);
+          return {
+            error: '',
+            payload: { form_url: trimmed },
+          };
+        } catch (error) {
+          return {
+            error: error instanceof Error && error.message
+              ? error.message
+              : '请填写可访问的 Google Forms 编辑链接',
+            payload: null,
+          };
+        }
+      },
+    },
     {
       key: 'snapshot_package_upload',
       type: 'snapshot',
@@ -150,7 +187,7 @@
     const link = document.createElement('link');
     link.id = STYLE_ID;
     link.rel = 'stylesheet';
-    link.href = '/static/questionnaire-sources.css?v=1';
+    link.href = '/static/questionnaire-sources.css?v=2';
     document.head.appendChild(link);
   }
 
@@ -169,10 +206,38 @@
     return `${value} B`;
   }
 
+  function parseGoogleFormsEditorLink(value) {
+    const raw = typeof value === 'string' ? value.trim() : '';
+    if (!raw) throw new Error('请先粘贴 Google Forms 编辑链接');
+    let parsed;
+    try {
+      parsed = new URL(raw);
+    } catch {
+      throw new Error('请输入完整的 Google Forms 编辑链接');
+    }
+    if (parsed.protocol !== 'https:') {
+      throw new Error('仅支持 https:// 开头的 Google Forms 编辑链接');
+    }
+    if (parsed.hostname === 'forms.gle') {
+      throw new Error('暂不支持 forms.gle 短链，请改贴 Google Forms 编辑链接，或上传 PDF、截图、快照包');
+    }
+    if (parsed.hostname !== 'docs.google.com') {
+      throw new Error('请粘贴 docs.google.com 域名下的 Google Forms 编辑链接');
+    }
+    const path = parsed.pathname.replace(/\/+$/, '');
+    const editMatch = path.match(/^\/forms\/d\/([A-Za-z0-9_-]+)\/edit$/);
+    if (editMatch) return editMatch[1];
+    if (/^\/forms\/d\/e\/[A-Za-z0-9_-]+\/viewform$/.test(path) || /\/viewform$/.test(path)) {
+      throw new Error('公开填写链接不能可靠读取问卷结构，请改贴 Google Forms 编辑链接，或上传 PDF、截图、快照包');
+    }
+    throw new Error('当前只支持 Google Forms 编辑链接 /forms/d/.../edit');
+  }
+
   function getCardState(type) {
     if (!panelState.cardStates[type]) {
       panelState.cardStates[type] = {
         files: [],
+        sourceValue: '',
         phase: 'idle',
         message: '',
         summary: null,
@@ -213,9 +278,9 @@
     const head = el('div', 'qsrc-panel__head');
     const titleWrap = el('div', 'qsrc-panel__title-wrap');
     titleWrap.append(
-      el('div', 'qsrc-panel__eyebrow', '本地问卷快照'),
-      Object.assign(el('h2', 'qsrc-panel__title', '单独保存本地问卷来源'), { id: 'qsrc-panel-title' }),
-      el('p', 'qsrc-panel__desc', '支持把本地问卷文件或材料保存为独立快照，便于后续单独复用。这里保存的快照不会自动用于当前报告。'),
+      el('div', 'qsrc-panel__eyebrow', '问卷结构快照'),
+      Object.assign(el('h2', 'qsrc-panel__title', '单独保存问卷来源'), { id: 'qsrc-panel-title' }),
+      el('p', 'qsrc-panel__desc', '支持把 Google Forms 编辑链接、本地问卷文件或材料保存为本地独立快照，便于后续单独复用。这里保存的快照不会自动用于当前报告。'),
     );
 
     refreshButton = el('button', 'qsrc-panel__refresh', '刷新能力');
@@ -245,7 +310,7 @@
     catalogStatus.setAttribute('aria-live', 'polite');
     catalogSection.append(catalogHead, catalogList, catalogStatus);
 
-    const disclaimer = el('div', 'qsrc-card__disclaimer', '提示：本区域只负责独立保存本地问卷快照。保存成功后，需要在后续单独选择或导入，当前问卷分析流程不会自动改用这些快照。');
+    const disclaimer = el('div', 'qsrc-card__disclaimer', '提示：本区域只负责独立保存本地问卷快照。若 Google Forms 无法访问，请按提示共享编辑权限，或改传问卷 PDF、截图、快照包；保存成功后仍需在后续单独选择，当前问卷分析流程不会自动改用这些快照。');
     const foot = el('div', 'qsrc-panel__foot', '支持能力由服务端显式声明；未开放的入口不会展示。');
 
     panel.append(head, cardsHost, catalogSection, disclaimer, foot);
@@ -360,8 +425,9 @@
       if (typeof payload[key] !== 'boolean') return null;
       normalized[key] = payload[key];
     }
-    normalized.snapshot_analysis_session = payload.snapshot_analysis_session === true;
-    normalized.asset_review_decisions = payload.asset_review_decisions === true;
+    for (const key of OPTIONAL_CAPABILITY_KEYS) {
+      normalized[key] = payload[key] === true;
+    }
     return normalized;
   }
 
@@ -468,6 +534,27 @@
     renderCard(def);
   }
 
+  function setSourceValue(def, value) {
+    const cardState = getCardState(def.type);
+    cardState.sourceValue = typeof value === 'string' ? value : '';
+    cardState.summary = null;
+    if (!cardState.sourceValue.trim()) {
+      cardState.phase = 'idle';
+      cardState.message = '';
+      renderCard(def);
+      return;
+    }
+    const validation = def.validateValue(cardState.sourceValue);
+    if (validation.error) {
+      cardState.phase = 'error';
+      cardState.message = validation.error;
+    } else {
+      cardState.phase = 'ready';
+      cardState.message = '已识别编辑链接，可读取结构并保存为独立快照';
+    }
+    renderCard(def);
+  }
+
   function reset(defType) {
     if (defType) {
       const cardState = getCardState(defType);
@@ -478,6 +565,7 @@
       }
       panelState.cardStates[defType] = {
         files: [],
+        sourceValue: '',
         phase: 'idle',
         message: '',
         summary: null,
@@ -500,6 +588,7 @@
       }
       panelState.cardStates[def.type] = {
         files: [],
+        sourceValue: '',
         phase: 'idle',
         message: '',
         summary: null,
@@ -587,9 +676,9 @@
     }
     return {
       phase: 'success',
-      message: def.type === 'snapshot' || def.type === 'bested'
-        ? '已保存独立快照，不会自动用于当前报告'
-        : '已保存独立快照，当前报告不会自动引用',
+        message: def.type === 'snapshot' || def.type === 'bested' || def.type === 'google_forms'
+          ? '已保存独立快照，不会自动用于当前报告'
+          : '已保存独立快照，当前报告不会自动引用',
       extra: { label: '保存成功', detail },
     };
   }
@@ -781,6 +870,35 @@
     const card = cardsHost.querySelector(`[data-qsrc-card="${def.type}"]`);
     if (!card) return;
     const cardState = getCardState(def.type);
+    if (def.type === 'google_forms') {
+      const picker = card.querySelector('.qsrc-card__picker');
+      const input = card.querySelector('.qsrc-card__input');
+      const helper = card.querySelector('.qsrc-card__helper');
+      const submitButton = card.querySelector('[data-qsrc-action="submit"]');
+      const resetButton = card.querySelector('[data-qsrc-action="reset"]');
+      const status = card.querySelector('.qsrc-card__status');
+
+      if (input) input.value = cardState.sourceValue;
+      if (input) input.disabled = cardState.phase === 'loading';
+      picker.className = pickerClassName(cardState);
+      submitButton.disabled = cardState.phase === 'loading' || !cardState.sourceValue.trim();
+      submitButton.textContent = cardState.phase === 'loading' ? def.loadingLabel : def.submitLabel;
+      resetButton.disabled = cardState.phase !== 'loading' && !cardState.sourceValue.trim();
+      resetButton.textContent = cardState.phase === 'loading' ? '取消读取' : '清空';
+      if (helper) {
+        helper.textContent = cardState.sourceValue.trim()
+          ? '仅保存问卷结构快照；保存成功后仍需在后续手动选择用于本次分析。'
+          : def.note;
+      }
+
+      const summary = summaryMeta(def, cardState.summary);
+      if (summary) {
+        setCardMessage(status, summary.message, summary.extra, summary.phase);
+        return;
+      }
+      setCardMessage(status, cardState.message, null, cardState.phase === 'error' ? 'error' : cardState.phase === 'loading' ? 'loading' : '');
+      return;
+    }
     const picker = card.querySelector('.qsrc-card__picker');
     const fileName = card.querySelector('.qsrc-card__file-name');
     const fileMeta = card.querySelector('.qsrc-card__file-meta');
@@ -826,40 +944,60 @@
     );
     top.append(titleWrap, el('span', 'qsrc-card__badge', def.badge));
 
-    const input = document.createElement('input');
-    input.id = `${INPUT_PREFIX}${def.type}`;
-    input.type = 'file';
-    input.accept = def.accept;
-    input.multiple = !!def.multiple;
-    input.className = 'qsrc-sr-only';
-    input.setAttribute('aria-label', `${def.title}文件选择`);
-    input.addEventListener('change', () => {
-      const files = Array.from(input.files || []);
-      setFiles(def, files);
-    });
-
     const picker = el('div', 'qsrc-card__picker');
-    const pickerMain = el('div', 'qsrc-card__picker-main');
-    const fileSummary = el('div', 'qsrc-card__file-summary');
-    fileSummary.append(
-      el('span', 'qsrc-card__file-name', def.emptyLabel),
-      el('span', 'qsrc-card__file-meta', def.note),
-    );
-    const pickerActions = el('div', 'qsrc-card__picker-actions');
-    const chooseButton = el('button', 'qsrc-btn qsrc-btn--ghost', def.chooseLabel);
-    chooseButton.type = 'button';
-    chooseButton.dataset.qsrcAction = 'choose';
-    chooseButton.addEventListener('click', () => input.click());
-    pickerActions.appendChild(chooseButton);
-    pickerMain.append(fileSummary, pickerActions);
-    picker.appendChild(pickerMain);
+    let input;
+    if (def.type === 'google_forms') {
+      input = document.createElement('input');
+      input.id = `${INPUT_PREFIX}${def.type}`;
+      input.type = 'url';
+      input.className = 'qsrc-card__input';
+      input.placeholder = def.placeholder;
+      input.autocomplete = 'off';
+      input.inputMode = 'url';
+      input.spellcheck = false;
+      input.setAttribute('aria-label', 'Google Forms 编辑链接');
+      input.addEventListener('input', () => {
+        setSourceValue(def, input.value);
+      });
+      picker.append(
+        input,
+        el('p', 'qsrc-card__helper', def.note),
+      );
+    } else {
+      input = document.createElement('input');
+      input.id = `${INPUT_PREFIX}${def.type}`;
+      input.type = 'file';
+      input.accept = def.accept;
+      input.multiple = !!def.multiple;
+      input.className = 'qsrc-sr-only';
+      input.setAttribute('aria-label', `${def.title}文件选择`);
+      input.addEventListener('change', () => {
+        const files = Array.from(input.files || []);
+        setFiles(def, files);
+      });
+
+      const pickerMain = el('div', 'qsrc-card__picker-main');
+      const fileSummary = el('div', 'qsrc-card__file-summary');
+      fileSummary.append(
+        el('span', 'qsrc-card__file-name', def.emptyLabel),
+        el('span', 'qsrc-card__file-meta', def.note),
+      );
+      const pickerActions = el('div', 'qsrc-card__picker-actions');
+      const chooseButton = el('button', 'qsrc-btn qsrc-btn--ghost', def.chooseLabel);
+      chooseButton.type = 'button';
+      chooseButton.dataset.qsrcAction = 'choose';
+      chooseButton.addEventListener('click', () => input.click());
+      pickerActions.appendChild(chooseButton);
+      pickerMain.append(fileSummary, pickerActions);
+      picker.appendChild(pickerMain);
+    }
 
     const footer = el('div', 'qsrc-card__footer');
     const submitButton = el('button', 'qsrc-btn qsrc-btn--primary', def.submitLabel);
     submitButton.type = 'button';
     submitButton.dataset.qsrcAction = 'submit';
-    submitButton.addEventListener('click', () => upload(def));
-    const resetButton = el('button', 'qsrc-btn qsrc-btn--ghost', '重置');
+    submitButton.addEventListener('click', () => (def.type === 'google_forms' ? uploadGoogleForms(def) : upload(def)));
+    const resetButton = el('button', 'qsrc-btn qsrc-btn--ghost', def.type === 'google_forms' ? '清空' : '重置');
     resetButton.type = 'button';
     resetButton.dataset.qsrcAction = 'reset';
     resetButton.addEventListener('click', () => reset(def.type));
@@ -868,7 +1006,11 @@
     const status = el('div', 'qsrc-card__status');
     status.setAttribute('aria-live', 'polite');
 
-    card.append(top, input, picker, footer, status);
+    if (def.type === 'google_forms') {
+      card.append(top, picker, footer, status);
+    } else {
+      card.append(top, input, picker, footer, status);
+    }
     return card;
   }
 
@@ -943,14 +1085,58 @@
     return assetReviewModulePromise;
   }
 
-  function responseErrorMessage(response, fallback) {
+  function responseErrorInfo(response, fallback) {
     return response.json()
-      .then(parsed => (
-        parsed && typeof parsed.detail === 'string' && parsed.detail.trim()
-          ? parsed.detail.trim()
-          : fallback
-      ))
-      .catch(() => fallback);
+      .then(parsed => {
+        const detail = parsed && parsed.detail;
+        if (typeof detail === 'string' && detail.trim()) {
+          return { code: '', message: detail.trim() };
+        }
+        if (detail && typeof detail === 'object' && !Array.isArray(detail)) {
+          const code = typeof detail.code === 'string' && /^google_forms_[a-z_]+$/.test(detail.code)
+            ? detail.code
+            : '';
+          const message = typeof detail.message === 'string' && detail.message.trim()
+            ? detail.message.trim()
+            : fallback;
+          return { code, message };
+        }
+        return { code: '', message: fallback };
+      })
+      .catch(() => ({ code: '', message: fallback }));
+  }
+
+  function responseErrorMessage(response, fallback) {
+    return responseErrorInfo(response, fallback).then(info => info.message);
+  }
+
+  function googleFormsErrorMessage(status, errorInfo) {
+    const code = errorInfo && typeof errorInfo.code === 'string' ? errorInfo.code : '';
+    const detail = errorInfo && typeof errorInfo.message === 'string' ? errorInfo.message : '';
+    if (code.startsWith('google_forms_') && detail) {
+      return detail;
+    }
+    if (status === 401) {
+      return '登录状态已失效，请重新登录后再读取 Google Forms。';
+    }
+    if (status === 403) {
+      return '当前账号没有问卷来源功能权限，请联系平台管理员。';
+    }
+    if (status === 404) {
+      return 'Google Forms 导入入口当前不可用，请刷新页面或联系平台管理员。';
+    }
+    if (status === 422) {
+      return detail && detail.includes('无效')
+        ? '当前只支持 Google Forms 编辑链接 /forms/d/.../edit。公开填写链接和 forms.gle 短链暂不支持；请改贴编辑链接，或上传 PDF、截图、快照包。'
+        : 'Google Forms 导入请求无效。请确认链接可打开到编辑页，或改传 PDF、截图、快照包。';
+    }
+    if (status === 429) {
+      return 'Google Forms 导入入口正忙，请稍后重试；若赶时间，可先上传 PDF、截图或快照包。';
+    }
+    if (status === 502 || status === 503 || status === 504) {
+      return 'Google Forms 暂时不可用，请稍后重试；若需要继续处理，请先上传问卷 PDF、截图或快照包。';
+    }
+    return detail || 'Google Forms 导入暂时不可用；若无法稍后重试，请先上传问卷 PDF、截图或快照包。';
   }
 
   async function upload(def) {
@@ -1024,6 +1210,81 @@
       }
       if (cardState.requestSerial !== requestSerial) return;
       const message = error instanceof Error && error.message ? error.message : '保存失败，请重试';
+      cardState.phase = 'error';
+      cardState.message = message;
+      cardState.summary = null;
+      renderCard(def);
+      showUploadToast(message, 'error');
+    } finally {
+      if (cardState.abortController === abortController) {
+        cardState.abortController = null;
+      }
+    }
+  }
+
+  async function uploadGoogleForms(def) {
+    const cardState = getCardState(def.type);
+    const validation = def.validateValue(cardState.sourceValue);
+    if (validation.error || !validation.payload) {
+      const message = validation.error || '请先粘贴 Google Forms 编辑链接';
+      cardState.phase = 'error';
+      cardState.message = message;
+      cardState.summary = null;
+      renderCard(def);
+      showUploadToast(message, 'error');
+      return;
+    }
+
+    cardState.phase = 'loading';
+    cardState.message = '正在读取问卷结构并独立保存，不会自动用于当前报告';
+    cardState.summary = null;
+    cardState.requestSerial += 1;
+    const requestSerial = cardState.requestSerial;
+    if (cardState.abortController) cardState.abortController.abort();
+    const abortController = new AbortController();
+    cardState.abortController = abortController;
+    renderCard(def);
+
+    try {
+      const response = await fetch(def.endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(validation.payload),
+        signal: abortController.signal,
+      });
+      if (cardState.requestSerial !== requestSerial) return;
+      if (!response.ok) {
+        const fallback = response.status === 504
+          ? 'Google Forms 问卷导入超时，请稍后重试'
+          : 'Google Forms 导入失败，请重试';
+        const errorInfo = await responseErrorInfo(response, fallback);
+        throw new Error(googleFormsErrorMessage(response.status, errorInfo));
+      }
+
+      let summary;
+      try {
+        summary = await response.json();
+      } catch {
+        throw new Error('保存成功，但返回结果无法识别');
+      }
+      if (cardState.requestSerial !== requestSerial) return;
+      if (!summary || typeof summary.snapshot_id !== 'string' || summary.snapshot_id.trim() === '') {
+        throw new Error('保存成功，但返回结果缺少快照编号');
+      }
+
+      const meta = summaryMeta(def, summary);
+      cardState.summary = summary;
+      cardState.phase = meta ? meta.phase : 'success';
+      cardState.message = meta ? meta.message : '已保存独立快照';
+      renderCard(def);
+      refreshCatalog();
+      showUploadToast('已保存独立快照', 'success');
+    } catch (error) {
+      if (abortController.signal.aborted || (error instanceof DOMException && error.name === 'AbortError')) {
+        return;
+      }
+      if (cardState.requestSerial !== requestSerial) return;
+      const message = error instanceof Error && error.message ? error.message : 'Google Forms 导入失败，请重试';
       cardState.phase = 'error';
       cardState.message = message;
       cardState.summary = null;

@@ -195,6 +195,37 @@
   gap: 12px;
 }
 
+.qsrc-card__input {
+  width: 100%;
+  min-height: 42px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--surface) 90%, transparent);
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.5;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease, background 0.2s ease;
+}
+
+.qsrc-card__input::placeholder {
+  color: var(--text-3);
+}
+
+.qsrc-card__input:focus {
+  outline: none;
+  border-color: var(--border-act);
+  background: color-mix(in srgb, var(--surface) 96%, transparent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent-soft) 20%, transparent);
+}
+
+.qsrc-card__helper {
+  margin: 10px 0 0;
+  color: var(--text-3);
+  font-size: 12px;
+  line-height: 1.65;
+}
+
 .qsrc-card__file-summary {
   min-width: 0;
 }

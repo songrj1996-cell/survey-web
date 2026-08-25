@@ -30,6 +30,7 @@ CAPABILITIES_URL = "/api/questionnaire-sources/capabilities"
 SNAPSHOTS_URL = "/api/questionnaire-sources/snapshots"
 POST_URLS = {
     SNAPSHOTS_URL,
+    "/api/questionnaire-sources/google-forms/snapshots",
     "/api/questionnaire-sources/bested/snapshots",
     "/api/questionnaire-sources/materials/snapshots",
     "/api/questionnaire-sources/materials/pdf/snapshots",
@@ -45,6 +46,8 @@ CAPABILITY_KEYS = {
 OPTIONAL_CAPABILITY_KEYS = {
     "snapshot_analysis_session",
     "asset_review_decisions",
+    "google_forms_connection",
+    "source_workflow",
 }
 
 SOURCE_CONTRACTS = {
@@ -459,10 +462,10 @@ class QuestionnaireSourceFrontendContractTests(unittest.TestCase):
         blocks = _source_definition_blocks(self.javascript)
         self.assertEqual(
             set(blocks),
-            CAPABILITY_KEYS - {
+            (CAPABILITY_KEYS - {
                 "snapshot_catalog",
                 "asset_review_projection",
-            },
+            }) | {"google_forms_connection"},
         )
         self.assertEqual(
             {
@@ -491,13 +494,11 @@ class QuestionnaireSourceFrontendContractTests(unittest.TestCase):
 
         normalize = _function_body(self.javascript, "normalizeCapabilities")
         self.assertIn(
-            "normalized.asset_review_decisions = "
-            "payload.asset_review_decisions === true",
+            "for (const key of OPTIONAL_CAPABILITY_KEYS)",
             normalize,
         )
         self.assertIn(
-            "normalized.snapshot_analysis_session = "
-            "payload.snapshot_analysis_session === true",
+            "normalized[key] = payload[key] === true",
             normalize,
         )
         self.assertNotRegex(
@@ -505,6 +506,63 @@ class QuestionnaireSourceFrontendContractTests(unittest.TestCase):
             r"typeof\s+payload\.asset_review_decisions\s*!==\s*"
             r"['\"]boolean['\"]",
         )
+
+    def test_google_forms_editor_link_requires_strict_edit_url_and_safe_downgrade_copy(self):
+        parser = _function_body(
+            self.javascript,
+            "parseGoogleFormsEditorLink",
+        )
+        self.assertIn("new URL(raw)", parser)
+        self.assertIn("parsed.protocol !== 'https:'", parser)
+        self.assertIn("parsed.hostname === 'forms.gle'", parser)
+        self.assertIn("parsed.hostname !== 'docs.google.com'", parser)
+        self.assertIn("/forms/d/.../edit", parser)
+        self.assertIn("/viewform", parser)
+        self.assertIn("PDF、截图、快照包", parser)
+
+        block = _source_definition_blocks(self.javascript)["google_forms_connection"]
+        self.assertEqual(
+            _string_or_constant_property(self.javascript, block, "endpoint"),
+            "/api/questionnaire-sources/google-forms/snapshots",
+        )
+        self.assertIn("parseGoogleFormsEditorLink(trimmed);", block)
+        self.assertIn("payload: { form_url: trimmed }", block)
+
+    def test_google_forms_card_uses_url_input_and_json_post(self):
+        create_card = _function_body(self.javascript, "createCard")
+        render_card = _function_body(self.javascript, "renderCard")
+        self.assertIn("input.type = 'url'", create_card)
+        self.assertIn("input.className = 'qsrc-card__input'", create_card)
+        self.assertIn("setSourceValue(def, input.value)", create_card)
+        self.assertIn("uploadGoogleForms(def)", create_card)
+
+        upload_google = _function_body(self.javascript, "uploadGoogleForms")
+        self.assertIn("new AbortController()", upload_google)
+        self.assertIn("cardState.requestSerial += 1", upload_google)
+        self.assertIn("cardState.requestSerial !== requestSerial", upload_google)
+        self.assertIn("headers: { 'Content-Type': 'application/json' }", upload_google)
+        self.assertIn("body: JSON.stringify(validation.payload)", upload_google)
+        self.assertIn(
+            "googleFormsErrorMessage(response.status, errorInfo)",
+            upload_google,
+        )
+        self.assertNotIn("hidePanel(", upload_google)
+        self.assertIn("if (input) input.value = cardState.sourceValue;", render_card)
+        self.assertIn("if (input) input.disabled = cardState.phase === 'loading';", render_card)
+
+    def test_google_forms_error_messages_keep_panel_visible_and_offer_fallback(self):
+        parser = _function_body(self.javascript, "responseErrorInfo")
+        mapper = _function_body(self.javascript, "googleFormsErrorMessage")
+        for status in ("status === 401", "status === 403", "status === 404", "status === 422", "status === 429", "status === 502 || status === 503 || status === 504"):
+            with self.subTest(status=status):
+                self.assertIn(status, mapper)
+        self.assertIn("detail.code", parser)
+        self.assertIn("detail.message", parser)
+        self.assertIn("/^google_forms_[a-z_]+$/", parser)
+        self.assertIn("code.startsWith('google_forms_')", mapper)
+        self.assertIn("登录状态已失效", mapper)
+        self.assertIn("功能权限", mapper)
+        self.assertIn("PDF、截图或快照包", mapper)
 
     def test_asset_review_launch_uses_latest_projection_and_write_capabilities(self):
         projection_gate = _function_body(
@@ -608,12 +666,16 @@ class QuestionnaireSourceFrontendContractTests(unittest.TestCase):
         self.assertIn("messageNode.appendChild", set_message)
 
     def test_error_responses_are_json_only_and_never_echo_raw_text(self):
+        error_info = _function_body(
+            self.javascript,
+            "responseErrorInfo",
+        )
         error_message = _function_body(
             self.javascript,
             "responseErrorMessage",
         )
         self.assertRegex(
-            error_message,
+            error_info,
             r"\bresponse\.json\s*\(\s*\)",
         )
         self.assertNotRegex(
@@ -621,7 +683,7 @@ class QuestionnaireSourceFrontendContractTests(unittest.TestCase):
             r"\bresponse\.text\s*\(",
         )
         self.assertNotRegex(
-            error_message,
+            error_info + "\n" + error_message,
             r"\b(?:innerHTML|outerHTML|insertAdjacentHTML)\b",
         )
 
@@ -824,6 +886,10 @@ class QuestionnaireSourceFrontendContractTests(unittest.TestCase):
         )
         self.assertIn("formData.append(def.fieldName, file)", upload)
 
+        render_card = _function_body(self.javascript, "renderCard")
+        self.assertIn("resetButton.textContent = cardState.phase === 'loading' ? '取消读取' : '清空';", render_card)
+        self.assertIn("仅保存问卷结构快照；保存成功后仍需在后续手动选择用于本次分析。", render_card)
+
     def test_copy_is_honest_about_not_using_sources_in_current_report(self):
         self.assertIn(
             "这里保存的快照不会自动用于当前报告",
@@ -845,17 +911,21 @@ class QuestionnaireSourceFrontendContractTests(unittest.TestCase):
             self.assertNotIn(misleading, self.javascript)
 
     def test_snapshot_analysis_selection_interface_is_minimal_and_frozen(self):
+        expose_selection = _function_body(
+            self.javascript,
+            "exposeSnapshotAnalysisSelection",
+        )
         self.assertIn("snapshot_analysis_session", self.javascript)
         self.assertIn(
             "Object.defineProperty(window, SNAPSHOT_ANALYSIS_INTERFACE_KEY",
-            self.javascript,
+            expose_selection,
         )
-        self.assertIn("Object.freeze({", self.javascript)
-        self.assertIn("getSelectedSnapshotId", self.javascript)
-        self.assertIn("reset: () => resetAnalysisSelection()", self.javascript)
+        self.assertIn("Object.freeze({", expose_selection)
+        self.assertIn("getSelectedSnapshotId", expose_selection)
+        self.assertIn("reset: () => resetAnalysisSelection()", expose_selection)
         for forbidden in ("owner", "raw", "media", "token"):
             self.assertNotRegex(
-                self.javascript,
+                expose_selection,
                 rf"\b{forbidden}\b",
             )
 
@@ -901,6 +971,14 @@ class QuestionnaireSourceFrontendContractTests(unittest.TestCase):
         self.assertIn("resp.status === 422", self.survey_javascript)
 
     def test_snapshot_catalog_contract_is_safe_and_paged(self):
+        normalize_entry = _function_body(
+            self.javascript,
+            "normalizeCatalogEntry",
+        )
+        render_catalog = _function_body(
+            self.javascript,
+            "renderCatalog",
+        )
         self.assertIn("snapshot_catalog", self.javascript)
         self.assertRegex(
             self.javascript,
@@ -919,7 +997,7 @@ class QuestionnaireSourceFrontendContractTests(unittest.TestCase):
             self.stylesheet,
         )
         self.assertNotRegex(
-            self.javascript,
+            normalize_entry + "\n" + render_catalog,
             r"\b(?:owner_ref|path|media|hash|raw_text|original_text)\b",
         )
 
@@ -938,6 +1016,9 @@ class QuestionnaireSourceFrontendContractTests(unittest.TestCase):
             r"HTTP_HIDE_STATUSES\.has\(response\.status\)",
         )
         self.assertIn("hidePanel('当前账号暂无本地问卷快照权限')", self.javascript)
+        self.assertIn("Google Forms 编辑链接", create_card)
+        self.assertIn(".qsrc-card__input", self.stylesheet)
+        self.assertIn(".qsrc-card__helper", self.stylesheet)
 
     def test_stylesheet_rules_and_keyframes_are_qsrc_namespaced(self):
         self.assertTrue(STYLESHEET_PATH.is_file())

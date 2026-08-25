@@ -11,6 +11,11 @@ from fastapi.staticfiles import StaticFiles
 
 from app.core.config import COOKIE_NAME, FEISHU_LOGIN_REQUIRED
 from app.core.config import (
+    GOOGLE_FORMS_API_BASE,
+    GOOGLE_FORMS_CONNECT_TIMEOUT,
+    GOOGLE_FORMS_READ_TIMEOUT,
+    GOOGLE_FORMS_SERVICE_ACCOUNT_ENABLED,
+    GOOGLE_FORMS_SERVICE_ACCOUNT_FILE,
     QUESTIONNAIRE_LOCAL_SOURCE_PREVIEW_ENABLED,
     RESEARCH_ASSET_STORAGE_DIR,
 )
@@ -82,8 +87,26 @@ if QUESTIONNAIRE_LOCAL_SOURCE_PREVIEW_ENABLED:
         create_questionnaire_source_runtime,
     )
 
+    _google_forms_client = None
+    if GOOGLE_FORMS_SERVICE_ACCOUNT_ENABLED:
+        if GOOGLE_FORMS_SERVICE_ACCOUNT_FILE is None:
+            raise RuntimeError(
+                "已启用 Google Forms 服务账号，但未配置凭据文件"
+            )
+        from app.integrations.google_forms_service_account_client import (
+            GoogleFormsServiceAccountClient,
+        )
+
+        _google_forms_client = GoogleFormsServiceAccountClient(
+            GOOGLE_FORMS_SERVICE_ACCOUNT_FILE,
+            forms_api_base=GOOGLE_FORMS_API_BASE,
+            connect_timeout=GOOGLE_FORMS_CONNECT_TIMEOUT,
+            read_timeout=GOOGLE_FORMS_READ_TIMEOUT,
+        )
+
     _questionnaire_source_runtime = create_questionnaire_source_runtime(
         RESEARCH_ASSET_STORAGE_DIR,
+        google_forms_client=_google_forms_client,
     )
     app.include_router(
         create_questionnaire_source_runtime_router(

@@ -1,4 +1,4 @@
-"""只装配本地问卷来源能力的显式根目录运行时。"""
+"""装配共享问卷快照存储及可选外部只读连接的运行时。"""
 
 from __future__ import annotations
 
@@ -10,6 +10,10 @@ from app.schemas.questionnaire_source_runtime import (
 )
 from app.services.bested_questionnaire_snapshot_api import (
     BestedQuestionnaireSnapshotApi,
+)
+from app.services.google_forms_snapshot_api import (
+    GoogleFormsCaptureClient,
+    GoogleFormsQuestionnaireSnapshotApi,
 )
 from app.services.questionnaire_material_snapshot_api import (
     QuestionnaireMaterialSnapshotApi,
@@ -32,7 +36,7 @@ from app.storage.research_assets import FileResearchAssetStorage
 
 @dataclass(frozen=True, slots=True)
 class QuestionnaireSourceRuntime:
-    """共享显式根目录、且不包含外部连接器或工作流的运行时。"""
+    """共享显式根目录，并按注入能力开放外部只读连接。"""
 
     storage: FileResearchAssetStorage
     review_storage: FileQuestionnaireAssetReviewStorage
@@ -42,6 +46,7 @@ class QuestionnaireSourceRuntime:
     bested_api: BestedQuestionnaireSnapshotApi
     screenshot_material_api: QuestionnaireMaterialSnapshotApi
     pdf_material_api: QuestionnairePdfMaterialSnapshotApi
+    google_forms_api: GoogleFormsQuestionnaireSnapshotApi | None = None
     capabilities: QuestionnaireSourceCapabilities = field(
         default_factory=QuestionnaireSourceCapabilities,
     )
@@ -85,6 +90,20 @@ class QuestionnaireSourceRuntime:
             if api.storage is not self.storage:
                 raise ValueError(f"{name} 必须共享 runtime.storage")
 
+        if self.google_forms_api is not None:
+            if not isinstance(
+                self.google_forms_api,
+                GoogleFormsQuestionnaireSnapshotApi,
+            ):
+                raise TypeError(
+                    "google_forms_api 必须是 "
+                    "GoogleFormsQuestionnaireSnapshotApi"
+                )
+            if self.google_forms_api.storage is not self.storage:
+                raise ValueError(
+                    "google_forms_api 必须共享 runtime.storage"
+                )
+
         if not isinstance(
             self.asset_review_api,
             QuestionnaireAssetReviewApi,
@@ -106,12 +125,20 @@ class QuestionnaireSourceRuntime:
             raise TypeError(
                 "capabilities 必须是 QuestionnaireSourceCapabilities"
             )
+        if self.capabilities.google_forms_connection != (
+            self.google_forms_api is not None
+        ):
+            raise ValueError(
+                "google_forms_connection 必须与 google_forms_api 装配一致"
+            )
 
 
 def create_questionnaire_source_runtime(
     storage_root: str | os.PathLike[str],
+    *,
+    google_forms_client: GoogleFormsCaptureClient | None = None,
 ) -> QuestionnaireSourceRuntime:
-    """从调用方显式路径构造仅包含本地能力的共享存储运行时。"""
+    """从显式路径构造共享存储运行时，并按注入开放 Google 读取。"""
 
     storage = FileResearchAssetStorage(storage_root)
     review_storage = FileQuestionnaireAssetReviewStorage(storage.root)
@@ -127,4 +154,15 @@ def create_questionnaire_source_runtime(
         bested_api=BestedQuestionnaireSnapshotApi(storage),
         screenshot_material_api=QuestionnaireMaterialSnapshotApi(storage),
         pdf_material_api=QuestionnairePdfMaterialSnapshotApi(storage),
+        google_forms_api=(
+            GoogleFormsQuestionnaireSnapshotApi(
+                google_forms_client,
+                storage,
+            )
+            if google_forms_client is not None
+            else None
+        ),
+        capabilities=QuestionnaireSourceCapabilities(
+            google_forms_connection=google_forms_client is not None,
+        ),
     )

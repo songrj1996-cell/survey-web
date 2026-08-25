@@ -13,6 +13,11 @@ from starlette.requests import ClientDisconnect
 from starlette.responses import StreamingResponse
 
 from app.core.security import _owner_from_login
+from app.core.google_forms_links import (
+    GoogleFormsLinkError,
+    GoogleFormsLinkErrorCode,
+    parse_google_forms_edit_link,
+)
 from app.schemas.questionnaire_source_api import (
     GoogleFormsSnapshotImportRequest,
     QuestionnaireMaterialUploadSummary,
@@ -266,50 +271,129 @@ def _raise_bested_http_error(error: Exception) -> None:
     ) from error
 
 
-def _raise_google_http_error(error: Exception) -> None:
+def _google_error_detail(code: str, message: str) -> dict[str, str]:
+    return {"code": code, "message": message}
+
+
+def _google_service_account_email(client: object) -> str | None:
+    try:
+        value = getattr(client, "service_account_email", None)
+    except Exception:
+        return None
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > 320
+        or "@" not in value
+        or any(ord(character) < 33 or ord(character) > 126 for character in value)
+    ):
+        return None
+    return value
+
+
+def _raise_google_http_error(
+    error: Exception,
+    *,
+    service_account_email: str | None = None,
+) -> None:
+    account_target = (
+        service_account_email
+        if service_account_email is not None
+        else "平台 Google 服务账号"
+    )
     if isinstance(error, GoogleFormsQuestionnaireInvalidError):
         raise HTTPException(
             status_code=422,
-            detail="Google Forms 问卷 ID 无效",
+            detail=_google_error_detail(
+                "google_forms_invalid",
+                "Google Forms 问卷 ID 无效",
+            ),
         ) from error
     if isinstance(error, GoogleFormsQuestionnaireAuthRequiredError):
         raise HTTPException(
             status_code=401,
-            detail="请连接或重新授权 Google Forms",
+            detail=_google_error_detail(
+                "google_forms_auth_required",
+                (
+                    "Google Forms 服务账号授权无效，请联系管理员；"
+                    "也可上传问卷 PDF、截图或快照包"
+                ),
+            ),
         ) from error
     if isinstance(error, GoogleFormsQuestionnairePermissionError):
         raise HTTPException(
             status_code=403,
-            detail="当前 Google 账号无权读取该问卷",
+            detail=_google_error_detail(
+                "google_forms_permission_denied",
+                (
+                    f"请将问卷编辑权限共享给 {account_target}；"
+                    "无法授权时可上传问卷 PDF、截图或快照包"
+                ),
+            ),
         ) from error
     if isinstance(error, GoogleFormsQuestionnaireNotFoundError):
         raise HTTPException(
             status_code=404,
-            detail="Google Forms 问卷不存在",
+            detail=_google_error_detail(
+                "google_forms_not_found",
+                (
+                    "未找到该 Google Forms 问卷，请核对编辑链接，"
+                    f"并确认已将编辑权限共享给 {account_target}；"
+                    "也可上传问卷 PDF、截图或快照包"
+                ),
+            ),
         ) from error
     if isinstance(error, GoogleFormsQuestionnaireRetryableError):
         raise HTTPException(
             status_code=503,
-            detail="Google Forms 暂时不可用，请稍后重试",
+            detail=_google_error_detail(
+                "google_forms_retryable",
+                (
+                    "Google Forms 暂时不可用，请稍后重试；"
+                    "如需立即继续可上传问卷 PDF、截图或快照包"
+                ),
+            ),
         ) from error
     if isinstance(error, GoogleFormsQuestionnaireProviderError):
         raise HTTPException(
             status_code=502,
-            detail="Google Forms 返回了无法处理的问卷数据",
+            detail=_google_error_detail(
+                "google_forms_provider_error",
+                (
+                    "Google Forms 返回了无法处理的问卷数据；"
+                    "请上传问卷 PDF、截图或快照包继续"
+                ),
+            ),
         ) from error
     if isinstance(error, GoogleFormsQuestionnaireConflictError):
         raise HTTPException(
             status_code=409,
-            detail="同一 Google Forms 快照 ID 已存在不同内容",
+            detail=_google_error_detail(
+                "google_forms_conflict",
+                "同一 Google Forms 快照 ID 已存在不同内容",
+            ),
         ) from error
     if isinstance(error, GoogleFormsQuestionnaireInternalError):
         raise HTTPException(
             status_code=500,
-            detail="Google Forms 问卷导入暂时不可用",
+            detail=_google_error_detail(
+                "google_forms_internal",
+                (
+                    "Google Forms 问卷导入暂时不可用，请联系管理员；"
+                    "也可上传问卷 PDF、截图或快照包"
+                ),
+            ),
         ) from error
     raise HTTPException(
         status_code=500,
-        detail="Google Forms 问卷导入暂时不可用",
+        detail=_google_error_detail(
+            "google_forms_internal",
+            (
+                "Google Forms 问卷导入暂时不可用，请联系管理员；"
+                "也可上传问卷 PDF、截图或快照包"
+            ),
+        ),
     ) from error
 
 
@@ -424,6 +508,33 @@ async def _parse_google_request(
             status_code=422,
             detail="Google Forms 导入请求无效",
         ) from error
+
+
+def _google_form_id_from_request(
+    payload: GoogleFormsSnapshotImportRequest,
+) -> str:
+    if payload.form_id is not None:
+        return payload.form_id
+    assert payload.form_url is not None
+    try:
+        return parse_google_forms_edit_link(payload.form_url)
+    except GoogleFormsLinkError as error:
+        if error.code in {
+            GoogleFormsLinkErrorCode.SHORT_LINK_UNSUPPORTED,
+            GoogleFormsLinkErrorCode.PUBLISHED_LINK_UNSUPPORTED,
+        }:
+            detail = (
+                "该链接是短链接或问卷填写链接，无法取得 Forms API "
+                "所需的问卷 ID；请粘贴 /forms/d/.../edit 编辑链接，"
+                "或上传问卷 PDF、截图或快照包"
+            )
+        else:
+            detail = (
+                "Google Forms 编辑链接无效；请粘贴 "
+                "https://docs.google.com/forms/d/.../edit 链接，"
+                "或上传问卷 PDF、截图或快照包"
+            )
+        raise HTTPException(status_code=422, detail=detail) from error
 
 
 async def _bounded_request_stream(
@@ -940,6 +1051,7 @@ def create_google_forms_questionnaire_sources_router(
         raise TypeError("api 必须是 GoogleFormsQuestionnaireSnapshotApi")
 
     router = APIRouter()
+    service_account_email = _google_service_account_email(api.client)
     import_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_GOOGLE_IMPORTS)
 
     @router.post(
@@ -972,7 +1084,10 @@ def create_google_forms_questionnaire_sources_router(
                 ) from error
 
             import_task = asyncio.create_task(
-                api.import_questionnaire(owner_ref, payload.form_id)
+                api.import_questionnaire(
+                    owner_ref,
+                    _google_form_id_from_request(payload),
+                )
             )
             try:
                 return await asyncio.wait_for(
@@ -1002,7 +1117,10 @@ def create_google_forms_questionnaire_sources_router(
                     )
                 raise
             except Exception as error:
-                _raise_google_http_error(error)
+                _raise_google_http_error(
+                    error,
+                    service_account_email=service_account_email,
+                )
                 raise AssertionError("unreachable")
         finally:
             if not release_deferred:

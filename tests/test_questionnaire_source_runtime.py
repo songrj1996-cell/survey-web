@@ -101,11 +101,20 @@ EXPECTED_ROUTES = {
     ("POST", "/api/questionnaire-sources/materials/snapshots"),
     ("POST", "/api/questionnaire-sources/materials/pdf/snapshots"),
 }
+EXPECTED_ROUTES_WITH_GOOGLE = {
+    *EXPECTED_ROUTES,
+    ("POST", "/api/questionnaire-sources/google-forms/snapshots"),
+}
 
 
 class _InvalidPathLike:
     def __fspath__(self):
         return object()
+
+
+class _FakeGoogleFormsCaptureClient:
+    async def fetch_form(self, owner_ref: str, form_id: str):
+        raise AssertionError("runtime wiring test must not call Google")
 
 
 def _snapshot_archive(owner_ref: str) -> tuple[bytes, str]:
@@ -179,7 +188,6 @@ class QuestionnaireSourceRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "bested_original_questionnaire_upload": False,
             "screenshot_material_upload": False,
             "pdf_material_upload": False,
-            "google_forms_connection": True,
             "source_workflow": True,
         }
         for field, invalid_value in invalid_values.items():
@@ -188,6 +196,18 @@ class QuestionnaireSourceRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     QuestionnaireSourceCapabilities.model_validate({
                         **EXPECTED_CAPABILITIES,
                         field: invalid_value,
+                    })
+
+        connected = QuestionnaireSourceCapabilities(
+            google_forms_connection=True,
+        )
+        self.assertTrue(connected.google_forms_connection)
+        for invalid_value in (1, 0, "true", None):
+            with self.subTest(google_forms_connection=invalid_value):
+                with self.assertRaises(ValidationError):
+                    QuestionnaireSourceCapabilities.model_validate({
+                        **EXPECTED_CAPABILITIES,
+                        "google_forms_connection": invalid_value,
                     })
 
         with self.assertRaises(ValidationError):
@@ -397,6 +417,30 @@ class QuestionnaireSourceRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(
             ("POST", "/api/questionnaire-sources/google-forms/snapshots"),
             actual_routes,
+        )
+
+    def test_google_forms_route_is_registered_only_when_client_is_injected(self):
+        connected_runtime = create_questionnaire_source_runtime(
+            Path(self.temporary.name) / "connected-storage",
+            google_forms_client=_FakeGoogleFormsCaptureClient(),
+        )
+        connected_router = create_questionnaire_source_runtime_router(
+            connected_runtime,
+        )
+        actual_routes = {
+            (method, route.path)
+            for route in connected_router.routes
+            for method in route.methods
+        }
+
+        self.assertEqual(actual_routes, EXPECTED_ROUTES_WITH_GOOGLE)
+        self.assertIsNotNone(connected_runtime.google_forms_api)
+        self.assertTrue(
+            connected_runtime.capabilities.google_forms_connection
+        )
+        self.assertIs(
+            connected_runtime.google_forms_api.storage,
+            connected_runtime.storage,
         )
         self.assertNotIn(
             ("POST", "/api/questionnaire-sources/workflow/resolve"),

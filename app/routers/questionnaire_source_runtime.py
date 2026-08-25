@@ -1,4 +1,4 @@
-"""本地问卷来源运行时的聚合 HTTP 路由。"""
+"""问卷来源运行时的聚合 HTTP 路由。"""
 
 from fastapi import APIRouter, HTTPException, Request
 
@@ -11,6 +11,7 @@ from app.routers.questionnaire_asset_reviews import (
 )
 from app.routers.questionnaire_sources import (
     create_bested_questionnaire_sources_router,
+    create_google_forms_questionnaire_sources_router,
     create_questionnaire_material_sources_router,
     create_questionnaire_sources_router,
 )
@@ -34,7 +35,7 @@ def _owner_key(login: dict | None) -> str:
 def create_questionnaire_source_runtime_router(
     runtime: QuestionnaireSourceRuntime,
 ) -> APIRouter:
-    """聚合显式注入运行时支持的本地问卷来源接口。"""
+    """聚合显式注入运行时支持的问卷来源接口。"""
     if not isinstance(runtime, QuestionnaireSourceRuntime):
         raise TypeError("runtime 必须是 QuestionnaireSourceRuntime")
 
@@ -57,6 +58,10 @@ def create_questionnaire_source_runtime_router(
     router.include_router(create_questionnaire_pdf_material_sources_router(
         runtime.pdf_material_api,
     ))
+    if runtime.google_forms_api is not None:
+        router.include_router(create_google_forms_questionnaire_sources_router(
+            runtime.google_forms_api,
+        ))
 
     @router.get(
         "/api/questionnaire-sources/capabilities",

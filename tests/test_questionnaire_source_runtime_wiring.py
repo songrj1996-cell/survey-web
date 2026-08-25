@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import os
 from pathlib import Path
 import subprocess
@@ -11,6 +12,12 @@ import unittest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+try:
+    GOOGLE_AUTH_AVAILABLE = importlib.util.find_spec("google.auth") is not None
+except ModuleNotFoundError:
+    GOOGLE_AUTH_AVAILABLE = False
+
 PROBE_PREFIX = "QUESTIONNAIRE_SOURCE_RUNTIME_PROBE="
 QUESTIONNAIRE_SOURCE_PREFIX = "/api/questionnaire-sources"
 
@@ -49,8 +56,23 @@ EXPECTED_LOCAL_ROUTES = {
 MAIN_PROBE = textwrap.dedent(
     f"""
     import json
+    import os
     from pathlib import Path
     import sys
+
+    if os.environ.get("QUESTIONNAIRE_SOURCE_FAKE_GOOGLE_CREDENTIALS") == "1":
+        from unittest.mock import patch
+
+        class _FakeCredentials:
+            service_account_email = "forms-reader@example.iam.gserviceaccount.com"
+            valid = True
+            token = "synthetic-token"
+
+        patch(
+            "google.oauth2.service_account.Credentials."
+            "from_service_account_file",
+            return_value=_FakeCredentials(),
+        ).start()
 
     from app import main
     from app.core import config
@@ -68,8 +90,19 @@ MAIN_PROBE = textwrap.dedent(
         "data_dir": str(Path(config.DATA_DIR).resolve()),
         "data_dir_exists": Path(config.DATA_DIR).is_dir(),
         "preview_enabled": config.QUESTIONNAIRE_LOCAL_SOURCE_PREVIEW_ENABLED,
+        "google_forms_enabled": config.GOOGLE_FORMS_SERVICE_ACCOUNT_ENABLED,
+        "google_forms_file": (
+            str(config.GOOGLE_FORMS_SERVICE_ACCOUNT_FILE)
+            if config.GOOGLE_FORMS_SERVICE_ACCOUNT_FILE is not None
+            else None
+        ),
         "routes": routes,
         "runtime_bound": hasattr(main, "_questionnaire_source_runtime"),
+        "runtime_google_connection": (
+            main._questionnaire_source_runtime.capabilities.google_forms_connection
+            if hasattr(main, "_questionnaire_source_runtime")
+            else False
+        ),
         "runtime_router_loaded": (
             "app.routers.questionnaire_source_runtime" in sys.modules
         ),
@@ -98,6 +131,12 @@ CONFIG_PROBE = textwrap.dedent(
         "data_dir": str(Path(config.DATA_DIR).resolve()),
         "data_dir_exists": Path(config.DATA_DIR).is_dir(),
         "preview_enabled": config.QUESTIONNAIRE_LOCAL_SOURCE_PREVIEW_ENABLED,
+        "google_forms_enabled": config.GOOGLE_FORMS_SERVICE_ACCOUNT_ENABLED,
+        "google_forms_file": (
+            str(config.GOOGLE_FORMS_SERVICE_ACCOUNT_FILE)
+            if config.GOOGLE_FORMS_SERVICE_ACCOUNT_FILE is not None
+            else None
+        ),
         "storage_root": str(storage_root.resolve()),
         "storage_root_exists": storage_root.exists(),
     }}
@@ -114,6 +153,9 @@ class QuestionnaireSourceRuntimeWiringTests(unittest.TestCase):
         preview_value: str | None,
         storage_value: str | None,
         data_dir_name: str,
+        google_enabled_value: str | None = None,
+        google_file_value: str | None = None,
+        fake_google_credentials: bool = False,
     ) -> tuple[dict[str, object], Path, Path | None]:
         with tempfile.TemporaryDirectory(
             prefix="questionnaire-source-runtime-wiring-test-",
@@ -144,6 +186,24 @@ class QuestionnaireSourceRuntimeWiringTests(unittest.TestCase):
                 env.pop("RESEARCH_ASSET_STORAGE_DIR", None)
             else:
                 env["RESEARCH_ASSET_STORAGE_DIR"] = storage_value
+            for name in (
+                "GOOGLE_FORMS_SERVICE_ACCOUNT_ENABLED",
+                "GOOGLE_FORMS_SERVICE_ACCOUNT_FILE",
+                "GOOGLE_FORMS_API_BASE",
+                "GOOGLE_FORMS_CONNECT_TIMEOUT",
+                "GOOGLE_FORMS_READ_TIMEOUT",
+            ):
+                env.pop(name, None)
+            if google_enabled_value is not None:
+                env["GOOGLE_FORMS_SERVICE_ACCOUNT_ENABLED"] = (
+                    google_enabled_value
+                )
+            if google_file_value is not None:
+                env["GOOGLE_FORMS_SERVICE_ACCOUNT_FILE"] = google_file_value
+            if fake_google_credentials:
+                env["QUESTIONNAIRE_SOURCE_FAKE_GOOGLE_CREDENTIALS"] = "1"
+            else:
+                env.pop("QUESTIONNAIRE_SOURCE_FAKE_GOOGLE_CREDENTIALS", None)
 
             completed = subprocess.run(
                 [sys.executable, "-B", "-c", script],
@@ -202,6 +262,8 @@ class QuestionnaireSourceRuntimeWiringTests(unittest.TestCase):
                     )
 
                 self.assertFalse(payload["preview_enabled"])
+                self.assertFalse(payload["google_forms_enabled"])
+                self.assertIsNone(payload["google_forms_file"])
                 self.assertEqual(self._route_pairs(payload), [])
                 self.assertFalse(payload["runtime_bound"])
                 self.assertFalse(payload["runtime_router_loaded"])
@@ -229,6 +291,8 @@ class QuestionnaireSourceRuntimeWiringTests(unittest.TestCase):
 
         routes = self._route_pairs(payload)
         self.assertTrue(payload["preview_enabled"])
+        self.assertFalse(payload["google_forms_enabled"])
+        self.assertIsNone(payload["google_forms_file"])
         self.assertTrue(payload["runtime_bound"])
         self.assertTrue(payload["runtime_router_loaded"])
         self.assertTrue(payload["runtime_service_loaded"])
@@ -274,6 +338,8 @@ class QuestionnaireSourceRuntimeWiringTests(unittest.TestCase):
         self.assertTrue(override["data_dir_exists"])
         self.assertFalse(override["storage_root_exists"])
         self.assertFalse(override["preview_enabled"])
+        self.assertFalse(override["google_forms_enabled"])
+        self.assertIsNone(override["google_forms_file"])
 
         default, default_data_dir, configured_default = self._run_probe(
             CONFIG_PROBE,
@@ -293,6 +359,40 @@ class QuestionnaireSourceRuntimeWiringTests(unittest.TestCase):
         self.assertTrue(default["data_dir_exists"])
         self.assertFalse(default["storage_root_exists"])
         self.assertFalse(default["preview_enabled"])
+        self.assertFalse(default["google_forms_enabled"])
+        self.assertIsNone(default["google_forms_file"])
+
+    @unittest.skipUnless(
+        GOOGLE_AUTH_AVAILABLE,
+        "google-auth dependency is not installed in this interpreter",
+    )
+    def test_enabled_service_account_registers_google_route_and_capability(self):
+        with tempfile.TemporaryDirectory(
+            prefix="questionnaire-source-google-wiring-test-",
+        ) as storage_temporary:
+            storage_root = Path(storage_temporary) / "research-assets"
+            payload, _, _ = self._run_probe(
+                MAIN_PROBE,
+                preview_value="true",
+                storage_value=str(storage_root),
+                data_dir_name="google-enabled-data",
+                google_enabled_value="true",
+                google_file_value=str(
+                    Path(storage_temporary) / "synthetic-credentials.json"
+                ),
+                fake_google_credentials=True,
+            )
+
+        routes = self._route_pairs(payload)
+        self.assertTrue(payload["preview_enabled"])
+        self.assertTrue(payload["google_forms_enabled"])
+        self.assertTrue(payload["runtime_bound"])
+        self.assertTrue(payload["runtime_google_connection"])
+        self.assertEqual(len(routes), len(EXPECTED_LOCAL_ROUTES) + 1)
+        self.assertIn(
+            ("POST", "/api/questionnaire-sources/google-forms/snapshots"),
+            routes,
+        )
 
 
 if __name__ == "__main__":

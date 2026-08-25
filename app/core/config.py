@@ -325,6 +325,31 @@ RESEARCH_ASSET_STORAGE_DIR = (
     if _research_asset_storage_dir
     else Path(DATA_DIR) / "research_assets"
 )
+GOOGLE_FORMS_SERVICE_ACCOUNT_ENABLED = _env_bool(
+    "GOOGLE_FORMS_SERVICE_ACCOUNT_ENABLED",
+    False,
+)
+_google_forms_service_account_file = os.getenv(
+    "GOOGLE_FORMS_SERVICE_ACCOUNT_FILE",
+    "",
+).strip()
+GOOGLE_FORMS_SERVICE_ACCOUNT_FILE = (
+    Path(_google_forms_service_account_file)
+    if _google_forms_service_account_file
+    else None
+)
+GOOGLE_FORMS_API_BASE = os.getenv(
+    "GOOGLE_FORMS_API_BASE",
+    "https://forms.googleapis.com/v1",
+).strip().rstrip("/")
+GOOGLE_FORMS_CONNECT_TIMEOUT = max(
+    1.0,
+    _env_float("GOOGLE_FORMS_CONNECT_TIMEOUT", 15.0),
+)
+GOOGLE_FORMS_READ_TIMEOUT = max(
+    5.0,
+    _env_float("GOOGLE_FORMS_READ_TIMEOUT", 60.0),
+)
 MAX_HISTORY  = 20
 MAX_REPORT_VERSIONS = 5
 MAX_AUDIT_LOGS = max(200, _env_int("AUDIT_LOG_MAX", 5000))
