@@ -411,6 +411,11 @@ def save_to_history(
             replace_report_versions=replace_report_versions,
         )
         active_source = version_source or sess
+        timing_source = (
+            resolve_report_version(version_source)
+            if version_source
+            else sess
+        )
         qa_messages = active_source.get("qa_messages")
         if qa_messages is None and old_entry:
             qa_messages = old_entry.get("qa_messages", [])
@@ -426,6 +431,11 @@ def save_to_history(
             "filename": sess.get("filename", "unknown"),
             "title": active_source.get("title") or title,
             "created_at": created_at,
+            "plan_approved_at": timing_source.get("plan_approved_at", ""),
+            "report_completed_at": timing_source.get("report_completed_at", ""),
+            "report_duration_seconds": timing_source.get(
+                "report_duration_seconds"
+            ),
             "report_md": active_source.get("report_md") or report_md,
             "plan": sess.get("plan"),
             "stats_md": sess.get("stats_md"),
@@ -739,6 +749,16 @@ def save_annotate_to_history(sid: str, sess: dict, result_path: str, download_na
             "owner_name": sess.get("owner_name") or (old_entry or {}).get("owner_name", ""),
         }
         tasks = sess.get("tasks", {}) or {}
+        annotate_timing = {}
+        for session_key, history_key in (
+            ("quality_started_at", "annotate_quality_started_at"),
+            ("quality_completed_at", "annotate_quality_completed_at"),
+            ("quality_duration_seconds", "annotate_quality_duration_seconds"),
+        ):
+            if session_key in sess:
+                annotate_timing[history_key] = sess.get(session_key)
+            elif old_entry and history_key in old_entry:
+                annotate_timing[history_key] = old_entry.get(history_key)
         entry = {
             "id": sid,
             "report_no": old_entry.get("report_no") if old_entry else _next_history_report_no(history),
@@ -763,6 +783,7 @@ def save_annotate_to_history(sid: str, sess: dict, result_path: str, download_na
                 "ai_detect": bool(tasks.get("ai_detect")),
                 "quality": bool(tasks.get("quality")),
             },
+            **annotate_timing,
             **owner,
         }
         retained = [h for h in history if h.get("id") != sid]
