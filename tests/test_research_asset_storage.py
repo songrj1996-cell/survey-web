@@ -271,7 +271,9 @@ class FileResearchAssetStorageTests(unittest.TestCase):
         *,
         synchronize_writes: bool = False,
     ) -> list[str]:
-        context = multiprocessing.get_context("fork")
+        context = multiprocessing.get_context(
+            "spawn" if os.name == "nt" else "fork"
+        )
         start_event = context.Event()
         result_queue = context.Queue()
         write_barrier = (
@@ -786,21 +788,22 @@ class FileResearchSnapshotStorageTests(unittest.TestCase):
         safe_target = package_path.with_suffix(".safe")
         safe_target.write_bytes(persisted_bytes)
 
-        package_path.unlink()
-        package_path.symlink_to(safe_target.name)
-        with self.assertRaisesRegex(SnapshotPackageError, "普通文件"):
-            self.storage.load_snapshot_package_with_identity(
-                self.owner_ref,
-                self.snapshot_id,
-            )
+        if os.name != "nt":
+            package_path.unlink()
+            package_path.symlink_to(safe_target.name)
+            with self.assertRaisesRegex(SnapshotPackageError, "普通文件"):
+                self.storage.load_snapshot_package_with_identity(
+                    self.owner_ref,
+                    self.snapshot_id,
+                )
 
-        package_path.unlink()
-        os.mkfifo(package_path)
-        with self.assertRaisesRegex(SnapshotPackageError, "普通文件"):
-            self.storage.load_snapshot_package_with_identity(
-                self.owner_ref,
-                self.snapshot_id,
-            )
+            package_path.unlink()
+            os.mkfifo(package_path)
+            with self.assertRaisesRegex(SnapshotPackageError, "普通文件"):
+                self.storage.load_snapshot_package_with_identity(
+                    self.owner_ref,
+                    self.snapshot_id,
+                )
 
         package_path.unlink()
         package_path.write_bytes(persisted_bytes)
@@ -846,6 +849,10 @@ class FileResearchSnapshotStorageTests(unittest.TestCase):
                 self.snapshot_id,
             )
 
+    @unittest.skipIf(
+        os.name == "nt",
+        "Windows symlink creation requires an optional developer privilege",
+    )
     def test_identity_load_rejects_symlinked_owner_directory(self):
         self.storage.save_snapshot_package(self.owner_ref, self.package)
         package_path = self.storage._package_path(
@@ -1402,6 +1409,10 @@ class FileResearchSnapshotStorageTests(unittest.TestCase):
         self.assertEqual(page.snapshot_ids, (self.snapshot_id,))
         self.assertIsNone(page.next_cursor)
 
+    @unittest.skipIf(
+        os.name == "nt",
+        "Windows symlink creation requires an optional developer privilege",
+    )
     def test_catalog_fails_closed_for_corrupt_symlink_or_nonregular_zip(self):
         self.storage.save_snapshot_package(self.owner_ref, self.package)
         package_path = self.storage._package_path(

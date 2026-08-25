@@ -9,7 +9,6 @@ from __future__ import annotations
 from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import datetime, timezone
-import fcntl
 import hashlib
 import json
 import os
@@ -22,6 +21,7 @@ import unicodedata
 
 from pydantic import ValidationError
 
+from app.core.file_lock import acquire_exclusive_file_lock, release_file_lock
 from app.schemas.questionnaire_asset_review_state import (
     MAX_QUESTIONNAIRE_ASSET_REVIEW_EVENTS as _SCHEMA_MAX_EVENTS,
     QUESTIONNAIRE_ASSET_REVIEW_STATE_SCHEMA_VERSION,
@@ -38,6 +38,7 @@ MAX_QUESTIONNAIRE_ASSET_REVIEW_SCOPE_BYTES = 4096
 MAX_QUESTIONNAIRE_ASSET_REVIEW_PACKAGE_BYTES = 128 * 1024 * 1024
 
 _NAMESPACE = ".asset-reviews-v1"
+_DirectoryHandle = int | Path
 _OWNER_SCOPE_DOMAIN = b"survey-web/questionnaire-asset-review/owner-scope/v1\0"
 _COMMAND_HASH_DOMAIN = b"survey-web/questionnaire-asset-review/command/v1\0"
 _EVENT_HASH_DOMAIN = b"survey-web/questionnaire-asset-review/event/v1\0"
@@ -339,7 +340,7 @@ class FileQuestionnaireAssetReviewStorage:
         try:
             content = self._read_state_content(owner_directory, snapshot_key)
         finally:
-            os.close(owner_directory)
+            self._close_directory(owner_directory)
         if content is None:
             return self._empty_state(owner_key, snapshot_key, base_sha, base_size)
         state = self._decode_state(content, owner_key, snapshot_key)
@@ -357,7 +358,7 @@ class FileQuestionnaireAssetReviewStorage:
         try:
             content = self._read_state_content(owner_directory, snapshot_key)
         finally:
-            os.close(owner_directory)
+            self._close_directory(owner_directory)
         if content is None:
             return None
         return self._decode_state(content, owner_key, snapshot_key)
@@ -396,7 +397,7 @@ class FileQuestionnaireAssetReviewStorage:
 
     def _append_locked(
         self,
-        directory: int,
+        directory: _DirectoryHandle,
         owner_key: str,
         snapshot_key: str,
         command: QuestionnaireAssetReviewCommand,
@@ -653,17 +654,38 @@ class FileQuestionnaireAssetReviewStorage:
         )
 
     @classmethod
-    def _verify_directory(cls, descriptor: int, label: str) -> None:
+    def _verify_directory(cls, descriptor: _DirectoryHandle, label: str) -> None:
         try:
-            status = os.fstat(descriptor)
+            status = (
+                descriptor.lstat()
+                if isinstance(descriptor, Path)
+                else os.fstat(descriptor)
+            )
         except OSError as error:
             raise QuestionnaireAssetReviewStorageError(
                 f"{label}状态读取失败"
             ) from error
-        if not stat.S_ISDIR(status.st_mode):
+        if stat.S_ISLNK(status.st_mode) or not stat.S_ISDIR(status.st_mode):
             raise QuestionnaireAssetReviewInvalidError(f"{label}必须是目录")
 
-    def _open_root_directory(self, *, create: bool) -> int | None:
+    @staticmethod
+    def _close_directory(directory: _DirectoryHandle) -> None:
+        if not isinstance(directory, Path):
+            os.close(directory)
+
+    def _open_root_directory(self, *, create: bool) -> _DirectoryHandle | None:
+        if os.name == "nt":
+            if create:
+                try:
+                    self._root.mkdir(parents=False, exist_ok=True)
+                except OSError as error:
+                    raise QuestionnaireAssetReviewInternalError(
+                        "素材审阅根目录创建失败"
+                    ) from error
+            if not self._root.exists():
+                return None
+            self._verify_directory(self._root, "素材审阅根目录")
+            return self._root
         if create:
             try:
                 os.mkdir(self._root, 0o700)
@@ -695,6 +717,8 @@ class FileQuestionnaireAssetReviewStorage:
         return descriptor
 
     def _fsync_root_parent(self) -> None:
+        if os.name == "nt":
+            return
         flags = (
             os.O_RDONLY
             | getattr(os, "O_DIRECTORY", 0)
@@ -721,12 +745,25 @@ class FileQuestionnaireAssetReviewStorage:
     @classmethod
     def _open_child_directory(
         cls,
-        parent: int,
+        parent: _DirectoryHandle,
         name: str,
         *,
         create: bool,
         label: str,
-    ) -> int | None:
+    ) -> _DirectoryHandle | None:
+        if isinstance(parent, Path):
+            child = parent / name
+            if create:
+                try:
+                    child.mkdir(exist_ok=True)
+                except OSError as error:
+                    raise QuestionnaireAssetReviewInternalError(
+                        f"{label}创建失败"
+                    ) from error
+            if not child.exists():
+                return None
+            cls._verify_directory(child, label)
+            return child
         if create:
             try:
                 os.mkdir(name, 0o700, dir_fd=parent)
@@ -760,7 +797,10 @@ class FileQuestionnaireAssetReviewStorage:
             raise
         return descriptor
 
-    def _open_existing_owner_directory(self, owner_key: str) -> int | None:
+    def _open_existing_owner_directory(
+        self,
+        owner_key: str,
+    ) -> _DirectoryHandle | None:
         root = self._open_root_directory(create=False)
         if root is None:
             return None
@@ -772,7 +812,7 @@ class FileQuestionnaireAssetReviewStorage:
                 label="素材审阅命名空间目录",
             )
         finally:
-            os.close(root)
+            self._close_directory(root)
         if namespace is None:
             return None
         try:
@@ -783,10 +823,10 @@ class FileQuestionnaireAssetReviewStorage:
                 label="素材审阅 owner 目录",
             )
         finally:
-            os.close(namespace)
+            self._close_directory(namespace)
         return owner
 
-    def _open_or_create_owner_directory(self, owner_key: str) -> int:
+    def _open_or_create_owner_directory(self, owner_key: str) -> _DirectoryHandle:
         root = self._open_root_directory(create=True)
         assert root is not None
         try:
@@ -797,7 +837,7 @@ class FileQuestionnaireAssetReviewStorage:
                 label="素材审阅命名空间目录",
             )
         finally:
-            os.close(root)
+            self._close_directory(root)
         assert namespace is not None
         try:
             owner = self._open_child_directory(
@@ -807,7 +847,7 @@ class FileQuestionnaireAssetReviewStorage:
                 label="素材审阅 owner 目录",
             )
         finally:
-            os.close(namespace)
+            self._close_directory(namespace)
         assert owner is not None
         return owner
 
@@ -826,12 +866,19 @@ class FileQuestionnaireAssetReviewStorage:
         last_missing_error: FileNotFoundError | None = None
         for _ in range(8):
             try:
-                lock_descriptor = os.open(
-                    lock_name,
-                    flags,
-                    0o600,
-                    dir_fd=directory,
-                )
+                if isinstance(directory, Path):
+                    lock_descriptor = os.open(
+                        directory / lock_name,
+                        flags,
+                        0o600,
+                    )
+                else:
+                    lock_descriptor = os.open(
+                        lock_name,
+                        flags,
+                        0o600,
+                        dir_fd=directory,
+                    )
                 break
             except FileNotFoundError as error:
                 # macOS may transiently return ENOENT when two processes both
@@ -839,12 +886,12 @@ class FileQuestionnaireAssetReviewStorage:
                 # descriptor-relative, no-follow operation remains fail-closed.
                 last_missing_error = error
             except OSError as error:
-                os.close(directory)
+                self._close_directory(directory)
                 raise QuestionnaireAssetReviewStorageError(
                     "素材审阅进程锁无法安全打开"
                 ) from error
         if lock_descriptor is None:
-            os.close(directory)
+            self._close_directory(directory)
             raise QuestionnaireAssetReviewStorageError(
                 "素材审阅进程锁无法安全打开"
             ) from last_missing_error
@@ -860,14 +907,14 @@ class FileQuestionnaireAssetReviewStorage:
                     "素材审阅进程锁必须是单链接普通文件"
                 )
             lock_mode = stat.S_IMODE(lock_status.st_mode)
-            if lock_mode & 0o077:
+            if os.name != "nt" and lock_mode & 0o077:
                 raise QuestionnaireAssetReviewInvalidError(
                     "素材审阅进程锁不能允许 owner 之外的访问"
                 )
             try:
-                if lock_mode != 0o600:
+                if os.name != "nt" and lock_mode != 0o600:
                     os.fchmod(lock_descriptor, 0o600)
-                fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+                acquire_exclusive_file_lock(lock_descriptor)
             except OSError as error:
                 raise QuestionnaireAssetReviewStorageError(
                     "素材审阅进程锁获取失败"
@@ -875,23 +922,30 @@ class FileQuestionnaireAssetReviewStorage:
             yield directory
         finally:
             try:
-                fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+                release_file_lock(lock_descriptor)
             except OSError:
                 pass
             os.close(lock_descriptor)
-            os.close(directory)
+            self._close_directory(directory)
 
     @staticmethod
-    def _read_state_content(directory: int, snapshot_key: str) -> bytes | None:
+    def _read_state_content(
+        directory: _DirectoryHandle,
+        snapshot_key: str,
+    ) -> bytes | None:
         name = f"{snapshot_key}.json"
         flags = (
             os.O_RDONLY
             | getattr(os, "O_NOFOLLOW", 0)
             | getattr(os, "O_NONBLOCK", 0)
             | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_BINARY", 0)
         )
         try:
-            descriptor = os.open(name, flags, dir_fd=directory)
+            if isinstance(directory, Path):
+                descriptor = os.open(directory / name, flags)
+            else:
+                descriptor = os.open(name, flags, dir_fd=directory)
         except FileNotFoundError:
             return None
         except OSError as error:
@@ -909,7 +963,7 @@ class FileQuestionnaireAssetReviewStorage:
                 raise QuestionnaireAssetReviewInvalidError(
                     "素材审阅状态必须是单链接普通文件"
                 )
-            if stat.S_IMODE(initial.st_mode) & 0o077:
+            if os.name != "nt" and stat.S_IMODE(initial.st_mode) & 0o077:
                 raise QuestionnaireAssetReviewInvalidError(
                     "素材审阅状态不能允许 owner 之外的访问"
                 )
@@ -981,26 +1035,38 @@ class FileQuestionnaireAssetReviewStorage:
         os.fsync(descriptor)
 
     @staticmethod
-    def _replace_file(source: str, target: str, directory: int) -> None:
-        os.replace(
-            source,
-            target,
-            src_dir_fd=directory,
-            dst_dir_fd=directory,
-        )
+    def _replace_file(
+        source: str,
+        target: str,
+        directory: _DirectoryHandle,
+    ) -> None:
+        if isinstance(directory, Path):
+            os.replace(directory / source, directory / target)
+        else:
+            os.replace(
+                source,
+                target,
+                src_dir_fd=directory,
+                dst_dir_fd=directory,
+            )
 
     @staticmethod
-    def _unlink_file(name: str, directory: int) -> None:
-        os.unlink(name, dir_fd=directory)
+    def _unlink_file(name: str, directory: _DirectoryHandle) -> None:
+        if isinstance(directory, Path):
+            os.unlink(directory / name)
+        else:
+            os.unlink(name, dir_fd=directory)
 
     @staticmethod
-    def _fsync_directory(directory: int) -> None:
+    def _fsync_directory(directory: _DirectoryHandle) -> None:
+        if isinstance(directory, Path):
+            return
         os.fsync(directory)
 
     @classmethod
     def _create_temporary_file(
         cls,
-        directory: int,
+        directory: _DirectoryHandle,
         target_name: str,
     ) -> tuple[int, str]:
         flags = (
@@ -1009,11 +1075,19 @@ class FileQuestionnaireAssetReviewStorage:
             | os.O_WRONLY
             | getattr(os, "O_NOFOLLOW", 0)
             | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_BINARY", 0)
         )
         for _ in range(32):
-            name = f".{target_name}.{secrets.token_hex(16)}.tmp"
+            name = (
+                f".{secrets.token_hex(12)}.tmp"
+                if isinstance(directory, Path)
+                else f".{target_name}.{secrets.token_hex(16)}.tmp"
+            )
             try:
-                descriptor = os.open(name, flags, 0o600, dir_fd=directory)
+                if isinstance(directory, Path):
+                    descriptor = os.open(directory / name, flags, 0o600)
+                else:
+                    descriptor = os.open(name, flags, 0o600, dir_fd=directory)
             except FileExistsError:
                 continue
             try:
@@ -1022,11 +1096,12 @@ class FileQuestionnaireAssetReviewStorage:
                     raise QuestionnaireAssetReviewInvalidError(
                         "素材审阅临时文件必须是单链接普通文件"
                     )
-                os.fchmod(descriptor, 0o600)
+                if os.name != "nt":
+                    os.fchmod(descriptor, 0o600)
             except Exception:
                 os.close(descriptor)
                 try:
-                    os.unlink(name, dir_fd=directory)
+                    cls._unlink_file(name, directory)
                 except OSError:
                     pass
                 raise
@@ -1036,7 +1111,7 @@ class FileQuestionnaireAssetReviewStorage:
     @classmethod
     def _write_temporary_file(
         cls,
-        directory: int,
+        directory: _DirectoryHandle,
         target_name: str,
         content: bytes,
     ) -> str:
@@ -1047,7 +1122,7 @@ class FileQuestionnaireAssetReviewStorage:
         except Exception:
             os.close(descriptor)
             try:
-                os.unlink(name, dir_fd=directory)
+                cls._unlink_file(name, directory)
             except OSError:
                 pass
             raise
@@ -1057,7 +1132,7 @@ class FileQuestionnaireAssetReviewStorage:
     @classmethod
     def _atomic_replace_state(
         cls,
-        directory: int,
+        directory: _DirectoryHandle,
         target_name: str,
         content: bytes,
         previous_content: bytes | None,
@@ -1086,17 +1161,16 @@ class FileQuestionnaireAssetReviewStorage:
             except Exception as sync_error:
                 try:
                     if rollback_temporary is not None:
-                        os.replace(
+                        cls._replace_file(
                             rollback_temporary,
                             target_name,
-                            src_dir_fd=directory,
-                            dst_dir_fd=directory,
+                            directory,
                         )
                         rollback_temporary = None
                     else:
-                        os.unlink(target_name, dir_fd=directory)
+                        cls._unlink_file(target_name, directory)
                     replaced = False
-                    os.fsync(directory)
+                    cls._fsync_directory(directory)
                 except OSError as rollback_error:
                     raise QuestionnaireAssetReviewInternalError(
                         "素材审阅状态原子保存失败且无法回滚"
@@ -1111,17 +1185,16 @@ class FileQuestionnaireAssetReviewStorage:
             if replaced and not committed:
                 try:
                     if rollback_temporary is not None:
-                        os.replace(
+                        cls._replace_file(
                             rollback_temporary,
                             target_name,
-                            src_dir_fd=directory,
-                            dst_dir_fd=directory,
+                            directory,
                         )
                         rollback_temporary = None
                     else:
-                        os.unlink(target_name, dir_fd=directory)
+                        cls._unlink_file(target_name, directory)
                     try:
-                        os.fsync(directory)
+                        cls._fsync_directory(directory)
                     except OSError:
                         pass
                 except OSError as rollback_error:

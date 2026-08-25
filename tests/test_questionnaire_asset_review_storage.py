@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-import fcntl
 import hashlib
 import json
 import multiprocessing
@@ -13,6 +12,11 @@ import tempfile
 import threading
 import unittest
 from unittest.mock import patch
+
+try:
+    import fcntl
+except ImportError:  # Windows has no POSIX descriptor-path API.
+    fcntl = None
 
 from pydantic import ValidationError
 
@@ -51,7 +55,7 @@ def _descriptor_path(descriptor: int) -> Path:
             return Path(os.readlink(directory / str(descriptor))).resolve()
         except OSError:
             continue
-    if hasattr(fcntl, "F_GETPATH"):
+    if fcntl is not None and hasattr(fcntl, "F_GETPATH"):
         try:
             raw_path = fcntl.fcntl(
                 descriptor,
@@ -495,9 +499,10 @@ class FileQuestionnaireAssetReviewStorageTests(unittest.TestCase):
             baseline,
         )
 
-    @unittest.skipUnless(hasattr(os, "fork"), "requires fork multiprocessing")
     def test_process_contenders_for_same_revision_have_one_winner(self) -> None:
-        context = multiprocessing.get_context("fork")
+        context = multiprocessing.get_context(
+            "spawn" if os.name == "nt" else "fork"
+        )
         start_event = context.Event()
         result_queue = context.Queue()
         processes = [
@@ -790,6 +795,7 @@ class FileQuestionnaireAssetReviewStorageTests(unittest.TestCase):
             self.storage.append(OWNER_REF, SNAPSHOT_ID, _command())
         self.assertEqual(target.read_bytes(), persisted)
 
+    @unittest.skipIf(os.name == "nt", "Windows uses ACLs, not POSIX mode bits")
     def test_group_or_other_readable_state_is_rejected_without_repair(self) -> None:
         self._append_first()
         target = self._state_path()
@@ -834,7 +840,11 @@ class FileQuestionnaireAssetReviewStorageTests(unittest.TestCase):
             self._load()
 
     def test_symlink_fifo_hardlink_and_oversize_state_files_are_rejected(self) -> None:
-        cases = ("symlink", "fifo", "hardlink", "oversize")
+        cases = (
+            ("hardlink", "oversize")
+            if os.name == "nt"
+            else ("symlink", "fifo", "hardlink", "oversize")
+        )
         for case in cases:
             with self.subTest(case=case):
                 with tempfile.TemporaryDirectory(
@@ -897,7 +907,8 @@ class FileQuestionnaireAssetReviewStorageTests(unittest.TestCase):
                             )
 
     def test_symlink_fifo_and_hardlink_lock_files_are_rejected(self) -> None:
-        for case in ("symlink", "fifo", "hardlink"):
+        cases = ("hardlink",) if os.name == "nt" else ("symlink", "fifo", "hardlink")
+        for case in cases:
             with self.subTest(case=case):
                 with tempfile.TemporaryDirectory(
                     prefix=f"asset-review-lock-{case}-"
@@ -948,6 +959,7 @@ class FileQuestionnaireAssetReviewStorageTests(unittest.TestCase):
                 self.assertEqual(self._tree_entries(), before_entries)
                 self._assert_no_temporary_files()
 
+    @unittest.skipIf(os.name == "nt", "Windows cannot fsync directories")
     def test_first_append_fsyncs_each_new_directory_parent_in_order(self) -> None:
         fsynced_directories: list[Path] = []
         original_fsync = FileQuestionnaireAssetReviewStorage._fsync_directory
@@ -974,6 +986,7 @@ class FileQuestionnaireAssetReviewStorageTests(unittest.TestCase):
             ],
         )
 
+    @unittest.skipIf(os.name == "nt", "Windows cannot fsync directories")
     def test_new_directory_parent_fsync_failures_precede_lock_and_state(self) -> None:
         for failed_call in (1, 2, 3):
             with self.subTest(failed_call=failed_call):
@@ -1081,6 +1094,7 @@ class FileQuestionnaireAssetReviewStorageTests(unittest.TestCase):
         self.assertEqual(replayed, committed)
         self.assertEqual(target.read_bytes(), before)
 
+    @unittest.skipIf(os.name == "nt", "Windows cannot fsync directories")
     def test_post_cleanup_directory_fsync_failure_cannot_return_success(self) -> None:
         self._append_first()
         command = _command(
@@ -1117,6 +1131,7 @@ class FileQuestionnaireAssetReviewStorageTests(unittest.TestCase):
         self.assertEqual(replayed, committed)
         self.assertEqual(target.read_bytes(), before)
 
+    @unittest.skipIf(os.name == "nt", "Windows uses ACLs, not POSIX mode bits")
     def test_state_and_lock_files_are_owner_only(self) -> None:
         self._append_first()
         state_path = self._state_path()
@@ -1253,7 +1268,11 @@ class FileQuestionnaireAssetReviewStorageTests(unittest.TestCase):
                     self.assertFalse(root.exists())
 
     def test_symlinked_or_non_directory_scope_components_fail_closed(self) -> None:
-        cases = ("root-file", "root-symlink", "namespace-symlink", "owner-symlink")
+        cases = (
+            ("root-file",)
+            if os.name == "nt"
+            else ("root-file", "root-symlink", "namespace-symlink", "owner-symlink")
+        )
         for case in cases:
             with self.subTest(case=case):
                 with tempfile.TemporaryDirectory(

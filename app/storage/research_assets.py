@@ -17,12 +17,12 @@ import threading
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
-import fcntl
 from typing import Any, BinaryIO, NamedTuple, Protocol, runtime_checkable
 import zipfile
 
 from pydantic import ValidationError
 
+from app.core.file_lock import acquire_exclusive_file_lock, release_file_lock
 from app.core.research_assets import (
     ResearchContractError,
     canonical_json,
@@ -54,6 +54,8 @@ _SNAPSHOT_CATALOG_MAX_PAGE_METADATA_BYTES = 128 * 1024 * 1024
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _SNAPSHOT_PACKAGE_FILENAME_PATTERN = re.compile(r"^([0-9a-f]{64})\.zip$")
 _MANIFEST_PATH = "manifest.json"
+
+_DirectoryHandle = int | Path
 
 
 class ResearchAssetStorageError(RuntimeError):
@@ -400,6 +402,7 @@ class FileResearchAssetStorage:
             os.O_RDONLY
             | getattr(os, "O_NOFOLLOW", 0)
             | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_BINARY", 0)
         )
         try:
             descriptor = os.open(target, flags)
@@ -458,7 +461,10 @@ class FileResearchAssetStorage:
                 or path_status.st_mode != initial_status.st_mode
                 or path_status.st_size != initial_status.st_size
                 or path_status.st_mtime_ns != initial_status.st_mtime_ns
-                or path_status.st_ctime_ns != initial_status.st_ctime_ns
+                or (
+                    os.name != "nt"
+                    and path_status.st_ctime_ns != initial_status.st_ctime_ns
+                )
             ):
                 raise error_type(f"{label}在读取期间发生变化")
             return b"".join(chunks)
@@ -671,11 +677,17 @@ class FileResearchAssetStorage:
                 return None
             package_name = f"{storage_key}.zip"
             try:
-                package_status = os.stat(
-                    package_name,
-                    dir_fd=directory,
-                    follow_symlinks=False,
-                )
+                if isinstance(directory, Path):
+                    package_status = os.stat(
+                        directory / package_name,
+                        follow_symlinks=False,
+                    )
+                else:
+                    package_status = os.stat(
+                        package_name,
+                        dir_fd=directory,
+                        follow_symlinks=False,
+                    )
             except FileNotFoundError:
                 return None
             except OSError as error:
@@ -857,6 +869,33 @@ class FileResearchAssetStorage:
     @contextmanager
     def _open_owner_directory(self, owner_ref: str):
         directory_path = self._root / _identity_hash(owner_ref)
+        if os.name == "nt":
+            try:
+                root_status = self._root.lstat()
+            except FileNotFoundError:
+                yield None
+                return
+            except OSError as error:
+                raise ResearchAssetStorageError(
+                    "快照包存储根目录打开失败"
+                ) from error
+            if stat.S_ISLNK(root_status.st_mode) or not stat.S_ISDIR(
+                root_status.st_mode
+            ):
+                raise ResearchAssetStorageError("快照包存储根路径必须是目录")
+            try:
+                status = directory_path.lstat()
+            except FileNotFoundError:
+                yield None
+                return
+            except OSError as error:
+                raise ResearchAssetStorageError(
+                    "快照包 owner 目录打开失败"
+                ) from error
+            if stat.S_ISLNK(status.st_mode) or not stat.S_ISDIR(status.st_mode):
+                raise ResearchAssetStorageError("快照包 owner 路径必须是目录")
+            yield directory_path
+            return
         flags = (
             os.O_RDONLY
             | getattr(os, "O_DIRECTORY", 0)
@@ -887,7 +926,7 @@ class FileResearchAssetStorage:
         cls,
         owner: str,
         storage_key: str,
-        directory: int,
+        directory: _DirectoryHandle,
         *,
         metadata_budget: int,
     ) -> tuple[SnapshotCatalogEntry, int]:
@@ -953,16 +992,33 @@ class FileResearchAssetStorage:
     @staticmethod
     @contextmanager
     def _open_directory_file(
-        directory: int,
+        directory: _DirectoryHandle,
         name: str,
         *,
         max_bytes: int,
         label: str,
         required: bool,
     ):
+        if isinstance(directory, Path):
+            content = FileResearchAssetStorage._read_directory_file(
+                directory,
+                name,
+                max_bytes=max_bytes,
+                label=label,
+                required=required,
+            )
+            if content is None:
+                yield None
+                return
+            with io.BytesIO(content) as source:
+                yield source
+            return
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
         try:
-            descriptor = os.open(name, flags, dir_fd=directory)
+            if isinstance(directory, Path):
+                descriptor = os.open(directory / name, flags)
+            else:
+                descriptor = os.open(name, flags, dir_fd=directory)
         except FileNotFoundError as error:
             if not required:
                 yield None
@@ -997,7 +1053,7 @@ class FileResearchAssetStorage:
 
     @staticmethod
     def _read_directory_file(
-        directory: int,
+        directory: _DirectoryHandle,
         name: str,
         *,
         max_bytes: int,
@@ -1009,9 +1065,13 @@ class FileResearchAssetStorage:
             os.O_RDONLY
             | getattr(os, "O_NOFOLLOW", 0)
             | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_BINARY", 0)
         )
         try:
-            descriptor = os.open(name, flags, dir_fd=directory)
+            if isinstance(directory, Path):
+                descriptor = os.open(directory / name, flags)
+            else:
+                descriptor = os.open(name, flags, dir_fd=directory)
         except FileNotFoundError as error:
             if not required:
                 return None
@@ -1048,11 +1108,17 @@ class FileResearchAssetStorage:
                 chunks.append(chunk)
             try:
                 final_status = os.fstat(descriptor)
-                path_status = os.stat(
-                    name,
-                    dir_fd=directory,
-                    follow_symlinks=False,
-                )
+                if isinstance(directory, Path):
+                    path_status = os.stat(
+                        directory / name,
+                        follow_symlinks=False,
+                    )
+                else:
+                    path_status = os.stat(
+                        name,
+                        dir_fd=directory,
+                        follow_symlinks=False,
+                    )
             except OSError as error:
                 raise error_type(f"{label}在读取期间发生变化") from error
             if (
@@ -1069,7 +1135,10 @@ class FileResearchAssetStorage:
                 or path_status.st_mode != file_status.st_mode
                 or path_status.st_size != file_status.st_size
                 or path_status.st_mtime_ns != file_status.st_mtime_ns
-                or path_status.st_ctime_ns != file_status.st_ctime_ns
+                or (
+                    os.name != "nt"
+                    and path_status.st_ctime_ns != file_status.st_ctime_ns
+                )
             ):
                 raise error_type(f"{label}在读取期间发生变化")
             return b"".join(chunks)
@@ -1079,7 +1148,7 @@ class FileResearchAssetStorage:
     @staticmethod
     @contextmanager
     def _exclusive_snapshot_in_directory(
-        directory: int,
+        directory: _DirectoryHandle,
         snapshot_id: str,
     ):
         lock_name = f".{_identity_hash(snapshot_id)}.lock"
@@ -1089,7 +1158,10 @@ class FileResearchAssetStorage:
             | getattr(os, "O_NOFOLLOW", 0)
         )
         try:
-            descriptor = os.open(lock_name, flags, 0o600, dir_fd=directory)
+            if isinstance(directory, Path):
+                descriptor = os.open(directory / lock_name, flags, 0o600)
+            else:
+                descriptor = os.open(lock_name, flags, 0o600, dir_fd=directory)
         except OSError as error:
             raise ResearchAssetStorageError("快照进程锁创建失败") from error
         try:
@@ -1100,14 +1172,14 @@ class FileResearchAssetStorage:
             if not stat.S_ISREG(lock_status.st_mode) or lock_status.st_nlink != 1:
                 raise ResearchAssetStorageError("快照进程锁必须是单链接普通文件")
             try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                acquire_exclusive_file_lock(descriptor)
             except OSError as error:
                 raise ResearchAssetStorageError("快照进程锁获取失败") from error
             try:
                 yield
             finally:
                 try:
-                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                    release_file_lock(descriptor)
                 except OSError:
                     pass
         finally:
@@ -1126,7 +1198,7 @@ class FileResearchAssetStorage:
         except OSError as error:
             raise ResearchAssetStorageError("快照进程锁创建失败") from error
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            acquire_exclusive_file_lock(descriptor)
         except OSError as error:
             os.close(descriptor)
             raise ResearchAssetStorageError("快照进程锁获取失败") from error
@@ -1134,7 +1206,7 @@ class FileResearchAssetStorage:
             yield
         finally:
             try:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                release_file_lock(descriptor)
             except OSError:
                 pass
             finally:
@@ -1173,6 +1245,8 @@ class FileResearchAssetStorage:
 
     @staticmethod
     def _fsync_directory(directory: Path) -> None:
+        if os.name == "nt":
+            return
         try:
             descriptor = os.open(directory, os.O_RDONLY)
         except OSError:
