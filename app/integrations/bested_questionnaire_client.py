@@ -213,13 +213,13 @@ def _validate_zip_member(info: zipfile.ZipInfo) -> None:
         or _WINDOWS_DRIVE_RE.match(name)
     ):
         raise ValueError("倍市得 .xlsx 包含非法成员路径")
-    path = PurePosixPath(name)
+    is_directory = info.is_dir()
+    checked_name = name[:-1] if is_directory else name
+    path = PurePosixPath(checked_name)
     if path.is_absolute() or any(
-        part in {"", ".", ".."} for part in name.split("/")
+        part in {"", ".", ".."} for part in checked_name.split("/")
     ):
         raise ValueError(f"倍市得 .xlsx 包含不安全路径：{name}")
-    if info.is_dir():
-        raise ValueError(f"倍市得 .xlsx 不允许目录成员：{name}")
     if info.flag_bits & 0x1:
         raise ValueError(f"倍市得 .xlsx 不允许加密成员：{name}")
     mode = info.external_attr >> 16
@@ -227,6 +227,10 @@ def _validate_zip_member(info: zipfile.ZipInfo) -> None:
         raise ValueError(f"倍市得 .xlsx 不允许符号链接：{name}")
     if info.compress_type not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}:
         raise ValueError(f"倍市得 .xlsx 成员压缩算法不受支持：{name}")
+    if is_directory:
+        if info.file_size != 0:
+            raise ValueError(f"倍市得 .xlsx 目录成员必须为空：{name}")
+        return
     if (
         info.file_size < 0
         or info.file_size > _XLSX_MAX_MEMBER_BYTES

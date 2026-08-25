@@ -491,6 +491,42 @@ class BestedQuestionnaireConnectorTests(unittest.TestCase):
                         package,
                     )
 
+    def test_security_preflight_allows_empty_safe_directory_members(self):
+        package = _rewrite_xlsx(
+            _questionnaire_bytes(),
+            additions=(
+                ("_rels/", b""),
+                ("docProps/", b""),
+                ("xl/", b""),
+                ("xl/worksheets/", b""),
+            ),
+        )
+
+        parsed = parse_bested_questionnaire_upload(
+            "questionnaire.xlsx",
+            package,
+        )
+
+        self.assertEqual(len(parsed.questions), 1)
+
+    def test_security_preflight_rejects_unsafe_directory_members(self):
+        cases = (
+            ("../", b"", "不安全路径"),
+            ("xl/../", b"", "不安全路径"),
+            ("xl/suspicious/", b"content", "目录成员必须为空"),
+        )
+        for name, payload, message in cases:
+            with self.subTest(name=name):
+                package = _rewrite_xlsx(
+                    _questionnaire_bytes(),
+                    additions=((name, payload),),
+                )
+                with self.assertRaisesRegex(ValueError, message):
+                    parse_bested_questionnaire_upload(
+                        "questionnaire.xlsx",
+                        package,
+                    )
+
     def test_security_preflight_rejects_encryption_and_missing_ooxml(self):
         cases = (
             (
