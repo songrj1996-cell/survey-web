@@ -230,7 +230,7 @@ def _substantive_questions(package: SnapshotPackage) -> list[CanonicalQuestion]:
     if not questions:
         raise ValueError("该快照没有可绑定的问卷结构，请先完成结构复核")
     ids: set[str] = set()
-    titles: dict[str, str] = {}
+    titles: dict[str, CanonicalQuestion] = {}
     for question in questions:
         question_id = str(question.question_id).strip()
         title = str(question.title).strip()
@@ -240,11 +240,19 @@ def _substantive_questions(package: SnapshotPackage) -> list[CanonicalQuestion]:
             raise ValueError(f"题目 {question_id} 缺少题干")
         title_key = _norm(title)
         if title_key in titles:
-            raise ValueError(
-                f"快照包含重复题干「{title}」，不能确定性绑定回答列"
+            previous = titles[title_key]
+            google_exact_duplicate = (
+                package.bundle.snapshot.provider == Provider.GOOGLE_FORMS
+                and previous.title.strip() == title
+                and previous.canonical_type not in _MATRIX_TYPES
+                and question.canonical_type not in _MATRIX_TYPES
             )
+            if not google_exact_duplicate:
+                raise ValueError(
+                    f"快照包含重复题干「{title}」，不能确定性绑定回答列"
+                )
         ids.add(question_id)
-        titles[title_key] = question_id
+        titles.setdefault(title_key, question)
         if question.mapping_status not in {
             MappingStatus.EXACT,
             MappingStatus.NORMALIZED,
@@ -318,6 +326,7 @@ def _header_candidates(
     *,
     row_label: str | None,
     row_key: str | None,
+    exported_header: str | None,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     stable = tuple(dict.fromkeys(
         value
@@ -330,12 +339,12 @@ def _header_candidates(
         if value
     ))
     structural: list[str] = []
-    if binding.column_header:
-        structural.append(binding.column_header)
     title = question.title.strip()
     if row_label is None:
-        structural.append(title)
+        structural.append(exported_header or binding.column_header or title)
     else:
+        if binding.column_header:
+            structural.append(binding.column_header)
         structural.extend((
             f"{title} [{row_label}]",
             f"{title}__{row_label}",
@@ -351,12 +360,14 @@ def _select_google_source_index(
     row_label: str | None,
     row_key: str | None,
     used_indexes: set[int],
+    exported_header: str | None,
 ) -> tuple[int, str, str, float, tuple[str, ...]]:
     stable, structural = _header_candidates(
         question,
         binding,
         row_label=row_label,
         row_key=row_key,
+        exported_header=exported_header,
     )
 
     exact_stable = _matching_header_indexes(headers, stable, normalized=False)
@@ -519,6 +530,40 @@ def _bind_google(
     detected: list[SnapshotDetectedColumn] = []
     safe_bindings: list[SnapshotResponseBinding] = []
     used_indexes: set[int] = set()
+    title_totals: dict[str, int] = {}
+    for question in questions:
+        if question.canonical_type not in _MATRIX_TYPES:
+            title = question.title.strip()
+            title_totals[title] = title_totals.get(title, 0) + 1
+    title_occurrences: dict[str, int] = {}
+    exported_headers: dict[str, str] = {}
+    used_exported_headers: set[str] = set()
+    for question in questions:
+        if question.canonical_type in _MATRIX_TYPES:
+            continue
+        title = question.title.strip()
+        if title_totals[title] == 1:
+            title_key = _norm(title)
+            if title_key in used_exported_headers:
+                raise ValueError(
+                    f"Google Forms 题目「{title}」的导出列名无法唯一确定"
+                )
+            used_exported_headers.add(title_key)
+            continue
+        occurrence = title_occurrences.get(title, 0) + 1
+        title_occurrences[title] = occurrence
+        exported_header = (
+            title
+            if occurrence == 1
+            else f"{title} {occurrence}"
+        )
+        exported_header_key = _norm(exported_header)
+        if exported_header_key in used_exported_headers:
+            raise ValueError(
+                f"Google Forms 题目「{title}」的导出列名无法唯一确定"
+            )
+        used_exported_headers.add(exported_header_key)
+        exported_headers[question.question_id] = exported_header
 
     for question in questions:
         mapping = mappings.get(question.question_id)
@@ -541,6 +586,7 @@ def _bind_google(
                     row_label=row_label,
                     row_key=row_key,
                     used_indexes=used_indexes,
+                    exported_header=exported_headers.get(question.question_id),
                 )
             )
             source_indexes.append(index)
@@ -562,7 +608,10 @@ def _bind_google(
                     f"{question.title.strip()} [{row_labels[position]}]"
                 )
             else:
-                normalized_headers.append(question.title.strip())
+                normalized_headers.append(
+                    exported_headers.get(question.question_id)
+                    or question.title.strip()
+                )
             if role in {"multi_choice", "matrix_multi"}:
                 normalized_columns.append(_normalize_multi_values(
                     body, source_index, options, question.title
@@ -577,7 +626,10 @@ def _bind_google(
         if role in {"scale", "matrix_scale"}:
             scale_min, scale_max = _scale_bounds(question)
         detected.append(SnapshotDetectedColumn(
-            name_zh=question.title.strip(),
+            name_zh=(
+                exported_headers.get(question.question_id)
+                or question.title.strip()
+            ),
             role=role,
             column_indexes=tuple(target_indexes),
             source_question_id=question.question_id,

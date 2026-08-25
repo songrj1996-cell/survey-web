@@ -104,6 +104,25 @@ def _google_csv(*, omit: str | None = None) -> bytes:
     return (",".join(headers) + "\n" + ",".join(row) + "\n").encode()
 
 
+def _google_duplicate_title_package() -> SnapshotPackage:
+    package = _google_package()
+    questions = list(package.bundle.snapshot.canonical_questions)
+    choice = next(q for q in questions if q.question_id == "q_concept_choice")
+    questions = [
+        question.model_copy(update={"title": choice.title})
+        if question.question_id == "q_open"
+        else question
+        for question in questions
+    ]
+    snapshot = package.bundle.snapshot.model_copy(update={
+        "canonical_questions": questions,
+    })
+    return SnapshotPackage(
+        ResearchAssetBundle(snapshot, package.bundle.collection),
+        package.media,
+    )
+
+
 def _bested_package() -> tuple[SnapshotPackage, bytes]:
     questionnaire = _workbook_bytes({
         "问卷内容": [
@@ -240,27 +259,89 @@ class QuestionnaireSnapshotBindingTests(unittest.TestCase):
                 response_content=_google_csv(omit="gf-q-grid-art"),
             )
 
-    def test_duplicate_question_titles_fail_even_with_stable_response_keys(self):
+    def test_google_duplicate_titles_bind_with_stable_response_keys(self):
+        binding = bind_snapshot_to_survey_responses(
+            _google_duplicate_title_package(),
+            owner_ref="fixture-user",
+            response_filename="responses.csv",
+            response_content=_google_csv(),
+        )
+
+        self.assertEqual(binding.matched_questions, 4)
+        self.assertEqual(binding.rows[0][0], "你更喜欢哪个方案？")
+        self.assertEqual(binding.rows[0][3], "你更喜欢哪个方案？ 2")
+        self.assertTrue(all(
+            item.mapping_method == "provider_response_key"
+            for item in binding.response_bindings
+        ))
+
+    def test_google_duplicate_titles_bind_declared_export_suffixes(self):
+        response = _workbook_bytes({
+            "回答": [[
+                "你更喜欢哪个方案？",
+                "功能评价 [易用性]",
+                "功能评价 [美术表现]",
+                "你更喜欢哪个方案？ 2",
+                "上传参考文件",
+            ], ["方案 B", "一般", "满意", "更直观", ""]],
+        })
+
+        binding = bind_snapshot_to_survey_responses(
+            _google_duplicate_title_package(),
+            owner_ref="fixture-user",
+            response_filename="responses.xlsx",
+            response_content=response,
+        )
+
+        self.assertEqual(binding.rows[1][:4], ("方案 B", "一般", "满意", "更直观"))
+        self.assertEqual(binding.rows[0][0], "你更喜欢哪个方案？")
+        self.assertEqual(binding.rows[0][3], "你更喜欢哪个方案？ 2")
+        self.assertTrue(all(
+            "header" in item.mapping_method
+            for item in binding.response_bindings
+        ))
+
+    def test_google_duplicate_title_wrong_export_suffix_fails_closed(self):
+        response = _workbook_bytes({
+            "回答": [[
+                "你更喜欢哪个方案？",
+                "功能评价 [易用性]",
+                "功能评价 [美术表现]",
+                "你更喜欢哪个方案？ 3",
+                "上传参考文件",
+            ], ["方案 B", "一般", "满意", "更直观", ""]],
+        })
+
+        with self.assertRaisesRegex(ValueError, "未找到题目"):
+            bind_snapshot_to_survey_responses(
+                _google_duplicate_title_package(),
+                owner_ref="fixture-user",
+                response_filename="responses.xlsx",
+                response_content=response,
+            )
+
+    def test_google_normalized_title_collision_still_fails_closed(self):
         package = _google_package()
         questions = list(package.bundle.snapshot.canonical_questions)
-        choice = next(q for q in questions if q.question_id == "q_concept_choice")
         questions = [
-            q.model_copy(update={"title": choice.title})
-            if q.question_id == "q_open"
-            else q
-            for q in questions
+            question.model_copy(update={"title": "Duplicate title"})
+            if question.question_id == "q_concept_choice"
+            else question.model_copy(update={"title": "duplicate TITLE"})
+            if question.question_id == "q_open"
+            else question
+            for question in questions
         ]
         snapshot = package.bundle.snapshot.model_copy(update={
             "canonical_questions": questions,
         })
-        duplicate = SnapshotPackage(
+        collision = SnapshotPackage(
             ResearchAssetBundle(snapshot, package.bundle.collection),
             package.media,
         )
 
         with self.assertRaisesRegex(ValueError, "重复题干"):
             bind_snapshot_to_survey_responses(
-                duplicate,
+                collision,
                 owner_ref="fixture-user",
                 response_filename="responses.csv",
                 response_content=_google_csv(),
