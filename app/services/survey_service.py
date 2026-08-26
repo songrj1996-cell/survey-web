@@ -78,7 +78,9 @@ from app.services.questionnaire_import import (
     parse_questionnaire_translations,
 )
 from app.services.qualitative_viewpoints import (
+    build_viewpoint_diagnostics,
     build_report_viewpoint_stats,
+    finalize_viewpoint_diagnostics,
     render_viewpoint_stats,
 )
 from app.services.report_engine import (
@@ -1546,6 +1548,10 @@ async def report_stream(
                 if minutes else f"，耗时 {remaining} 秒"
             )
 
+        viewpoint_stats_md = ""
+        viewpoint_diagnostics = build_viewpoint_diagnostics({}, [], "")
+        writer_context_included = False
+
         if use_large_mode:
             total_open_text = sum(len(v) for v in open_text.values())
             start_msg = (
@@ -1614,9 +1620,8 @@ async def report_stream(
                     scope_concurrency=cluster_metrics.get("scope_concurrency", 1),
                 )
 
-            viewpoint_stats_md = ""
+            report_viewpoints: list[dict] = []
             if not quantitative_first and not is_crosstab:
-                report_viewpoints: list[dict] = []
                 synthesis_event_seen = False
                 async for item in build_report_viewpoint_stats(
                     clustered_themes, open_text, plan, rows[0]
@@ -1645,6 +1650,14 @@ async def report_stream(
                     "skipped",
                     "当前报告模式不需要跨题观点归纳",
                 )
+
+            viewpoint_diagnostics = build_viewpoint_diagnostics(
+                clustered_themes,
+                report_viewpoints,
+                viewpoint_stats_md,
+                cluster_diagnostics=cluster_diagnostics,
+                cluster_metrics=cluster_metrics,
+            )
 
             yield _analysis_progress(
                 "writing",
@@ -1678,6 +1691,9 @@ async def report_stream(
                         f"<questionnaire>\n以下是问卷原文（仅供理解题目意图与背景，"
                         f"不要直接搬运）：\n{q_text}\n</questionnaire>\n\n" + writer_query
                     )
+            writer_context_included = bool(
+                viewpoint_stats_md and viewpoint_stats_md in writer_query
+            )
             async for heartbeat in _writer_call(writer_query):
                 yield heartbeat
             full_report, model_used = _writer_call.out
@@ -1690,16 +1706,16 @@ async def report_stream(
             for event in _content_events(full_report):
                 yield event
         else:
-            viewpoint_stats_md = ""
+            clustered_themes: dict = {}
+            cluster_diagnostics: dict = {}
+            cluster_metrics: dict = {}
+            report_viewpoints: list[dict] = []
             if not quantitative_first and open_text:
                 yield _analysis_progress(
                     "themes",
                     "active",
                     "正在逐题提炼主题并按玩家去重统计提及人数",
                 )
-                clustered_themes: dict = {}
-                cluster_diagnostics: dict = {}
-                cluster_metrics: dict = {}
                 async for item in _batch_qualitative_analysis(
                     open_text,
                     plan,
@@ -1749,7 +1765,6 @@ async def report_stream(
                     scope_concurrency=cluster_metrics.get("scope_concurrency", 1),
                 )
 
-                report_viewpoints: list[dict] = []
                 synthesis_event_seen = False
                 async for item in build_report_viewpoint_stats(
                     clustered_themes, open_text, plan, rows[0]
@@ -1784,6 +1799,14 @@ async def report_stream(
                     "没有逐题主题可用于跨题观点归纳",
                 )
 
+            viewpoint_diagnostics = build_viewpoint_diagnostics(
+                clustered_themes,
+                report_viewpoints,
+                viewpoint_stats_md,
+                cluster_diagnostics=cluster_diagnostics,
+                cluster_metrics=cluster_metrics,
+            )
+
             yield _analysis_progress(
                 "writing",
                 "active",
@@ -1816,6 +1839,9 @@ async def report_stream(
             first_q = (
                 _build_report_generation_instruction_block(prompt_instruction)
                 + first_q
+            )
+            writer_context_included = bool(
+                viewpoint_stats_md and viewpoint_stats_md in first_q
             )
             async for ev in _round(first_q):
                 yield ev
@@ -1973,6 +1999,23 @@ async def report_stream(
         full_report = _inject_disclaimer(full_report, mode=sess.get("mode") or "")
         full_report = _inject_research_background(full_report, qualitative_context)
         full_report = normalize_glossary_terms(full_report)
+        viewpoint_diagnostics = finalize_viewpoint_diagnostics(
+            viewpoint_diagnostics,
+            full_report,
+            writer_context_included=writer_context_included,
+        )
+        viewpoint_catalog = viewpoint_diagnostics["catalog"]
+        viewpoint_output = viewpoint_diagnostics["writer_output"]
+        print(
+            "[viewpoint-diagnostics] "
+            f"session={session_id} "
+            f"catalog_entries={viewpoint_catalog['entry_count']} "
+            f"context_included={writer_context_included} "
+            f"viewpoint_blocks={viewpoint_output['viewpoint_block_count']} "
+            f"mention_blocks={viewpoint_output['mention_block_count']} "
+            f"status={viewpoint_output['status']}",
+            flush=True,
+        )
         qa_context_md = _build_qa_context(sess, full_report)
         writer_model = ",".join(dict.fromkeys(writer_models_used))
         # 生成期间仍可能发生改名等非模型写入；提交前重读最新 session，
@@ -1990,6 +2033,7 @@ async def report_stream(
             "analyst_app": "large" if use_large_mode else "standard",
             "report_writer_provider": "direct_llm",
             "report_writer_model": writer_model,
+            "viewpoint_diagnostics": viewpoint_diagnostics,
         }
         if rerun_history_id:
             if str(sess.get("rerun_target_history_id") or "").strip() != rerun_history_id:

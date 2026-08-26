@@ -3,9 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
+import hashlib
+import re
 import time
 
 from app.services import report_engine
+
+
+_VIEWPOINT_BLOCK_RE = re.compile(r"(?m)^[ \t]*\*\*观点：")
+_MENTION_BLOCK_RE = re.compile(r"(?m)^[ \t]*\*\*提及情况：")
+_INFERENCE_BLOCK_RE = re.compile(r"(?m)^[ \t]*\*\*分析推断：")
+_VAGUE_VIEWPOINT_TERMS = ("多数玩家", "多位玩家", "部分玩家", "少数玩家")
 
 
 def _question_label(data: dict) -> str:
@@ -327,3 +336,204 @@ def render_viewpoint_stats(clustered_themes: dict, report_viewpoints: list[dict]
             )
     lines.append("</subjective_viewpoint_stats>")
     return "\n".join(lines)
+
+
+def _diagnostic_number(value, default=0):
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float)):
+        return value
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _diagnostic_error_type(value) -> str:
+    text = str(value or "").lower()
+    for error_type, markers in (
+        ("timeout", ("timeout", "timed out", "超时")),
+        ("rate_limit", ("rate limit", "ratelimit", "429", "限流")),
+        ("authentication", ("authentication", "unauthorized", "401", "鉴权")),
+        ("connection", ("connection", "connecterror", "network", "网络")),
+        ("json_validation", ("json", "validation", "schema", "校验")),
+        ("empty_output", ("empty", "为空", "无有效")),
+    ):
+        if any(marker in text for marker in markers):
+            return error_type
+    return "other"
+
+
+def _diagnostic_error_counts(diagnostics: dict) -> tuple[dict, dict]:
+    type_counts: dict[str, int] = {}
+    stage_counts: dict[str, int] = {}
+
+    def collect(value, stage: str = "unknown") -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                next_stage = str(key) if str(key).startswith("phase_") else stage
+                if str(key) == "error" and item:
+                    error_type = _diagnostic_error_type(item)
+                    type_counts[error_type] = type_counts.get(error_type, 0) + 1
+                    stage_counts[next_stage] = stage_counts.get(next_stage, 0) + 1
+                else:
+                    collect(item, next_stage)
+        elif isinstance(value, list):
+            for item in value:
+                collect(item, stage)
+
+    collect(diagnostics)
+    return type_counts, stage_counts
+
+
+def build_viewpoint_diagnostics(
+    clustered_themes: dict,
+    report_viewpoints: list[dict],
+    viewpoint_stats_md: str,
+    *,
+    cluster_diagnostics: dict | None = None,
+    cluster_metrics: dict | None = None,
+) -> dict:
+    """Build a per-report, privacy-safe snapshot of the viewpoint pipeline."""
+    catalog_entries: list[dict] = []
+    question_viewpoint_count = 0
+    for scope_key, data in (clustered_themes or {}).items():
+        question = _question_label(data)
+        denominator = int(_diagnostic_number(data.get("total"), 0))
+        for theme in data.get("all_themes") or data.get("themes") or []:
+            count = int(_diagnostic_number(theme.get("count"), 0))
+            if not count or not denominator:
+                continue
+            question_viewpoint_count += 1
+            catalog_entries.append({
+                "id": f"QVIEW:{scope_key}:{theme.get('id', '')}",
+                "kind": "question",
+                "name": str(theme.get("name") or "").strip(),
+                "count": count,
+                "denominator": denominator,
+                "percentage": _diagnostic_number(theme.get("percentage"), 0),
+                "source_questions": [question],
+            })
+
+    report_viewpoint_count = 0
+    for item in report_viewpoints or []:
+        count = int(_diagnostic_number(item.get("count"), 0))
+        denominator = int(_diagnostic_number(item.get("denominator"), 0))
+        if not count or not denominator:
+            continue
+        report_viewpoint_count += 1
+        catalog_entries.append({
+            "id": str(item.get("id") or "").strip(),
+            "kind": "report",
+            "name": str(item.get("name") or "").strip(),
+            "count": count,
+            "denominator": denominator,
+            "percentage": _diagnostic_number(item.get("percentage"), 0),
+            "source_questions": [
+                str(question).strip()
+                for question in item.get("source_questions") or []
+                if str(question).strip()
+            ],
+        })
+
+    diagnostics = cluster_diagnostics or {}
+    failed_scope_count = sum(
+        1 for item in diagnostics.values()
+        if isinstance(item, dict) and item.get("status") == "failed"
+    )
+    degraded_scope_count = sum(
+        1 for item in diagnostics.values()
+        if isinstance(item, dict) and item.get("quality_status") == "degraded"
+    )
+    error_type_counts, error_stage_counts = _diagnostic_error_counts(diagnostics)
+    if failed_scope_count and failed_scope_count == len(diagnostics):
+        cluster_status = "failed"
+    elif failed_scope_count or degraded_scope_count:
+        cluster_status = "degraded"
+    elif clustered_themes:
+        cluster_status = "completed"
+    else:
+        cluster_status = "empty"
+
+    safe_metrics = {}
+    for key in ("scope_concurrency", "elapsed_seconds"):
+        value = (cluster_metrics or {}).get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            safe_metrics[key] = value
+
+    rendered = str(viewpoint_stats_md or "")
+    return {
+        "schema_version": 1,
+        "cluster": {
+            "status": cluster_status,
+            "scope_count": len(clustered_themes or {}),
+            "failed_scope_count": failed_scope_count,
+            "degraded_scope_count": degraded_scope_count,
+            "error_type_counts": error_type_counts,
+            "error_stage_counts": error_stage_counts,
+            "metrics": safe_metrics,
+        },
+        "catalog": {
+            "question_viewpoint_count": question_viewpoint_count,
+            "report_viewpoint_count": report_viewpoint_count,
+            "entry_count": len(catalog_entries),
+            "rendered": bool(rendered.strip()),
+            "rendered_char_count": len(rendered),
+            "rendered_sha256": (
+                hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+                if rendered else ""
+            ),
+            "entries": catalog_entries,
+        },
+        "writer_context": {
+            "included": False,
+        },
+        "writer_output": {
+            "status": "not_checked",
+        },
+    }
+
+
+def finalize_viewpoint_diagnostics(
+    diagnostics: dict,
+    report_md: str,
+    *,
+    writer_context_included: bool,
+) -> dict:
+    """Add Writer propagation/compliance facts without changing report output."""
+    result = deepcopy(diagnostics)
+    catalog_count = int(
+        _diagnostic_number(result.get("catalog", {}).get("entry_count"), 0)
+    )
+    viewpoint_block_count = len(_VIEWPOINT_BLOCK_RE.findall(report_md or ""))
+    mention_block_count = len(_MENTION_BLOCK_RE.findall(report_md or ""))
+    inference_block_count = len(_INFERENCE_BLOCK_RE.findall(report_md or ""))
+    missing_mention_count = max(0, viewpoint_block_count - mention_block_count)
+
+    if not catalog_count and viewpoint_block_count:
+        status = "catalog_unavailable"
+    elif catalog_count and not writer_context_included:
+        status = "context_missing"
+    elif catalog_count and not viewpoint_block_count:
+        status = "writer_no_viewpoints"
+    elif missing_mention_count:
+        status = "writer_omission"
+    elif not catalog_count and not viewpoint_block_count:
+        status = "not_applicable"
+    else:
+        status = "complete"
+
+    result["writer_context"] = {
+        "included": bool(writer_context_included),
+    }
+    result["writer_output"] = {
+        "status": status,
+        "viewpoint_block_count": viewpoint_block_count,
+        "mention_block_count": mention_block_count,
+        "missing_mention_count": missing_mention_count,
+        "analysis_inference_block_count": inference_block_count,
+        "vague_reference_count": sum(
+            str(report_md or "").count(term) for term in _VAGUE_VIEWPOINT_TERMS
+        ),
+    }
+    return result

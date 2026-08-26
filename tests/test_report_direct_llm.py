@@ -56,7 +56,14 @@ async def _stub_qualitative_analysis(*_args, **_kwargs):
 
 
 async def _stub_report_viewpoint_stats(*_args, **_kwargs):
-    yield ("result", [{"title": "消息会消失", "count": 1, "percentage": 100.0}])
+    yield ("result", [{
+        "id": "RVIEW:t01",
+        "name": "消息会消失",
+        "count": 1,
+        "denominator": 1,
+        "percentage": 100.0,
+        "source_questions": ["聊天反馈"],
+    }])
 
 
 class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
@@ -422,7 +429,11 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
         }
         answers = iter([
             ("# 聊天功能调研", "model-a"),
-            ("## Part 1 聊天体验\n\n本节总结。", "model-a"),
+            (
+                "## Part 1 聊天体验\n\n本节总结。\n\n"
+                "**观点：消息会消失**\n\n- **主要发现**：需要处理。",
+                "model-a",
+            ),
             ("NONE", "model-a"),
             (
                 "<!--CORE_START-->\n## 核心结论\n消息丢失需要处理。\n<!--CORE_END-->",
@@ -475,6 +486,18 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
             [*(message["content"] for message in final_messages), final_query]
         )
         self.assertIn(VIEWPOINT_STATS_MD, final_prompt)
+        diagnostics = sess["report_versions"][-1]["viewpoint_diagnostics"]
+        self.assertEqual(diagnostics["catalog"]["entry_count"], 1)
+        self.assertTrue(diagnostics["writer_context"]["included"])
+        self.assertEqual(
+            diagnostics["writer_output"]["status"], "writer_omission"
+        )
+        self.assertEqual(
+            diagnostics["writer_output"]["viewpoint_block_count"], 1
+        )
+        self.assertEqual(
+            diagnostics["writer_output"]["mention_block_count"], 0
+        )
 
     async def test_direct_qa_uses_context_history_and_configured_model_chain(self):
         source = {
