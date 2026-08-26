@@ -71,8 +71,31 @@ class LargeSampleDirectLLMTests(unittest.IsolatedAsyncioTestCase):
             report_engine._validate_theme_candidates(unknown, ["原文"]),
         )
         self.assertIn(
-            "不重复",
+            "字符串",
             report_engine._validate_theme_candidates(malformed, ["原文"]),
+        )
+
+    def test_theme_extract_has_no_count_cap_and_normalizes_extra_evidence_ids(self):
+        source = [f"原文{i}" for i in range(1, 6)]
+        themes = [
+            {
+                "name": f"主题{i}",
+                "description": f"独立范围{i}",
+                "positive_summary": None,
+                "negative_summary": None,
+                "representative_response_ids": [
+                    "r0001", "r0002", "r0002", "r0003", "r0004"
+                ],
+            }
+            for i in range(1, 31)
+        ]
+        data = {"themes": themes}
+
+        self.assertIsNone(report_engine._validate_theme_candidates(data, source))
+        hydrated = report_engine._hydrate_theme_candidate_quotes(data, source)
+        self.assertEqual(
+            hydrated["themes"][0]["representative_quotes"],
+            ["原文1", "原文2", "原文3"],
         )
 
     def test_theme_extract_validator_requires_verbatim_quotes(self):
@@ -98,7 +121,7 @@ class LargeSampleDirectLLMTests(unittest.IsolatedAsyncioTestCase):
             report_engine._validate_theme_candidates(valid, source),
         )
 
-    def test_merge_validator_enforces_count_ids_and_candidate_quotes(self):
+    def test_merge_validator_has_no_theme_count_limit_and_requires_full_mapping(self):
         candidates = [
             {
                 "name": f"主题{i}",
@@ -107,9 +130,25 @@ class LargeSampleDirectLLMTests(unittest.IsolatedAsyncioTestCase):
                 "negative_summary": None,
                 "representative_quotes": [f"quote-{i}"],
             }
-            for i in range(1, 11)
+            for i in range(1, 31)
         ]
         merged = {
+            "themes": [{
+                "id": "t01",
+                "name": "同一语义主题",
+                "description": "全部候选语义等价",
+                "positive_summary": None,
+                "negative_summary": None,
+                "source_candidate_ids": [f"c{i:04d}" for i in range(1, 31)],
+                "representative_quotes": ["quote-1"],
+            }]
+        }
+
+        self.assertIsNone(
+            report_engine._validate_merged_themes(merged, candidates)
+        )
+
+        distinct = {
             "themes": [
                 {
                     "id": f"t{i:02d}",
@@ -117,19 +156,77 @@ class LargeSampleDirectLLMTests(unittest.IsolatedAsyncioTestCase):
                     "description": f"最终范围{i}",
                     "positive_summary": None,
                     "negative_summary": None,
+                    "source_candidate_ids": [f"c{i:04d}"],
                     "representative_quotes": [f"quote-{i}"],
                 }
-                for i in range(1, 11)
+                for i in range(1, 31)
+            ]
+        }
+        self.assertIsNone(
+            report_engine._validate_merged_themes(distinct, candidates)
+        )
+
+        merged["themes"][0]["source_candidate_ids"] = [
+            f"c{i:04d}" for i in range(1, 30)
+        ]
+        self.assertIn(
+            "未分配",
+            report_engine._validate_merged_themes(merged, candidates),
+        )
+
+    def test_merge_validator_rejects_duplicate_mapping_and_restores_real_quotes(self):
+        candidates = [
+            {
+                "name": "界面设计",
+                "description": "界面体验",
+                "positive_summary": None,
+                "negative_summary": None,
+                "representative_quotes": ["界面清晰"],
+            },
+            {
+                "name": "性能表现",
+                "description": "性能体验",
+                "positive_summary": None,
+                "negative_summary": None,
+                "representative_quotes": ["战斗卡顿"],
+            },
+        ]
+        merged = {
+            "themes": [
+                {
+                    "id": "t01",
+                    "name": "界面设计",
+                    "description": "界面体验",
+                    "positive_summary": None,
+                    "negative_summary": None,
+                    "source_candidate_ids": ["c0001"],
+                    "representative_quotes": ["界面清晰"],
+                },
+                {
+                    "id": "t02",
+                    "name": "性能表现",
+                    "description": "性能体验",
+                    "positive_summary": None,
+                    "negative_summary": None,
+                    "source_candidate_ids": ["c0002"],
+                    "representative_quotes": ["战斗卡顿"],
+                },
             ]
         }
 
+        merged["themes"][1]["source_candidate_ids"] = ["c0001", "c0002"]
+        self.assertIn(
+            "重复分配",
+            report_engine._validate_merged_themes(merged, candidates),
+        )
+        merged["themes"][1]["source_candidate_ids"] = ["c0002"]
+        merged["themes"][1]["representative_quotes"] = ["并不存在的原文"]
         self.assertIsNone(
             report_engine._validate_merged_themes(merged, candidates)
         )
-        merged["themes"] = merged["themes"][:9]
-        self.assertIn(
-            "10–25",
-            report_engine._validate_merged_themes(merged, candidates),
+        self.assertEqual(
+            merged["themes"][1]["representative_quotes"],
+            ["战斗卡顿"],
         )
 
     def test_classification_normalizer_rejects_duplicates_and_invalid_values(self):
@@ -179,6 +276,19 @@ class LargeSampleDirectLLMTests(unittest.IsolatedAsyncioTestCase):
             normalized["3"],
             [{"theme_id": "other", "sentiment": "neutral"}],
         )
+
+    def test_classification_normalizer_accepts_more_than_three_explicit_themes(self):
+        assignments = [
+            {"theme_id": f"t{i:02d}", "sentiment": "neutral"}
+            for i in range(1, 6)
+        ]
+        normalized = report_engine._normalize_classifications(
+            {"classifications": [{"response_id": "0", "assignments": assignments}]},
+            ["0"],
+            {assignment["theme_id"] for assignment in assignments},
+        )
+
+        self.assertEqual(normalized["0"], assignments)
 
     async def test_classification_repairs_missing_ids_then_falls_back_to_other(self):
         final_themes = [
@@ -367,6 +477,84 @@ class LargeSampleDirectLLMTests(unittest.IsolatedAsyncioTestCase):
             "unique_respondent_coverage",
         )
         self.assertEqual(diagnostics["0"]["percentage_denominator"], 3)
+
+    async def test_pipeline_keeps_low_frequency_themes_in_full_report_material(self):
+        entries = [
+            {"text": f"回答{i}", "respondent_key": f"p{i}"}
+            for i in range(1, 22)
+        ]
+        open_text = {0: entries}
+        plan = {
+            "columns": [{"index": 0, "name": "反馈", "role": "open_text"}],
+            "branch_rules": [],
+        }
+        candidate = {
+            "name": "候选主题",
+            "description": "候选范围",
+            "positive_summary": None,
+            "negative_summary": None,
+            "representative_quotes": ["回答1"],
+        }
+        final_themes = [
+            {
+                "id": "t01",
+                "name": "主要主题",
+                "description": "主要反馈",
+                "positive_summary": None,
+                "negative_summary": None,
+                "representative_quotes": ["回答1"],
+            },
+            {
+                "id": "t02",
+                "name": "低频独立主题",
+                "description": "少数但独立的反馈",
+                "positive_summary": None,
+                "negative_summary": None,
+                "representative_quotes": ["回答21"],
+            },
+        ]
+        direct = AsyncMock(side_effect=[
+            {"data": {"themes": [candidate]}, "model": "extract", "raw_len": 10, "error": ""},
+            {"data": {"themes": final_themes}, "model": "merge", "raw_len": 20, "error": ""},
+        ])
+        classifications = [
+            {
+                "response_id": str(index),
+                "assignments": [{
+                    "theme_id": "t02" if index == 20 else "t01",
+                    "sentiment": "neutral",
+                }],
+            }
+            for index in range(21)
+        ]
+        classified = AsyncMock(return_value={
+            "classifications": classifications,
+            "model": "classify",
+            "raw_len": 20,
+            "repaired_count": 0,
+            "fallback_count": 0,
+            "error": "",
+        })
+
+        with (
+            patch.object(report_engine, "BATCH_SIZE", 50),
+            patch.object(report_engine, "_get_theme_extract_system_prompt", return_value="extract"),
+            patch.object(report_engine, "_get_theme_merge_system_prompt", return_value="merge"),
+            patch.object(report_engine, "_direct_json_call", new=direct),
+            patch.object(report_engine, "_classify_batch_direct", new=classified),
+        ):
+            items = [
+                item
+                async for item in report_engine._batch_qualitative_analysis(
+                    open_text, plan, ["反馈"], "sid", deduplicate_respondents=True
+                )
+            ]
+
+        clustered = next(item[1] for item in items if item[0] == "result")
+        by_id = {theme["id"]: theme for theme in clustered[0]["themes"]}
+        self.assertEqual(by_id["t02"]["count"], 1)
+        self.assertEqual(by_id["t02"]["percentage"], 4.8)
+        self.assertEqual(clustered[0]["other_themes"], [])
 
     async def test_pipeline_reports_retry_recovery_and_quality_impact(self):
         entries = [{"text": "The interface is clean.", "respondent_key": "p1"}]
@@ -681,6 +869,7 @@ class LargeSampleDirectLLMTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"positive_summary": "更整洁"', query)
         self.assertIn('"negative_summary": "按钮太小"', query)
         self.assertIn("The UI is clean.", query)
+        self.assertIn('"candidate_id": "c0001"', query)
 
 
 if __name__ == "__main__":

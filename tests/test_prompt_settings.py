@@ -141,6 +141,9 @@ class PromptCatalogTests(unittest.TestCase):
         self.assertEqual(migrated["survey_planner_system"]["version"], 4)
         self.assertEqual(migrated["writer_requirements"]["version"], 14)
         self.assertEqual(migrated["annotate_quality_system"]["version"], 2)
+        self.assertEqual(migrated["theme_extract_system"]["version"], 3)
+        self.assertEqual(migrated["theme_merge_system"]["version"], 2)
+        self.assertEqual(migrated["response_classify_system"]["version"], 2)
         self.assertEqual(
             migrated["writer_requirements"]["current"],
             prompt_storage.DEFAULT_PROMPTS["writer_requirements"]["current"],
@@ -158,6 +161,9 @@ class PromptCatalogTests(unittest.TestCase):
             ("survey_planner_system", 3),
             ("writer_requirements", 11),
             ("annotate_quality_system", 1),
+            ("theme_extract_system", 2),
+            ("theme_merge_system", 1),
+            ("response_classify_system", 1),
         ):
             with self.subTest(key=key, content="default"):
                 stored = deepcopy(prompt_storage.DEFAULT_PROMPTS[key])
@@ -203,6 +209,19 @@ class PromptCatalogTests(unittest.TestCase):
                     stored["version"],
                     prompt_storage.DEFAULT_PROMPTS[key]["version"],
                 )
+
+    def test_qualitative_prompts_use_semantic_boundaries_without_count_caps(self):
+        extract_prompt = prompt_storage.DEFAULT_PROMPTS["theme_extract_system"]["current"]
+        merge_prompt = prompt_storage.DEFAULT_PROMPTS["theme_merge_system"]["current"]
+        classify_prompt = prompt_storage.DEFAULT_PROMPTS["response_classify_system"]["current"]
+
+        self.assertNotIn("5–15", extract_prompt)
+        self.assertNotIn("10–25", merge_prompt)
+        self.assertNotIn("1–3 个不同主题", classify_prompt)
+        self.assertIn("不设置候选主题数量目标", extract_prompt)
+        self.assertIn("最终主题不设置最少或最多数量", merge_prompt)
+        self.assertIn("source_candidate_ids", merge_prompt)
+        self.assertIn("不设置上限", classify_prompt)
 
     def test_catalog_api_filters_unknown_and_legacy_entries(self):
         with tempfile.TemporaryDirectory(prefix="prompt-api-test-") as temp_dir:

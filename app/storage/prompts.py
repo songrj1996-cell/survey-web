@@ -181,7 +181,7 @@ DEFAULT_PROMPTS: dict = {
         order=10,
         kind="system",
         current=DEFAULT_THEME_EXTRACT_SYSTEM_PROMPT,
-        version=2,
+        version=3,
     ),
     "theme_merge_system": _prompt(
         "theme_merge_system",
@@ -192,6 +192,7 @@ DEFAULT_PROMPTS: dict = {
         order=20,
         kind="system",
         current=DEFAULT_THEME_MERGE_SYSTEM_PROMPT,
+        version=2,
     ),
     "response_classify_system": _prompt(
         "response_classify_system",
@@ -202,6 +203,7 @@ DEFAULT_PROMPTS: dict = {
         order=30,
         kind="system",
         current=DEFAULT_RESPONSE_CLASSIFY_SYSTEM_PROMPT,
+        version=2,
     ),
     "comment_relevance_system": _prompt(
         "comment_relevance_system",

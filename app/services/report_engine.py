@@ -30,7 +30,6 @@ from app.core.config import (
     LLM_THEME_MERGE_MAX_TOKENS,
     LLM_THEME_MERGE_MODEL,
     LLM_THEME_MERGE_REASONING,
-    OTHER_THEME_PCT,
 )
 from app.integrations.llm_client import collect_chat_completion
 from app.services.branch_logic import branch_rule_for_column, branch_rule_label
@@ -44,9 +43,29 @@ from app.storage.prompts import (
     _get_planner_extra,
     _get_response_classify_system_prompt,
     _get_theme_extract_system_prompt,
-    _get_theme_merge_system_prompt,
+    _get_theme_merge_system_prompt as _get_theme_merge_system_prompt_base,
     _get_writer_requirements,
 )
+
+_THEME_MERGE_RUNTIME_CONTRACT = """\
+<protected_theme_merge_contract>
+以下运行时契约优先于上文任何主题数量目标或旧版输出示例：
+1. 最终主题不设置最少或最多数量，只按真实语义分组。
+2. 合并键是“讨论对象或功能 + 核心问题、诉求或判断 + 关键场景、条件或期望结果”。
+   关键语义相同且合并后不损失独立决策含义时必须合并；否则必须分开。
+3. 同义词、多语言、措辞、情绪方向、强弱程度和举例差异不得单独拆分；无法确认等价时保留分开。
+4. 每个输入 candidate_id 必须且只能出现在一个最终主题的 source_candidate_ids 中。
+5. representative_quotes 只能来自该主题 source_candidate_ids 对应候选的原文引用。
+</protected_theme_merge_contract>"""
+
+
+def _get_theme_merge_system_prompt() -> str:
+    """Append the non-configurable merge protocol to the editable business prompt."""
+    return (
+        _get_theme_merge_system_prompt_base().rstrip()
+        + "\n\n"
+        + _THEME_MERGE_RUNTIME_CONTRACT
+    )
 
 _QUALITATIVE_CONTEXT_LABELS = [
     ("problem", "这次想解决什么问题"),
@@ -852,8 +871,6 @@ def _validate_theme_candidates(data: dict | None, source_texts: list[str]) -> st
     themes = data.get("themes")
     if not isinstance(themes, list) or not themes:
         return "themes 必须是非空数组"
-    if len(themes) > 15:
-        return f"themes 数量为 {len(themes)}，不得超过 15"
     source_set = {_text_key(text) for text in source_texts if _text_key(text)}
     seen_names: set[str] = set()
     for index, theme in enumerate(themes):
@@ -877,11 +894,10 @@ def _validate_theme_candidates(data: dict | None, source_texts: list[str]) -> st
             valid_ids = {_response_ref(i) for i in range(len(source_texts))}
             if (
                 not isinstance(response_ids, list)
-                or not 1 <= len(response_ids) <= 3
+                or not response_ids
                 or not all(isinstance(response_id, str) for response_id in response_ids)
-                or len(set(response_ids)) != len(response_ids)
             ):
-                return f"主题「{name}」必须包含 1–3 个不重复的 representative_response_ids"
+                return f"主题「{name}」必须包含非空的字符串 representative_response_ids"
             invalid_ids = [response_id for response_id in response_ids if response_id not in valid_ids]
             if invalid_ids:
                 return f"主题「{name}」引用了不存在的回答 ID：{invalid_ids[0]}"
@@ -890,8 +906,12 @@ def _validate_theme_candidates(data: dict | None, source_texts: list[str]) -> st
         # 兼容管理员尚未迁移的旧版自定义提示词。新默认协议使用回答 ID，
         # 由代码确定性还原原文，避免模型复制标点或空格时导致整批报废。
         quotes = theme.get("representative_quotes")
-        if not isinstance(quotes, list) or not quotes or len(quotes) > 3:
-            return f"主题「{name}」必须包含 1–3 个 representative_response_ids"
+        if (
+            not isinstance(quotes, list)
+            or not quotes
+            or not all(isinstance(quote, str) for quote in quotes)
+        ):
+            return f"主题「{name}」必须包含非空的字符串 representative_quotes"
         for quote in quotes:
             if _text_key(quote) not in source_set:
                 return f"主题「{name}」包含并非逐字来自输入的引用"
@@ -912,11 +932,16 @@ def _hydrate_theme_candidate_quotes(
             continue
         response_ids = theme.pop("representative_response_ids", None)
         if response_ids is not None:
+            unique_ids = list(dict.fromkeys(response_ids))
             theme["representative_quotes"] = [
                 lookup[response_id]
-                for response_id in response_ids
+                for response_id in unique_ids[:3]
                 if response_id in lookup
             ]
+            continue
+        quotes = theme.get("representative_quotes")
+        if isinstance(quotes, list):
+            theme["representative_quotes"] = list(dict.fromkeys(quotes))[:3]
     return hydrated
 
 
@@ -926,28 +951,21 @@ def _validate_merged_themes(data: dict | None, candidates: list[dict]) -> str | 
     themes = data.get("themes")
     if not isinstance(themes, list) or not themes:
         return "themes 必须是非空数组"
-    unique_candidates = {
-        str(theme.get("name") or "").strip().casefold()
-        for theme in candidates
-        if str(theme.get("name") or "").strip()
-    }
-    required_min = min(10, len(unique_candidates))
-    if len(themes) < required_min or len(themes) > 25:
-        return (
-            f"最终主题数量为 {len(themes)}，本次必须在 "
-            f"{required_min}–25 个之间；不要用宽泛上位主题过度合并"
-        )
     expected_ids = [f"t{i:02d}" for i in range(1, len(themes) + 1)]
     actual_ids = [theme.get("id") if isinstance(theme, dict) else None for theme in themes]
     if actual_ids != expected_ids:
         return f"主题 ID 必须从 t01 连续编号，期望 {expected_ids}"
-    quote_pool = {
-        _text_key(quote)
-        for theme in candidates
-        if isinstance(theme, dict)
-        for quote in (theme.get("representative_quotes") or [])
-        if _text_key(quote)
+    candidate_quotes = {
+        f"c{index:04d}": list(dict.fromkeys(
+            quote
+            for quote in (candidate.get("representative_quotes") or [])
+            if isinstance(quote, str) and _text_key(quote)
+        ))
+        for index, candidate in enumerate(candidates, 1)
+        if isinstance(candidate, dict)
     }
+    expected_candidate_ids = set(candidate_quotes)
+    assigned_candidate_ids: set[str] = set()
     seen_names: set[str] = set()
     for theme in themes:
         name = str(theme.get("name") or "").strip()
@@ -961,12 +979,56 @@ def _validate_merged_themes(data: dict | None, candidates: list[dict]) -> str | 
             value = theme.get(field)
             if value is not None and not isinstance(value, str):
                 return f"主题「{name}」的 {field} 必须是字符串或 null"
-        quotes = theme.get("representative_quotes")
-        if not isinstance(quotes, list) or not quotes or len(quotes) > 3:
-            return f"主题「{name}」必须包含 1–3 条 representative_quotes"
-        for quote in quotes:
-            if _text_key(quote) not in quote_pool:
-                return f"主题「{name}」包含候选主题中不存在的引用"
+        source_candidate_ids = theme.get("source_candidate_ids")
+        if (
+            not isinstance(source_candidate_ids, list)
+            or not source_candidate_ids
+            or not all(isinstance(candidate_id, str) for candidate_id in source_candidate_ids)
+            or len(set(source_candidate_ids)) != len(source_candidate_ids)
+        ):
+            return f"主题「{name}」必须包含不重复的 source_candidate_ids"
+        invalid_candidate_ids = [
+            candidate_id
+            for candidate_id in source_candidate_ids
+            if candidate_id not in expected_candidate_ids
+        ]
+        if invalid_candidate_ids:
+            return f"主题「{name}」引用了不存在的候选 ID：{invalid_candidate_ids[0]}"
+        repeated_candidate_ids = [
+            candidate_id
+            for candidate_id in source_candidate_ids
+            if candidate_id in assigned_candidate_ids
+        ]
+        if repeated_candidate_ids:
+            return f"候选 ID 被重复分配：{repeated_candidate_ids[0]}"
+        assigned_candidate_ids.update(source_candidate_ids)
+        # 模型只负责语义合并。引用由代码按已校验的候选映射确定性还原，避免模型改写
+        # 标点或措辞时让整题失败，同时确保最终证据一定来自该主题的真实候选原文。
+        allowed_quotes = list(dict.fromkeys(
+            quote
+            for candidate_id in source_candidate_ids
+            for quote in candidate_quotes[candidate_id]
+        ))
+        if not allowed_quotes:
+            return f"主题「{name}」对应候选没有可用原文引用"
+        allowed_by_key = {_text_key(quote): quote for quote in allowed_quotes}
+        requested_quotes = theme.get("representative_quotes")
+        selected_quotes: list[str] = []
+        if isinstance(requested_quotes, list):
+            for quote in requested_quotes:
+                quote_key = _text_key(quote) if isinstance(quote, str) else ""
+                canonical_quote = allowed_by_key.get(quote_key)
+                if canonical_quote and canonical_quote not in selected_quotes:
+                    selected_quotes.append(canonical_quote)
+        for quote in allowed_quotes:
+            if len(selected_quotes) >= 3:
+                break
+            if quote not in selected_quotes:
+                selected_quotes.append(quote)
+        theme["representative_quotes"] = selected_quotes[:3]
+    missing_candidate_ids = sorted(expected_candidate_ids - assigned_candidate_ids)
+    if missing_candidate_ids:
+        return f"候选 ID 未分配到最终主题：{missing_candidate_ids[0]}"
     return None
 
 
@@ -994,7 +1056,7 @@ def _normalize_classifications(
             duplicate_ids.add(response_id)
             continue
         assignments = item.get("assignments")
-        if not isinstance(assignments, list) or not 1 <= len(assignments) <= 3:
+        if not isinstance(assignments, list) or not assignments:
             continue
         clean_assignments: list[dict] = []
         seen_themes: set[str] = set()
@@ -1051,11 +1113,16 @@ def _build_theme_merge_query(
     candidates: list[dict],
     total_responses: int,
 ) -> str:
+    indexed_candidates = []
+    for index, candidate in enumerate(candidates, 1):
+        indexed = deepcopy(candidate)
+        indexed["candidate_id"] = f"c{index:04d}"
+        indexed_candidates.append(indexed)
     return (
         f"<question>\n{question}\n</question>\n"
         f"<total_responses>{total_responses}</total_responses>\n"
         "<theme_candidates_json>\n"
-        f"{json.dumps(candidates, ensure_ascii=False)}\n"
+        f"{json.dumps(indexed_candidates, ensure_ascii=False)}\n"
         "</theme_candidates_json>"
     )
 
@@ -1750,7 +1817,6 @@ async def _batch_qualitative_analysis(
 
         themes_out = []
         all_themes_out = []
-        other_themes_out = []
 
         for t in final_themes:
             tid = t["id"]
@@ -1791,13 +1857,9 @@ async def _batch_qualitative_analysis(
                 "respondent_keys": sorted(c["members"]),
             }
             all_themes_out.append(entry)
-            if pct < OTHER_THEME_PCT:
-                other_themes_out.append({"name": t["name"], "count": cnt, "percentage": pct})
-            else:
-                themes_out.append(entry)
+            themes_out.append(entry)
 
         themes_out.sort(key=lambda x: x["count"], reverse=True)
-        other_themes_out.sort(key=lambda x: x["count"], reverse=True)
 
         clustered_themes[scope_key] = {
             "column_index": col_idx,
@@ -1809,7 +1871,7 @@ async def _batch_qualitative_analysis(
             "count_unit": "players" if deduplicate_respondents else "responses",
             "themes": themes_out,
             "all_themes": all_themes_out,
-            "other_themes": other_themes_out,
+            "other_themes": [],
         }
         diag["status"] = "ok"
         diag["reason"] = ""
