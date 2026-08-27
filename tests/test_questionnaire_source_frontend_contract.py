@@ -28,6 +28,7 @@ SNAPSHOT_ANALYSIS_UPLOAD_PATH = (
 
 CAPABILITIES_URL = "/api/questionnaire-sources/capabilities"
 SNAPSHOTS_URL = "/api/questionnaire-sources/snapshots"
+FAMILIES_URL = "/api/questionnaire-sources/google-forms/families"
 POST_URLS = {
     SNAPSHOTS_URL,
     "/api/questionnaire-sources/google-forms/snapshots",
@@ -47,6 +48,7 @@ OPTIONAL_CAPABILITY_KEYS = {
     "snapshot_analysis_session",
     "asset_review_decisions",
     "google_forms_connection",
+    "google_forms_unified_analysis",
     "source_workflow",
 }
 
@@ -421,7 +423,7 @@ class QuestionnaireSourceFrontendContractTests(unittest.TestCase):
             self.javascript,
         )
         counts = Counter(route for _, route in route_literals)
-        expected = {CAPABILITIES_URL, *POST_URLS}
+        expected = {CAPABILITIES_URL, FAMILIES_URL, *POST_URLS}
         self.assertEqual(set(counts), expected)
         self.assertEqual(counts, Counter({route: 1 for route in expected}))
 
@@ -892,7 +894,7 @@ class QuestionnaireSourceFrontendContractTests(unittest.TestCase):
 
     def test_copy_is_honest_about_not_using_sources_in_current_report(self):
         self.assertIn(
-            "这里保存的快照不会自动用于当前报告",
+            "快照不会自动用于当前报告",
             self.javascript,
         )
         self.assertIn(
@@ -909,6 +911,37 @@ class QuestionnaireSourceFrontendContractTests(unittest.TestCase):
             "当前报告已引用",
         ):
             self.assertNotIn(misleading, self.javascript)
+
+    def test_multilingual_direct_flow_is_separate_from_snapshot_library(self):
+        mount = _function_body(self.javascript, "mountPanel")
+        render = _function_body(self.javascript, "renderCards")
+        self.assertIn("Google Forms 多语言直读", mount)
+        self.assertIn("添加语言版本", mount)
+        self.assertIn("自动检查差异", mount)
+        self.assertIn("读取回答并分析", mount)
+        self.assertIn("问卷结构资料库", mount)
+        self.assertIn("和上方的 Google Forms 回答直读不是同一个流程", mount)
+        self.assertIn("cardsHost.replaceChildren(...familyCards)", render)
+        self.assertIn(
+            "snapshotCardsHost.replaceChildren(...supported.map(createCard))",
+            render,
+        )
+        self.assertIn("snapshotTools.hidden", render)
+
+    def test_family_review_renders_actionable_language_and_question_details(self):
+        normalize = _function_body(self.javascript, "normalizeFamilyDiagnostics")
+        review = _function_body(self.javascript, "createFamilyReview")
+        family_card = _function_body(self.javascript, "createFamilyCard")
+        self.assertIn("question_title", normalize)
+        self.assertIn("related_question_title", normalize)
+        self.assertIn("affected_count", normalize)
+        self.assertIn("需要复核", review)
+        self.assertIn("当前版本：", review)
+        self.assertIn("规范问卷：", review)
+        self.assertIn("尚未读取回答", review)
+        self.assertIn("重新自动检查", family_card)
+        self.assertIn("自动检查问卷差异", family_card)
+        self.assertIn("createFamilyReview(family.summary)", family_card)
 
     def test_snapshot_analysis_selection_interface_is_minimal_and_frozen(self):
         expose_selection = _function_body(
@@ -1000,6 +1033,44 @@ class QuestionnaireSourceFrontendContractTests(unittest.TestCase):
             normalize_entry + "\n" + render_catalog,
             r"\b(?:owner_ref|path|media|hash|raw_text|original_text)\b",
         )
+
+    def test_snapshot_title_is_primary_and_full_id_remains_internal(self):
+        normalize_title = _function_body(
+            self.javascript,
+            "normalizeSnapshotDisplayTitle",
+        )
+        short_id = _function_body(self.javascript, "shortSnapshotId")
+        normalize_entry = _function_body(
+            self.javascript,
+            "normalizeCatalogEntry",
+        )
+        summary_meta = _function_body(self.javascript, "summaryMeta")
+        set_card_message = _function_body(self.javascript, "setCardMessage")
+        render_catalog = _function_body(self.javascript, "renderCatalog")
+        element = _function_body(self.javascript, "el")
+
+        self.assertIn(".slice(0, 200)", normalize_title)
+        self.assertIn("snapshotId.slice(0, 12)", short_id)
+        self.assertIn("snapshotId.slice(-8)", short_id)
+        self.assertIn(
+            "display_title: normalizeSnapshotDisplayTitle(entry.display_title)",
+            normalize_entry,
+        )
+        self.assertIn(
+            "normalizeSnapshotDisplayTitle(summary.display_title)",
+            summary_meta,
+        )
+        self.assertIn("shortSnapshotId(snapshotId)", summary_meta)
+        self.assertIn("summary.provider === 'google_forms'", summary_meta)
+        self.assertIn("'未命名问卷'", summary_meta)
+        self.assertIn("detail.style.overflowWrap = 'anywhere'", set_card_message)
+        self.assertIn("meta.style.maxWidth = '100%'", set_card_message)
+        self.assertIn("entry.display_title || '未命名问卷'", render_catalog)
+        self.assertIn("shortSnapshotId(entry.snapshot_id)", render_catalog)
+        self.assertIn("setSelectedSnapshotId(entry.snapshot_id)", render_catalog)
+        self.assertIn("review.openForSnapshot(entry.snapshot_id", render_catalog)
+        self.assertIn("node.textContent = text", element)
+        self.assertNotIn("innerHTML", normalize_entry + render_catalog)
 
     def test_upload_loading_copy_and_accessibility_contract(self):
         create_card = _function_body(self.javascript, "createCard")

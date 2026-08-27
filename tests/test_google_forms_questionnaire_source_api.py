@@ -58,6 +58,7 @@ GOOGLE_FIXTURE = (
 SUMMARY_FIELDS = {
     "schema_version",
     "snapshot_id",
+    "display_title",
     "provider",
     "source_mode",
     "collection_state",
@@ -248,6 +249,7 @@ class GoogleFormsQuestionnaireSourceApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(package)
         assert package is not None
         self.assertEqual(summary.provider, Provider.GOOGLE_FORMS)
+        self.assertEqual(summary.display_title, "合成问卷连接器样例")
         self.assertEqual(summary.source_mode, QuestionnaireSourceMode.OFFICIAL_API)
         self.assertEqual(summary.mapping_status, MappingStatus.EXACT)
         self.assertEqual(summary.image_asset_count, 4)

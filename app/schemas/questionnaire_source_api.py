@@ -13,6 +13,9 @@ from app.schemas.questionnaire import (
 from app.schemas.research_assets import ContractModel, ProcessingStatus, Provider
 
 
+MAX_QUESTIONNAIRE_SNAPSHOT_DISPLAY_TITLE_LENGTH = 200
+
+
 GoogleFormId = Annotated[
     str,
     StringConstraints(
@@ -59,6 +62,10 @@ class QuestionnaireSnapshotSummary(ContractModel):
 
     schema_version: Literal[1] = 1
     snapshot_id: str = Field(min_length=1)
+    display_title: str = Field(
+        default="",
+        max_length=MAX_QUESTIONNAIRE_SNAPSHOT_DISPLAY_TITLE_LENGTH,
+    )
     provider: Provider
     source_mode: QuestionnaireSourceMode
     collection_state: CollectionState

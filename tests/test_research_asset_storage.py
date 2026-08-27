@@ -1129,6 +1129,7 @@ class FileResearchSnapshotStorageTests(unittest.TestCase):
         self.assertEqual(page.snapshot_ids, (self.snapshot_id,))
         self.assertEqual(page._fields, ("entries", "next_cursor"))
         self.assertIsInstance(page.entries[0], SnapshotCatalogEntry)
+        self.assertEqual(page.entries[0].title, self.bundle.snapshot.title)
         self.assertFalse(hasattr(page.entries[0], "bundle"))
         self.assertFalse(hasattr(page.entries[0], "media"))
         self.assertEqual(read_names[0], "manifest.json")

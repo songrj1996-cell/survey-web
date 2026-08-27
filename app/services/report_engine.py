@@ -1235,7 +1235,7 @@ async def _batch_qualitative_analysis(
         counts: dict[str, dict] = {t["id"]: {"members": set(), "pos": 0, "neg": 0, "neutral": 0, "mixed": 0}
                                     for t in final_themes}
         counts["other"] = {"members": set(), "pos": 0, "neg": 0, "neutral": 0, "mixed": 0}
-        # quotes_pool[theme_id] = list of (sentiment, text)
+        # quotes_pool[theme_id] = list of (sentiment, original text, source identity)
         quotes_pool: dict[str, list] = {t["id"]: [] for t in final_themes}
 
         classify_factories = []
@@ -1311,7 +1311,11 @@ async def _batch_qualitative_analysis(
                         and len(quotes_pool[tid]) < 10
                         and original_text
                     ):
-                        quotes_pool[tid].append((sentiment, original_text))
+                        quotes_pool[tid].append((
+                            sentiment,
+                            original_text,
+                            _entry_identity(batch[resp_idx]),
+                        ))
             diag["assignments"] += phase_c["assignments"]
             diag["phase_c"].append(phase_c)
 
@@ -1346,15 +1350,20 @@ async def _batch_qualitative_analysis(
 
             # 代表性引用：每种情感最多取 1-2 条
             pool = quotes_pool.get(tid, [])
-            pos_q = [txt for sent, txt in pool if sent == "positive"][:2]
-            neg_q = [txt for sent, txt in pool if sent == "negative"][:2]
-            neu_q = [txt for sent, txt in pool if sent not in ("positive", "negative")][:2]
-            quotes = (pos_q + neg_q + neu_q)[:6]
+            pos_q = [item for item in pool if item[0] == "positive"][:2]
+            neg_q = [item for item in pool if item[0] == "negative"][:2]
+            neu_q = [item for item in pool if item[0] not in ("positive", "negative")][:2]
+            selected_quotes = (pos_q + neg_q + neu_q)[:6]
             # 不足 3 条时从 pool 中补充未使用的原文，保证 Writer 有足够素材
-            if len(quotes) < 3:
-                used = set(quotes)
-                extras = [txt for _, txt in pool if txt not in used]
-                quotes = quotes + extras[:max(0, 3 - len(quotes))]
+            if len(selected_quotes) < 3:
+                used = {item[1] for item in selected_quotes}
+                extras = [item for item in pool if item[1] not in used]
+                selected_quotes += extras[:max(0, 3 - len(selected_quotes))]
+            quotes = [item[1] for item in selected_quotes]
+            quote_evidence = [
+                {"quote": item[1], "source": item[2]}
+                for item in selected_quotes
+            ]
 
             entry = {
                 "id": tid,
@@ -1369,6 +1378,7 @@ async def _batch_qualitative_analysis(
                 "negative_pct": neg_pct,
                 "negative_summary": t.get("negative_summary") or "",
                 "quotes": quotes,
+                "quote_evidence": quote_evidence,
                 "source_quotes": list(t.get("representative_quotes") or []),
                 "respondent_keys": sorted(c["members"]),
             }

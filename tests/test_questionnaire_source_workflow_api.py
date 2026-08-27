@@ -86,6 +86,7 @@ RESPONSE_FIELDS = {
 SNAPSHOT_SUMMARY_FIELDS = {
     "schema_version",
     "snapshot_id",
+    "display_title",
     "provider",
     "source_mode",
     "collection_state",

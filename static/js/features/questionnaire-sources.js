@@ -9,7 +9,9 @@
   const CAPABILITIES_URL = '/api/questionnaire-sources/capabilities';
   const SNAPSHOTS_ENDPOINT = '/api/questionnaire-sources/snapshots';
   const GOOGLE_FORMS_SNAPSHOTS_ENDPOINT = '/api/questionnaire-sources/google-forms/snapshots';
+  const GOOGLE_FORMS_FAMILIES_ENDPOINT = '/api/questionnaire-sources/google-forms/families';
   const SNAPSHOT_ANALYSIS_INTERFACE_KEY = 'questionnaireSnapshotAnalysisSelection';
+  const SURVEY_SESSION_INGRESS_INTERFACE_KEY = 'surveySessionIngress';
   const ASSET_REVIEW_INTERFACE_KEY = 'questionnaireAssetReview';
   const ASSET_REVIEW_SCRIPT_ID = 'qar-script';
   const ASSET_REVIEW_SCRIPT_URL = '/static/js/features/research-asset-review.js?v=1';
@@ -26,6 +28,7 @@
     'snapshot_analysis_session',
     'asset_review_decisions',
     'google_forms_connection',
+    'google_forms_unified_analysis',
     'source_workflow',
   ];
 
@@ -171,10 +174,24 @@
     capabilityRequestSerial: 0,
     capabilityAbortController: null,
     selectedSnapshotId: '',
+    family: {
+      title: '',
+      variants: [
+        { language: 'en', form_url: '' },
+        { language: 'id', form_url: '' },
+      ],
+      phase: 'idle',
+      message: '',
+      summary: null,
+      requestSerial: 0,
+      abortController: null,
+    },
   };
 
   let panel = null;
   let cardsHost = null;
+  let snapshotCardsHost = null;
+  let snapshotTools = null;
   let catalogSection = null;
   let catalogList = null;
   let catalogStatus = null;
@@ -187,7 +204,7 @@
     const link = document.createElement('link');
     link.id = STYLE_ID;
     link.rel = 'stylesheet';
-    link.href = '/static/questionnaire-sources.css?v=2';
+    link.href = '/static/questionnaire-sources.css?v=4';
     document.head.appendChild(link);
   }
 
@@ -253,7 +270,7 @@
   }
 
   function mountPanel() {
-    if (panel && cardsHost && refreshButton && catalogSection && catalogList && catalogStatus && catalogLoadMoreButton) return true;
+    if (panel && cardsHost && snapshotCardsHost && snapshotTools && refreshButton && catalogSection && catalogList && catalogStatus && catalogLoadMoreButton) return true;
     const uploadArea = document.getElementById('upload-area');
     const bestedUpload = document.getElementById('survey-bested-upload');
     if (!uploadArea || !bestedUpload) return false;
@@ -262,12 +279,14 @@
     if (existing) {
       panel = existing;
       cardsHost = existing.querySelector('.qsrc-panel__cards');
+      snapshotCardsHost = existing.querySelector('.qsrc-snapshot-tools__cards');
+      snapshotTools = existing.querySelector('.qsrc-snapshot-tools');
       catalogSection = existing.querySelector('.qsrc-catalog');
       catalogList = existing.querySelector('.qsrc-catalog__list');
       catalogStatus = existing.querySelector('.qsrc-catalog__status');
       catalogLoadMoreButton = existing.querySelector('.qsrc-catalog__load-more');
       refreshButton = existing.querySelector('.qsrc-panel__refresh');
-      return !!(cardsHost && refreshButton && catalogSection && catalogList && catalogStatus && catalogLoadMoreButton);
+      return !!(cardsHost && snapshotCardsHost && snapshotTools && refreshButton && catalogSection && catalogList && catalogStatus && catalogLoadMoreButton);
     }
 
     panel = el('section', 'qsrc-panel');
@@ -278,9 +297,9 @@
     const head = el('div', 'qsrc-panel__head');
     const titleWrap = el('div', 'qsrc-panel__title-wrap');
     titleWrap.append(
-      el('div', 'qsrc-panel__eyebrow', '问卷结构快照'),
-      Object.assign(el('h2', 'qsrc-panel__title', '单独保存问卷来源'), { id: 'qsrc-panel-title' }),
-      el('p', 'qsrc-panel__desc', '支持把 Google Forms 编辑链接、本地问卷文件或材料保存为本地独立快照，便于后续单独复用。这里保存的快照不会自动用于当前报告。'),
+      el('div', 'qsrc-panel__eyebrow', 'Google Forms 多语言直读'),
+      Object.assign(el('h2', 'qsrc-panel__title', '连接各语言问卷，直接开始统一分析'), { id: 'qsrc-panel-title' }),
+      el('p', 'qsrc-panel__desc', '为每种语言添加一份 Google Form。系统会自动检查题目差异，通过后直接读取所有回答，不需要下载或合并文件。'),
     );
 
     refreshButton = el('button', 'qsrc-panel__refresh', '刷新能力');
@@ -288,7 +307,34 @@
     refreshButton.addEventListener('click', () => refresh());
     head.append(titleWrap, refreshButton);
 
+    const flow = el('ol', 'qsrc-flow-steps');
+    ['添加语言版本', '自动检查差异', '读取回答并分析'].forEach((label, index) => {
+      const item = el('li', 'qsrc-flow-steps__item');
+      item.append(
+        el('span', 'qsrc-flow-steps__number', String(index + 1)),
+        el('span', 'qsrc-flow-steps__label', label),
+      );
+      flow.appendChild(item);
+    });
+
     cardsHost = el('div', 'qsrc-panel__cards');
+    snapshotTools = el('details', 'qsrc-snapshot-tools');
+    const snapshotSummary = el('summary', 'qsrc-snapshot-tools__summary');
+    const snapshotSummaryText = el('span', 'qsrc-snapshot-tools__summary-text');
+    snapshotSummaryText.append(
+      el('strong', '', '问卷结构资料库'),
+      el('span', '', '高级工具 · 保存或选择独立快照'),
+    );
+    snapshotSummary.append(
+      snapshotSummaryText,
+      el('span', 'qsrc-snapshot-tools__chevron', '展开'),
+    );
+    const snapshotIntro = el(
+      'p',
+      'qsrc-snapshot-tools__intro',
+      '这里仅管理问卷结构快照，和上方的 Google Forms 回答直读不是同一个流程。快照不会自动用于当前报告。',
+    );
+    snapshotCardsHost = el('div', 'qsrc-snapshot-tools__cards');
     catalogSection = el('section', 'qsrc-catalog');
     catalogSection.hidden = true;
     catalogSection.setAttribute('aria-labelledby', 'qsrc-catalog-title');
@@ -310,10 +356,18 @@
     catalogStatus.setAttribute('aria-live', 'polite');
     catalogSection.append(catalogHead, catalogList, catalogStatus);
 
-    const disclaimer = el('div', 'qsrc-card__disclaimer', '提示：本区域只负责独立保存本地问卷快照。若 Google Forms 无法访问，请按提示共享编辑权限，或改传问卷 PDF、截图、快照包；保存成功后仍需在后续单独选择，当前问卷分析流程不会自动改用这些快照。');
+    const disclaimer = el('div', 'qsrc-card__disclaimer', '提示：这里保存的独立快照需要手动选择，当前问卷分析流程不会自动改用这些快照。');
     const foot = el('div', 'qsrc-panel__foot', '支持能力由服务端显式声明；未开放的入口不会展示。');
 
-    panel.append(head, cardsHost, catalogSection, disclaimer, foot);
+    snapshotTools.append(
+      snapshotSummary,
+      snapshotIntro,
+      snapshotCardsHost,
+      catalogSection,
+      disclaimer,
+      foot,
+    );
+    panel.append(head, flow, cardsHost, snapshotTools);
     bestedUpload.insertAdjacentElement('afterend', panel);
     return true;
   }
@@ -408,7 +462,8 @@
   }
 
   function shouldShowPanel() {
-    return supportedSources().length > 0 || shouldShowCatalog();
+    return supportedSources().length > 0 || shouldShowCatalog()
+      || panelState.capabilities?.google_forms_unified_analysis === true;
   }
 
   function setRefreshLoading(loading) {
@@ -431,12 +486,271 @@
     return normalized;
   }
 
+  function resetFamilyState() {
+    const family = panelState.family;
+    family.requestSerial += 1;
+    if (family.abortController) family.abortController.abort();
+    panelState.family = {
+      title: '',
+      variants: [
+        { language: 'en', form_url: '' },
+        { language: 'id', form_url: '' },
+      ],
+      phase: 'idle',
+      message: '',
+      summary: null,
+      requestSerial: family.requestSerial,
+      abortController: null,
+    };
+  }
+
+  function validateFamilyInput() {
+    const family = panelState.family;
+    const title = String(family.title || '').trim();
+    if (!title) return { error: '请填写调研项目名称' };
+    if (!Array.isArray(family.variants) || family.variants.length < 2 || family.variants.length > 10) {
+      return { error: '完整功能需要添加 2–10 个语言版本' };
+    }
+    const languages = new Set();
+    const formIds = new Set();
+    const variants = [];
+    for (const item of family.variants) {
+      const language = String(item.language || '').trim().toLowerCase();
+      if (!/^[a-z]{2,3}(?:-[a-z0-9]{2,8})*$/.test(language)) {
+        return { error: '语言标记请使用 en、id、th 或 zh-cn 这类格式' };
+      }
+      if (languages.has(language)) return { error: `语言 ${language} 重复` };
+      languages.add(language);
+      const formUrl = String(item.form_url || '').trim();
+      let formId;
+      try {
+        formId = parseGoogleFormsEditorLink(formUrl);
+      } catch (error) {
+        return { error: `${language}: ${error instanceof Error ? error.message : '编辑链接无效'}` };
+      }
+      if (formIds.has(formId)) return { error: '同一 Google Form 不能重复添加' };
+      formIds.add(formId);
+      variants.push({ language, form_url: formUrl });
+    }
+    return { error: '', payload: { title, variants } };
+  }
+
+  function updateFamilyField(kind, index, value) {
+    const family = panelState.family;
+    if (kind === 'title') family.title = value;
+    else if (family.variants[index]) family.variants[index][kind] = value;
+    family.summary = null;
+    family.phase = 'idle';
+    family.message = '';
+  }
+
+  function addFamilyVariant() {
+    if (panelState.family.variants.length >= 10) return;
+    panelState.family.variants.push({ language: '', form_url: '' });
+    renderCards();
+  }
+
+  function removeFamilyVariant(index) {
+    if (panelState.family.variants.length <= 2) return;
+    panelState.family.variants.splice(index, 1);
+    panelState.family.summary = null;
+    panelState.family.phase = 'idle';
+    renderCards();
+  }
+
+  function familyDiagnosticText(summary) {
+    const blocking = Number(summary?.blocking_issue_count || 0);
+    const warnings = Number(summary?.warning_count || 0);
+    const variants = Number(summary?.variant_count || 0);
+    const questions = Number(summary?.canonical_question_count || 0);
+    const languages = Array.isArray(summary?.languages) ? summary.languages.join(' / ') : '';
+    return `${variants} 个版本 · ${languages || '语言未记录'} · ${questions} 道规范题 · ${blocking} 个需复核问题 · ${warnings} 条兼容提示`;
+  }
+
+  function normalizeFamilyDiagnostics(summary) {
+    if (!summary || !Array.isArray(summary.diagnostics)) return [];
+    return summary.diagnostics
+      .filter(item => item && typeof item === 'object' && !Array.isArray(item))
+      .map(item => ({
+        code: typeof item.code === 'string' ? item.code : '',
+        message: typeof item.message === 'string' ? item.message.trim().slice(0, 1000) : '',
+        blocking: item.blocking === true,
+        language: typeof item.language === 'string' ? item.language.trim().slice(0, 35) : '',
+        question_title: normalizeSnapshotDisplayTitle(item.question_title),
+        related_question_title: normalizeSnapshotDisplayTitle(item.related_question_title),
+        affected_count: Number.isInteger(item.affected_count) && item.affected_count > 0
+          ? Math.min(item.affected_count, 1000)
+          : 1,
+      }))
+      .filter(item => item.code && item.message);
+  }
+
+  function familyDiagnosticLabel(code) {
+    return {
+      core_question_ambiguous: '无法唯一匹配',
+      core_question_missing: '核心题缺失',
+      core_question_type_conflict: '题型不一致',
+      optional_metadata_missing: '可选受访者信息缺失',
+      structured_values_position_fallback: '选项或矩阵已兼容',
+      metadata_structure_position_fallback: '受访者信息结构已兼容',
+      metadata_semantic_position_fallback: '受访者信息已按相对顺序兼容',
+      duplicate_semantic_position_fallback: '重复题名已按相对顺序兼容',
+    }[code] || '问卷差异';
+  }
+
+  function createFamilyReview(summary) {
+    const diagnostics = normalizeFamilyDiagnostics(summary);
+    const blocking = diagnostics.filter(item => item.blocking);
+    if (!blocking.length) return null;
+
+    const review = el('section', 'qsrc-family-review');
+    const head = el('div', 'qsrc-family-review__head');
+    const headText = el('div', 'qsrc-family-review__head-text');
+    headText.append(
+      el('strong', '', `需要复核 ${blocking.reduce((total, item) => total + item.affected_count, 0)} 个问题`),
+      el('span', '', '下面列出了具体语言和题目。修正对应 Form 后，点击“重新自动检查”。'),
+    );
+    head.append(headText, el('span', 'qsrc-family-review__badge', '尚未读取回答'));
+    review.appendChild(head);
+
+    const list = el('div', 'qsrc-family-review__list');
+    blocking.forEach(item => {
+      const issue = el('article', 'qsrc-family-review__item');
+      const issueTop = el('div', 'qsrc-family-review__item-top');
+      issueTop.append(
+        el('span', 'qsrc-family-review__language', item.language || '未记录语言'),
+        el('strong', 'qsrc-family-review__type', familyDiagnosticLabel(item.code)),
+      );
+      issue.append(issueTop, el('p', 'qsrc-family-review__message', item.message));
+      if (item.question_title) {
+        issue.appendChild(el('p', 'qsrc-family-review__question', `当前版本：${item.question_title}`));
+      }
+      if (item.related_question_title) {
+        issue.appendChild(el('p', 'qsrc-family-review__question', `规范问卷：${item.related_question_title}`));
+      }
+      list.appendChild(issue);
+    });
+    review.appendChild(list);
+    return review;
+  }
+
+  function familySessionIngress() {
+    const api = window[SURVEY_SESSION_INGRESS_INTERFACE_KEY];
+    if (!api || typeof api.acceptGoogleFormsFamilySession !== 'function') return null;
+    return api;
+  }
+
+  async function createFamily() {
+    const validation = validateFamilyInput();
+    const family = panelState.family;
+    if (validation.error || !validation.payload) {
+      family.phase = 'error';
+      family.message = validation.error || '问卷家族输入无效';
+      renderCards();
+      return;
+    }
+    family.phase = 'loading';
+    family.message = '正在读取各语言问卷并自动建立规范题映射…';
+    family.summary = null;
+    family.requestSerial += 1;
+    const serial = family.requestSerial;
+    if (family.abortController) family.abortController.abort();
+    const controller = new AbortController();
+    family.abortController = controller;
+    renderCards();
+    try {
+      const response = await fetch(GOOGLE_FORMS_FAMILIES_ENDPOINT, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(validation.payload),
+        signal: controller.signal,
+      });
+      if (family.requestSerial !== serial) return;
+      if (!response.ok) {
+        const info = await responseErrorInfo(response, '问卷家族创建失败');
+        throw new Error(googleFormsErrorMessage(response.status, info));
+      }
+      const summary = await response.json();
+      if (!summary || typeof summary.family_id !== 'string') throw new Error('返回结果缺少问卷家族编号');
+      family.summary = summary;
+      family.phase = summary.status === 'ready' ? 'ready' : 'review';
+      family.message = summary.status === 'ready'
+        ? '自动映射已通过，可直接读取全部语言回答'
+        : '自动检查未通过。请查看下方具体问题，修正对应 Form 后重新检查。';
+      renderCards();
+    } catch (error) {
+      if (controller.signal.aborted || (error instanceof DOMException && error.name === 'AbortError')) return;
+      if (family.requestSerial !== serial) return;
+      family.phase = 'error';
+      family.message = error instanceof Error ? error.message : '问卷家族创建失败';
+      renderCards();
+    } finally {
+      if (family.abortController === controller) family.abortController = null;
+    }
+  }
+
+  async function startFamilyAnalysis() {
+    const family = panelState.family;
+    const familyId = String(family.summary?.family_id || '').trim();
+    if (!familyId || family.summary?.status !== 'ready') return;
+    family.phase = 'analysis_loading';
+    family.message = '正在分页读取各 Form 回答、去重并创建统一分析会话…';
+    family.requestSerial += 1;
+    const serial = family.requestSerial;
+    if (family.abortController) family.abortController.abort();
+    const controller = new AbortController();
+    family.abortController = controller;
+    renderCards();
+    try {
+      const response = await fetch(
+        `${GOOGLE_FORMS_FAMILIES_ENDPOINT}/${encodeURIComponent(familyId)}/analysis-sessions`,
+        { method: 'POST', signal: controller.signal },
+      );
+      if (family.requestSerial !== serial) return;
+      if (!response.ok) {
+        const info = await responseErrorInfo(response, '统一分析会话创建失败');
+        throw new Error(googleFormsErrorMessage(response.status, info));
+      }
+      const data = await response.json();
+      const ingress = familySessionIngress();
+      if (!ingress) throw new Error('分析页面尚未准备好，请刷新后重试');
+      ingress.acceptGoogleFormsFamilySession(data);
+      family.phase = 'success';
+      family.message = `已合并 ${Number(data.total_rows || 0)} 条回答；重复 ${Number(data.duplicate_response_count || 0)} 条；未匹配 ${Number(data.unmatched_answer_count || 0)} 项`;
+      renderCards();
+    } catch (error) {
+      if (controller.signal.aborted || (error instanceof DOMException && error.name === 'AbortError')) return;
+      if (family.requestSerial !== serial) return;
+      family.phase = 'error';
+      family.message = error instanceof Error ? error.message : '统一分析会话创建失败';
+      renderCards();
+    } finally {
+      if (family.abortController === controller) family.abortController = null;
+    }
+  }
+
+  function normalizeSnapshotDisplayTitle(value) {
+    if (typeof value !== 'string') return '';
+    return value
+      .replace(/[\u0000-\u001f\u007f\u061c\u200b\u200e\u200f\u202a-\u202e\u2060-\u206f\ufeff]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 200);
+  }
+
+  function shortSnapshotId(value) {
+    const snapshotId = typeof value === 'string' ? value.trim() : '';
+    if (snapshotId.length <= 24) return snapshotId;
+    return `${snapshotId.slice(0, 12)}…${snapshotId.slice(-8)}`;
+  }
+
   function normalizeCatalogEntry(entry) {
     if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null;
     const snapshotId = typeof entry.snapshot_id === 'string' ? entry.snapshot_id.trim() : '';
     if (!snapshotId) return null;
     return {
       snapshot_id: snapshotId,
+      display_title: normalizeSnapshotDisplayTitle(entry.display_title),
       provider: typeof entry.provider === 'string' ? entry.provider : '',
       source_mode: typeof entry.source_mode === 'string' ? entry.source_mode : '',
       collection_state: typeof entry.collection_state === 'string' ? entry.collection_state : '',
@@ -579,6 +893,7 @@
       return;
     }
 
+    resetFamilyState();
     for (const def of SOURCE_DEFS) {
       const cardState = getCardState(def.type);
       cardState.requestSerial += 1;
@@ -648,10 +963,14 @@
     }
     if (extra) {
       const meta = el('span', 'qsrc-card__status-meta');
+      meta.style.maxWidth = '100%';
       const pill = el('span', 'qsrc-card__status-pill', extra.label);
       meta.appendChild(pill);
       if (extra.detail) {
-        meta.appendChild(el('span', '', extra.detail));
+        const detail = el('span', '', extra.detail);
+        detail.style.minWidth = '0';
+        detail.style.overflowWrap = 'anywhere';
+        meta.appendChild(detail);
       }
       messageNode.appendChild(meta);
     }
@@ -660,13 +979,22 @@
   function summaryMeta(def, summary) {
     if (!summary || typeof summary !== 'object') return null;
     const snapshotId = typeof summary.snapshot_id === 'string' ? summary.snapshot_id : '';
+    const displayTitle = normalizeSnapshotDisplayTitle(summary.display_title)
+      || (summary.provider === 'google_forms' ? '未命名问卷' : '');
+    const displaySnapshotId = shortSnapshotId(snapshotId);
     const needsReview = summary.requires_human_review === true
       || summary.mapping_status === 'needs_review'
       || summary.processing_status === 'needs_review';
     const questionCount = Number.isFinite(summary.question_count) ? `题目 ${summary.question_count}` : '';
     const fileCount = Number.isFinite(summary.file_count) ? `文件 ${summary.file_count}` : '';
     const pageCount = Number.isFinite(summary.page_count) ? `页数 ${summary.page_count}` : '';
-    const detail = [snapshotId ? `ID ${snapshotId}` : '', questionCount, fileCount, pageCount].filter(Boolean).join(' · ');
+    const detail = [
+      displayTitle ? `问卷「${displayTitle}」` : '',
+      displaySnapshotId ? `ID ${displaySnapshotId}` : '',
+      questionCount,
+      fileCount,
+      pageCount,
+    ].filter(Boolean).join(' · ');
     if (needsReview) {
       return {
         phase: 'review',
@@ -751,9 +1079,17 @@
         if (isSelectedForAnalysis(entry.snapshot_id)) row.classList.add('is-selected');
         const top = el('div', 'qsrc-catalog__item-top');
         const titleWrap = el('div', 'qsrc-catalog__item-title-wrap');
+        const displayTitle = entry.display_title || '未命名问卷';
+        const displaySnapshotId = shortSnapshotId(entry.snapshot_id);
         titleWrap.append(
-          el('div', 'qsrc-catalog__item-id', entry.snapshot_id),
-          el('div', 'qsrc-catalog__item-meta', catalogMeta(entry).join(' · ')),
+          el('div', 'qsrc-catalog__item-id', displayTitle),
+          el(
+            'div',
+            'qsrc-catalog__item-meta',
+            [displaySnapshotId ? `ID ${displaySnapshotId}` : '', ...catalogMeta(entry)]
+              .filter(Boolean)
+              .join(' · '),
+          ),
         );
         const badge = el('span', 'qsrc-catalog__item-badge', reviewLabel(entry));
         if (reviewLabel(entry) === '待人工复核') badge.classList.add('is-review');
@@ -1014,10 +1350,146 @@
     return card;
   }
 
+  function createFamilyCard() {
+    const family = panelState.family;
+    const locked = ['loading', 'analysis_loading'].includes(family.phase);
+    const card = el('article', 'qsrc-card qsrc-family-card');
+    card.dataset.qsrcCard = 'google_forms_family';
+
+    const top = el('div', 'qsrc-card__top');
+    const titleWrap = el('div', 'qsrc-card__title-wrap');
+    titleWrap.append(
+      el('h3', 'qsrc-card__title', '添加 Google Forms 语言版本'),
+      el('p', 'qsrc-card__desc', '粘贴每个语言版本的编辑链接。自动检查通过前不会读取任何回答。'),
+      el('p', 'qsrc-card__note', '轻微题序和可选受访者信息差异会自动兼容；真正的核心题缺失或题型冲突才需要复核。'),
+    );
+    top.append(titleWrap, el('span', 'qsrc-card__badge', '推荐'));
+
+    const fields = el('div', 'qsrc-family-card__fields');
+    const titleLabel = el('label', 'qsrc-family-card__title-field');
+    titleLabel.append(el('span', 'qsrc-family-card__label', '调研项目名称'));
+    const titleInput = document.createElement('input');
+    titleInput.type = 'text';
+    titleInput.maxLength = 200;
+    titleInput.className = 'qsrc-card__input';
+    titleInput.placeholder = '例如：2026 新版本玩家调研';
+    titleInput.value = family.title;
+    titleInput.disabled = locked;
+    titleInput.addEventListener('input', () => updateFamilyField('title', 0, titleInput.value));
+    titleLabel.appendChild(titleInput);
+    fields.appendChild(titleLabel);
+
+    const variants = el('div', 'qsrc-family-card__variants');
+    const variantHead = el('div', 'qsrc-family-card__variant-head');
+    variantHead.append(
+      el('span', '', '语言标记'),
+      el('span', '', 'Google Forms 编辑链接'),
+      el('span', 'qsrc-sr-only', '操作'),
+    );
+    variants.appendChild(variantHead);
+    family.variants.forEach((variant, index) => {
+      const row = el('div', 'qsrc-family-card__variant');
+      const language = document.createElement('input');
+      language.type = 'text';
+      language.maxLength = 35;
+      language.className = 'qsrc-card__input qsrc-family-card__language';
+      language.placeholder = '语言，如 en';
+      language.value = variant.language;
+      language.disabled = locked;
+      language.setAttribute('aria-label', `第 ${index + 1} 个 Form 的语言标记`);
+      language.addEventListener('input', () => updateFamilyField('language', index, language.value));
+
+      const formUrl = document.createElement('input');
+      formUrl.type = 'url';
+      formUrl.className = 'qsrc-card__input qsrc-family-card__url';
+      formUrl.placeholder = 'https://docs.google.com/forms/d/.../edit';
+      formUrl.value = variant.form_url;
+      formUrl.disabled = locked;
+      formUrl.autocomplete = 'off';
+      formUrl.spellcheck = false;
+      formUrl.setAttribute('aria-label', `第 ${index + 1} 个 Google Forms 编辑链接`);
+      formUrl.addEventListener('input', () => updateFamilyField('form_url', index, formUrl.value));
+
+      const remove = el('button', 'qsrc-btn qsrc-btn--ghost qsrc-family-card__remove', '移除');
+      remove.type = 'button';
+      remove.disabled = locked || family.variants.length <= 2;
+      remove.addEventListener('click', () => removeFamilyVariant(index));
+      row.append(language, formUrl, remove);
+      variants.appendChild(row);
+    });
+    fields.appendChild(variants);
+
+    const add = el('button', 'qsrc-btn qsrc-btn--ghost', '添加语言版本');
+    add.type = 'button';
+    add.disabled = locked || family.variants.length >= 10;
+    add.addEventListener('click', addFamilyVariant);
+    fields.appendChild(add);
+
+    const footer = el('div', 'qsrc-card__footer');
+    const mapButton = el(
+      'button',
+      'qsrc-btn qsrc-btn--primary',
+      family.phase === 'loading'
+        ? '正在自动检查…'
+        : family.phase === 'review' ? '重新自动检查' : '自动检查问卷差异',
+    );
+    mapButton.type = 'button';
+    mapButton.disabled = locked;
+    mapButton.addEventListener('click', createFamily);
+    footer.appendChild(mapButton);
+    if (family.summary?.status === 'ready') {
+      const analyzeButton = el(
+        'button',
+        'qsrc-btn qsrc-btn--primary',
+        family.phase === 'analysis_loading' ? '正在读取回答…' : '读取回答并开始统一分析',
+      );
+      analyzeButton.type = 'button';
+      analyzeButton.disabled = locked;
+      analyzeButton.addEventListener('click', startFamilyAnalysis);
+      footer.appendChild(analyzeButton);
+    }
+    const clear = el('button', 'qsrc-btn qsrc-btn--ghost', locked ? '取消' : '重置');
+    clear.type = 'button';
+    clear.addEventListener('click', () => {
+      resetFamilyState();
+      renderCards();
+    });
+    footer.appendChild(clear);
+
+    const status = el('div', 'qsrc-card__status');
+    status.setAttribute('aria-live', 'polite');
+    if (family.phase) status.classList.add(`is-${family.phase === 'ready' ? 'success' : family.phase}`);
+    if (family.message) status.appendChild(el('span', '', family.message));
+    if (family.summary) {
+      const meta = el('span', 'qsrc-card__status-meta');
+      meta.append(
+        el('span', 'qsrc-card__status-pill', family.summary.status === 'ready' ? '自动通过' : '需要复核'),
+        el('span', '', familyDiagnosticText(family.summary)),
+      );
+      status.appendChild(meta);
+      const review = createFamilyReview(family.summary);
+      if (review) status.appendChild(review);
+    }
+
+    const accessNote = el(
+      'p',
+      'qsrc-family-card__access-note',
+      '需要服务账号能够访问每份 Form 的问卷和回答。文件上传题只记录文件元数据，不读取 Drive 文件内容。',
+    );
+    card.append(top, fields, accessNote, footer, status);
+    return card;
+  }
+
   function renderCards() {
-    if (!cardsHost) return;
+    if (!cardsHost || !snapshotCardsHost || !snapshotTools) return;
     const supported = supportedSources();
-    cardsHost.replaceChildren(...supported.map(createCard));
+    const familyCards = [];
+    if (panelState.capabilities?.google_forms_unified_analysis === true) {
+      familyCards.push(createFamilyCard());
+    }
+    cardsHost.replaceChildren(...familyCards);
+    snapshotCardsHost.replaceChildren(...supported.map(createCard));
+    snapshotTools.hidden = supported.length === 0 && !shouldShowCatalog();
     for (const def of supported) renderCard(def);
   }
 

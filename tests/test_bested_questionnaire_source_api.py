@@ -46,6 +46,7 @@ FIXED_TIME = datetime(2026, 8, 13, 8, 0, tzinfo=timezone.utc)
 SUMMARY_FIELDS = {
     "schema_version",
     "snapshot_id",
+    "display_title",
     "provider",
     "source_mode",
     "collection_state",
@@ -506,6 +507,7 @@ class BestedQuestionnaireSourceApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(set(response.json()), SUMMARY_FIELDS)
         self.assertEqual(response.json()["provider"], "bested")
+        self.assertEqual(response.json()["display_title"], "")
         serialized = json.dumps(response.json(), ensure_ascii=False)
         for forbidden in (
             OWNER_REF,

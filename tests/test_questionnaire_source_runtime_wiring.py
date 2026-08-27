@@ -53,6 +53,17 @@ EXPECTED_LOCAL_ROUTES = {
     ("POST", "/api/questionnaire-sources/materials/pdf/snapshots"),
 }
 
+EXPECTED_GOOGLE_ROUTES = {
+    ("POST", "/api/questionnaire-sources/google-forms/snapshots"),
+    ("POST", "/api/questionnaire-sources/google-forms/families"),
+    ("GET", "/api/questionnaire-sources/google-forms/families/{family_id}"),
+    (
+        "POST",
+        "/api/questionnaire-sources/google-forms/families/{family_id}"
+        "/analysis-sessions",
+    ),
+}
+
 MAIN_PROBE = textwrap.dedent(
     f"""
     import json
@@ -100,6 +111,11 @@ MAIN_PROBE = textwrap.dedent(
         "runtime_bound": hasattr(main, "_questionnaire_source_runtime"),
         "runtime_google_connection": (
             main._questionnaire_source_runtime.capabilities.google_forms_connection
+            if hasattr(main, "_questionnaire_source_runtime")
+            else False
+        ),
+        "runtime_google_unified_analysis": (
+            main._questionnaire_source_runtime.capabilities.google_forms_unified_analysis
             if hasattr(main, "_questionnaire_source_runtime")
             else False
         ),
@@ -388,11 +404,8 @@ class QuestionnaireSourceRuntimeWiringTests(unittest.TestCase):
         self.assertTrue(payload["google_forms_enabled"])
         self.assertTrue(payload["runtime_bound"])
         self.assertTrue(payload["runtime_google_connection"])
-        self.assertEqual(len(routes), len(EXPECTED_LOCAL_ROUTES) + 1)
-        self.assertIn(
-            ("POST", "/api/questionnaire-sources/google-forms/snapshots"),
-            routes,
-        )
+        self.assertTrue(payload["runtime_google_unified_analysis"])
+        self.assertEqual(set(routes), EXPECTED_LOCAL_ROUTES | EXPECTED_GOOGLE_ROUTES)
 
 
 if __name__ == "__main__":

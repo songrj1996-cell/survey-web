@@ -22,6 +22,7 @@ class QuestionnaireSourceCapabilities(ContractModel):
     screenshot_material_upload: Literal[True] = True
     pdf_material_upload: Literal[True] = True
     google_forms_connection: bool = False
+    google_forms_unified_analysis: bool = False
     source_workflow: Literal[False] = False
 
     @field_validator("asset_review_decisions", mode="before")
@@ -34,12 +35,16 @@ class QuestionnaireSourceCapabilities(ContractModel):
             raise ValueError("asset_review_decisions 必须是布尔值 true")
         return value
 
-    @field_validator("google_forms_connection", mode="before")
+    @field_validator(
+        "google_forms_connection",
+        "google_forms_unified_analysis",
+        mode="before",
+    )
     @classmethod
     def validate_google_forms_connection(
         cls,
         value: object,
     ) -> object:
         if type(value) is not bool:
-            raise ValueError("google_forms_connection 必须是布尔值")
+            raise ValueError("Google Forms capability 必须是布尔值")
         return value

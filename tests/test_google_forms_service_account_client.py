@@ -16,6 +16,7 @@ from app.integrations.google_forms_client import (
 )
 from app.integrations.google_forms_service_account_client import (
     GOOGLE_FORMS_BODY_READONLY_SCOPE,
+    GOOGLE_FORMS_RESPONSES_READONLY_SCOPE,
     GoogleFormsServiceAccountClient,
 )
 
@@ -104,12 +105,48 @@ def _build_client(
 
 
 class GoogleFormsServiceAccountClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_fetch_responses_uses_scoped_token_and_responses_endpoint(self):
+        requests: list[httpx.Request] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200, json={
+                "responses": [{
+                    "responseId": "response-1",
+                    "createTime": "2026-08-25T00:00:00Z",
+                    "lastSubmittedTime": "2026-08-25T00:01:00Z",
+                    "answers": {},
+                }],
+            })
+
+        client, factory = _build_client(
+            _FakeCredentials(valid=True, token=ACCESS_TOKEN),
+            http_transport=httpx.MockTransport(handler),
+        )
+        capture = await client.fetch_responses(OWNER_REF, FORM_ID)
+
+        self.assertEqual(len(capture.responses), 1)
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0].url.path, f"/v1/forms/{FORM_ID}/responses")
+        self.assertEqual(requests[0].url.params["pageSize"], "5000")
+        self.assertEqual(requests[0].headers["authorization"], f"Bearer {ACCESS_TOKEN}")
+        factory.assert_called_once_with(
+            str(CREDENTIAL_PATH),
+            scopes=(
+                GOOGLE_FORMS_BODY_READONLY_SCOPE,
+                GOOGLE_FORMS_RESPONSES_READONLY_SCOPE,
+            ),
+        )
+
     async def test_google_credentials_refresh_protocol_is_compatible(self):
         credentials = module.service_account.Credentials(
             _FakeSigner(),
             service_account_email=SERVICE_ACCOUNT_EMAIL,
             token_uri=TOKEN_ENDPOINT,
-            scopes=(GOOGLE_FORMS_BODY_READONLY_SCOPE,),
+            scopes=(
+                GOOGLE_FORMS_BODY_READONLY_SCOPE,
+                GOOGLE_FORMS_RESPONSES_READONLY_SCOPE,
+            ),
         )
 
         def token_handler(request: httpx.Request) -> httpx.Response:
@@ -167,7 +204,10 @@ class GoogleFormsServiceAccountClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.service_account_email, SERVICE_ACCOUNT_EMAIL)
         factory.assert_called_once_with(
             str(CREDENTIAL_PATH),
-            scopes=(GOOGLE_FORMS_BODY_READONLY_SCOPE,),
+            scopes=(
+                GOOGLE_FORMS_BODY_READONLY_SCOPE,
+                GOOGLE_FORMS_RESPONSES_READONLY_SCOPE,
+            ),
         )
         self.assertEqual(credentials.refresh_calls, 1)
         self.assertEqual(len(token_requests), 1)

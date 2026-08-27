@@ -77,6 +77,7 @@ from app.services.questionnaire_import import (
     parse_questionnaire_translations,
 )
 from app.services.questionnaire_snapshot_binding import SnapshotSurveyBinding
+from app.services.google_forms_family_binding import QuestionnaireFamilySurveyBinding
 from app.services.qualitative_viewpoints import (
     build_report_viewpoint_stats,
     render_viewpoint_stats,
@@ -242,11 +243,16 @@ async def handle_survey_upload(
     source_type: str = "google",
     questionnaire_filename: str | None = None,
     questionnaire_content: bytes | None = None,
-    bound_questionnaire: SnapshotSurveyBinding | None = None,
+    bound_questionnaire: (
+        SnapshotSurveyBinding | QuestionnaireFamilySurveyBinding | None
+    ) = None,
 ) -> dict:
     """解析上传文件，创建 session，返回前端所需的 result dict。"""
     if bound_questionnaire is not None:
-        if not isinstance(bound_questionnaire, SnapshotSurveyBinding):
+        if not isinstance(
+            bound_questionnaire,
+            (SnapshotSurveyBinding, QuestionnaireFamilySurveyBinding),
+        ):
             raise TypeError("bound_questionnaire 类型无效")
         if questionnaire_content is not None or questionnaire_filename is not None:
             raise HTTPException(
@@ -299,9 +305,17 @@ async def handle_survey_upload(
     sess["rows"] = rows
     sess["filename"] = filename
     sess["source_type"] = source_type
-    sess["file_sha256"] = hashlib.sha256(content).hexdigest()
-    if bound_questionnaire is not None:
+    sess["file_sha256"] = (
+        bound_questionnaire.response_fingerprint
+        if isinstance(bound_questionnaire, QuestionnaireFamilySurveyBinding)
+        else hashlib.sha256(content).hexdigest()
+    )
+    if isinstance(bound_questionnaire, SnapshotSurveyBinding):
         sess["questionnaire_sha256"] = bound_questionnaire.package_sha256
+    elif isinstance(bound_questionnaire, QuestionnaireFamilySurveyBinding):
+        sess["questionnaire_sha256"] = (
+            bound_questionnaire.family.mapping_fingerprint
+        )
     else:
         sess["questionnaire_sha256"] = (
             hashlib.sha256(questionnaire_content).hexdigest()
@@ -314,7 +328,7 @@ async def handle_survey_upload(
         sess["column_provider"] = "questionnaire"
         sess["questionnaire_text"] = questionnaire_text
         sess["questionnaire_filename"] = questionnaire_filename
-    if bound_questionnaire is not None:
+    if isinstance(bound_questionnaire, SnapshotSurveyBinding):
         sess["questionnaire_input_kind"] = "saved_snapshot"
         sess["questionnaire_snapshot_ref"] = (
             bound_questionnaire.session_snapshot_ref()
@@ -322,6 +336,26 @@ async def handle_survey_upload(
         sess["questionnaire_response_bindings"] = (
             bound_questionnaire.session_response_bindings()
         )
+    elif isinstance(bound_questionnaire, QuestionnaireFamilySurveyBinding):
+        sess["questionnaire_family_input_kind"] = "google_forms_family"
+        sess["questionnaire_family_ref"] = (
+            bound_questionnaire.session_family_ref()
+        )
+        sess["google_forms_response_provenance"] = (
+            bound_questionnaire.session_response_provenance()
+        )
+        sess["google_forms_response_diagnostics"] = {
+            "duplicate_response_count": (
+                bound_questionnaire.duplicate_response_count
+            ),
+            "unmatched_answer_count": (
+                bound_questionnaire.unmatched_answer_count
+            ),
+            "file_upload_answer_count": (
+                bound_questionnaire.file_upload_answer_count
+            ),
+            "blocking_issue_count": bound_questionnaire.blocking_issue_count,
+        }
     _assign_session_owner(sess, login)
     save_session(sid, sess)
 
@@ -335,10 +369,26 @@ async def handle_survey_upload(
         "questionnaire_used": deterministic_questions is not None,
         "matched_questions": matched_questions,
     }
-    if bound_questionnaire is not None:
+    if isinstance(bound_questionnaire, SnapshotSurveyBinding):
         result["questionnaire_snapshot_id"] = (
             bound_questionnaire.provenance.snapshot_id
         )
+    elif isinstance(bound_questionnaire, QuestionnaireFamilySurveyBinding):
+        result.update({
+            "questionnaire_family_id": bound_questionnaire.family.family_id,
+            "languages": [
+                item.language for item in bound_questionnaire.family.variants
+            ],
+            "duplicate_response_count": (
+                bound_questionnaire.duplicate_response_count
+            ),
+            "unmatched_answer_count": (
+                bound_questionnaire.unmatched_answer_count
+            ),
+            "file_upload_answer_count": (
+                bound_questionnaire.file_upload_answer_count
+            ),
+        })
     return result
 
 

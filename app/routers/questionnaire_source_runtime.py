@@ -18,6 +18,7 @@ from app.routers.questionnaire_sources import (
 from app.routers.questionnaire_snapshot_analysis import (
     create_questionnaire_snapshot_analysis_router,
 )
+from app.routers.google_forms_families import create_google_forms_families_router
 from app.schemas.questionnaire_source_runtime import (
     QuestionnaireSourceCapabilities,
 )
@@ -61,6 +62,10 @@ def create_questionnaire_source_runtime_router(
     if runtime.google_forms_api is not None:
         router.include_router(create_google_forms_questionnaire_sources_router(
             runtime.google_forms_api,
+        ))
+    if runtime.google_forms_family_api is not None:
+        router.include_router(create_google_forms_families_router(
+            runtime.google_forms_family_api,
         ))
 
     @router.get(

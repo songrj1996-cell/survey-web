@@ -11,6 +11,7 @@ const bestedQuestionnaireInput = $('bested-questionnaire-file');
 const bestedUploadButton = $('btn-bested-upload');
 const SNAPSHOT_ANALYSIS_INTERFACE_KEY = 'questionnaireSnapshotAnalysisSelection';
 const SNAPSHOT_ANALYSIS_UPLOAD_PREFIX = '/api/questionnaire-sources/snapshots/';
+const SURVEY_SESSION_INGRESS_INTERFACE_KEY = 'surveySessionIngress';
 let surveyUploadRequestSerial = 0;
 let surveyUploadAbortController = null;
 
@@ -50,6 +51,93 @@ function abortSurveyUpload() {
     surveyUploadAbortController = null;
   }
 }
+
+function acceptSurveySessionResult(data, {
+  sourceType = 'google',
+  snapshotId = '',
+  questionnaireFilename = '',
+  uploadSignature = '',
+  familyId = '',
+  successMessage = '',
+} = {}) {
+  if (!data || typeof data.session_id !== 'string' || !data.session_id.trim()) {
+    throw new Error('返回结果缺少会话编号');
+  }
+  if (surveyUploadIsLocked()) {
+    throw new Error('当前分析已经开始，不能替换回答来源');
+  }
+
+  state.sessionId = data.session_id;
+  state.surveySource = data.source_type || sourceType;
+  state.questionnaireUsed = familyId
+    ? data.questionnaire_used === true
+    : snapshotId ? data.questionnaire_used !== false : !!data.questionnaire_used;
+  state.viewMode = 'session';
+  state.historyId = null;
+  state.reportVersionLoading = false;
+  clearPlanInput();
+  currentContextFileSignature = uploadSignature;
+  const draft = uploadSignature ? loadContextDraft() : null;
+  const restoreContext = !!uploadSignature && (
+    preserveContextDraftOnNextUpload
+    || (draft && draft.fileSignature && draft.fileSignature === uploadSignature)
+  );
+  if (restoreContext) {
+    writeContextForm(draft.fields || {});
+    preserveContextDraftOnNextUpload = false;
+  } else {
+    clearContextDraft();
+    clearContextForm();
+  }
+  state.sessionReport = {
+    reportMd: null,
+    title: '',
+    reportNo: '',
+    qaHtml: '',
+    qaMessages: [],
+    feishuLinkHtml: '',
+    running: false,
+    stream: '',
+    generatingVersion: null,
+  };
+  renderUploadedFileState(
+    data.filename,
+    state.surveySource,
+    questionnaireFilename,
+    snapshotId,
+    familyId,
+  );
+  renderPreview(data);
+  goStep(2);
+  if (successMessage) showToast(successMessage, 'success');
+  loadColumns();
+}
+
+function exposeSurveySessionIngress() {
+  Object.defineProperty(window, SURVEY_SESSION_INGRESS_INTERFACE_KEY, {
+    value: Object.freeze({
+      acceptGoogleFormsFamilySession(data) {
+        const familyId = typeof data?.questionnaire_family_id === 'string'
+          ? data.questionnaire_family_id.trim()
+          : '';
+        if (!familyId || !Array.isArray(data?.languages)) {
+          throw new Error('Google Forms 统一会话返回结果无效');
+        }
+        const languages = data.languages.map(value => String(value || '').trim()).filter(Boolean);
+        acceptSurveySessionResult(data, {
+          sourceType: 'google',
+          familyId,
+          successMessage: `已合并 ${languages.join(' / ')} 回答并创建统一分析会话`,
+        });
+      },
+    }),
+    configurable: true,
+    enumerable: false,
+    writable: false,
+  });
+}
+
+exposeSurveySessionIngress();
 
 async function responseDetailMessage(response, fallback) {
   const data = await response.json().catch(() => ({}));
@@ -195,50 +283,18 @@ async function handleUpload(file, { sourceType = 'google', questionnaireFile = n
       throw new Error('上传成功，但返回结果缺少会话编号');
     }
 
-    state.sessionId = data.session_id;
-    state.surveySource = data.source_type || (snapshotId ? 'google' : sourceType);
-    state.questionnaireUsed = snapshotId ? data.questionnaire_used !== false : !!data.questionnaire_used;
-    state.viewMode = 'session';
-    state.historyId = null;
-    state.reportVersionLoading = false;
-    clearPlanInput();
-    currentContextFileSignature = uploadSignature;
-    const draft = loadContextDraft();
-    const restoreContext = preserveContextDraftOnNextUpload ||
-      (draft && draft.fileSignature && draft.fileSignature === uploadSignature);
-    if (restoreContext) {
-      writeContextForm(draft.fields || {});
-      preserveContextDraftOnNextUpload = false;
-    } else {
-      clearContextDraft();
-      clearContextForm();
-    }
-    state.sessionReport = {
-      reportMd: null,
-      title: '',
-      reportNo: '',
-      qaHtml: '',
-      qaMessages: [],
-      feishuLinkHtml: '',
-      running: false,
-      stream: '',
-      generatingVersion: null,
-    };
-    renderUploadedFileState(
-      data.filename,
-      state.surveySource,
-      snapshotId ? '' : questionnaireFile?.name || '',
-      snapshotId,
-    );
-    renderPreview(data);
-    goStep(2);
     const successMessage = snapshotId
       ? `成功创建标准分析会话，将按快照 ${snapshotId} 的结构继续；图片不会自动进入报告`
       : data.questionnaire_used
       ? `成功读取 ${data.total_rows} 行数据，并匹配 ${data.matched_questions} 道原问卷题目`
       : `成功读取 ${data.total_rows} 行数据`;
-    showToast(successMessage, 'success');
-    loadColumns();
+    acceptSurveySessionResult(data, {
+      sourceType: snapshotId ? 'google' : sourceType,
+      snapshotId,
+      questionnaireFilename: snapshotId ? '' : questionnaireFile?.name || '',
+      uploadSignature,
+      successMessage,
+    });
   } catch (e) {
     if (abortController.signal.aborted || (e instanceof DOMException && e.name === 'AbortError')) {
       return;
@@ -258,6 +314,7 @@ function renderUploadedFileState(
   sourceType = 'google',
   questionnaireFilename = '',
   snapshotId = '',
+  familyId = '',
 ) {
   state.uploadedFilename = String(filename || '').trim();
   document.querySelectorAll('[data-survey-source]').forEach(card => {
@@ -284,6 +341,20 @@ function renderUploadedFileState(
   uploadZone.classList.remove('drag-over');
   uploadZone.classList.add('upload-zone--readonly');
   uploadZone.setAttribute('aria-disabled', 'true');
+  if (familyId) {
+    uploadZone.innerHTML = `
+      <div class="upload-zone__icon upload-zone__icon--complete">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+          <path d="M7 7h10v10H7z"/><path d="M3 12h4M17 12h4M12 3v4M12 17v4"/>
+          <polyline points="9 12 11 14 15 10"/>
+        </svg>
+      </div>
+      <div class="upload-zone__text">
+        <span class="upload-zone__primary">已连接多语言 Google Forms 回答</span>
+        <span class="upload-zone__secondary">已直接创建统一分析会话，无需上传或合并回答文件</span>
+      </div>`;
+    return;
+  }
   uploadZone.innerHTML = `
     <div class="upload-zone__icon upload-zone__icon--complete">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">

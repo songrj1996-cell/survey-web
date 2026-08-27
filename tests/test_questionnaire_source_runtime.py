@@ -25,6 +25,7 @@ from app.schemas.questionnaire_source_runtime import (
     QuestionnaireSourceCapabilities,
 )
 from app.schemas.research_assets import MediaType, ResearchAssetCollection
+from app.integrations.google_forms_responses_client import GoogleFormResponsesCapture
 from app.services.questionnaire_snapshot_api import (
     QuestionnaireSnapshotApi,
     QuestionnaireSnapshotInternalError,
@@ -67,6 +68,7 @@ EXPECTED_CAPABILITIES = {
     "screenshot_material_upload": True,
     "pdf_material_upload": True,
     "google_forms_connection": False,
+    "google_forms_unified_analysis": False,
     "source_workflow": False,
 }
 
@@ -104,6 +106,13 @@ EXPECTED_ROUTES = {
 EXPECTED_ROUTES_WITH_GOOGLE = {
     *EXPECTED_ROUTES,
     ("POST", "/api/questionnaire-sources/google-forms/snapshots"),
+    ("POST", "/api/questionnaire-sources/google-forms/families"),
+    ("GET", "/api/questionnaire-sources/google-forms/families/{family_id}"),
+    (
+        "POST",
+        "/api/questionnaire-sources/google-forms/families/{family_id}"
+        "/analysis-sessions",
+    ),
 }
 
 
@@ -115,6 +124,9 @@ class _InvalidPathLike:
 class _FakeGoogleFormsCaptureClient:
     async def fetch_form(self, owner_ref: str, form_id: str):
         raise AssertionError("runtime wiring test must not call Google")
+
+    async def fetch_responses(self, owner_ref: str, form_id: str):
+        return GoogleFormResponsesCapture(form_id=form_id, responses=(), page_count=1)
 
 
 def _snapshot_archive(owner_ref: str) -> tuple[bytes, str]:
@@ -200,14 +212,23 @@ class QuestionnaireSourceRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         connected = QuestionnaireSourceCapabilities(
             google_forms_connection=True,
+            google_forms_unified_analysis=True,
         )
         self.assertTrue(connected.google_forms_connection)
+        self.assertTrue(connected.google_forms_unified_analysis)
         for invalid_value in (1, 0, "true", None):
             with self.subTest(google_forms_connection=invalid_value):
                 with self.assertRaises(ValidationError):
                     QuestionnaireSourceCapabilities.model_validate({
                         **EXPECTED_CAPABILITIES,
                         "google_forms_connection": invalid_value,
+                    })
+        for invalid_value in (1, 0, "true", None):
+            with self.subTest(google_forms_unified_analysis=invalid_value):
+                with self.assertRaises(ValidationError):
+                    QuestionnaireSourceCapabilities.model_validate({
+                        **EXPECTED_CAPABILITIES,
+                        "google_forms_unified_analysis": invalid_value,
                     })
 
         with self.assertRaises(ValidationError):
@@ -435,8 +456,12 @@ class QuestionnaireSourceRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(actual_routes, EXPECTED_ROUTES_WITH_GOOGLE)
         self.assertIsNotNone(connected_runtime.google_forms_api)
+        self.assertIsNotNone(connected_runtime.google_forms_family_api)
         self.assertTrue(
             connected_runtime.capabilities.google_forms_connection
+        )
+        self.assertTrue(
+            connected_runtime.capabilities.google_forms_unified_analysis
         )
         self.assertIs(
             connected_runtime.google_forms_api.storage,

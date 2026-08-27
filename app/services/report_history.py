@@ -24,6 +24,10 @@ from app.services.questionnaire_snapshot_history import (
     has_matching_snapshot_provenance,
     snapshot_history_fields,
 )
+from app.services.questionnaire_family_history import (
+    family_history_fields,
+    has_matching_family_provenance,
+)
 from app.services.report_versions import (
     append_report_version,
     delete_report_version,
@@ -274,6 +278,8 @@ def _has_complete_survey_duplicate_fingerprint(source: dict) -> bool:
         return False
     if not has_matching_snapshot_provenance(source, source):
         return False
+    if not has_matching_family_provenance(source, source):
+        return False
     questionnaire_sha256 = str(source.get("questionnaire_sha256") or "").strip().lower()
     return not bool(source.get("questionnaire_used")) or bool(
         re.fullmatch(r"[0-9a-f]{64}", questionnaire_sha256)
@@ -322,6 +328,8 @@ def _is_exact_survey_duplicate(entry: dict, sess: dict, login: dict | None) -> b
     ):
         return False
     if not has_matching_snapshot_provenance(entry, sess):
+        return False
+    if not has_matching_family_provenance(entry, sess):
         return False
 
     entry_context = entry.get("qualitative_context")
@@ -478,6 +486,7 @@ def save_to_history(
             **owner,
         }
         entry.update(snapshot_history_fields(sess, fallback=old_entry))
+        entry.update(family_history_fields(sess, fallback=old_entry))
         if version_source:
             entry.update({
                 "report_versions": deepcopy(version_source["report_versions"]),
@@ -586,13 +595,17 @@ def append_exact_rerun_to_history(
             "rows_fed": False,
         })
         snapshot_fields = snapshot_history_fields(sess)
+        family_fields = family_history_fields(sess)
         for field in (
             "questionnaire_input_kind",
             "questionnaire_snapshot_ref",
             "questionnaire_response_bindings",
+            "questionnaire_family_input_kind",
+            "questionnaire_family_ref",
         ):
             entry.pop(field, None)
         entry.update(snapshot_fields)
+        entry.update(family_fields)
         return deepcopy(entry), deepcopy(committed)
 
     return mutate_history(persist)

@@ -108,6 +108,7 @@ class SnapshotCatalogEntry(NamedTuple):
     asset_count: int
     image_asset_count: int
     asset_reference_count: int
+    title: str = ""
 
 
 class SnapshotCatalogPage(NamedTuple):
@@ -986,6 +987,7 @@ class FileResearchAssetStorage:
                 for asset in collection.assets
             ),
             asset_reference_count=snapshot.asset_reference_count,
+            title=snapshot.title,
         )
         return entry, metadata_bytes
 

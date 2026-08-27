@@ -13,6 +13,7 @@ from app.schemas.questionnaire import (
     QuestionnaireSourceMode,
 )
 from app.schemas.questionnaire_source_api import (
+    MAX_QUESTIONNAIRE_SNAPSHOT_DISPLAY_TITLE_LENGTH,
     QuestionnaireSnapshotCatalogResponse,
     QuestionnaireSnapshotSummary,
 )
@@ -41,6 +42,10 @@ MAX_SNAPSHOT_UPLOAD_BYTES = SNAPSHOT_PACKAGE_MAX_ARCHIVE_BYTES
 MAX_SNAPSHOT_CATALOG_LIMIT = 50
 DEFAULT_SNAPSHOT_CATALOG_LIMIT = 20
 _SNAPSHOT_CATALOG_CURSOR_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_DISPLAY_TITLE_CONTROL_PATTERN = re.compile(
+    r"[\x00-\x1f\x7f\u061c\u200b\u200e\u200f"
+    r"\u202a-\u202e\u2060-\u206f\ufeff]+"
+)
 
 
 class QuestionnaireSnapshotApiError(RuntimeError):
@@ -73,11 +78,25 @@ def _require_owner(owner_ref: str) -> str:
     return owner_ref.strip()
 
 
+def _snapshot_display_title(provider: Provider, title: object) -> str:
+    """返回仅供 owner-scoped UI 识别 Google 问卷的安全短标题。"""
+    if provider != Provider.GOOGLE_FORMS or not isinstance(title, str):
+        return ""
+    normalized = " ".join(
+        _DISPLAY_TITLE_CONTROL_PATTERN.sub(" ", title).split()
+    )
+    return normalized[:MAX_QUESTIONNAIRE_SNAPSHOT_DISPLAY_TITLE_LENGTH]
+
+
 def _summary(package: SnapshotPackage) -> QuestionnaireSnapshotSummary:
     snapshot = package.bundle.snapshot
     collection = package.bundle.collection
     return QuestionnaireSnapshotSummary(
         snapshot_id=snapshot.snapshot_id,
+        display_title=_snapshot_display_title(
+            snapshot.provider,
+            snapshot.title,
+        ),
         provider=snapshot.provider,
         source_mode=snapshot.source_mode,
         collection_state=snapshot.collection_state,
@@ -211,6 +230,7 @@ def _list_snapshot_summaries(
             or not isinstance(entry.source_mode, QuestionnaireSourceMode)
             or not isinstance(entry.collection_state, CollectionState)
             or not isinstance(entry.mapping_status, MappingStatus)
+            or not isinstance(entry.title, str)
             or any(
                 isinstance(value, bool)
                 or not isinstance(value, int)
@@ -230,6 +250,10 @@ def _list_snapshot_summaries(
         try:
             items.append(QuestionnaireSnapshotSummary(
                 snapshot_id=entry.snapshot_id,
+                display_title=_snapshot_display_title(
+                    entry.provider,
+                    entry.title,
+                ),
                 provider=entry.provider,
                 source_mode=entry.source_mode,
                 collection_state=entry.collection_state,

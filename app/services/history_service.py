@@ -7,6 +7,10 @@ from app.services.questionnaire_snapshot_history import (
     snapshot_history_fields,
     snapshot_history_summary,
 )
+from app.services.questionnaire_family_history import (
+    family_history_fields,
+    family_history_summary,
+)
 from app.services.report_history import (
     _history_effective_row_count,
     _qa_user_count,
@@ -110,6 +114,7 @@ def get_history_list(login: dict | None, mode: str = "") -> list[dict]:
             "annotate_quality_count": h.get("annotate_quality_count", 0),
             "annotate_has_download": bool(h.get("annotate_result_path")),
             **snapshot_history_summary(h),
+            **family_history_summary(h),
             **_history_version_metadata(h, login),
         })
     return result
@@ -133,11 +138,17 @@ def get_history_entry(
         "questionnaire_response_bindings",
         "questionnaire_snapshot_summary",
         "has_questionnaire_snapshot",
+        "questionnaire_family_input_kind",
+        "questionnaire_family_ref",
+        "questionnaire_family_summary",
+        "google_forms_response_provenance",
+        "google_forms_response_diagnostics",
     ):
         result.pop(field, None)
     metadata = _history_version_metadata(entry, login)
     result.update(metadata)
     result.update(snapshot_history_fields(entry))
+    result.update(family_history_fields(entry))
     if metadata["version_count"]:
         selected = resolve_report_version(
             entry,

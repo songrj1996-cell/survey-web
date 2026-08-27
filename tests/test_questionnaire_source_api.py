@@ -100,6 +100,7 @@ def _catalog_entry(
             snapshot.snapshot_id.encode("utf-8")
         ).hexdigest(),
         snapshot_id=snapshot.snapshot_id,
+        title=snapshot.title,
         provider=snapshot.provider,
         source_mode=snapshot.source_mode,
         collection_state=snapshot.collection_state,
@@ -384,6 +385,7 @@ class QuestionnaireSourceApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(first.json()), {
             "schema_version",
             "snapshot_id",
+            "display_title",
             "provider",
             "source_mode",
             "collection_state",
@@ -398,6 +400,10 @@ class QuestionnaireSourceApiTests(unittest.IsolatedAsyncioTestCase):
             first.json()["asset_reference_count"],
             self.package.bundle.snapshot.asset_reference_count,
         )
+        self.assertEqual(
+            first.json()["display_title"],
+            self.package.bundle.snapshot.title,
+        )
         serialized = json.dumps(first.json(), ensure_ascii=False).casefold()
         for forbidden in (
             "owner_ref",
@@ -408,6 +414,33 @@ class QuestionnaireSourceApiTests(unittest.IsolatedAsyncioTestCase):
             self.temporary.name.casefold(),
         ):
             self.assertNotIn(forbidden.casefold(), serialized)
+
+    async def test_google_display_title_is_normalized_without_rewriting_snapshot(self):
+        raw_title = " \t研究\n问卷\x00\u202e标题  " + ("长" * 220)
+        archive, package = _package_archive(title=raw_title)
+
+        saved = await self._request_api(
+            "POST",
+            "/api/questionnaire-sources/snapshots",
+            files={"file": ("snapshot.zip", archive, "application/zip")},
+        )
+        catalog = await self._request_api(
+            "GET",
+            "/api/questionnaire-sources/snapshots",
+        )
+
+        expected = ("研究 问卷 标题 " + ("长" * 220))[:200]
+        self.assertEqual(saved.status_code, 200)
+        self.assertEqual(saved.json()["display_title"], expected)
+        self.assertEqual(catalog.status_code, 200)
+        self.assertEqual(catalog.json()["items"][0]["display_title"], expected)
+        stored = self.storage.load_snapshot_package(
+            OWNER_REF,
+            package.bundle.snapshot.snapshot_id,
+        )
+        self.assertIsNotNone(stored)
+        assert stored is not None
+        self.assertEqual(stored.bundle.snapshot.title, raw_title)
 
     async def test_catalog_empty_pagination_owner_isolation_and_safe_fields(self):
         empty = await self._request_api(
@@ -468,6 +501,7 @@ class QuestionnaireSourceApiTests(unittest.IsolatedAsyncioTestCase):
         expected_summary_fields = {
             "schema_version",
             "snapshot_id",
+            "display_title",
             "provider",
             "source_mode",
             "collection_state",

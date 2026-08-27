@@ -29,16 +29,30 @@ from app.integrations.google_forms_client import (
     GoogleFormsStage,
     GoogleImageDownloadPolicy,
 )
+from app.integrations.google_forms_responses_client import (
+    GoogleFormResponsesCapture,
+    GoogleFormsResponsesClient,
+    GoogleFormsResponsesClientError,
+    GoogleFormsResponsesErrorCode,
+)
 
 
 __all__ = [
     "GOOGLE_FORMS_BODY_READONLY_SCOPE",
+    "GOOGLE_FORMS_RESPONSES_READONLY_SCOPE",
     "GoogleFormsServiceAccountClient",
 ]
 
 
 GOOGLE_FORMS_BODY_READONLY_SCOPE = (
     "https://www.googleapis.com/auth/forms.body.readonly"
+)
+GOOGLE_FORMS_RESPONSES_READONLY_SCOPE = (
+    "https://www.googleapis.com/auth/forms.responses.readonly"
+)
+_GOOGLE_FORMS_READONLY_SCOPES = (
+    GOOGLE_FORMS_BODY_READONLY_SCOPE,
+    GOOGLE_FORMS_RESPONSES_READONLY_SCOPE,
 )
 _OFFICIAL_FORMS_API_BASE = "https://forms.googleapis.com/v1"
 _MAX_SERVICE_ACCOUNT_EMAIL_LENGTH = 320
@@ -290,7 +304,7 @@ class GoogleFormsServiceAccountClient:
         try:
             credentials = service_account.Credentials.from_service_account_file(
                 credential_path,
-                scopes=(GOOGLE_FORMS_BODY_READONLY_SCOPE,),
+                scopes=_GOOGLE_FORMS_READONLY_SCOPES,
             )
         except Exception:
             raise _configuration_error(
@@ -351,6 +365,57 @@ class GoogleFormsServiceAccountClient:
                 GoogleFormsErrorCode.TRANSPORT_ERROR,
                 "Google Forms request failed before receiving a response",
                 stage=GoogleFormsStage.FORMS_GET,
+                retryable=True,
+            ) from None
+
+    async def fetch_responses(
+        self,
+        owner_ref: str,
+        form_id: str,
+    ) -> GoogleFormResponsesCapture:
+        """Fetch all response pages without retaining owner or response data."""
+
+        if not isinstance(owner_ref, str) or not owner_ref.strip():
+            raise _configuration_error("Google Forms owner context is invalid")
+
+        timeout = httpx.Timeout(
+            connect=self._connect_timeout,
+            read=self._read_timeout,
+            write=self._read_timeout,
+            pool=self._connect_timeout,
+        )
+        try:
+            async with httpx.AsyncClient(
+                timeout=timeout,
+                follow_redirects=False,
+                trust_env=False,
+                transport=self._http_transport,
+            ) as http_client:
+                connector = GoogleFormsResponsesClient(
+                    http_client,
+                    self._authorization_headers,
+                    forms_api_base=self._forms_api_base,
+                )
+                return await connector.fetch_all(form_id)
+        except asyncio.CancelledError:
+            raise
+        except GoogleFormsResponsesClientError:
+            raise
+        except GoogleFormsConnectorError as error:
+            try:
+                response_code = GoogleFormsResponsesErrorCode(error.code.value)
+            except ValueError:
+                response_code = GoogleFormsResponsesErrorCode.HTTP_ERROR
+            raise GoogleFormsResponsesClientError(
+                code=response_code,
+                message="Google Forms responses authorization or request failed",
+                retryable=error.retryable,
+                status_code=error.status_code,
+            ) from error
+        except Exception:
+            raise GoogleFormsResponsesClientError(
+                code=GoogleFormsResponsesErrorCode.TRANSPORT_ERROR,
+                message="Google Forms responses request failed",
                 retryable=True,
             ) from None
 
