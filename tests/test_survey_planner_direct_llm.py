@@ -1,3 +1,4 @@
+from copy import deepcopy
 import json
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -295,6 +296,90 @@ class DirectSurveyPlannerTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.assertFalse(survey_service.columns_require_llm("sid"))
 
+        with patch.object(
+            survey_service,
+            "get_session",
+            return_value={
+                "column_provider": "questionnaire",
+                "columns_detected": [
+                    {
+                        "source_question_id": "Q1",
+                        "name_zh": "请填写您的玩家信息",
+                    },
+                    {
+                        "source_question_id": "Q2",
+                        "name_zh": "MLBB ID",
+                    },
+                ],
+            },
+        ):
+            self.assertFalse(survey_service.columns_require_llm("sid"))
+
+        with patch.object(
+            survey_service,
+            "get_session",
+            return_value={
+                "column_provider": "questionnaire",
+                "columns_detected": [{
+                    "source_question_id": "Q1",
+                    "name_zh": "How familiar are you with 中国 server settings?",
+                }],
+            },
+        ):
+            self.assertTrue(survey_service.columns_require_llm("sid"))
+
+        with patch.object(
+            survey_service,
+            "get_session",
+            return_value={
+                "column_provider": "questionnaire",
+                "columns_detected": [{
+                    "source_question_id": "Q1",
+                    "name_zh": "您平时会使用 WhatsApp 吗？",
+                }],
+            },
+        ):
+            self.assertFalse(survey_service.columns_require_llm("sid"))
+
+    async def test_chinese_questionnaire_text_is_preserved_without_llm(self):
+        questions = [{
+            "source_question_id": "Q5",
+            "name_zh": "您对以下 MLBB 内容的熟悉程度如何？",
+            "role": "matrix_single",
+            "column_indexes": [0, 1],
+            "rows": ["迷雾之地", "北境山谷"],
+            "options": ["非常熟悉", "从未听说过"],
+            "options_original": ["非常熟悉", "从未听说过"],
+        }]
+        expected_questions = deepcopy(questions)
+        sess = {
+            "rows": [
+                ["Familiarity [The Mist]", "Familiarity [Northern Vale]"],
+                ["Very familiar", "Never heard of it"],
+            ],
+            "column_provider": "questionnaire",
+            "columns_detected": questions,
+        }
+        collect = AsyncMock(side_effect=AssertionError("中文问卷不应调用翻译模型"))
+
+        with (
+            patch.object(survey_service, "get_session", return_value=sess),
+            patch.object(survey_service, "save_session") as save,
+            patch.object(survey_service, "audit_log", new=AsyncMock()),
+            patch.object(survey_service, "collect_chat_completion", new=collect),
+        ):
+            events = [
+                event async for event in survey_service.columns_stream("sid", object())
+            ]
+
+        collect.assert_not_awaited()
+        save.assert_called_once_with("sid", sess)
+        self.assertEqual(sess["columns_detected"], expected_questions)
+        self.assertEqual(sess["questionnaire_translation_status"], "translated")
+        self.assertEqual(sess["questionnaire_translation_model"], "")
+        self.assertTrue(any("AI 未参与题型判断或文本改写" in event for event in events))
+        self.assertTrue(any('"type": "columns_ready"' in event for event in events))
+
     async def test_questionnaire_columns_are_translated_without_reclassifying(self):
         sess = {
             "rows": [
@@ -348,6 +433,7 @@ class DirectSurveyPlannerTests(unittest.IsolatedAsyncioTestCase):
             ["Very familiar"],
         )
         self.assertEqual(sess["questionnaire_translation_status"], "translated")
+        collect.assert_awaited_once()
         self.assertTrue(any('"type": "columns_ready"' in event for event in events))
 
     async def test_columns_stream_uses_multilingual_direct_model_chain(self):

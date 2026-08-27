@@ -94,6 +94,11 @@ def get_history_list(login: dict | None, mode: str = "") -> list[dict]:
         visible = [h for h in visible if (h.get("mode") or "") == mode]
     result = []
     for h in visible:
+        active_snapshot = (
+            resolve_report_version(h)
+            if _supports_report_versions(h)
+            else h
+        )
         result.append({
             "id": h["id"],
             "report_no": h.get("report_no", ""),
@@ -115,6 +120,12 @@ def get_history_list(login: dict | None, mode: str = "") -> list[dict]:
             "annotate_has_download": bool(h.get("annotate_result_path")),
             **snapshot_history_summary(h),
             **family_history_summary(h),
+            "annotate_quality_duration_seconds": h.get(
+                "annotate_quality_duration_seconds"
+            ),
+            "report_duration_seconds": active_snapshot.get(
+                "report_duration_seconds"
+            ),
             **_history_version_metadata(h, login),
         })
     return result
@@ -163,5 +174,8 @@ def get_history_entry(
             "base_version": selected["base_version"],
             "instruction": selected["instruction"],
             "version_created_at": selected["created_at"],
+            "plan_approved_at": selected.get("plan_approved_at", ""),
+            "report_completed_at": selected.get("report_completed_at", ""),
+            "report_duration_seconds": selected.get("report_duration_seconds"),
         })
     return result

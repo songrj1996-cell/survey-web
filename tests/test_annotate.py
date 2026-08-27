@@ -2,6 +2,7 @@ import asyncio
 import io
 import json
 import unittest
+from datetime import datetime
 from unittest.mock import AsyncMock, patch
 
 import openpyxl
@@ -15,6 +16,69 @@ from app.services import annotate_workflow
 
 
 class AnnotateRuleTests(unittest.TestCase):
+    def test_quality_timing_starts_only_after_quality_is_formally_accepted(self):
+        start = datetime.fromisoformat("2026-08-25T10:00:00.000")
+        scenarios = (
+            (
+                "quality-only",
+                {"quality": True, "ai_detect": False},
+                {"ai_status": "skipped", "ai_confirmation_complete": True},
+            ),
+            (
+                "ai-no-review",
+                {"quality": True, "ai_detect": True},
+                {"ai_status": "complete", "ai_confirmation_complete": True},
+            ),
+        )
+        for name, tasks, state in scenarios:
+            with self.subTest(name=name):
+                sid = f"test-quality-start-{name}"
+                sess = {
+                    "rows": [["ID", "Q1"], ["P1", "answer"]],
+                    "open_text_cols": [1],
+                    "tasks": tasks,
+                    "quality_status": "pending",
+                    **state,
+                }
+                annotate_workflow.annotate_sessions[sid] = sess
+                self.addCleanup(annotate_workflow.annotate_sessions.pop, sid, None)
+
+                with patch.object(annotate_workflow, "_quality_now", return_value=start):
+                    annotate_workflow.validate_annotate_session_for_quality(sid)
+
+                self.assertEqual(
+                    sess["quality_started_at"],
+                    "2026-08-25T10:00:00.000",
+                )
+                self.assertEqual(sess["quality_status"], "running")
+
+    def test_manual_ai_review_wait_is_excluded_from_quality_timing(self):
+        sid = "test-quality-start-after-manual-confirm"
+        sess = {
+            "rows": [["ID", "Q1"], ["P1", "answer"]],
+            "open_text_cols": [1],
+            "tasks": {"quality": True, "ai_detect": True},
+            "ai_status": "complete",
+            "ai_confirmation_complete": False,
+            "quality_status": "pending",
+        }
+        annotate_workflow.annotate_sessions[sid] = sess
+        self.addCleanup(annotate_workflow.annotate_sessions.pop, sid, None)
+
+        with self.assertRaises(HTTPException):
+            annotate_workflow.validate_annotate_session_for_quality(sid)
+        self.assertNotIn("quality_started_at", sess)
+
+        sess["ai_confirmation_complete"] = True
+        with patch.object(
+            annotate_workflow,
+            "_quality_now",
+            return_value=datetime.fromisoformat("2026-08-25T10:05:00.000"),
+        ):
+            annotate_workflow.validate_annotate_session_for_quality(sid)
+
+        self.assertEqual(sess["quality_started_at"], "2026-08-25T10:05:00.000")
+
     def test_quality_prompt_keeps_bare_evaluations_invalid(self):
         prompt = DEFAULT_ANNOTATE_QUALITY_SYSTEM_PROMPT
 
@@ -500,6 +564,7 @@ class AnnotateReviewTests(unittest.IsolatedAsyncioTestCase):
             "headers": ["ID", "Q1"], "id_col": 0, "open_text_cols": [1],
             "tasks": {"quality": True}, "quality_status": "running",
             "quality_results": [existing], "missing_quality_ids": ["P2"],
+            "quality_started_at": "2026-08-25T10:00:00.000",
         }
         self.addCleanup(annotate_workflow.annotate_sessions.pop, sid, None)
 
@@ -514,6 +579,11 @@ class AnnotateReviewTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch.object(annotate_workflow, "_save_annotate_result_history", new=AsyncMock()),
             patch.object(annotate_workflow, "audit_log", new=AsyncMock()),
+            patch.object(
+                annotate_workflow,
+                "_quality_now",
+                return_value=datetime.fromisoformat("2026-08-25T10:02:05.600"),
+            ),
         ):
             events = [
                 self._decode_sse_event(raw)
@@ -524,6 +594,50 @@ class AnnotateReviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([row[0] for row in processed_rows], ["P2"])
         self.assertEqual([item["id"] for item in events[-1]["results"]], ["P1", "P2"])
         self.assertIs(annotate_workflow.annotate_sessions[sid]["quality_results"][0], existing)
+        self.assertEqual(events[-1]["quality_duration_seconds"], 126)
+        self.assertEqual(
+            annotate_workflow.annotate_sessions[sid]["quality_started_at"],
+            "2026-08-25T10:00:00.000",
+        )
+
+    async def test_missing_quality_labels_do_not_complete_timing(self):
+        sid = "test-quality-missing-does-not-complete-timing"
+        annotate_workflow.annotate_sessions[sid] = {
+            "rows": [["ID", "Q1"], ["P1", "answer"]],
+            "headers": ["ID", "Q1"],
+            "id_col": 0,
+            "open_text_cols": [1],
+            "tasks": {"quality": True},
+            "quality_status": "running",
+            "quality_started_at": "2026-08-25T10:00:00.000",
+        }
+        self.addCleanup(annotate_workflow.annotate_sessions.pop, sid, None)
+
+        with (
+            patch.object(
+                annotate_workflow,
+                "_run_one_quality_batch_strict",
+                new=AsyncMock(return_value=(1, [], {"P1"}, "漏返")),
+            ),
+            patch.object(
+                annotate_workflow,
+                "_repair_missing_translations",
+                new=AsyncMock(return_value=(set(), "")),
+            ),
+            patch.object(annotate_workflow, "_save_annotate_result_history", new=AsyncMock()),
+            patch.object(annotate_workflow, "audit_log", new=AsyncMock()),
+        ):
+            events = [
+                self._decode_sse_event(raw)
+                async for raw in annotate_workflow.quality_stream(sid, object())
+            ]
+
+        sess = annotate_workflow.annotate_sessions[sid]
+        self.assertEqual(sess["quality_status"], "incomplete")
+        self.assertEqual(sess["quality_started_at"], "2026-08-25T10:00:00.000")
+        self.assertNotIn("quality_completed_at", sess)
+        self.assertNotIn("quality_duration_seconds", sess)
+        self.assertIsNone(events[-1]["quality_duration_seconds"])
 
     async def test_stream_cancellation_cancels_orphaned_model_tasks(self):
         sid = "test-ai-cancel"
@@ -581,6 +695,7 @@ class AnnotateReviewTests(unittest.IsolatedAsyncioTestCase):
             "open_text_cols": [1],
             "tasks": {"quality": True},
             "ai_results": [],
+            "quality_started_at": "2026-08-25T10:00:00.000",
         }
         self.addCleanup(annotate_workflow.annotate_sessions.pop, sid, None)
         quality_result = {
@@ -607,6 +722,11 @@ class AnnotateReviewTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch.object(annotate_workflow, "_save_annotate_result_history", new=AsyncMock()),
             patch.object(annotate_workflow, "audit_log", new=AsyncMock()),
+            patch.object(
+                annotate_workflow,
+                "_quality_now",
+                return_value=datetime.fromisoformat("2026-08-25T10:01:05.600"),
+            ),
         ):
             events = [
                 self._decode_sse_event(raw)
@@ -617,6 +737,11 @@ class AnnotateReviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(done["type"], "quality_done")
         self.assertEqual(done["missing_ids"], [])
         self.assertEqual(done["missing_translation_ids"], ["P1"])
+        self.assertEqual(done["quality_duration_seconds"], 66)
+        self.assertEqual(
+            annotate_workflow.annotate_sessions[sid]["quality_completed_at"],
+            "2026-08-25T10:01:05.600",
+        )
         self.assertNotIn("missing_quality_ids", annotate_workflow.annotate_sessions[sid])
         self.assertEqual(
             annotate_workflow.annotate_sessions[sid]["missing_translation_ids"], ["P1"]

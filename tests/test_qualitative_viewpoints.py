@@ -1,3 +1,4 @@
+import json
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -5,7 +6,9 @@ import survey_stats
 
 from app.services import report_engine
 from app.services.qualitative_viewpoints import (
+    build_viewpoint_diagnostics,
     build_report_viewpoint_stats,
+    finalize_viewpoint_diagnostics,
     render_viewpoint_stats,
 )
 
@@ -60,6 +63,136 @@ class QualitativeViewpointTests(unittest.TestCase):
         self.assertIn("[RVIEW:t01]", rendered)
         self.assertIn("占相关题目4名有效回答玩家的50.0%", rendered)
         self.assertIn("目录外的综合判断必须标为“分析推断”", rendered)
+
+    def test_viewpoint_diagnostics_persist_only_sanitized_catalog_fields(self):
+        clustered = {
+            1: {
+                "col_name": "界面反馈",
+                "total": 3,
+                "all_themes": [{
+                    "id": "t01",
+                    "name": "按钮数量",
+                    "description": "secret-description",
+                    "count": 2,
+                    "percentage": 66.7,
+                    "source_quotes": ["secret-player-quote"],
+                    "respondent_keys": ["secret-player-id"],
+                }],
+            }
+        }
+        report_viewpoints = [{
+            "id": "RVIEW:t01",
+            "name": "入口理解",
+            "description": "secret-report-description",
+            "count": 2,
+            "denominator": 3,
+            "percentage": 66.7,
+            "source_questions": ["界面反馈"],
+            "quotes": ["secret-report-quote"],
+        }]
+        rendered = render_viewpoint_stats(clustered, report_viewpoints)
+
+        diagnostics = build_viewpoint_diagnostics(
+            clustered,
+            report_viewpoints,
+            rendered,
+            cluster_diagnostics={
+                "1": {
+                    "status": "failed",
+                    "quality_status": "degraded",
+                    "phase_a": [{
+                        "error": "TimeoutError: secret-player-error-detail",
+                    }],
+                },
+            },
+            cluster_metrics={
+                "scope_concurrency": 2,
+                "elapsed_seconds": 1.5,
+                "unsafe_extra": "secret-metric",
+            },
+        )
+        serialized = json.dumps(diagnostics, ensure_ascii=False)
+
+        self.assertEqual(diagnostics["catalog"]["entry_count"], 2)
+        self.assertEqual(diagnostics["catalog"]["question_viewpoint_count"], 1)
+        self.assertEqual(diagnostics["catalog"]["report_viewpoint_count"], 1)
+        self.assertEqual(len(diagnostics["catalog"]["rendered_sha256"]), 64)
+        self.assertEqual(
+            diagnostics["cluster"]["metrics"],
+            {"scope_concurrency": 2, "elapsed_seconds": 1.5},
+        )
+        self.assertEqual(
+            diagnostics["cluster"]["error_type_counts"], {"timeout": 1}
+        )
+        self.assertEqual(
+            diagnostics["cluster"]["error_stage_counts"], {"phase_a": 1}
+        )
+        self.assertNotIn("secret-", serialized)
+        self.assertNotIn("respondent_keys", serialized)
+        self.assertNotIn("quotes", serialized)
+        self.assertNotIn("description", serialized)
+
+    def test_viewpoint_diagnostics_distinguish_failure_boundaries(self):
+        catalog = build_viewpoint_diagnostics(
+            {
+                1: {
+                    "col_name": "界面反馈",
+                    "total": 1,
+                    "themes": [{
+                        "id": "t01", "name": "入口难找",
+                        "count": 1, "percentage": 100.0,
+                    }],
+                }
+            },
+            [],
+            "<subjective_viewpoint_stats>catalog</subjective_viewpoint_stats>",
+        )
+        report_without_mentions = "**观点：入口难找**\n\n- **主要发现**：需要优化。"
+
+        context_missing = finalize_viewpoint_diagnostics(
+            catalog,
+            report_without_mentions,
+            writer_context_included=False,
+        )
+        writer_omission = finalize_viewpoint_diagnostics(
+            catalog,
+            report_without_mentions,
+            writer_context_included=True,
+        )
+        catalog_unavailable = finalize_viewpoint_diagnostics(
+            build_viewpoint_diagnostics({}, [], ""),
+            report_without_mentions,
+            writer_context_included=False,
+        )
+        complete = finalize_viewpoint_diagnostics(
+            catalog,
+            report_without_mentions + "\n\n**提及情况：** 1名玩家提及。",
+            writer_context_included=True,
+        )
+        writer_no_viewpoints = finalize_viewpoint_diagnostics(
+            catalog,
+            "## Part 1 界面反馈\n\n没有输出观点块。",
+            writer_context_included=True,
+        )
+
+        self.assertEqual(
+            context_missing["writer_output"]["status"], "context_missing"
+        )
+        self.assertEqual(
+            writer_omission["writer_output"]["status"], "writer_omission"
+        )
+        self.assertEqual(
+            catalog_unavailable["writer_output"]["status"],
+            "catalog_unavailable",
+        )
+        self.assertEqual(complete["writer_output"]["status"], "complete")
+        self.assertEqual(
+            writer_no_viewpoints["writer_output"]["status"],
+            "writer_no_viewpoints",
+        )
+        self.assertEqual(
+            writer_omission["writer_output"]["missing_mention_count"], 1
+        )
 
 
 class CrossQuestionViewpointTests(unittest.IsolatedAsyncioTestCase):

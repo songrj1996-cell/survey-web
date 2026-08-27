@@ -2,7 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
+from copy import deepcopy
+import hashlib
+import re
+import time
+
 from app.services import report_engine
+
+
+_VIEWPOINT_BLOCK_RE = re.compile(r"(?m)^[ \t]*\*\*观点：")
+_MENTION_BLOCK_RE = re.compile(r"(?m)^[ \t]*\*\*提及情况：")
+_INFERENCE_BLOCK_RE = re.compile(r"(?m)^[ \t]*\*\*分析推断：")
+_VAGUE_VIEWPOINT_TERMS = ("多数玩家", "多位玩家", "部分玩家", "少数玩家")
 
 
 def _question_label(data: dict) -> str:
@@ -80,46 +92,127 @@ async def build_report_viewpoint_stats(
     plan: dict,
     headers: list[str],
 ):
-    """跨题合并观点并回跑全部原文；yield progress/heartbeat/result。"""
+    """跨题合并观点并回跑全部原文；yield analysis_progress/heartbeat/result。"""
+    synthesis_started = time.monotonic()
     candidates = _cross_question_candidates(clustered_themes)
     evidence = _flatten_evidence(open_text, plan, headers)
     if len(clustered_themes) < 2 or not candidates or not evidence:
         yield ("result", [])
         return
 
-    yield ("progress", "正在按报告分析结构合并跨题观点")
-    organization = _report_organization(plan)
-    merge_result = await report_engine._direct_json_call(
-        report_engine._get_theme_merge_system_prompt()
-        + (
-            "\n\n跨题观点额外规则：最终主题必须是玩家能够在一条回答中直接表达的具体观点。"
-            "可以合并不同题目里意思相同的玩家说法，但禁止创造‘A影响B’‘A导致B’‘A与B有关’"
-            "等需要比较多题、客观统计或多类证据才能得出的关系、标准、框架或产品判断；"
-            "这类内容属于分析推断，不进入玩家观点目录。"
-        ),
-        report_engine._build_theme_merge_query(
-            f"跨题报告观点；报告组织方式：{organization}",
-            candidates,
-            len(evidence),
-        ),
-        models=(
-            report_engine.LLM_THEME_MERGE_MODEL,
-            *report_engine.LLM_THEME_MERGE_FALLBACK_MODELS,
-        ),
-        max_tokens=report_engine.LLM_THEME_MERGE_MAX_TOKENS,
-        reasoning_effort=report_engine.LLM_THEME_MERGE_REASONING or None,
-        validator=lambda data: report_engine._validate_merged_themes(data, candidates),
+    yield (
+        "analysis_progress",
+        {
+            "phase": "synthesis",
+            "phase_index": 2,
+            "phase_total": 4,
+            "status": "active",
+            "step": "merging",
+            "message": "正在合并不同题目中含义相近的玩家观点",
+            "impact": "none",
+        },
     )
+    organization = _report_organization(plan)
+    repair_events: asyncio.Queue = asyncio.Queue()
+
+    async def _merge():
+        return await report_engine._direct_json_call(
+            report_engine._get_theme_merge_system_prompt()
+            + (
+                "\n\n跨题观点额外规则：最终主题必须是玩家能够在一条回答中直接表达的具体观点。"
+                "可以合并不同题目里意思相同的玩家说法，但禁止创造‘A影响B’‘A导致B’‘A与B有关’"
+                "等需要比较多题、客观统计或多类证据才能得出的关系、标准、框架或产品判断；"
+                "这类内容属于分析推断，不进入玩家观点目录。"
+            ),
+            report_engine._build_theme_merge_query(
+                f"跨题报告观点；报告组织方式：{organization}",
+                candidates,
+                len(evidence),
+            ),
+            models=(
+                report_engine.LLM_THEME_MERGE_MODEL,
+                *report_engine.LLM_THEME_MERGE_FALLBACK_MODELS,
+            ),
+            max_tokens=report_engine.LLM_THEME_MERGE_MAX_TOKENS,
+            reasoning_effort=report_engine.LLM_THEME_MERGE_REASONING or None,
+            validator=lambda data: report_engine._validate_merged_themes(data, candidates),
+            on_repair=lambda error: repair_events.put_nowait({"error": error}),
+        )
+
+    merge_result = None
+    async for event_type, payload in report_engine._run_bounded_calls(
+        [_merge], 1, repair_events
+    ):
+        if event_type == "heartbeat":
+            yield ("heartbeat", "")
+        elif event_type == "call_progress":
+            yield (
+                "analysis_progress",
+                {
+                    "phase": "synthesis",
+                    "phase_index": 2,
+                    "phase_total": 4,
+                    "status": "retrying",
+                    "step": "merging",
+                    "retry_index": 1,
+                    "retry_total": 1,
+                    "message": "跨题归纳未通过校验，正在自动修正并重新调用（1/1）",
+                    "impact": "各题主题和原文仍完整保留",
+                },
+            )
+        else:
+            _batch_index, merge_result = payload
+    merge_result = merge_result or {}
     merged = merge_result.get("data") if isinstance(merge_result, dict) else None
     themes = merged.get("themes", []) if isinstance(merged, dict) else []
     if not themes:
+        yield (
+            "analysis_progress",
+            {
+                "phase": "synthesis",
+                "phase_index": 2,
+                "phase_total": 4,
+                "status": "degraded",
+                "step": "completed",
+                "message": "跨题观点归纳未完成，继续使用各题分析结果撰写报告",
+                "impact": (
+                    "各题主题和原文均保留，但跨题共同观点及其去重人数可能缺失"
+                ),
+                "elapsed_seconds": round(time.monotonic() - synthesis_started, 3),
+            },
+        )
         yield ("result", [])
         return
+    if merge_result.get("repaired"):
+        yield (
+            "analysis_progress",
+            {
+                "phase": "synthesis",
+                "phase_index": 2,
+                "phase_total": 4,
+                "status": "recovered",
+                "step": "merging",
+                "message": "跨题归纳自动修正成功，正在回查全部原文",
+                "impact": "none",
+            },
+        )
 
     batches = [
         evidence[index:index + report_engine.BATCH_SIZE]
         for index in range(0, len(evidence), report_engine.BATCH_SIZE)
     ]
+    yield (
+        "analysis_progress",
+        {
+            "phase": "synthesis",
+            "phase_index": 2,
+            "phase_total": 4,
+            "status": "active",
+            "step": "classifying",
+            "message": f"正在回查全部原文并统计跨题观点（共 {len(batches)} 批）",
+            "impact": "none",
+        },
+    )
     factories = []
     for batch in batches:
         async def _classify(batch=batch):
@@ -188,6 +281,26 @@ async def build_report_viewpoint_stats(
             "quotes": quotes[theme_id],
         })
     result.sort(key=lambda item: item["count"], reverse=True)
+    fallback_count = sum(
+        item.get("fallback_count", 0) for item in classified.values()
+    )
+    yield (
+        "analysis_progress",
+        {
+            "phase": "synthesis",
+            "phase_index": 2,
+            "phase_total": 4,
+            "status": "degraded" if fallback_count else "completed",
+            "step": "completed",
+            "viewpoint_count": len(result),
+            "message": f"跨题归纳完成，共形成 {len(result)} 个跨题观点",
+            "impact": (
+                f"有 {fallback_count} 条回答未能归入跨题观点；单题结果和原文不受影响"
+                if fallback_count else "none"
+            ),
+            "elapsed_seconds": round(time.monotonic() - synthesis_started, 3),
+        },
+    )
     yield ("result", result)
 
 
@@ -223,3 +336,204 @@ def render_viewpoint_stats(clustered_themes: dict, report_viewpoints: list[dict]
             )
     lines.append("</subjective_viewpoint_stats>")
     return "\n".join(lines)
+
+
+def _diagnostic_number(value, default=0):
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float)):
+        return value
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _diagnostic_error_type(value) -> str:
+    text = str(value or "").lower()
+    for error_type, markers in (
+        ("timeout", ("timeout", "timed out", "超时")),
+        ("rate_limit", ("rate limit", "ratelimit", "429", "限流")),
+        ("authentication", ("authentication", "unauthorized", "401", "鉴权")),
+        ("connection", ("connection", "connecterror", "network", "网络")),
+        ("json_validation", ("json", "validation", "schema", "校验")),
+        ("empty_output", ("empty", "为空", "无有效")),
+    ):
+        if any(marker in text for marker in markers):
+            return error_type
+    return "other"
+
+
+def _diagnostic_error_counts(diagnostics: dict) -> tuple[dict, dict]:
+    type_counts: dict[str, int] = {}
+    stage_counts: dict[str, int] = {}
+
+    def collect(value, stage: str = "unknown") -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                next_stage = str(key) if str(key).startswith("phase_") else stage
+                if str(key) == "error" and item:
+                    error_type = _diagnostic_error_type(item)
+                    type_counts[error_type] = type_counts.get(error_type, 0) + 1
+                    stage_counts[next_stage] = stage_counts.get(next_stage, 0) + 1
+                else:
+                    collect(item, next_stage)
+        elif isinstance(value, list):
+            for item in value:
+                collect(item, stage)
+
+    collect(diagnostics)
+    return type_counts, stage_counts
+
+
+def build_viewpoint_diagnostics(
+    clustered_themes: dict,
+    report_viewpoints: list[dict],
+    viewpoint_stats_md: str,
+    *,
+    cluster_diagnostics: dict | None = None,
+    cluster_metrics: dict | None = None,
+) -> dict:
+    """Build a per-report, privacy-safe snapshot of the viewpoint pipeline."""
+    catalog_entries: list[dict] = []
+    question_viewpoint_count = 0
+    for scope_key, data in (clustered_themes or {}).items():
+        question = _question_label(data)
+        denominator = int(_diagnostic_number(data.get("total"), 0))
+        for theme in data.get("all_themes") or data.get("themes") or []:
+            count = int(_diagnostic_number(theme.get("count"), 0))
+            if not count or not denominator:
+                continue
+            question_viewpoint_count += 1
+            catalog_entries.append({
+                "id": f"QVIEW:{scope_key}:{theme.get('id', '')}",
+                "kind": "question",
+                "name": str(theme.get("name") or "").strip(),
+                "count": count,
+                "denominator": denominator,
+                "percentage": _diagnostic_number(theme.get("percentage"), 0),
+                "source_questions": [question],
+            })
+
+    report_viewpoint_count = 0
+    for item in report_viewpoints or []:
+        count = int(_diagnostic_number(item.get("count"), 0))
+        denominator = int(_diagnostic_number(item.get("denominator"), 0))
+        if not count or not denominator:
+            continue
+        report_viewpoint_count += 1
+        catalog_entries.append({
+            "id": str(item.get("id") or "").strip(),
+            "kind": "report",
+            "name": str(item.get("name") or "").strip(),
+            "count": count,
+            "denominator": denominator,
+            "percentage": _diagnostic_number(item.get("percentage"), 0),
+            "source_questions": [
+                str(question).strip()
+                for question in item.get("source_questions") or []
+                if str(question).strip()
+            ],
+        })
+
+    diagnostics = cluster_diagnostics or {}
+    failed_scope_count = sum(
+        1 for item in diagnostics.values()
+        if isinstance(item, dict) and item.get("status") == "failed"
+    )
+    degraded_scope_count = sum(
+        1 for item in diagnostics.values()
+        if isinstance(item, dict) and item.get("quality_status") == "degraded"
+    )
+    error_type_counts, error_stage_counts = _diagnostic_error_counts(diagnostics)
+    if failed_scope_count and failed_scope_count == len(diagnostics):
+        cluster_status = "failed"
+    elif failed_scope_count or degraded_scope_count:
+        cluster_status = "degraded"
+    elif clustered_themes:
+        cluster_status = "completed"
+    else:
+        cluster_status = "empty"
+
+    safe_metrics = {}
+    for key in ("scope_concurrency", "elapsed_seconds"):
+        value = (cluster_metrics or {}).get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            safe_metrics[key] = value
+
+    rendered = str(viewpoint_stats_md or "")
+    return {
+        "schema_version": 1,
+        "cluster": {
+            "status": cluster_status,
+            "scope_count": len(clustered_themes or {}),
+            "failed_scope_count": failed_scope_count,
+            "degraded_scope_count": degraded_scope_count,
+            "error_type_counts": error_type_counts,
+            "error_stage_counts": error_stage_counts,
+            "metrics": safe_metrics,
+        },
+        "catalog": {
+            "question_viewpoint_count": question_viewpoint_count,
+            "report_viewpoint_count": report_viewpoint_count,
+            "entry_count": len(catalog_entries),
+            "rendered": bool(rendered.strip()),
+            "rendered_char_count": len(rendered),
+            "rendered_sha256": (
+                hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+                if rendered else ""
+            ),
+            "entries": catalog_entries,
+        },
+        "writer_context": {
+            "included": False,
+        },
+        "writer_output": {
+            "status": "not_checked",
+        },
+    }
+
+
+def finalize_viewpoint_diagnostics(
+    diagnostics: dict,
+    report_md: str,
+    *,
+    writer_context_included: bool,
+) -> dict:
+    """Add Writer propagation/compliance facts without changing report output."""
+    result = deepcopy(diagnostics)
+    catalog_count = int(
+        _diagnostic_number(result.get("catalog", {}).get("entry_count"), 0)
+    )
+    viewpoint_block_count = len(_VIEWPOINT_BLOCK_RE.findall(report_md or ""))
+    mention_block_count = len(_MENTION_BLOCK_RE.findall(report_md or ""))
+    inference_block_count = len(_INFERENCE_BLOCK_RE.findall(report_md or ""))
+    missing_mention_count = max(0, viewpoint_block_count - mention_block_count)
+
+    if not catalog_count and viewpoint_block_count:
+        status = "catalog_unavailable"
+    elif catalog_count and not writer_context_included:
+        status = "context_missing"
+    elif catalog_count and not viewpoint_block_count:
+        status = "writer_no_viewpoints"
+    elif missing_mention_count:
+        status = "writer_omission"
+    elif not catalog_count and not viewpoint_block_count:
+        status = "not_applicable"
+    else:
+        status = "complete"
+
+    result["writer_context"] = {
+        "included": bool(writer_context_included),
+    }
+    result["writer_output"] = {
+        "status": status,
+        "viewpoint_block_count": viewpoint_block_count,
+        "mention_block_count": mention_block_count,
+        "missing_mention_count": missing_mention_count,
+        "analysis_inference_block_count": inference_block_count,
+        "vague_reference_count": sum(
+            str(report_md or "").count(term) for term in _VAGUE_VIEWPOINT_TERMS
+        ),
+    }
+    return result

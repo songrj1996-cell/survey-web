@@ -51,6 +51,10 @@ class ReportWriterStructureTests(unittest.TestCase):
         self.assertIn("<subjective_viewpoint_stats>", requirements)
         self.assertIn("`**分析推断：短标题**`", requirements)
         self.assertIn("不得表述为“玩家认为/玩家提及”", requirements)
+        self.assertIn("每个 `**观点：观点短标题**` 观点块结束后，必须立即单独写", requirements)
+        self.assertIn("每个观点必须分别选择 1–5 条能直接支撑该观点的反馈", requirements)
+        self.assertIn("禁止将多个观点的引用合并成 Part 末尾的公共引用表", requirements)
+        self.assertIn("不得编造、重复或挪用其它观点的反馈", requirements)
         self.assertIn("必须同时说明对应分母或有效回答范围", requirements)
         self.assertNotIn("**不使用百分比，也不使用精确人数**", requirements)
         self.assertIn("### 少数但值得关注的反馈", requirements)
@@ -87,6 +91,11 @@ class ReportWriterStructureTests(unittest.TestCase):
         self.assertIn("玩家直接表达的观点", query)
         self.assertIn("<subjective_viewpoint_stats>", query)
         self.assertIn("`**分析推断：短标题**`", query)
+        self.assertIn("每个玩家直接表达的 `**观点：短标题**` 观点块结束后，必须立即单独写", query)
+        self.assertIn("该观点自己的 1–5 条 `玩家ID | 画像信息 | 中文翻译` 证据表", query)
+        self.assertIn("不足 5 条时展示该观点的全部可用证据", query)
+        self.assertIn("禁止将多个观点的引用合并成 Part 末尾的公共引用表", query)
+        self.assertIn("不得挪用其他观点的证据", query)
 
     def test_filtered_part_context_excludes_other_option_responses(self):
         plan = {

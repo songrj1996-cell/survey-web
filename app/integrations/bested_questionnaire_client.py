@@ -92,6 +92,7 @@ _XLSX_MAX_MERGED_CELLS_PER_RANGE = 100_000
 _XLSX_MAX_TOTAL_MERGED_CELLS_PER_SHEET = 1_000_000
 _ZIP_READ_CHUNK_BYTES = 1024 * 1024
 _BESTED_ROLE_MAP = {
+    "描述题": "ignore",
     "单选题": "single_choice",
     "多选题": "multi_choice",
     "矩阵单选题": "matrix_single",
