@@ -788,6 +788,7 @@
             <button class="step-bar__item step-bar__item--active" data-iv-v2-step="1"><span class="step-bar__num">1</span><span class="step-bar__label">上传预检</span></button>
             <button class="step-bar__item" data-iv-v2-step="2"><span class="step-bar__num">2</span><span class="step-bar__label">分组映射</span></button>
             <button class="step-bar__item" data-iv-v2-step="3"><span class="step-bar__num">3</span><span class="step-bar__label">确认检查点</span></button>
+            <button class="step-bar__item" data-iv-v2-step="4"><span class="step-bar__num">4</span><span class="step-bar__label">玩家档案</span></button>
           </div>
           <div class="panel__header">
             <div class="iv-eyebrow">INTERVIEW REPORT V2</div>
@@ -918,6 +919,7 @@
             <button class="step-bar__item step-bar__item--done" data-iv-v2-step="1"><span class="step-bar__num">1</span><span class="step-bar__label">上传预检</span></button>
             <button class="step-bar__item step-bar__item--active" data-iv-v2-step="2"><span class="step-bar__num">2</span><span class="step-bar__label">分组映射</span></button>
             <button class="step-bar__item" data-iv-v2-step="3"><span class="step-bar__num">3</span><span class="step-bar__label">确认检查点</span></button>
+            <button class="step-bar__item" data-iv-v2-step="4"><span class="step-bar__num">4</span><span class="step-bar__label">玩家档案</span></button>
           </div>
           <div class="iv-v2-editor-shell" id="iv-v2-editor-shell">
             <div class="iv-v2-toolbar">
@@ -1045,6 +1047,7 @@
             <button class="step-bar__item step-bar__item--done" data-iv-v2-step="1"><span class="step-bar__num">1</span><span class="step-bar__label">上传预检</span></button>
             <button class="step-bar__item step-bar__item--done" data-iv-v2-step="2"><span class="step-bar__num">2</span><span class="step-bar__label">分组映射</span></button>
             <button class="step-bar__item step-bar__item--active" data-iv-v2-step="3"><span class="step-bar__num">3</span><span class="step-bar__label">确认检查点</span></button>
+            <button class="step-bar__item" data-iv-v2-step="4"><span class="step-bar__num">4</span><span class="step-bar__label">玩家档案</span></button>
           </div>
           <div class="panel__header">
             <div class="iv-eyebrow">GROUP_MAPPING_CONFIRMED</div>
@@ -1053,18 +1056,46 @@
           </div>
           <div class="iv-v2-confirmed-shell" id="iv-v2-confirmed-shell">
             <div id="iv-v2-confirmed-meta"></div>
-            <section class="iv-v2-side-card">
-              <div class="iv-v2-side-card__title">最终玩家预览</div>
-              <div id="iv-v2-confirmed-preview"></div>
-            </section>
-            <section class="iv-v2-side-card">
-              <div class="iv-v2-side-card__title">版本历史</div>
-              <div id="iv-v2-confirmed-history"></div>
-            </section>
-            <div class="iv-v2-confirmed-actions">
-              <button class="btn btn--ghost" id="iv-v2-back-to-editor" type="button">返回映射编辑器</button>
-              <button class="btn btn--primary" id="iv-v2-start-over" type="button">重新上传新工作簿</button>
+            <div id="iv-v2-review-workspace">
+              <section class="iv-v2-side-card">
+                <div class="iv-v2-side-card__title">最终玩家预览</div>
+                <div id="iv-v2-confirmed-preview"></div>
+              </section>
+              <section class="iv-v2-side-card">
+                <div class="iv-v2-side-card__title">版本历史</div>
+                <div id="iv-v2-confirmed-history"></div>
+              </section>
+              <div class="iv-v2-confirmed-actions">
+                <button class="btn btn--ghost" id="iv-v2-back-to-editor" type="button">返回映射编辑器</button>
+                <button class="btn btn--primary" id="iv-v2-start-over" type="button">重新上传新工作簿</button>
+              </div>
             </div>
+            <section class="iv-v2-dossier-workbench" id="iv-v2-dossier-workbench" hidden aria-label="玩家档案工作台">
+              <header class="iv-v2-dossier-head">
+                <div>
+                  <div class="iv-eyebrow">PARTICIPANT DOSSIERS</div>
+                  <h2>玩家属性与单玩家逻辑</h2>
+                  <p>每项事实和判断都由服务端绑定当前玩家证据；分析标签不会冒充玩家明确表达。</p>
+                </div>
+                <div class="iv-v2-toolbar__actions">
+                  <button class="btn btn--ghost btn--sm" type="button" data-iv-v2-action="dossier-back">返回分析边界</button>
+                  <button class="btn btn--ghost btn--sm" type="button" data-iv-v2-action="dossier-refresh">刷新档案状态</button>
+                </div>
+              </header>
+              <div id="iv-v2-dossier-status" role="status" aria-live="polite"></div>
+              <div class="iv-v2-dossier-layout">
+                <aside class="iv-v2-dossier-participants">
+                  <div class="iv-v2-side-card__title">玩家列表</div>
+                  <div id="iv-v2-dossier-participant-list"></div>
+                </aside>
+                <main class="iv-v2-dossier-main" id="iv-v2-dossier-main"></main>
+                <aside class="iv-v2-dossier-evidence" id="iv-v2-dossier-evidence">
+                  <div class="iv-v2-side-card__title">证据来源</div>
+                  <div id="iv-v2-dossier-evidence-content" class="iv-v2-empty">点击档案中的证据编号查看原始来源。</div>
+                </aside>
+              </div>
+            </section>
+          </div>
           </div>
         </div>
       </section>

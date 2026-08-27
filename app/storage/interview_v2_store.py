@@ -36,7 +36,7 @@ _STORE_LOCK = threading.RLock()
 _MAPPING_LOCK_TIMEOUT_SECONDS = 10.0
 _MAPPING_LOCK_POLL_SECONDS = 0.025
 _ID_RE = re.compile(
-    r"^(?:upload|job|project|import|workbook|mapping|structure|evidence|boundary|coverage)_[0-9a-f]{32}$"
+    r"^(?:upload|job|project|import|workbook|mapping|structure|evidence|boundary|coverage|dossier)_[0-9a-f]{32}$"
 )
 _EVIDENCE_ID_RE = re.compile(r"^(?:ev|evidence)_[0-9a-f]{32}$")
 _REVIEW_ISSUE_ID_RE = re.compile(r"^(?:issue|review)_[0-9a-f]{32}$")
@@ -4468,3 +4468,129 @@ def confirm_analysis_boundary_cas(
             )
             _atomic_write_json(state_path, next_state)
             return _load_analysis_boundary_head_locked(next_state)["state"]
+
+
+# Participant dossier checkpoint -------------------------------------------------
+
+def _dossier_participant_dir(project_id: str, participant_id: str) -> Path:
+    project_id = validate_resource_id(project_id, "project")
+    participant_id = _validate_entity_id(
+        participant_id, _PARTICIPANT_ID_RE, "participant"
+    )
+    return _safe_child("projects", project_id, "participant_dossiers", participant_id)
+
+
+def _dossier_digest(revision: dict[str, Any]) -> str:
+    payload = {key: value for key, value in revision.items() if key != "revision_payload_sha256"}
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def load_current_participant_dossier(
+    project_id: str, participant_id: str
+) -> dict[str, Any] | None:
+    directory = _dossier_participant_dir(project_id, participant_id)
+    with _STORE_LOCK:
+        with _mapping_process_lock(project_id):
+            state = _read_json(directory / "state.json")
+            if state is None:
+                return None
+            revision_id = validate_resource_id(
+                str(state.get("current_dossier_version_id") or ""), "dossier"
+            )
+            revision = _read_json(directory / "versions" / f"{revision_id}.json")
+            if revision is None:
+                raise ValueError("current participant dossier revision is missing")
+            declared = str(revision.get("revision_payload_sha256") or "")
+            if not _SHA256_RE.fullmatch(declared) or _dossier_digest(revision) != declared:
+                raise ValueError("participant dossier revision digest mismatch")
+            return {"state": state, "revision": revision}
+
+
+def save_participant_dossier_cas(
+    *,
+    project_id: str,
+    participant_id: str,
+    base_dossier_version_id: str | None,
+    revision: dict[str, Any],
+) -> dict[str, Any]:
+    directory = _dossier_participant_dir(project_id, participant_id)
+    revision_id = validate_resource_id(
+        str(revision.get("dossier_version_id") or ""), "dossier"
+    )
+    with _STORE_LOCK:
+        with _mapping_process_lock(project_id):
+            state_path = directory / "state.json"
+            current = _read_json(state_path)
+            current_id = (
+                str(current.get("current_dossier_version_id") or "")
+                if current else None
+            )
+            if current_id != base_dossier_version_id:
+                raise ValueError("participant dossier version conflict")
+            next_number = int((current or {}).get("current_version_number") or 0) + 1
+            durable = deepcopy(revision)
+            durable["project_id"] = project_id
+            durable["participant_id"] = participant_id
+            durable["version_number"] = next_number
+            durable["revision_payload_sha256"] = _dossier_digest(durable)
+            version_path = directory / "versions" / f"{revision_id}.json"
+            if version_path.exists():
+                raise ValueError("participant dossier revision already exists")
+            _atomic_write_json(version_path, durable)
+            history = list((current or {}).get("history") or [])
+            history.append({
+                "dossier_version_id": revision_id,
+                "version_number": next_number,
+                "revision_payload_sha256": durable["revision_payload_sha256"],
+                "created_at": durable.get("created_at"),
+                "status": durable.get("status"),
+            })
+            next_state = {
+                "project_id": project_id,
+                "participant_id": participant_id,
+                "current_dossier_version_id": revision_id,
+                "current_version_number": next_number,
+                "status": durable.get("status"),
+                "source": deepcopy(durable.get("source") or {}),
+                "history": history,
+            }
+            _atomic_write_json(state_path, next_state)
+            return {"state": next_state, "revision": durable}
+
+
+def review_participant_dossier_cas(
+    *,
+    project_id: str,
+    participant_id: str,
+    base_dossier_version_id: str,
+    decision: str,
+    note: str,
+    actor: str,
+    reviewed_at: str,
+) -> dict[str, Any]:
+    current = load_current_participant_dossier(project_id, participant_id)
+    if current is None or (
+        current["state"].get("current_dossier_version_id") != base_dossier_version_id
+    ):
+        raise ValueError("participant dossier version conflict")
+    revision = deepcopy(current["revision"])
+    revision["dossier_version_id"] = f"dossier_{uuid.uuid4().hex}"
+    revision.pop("revision_payload_sha256", None)
+    revision.pop("version_number", None)
+    revision["status"] = "approved" if decision == "approved" else "needs_changes"
+    revision["review"] = {
+        "decision": decision,
+        "note": note,
+        "reviewed_by": actor,
+        "reviewed_at": reviewed_at,
+    }
+    revision["created_at"] = reviewed_at
+    return save_participant_dossier_cas(
+        project_id=project_id,
+        participant_id=participant_id,
+        base_dossier_version_id=base_dossier_version_id,
+        revision=revision,
+    )

@@ -23,6 +23,8 @@ from app.core.config import (
     DEFAULT_INTERVIEW_EXTRACT_SYSTEM_PROMPT,
     DEFAULT_INTERVIEW_REPAIR_SYSTEM_PROMPT,
     DEFAULT_INTERVIEW_REPORT_SYSTEM_PROMPT,
+    DEFAULT_INTERVIEW_V2_ATTRIBUTE_SYSTEM_PROMPT,
+    DEFAULT_INTERVIEW_V2_DOSSIER_SYSTEM_PROMPT,
     DEFAULT_LARGE_SAMPLE_WRITER_REQUIREMENTS,
     DEFAULT_PLANNER_EXTRA,
     DEFAULT_QUESTIONNAIRE_TRANSLATION_SYSTEM_PROMPT,
@@ -344,6 +346,26 @@ DEFAULT_PROMPTS: dict = {
         kind="system",
         current=DEFAULT_INTERVIEW_AUDIT_SYSTEM_PROMPT,
     ),
+    "interview_v2_attribute_system": _prompt(
+        "interview_v2_attribute_system",
+        "访谈 V2 玩家属性抽取 System Prompt",
+        "仅从当前玩家背景证据抽取可追溯属性事实和独立分析标签。",
+        group="访谈报告",
+        group_order=60,
+        order=50,
+        kind="system",
+        current=DEFAULT_INTERVIEW_V2_ATTRIBUTE_SYSTEM_PROMPT,
+    ),
+    "interview_v2_dossier_system": _prompt(
+        "interview_v2_dossier_system",
+        "访谈 V2 玩家档案 System Prompt",
+        "基于当前玩家证据白名单重建行为逻辑、矛盾和缺失信息。",
+        group="访谈报告",
+        group_order=60,
+        order=60,
+        kind="system",
+        current=DEFAULT_INTERVIEW_V2_DOSSIER_SYSTEM_PROMPT,
+    ),
 }
 
 
@@ -559,3 +581,11 @@ def _get_interview_repair_system_prompt() -> str:
 
 def _get_interview_audit_system_prompt() -> str:
     return _get_prompt_text("interview_audit_system")
+
+
+def _get_interview_v2_attribute_system_prompt() -> str:
+    return _get_prompt_text("interview_v2_attribute_system")
+
+
+def _get_interview_v2_dossier_system_prompt() -> str:
+    return _get_prompt_text("interview_v2_dossier_system")

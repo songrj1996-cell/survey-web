@@ -105,4 +105,38 @@ def get_interview_import_with_structure_status(
         )
 
     public["status"] = boundary_status
+    if boundary_status == "READY_FOR_DOSSIERS":
+        evidence_revision_id = str(
+            boundary_state.get("current_evidence_revision_id") or ""
+        )
+        if not evidence_revision_id:
+            return public
+        evidence_revision = store.load_evidence_revision(
+            str(public.get("project_id") or ""),
+            evidence_revision_id,
+        )
+        payload = (evidence_revision or {}).get("evidence") or {}
+        participants = (
+            (evidence_revision or {}).get("expected_participants")
+            or payload.get("expected_participants")
+            or []
+        )
+        summary = {
+            "participant_count": len(participants),
+            "not_generated_count": 0,
+            "generated_count": 0,
+            "approved_count": 0,
+            "needs_changes_count": 0,
+        }
+        for participant in participants:
+            current = store.load_current_participant_dossier(
+                str(public.get("project_id") or ""),
+                str(participant.get("participant_id") or ""),
+            )
+            status = str((current or {}).get("revision", {}).get("status") or "not_generated")
+            key = f"{status}_count"
+            if key not in summary:
+                key = "generated_count"
+            summary[key] += 1
+        public["dossier_summary"] = summary
     return public

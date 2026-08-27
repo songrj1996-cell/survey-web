@@ -31,6 +31,12 @@ from app.schemas.interview_v2_mapping import (
     InterviewV2GroupMappingResponse,
     InterviewV2GroupProposalResponse,
 )
+from app.schemas.interview_v2_dossier import (
+    InterviewV2DossierGenerateRequest,
+    InterviewV2DossierReviewRequest,
+    InterviewV2DossierResponse,
+    InterviewV2ParticipantListResponse,
+)
 from app.schemas.interview_v2_structure import (
     InterviewV2EvidenceContextResponse,
     InterviewV2ReviewIssueBatchRequest,
@@ -60,6 +66,12 @@ from app.services.interview_v2_mapping_service import (
     get_group_proposals,
     restore_group_mapping,
     save_group_mapping,
+)
+from app.services.interview_v2_dossier_service import (
+    get_current_dossier,
+    list_participants,
+    regenerate_dossier,
+    review_dossier,
 )
 from app.services.interview_v2_status_service import (
     get_interview_import_with_structure_status as get_interview_import,
@@ -914,6 +926,80 @@ async def get_interview_coverage_preview(import_id: str, request: Request):
     try:
         return await run_in_threadpool(
             get_coverage_preview, import_id, login
+        )
+    except InterviewV2ImportError as exc:
+        return _service_error_response(request, exc)
+
+
+@router.get(
+    "/api/v1/interview-projects/{project_id}/participants",
+    response_model=InterviewV2ParticipantListResponse,
+)
+async def get_interview_v2_participants(project_id: str, request: Request):
+    login = await _require_feature(request, "interview")
+    if not INTERVIEW_V2_ENABLED:
+        return _disabled_response(request)
+    try:
+        return await run_in_threadpool(list_participants, project_id, login)
+    except InterviewV2ImportError as exc:
+        return _service_error_response(request, exc)
+
+
+@router.get(
+    "/api/v1/interview-participants/{participant_id}/dossiers/current",
+    response_model=InterviewV2DossierResponse,
+)
+async def get_interview_v2_dossier(
+    participant_id: str, project_id: str, request: Request
+):
+    login = await _require_feature(request, "interview")
+    if not INTERVIEW_V2_ENABLED:
+        return _disabled_response(request)
+    try:
+        return await run_in_threadpool(
+            get_current_dossier, project_id, participant_id, login
+        )
+    except InterviewV2ImportError as exc:
+        return _service_error_response(request, exc)
+
+
+@router.post(
+    "/api/v1/interview-participants/{participant_id}/dossiers:regenerate",
+    response_model=InterviewV2DossierResponse,
+)
+async def regenerate_interview_v2_dossier(participant_id: str, request: Request):
+    login = await _require_feature(request, "interview")
+    if not INTERVIEW_V2_ENABLED:
+        return _disabled_response(request)
+    try:
+        raw = await _read_structure_json(request)
+        payload = InterviewV2DossierGenerateRequest.model_validate(raw).model_dump(mode="json")
+    except (OverflowError, json.JSONDecodeError, UnicodeDecodeError, ValidationError, ValueError, RecursionError):
+        return _analysis_boundary_request_error(request)
+    try:
+        return await regenerate_dossier(
+            payload["project_id"], participant_id, payload, login
+        )
+    except InterviewV2ImportError as exc:
+        return _service_error_response(request, exc)
+
+
+@router.post(
+    "/api/v1/interview-participants/{participant_id}/dossiers:review",
+    response_model=InterviewV2DossierResponse,
+)
+async def review_interview_v2_dossier(participant_id: str, request: Request):
+    login = await _require_feature(request, "interview")
+    if not INTERVIEW_V2_ENABLED:
+        return _disabled_response(request)
+    try:
+        raw = await _read_structure_json(request)
+        payload = InterviewV2DossierReviewRequest.model_validate(raw).model_dump(mode="json")
+    except (OverflowError, json.JSONDecodeError, UnicodeDecodeError, ValidationError, ValueError, RecursionError):
+        return _analysis_boundary_request_error(request)
+    try:
+        return await run_in_threadpool(
+            review_dossier, payload["project_id"], participant_id, payload, login
         )
     except InterviewV2ImportError as exc:
         return _service_error_response(request, exc)

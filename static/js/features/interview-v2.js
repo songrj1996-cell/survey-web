@@ -59,6 +59,13 @@ const ivV2State = {
   boundarySplitRows: {},
   coverageFilter: 'all',
   selectedCoverageCellKey: '',
+  dossierBusy: false,
+  dossierToken: 0,
+  participantResponse: null,
+  selectedParticipantId: '',
+  dossierResponse: null,
+  dossierEvidenceCache: {},
+  selectedDossierEvidenceId: '',
 };
 
 function ivV2$(id) {
@@ -120,6 +127,7 @@ function ivV2OperationBusy() {
     || ivV2State.boundaryBusy
     || ivV2State.boundaryConfirmBusy
     || ivV2State.coverageBusy
+    || ivV2State.dossierBusy
   );
 }
 
@@ -380,6 +388,12 @@ function ivV2RenderStep3Header() {
   const desc = shell.querySelector('.panel__desc');
   const previewTitle = ivV2$('iv-v2-confirmed-preview')?.closest('section')?.querySelector('.iv-v2-side-card__title');
   const historyTitle = ivV2$('iv-v2-confirmed-history')?.closest('section')?.querySelector('.iv-v2-side-card__title');
+  if (ivV2State.currentStep === 4) {
+    if (eyebrow) eyebrow.textContent = 'PARTICIPANT DOSSIERS';
+    if (title) title.textContent = '玩家属性与单玩家逻辑';
+    if (desc) desc.textContent = '先逐玩家生成并审阅证据绑定档案；跨玩家分析仍未开放。';
+    return;
+  }
   if (eyebrow) eyebrow.textContent = ivV2HasStructureCheckpoint() ? String(ivV2State.status || 'STRUCTURE_REVIEW_REQUIRED') : 'GROUP_MAPPING_CONFIRMED';
   if (title) {
     title.textContent = ivV2HasStructureCheckpoint()
@@ -448,10 +462,17 @@ function ivV2SetStep(step) {
   ivV2State.currentStep = step;
   if (!ivV2IsActive()) return;
   [1, 2, 3].forEach(index => {
-    ivV2$(`iv-panel-${index}`)?.classList.toggle('panel--hidden', index !== step);
+    const visiblePanel = step === 4 ? 3 : step;
+    ivV2$(`iv-panel-${index}`)?.classList.toggle('panel--hidden', index !== visiblePanel);
   });
   document.querySelector('.main')?.scrollTo({ top: 0, behavior: 'smooth' });
   ivV2RenderStepBars();
+  if (step === 4) {
+    ivV2RenderConfirmed();
+    if (!ivV2State.participantResponse && ivV2State.status === 'READY_FOR_DOSSIERS') {
+      ivV2LoadParticipants();
+    }
+  }
 }
 
 function ivV2PreviewStep(step) {
@@ -2672,8 +2693,9 @@ function ivV2ReviewSummaryHtml() {
       </div>
     </div>
     <div class="iv-v2-status-banner iv-v2-status-banner--info">
-      <strong>当前阶段开放结构、被测对象与分析边界复核</strong>
-      <p>玩家档案与后续 dossier 工作台尚未开放；只有分析边界和覆盖口径确认后，状态才会进入 READY_FOR_DOSSIERS。</p>
+      <strong>${ivV2State.status === 'READY_FOR_DOSSIERS' ? '分析边界已确认，可以进入玩家档案' : '当前阶段开放结构、被测对象与分析边界复核'}</strong>
+      <p>${ivV2State.status === 'READY_FOR_DOSSIERS' ? '档案按单个玩家生成；其他玩家不会被连带重跑。' : '玩家档案与后续 dossier 工作台尚未开放；只有分析边界和覆盖口径确认后才能进入。'}</p>
+      ${ivV2State.status === 'READY_FOR_DOSSIERS' ? '<button class="btn btn--primary btn--sm" type="button" data-iv-v2-action="dossier-open">进入玩家档案</button>' : ''}
     </div>
   `;
 }
@@ -3685,12 +3707,291 @@ function ivV2HeadsHtml() {
   `;
 }
 
+function ivV2DossierStatusLabel(status) {
+  return {
+    not_generated: '未生成',
+    generated: '待审阅',
+    approved: '已批准',
+    needs_changes: '需修改',
+    stale: '上游已变化',
+  }[status] || status || '未知';
+}
+
+function ivV2DossierStatusTone(status) {
+  return {
+    approved: 'success',
+    generated: 'info',
+    needs_changes: 'warning',
+    stale: 'danger',
+  }[status] || '';
+}
+
+function ivV2DossierEvidenceButtons(ids) {
+  const values = Array.from(new Set(ids || []));
+  if (!values.length) return '<span class="iv-v2-dossier-no-evidence">无证据编号</span>';
+  return values.map(id => `
+    <button class="iv-v2-dossier-citation" type="button" data-iv-v2-action="dossier-evidence" data-evidence-id="${ivV2Esc(id)}">${ivV2Esc(id)}</button>
+  `).join('');
+}
+
+function ivV2DossierStatusHtml() {
+  if (ivV2State.dossierBusy) {
+    return '<div class="iv-v2-status-banner iv-v2-status-banner--info"><strong>正在处理玩家档案</strong><p>生成只处理当前玩家，已完成的其他玩家不会重跑。</p></div>';
+  }
+  if (ivV2State.errorMessage && ivV2State.currentStep === 4) {
+    return `<div class="iv-v2-status-banner iv-v2-status-banner--danger"><strong>${ivV2Esc(ivV2State.statusCode || 'DOSSIER_REQUEST_FAILED')}</strong><p>${ivV2Esc(ivV2State.errorMessage)}</p></div>`;
+  }
+  const summary = ivV2State.importData?.dossier_summary;
+  if (!summary) return '<div class="iv-v2-status-banner iv-v2-status-banner--info"><strong>玩家档案检查点已开放</strong><p>请选择玩家生成档案；人数和状态以服务端返回为准。</p></div>';
+  return `
+    <div class="iv-v2-status-grid iv-v2-dossier-summary">
+      <div class="iv-v2-status-card"><strong>${ivV2Esc(summary.participant_count ?? 0)} 名玩家</strong><p>当前项目玩家总数</p></div>
+      <div class="iv-v2-status-card"><strong>${ivV2Esc(summary.not_generated_count ?? 0)} 未生成</strong><p>${ivV2Esc(summary.generated_count ?? 0)} 待审阅</p></div>
+      <div class="iv-v2-status-card"><strong>${ivV2Esc(summary.approved_count ?? 0)} 已批准</strong><p>${ivV2Esc(summary.needs_changes_count ?? 0)} 需修改</p></div>
+    </div>`;
+}
+
+function ivV2ParticipantListHtml() {
+  const participants = ivV2State.participantResponse?.participants || [];
+  if (!participants.length) return '<div class="iv-v2-empty">尚未读取到玩家清单。</div>';
+  return participants.map(item => `
+    <button class="iv-v2-dossier-participant${item.participant_id === ivV2State.selectedParticipantId ? ' iv-v2-dossier-participant--active' : ''}" type="button"
+      data-iv-v2-action="dossier-select-participant" data-participant-id="${ivV2Esc(item.participant_id)}">
+      <span><strong>${ivV2Esc(item.participant_id)}</strong><small>${ivV2Esc(item.group_id || '')}</small></span>
+      <em class="iv-v2-badge iv-v2-badge--${ivV2DossierStatusTone(item.dossier_status)}">${ivV2Esc(ivV2DossierStatusLabel(item.dossier_status))}</em>
+    </button>
+  `).join('');
+}
+
+function ivV2DossierFactHtml(fact) {
+  return `
+    <article class="iv-v2-dossier-item">
+      <div class="iv-v2-dossier-item__head"><strong>${ivV2Esc(fact.attribute_label || fact.attribute_key || '属性')}</strong><span>${ivV2Esc(fact.fact_status || '')}</span></div>
+      <p>${ivV2Esc(fact.raw_value || '')}</p>
+      ${fact.normalized_value ? `<small>规范值：${ivV2Esc(fact.normalized_value)}</small>` : ''}
+      <div class="iv-v2-dossier-citations">${ivV2DossierEvidenceButtons(fact.source_evidence_ids)}</div>
+    </article>`;
+}
+
+function ivV2DossierClaimHtml(claim) {
+  return `
+    <article class="iv-v2-dossier-item iv-v2-dossier-claim">
+      <div class="iv-v2-dossier-item__head"><strong>${ivV2Esc(claim.claim_type || '判断')}</strong><span>${ivV2Esc(claim.module_id || '跨模块')}</span></div>
+      <p>${ivV2Esc(claim.statement || '')}</p>
+      <div class="iv-v2-dossier-citations">${ivV2DossierEvidenceButtons(claim.supporting_evidence_ids)}</div>
+      ${(claim.conflicting_evidence_ids || []).length ? `<div class="iv-v2-dossier-conflict"><small>冲突证据</small>${ivV2DossierEvidenceButtons(claim.conflicting_evidence_ids)}</div>` : ''}
+    </article>`;
+}
+
+function ivV2DossierMainHtml() {
+  if (!ivV2State.selectedParticipantId) return '<div class="iv-v2-empty">从左侧选择一名玩家查看或生成档案。</div>';
+  const response = ivV2State.dossierResponse;
+  if (!response) return '<div class="iv-v2-empty">正在读取当前玩家档案。</div>';
+  const status = response.status || 'not_generated';
+  if (status === 'not_generated') {
+    return `<div class="iv-v2-dossier-empty-state"><strong>该玩家尚未生成档案</strong><p>系统将只发送当前玩家的有效证据，先抽取明确属性，再重建单玩家逻辑。</p><button class="btn btn--primary" type="button" data-iv-v2-action="dossier-generate">生成玩家档案</button></div>`;
+  }
+  const facts = response.attributes?.facts || [];
+  const labels = response.attributes?.analytical_labels || [];
+  const claims = response.dossier?.claims || [];
+  const contradictions = response.dossier?.contradictions || [];
+  const missing = response.dossier?.missing_context || [];
+  const canReview = status === 'generated' || status === 'needs_changes';
+  return `
+    <section class="iv-v2-dossier-toolbar">
+      <div><span class="iv-v2-badge iv-v2-badge--${ivV2DossierStatusTone(status)}">${ivV2Esc(ivV2DossierStatusLabel(status))}</span><small>档案版 ${ivV2Esc(response.dossier_version_number || '--')} · ${ivV2Esc(response.dossier_version_id || '')}</small></div>
+      <button class="btn btn--ghost btn--sm" type="button" data-iv-v2-action="dossier-generate">${status === 'stale' ? '按最新证据重新生成' : '重新生成当前玩家'}</button>
+    </section>
+    ${status === 'stale' ? '<div class="iv-v2-status-banner iv-v2-status-banner--warning"><strong>当前档案已过期</strong><p>结构、证据或分析边界已变化；旧版仍可查看，但不能直接批准。</p></div>' : ''}
+    <section class="iv-v2-dossier-section"><h3>明确属性</h3>${facts.length ? facts.map(ivV2DossierFactHtml).join('') : '<div class="iv-v2-empty">没有可确认的属性事实。</div>'}</section>
+    <section class="iv-v2-dossier-section"><h3>分析标签</h3>${labels.length ? labels.map(label => `<article class="iv-v2-dossier-label"><strong>${ivV2Esc(label.label || label.label_key)}</strong><small>系统归纳，不代表玩家原话</small><div>${ivV2DossierEvidenceButtons(label.source_evidence_ids)}</div></article>`).join('') : '<div class="iv-v2-empty">没有分析标签。</div>'}</section>
+    <section class="iv-v2-dossier-section"><h3>玩家逻辑</h3>${claims.length ? claims.map(ivV2DossierClaimHtml).join('') : '<div class="iv-v2-empty">没有通过证据校验的档案判断。</div>'}</section>
+    <section class="iv-v2-dossier-section iv-v2-dossier-limits"><h3>矛盾与信息缺口</h3><div><strong>矛盾</strong>${contradictions.length ? `<ul>${contradictions.map(item => `<li>${ivV2Esc(typeof item === 'string' ? item : JSON.stringify(item))}</li>`).join('')}</ul>` : '<p>未识别到明确矛盾。</p>'}</div><div><strong>缺失信息</strong>${missing.length ? `<ul>${missing.map(item => `<li>${ivV2Esc(typeof item === 'string' ? item : JSON.stringify(item))}</li>`).join('')}</ul>` : '<p>未标记信息缺口。</p>'}</div></section>
+    ${canReview ? `<section class="iv-v2-dossier-review"><label><span>审阅备注</span><textarea id="iv-v2-dossier-review-note" maxlength="2000" placeholder="说明批准依据或需要修改的内容"></textarea></label><div><button class="btn btn--ghost" type="button" data-iv-v2-action="dossier-review" data-decision="needs_changes">退回修改</button><button class="btn btn--primary" type="button" data-iv-v2-action="dossier-review" data-decision="approved">批准档案</button></div></section>` : ''}
+  `;
+}
+
+function ivV2DossierEvidenceHtml() {
+  const evidenceId = ivV2State.selectedDossierEvidenceId;
+  if (!evidenceId) return '<div class="iv-v2-empty">点击档案中的证据编号查看原始来源。</div>';
+  const data = ivV2State.dossierEvidenceCache[evidenceId];
+  if (!data) return '<div class="iv-v2-empty">正在读取证据来源。</div>';
+  const evidence = data.evidence || data.entry || {};
+  return `<article class="iv-v2-dossier-source"><strong>${ivV2Esc(evidenceId)}</strong><p>${ivV2Esc(evidence.normalized_content || evidence.display_content || evidence.raw_content || '')}</p><dl><div><dt>来源</dt><dd>${ivV2Esc(evidence.sheet_name || evidence.sheet_id || '')} · ${ivV2Esc(evidence.cell_address || '')}</dd></div><div><dt>记录员</dt><dd>${ivV2Esc(evidence.recorder_label || '--')}</dd></div><div><dt>身份</dt><dd>${ivV2Esc(evidence.evidence_type || '')}</dd></div></dl></article>`;
+}
+
+function ivV2RenderDossierWorkbench() {
+  const workbench = ivV2$('iv-v2-dossier-workbench');
+  const reviewWorkspace = ivV2$('iv-v2-review-workspace');
+  if (!workbench || !reviewWorkspace) return;
+  const active = ivV2State.currentStep === 4;
+  workbench.hidden = !active;
+  reviewWorkspace.hidden = active;
+  if (!active) return;
+  ivV2$('iv-v2-dossier-status').innerHTML = ivV2DossierStatusHtml();
+  ivV2$('iv-v2-dossier-participant-list').innerHTML = ivV2ParticipantListHtml();
+  ivV2$('iv-v2-dossier-main').innerHTML = ivV2DossierMainHtml();
+  ivV2$('iv-v2-dossier-evidence-content').innerHTML = ivV2DossierEvidenceHtml();
+}
+
+async function ivV2LoadParticipants({ preserveSelection = true, allowBusy = false } = {}) {
+  if (!ivV2State.projectId || (ivV2State.dossierBusy && !allowBusy)) return false;
+  const token = ++ivV2State.dossierToken;
+  ivV2State.dossierBusy = true;
+  ivV2ClearStatusError();
+  ivV2RenderConfirmed();
+  try {
+    const [response, importResponse] = await Promise.all([
+      fetch(`/api/v1/interview-projects/${ivV2State.projectId}/participants`),
+      fetch(`/api/v1/interview-imports/${ivV2State.importId}`),
+    ]);
+    const [data, importData] = await Promise.all([response.json(), importResponse.json()]);
+    if (token !== ivV2State.dossierToken) return false;
+    if (!response.ok) throw new Error(ivV2NormalizeApiError(data, response.status, '读取玩家档案列表失败').message);
+    if (!importResponse.ok) throw new Error(ivV2NormalizeApiError(importData, importResponse.status, '读取档案进度失败').message);
+    ivV2State.participantResponse = data;
+    ivV2State.importData = importData;
+    const ids = (data.participants || []).map(item => item.participant_id);
+    if (!preserveSelection || !ids.includes(ivV2State.selectedParticipantId)) {
+      ivV2State.selectedParticipantId = ids[0] || '';
+      ivV2State.dossierResponse = null;
+    }
+    if (ivV2State.selectedParticipantId) await ivV2LoadCurrentDossier(ivV2State.selectedParticipantId, { token });
+    return true;
+  } catch (error) {
+    if (token === ivV2State.dossierToken) ivV2State.errorMessage = String(error?.message || '读取玩家档案列表失败');
+    return false;
+  } finally {
+    if (token === ivV2State.dossierToken) {
+      ivV2State.dossierBusy = false;
+      ivV2RenderConfirmed();
+    }
+  }
+}
+
+async function ivV2LoadCurrentDossier(participantId, { token = ++ivV2State.dossierToken } = {}) {
+  const response = await fetch(`/api/v1/interview-participants/${participantId}/dossiers/current?project_id=${encodeURIComponent(ivV2State.projectId)}`);
+  const data = await response.json();
+  if (token !== ivV2State.dossierToken) return false;
+  if (!response.ok) throw new Error(ivV2NormalizeApiError(data, response.status, '读取玩家档案失败').message);
+  ivV2State.dossierResponse = data;
+  return true;
+}
+
+async function ivV2SelectDossierParticipant(participantId) {
+  if (!participantId || ivV2State.dossierBusy) return;
+  const token = ++ivV2State.dossierToken;
+  ivV2State.selectedParticipantId = participantId;
+  ivV2State.dossierResponse = null;
+  ivV2State.dossierBusy = true;
+  ivV2ClearStatusError();
+  ivV2RenderConfirmed();
+  try {
+    await ivV2LoadCurrentDossier(participantId, { token });
+  } catch (error) {
+    if (token === ivV2State.dossierToken) ivV2State.errorMessage = String(error?.message || '读取玩家档案失败');
+  } finally {
+    if (token === ivV2State.dossierToken) {
+      ivV2State.dossierBusy = false;
+      ivV2RenderConfirmed();
+    }
+  }
+}
+
+async function ivV2RegenerateDossier() {
+  const participantId = ivV2State.selectedParticipantId;
+  if (!participantId || ivV2State.dossierBusy) return;
+  const token = ++ivV2State.dossierToken;
+  ivV2State.dossierBusy = true;
+  ivV2ClearStatusError();
+  ivV2RenderConfirmed();
+  try {
+    const response = await fetch(`/api/v1/interview-participants/${participantId}/dossiers:regenerate`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ project_id: ivV2State.projectId, base_dossier_version_id: ivV2State.dossierResponse?.dossier_version_id || null }),
+    });
+    const data = await response.json();
+    if (token !== ivV2State.dossierToken) return;
+    if (!response.ok) {
+      const normalized = ivV2NormalizeApiError(data, response.status, '生成玩家档案失败');
+      ivV2State.statusCode = normalized.code;
+      if (response.status === 409) await ivV2LoadParticipants({ preserveSelection: true, allowBusy: true });
+      throw new Error(normalized.message);
+    }
+    ivV2State.dossierResponse = data;
+    await ivV2LoadParticipants({ preserveSelection: true, allowBusy: true });
+    showToast('玩家档案已生成', 'success');
+  } catch (error) {
+    if (token === ivV2State.dossierToken) ivV2State.errorMessage = String(error?.message || '生成玩家档案失败');
+  } finally {
+    if (token === ivV2State.dossierToken) {
+      ivV2State.dossierBusy = false;
+      ivV2RenderConfirmed();
+    }
+  }
+}
+
+async function ivV2ReviewDossier(decision) {
+  if (!ivV2State.selectedParticipantId || !ivV2State.dossierResponse?.dossier_version_id || ivV2State.dossierBusy) return;
+  const token = ++ivV2State.dossierToken;
+  const note = ivV2$('iv-v2-dossier-review-note')?.value || '';
+  ivV2State.dossierBusy = true;
+  ivV2ClearStatusError();
+  ivV2RenderConfirmed();
+  try {
+    const response = await fetch(`/api/v1/interview-participants/${ivV2State.selectedParticipantId}/dossiers:review`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ project_id: ivV2State.projectId, base_dossier_version_id: ivV2State.dossierResponse.dossier_version_id, decision, note }),
+    });
+    const data = await response.json();
+    if (token !== ivV2State.dossierToken) return;
+    if (!response.ok) throw new Error(ivV2NormalizeApiError(data, response.status, '审阅玩家档案失败').message);
+    ivV2State.dossierResponse = data;
+    await ivV2LoadParticipants({ preserveSelection: true, allowBusy: true });
+    showToast(decision === 'approved' ? '玩家档案已批准' : '玩家档案已退回修改', 'success');
+  } catch (error) {
+    if (token === ivV2State.dossierToken) ivV2State.errorMessage = String(error?.message || '审阅玩家档案失败');
+  } finally {
+    if (token === ivV2State.dossierToken) {
+      ivV2State.dossierBusy = false;
+      ivV2RenderConfirmed();
+    }
+  }
+}
+
+async function ivV2LoadDossierEvidence(evidenceId) {
+  if (!evidenceId || ivV2State.dossierBusy) return;
+  ivV2State.selectedDossierEvidenceId = evidenceId;
+  if (ivV2State.dossierEvidenceCache[evidenceId]) {
+    ivV2RenderConfirmed();
+    return;
+  }
+  const token = ++ivV2State.dossierToken;
+  ivV2State.dossierBusy = true;
+  ivV2RenderConfirmed();
+  try {
+    const response = await fetch(`/api/v1/interview-evidence/${evidenceId}/context`);
+    const data = await response.json();
+    if (token !== ivV2State.dossierToken) return;
+    if (!response.ok) throw new Error(ivV2NormalizeApiError(data, response.status, '读取证据来源失败').message);
+    ivV2State.dossierEvidenceCache[evidenceId] = data;
+  } catch (error) {
+    if (token === ivV2State.dossierToken) ivV2State.errorMessage = String(error?.message || '读取证据来源失败');
+  } finally {
+    if (token === ivV2State.dossierToken) {
+      ivV2State.dossierBusy = false;
+      ivV2RenderConfirmed();
+    }
+  }
+}
+
 function ivV2RenderConfirmed() {
   const meta = ivV2$('iv-v2-confirmed-meta');
   const preview = ivV2$('iv-v2-confirmed-preview');
   const history = ivV2$('iv-v2-confirmed-history');
   if (!meta || !preview || !history) return;
   ivV2RenderStep3Header();
+  ivV2RenderDossierWorkbench();
 
   const response = ivV2State.mappingResponse;
   if (!response) {
@@ -4027,6 +4328,43 @@ function ivV2HandleEditorClick(event) {
   const button = event.target.closest('[data-iv-v2-action]');
   if (!button) return;
   const action = button.dataset.ivV2Action;
+
+  if (action === 'dossier-open') {
+    if (ivV2State.status !== 'READY_FOR_DOSSIERS') return;
+    ivV2SetStep(4);
+    return;
+  }
+
+  if (action === 'dossier-back') {
+    ivV2SetStep(3);
+    ivV2RenderConfirmed();
+    return;
+  }
+
+  if (action === 'dossier-refresh') {
+    ivV2LoadParticipants({ preserveSelection: true });
+    return;
+  }
+
+  if (action === 'dossier-select-participant') {
+    ivV2SelectDossierParticipant(button.dataset.participantId);
+    return;
+  }
+
+  if (action === 'dossier-generate') {
+    ivV2RegenerateDossier();
+    return;
+  }
+
+  if (action === 'dossier-review') {
+    ivV2ReviewDossier(button.dataset.decision);
+    return;
+  }
+
+  if (action === 'dossier-evidence') {
+    ivV2LoadDossierEvidence(button.dataset.evidenceId);
+    return;
+  }
 
   if (action === 'remove-group') {
     ivV2State.draft.groups = ivV2State.draft.groups.filter(group => group.temp_id !== button.dataset.groupId);
@@ -4375,6 +4713,13 @@ function ivV2Reset() {
   ivV2State.boundaryBusy = false;
   ivV2State.boundaryConfirmBusy = false;
   ivV2State.coverageBusy = false;
+  ivV2State.dossierBusy = false;
+  ivV2State.dossierToken += 1;
+  ivV2State.participantResponse = null;
+  ivV2State.selectedParticipantId = '';
+  ivV2State.dossierResponse = null;
+  ivV2State.dossierEvidenceCache = {};
+  ivV2State.selectedDossierEvidenceId = '';
   ivV2State.importData = null;
   ivV2State.mappingResponse = null;
   ivV2State.draft = null;

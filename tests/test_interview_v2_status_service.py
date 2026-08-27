@@ -158,6 +158,30 @@ class InterviewV2StatusServiceTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "ANALYSIS_BOUNDARY_REQUIRED")
 
+    def test_ready_checkpoint_includes_dossier_progress_summary(self):
+        public = _mapping_status("GROUP_MAPPING_CONFIRMED")
+        participant_id = "participant_" + "4" * 32
+        with (
+            patch.object(service, "get_interview_import_with_mapping_status", return_value=public),
+            patch.object(service.store, "load_structure_state", return_value={
+                "is_stale": False, "derived_status": "READY_FOR_DOSSIERS",
+            }),
+            patch.object(service.store, "load_analysis_boundary_state", return_value={
+                "is_stale": False, "derived_status": "READY_FOR_DOSSIERS",
+                "current_evidence_revision_id": "evidence_" + "5" * 32,
+            }),
+            patch.object(service.store, "load_evidence_revision", return_value={
+                "expected_participants": [{"participant_id": participant_id, "group_id": "group_" + "6" * 32}],
+            }),
+            patch.object(service.store, "load_current_participant_dossier", return_value={
+                "revision": {"status": "approved"}, "state": {},
+            }),
+        ):
+            result = service.get_interview_import_with_structure_status(IMPORT_ID, LOGIN)
+
+        self.assertEqual(1, result["dossier_summary"]["participant_count"])
+        self.assertEqual(1, result["dossier_summary"]["approved_count"])
+
     def test_stale_structure_does_not_override_current_mapping_checkpoint(self):
         public = _mapping_status("GROUP_MAPPING_CONFIRMED")
         with (
