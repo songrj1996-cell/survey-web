@@ -15,6 +15,7 @@ data/
 *.log
 *.err.log
 .tmp_pdf_check
+tmp/
 
 # editor / OS
 .DS_Store
