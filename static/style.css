@@ -2848,6 +2848,42 @@ body {
   font-weight: 750;
 }
 
+.markdown-body .core-summary-box em {
+  color: var(--text-3);
+  font-style: italic;
+}
+
+.markdown-body .core-summary-box u {
+  color: var(--text);
+  text-decoration-color: rgba(139, 92, 246, 0.72);
+  text-decoration-thickness: 1.5px;
+  text-underline-offset: 3px;
+}
+
+.markdown-body .core-summary-box blockquote {
+  margin: 7px 0 11px 2px;
+  padding: 6px 11px;
+  border-left-color: rgba(139, 92, 246, 0.45);
+  border-radius: 0 6px 6px 0;
+  background: rgba(139, 92, 246, 0.045);
+}
+
+.core-summary-box ol ol,
+.core-summary-box ul ol {
+  margin-top: 6px;
+  list-style-type: lower-alpha;
+}
+
+.core-summary-box ol ol ol {
+  list-style-type: lower-roman;
+}
+
+.core-summary-box ol ul,
+.core-summary-box ul ul {
+  margin-top: 6px;
+  list-style-type: disc;
+}
+
 .chapter-summary-box {
   margin-top: 8px;
 }
@@ -2870,6 +2906,15 @@ body {
 .markdown-body strong {
   color: var(--text);
   font-weight: 600;
+}
+
+.markdown-body em {
+  font-style: italic;
+}
+
+.markdown-body u {
+  text-decoration-thickness: 1.25px;
+  text-underline-offset: 2px;
 }
 
 .markdown-body ul,

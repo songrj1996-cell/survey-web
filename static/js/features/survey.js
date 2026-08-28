@@ -608,6 +608,17 @@ function collectOptionsForColumn(i) {
   return values;
 }
 
+function syncOptionSummary(i) {
+  const summary = document.querySelector(
+    `[data-option-editor="${i}"] .option-editor__summary-main`
+  );
+  if (!summary) return;
+  const options = collectOptionsForColumn(i);
+  summary.innerHTML = options.length
+    ? options.map(opt => `<span class="option-summary-chip" title="${esc(opt)}">${esc(opt)}</span>`).join('')
+    : '<span class="option-summary-empty">暂无选项</span>';
+}
+
 function collectMatrixRowsForColumn(i, c) {
   const inputs = Array.from(document.querySelectorAll(`.matrix-row-input[data-matrix-row="${i}"]`));
   if (!inputs.length) return c.rows || [];
@@ -722,6 +733,7 @@ $('col-list').addEventListener('input', e => {
   const textarea = e.target.closest('textarea.option-input');
   if (textarea) {
     autosizeOptionTextareas(textarea.closest('.option-edit-row') || document);
+    syncOptionSummary(+textarea.dataset.option);
   }
 });
 
@@ -741,13 +753,16 @@ $('col-list').addEventListener('click', e => {
         </div>
       `);
       autosizeOptionTextareas(rows);
+      syncOptionSummary(i);
       rows.querySelector('.option-edit-row:last-child .option-input')?.focus();
     }
   }
 
   const removeBtn = e.target.closest('[data-option-remove]');
   if (removeBtn) {
+    const i = +removeBtn.dataset.optionRemove;
     removeBtn.closest('.option-edit-row')?.remove();
+    syncOptionSummary(i);
   }
 
   const aliasRemoveBtn = e.target.closest('.alias-chip__remove');

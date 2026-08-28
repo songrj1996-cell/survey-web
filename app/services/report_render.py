@@ -35,6 +35,7 @@ _RESEARCH_BACKGROUND_FIELDS = (
     ("problem", "业务问题/业务痛点/业务规划"),
     ("key_concerns", "本次调研最关心的问题"),
     ("target_users", "产品/功能的目标用户"),
+    ("analysis_approach", "分析思路"),
 )
 
 
@@ -46,7 +47,7 @@ def _escape_research_background_text(value: object) -> str:
 
 
 def _inject_research_background(md: str, qualitative_context: dict | None) -> str:
-    """在报告顶部插入用户填写的调研背景；无有效输入时保持报告不变。"""
+    """在报告顶部插入用户填写的调研背景与分析思路；无有效输入时保持不变。"""
     fields = []
     for key, label in _RESEARCH_BACKGROUND_FIELDS:
         value = _escape_research_background_text((qualitative_context or {}).get(key, ""))

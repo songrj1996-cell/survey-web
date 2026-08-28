@@ -478,7 +478,17 @@ class DuplicatePrepareAndGenerationTests(
                 "<!--CORE_START-->\n## 核心结论\n新数据结论。\n<!--CORE_END-->",
                 "writer-model",
             ),
-            ("## 行动建议\n\n**继续验证**", "writer-model"),
+            ("PASS", "writer-model"),
+            (
+                "## 行动建议\n\n"
+                "1. **继续验证新数据结论**（优先级：中）\n"
+                "   - **核心判断：** 当前结论需要继续验证。\n"
+                "   - **产品动作：** 补充验证样本。\n"
+                "   - **验证方式：** 对比新旧样本结果。\n"
+                "   - **依据：** 本次重跑数据。\n"
+                "   - **不确定性/前提：** 样本范围有限。",
+                "writer-model",
+            ),
         ]
         writer_calls = 0
 

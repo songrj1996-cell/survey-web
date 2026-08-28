@@ -1375,9 +1375,12 @@ async def _answer_qa_direct(
     question: str,
 ) -> tuple[str, str, str]:
     """通过统一直连模型链回答报告追问，并返回实际使用的模型。"""
-    qa_context = str(source.get("qa_context_md") or "").strip()
-    if not qa_context:
+    if source.get("rows"):
         qa_context = _build_qa_context(source)
+    else:
+        qa_context = str(source.get("qa_context_md") or "").strip()
+        if not qa_context:
+            qa_context = _build_qa_context(source)
     models = (LLM_QA_MODEL, *LLM_QA_FALLBACK_MODELS)
     answer, model = await collect_chat_completion(
         prepare_glossary_messages(
@@ -1890,37 +1893,36 @@ async def report_stream(
             writer_models_used.append(core_model)
             core_block = core_text.strip()
 
-            if analysis_focus:
+            yield sse_event({
+                "type": "progress",
+                "message": "正在局部复核核心结论的证据边界、原因场景与分析交付覆盖…",
+            })
+            review_history_len = len(writer_messages)
+            selected_core = core_block
+            try:
+                async for heartbeat in _writer_call(
+                    _build_writer_core_review_query(analysis_focus, has_bug)
+                ):
+                    yield heartbeat
+                review_text, review_model = _writer_call.out
+                writer_models_used.append(review_model)
+                selected_core = _resolve_core_coverage_review(core_block, review_text)
+            except Exception as review_error:
+                print(
+                    "[report] WARN optional core evidence review skipped: "
+                    f"{type(review_error).__name__}"
+                )
                 yield sse_event({
                     "type": "progress",
-                    "message": "正在复核核心结论对分析交付要求的覆盖…",
+                    "message": "核心结论证据复核未完成，已沿用原核心结论继续生成报告。",
                 })
-                review_history_len = len(writer_messages)
-                selected_core = core_block
-                try:
-                    async for heartbeat in _writer_call(
-                        _build_writer_core_review_query(analysis_focus, has_bug)
-                    ):
-                        yield heartbeat
-                    review_text, review_model = _writer_call.out
-                    writer_models_used.append(review_model)
-                    selected_core = _resolve_core_coverage_review(core_block, review_text)
-                except Exception as review_error:
-                    print(
-                        "[report] WARN optional core coverage review skipped: "
-                        f"{type(review_error).__name__}"
-                    )
-                    yield sse_event({
-                        "type": "progress",
-                        "message": "核心结论覆盖复核未完成，已沿用原核心结论继续生成报告。",
-                    })
-                finally:
-                    # 复核轮只用于选择核心结论；成功、无效或异常输出都不进入后续会话。
-                    del writer_messages[review_history_len:]
-                if selected_core != core_block:
-                    core_block = selected_core
-                    if writer_messages and writer_messages[-1].get("role") == "assistant":
-                        writer_messages[-1]["content"] = core_block
+            finally:
+                # 复核轮只用于选择核心结论；成功、无效或异常输出都不进入后续会话。
+                del writer_messages[review_history_len:]
+            if selected_core != core_block:
+                core_block = selected_core
+                if writer_messages and writer_messages[-1].get("role") == "assistant":
+                    writer_messages[-1]["content"] = core_block
 
             for event in _content_events(core_block):
                 yield event

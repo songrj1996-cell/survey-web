@@ -169,6 +169,11 @@ class QualitativeViewpointTests(unittest.TestCase):
             report_without_mentions + "\n\n**提及情况：** 1名玩家提及。",
             writer_context_included=True,
         )
+        complete_with_list_item = finalize_viewpoint_diagnostics(
+            catalog,
+            report_without_mentions + "\n\n- **提及情况：** 1名玩家提及。",
+            writer_context_included=True,
+        )
         writer_no_viewpoints = finalize_viewpoint_diagnostics(
             catalog,
             "## Part 1 界面反馈\n\n没有输出观点块。",
@@ -186,6 +191,9 @@ class QualitativeViewpointTests(unittest.TestCase):
             "catalog_unavailable",
         )
         self.assertEqual(complete["writer_output"]["status"], "complete")
+        self.assertEqual(
+            complete_with_list_item["writer_output"]["status"], "complete"
+        )
         self.assertEqual(
             writer_no_viewpoints["writer_output"]["status"],
             "writer_no_viewpoints",
