@@ -52,3 +52,39 @@ class MatrixSingleTests(unittest.TestCase):
         self.assertIn("| 易用性 | 2 (100.0%) | 0 (0.0%) | 0 (0.0%) | 2 |", stats)
         self.assertIn("| 稳定性 | 1 (33.3%) | 1 (33.3%) | 1 (33.3%) | 3 |", stats)
         self.assertEqual(open_text, {})
+
+    def test_ranking_stats_include_all_numeric_and_localized_answers(self):
+        permutations = (
+            [(1, 2, 3)] * 10
+            + [(1, 3, 2)] * 27
+            + [(2, 1, 3)] * 9
+            + [(2, 3, 1)] * 12
+            + [(3, 1, 2)] * 13
+            + [(3, 2, 1)] * 21
+        )
+        rows = [["概念排名 [概念1]", "概念排名 [概念2]", "概念排名 [概念3]"]]
+        rows.extend([
+            [float(rank) if row_index < 33 else f"Peringkat {rank}" for rank in ranks]
+            for row_index, ranks in enumerate(permutations)
+        ])
+        columns = expand_confirmed_to_columns([{
+            "name_zh": "概念排名",
+            "role": "matrix_single",
+            "column_indexes": [0, 1, 2],
+            "rows": ["概念1", "概念2", "概念3"],
+            "options": ["第1名", "第2名", "第3名"],
+            "analysis_semantic": "ranking",
+            "ranking_size": 3,
+        }])
+        plan = {
+            "columns": columns,
+            "parts": [{"name": "概念排名", "column_indexes": [0, 1, 2]}],
+        }
+
+        stats, _ = compute(rows, plan)
+
+        self.assertIn("矩阵单选排名", stats)
+        self.assertIn("| 概念1 | 37 (40.2%) | 21 (22.8%) | 34 (37.0%) | 92 |", stats)
+        self.assertIn("| 概念2 | 22 (23.9%) | 31 (33.7%) | 39 (42.4%) | 92 |", stats)
+        self.assertIn("| 概念3 | 33 (35.9%) | 40 (43.5%) | 19 (20.7%) | 92 |", stats)
+        self.assertIn("数值越低表示整体越靠前", stats)
