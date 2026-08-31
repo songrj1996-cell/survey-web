@@ -643,6 +643,190 @@ class LargeSampleDirectLLMTests(unittest.IsolatedAsyncioTestCase):
             ["The interface is clean."],
         )
 
+    async def test_phase_b_timeout_recovers_single_batch_structured_counts(self):
+        entries = [
+            {"text": f"回答{i}", "respondent_key": f"p{i}"}
+            for i in range(1, 93)
+        ]
+        plan = {
+            "columns": [{"index": 0, "name": "概念排名原因", "role": "open_text"}],
+            "parts": [{"name": "概念偏好", "column_indexes": [0]}],
+            "branch_rules": [],
+        }
+        candidates = [
+            {
+                "name": "偏好原因A",
+                "description": "第一类偏好原因",
+                "positive_summary": "认可原因A",
+                "negative_summary": None,
+                "representative_response_ids": ["r0001"],
+            },
+            {
+                "name": "偏好原因B",
+                "description": "第二类偏好原因",
+                "positive_summary": None,
+                "negative_summary": "质疑原因B",
+                "representative_response_ids": ["r0092"],
+            },
+        ]
+        direct = AsyncMock(side_effect=[
+            {
+                "data": {"themes": candidates},
+                "model": "extract",
+                "raw_len": 20,
+                "repaired": False,
+                "error": "",
+                "duration_seconds": 0.01,
+            },
+            {
+                "data": None,
+                "model": "",
+                "raw_len": 0,
+                "repaired": False,
+                "error": "TimeoutError",
+                "duration_seconds": 300.0,
+            },
+        ])
+        classifications = [
+            {
+                "response_id": str(index),
+                "assignments": [{
+                    "theme_id": "t01" if index < 46 else "t02",
+                    "sentiment": "neutral",
+                }],
+            }
+            for index in range(92)
+        ]
+        classified = AsyncMock(return_value={
+            "classifications": classifications,
+            "model": "classify",
+            "raw_len": 100,
+            "repaired_count": 0,
+            "fallback_count": 0,
+            "error": "",
+            "duration_seconds": 0.01,
+        })
+
+        with (
+            patch.object(report_engine, "BATCH_SIZE", 300),
+            patch.object(report_engine, "_get_theme_extract_system_prompt", return_value="extract"),
+            patch.object(report_engine, "_get_theme_merge_system_prompt", return_value="merge"),
+            patch.object(report_engine, "_direct_json_call", new=direct),
+            patch.object(report_engine, "_classify_batch_direct", new=classified),
+        ):
+            items = [
+                item
+                async for item in report_engine._batch_qualitative_analysis(
+                    {0: entries},
+                    plan,
+                    ["概念排名原因"],
+                    "sid",
+                    deduplicate_respondents=True,
+                )
+            ]
+
+        self.assertEqual(direct.await_count, 2)
+        self.assertEqual(classified.await_count, 1)
+        merge_query = direct.await_args_list[1].args[1]
+        self.assertIn('"candidate_id": "c0001"', merge_query)
+        self.assertIn('"candidate_id": "c0002"', merge_query)
+        self.assertIn("回答1", merge_query)
+        self.assertIn("回答92", merge_query)
+
+        diagnostics = next(item[1] for item in items if item[0] == "diagnostics")
+        diag = diagnostics["0"]
+        self.assertEqual(diag["status"], "ok")
+        self.assertEqual(diag["quality_status"], "ok")
+        self.assertEqual(diag["classifications"], 92)
+        self.assertEqual(diag["assignments"], 92)
+        self.assertEqual(diag["classification_coverage"], 1.0)
+        self.assertEqual(diag["classification_fallback_count"], 0)
+        self.assertEqual(
+            diag["phase_b"]["strategy"],
+            "single_batch_candidate_recovery",
+        )
+        self.assertTrue(diag["phase_b"]["recovered"])
+        self.assertEqual(diag["phase_b"]["initial_error"], "TimeoutError")
+        self.assertEqual(diag["phase_b"]["error"], "")
+        self.assertEqual(diag["phase_b"]["source_candidate_coverage"], 1.0)
+
+        clustered = next(item[1] for item in items if item[0] == "result")
+        self.assertEqual(clustered[0]["total"], 92)
+        themes = {theme["id"]: theme for theme in clustered[0]["themes"]}
+        self.assertEqual(themes["t01"]["count"], 46)
+        self.assertEqual(themes["t02"]["count"], 46)
+        progress = [item[1] for item in items if item[0] == "analysis_progress"]
+        recovered = [
+            item for item in progress
+            if item.get("step") == "merging" and item.get("status") == "recovered"
+        ]
+        self.assertEqual(len(recovered), 1)
+        self.assertIn("全部回答", recovered[0]["impact"])
+        self.assertEqual(progress[-1]["status"], "completed")
+
+    async def test_phase_b_failure_does_not_promote_multiple_batches(self):
+        entries = [
+            {"text": "回答A", "respondent_key": "p1"},
+            {"text": "回答B", "respondent_key": "p2"},
+        ]
+        plan = {
+            "columns": [{"index": 0, "name": "反馈", "role": "open_text"}],
+            "parts": [{"name": "体验", "column_indexes": [0]}],
+            "branch_rules": [],
+        }
+
+        async def direct(system_prompt, query, **_kwargs):
+            if system_prompt == "extract":
+                text = "回答A" if "回答A" in query else "回答B"
+                return {
+                    "data": {"themes": [{
+                        "name": f"{text}主题",
+                        "description": f"{text}描述",
+                        "positive_summary": None,
+                        "negative_summary": None,
+                        "representative_response_ids": ["r0001"],
+                    }]},
+                    "model": "extract",
+                    "raw_len": 10,
+                    "repaired": False,
+                    "error": "",
+                    "duration_seconds": 0.01,
+                }
+            return {
+                "data": None,
+                "model": "",
+                "raw_len": 0,
+                "repaired": False,
+                "error": "TimeoutError",
+                "duration_seconds": 300.0,
+            }
+
+        classified = AsyncMock()
+        with (
+            patch.object(report_engine, "BATCH_SIZE", 1),
+            patch.object(report_engine, "LLM_THEME_EXTRACT_CONCURRENCY", 1),
+            patch.object(report_engine, "_get_theme_extract_system_prompt", return_value="extract"),
+            patch.object(report_engine, "_get_theme_merge_system_prompt", return_value="merge"),
+            patch.object(report_engine, "_direct_json_call", new=direct),
+            patch.object(report_engine, "_classify_batch_direct", new=classified),
+        ):
+            items = [
+                item
+                async for item in report_engine._batch_qualitative_analysis(
+                    {0: entries}, plan, ["反馈"], "sid",
+                    deduplicate_respondents=True,
+                    _batch_concurrency_override=1,
+                )
+            ]
+
+        diagnostics = next(item[1] for item in items if item[0] == "diagnostics")
+        self.assertEqual(diagnostics["0"]["status"], "failed")
+        self.assertFalse(diagnostics["0"]["phase_b"]["recovered"])
+        self.assertEqual(diagnostics["0"]["phase_b"]["strategy"], "llm_merge")
+        self.assertEqual(diagnostics["0"]["phase_b"]["error"], "TimeoutError")
+        self.assertEqual(next(item[1] for item in items if item[0] == "result"), {})
+        classified.assert_not_awaited()
+
     async def test_pipeline_reports_final_degradation_without_claiming_data_loss(self):
         direct = AsyncMock(return_value={
             "data": None,
