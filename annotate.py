@@ -15,6 +15,18 @@ from typing import Optional
 import openpyxl
 from openpyxl.styles import Alignment, Font, PatternFill
 
+from app.core.config import (
+    ANNOTATE_QUALITY_EXCELLENT_AVG_THRESHOLD,
+    ANNOTATE_QUALITY_EXCELLENT_MAX_INVALID_RATIO,
+    ANNOTATE_QUALITY_INVALID_AVG_THRESHOLD,
+    ANNOTATE_QUALITY_INVALID_HARD_RATIO,
+    ANNOTATE_QUALITY_LOW_EFFORT_MIN_ANSWERS,
+    ANNOTATE_QUALITY_LOW_EFFORT_MIN_SIGNALS,
+    ANNOTATE_QUALITY_LOW_EFFORT_MIN_STRUCTURED_ITEMS,
+    ANNOTATE_QUALITY_SHORT_TEXT_MAX_CHARS,
+    ANNOTATE_QUALITY_SHORT_TEXT_MAX_WORDS,
+)
+
 QUALITY_LABELS = {"无效反馈", "普通反馈", "优秀反馈", "N/A"}
 
 # 标注列样式
@@ -351,25 +363,244 @@ def _strict_probability(val) -> int | None:
     return parsed if 0 <= parsed <= 100 else None
 
 
-def calculate_overall_quality(q_labels: dict[str, str], open_text_cols: list[int]) -> tuple[str, str]:
-    """按非 N/A 题目计算整体质量，并返回可复核的计数说明。"""
+_QUALITY_SCORE = {"无效反馈": 0, "普通反馈": 1, "优秀反馈": 2}
+_SCORE_HEADER_RE = re.compile(r"(?:\brate\b|\brating\b|\bscore\b|评分|打分|分数|量表)", re.IGNORECASE)
+_RANK_HEADER_RE = re.compile(r"(?:\brank(?:ing)?\b|\border\b|排序|排行|名次|优先级)", re.IGNORECASE)
+
+
+def _header_text(headers: list, headers_zh: list, index: int) -> str:
+    original = str(headers[index]).strip() if index < len(headers) else ""
+    translated = str(headers_zh[index]).strip() if index < len(headers_zh) else ""
+    return f"{original} {translated}".strip()
+
+
+def _strict_number(value: object) -> float | None:
+    text = str(value or "").strip()
+    if not re.fullmatch(r"[-+]?\d+(?:\.\d+)?", text):
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _header_preview(headers: list, headers_zh: list, indexes: list[int]) -> str:
+    names = []
+    for index in indexes[:3]:
+        name = _header_text(headers, headers_zh, index) or f"列{index}"
+        names.append(name[:40])
+    suffix = "等" if len(indexes) > 3 else ""
+    return "、".join(names) + suffix
+
+
+def _mechanical_ranking_evidence(
+    row: list,
+    headers: list,
+    headers_zh: list,
+    candidate_cols: list[int],
+) -> str:
+    """只识别明确的 A→B→C 或 1→2→3 展示顺序，不推断语义排序。"""
+    minimum = ANNOTATE_QUALITY_LOW_EFFORT_MIN_STRUCTURED_ITEMS
+    numeric_values: list[int] = []
+    numeric_cols: list[int] = []
+    for col in candidate_cols:
+        value = _strict_number(row[col] if col < len(row) else "")
+        if value is None or not value.is_integer():
+            continue
+        numeric_values.append(int(value))
+        numeric_cols.append(col)
+    if len(numeric_values) >= minimum and numeric_values == list(range(1, len(numeric_values) + 1)):
+        return (
+            f"{len(numeric_values)}个排序项按问卷列顺序填写为"
+            f"{'→'.join(str(value) for value in numeric_values)}（"
+            f"{_header_preview(headers, headers_zh, numeric_cols)}）"
+        )
+
+    for col in candidate_cols:
+        raw = str(row[col] if col < len(row) else "").strip()
+        parts = [
+            part.strip()
+            for part in re.split(r"[,，;；、>|\n]+", raw)
+            if part.strip()
+        ]
+        if len(parts) < minimum:
+            continue
+        letters: list[str] = []
+        for part in parts:
+            match = re.search(
+                r"(?:\b(?:track|song|music|option|item)\s*)?\b([A-Z])\b",
+                part,
+                re.IGNORECASE,
+            )
+            if not match:
+                letters = []
+                break
+            letters.append(match.group(1).upper())
+        expected = [chr(ord("A") + index) for index in range(len(letters))]
+        if letters and letters == expected:
+            return (
+                f"排序题按展示字母顺序填写为{'→'.join(letters)}（"
+                f"{_header_preview(headers, headers_zh, [col])}）"
+            )
+    return ""
+
+
+def detect_low_effort_signals(
+    row: list,
+    headers: list,
+    open_text_cols: list[int],
+    id_col: int,
+    q_labels: dict[str, str],
+    *,
+    headers_zh: list | None = None,
+) -> dict:
+    """返回可审计的整卷低投入组合信号；单项信号绝不触发硬门槛。"""
+    translated_headers = headers_zh or []
+    excluded = set(open_text_cols) | {id_col}
+    score_cols: list[int] = []
+    score_values: list[float] = []
+    rank_cols: list[int] = []
+    for col in range(max(len(headers), len(row))):
+        if col in excluded:
+            continue
+        header = _header_text(headers, translated_headers, col)
+        if _RANK_HEADER_RE.search(header):
+            rank_cols.append(col)
+        if _SCORE_HEADER_RE.search(header):
+            value = _strict_number(row[col] if col < len(row) else "")
+            if value is not None:
+                score_cols.append(col)
+                score_values.append(value)
+
+    signals: list[dict[str, str]] = []
+    minimum_structured = ANNOTATE_QUALITY_LOW_EFFORT_MIN_STRUCTURED_ITEMS
+    if len(score_values) >= minimum_structured and len(set(score_values)) == 1:
+        value = score_values[0]
+        display_value = str(int(value)) if value.is_integer() else str(value)
+        signals.append({
+            "code": "uniform_scores",
+            "kind": "structured",
+            "evidence": (
+                f"{len(score_values)}个明确评分项全部为{display_value}（"
+                f"{_header_preview(headers, translated_headers, score_cols)}）"
+            ),
+        })
+
+    ranking_evidence = _mechanical_ranking_evidence(
+        row, headers, translated_headers, rank_cols,
+    )
+    if ranking_evidence:
+        signals.append({
+            "code": "mechanical_ranking",
+            "kind": "structured",
+            "evidence": ranking_evidence,
+        })
+
+    answers = []
+    for col in open_text_cols:
+        if str(q_labels.get(f"col_{col}", "N/A")) == "N/A":
+            continue
+        text = str(row[col] if col < len(row) else "").strip()
+        if text:
+            answers.append(text)
+    if len(answers) >= ANNOTATE_QUALITY_LOW_EFFORT_MIN_ANSWERS:
+        short_flags = []
+        for text in answers:
+            compact_length = len(re.sub(r"[^\w\u4e00-\u9fff]", "", text, flags=re.UNICODE))
+            word_count = len(re.findall(r"[A-Za-z0-9]+", text))
+            short_flags.append(
+                compact_length <= ANNOTATE_QUALITY_SHORT_TEXT_MAX_CHARS
+                or (word_count > 0 and word_count <= ANNOTATE_QUALITY_SHORT_TEXT_MAX_WORDS)
+            )
+        if all(short_flags):
+            signals.append({
+                "code": "pervasively_short_text",
+                "kind": "text",
+                "evidence": f"{len(answers)}道非N/A主观回答全部为极短表达",
+            })
+
+        normalized = [re.sub(r"[\W_]", "", text.lower(), flags=re.UNICODE) for text in answers]
+        normalized = [text for text in normalized if text]
+        if normalized:
+            top_count = max(normalized.count(text) for text in set(normalized))
+            if top_count >= 2 and top_count * 2 >= len(normalized):
+                signals.append({
+                    "code": "repeated_simple_text",
+                    "kind": "text",
+                    "evidence": f"{top_count}/{len(normalized)}道主观回答为规范化后完全重复的简单描述",
+                })
+
+    kinds = {signal["kind"] for signal in signals}
+    triggered = (
+        len(signals) >= ANNOTATE_QUALITY_LOW_EFFORT_MIN_SIGNALS
+        and {"structured", "text"}.issubset(kinds)
+    )
+    return {"triggered": triggered, "signals": signals}
+
+
+def calculate_overall_quality(
+    q_labels: dict[str, str],
+    open_text_cols: list[int],
+    *,
+    low_effort: dict | None = None,
+) -> tuple[str, str]:
+    """按非 N/A 题目加权计算整体质量，并返回可复核的计数与硬门槛说明。"""
     labels = [str(q_labels.get(f"col_{col}", "N/A")) for col in open_text_cols]
     assessed = [label for label in labels if label != "N/A"]
     if not assessed:
-        return "N/A", "所有主观题均为 N/A，无可评估回答"
+        return "N/A", "非N/A题目0道：无效0、普通0、优秀0；无可评估回答，整体为N/A"
 
     invalid_count = assessed.count("无效反馈")
     ordinary_count = assessed.count("普通反馈")
     excellent_count = assessed.count("优秀反馈")
-    if invalid_count > len(assessed) / 2:
+    total = len(assessed)
+    invalid_ratio = invalid_count / total
+    weighted_total = sum(_QUALITY_SCORE.get(label, 0) for label in assessed)
+    average = weighted_total / total
+    majority_gate = invalid_ratio > ANNOTATE_QUALITY_INVALID_HARD_RATIO
+    low_effort_result = low_effort or {"triggered": False, "signals": []}
+    low_effort_gate = bool(low_effort_result.get("triggered"))
+
+    if majority_gate or low_effort_gate:
         overall = "无效反馈"
-    elif excellent_count > len(assessed) / 2:
+    elif average < ANNOTATE_QUALITY_INVALID_AVG_THRESHOLD:
+        overall = "无效反馈"
+    elif (
+        average >= ANNOTATE_QUALITY_EXCELLENT_AVG_THRESHOLD
+        and invalid_ratio <= ANNOTATE_QUALITY_EXCELLENT_MAX_INVALID_RATIO
+    ):
         overall = "优秀反馈"
     else:
         overall = "普通反馈"
+
+    hard_reasons = []
+    if majority_gate:
+        hard_reasons.append(
+            f"无效比例超过{ANNOTATE_QUALITY_INVALID_HARD_RATIO:.0%}"
+        )
+    if low_effort_gate:
+        hard_reasons.append("整份答卷出现多项跨类型低投入信号")
+    hard_text = f"已触发（{'；'.join(hard_reasons)}）" if hard_reasons else "未触发"
+
+    signal_evidence = [
+        str(signal.get("evidence", "")).strip()
+        for signal in low_effort_result.get("signals", [])
+        if str(signal.get("evidence", "")).strip()
+    ]
+    if signal_evidence:
+        low_effort_text = (
+            ("已触发" if low_effort_gate else "未触发")
+            + f"（发现{len(signal_evidence)}项：{'；'.join(signal_evidence)}）"
+        )
+    else:
+        low_effort_text = "未触发（未发现可审计的组合信号）"
+
     reason = (
-        f"非N/A题目{len(assessed)}道：无效{invalid_count}、普通{ordinary_count}、"
-        f"优秀{excellent_count}；按多数规则判为{overall}"
+        f"非N/A题目{total}道：无效{invalid_count}、普通{ordinary_count}、"
+        f"优秀{excellent_count}；无效比例{invalid_ratio:.2%}；"
+        f"加权总分{weighted_total}分、平均分{average:.2f}"
+        f"（无效=0、普通=1、优秀=2）；整体硬门槛：{hard_text}；"
+        f"低投入组合信号：{low_effort_text}；整体判为{overall}"
     )
     return overall, reason
 

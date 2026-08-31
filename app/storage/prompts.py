@@ -294,7 +294,7 @@ DEFAULT_PROMPTS: dict = {
         order=20,
         kind="system",
         current=DEFAULT_ANNOTATE_QUALITY_SYSTEM_PROMPT,
-        version=2,
+        version=3,
     ),
     "annotate_translation_system": _prompt(
         "annotate_translation_system",

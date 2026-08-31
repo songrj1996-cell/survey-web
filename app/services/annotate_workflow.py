@@ -963,6 +963,9 @@ def _validated_quality_results(
     id_col: int,
     open_text_cols: list[int],
     include_translations: bool,
+    *,
+    headers: list | None = None,
+    headers_zh: list | None = None,
 ) -> tuple[list[dict], set[str], list[str]]:
     rows_by_id = {_row_id(row, id_col): row for row in batch_rows}
     valid: list[dict] = []
@@ -1011,8 +1014,16 @@ def _validated_quality_results(
             errors.append(f"ID {row_id}：{'；'.join(row_errors[:4])}")
             continue
         result["originals"] = _open_text_originals(row, open_text_cols)
+        low_effort = annotate.detect_low_effort_signals(
+            row,
+            headers or [],
+            open_text_cols,
+            id_col,
+            labels,
+            headers_zh=headers_zh,
+        )
         result["overall"], result["overall_reason"] = annotate.calculate_overall_quality(
-            labels, open_text_cols,
+            labels, open_text_cols, low_effort=low_effort,
         )
         seen.add(row_id)
         valid.append(result)
@@ -1547,6 +1558,7 @@ async def _run_one_quality_batch_strict(
     open_text_cols: list[int],
     id_col: int,
     include_translations: bool,
+    headers_zh: list | None = None,
 ) -> tuple[int, list[dict], set[str], str]:
     async def call(
         current_query: str,
@@ -1630,7 +1642,13 @@ async def _run_one_quality_batch_strict(
                             target[key] = source[key]
 
         valid, missing, errors = _validated_quality_results(
-            list(parsed_by_id.values()), batch, id_col, open_text_cols, include_translations,
+            list(parsed_by_id.values()),
+            batch,
+            id_col,
+            open_text_cols,
+            include_translations,
+            headers=headers,
+            headers_zh=headers_zh,
         )
         if missing and repair_error:
             errors.append(repair_error)
@@ -1653,6 +1671,7 @@ async def quality_stream(sid: str, request: Request):
         sess["quality_status"] = "running"
     rows = sess.get("rows", [])
     headers = sess.get("headers", [])
+    headers_zh = sess.get("headers_zh", [])
     id_col = sess.get("id_col", 1)
     open_text_cols = sess.get("open_text_cols", [])
     confirmed_ai_ids = set(sess.get("confirmed_ai_ids", []))
@@ -1706,7 +1725,14 @@ async def quality_stream(sid: str, request: Request):
         async def run_with_sem(batch_num: int, batch: list):
             async with sem:
                 return await _run_one_quality_batch_strict(
-                    sid, batch_num, batch, headers, open_text_cols, id_col, include_translations,
+                    sid,
+                    batch_num,
+                    batch,
+                    headers,
+                    open_text_cols,
+                    id_col,
+                    include_translations,
+                    headers_zh,
                 )
 
         pending = {
