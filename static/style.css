@@ -3072,7 +3072,7 @@ body {
   word-break: keep-all;
 }
 
-.markdown-body tr:hover td {
+.markdown-body table:not(.report-stats-table) tr:hover td {
   background: var(--glass-hover);
 }
 
