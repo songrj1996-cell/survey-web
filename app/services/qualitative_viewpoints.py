@@ -12,7 +12,7 @@ from app.services import report_engine
 
 
 _VIEWPOINT_BLOCK_RE = re.compile(r"(?m)^[ \t]*\*\*观点：")
-_MENTION_BLOCK_RE = re.compile(r"(?m)^[ \t]*\*\*提及情况：")
+_MENTION_BLOCK_RE = re.compile(r"(?m)^[ \t]*(?:-[ \t]+)?\*\*提及情况：")
 _INFERENCE_BLOCK_RE = re.compile(r"(?m)^[ \t]*\*\*分析推断：")
 _VAGUE_VIEWPOINT_TERMS = ("多数玩家", "多位玩家", "部分玩家", "少数玩家")
 

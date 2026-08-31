@@ -169,6 +169,11 @@ class QualitativeViewpointTests(unittest.TestCase):
             report_without_mentions + "\n\n**提及情况：** 1名玩家提及。",
             writer_context_included=True,
         )
+        complete_with_list_item = finalize_viewpoint_diagnostics(
+            catalog,
+            report_without_mentions + "\n\n- **提及情况：** 1名玩家提及。",
+            writer_context_included=True,
+        )
         writer_no_viewpoints = finalize_viewpoint_diagnostics(
             catalog,
             "## Part 1 界面反馈\n\n没有输出观点块。",
@@ -186,6 +191,9 @@ class QualitativeViewpointTests(unittest.TestCase):
             "catalog_unavailable",
         )
         self.assertEqual(complete["writer_output"]["status"], "complete")
+        self.assertEqual(
+            complete_with_list_item["writer_output"]["status"], "complete"
+        )
         self.assertEqual(
             writer_no_viewpoints["writer_output"]["status"],
             "writer_no_viewpoints",
@@ -252,11 +260,17 @@ class CrossQuestionViewpointTests(unittest.IsolatedAsyncioTestCase):
             ]
         }
 
+        merge_call = AsyncMock(return_value={"data": {"themes": merged_themes}})
         with (
             patch.object(
                 report_engine,
+                "_get_theme_merge_system_prompt_base",
+                return_value="merge-base",
+            ),
+            patch.object(
+                report_engine,
                 "_direct_json_call",
-                new=AsyncMock(return_value={"data": {"themes": merged_themes}}),
+                new=merge_call,
             ),
             patch.object(
                 report_engine,
@@ -276,6 +290,10 @@ class CrossQuestionViewpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(by_id["RVIEW:t01"]["denominator"], 2)
         self.assertEqual(by_id["RVIEW:t02"]["count"], 2)
         self.assertEqual(by_id["RVIEW:t02"]["denominator"], 3)
+        merge_system_prompt = merge_call.await_args.args[0]
+        merge_query = merge_call.await_args.args[1]
+        self.assertIn("最终主题不设置最少或最多数量", merge_system_prompt)
+        self.assertIn('"candidate_id": "c0001"', merge_query)
 
 
 if __name__ == "__main__":

@@ -28,6 +28,7 @@ _SELECTED_VERSION_FIELDS = (
     "report_writer_model",
     "analyst_conv_id",
     "analyst_app",
+    "comparison_validation",
 )
 
 

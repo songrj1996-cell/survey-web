@@ -446,6 +446,7 @@ async function loadSessionReportVersion(version) {
     state.historyId = null;
     state.sessionReport.reportMd = data.report_md || '';
     state.sessionReport.title = data.title || reportTitleFromMarkdown(data.report_md || '');
+    state.sessionReport.comparisonValidation = data.comparison_validation || {};
     state.sessionReport.qaMessages = normalizeQAMessages(data.qa_messages || []);
     state.sessionReport.qaHtml = '';
     state.sessionReport.feishuLinkHtml = '';
@@ -485,6 +486,7 @@ async function loadHistoryReportVersion(version) {
     state.historyId = historyId;
     state.historyReport.reportMd = data.report_md || '';
     state.historyReport.title = data.title || reportTitleFromMarkdown(data.report_md || '');
+    state.historyReport.comparisonValidation = data.comparison_validation || {};
     state.historyReport.qaMessages = normalizeQAMessages(data.qa_messages || []);
     state.historyReport.qaHtml = '';
     state.historyReport.feishuLinkHtml = '';
@@ -763,6 +765,7 @@ async function runStats(options = {}) {
         state.sessionReport.id = generationSessionId;
         state.sessionReport.reportMd = ev.report_md;
         state.sessionReport.title = reportTitleFromMarkdown(ev.report_md);
+        state.sessionReport.comparisonValidation = ev.comparison_validation || {};
         state.sessionReport.reportNo = ev.report_no || state.sessionReport.reportNo || '';
         state.sessionReport.qaMessages = [];
         state.sessionReport.qaHtml = '';
@@ -1274,12 +1277,121 @@ function showReportPanelPreservingProgress() {
   document.querySelector('.main').scrollTo({ top: 0, behavior: 'smooth' });
 }
 
+function comparisonAuditRow(label, value, className = '') {
+  const row = document.createElement('div');
+  row.className = `comparison-validation__row ${className}`.trim();
+  const labelNode = document.createElement('strong');
+  labelNode.textContent = label;
+  const valueNode = document.createElement('span');
+  valueNode.textContent = String(value || '—');
+  row.append(labelNode, valueNode);
+  return row;
+}
+
+function renderComparisonValidation(validation) {
+  const panel = $('comparison-validation');
+  const statusNode = $('comparison-validation-status');
+  const countsNode = $('comparison-validation-counts');
+  const body = $('comparison-validation-body');
+  if (!panel || !statusNode || !countsNode || !body) return;
+
+  const audit = validation && typeof validation === 'object' ? validation : {};
+  const status = String(audit.status || 'legacy');
+  const labels = {
+    passed: '统计比较校验通过',
+    repaired: '统计比较校验已自动修正',
+    needs_review: '统计比较校验发现待确认风险',
+    incomplete: '统计比较校验未完整执行',
+    legacy: '此版本无统计比较校验记录',
+  };
+  panel.dataset.status = labels[status] ? status : 'incomplete';
+  statusNode.textContent = (
+    status === 'passed' && Number(audit.catalog_group_count || 0) === 0
+      ? '未发现可确定校验的量表比较'
+      : labels[status] || labels.incomplete
+  );
+  body.replaceChildren();
+
+  if (status === 'legacy') {
+    countsNode.textContent = '';
+    body.append(comparisonAuditRow(
+      '说明',
+      '该版本生成于本校验功能上线之前，不能据此判断正文中的比较结论已经通过复核。',
+    ));
+    panel.open = false;
+    return;
+  }
+
+  const detected = Number(audit.detected_count || 0);
+  const applied = Number(audit.applied_count || 0);
+  const unresolved = Number(audit.unresolved_count || 0);
+  countsNode.textContent = `发现 ${detected} · 修改 ${applied} · 待确认 ${unresolved}`;
+  if (audit.coverage) body.append(comparisonAuditRow('校验范围', audit.coverage));
+  if (status === 'passed' && Number(audit.catalog_group_count || 0) === 0) {
+    body.append(comparisonAuditRow(
+      '覆盖说明',
+      '本版本没有识别出至少两个可按同一口径比较的量表项目，因此没有执行具体比较句复核。',
+    ));
+  }
+  if (audit.error) {
+    body.append(comparisonAuditRow('执行状态', audit.error, 'comparison-validation__row--risk'));
+  }
+  if (audit.repair_error) {
+    body.append(comparisonAuditRow('修补状态', audit.repair_error, 'comparison-validation__row--risk'));
+  }
+  if (audit.risk) {
+    body.append(comparisonAuditRow('风险提示', audit.risk, 'comparison-validation__row--risk'));
+  }
+
+  const changes = Array.isArray(audit.changes) ? audit.changes : [];
+  changes.forEach((change, index) => {
+    const item = document.createElement('section');
+    item.className = 'comparison-validation__item comparison-validation__item--changed';
+    const title = document.createElement('h4');
+    title.textContent = `自动修改 ${index + 1} · ${change.section || '报告正文'}`;
+    item.append(
+      title,
+      comparisonAuditRow('修改前', change.original),
+      comparisonAuditRow('修改后', change.replacement),
+      comparisonAuditRow('事实依据', change.factual_basis),
+      comparisonAuditRow('复核说明', change.risk),
+    );
+    body.append(item);
+  });
+
+  const unresolvedItems = Array.isArray(audit.unresolved) ? audit.unresolved : [];
+  unresolvedItems.forEach((issue, index) => {
+    const item = document.createElement('section');
+    item.className = 'comparison-validation__item comparison-validation__item--risk';
+    const title = document.createElement('h4');
+    title.textContent = `待人工确认 ${index + 1} · ${issue.section || '报告正文'}`;
+    item.append(
+      title,
+      comparisonAuditRow('原文', issue.original),
+      comparisonAuditRow('不一致', (issue.reasons || []).join('；')),
+      comparisonAuditRow('事实依据', issue.factual_basis),
+      comparisonAuditRow('风险', issue.risk),
+    );
+    body.append(item);
+  });
+
+  const warnings = Array.isArray(audit.parser_warnings) ? audit.parser_warnings : [];
+  if (warnings.length) {
+    body.append(comparisonAuditRow('修补响应提示', warnings.join('；')));
+  }
+  if (!body.childElementCount) {
+    body.append(comparisonAuditRow('结果', '未发现需要修改的统计比较表述。'));
+  }
+  panel.open = status !== 'passed';
+}
+
 function renderReportWorkspace(md, { preserveQa = true } = {}) {
   state.reportMd = md;
   if (state.viewMode === 'history') showReportPanelPreservingProgress();
   else goStep(5);
 
   const ctx = activeReportCtx();
+  renderComparisonValidation(ctx.comparisonValidation);
   const title = ctx.title || reportTitleFromMarkdown(md);
   $('report-title-display').textContent = title;
   const renameBtn = $('btn-report-rename');

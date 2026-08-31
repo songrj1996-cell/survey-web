@@ -50,6 +50,27 @@ VIEWPOINT_STATS_MD = (
     "</subjective_viewpoint_stats>"
 )
 
+ACTION_SECTION_MD = (
+    "## 行动建议\n\n"
+    "1. **修复消息丢失**（优先级：高）\n"
+    "   - **核心判断：** 消息丢失需要优先验证。\n"
+    "   - **产品动作：** 排查消息链路。\n"
+    "   - **验证方式：** 对比修复前后的丢失率。\n"
+    "   - **依据：** 玩家反馈消息会消失。\n"
+    "   - **不确定性/前提：** 仍需确认发生范围。"
+)
+
+
+def _core_repair(original: str, replacement: str) -> str:
+    return (
+        "<!--CORE_REPAIRS_START-->\n"
+        "<!--CORE_REPAIR_START-->\n"
+        f"<original>\n{original}\n</original>\n"
+        f"<replacement>\n{replacement}\n</replacement>\n"
+        "<!--CORE_REPAIR_END-->\n"
+        "<!--CORE_REPAIRS_END-->"
+    )
+
 
 async def _stub_qualitative_analysis(*_args, **_kwargs):
     yield ("result", {1: {"col_name": "聊天反馈", "themes": []}})
@@ -71,7 +92,8 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
         original = (
             "<!--CORE_START-->\n"
             "## 核心结论\n"
-            "原始核心判断。\n"
+            "原始核心判断。\n\n"
+            "需要完整保留的原因与场景。\n"
             "<!--CORE_END-->"
         )
 
@@ -82,26 +104,95 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
             "PASS\n补充说明",
             "## 核心结论\n缺少完整标记",
             "<!--CORE_START-->\n## 核心结论\n缺少结束标记",
-            (
-                "解释如下：\n<!--CORE_START-->\n## 核心结论\n替换内容。\n"
-                "<!--CORE_END-->"
-            ),
-            (
-                "<!--CORE_START-->\n## 核心结论\n"
-                "针对这个问题，本次调研的结果并不是单一方向的。\n"
-                "<!--CORE_END-->"
-            ),
-            (
-                "<!--CORE_START-->\n## 核心结论\n"
-                "关于使用习惯是否影响复杂度，证据显示两者相关。\n"
-                "<!--CORE_END-->"
-            ),
+            _core_repair("不存在的原句。", "替换内容。"),
+            _core_repair("原始核心判断。", "针对这个问题，改写判断。"),
+            _core_repair("原始核心判断。", "## 核心结论\n替换全部内容。"),
+            _core_repair("原始核心判断。", ""),
         ):
             with self.subTest(invalid=invalid):
                 self.assertEqual(
                     _resolve_core_coverage_review(original, invalid),
                     original,
                 )
+
+    def test_core_coverage_review_applies_only_unique_local_repairs(self):
+        original = (
+            "<!--CORE_START-->\n"
+            "## 核心结论\n"
+            "### 观看渠道与产品机会\n"
+            "1. **外部观看占主导**：51名玩家选择官方赛事直播。\n\n"
+            "2. **游戏内场景仍有价值**：玩家提到学英雄、等好友和支持好友。\n\n"
+            "### 体验问题\n"
+            "聊天区存在广告和诈骗内容，影响观看体验。\n"
+            "<!--CORE_END-->"
+        )
+        review = _core_repair(
+            "1. **外部观看占主导**：51名玩家选择官方赛事直播。",
+            (
+                "1. **外部观看占主导，但产品机会要看具体场景**：51名玩家选择官方赛事直播。\n"
+                "   - 玩家同时提到学英雄、等好友和支持好友等游戏内观看场景。\n"
+                "   - **分析推断**：游戏内观看更适合承接与游戏行为紧密相连的短时、社交场景；"
+                "仍需进一步验证使用频次。"
+            ),
+        )
+
+        resolved = _resolve_core_coverage_review(original, review)
+
+        self.assertIn("产品机会要看具体场景", resolved)
+        self.assertIn("**分析推断**", resolved)
+        self.assertIn("2. **游戏内场景仍有价值**", resolved)
+        self.assertIn("聊天区存在广告和诈骗内容", resolved)
+        self.assertEqual(resolved.count("<!--CORE_START-->"), 1)
+        self.assertEqual(resolved.count("<!--CORE_END-->"), 1)
+
+    def test_core_coverage_review_can_promote_decision_rule_without_rewriting_details(self):
+        original = (
+            "<!--CORE_START-->\n"
+            "## 核心结论\n"
+            "本次调研共收集52份有效回复。\n"
+            "### 总体判断\n"
+            "<u>方案1获得最多第一名，方案3满意度最高。</u>\n\n"
+            "玩家还会结合切换聊天对象是否方便、新功能是否真正有用来权衡方案。\n\n"
+            "### 其他体验问题\n"
+            "部分玩家反馈聊天入口不够明显。\n"
+            "<!--CORE_END-->"
+        )
+        review = _core_repair(
+            "<u>方案1获得最多第一名，方案3满意度最高。</u>",
+            (
+                "三个方案的选择首先取决于 **是否保留旧习惯、聊天是否清晰、找队友是否更快、操作是否更少**，"
+                "而不是单看某一项排名。方案1获得最多第一名，方案3满意度最高。"
+            ),
+        )
+
+        resolved = _resolve_core_coverage_review(original, review)
+
+        first_judgment = resolved.index("三个方案的选择首先取决于")
+        supporting_detail = resolved.index("玩家还会结合切换聊天对象是否方便")
+        self.assertLess(first_judgment, supporting_detail)
+        self.assertNotIn("<u>方案1获得最多第一名", resolved)
+        self.assertIn("**是否保留旧习惯、聊天是否清晰、找队友是否更快、操作是否更少**", resolved)
+        self.assertIn("### 其他体验问题\n部分玩家反馈聊天入口不够明显。", resolved)
+
+    def test_core_coverage_review_rejects_ambiguous_or_overbroad_repairs(self):
+        repeated = (
+            "<!--CORE_START-->\n## 核心结论\n"
+            "相同句子。\n\n相同句子。\n<!--CORE_END-->"
+        )
+        self.assertEqual(
+            _resolve_core_coverage_review(repeated, _core_repair("相同句子。", "新句子。")),
+            repeated,
+        )
+
+        long_paragraph = "需保留的长段落。" * 220
+        overbroad = f"<!--CORE_START-->\n## 核心结论\n{long_paragraph}\n<!--CORE_END-->"
+        self.assertEqual(
+            _resolve_core_coverage_review(
+                overbroad,
+                _core_repair(long_paragraph, "被过度概括。"),
+            ),
+            overbroad,
+        )
 
     def test_qa_context_scope_reports_full_sampled_and_missing_feedback(self):
         full_context = '<qa_context><rows>\n{"id": "p-1"}\n{"id": "p-2"}\n</rows></qa_context>'
@@ -168,10 +259,10 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
                 "model-a",
             ),
             (
-                "<!--CORE_START-->\n## 核心结论\n覆盖审校后的核心判断。\n<!--CORE_END-->",
+                _core_repair("旧核心判断。", "覆盖审校后的核心判断。"),
                 "model-a",
             ),
-            ("## 行动建议\n\n**修复消息丢失**", "model-a"),
+            (ACTION_SECTION_MD, "model-a"),
         ])
 
         with (
@@ -202,6 +293,15 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(direct.await_count, 6)
         self.assertTrue(any('"type": "report_done"' in event for event in events))
+        done = next(
+            payload for payload in _event_payloads(events)
+            if payload.get("type") == "report_done"
+        )
+        self.assertEqual(done["comparison_validation"]["status"], "passed")
+        self.assertEqual(
+            sess["report_versions"][-1]["comparison_validation"],
+            done["comparison_validation"],
+        )
         progress = [
             payload
             for payload in _event_payloads(events)
@@ -261,7 +361,7 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
             ("NONE", "model-a"),
             (original_core, "model-a"),
             RuntimeError("review unavailable"),
-            ("## 行动建议\n\n**修复消息丢失**", "model-a"),
+            (ACTION_SECTION_MD, "model-a"),
         ])
 
         with (
@@ -291,7 +391,7 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
             events = [event async for event in survey_service.report_stream("sid", object())]
 
         self.assertEqual(direct.await_count, 6)
-        self.assertTrue(any("核心结论覆盖复核未完成" in event for event in events))
+        self.assertTrue(any("核心结论证据复核未完成" in event for event in events))
         self.assertTrue(any('"type": "report_done"' in event for event in events))
         self.assertIn("原始核心判断", sess["report_md"])
         self.assertIn("原始核心判断", _streamed_chunk_text(events))
@@ -317,8 +417,9 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
             ("## Part 1 聊天体验\n\n本节总结。", "model-a"),
             ("NONE", "model-a"),
             ("<!--CORE_START-->\n## 核心结论\n样本总数 1。\n<!--CORE_END-->", "model-a"),
+            ("PASS", "model-a"),
             ("无标题的旧建议", "model-a"),
-            ("### 行动建议（修正版）\n\n**修复消息丢失**", "model-a"),
+            (ACTION_SECTION_MD.replace("## 行动建议", "### 行动建议（修正版）"), "model-a"),
         ])
 
         with (
@@ -347,9 +448,10 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
         ):
             events = [event async for event in survey_service.report_stream("sid", object())]
 
-        self.assertEqual(direct.await_count, 6)
+        self.assertEqual(direct.await_count, 7)
         self.assertIn("不要改变建议", direct.await_args_list[-1].args[1])
-        self.assertIn("## 行动建议\n\n**修复消息丢失**", sess["report_md"])
+        self.assertIn("## 行动建议\n\n1. **修复消息丢失**", sess["report_md"])
+        self.assertNotIn("| 建议内容 |", sess["report_md"])
         self.assertNotIn("无标题的旧建议", "".join(events))
         self.assertTrue(any("行动建议格式校验中" in event for event in events))
 
@@ -373,7 +475,8 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
             ("## Part 1 聊天体验\n\n本节总结。", "model-a"),
             ("NONE", "model-a"),
             ("<!--CORE_START-->\n## 核心结论\n样本总数 1。\n<!--CORE_END-->", "model-a"),
-            ("## 行动建议\n\n**修复消息丢失**", "model-a"),
+            ("PASS", "model-a"),
+            (ACTION_SECTION_MD, "model-a"),
         ])
 
         async def slow_writer(*_args):
@@ -439,7 +542,8 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
                 "<!--CORE_START-->\n## 核心结论\n消息丢失需要处理。\n<!--CORE_END-->",
                 "model-a",
             ),
-            ("## 行动建议\n\n**修复消息丢失**", "model-a"),
+            ("PASS", "model-a"),
+            (ACTION_SECTION_MD, "model-a"),
         ])
         writer_calls: list[tuple[list[dict], str]] = []
 
@@ -479,8 +583,9 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
             events = [event async for event in survey_service.report_stream("sid", object())]
 
         self.assertTrue(any('"type": "report_done"' in event for event in events))
-        self.assertEqual(len(writer_calls), 5)
+        self.assertEqual(len(writer_calls), 6)
         self.assertIn(VIEWPOINT_STATS_MD, writer_calls[0][1])
+        self.assertIn("事实边界也必须逐条复核", writer_calls[-2][1])
         final_messages, final_query = writer_calls[-1]
         final_prompt = "\n".join(
             [*(message["content"] for message in final_messages), final_query]
@@ -541,6 +646,37 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
                 "reasoning_effort": "medium",
             },
         )
+
+    async def test_direct_qa_rebuilds_cached_context_when_raw_rows_are_available(self):
+        source = {
+            "report_md": "# 报告",
+            "stats_md": "总体=1",
+            "plan": {
+                "columns": [{"index": 1, "name": "概念1整体满意度", "role": "scale"}],
+                "parts": [],
+            },
+            "rows": [["玩家ID", "满意度"], ["p-1", "5"]],
+            "qa_context_md": "<qa_context><rows>旧的有损上下文</rows></qa_context>",
+        }
+        collect = AsyncMock(return_value=("已刷新", "qa-model"))
+
+        with patch.object(survey_service, "collect_chat_completion", new=collect):
+            answer, model, context = await survey_service._answer_qa_direct(source, "请核对")
+
+        self.assertEqual(answer, "已刷新")
+        self.assertEqual(model, "qa-model")
+        self.assertNotIn("旧的有损上下文", context)
+        self.assertIn('"满意度": "5"', context)
+
+    async def test_direct_qa_keeps_cached_context_when_raw_rows_are_unavailable(self):
+        cached = "<qa_context><report>历史报告</report><rows>历史上下文</rows></qa_context>"
+        source = {"qa_context_md": cached}
+        collect = AsyncMock(return_value=("历史回答", "qa-model"))
+
+        with patch.object(survey_service, "collect_chat_completion", new=collect):
+            _, _, context = await survey_service._answer_qa_direct(source, "请核对")
+
+        self.assertEqual(context, cached)
 
     async def test_history_qa_allows_direct_report_without_conversation_id(self):
         entry = {

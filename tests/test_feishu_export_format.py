@@ -3,12 +3,14 @@ from unittest.mock import AsyncMock, patch
 
 from app.core.config import CORE_END, CORE_START, QUALITATIVE_DISCLAIMER, REPORT_DISCLAIMER
 from app.integrations.feishu_client import (
-    _BT_BULLET,
     _BT_CALLOUT,
+    _BT_ORDERED,
+    _BT_QUOTE,
     _FONT_ORANGE,
     _FONT_PURPLE,
     _core_callout_children,
     _divider_block,
+    _markdown_inline_elements,
     _replace_section_with_callout,
 )
 from app.services.report_render import (
@@ -27,7 +29,9 @@ SAMPLE_REPORT = f"""# 测试报告
 这是总体判断，包含**关键结论**。
 ---
 ### Part 1 玩家画像与聊天意愿：关键发现
-- **样本特征**：玩家整体聊天意愿较高。
+1. **样本特征**：玩家整体聊天意愿较高，<u>该判断需要优先关注</u>。
+    1. *证据口径*：仅针对有效回答玩家。
+> *补充说明*：这里是辅助证据，不是新的玩家观点。
 ### 高信号少数观点与风险
 1. **风险信号**：存在需要关注的体验风险。
 {CORE_END}
@@ -75,8 +79,40 @@ class FeishuExportFormatTests(unittest.TestCase):
         style = group["text"]["elements"][0]["text_run"]["text_element_style"]
         self.assertTrue(style["bold"])
         self.assertEqual(style["text_color"], _FONT_PURPLE)
-        self.assertTrue(any(block["block_type"] == _BT_BULLET for block in children))
+        self.assertTrue(any(block["block_type"] == _BT_ORDERED for block in children))
+        self.assertTrue(any(block["block_type"] == _BT_QUOTE for block in children))
+        nested = next(
+            block for block in children
+            if block["block_type"] == _BT_ORDERED
+            and "证据口径" in "".join(
+                element["text_run"]["content"]
+                for element in block["ordered"]["elements"]
+            )
+        )
+        nested_text = "".join(
+            element["text_run"]["content"]
+            for element in nested["ordered"]["elements"]
+        )
+        self.assertTrue(nested_text.startswith("　↳ "))
         self.assertEqual(_BT_CALLOUT, 19)
+
+    def test_inline_styles_preserve_bold_italic_underline_and_combinations(self):
+        elements = _markdown_inline_elements(
+            "普通 **加粗** *斜体* <u>下划线</u> <u>**组合强调**</u>"
+        )
+        runs = {
+            element["text_run"]["content"]: element["text_run"].get(
+                "text_element_style", {}
+            )
+            for element in elements
+            if element["text_run"]["content"].strip()
+        }
+
+        self.assertTrue(runs["加粗"]["bold"])
+        self.assertTrue(runs["斜体"]["italic"])
+        self.assertTrue(runs["下划线"]["underline"])
+        self.assertTrue(runs["组合强调"]["underline"])
+        self.assertTrue(runs["组合强调"]["bold"])
 
     def test_detail_divider_is_centered_bold_and_orange(self):
         block = _divider_block("---------------- 以下为详细信息，各位可以按需查看 ----------------")

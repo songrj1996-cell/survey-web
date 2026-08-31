@@ -430,31 +430,48 @@ def _text_element(content: str, **style) -> dict:
     return {"text_run": run}
 
 
+_INLINE_MARKUP_RE = re.compile(
+    r"(<u>.+?</u>|\*\*\*.+?\*\*\*|\*\*.+?\*\*|__.+?__|(?<!\*)\*[^*]+?\*(?!\*)|`[^`]+`)",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+
+
 def _markdown_inline_elements(text: str, base_style: dict | None = None) -> list[dict]:
-    """把报告中常见的 Markdown 行内加粗/斜体转成飞书富文本元素。"""
+    """把核心结论的常用 Markdown/HTML 强调转换成飞书富文本元素。"""
+
+    def parse_fragment(fragment: str, inherited: dict) -> list[dict]:
+        elements: list[dict] = []
+        cursor = 0
+        for match in _INLINE_MARKUP_RE.finditer(fragment):
+            if match.start() > cursor:
+                elements.append(_text_element(fragment[cursor:match.start()], **inherited))
+            token = match.group(0)
+            style = dict(inherited)
+            lowered = token.casefold()
+            if lowered.startswith("<u>") and lowered.endswith("</u>"):
+                content = token[3:-4]
+                style["underline"] = True
+            elif token.startswith("***"):
+                content = token[3:-3]
+                style["bold"] = True
+                style["italic"] = True
+            elif token.startswith(("**", "__")):
+                content = token[2:-2]
+                style["bold"] = True
+            elif token.startswith("*"):
+                content = token[1:-1]
+                style["italic"] = True
+            else:
+                content = token[1:-1]
+                style["inline_code"] = True
+            elements.extend(parse_fragment(content, style))
+            cursor = match.end()
+        if cursor < len(fragment):
+            elements.append(_text_element(fragment[cursor:], **inherited))
+        return elements
+
     base = dict(base_style or {})
-    elements: list[dict] = []
-    pattern = re.compile(r"(\*\*.+?\*\*|__.+?__|(?<!\*)\*[^*]+?\*(?!\*)|`[^`]+`)")
-    cursor = 0
-    for match in pattern.finditer(str(text or "")):
-        if match.start() > cursor:
-            elements.append(_text_element(text[cursor:match.start()], **base))
-        token = match.group(0)
-        style = dict(base)
-        if token.startswith(("**", "__")):
-            content = token[2:-2]
-            style["bold"] = True
-        elif token.startswith("*"):
-            content = token[1:-1]
-            style["italic"] = True
-        else:
-            content = token[1:-1]
-            style["inline_code"] = True
-        elements.append(_text_element(content, **style))
-        cursor = match.end()
-    if cursor < len(text):
-        elements.append(_text_element(text[cursor:], **base))
-    return elements or [_text_element("", **base)]
+    return parse_fragment(str(text or ""), base) or [_text_element("", **base)]
 
 
 def _text_block(
@@ -491,10 +508,11 @@ def _clean_core_group_title(title: str) -> str:
 
 
 def _core_callout_children(lines: list[str]) -> list[dict]:
-    """核心结论全部降为正文块，仅分组标题使用紫色加粗。"""
+    """核心结论不进入目录；用富文本标题、引用和视觉缩进保留阅读层级。"""
     children: list[dict] = []
     for raw in lines:
-        text = str(raw or "").strip()
+        raw_text = str(raw or "").rstrip()
+        text = raw_text.strip()
         if not text or text == "---" or text.startswith("<!--"):
             continue
         if re.match(r"^##\s+核心结论\s*$", text):
@@ -514,11 +532,21 @@ def _core_callout_children(lines: list[str]) -> list[dict]:
             continue
         bullet = re.match(r"^(?:[-*•])\s+(.+)$", text)
         if bullet:
-            children.append(_text_block(bullet.group(1), _BT_BULLET))
+            indent_width = len(raw_text) - len(raw_text.lstrip(" \t"))
+            indent_level = min(2, (indent_width + 3) // 4)
+            prefix = ("　" * indent_level + "↳ ") if indent_level else ""
+            children.append(_text_block(prefix + bullet.group(1), _BT_BULLET))
             continue
         ordered = re.match(r"^\d+[.)、]\s*(.+)$", text)
         if ordered:
-            children.append(_text_block(ordered.group(1), _BT_ORDERED))
+            indent_width = len(raw_text) - len(raw_text.lstrip(" \t"))
+            indent_level = min(2, (indent_width + 3) // 4)
+            prefix = ("　" * indent_level + "↳ ") if indent_level else ""
+            children.append(_text_block(prefix + ordered.group(1), _BT_ORDERED))
+            continue
+        quote = re.match(r"^>\s*(.+)$", text)
+        if quote:
+            children.append(_text_block(quote.group(1), _BT_QUOTE))
             continue
         children.append(_text_block(text))
     return children

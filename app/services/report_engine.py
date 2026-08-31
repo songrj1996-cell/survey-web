@@ -30,7 +30,6 @@ from app.core.config import (
     LLM_THEME_MERGE_MAX_TOKENS,
     LLM_THEME_MERGE_MODEL,
     LLM_THEME_MERGE_REASONING,
-    OTHER_THEME_PCT,
 )
 from app.integrations.llm_client import collect_chat_completion
 from app.services.branch_logic import branch_rule_for_column, branch_rule_label
@@ -44,9 +43,29 @@ from app.storage.prompts import (
     _get_planner_extra,
     _get_response_classify_system_prompt,
     _get_theme_extract_system_prompt,
-    _get_theme_merge_system_prompt,
+    _get_theme_merge_system_prompt as _get_theme_merge_system_prompt_base,
     _get_writer_requirements,
 )
+
+_THEME_MERGE_RUNTIME_CONTRACT = """\
+<protected_theme_merge_contract>
+以下运行时契约优先于上文任何主题数量目标或旧版输出示例：
+1. 最终主题不设置最少或最多数量，只按真实语义分组。
+2. 合并键是“讨论对象或功能 + 核心问题、诉求或判断 + 关键场景、条件或期望结果”。
+   关键语义相同且合并后不损失独立决策含义时必须合并；否则必须分开。
+3. 同义词、多语言、措辞、情绪方向、强弱程度和举例差异不得单独拆分；无法确认等价时保留分开。
+4. 每个输入 candidate_id 必须且只能出现在一个最终主题的 source_candidate_ids 中。
+5. representative_quotes 只能来自该主题 source_candidate_ids 对应候选的原文引用。
+</protected_theme_merge_contract>"""
+
+
+def _get_theme_merge_system_prompt() -> str:
+    """Append the non-configurable merge protocol to the editable business prompt."""
+    return (
+        _get_theme_merge_system_prompt_base().rstrip()
+        + "\n\n"
+        + _THEME_MERGE_RUNTIME_CONTRACT
+    )
 
 _QUALITATIVE_CONTEXT_LABELS = [
     ("problem", "这次想解决什么问题"),
@@ -852,8 +871,6 @@ def _validate_theme_candidates(data: dict | None, source_texts: list[str]) -> st
     themes = data.get("themes")
     if not isinstance(themes, list) or not themes:
         return "themes 必须是非空数组"
-    if len(themes) > 15:
-        return f"themes 数量为 {len(themes)}，不得超过 15"
     source_set = {_text_key(text) for text in source_texts if _text_key(text)}
     seen_names: set[str] = set()
     for index, theme in enumerate(themes):
@@ -877,11 +894,10 @@ def _validate_theme_candidates(data: dict | None, source_texts: list[str]) -> st
             valid_ids = {_response_ref(i) for i in range(len(source_texts))}
             if (
                 not isinstance(response_ids, list)
-                or not 1 <= len(response_ids) <= 3
+                or not response_ids
                 or not all(isinstance(response_id, str) for response_id in response_ids)
-                or len(set(response_ids)) != len(response_ids)
             ):
-                return f"主题「{name}」必须包含 1–3 个不重复的 representative_response_ids"
+                return f"主题「{name}」必须包含非空的字符串 representative_response_ids"
             invalid_ids = [response_id for response_id in response_ids if response_id not in valid_ids]
             if invalid_ids:
                 return f"主题「{name}」引用了不存在的回答 ID：{invalid_ids[0]}"
@@ -890,8 +906,12 @@ def _validate_theme_candidates(data: dict | None, source_texts: list[str]) -> st
         # 兼容管理员尚未迁移的旧版自定义提示词。新默认协议使用回答 ID，
         # 由代码确定性还原原文，避免模型复制标点或空格时导致整批报废。
         quotes = theme.get("representative_quotes")
-        if not isinstance(quotes, list) or not quotes or len(quotes) > 3:
-            return f"主题「{name}」必须包含 1–3 个 representative_response_ids"
+        if (
+            not isinstance(quotes, list)
+            or not quotes
+            or not all(isinstance(quote, str) for quote in quotes)
+        ):
+            return f"主题「{name}」必须包含非空的字符串 representative_quotes"
         for quote in quotes:
             if _text_key(quote) not in source_set:
                 return f"主题「{name}」包含并非逐字来自输入的引用"
@@ -912,11 +932,16 @@ def _hydrate_theme_candidate_quotes(
             continue
         response_ids = theme.pop("representative_response_ids", None)
         if response_ids is not None:
+            unique_ids = list(dict.fromkeys(response_ids))
             theme["representative_quotes"] = [
                 lookup[response_id]
-                for response_id in response_ids
+                for response_id in unique_ids[:3]
                 if response_id in lookup
             ]
+            continue
+        quotes = theme.get("representative_quotes")
+        if isinstance(quotes, list):
+            theme["representative_quotes"] = list(dict.fromkeys(quotes))[:3]
     return hydrated
 
 
@@ -926,28 +951,21 @@ def _validate_merged_themes(data: dict | None, candidates: list[dict]) -> str | 
     themes = data.get("themes")
     if not isinstance(themes, list) or not themes:
         return "themes 必须是非空数组"
-    unique_candidates = {
-        str(theme.get("name") or "").strip().casefold()
-        for theme in candidates
-        if str(theme.get("name") or "").strip()
-    }
-    required_min = min(10, len(unique_candidates))
-    if len(themes) < required_min or len(themes) > 25:
-        return (
-            f"最终主题数量为 {len(themes)}，本次必须在 "
-            f"{required_min}–25 个之间；不要用宽泛上位主题过度合并"
-        )
     expected_ids = [f"t{i:02d}" for i in range(1, len(themes) + 1)]
     actual_ids = [theme.get("id") if isinstance(theme, dict) else None for theme in themes]
     if actual_ids != expected_ids:
         return f"主题 ID 必须从 t01 连续编号，期望 {expected_ids}"
-    quote_pool = {
-        _text_key(quote)
-        for theme in candidates
-        if isinstance(theme, dict)
-        for quote in (theme.get("representative_quotes") or [])
-        if _text_key(quote)
+    candidate_quotes = {
+        f"c{index:04d}": list(dict.fromkeys(
+            quote
+            for quote in (candidate.get("representative_quotes") or [])
+            if isinstance(quote, str) and _text_key(quote)
+        ))
+        for index, candidate in enumerate(candidates, 1)
+        if isinstance(candidate, dict)
     }
+    expected_candidate_ids = set(candidate_quotes)
+    assigned_candidate_ids: set[str] = set()
     seen_names: set[str] = set()
     for theme in themes:
         name = str(theme.get("name") or "").strip()
@@ -961,12 +979,56 @@ def _validate_merged_themes(data: dict | None, candidates: list[dict]) -> str | 
             value = theme.get(field)
             if value is not None and not isinstance(value, str):
                 return f"主题「{name}」的 {field} 必须是字符串或 null"
-        quotes = theme.get("representative_quotes")
-        if not isinstance(quotes, list) or not quotes or len(quotes) > 3:
-            return f"主题「{name}」必须包含 1–3 条 representative_quotes"
-        for quote in quotes:
-            if _text_key(quote) not in quote_pool:
-                return f"主题「{name}」包含候选主题中不存在的引用"
+        source_candidate_ids = theme.get("source_candidate_ids")
+        if (
+            not isinstance(source_candidate_ids, list)
+            or not source_candidate_ids
+            or not all(isinstance(candidate_id, str) for candidate_id in source_candidate_ids)
+            or len(set(source_candidate_ids)) != len(source_candidate_ids)
+        ):
+            return f"主题「{name}」必须包含不重复的 source_candidate_ids"
+        invalid_candidate_ids = [
+            candidate_id
+            for candidate_id in source_candidate_ids
+            if candidate_id not in expected_candidate_ids
+        ]
+        if invalid_candidate_ids:
+            return f"主题「{name}」引用了不存在的候选 ID：{invalid_candidate_ids[0]}"
+        repeated_candidate_ids = [
+            candidate_id
+            for candidate_id in source_candidate_ids
+            if candidate_id in assigned_candidate_ids
+        ]
+        if repeated_candidate_ids:
+            return f"候选 ID 被重复分配：{repeated_candidate_ids[0]}"
+        assigned_candidate_ids.update(source_candidate_ids)
+        # 模型只负责语义合并。引用由代码按已校验的候选映射确定性还原，避免模型改写
+        # 标点或措辞时让整题失败，同时确保最终证据一定来自该主题的真实候选原文。
+        allowed_quotes = list(dict.fromkeys(
+            quote
+            for candidate_id in source_candidate_ids
+            for quote in candidate_quotes[candidate_id]
+        ))
+        if not allowed_quotes:
+            return f"主题「{name}」对应候选没有可用原文引用"
+        allowed_by_key = {_text_key(quote): quote for quote in allowed_quotes}
+        requested_quotes = theme.get("representative_quotes")
+        selected_quotes: list[str] = []
+        if isinstance(requested_quotes, list):
+            for quote in requested_quotes:
+                quote_key = _text_key(quote) if isinstance(quote, str) else ""
+                canonical_quote = allowed_by_key.get(quote_key)
+                if canonical_quote and canonical_quote not in selected_quotes:
+                    selected_quotes.append(canonical_quote)
+        for quote in allowed_quotes:
+            if len(selected_quotes) >= 3:
+                break
+            if quote not in selected_quotes:
+                selected_quotes.append(quote)
+        theme["representative_quotes"] = selected_quotes[:3]
+    missing_candidate_ids = sorted(expected_candidate_ids - assigned_candidate_ids)
+    if missing_candidate_ids:
+        return f"候选 ID 未分配到最终主题：{missing_candidate_ids[0]}"
     return None
 
 
@@ -994,7 +1056,7 @@ def _normalize_classifications(
             duplicate_ids.add(response_id)
             continue
         assignments = item.get("assignments")
-        if not isinstance(assignments, list) or not 1 <= len(assignments) <= 3:
+        if not isinstance(assignments, list) or not assignments:
             continue
         clean_assignments: list[dict] = []
         seen_themes: set[str] = set()
@@ -1051,11 +1113,16 @@ def _build_theme_merge_query(
     candidates: list[dict],
     total_responses: int,
 ) -> str:
+    indexed_candidates = []
+    for index, candidate in enumerate(candidates, 1):
+        indexed = deepcopy(candidate)
+        indexed["candidate_id"] = f"c{index:04d}"
+        indexed_candidates.append(indexed)
     return (
         f"<question>\n{question}\n</question>\n"
         f"<total_responses>{total_responses}</total_responses>\n"
         "<theme_candidates_json>\n"
-        f"{json.dumps(candidates, ensure_ascii=False)}\n"
+        f"{json.dumps(indexed_candidates, ensure_ascii=False)}\n"
         "</theme_candidates_json>"
     )
 
@@ -1750,7 +1817,6 @@ async def _batch_qualitative_analysis(
 
         themes_out = []
         all_themes_out = []
-        other_themes_out = []
 
         for t in final_themes:
             tid = t["id"]
@@ -1791,13 +1857,9 @@ async def _batch_qualitative_analysis(
                 "respondent_keys": sorted(c["members"]),
             }
             all_themes_out.append(entry)
-            if pct < OTHER_THEME_PCT:
-                other_themes_out.append({"name": t["name"], "count": cnt, "percentage": pct})
-            else:
-                themes_out.append(entry)
+            themes_out.append(entry)
 
         themes_out.sort(key=lambda x: x["count"], reverse=True)
-        other_themes_out.sort(key=lambda x: x["count"], reverse=True)
 
         clustered_themes[scope_key] = {
             "column_index": col_idx,
@@ -1809,7 +1871,7 @@ async def _batch_qualitative_analysis(
             "count_unit": "players" if deduplicate_respondents else "responses",
             "themes": themes_out,
             "all_themes": all_themes_out,
-            "other_themes": other_themes_out,
+            "other_themes": [],
         }
         diag["status"] = "ok"
         diag["reason"] = ""
@@ -2281,7 +2343,7 @@ def _build_writer_part_query(
     )
     viewpoint_rule = (
         "每个玩家直接表达的观点使用 `**观点：短标题**`，并将主要发现、原因与情境、分歧或例外、产品含义拆成 2–4 条简短项目，"
-        "再逐字使用 <subjective_viewpoint_stats> 写 `**提及情况：** X名玩家提及，占相关有效回答玩家的Y%`。"
+        "再逐字使用 <subjective_viewpoint_stats> 写 `- **提及情况：** X名玩家提及，占相关有效回答玩家的Y%`。"
         "若某个判断由系统根据多题、客观统计或多类证据综合得出，而不是玩家直接说出的观点，必须改写为 `**分析推断：短标题**`，"
         "明确说明推断依据，禁止写成玩家的逻辑，也禁止套用“X名玩家提及”。"
         if not quantitative_first else
@@ -2292,6 +2354,16 @@ def _build_writer_part_query(
         "<subjective_viewpoint_stats>，禁止重算、拼接或编造。"
         if not quantitative_first else
         "④ 所有客观统计数字必须逐字取自 <stats>，禁止重算或编造。"
+    )
+    evidence_boundary_rule = (
+        "\n**事实与证据边界（最高优先级）**：选择题没有提供某个选项、问卷没有询问某个原因、"
+        "某类人群没有进入后续题，都只能写为“当前数据无法判断”，不得据此推断该人群或行为不存在，"
+        "也不得反推竞争/替代关系、留存强弱、转化效果、因果关系或“不是瓶颈”。"
+        "原始开放回答只能证明观点存在；只有 <stats> 或 <subjective_viewpoint_stats> 提供可直接比较的确定性统计时，"
+        "才能写“最多”“最普遍”“第一/第二高频”“主要”或高低排名。没有相应统计目录时必须使用不带排名的定性表述，"
+        "并明确不判断频次。‘使用过/接触过/选择某平台’不能自动推出入口易发现、体验好、留存稳定或平台吸引力更强。"
+        "Part、人群分支、题目范围和玩家身份标签必须沿用上下文中的真实来源，不得自行改写归属；"
+        "证据不足时说明缺口和所需补充数据，不得用合理化故事补齐。\n"
     )
     return (
         f"**本轮任务**：现在**只**写 `## Part {part['i']} {part['name']}` 这一个章节的完整内容"
@@ -2315,6 +2387,7 @@ def _build_writer_part_query(
         "**约束**：① 只输出这一个 Part，不要写其它 Part；② 不要写核心结论、不要写 Bug 模块；"
         "③ 不要重复前面已经写过的标题或章节；"
         + number_rule
+        + evidence_boundary_rule
     )
 
 
@@ -2371,8 +2444,8 @@ def _build_writer_core_query(
             "只能根据问卷题目、<stats>、<open_text> 和已生成章节归纳主要发现；如果需要判断这份调研可能关注什么，必须写成「从问卷内容推测/看起来」，并说明推测依据。\n"
         )
         organization_clause = (
-            f"若用户提供了业务问题，应按其中涉及的具体对象、场景和决策内容组织小节，但不得在正文中复述问题本身；否则逐个写 `### Part X 章节名：关键发现`"
-            f"（必须引用真实 Part 名：{part_titles}）；"
+            "根据问卷题目和已生成章节中的真实业务语义设置 `###` 小标题；小标题应直接说明对象、场景或决策内容，"
+            f"必要时可以沿用真实章节名（{part_titles}），但不得机械逐 Part 复述；"
         )
     return (
         "**本轮任务**：基于你前面已经生成的全部章节，撰写整篇报告的「核心结论」模块。"
@@ -2384,6 +2457,46 @@ def _build_writer_core_query(
         f"{organization_clause}"
         "按需写 `### 少数但值得关注的反馈`。\n"
         f"{bug_clause}\n"
+        "**信息层级与排版要求**：\n"
+        "1. 样本总数之后、`### 总体判断` 下的**第一句实质判断**是全报告最高优先级的信息，必须先写跨题洞察、"
+        "判断标准或取舍逻辑，再补方案排名、人数、百分比、均值等统计证据。若 `<analysis_focus>` 的 core_question、"
+        "report_organization 或 expected_deliverables 涉及方案选择、评价、优先级、权衡、判定标准或决策框架，第一句必须直接"
+        "概括玩家依据哪些真实标准做选择，并使用 `**加粗**` 标出这些关键标准；即使某方案排名第一或满意度最高，也不得以"
+        "“方案X排名第一/获得最多第一名/满意度最高”或任何纯数字陈述开头。若当前证据不足以形成判断标准，第一句应明确"
+        "可确认的最高层判断及边界，不得编造标准。之后，`### 总体判断` 只保留有必要、重要且必须优先展示的跨题判断或决策信息；可按真实内容写一段或多个短段，"
+        "不设置段数和字数硬限制，但每一段都必须有独立的信息价值。不要写成后续业务小节的目录式预告，"
+        "也不要机械汇总各 Part。避免逐字复制后文，但如果缺少关键数字、玩家原因或具体场景会让总体判断失去逻辑，"
+        "应保留足以独立理解结论的必要上下文。\n"
+        "2. 总体判断之后按业务逻辑设置 `###` 小标题，不设置小标题或最终观点数量上限；数量只由真实业务语义决定，"
+        "不得为了显得简洁遗漏重要观点，也不得把同类观点拆成多个近义小节。不要为了形式机械地给每个 Part 都设置一个核心小节；"
+        "但某个 Part 的本节总结如果已经准确、完整，并且本身就是合适的业务主题，可以原样复用或少量调整。"
+        "此时按真实业务语义命名即可，不要求保留或删除 `Part X` 编号；可以在不同业务判断中按需引用同一证据，"
+        "但不得逐字复制同一整段内容。\n"
+        "3. 每个业务小节优先用有序列表完整阐述主要观点。每条先用 `**短结论**` 明确对象与判断，再按真实证据组织"
+        "“主要发现 → 玩家原因与具体场景 → 分析推断 → 产品含义 → 证据边界”；这些是必须覆盖的信息层，不要求机械写成五个固定标签。"
+        "人数和占比只用于支撑判断，不能替代原因、场景和逻辑。支撑数字、口径、玩家原话中的具体例子或补充解释可以使用缩进子项或 "
+        "`> *斜体证据说明*`，不要把多个层次压成一条只有数字的短句。\n"
+        "4. 主要观点必须完整说明数量和逻辑。原则上把 `<subjective_viewpoint_stats>` 中提及率低于 5% 的观点视为低频补充，"
+        "在相关业务小节或 `### 少数但值得关注的反馈` 中简要说明其存在；涉及安全、合规、严重体验风险、明确反例或关键决策边界时，"
+        "即使低于 5% 也必须单独点出。这里只控制核心结论的展示层级，不得删除、合并或改写后台主题统计。\n"
+        "5. 同一事实或观点应选择一个最合适的小节完整展开；其他小节为建立跨题逻辑时可以简要引用必要的数字、原因或场景，"
+        "以读者无需来回查找仍能理解为准，但不得逐字复制同一整段。已经在业务小节完整展开的高风险或低频观点，"
+        "不要再原样复制到 `### 少数但值得关注的反馈`。\n"
+        "6. `### 待确认问题概述` 按问题类型使用有序列表，每类只写一个短条目，不得合成一个超长段落。\n"
+        "7. 使用 `**加粗**` 标记判断标准、核心取舍、结论短语和产品优先级，使用 `*斜体*` 标记证据口径或补充解释。"
+        "`<u>下划线</u>` 只能按需用于包含明确业务含义的完整关键判断，禁止给仅陈述方案排名、样本量、人数、占比、均值或"
+        "最高/最低项的事实句和数字单独加下划线；这类数字应放在判断之后作为普通证据。不得整段加粗、斜体或加下划线。"
+        "所有标记必须成对闭合，避免连续堆叠星号造成格式损坏。\n"
+        "8. **事实优先于洞察强度**：选择题没有提供某个选项、问卷没有询问某个原因、某类人群没有进入后续题，"
+        "都只能写为“当前数据无法判断”，不得据此断言该人群或行为不存在，也不得反推竞争/替代关系、留存强弱、"
+        "转化效果、因果关系或“不是瓶颈”。原始开放回答只能证明观点存在；只有 <stats> 或 "
+        "<subjective_viewpoint_stats> 提供可直接比较的确定性统计时，才能使用“最多”“最普遍”“第一/第二高频”"
+        "“主要”等频次排序或高低比较。没有对应观点统计目录时必须使用不带排名的定性表述并明确不判断频次。"
+        "‘使用过/接触过/选择某平台’不能自动推出入口易发现、体验好、留存稳定或平台吸引力更强。"
+        "Part、人群分支、题目范围和玩家身份标签必须继承真实来源，不得自行改写归属。不得把缺少证据的业务故事写成事实；"
+        "但应当基于真实的跨题关系、客观统计、玩家原因与具体场景形成有价值的分析推断，并明确标注“分析推断”、推断依据、适用范围"
+        "和仍待验证的边界。若现状行为主要发生在外部渠道，而开放反馈提供了证据，不得停留在渠道占比；应继续分析产品内部仍可能承接的"
+        "具体使用场景、触发条件和差异化价值，并把超出直接证据的部分标为分析推断。\n"
         + (
             "若 expected_deliverables 要求可复用框架、判定标准、分层模型或检查清单，必须把它上提为"
             "核心结论中的独立产出，明确维度、判断条件、适用边界和证据依据；不得只提到框架名称、"
@@ -2409,11 +2522,17 @@ def _build_writer_core_query(
         "③ 涉及分支题、筛选人群或不同使用程度人群时，必须说明对应分母或有效回答范围，不得用问卷总样本替代；"
         "④ 玩家观点必须来自 <open_text> 或已生成章节，不得编造；"
         "⑤ 凡是玩家原话没有直接表达、而是系统根据跨题关系、客观统计、人群差异或多类证据综合得出的判断，"
-        "必须明确标为“分析推断”并写清依据；不得写成玩家的逻辑，不得使用“X名玩家提及”；"
+        "应在有决策价值时主动形成，并必须明确标为“分析推断”、写清依据和边界；不得写成玩家的逻辑，不得使用“X名玩家提及”；"
         "⑥ 使用不看玩家原文也能立即理解的大白话，优先沿用玩家中文翻译中的具体词语。"
         "不要只写「功能性增益」「价值感知」「分层机制」等抽象概括；确需使用时，必须在同一句用「也就是……」"
         "或等价表达说明玩家具体希望增加、取消或改变什么，解释和例子只能来自 <open_text> 或已生成章节。"
     )
+
+
+CORE_REPAIRS_START = "<!--CORE_REPAIRS_START-->"
+CORE_REPAIRS_END = "<!--CORE_REPAIRS_END-->"
+CORE_REPAIR_START = "<!--CORE_REPAIR_START-->"
+CORE_REPAIR_END = "<!--CORE_REPAIR_END-->"
 
 
 def _build_writer_core_review_query(
@@ -2426,9 +2545,9 @@ def _build_writer_core_review_query(
         "只复核上一轮核心结论，不改写其它章节",
     )
     bug_rule = (
-        "替换稿必须保留与正文一致的 `### 待确认问题概述`。"
+        "局部修补必须保留与正文一致的 `### 待确认问题概述`。"
         if has_bug else
-        "替换稿不得新增待确认问题小节。"
+        "局部修补不得新增待确认问题小节。"
     )
     return (
         "**核心结论覆盖与表达复核**：检查上一轮完整 CORE block 是否同时满足内容覆盖与读者可理解性。"
@@ -2437,20 +2556,48 @@ def _build_writer_core_review_query(
         "report_organization 若要求跨题、跨人群或跨案例框架，必须把该框架上提到核心结论，"
         "不能用机械逐 Part 摘要代替。若要求可复用框架、判定标准、分层模型或检查清单，还必须明确"
         "维度、判断条件、适用边界和证据依据。\n"
+        "首句优先级必须单独复核：样本数之后、`### 总体判断` 下的第一句实质判断必须先回答最高层业务问题。"
+        "只要 analysis_focus 涉及方案选择、评价、优先级、权衡、判定标准或决策框架，第一句就必须先概括真实的判断标准和取舍逻辑，"
+        "并用 `**加粗**` 标出关键标准；方案排名、人数、百分比、均值只能随后作为证据。即使这些判断标准已在第二段或后文出现，"
+        "但第一句仍以“方案X排名第一/获得最多第一名/满意度最高”或纯数字陈述开头，也必须判定为不合格，使用局部修补将判断标准"
+        "上提，同时完整保留原有统计、原因、场景、分析推断和证据边界。\n"
         "表达质量也必须同时合格：直接陈述判断，不得复述、转述或重新提出业务问题；使用未参与调研立项的读者也能理解的大白话；"
         "每个判断明确写出对应对象、功能、场景或人群；正确区分相关关系与因果关系。以下句式一律视为不合格："
         "「针对……这个/这一问题」「关于……是否……」「证据显示相关」「结果给出了明确信号」"
         "「对于这个问题，答案是……」「本次调研的结果并不是单一方向的」。\n"
+        "事实边界也必须逐条复核：缺失的问卷选项、未提问的原因或未进入后续题的人群不能被当成“不存在”的证据；"
+        "不得由这些缺口推断竞争/替代关系、留存强弱、转化效果或因果关系。‘使用过/接触过’不能直接推出入口易发现、"
+        "体验良好、留存稳定或不是瓶颈。没有 <subjective_viewpoint_stats> 对应条目时，不得使用“最多”“最普遍”"
+        "“第一/第二高频”“主要”等频次排名；只能说明某观点在开放回答中存在或反复出现，并明确不判断频次。"
+        "Part、人群分支、题目范围和玩家身份标签必须与来源章节一致。发现任何过度解读、来源错配或证据不足却下确定性结论，"
+        "均视为不合格，必须在最小必要范围内改成“当前数据无法判断”或带清楚依据与边界的分析推断。\n"
         f"{bug_rule}\n"
+        "同时检查信息层级：`### 总体判断` 只能保留有必要、重要且必须优先展示的跨题判断或决策信息，"
+        "不限制段数和字数，但每段必须有独立信息价值；不得机械汇总各 Part，不得用连续超长段落承载多个不同判断，"
+        "也不得先总述后逐字复制同一批内容；但如果缺少关键数字、玩家原因或具体场景会使某个判断无法独立理解，"
+        "必须保留必要上下文，不能以去重为由删掉逻辑链；"
+        "业务小节应使用 `###` 小标题，主要观点应以有序列表展开，并通过加粗短结论、斜体证据说明和少量下划线关键内容建立层级。"
+        "视觉层级也必须复核：判断标准、核心取舍和产品优先级应加粗；仅陈述方案排名、样本量、人数、占比、均值或最高/最低项的"
+        "事实句和数字不得单独使用 `<u>下划线</u>`。若发现错误强调，只修补对应句段，不得改动无关内容。"
+        "不得为了形式逐 Part 搬运总结；但准确、完整且符合业务主题结构的本节总结可以直接复用或少量调整，"
+        "是否保留 `Part X` 编号由可读性决定；"
+        "主要观点必须完整说明数量与逻辑；低频观点应简要保留其存在，高风险低频观点不得隐藏。"
+        "每个重要业务主题都要能读出主要发现、玩家原因与具体场景、必要的分析推断、产品含义和证据边界；"
+        "人数与占比只能支撑判断，不能取代原因和逻辑。分析推断不是错误，应在有决策价值且有真实依据时主动保留，"
+        "并明确标注依据与尚未验证的边界。少数反馈不得原样复制业务小节已有整段内容；待确认问题必须按类型列成短条目。"
+        "不得把后台不同主题合并成一个宽泛结论。\n"
         "输出协议（严格二选一）：\n"
         "1. 若内容覆盖和表达质量均合格，只输出完全一致的单词 `PASS`。\n"
-        f"2. 若有任何内容遗漏或表达不合格，只输出一份完整替换稿：首行必须是 `{CORE_START}`，末行必须是 "
-        f"`{CORE_END}`，内部必须含独占一行的 `## 核心结论`；标记外不得有任何解释。\n"
-        "不得输出检查清单、遗漏说明、代码围栏、前言或行动建议。替换时只补齐覆盖缺口或改写不合格句子；"
-        "已经清楚、正确的段落原样保留，不改变任何数字、事实、玩家观点和证据边界，不新增分析结论。"
-        "每个判断第一句话直接写结论；客观统计继续与 <stats> 一致，观点提及人数继续与 "
+        f"2. 若有任何内容遗漏或表达不合格，只输出局部修补清单：首行必须是 `{CORE_REPAIRS_START}`，末行必须是 "
+        f"`{CORE_REPAIRS_END}`。每一处修补严格使用以下结构，最多 6 处：\n"
+        f"{CORE_REPAIR_START}\n<original>\n上一轮 CORE 中唯一出现、需要修改的完整原句/段落/列表项\n</original>\n"
+        f"<replacement>\n仅修正该处后的替换文本\n</replacement>\n{CORE_REPAIR_END}\n"
+        "`<original>` 必须逐字复制上一轮 CORE 中的一段连续文本且只出现一次；只选择最小必要范围，不得把整个 CORE、"
+        "多个无关小节或全部正文作为 original。需要补充遗漏内容时，可把最相关的小标题或段落作为 original，并在 replacement 中"
+        "保留原文后紧接补充。不得输出完整 CORE 替换稿、检查清单、遗漏说明、代码围栏、前言或行动建议。"
+        "已经清楚、正确的段落不会被修补协议触及，因此必须原样保留。客观统计继续与 <stats> 一致，观点提及人数继续与 "
         "<subjective_viewpoint_stats> 一致。玩家没有直接表达的综合判断必须保留“分析推断”标识，"
-        "不得在替换稿中改写成玩家观点。"
+        "不得在 replacement 中改写成玩家观点。"
     )
 
 
@@ -2469,7 +2616,7 @@ def _core_has_forbidden_meta_wording(text: str) -> bool:
 
 
 def _resolve_core_coverage_review(original_core: str, review_output: str) -> str:
-    """只接受精确 PASS 或完整 CORE 替换块；其余输出一律回退原文。"""
+    """只接受精确 PASS 或可唯一定位的局部修补；其余输出一律回退原文。"""
     original = str(original_core or "")
     candidate = str(review_output or "").strip()
     if candidate == "PASS":
@@ -2478,20 +2625,67 @@ def _resolve_core_coverage_review(original_core: str, review_output: str) -> str
     lines = candidate.splitlines()
     if len(lines) < 3:
         return original
-    if lines[0].strip() != CORE_START or lines[-1].strip() != CORE_END:
+    if lines[0].strip() != CORE_REPAIRS_START or lines[-1].strip() != CORE_REPAIRS_END:
         return original
-    if sum(line.strip() == CORE_START for line in lines) != 1:
+    if sum(line.strip() == CORE_REPAIRS_START for line in lines) != 1:
         return original
-    if sum(line.strip() == CORE_END for line in lines) != 1:
+    if sum(line.strip() == CORE_REPAIRS_END for line in lines) != 1:
         return original
+
     inner = "\n".join(lines[1:-1]).strip()
-    if not re.search(r"(?m)^## 核心结论[ \t]*$", inner):
+    repair_pattern = re.compile(
+        rf"{re.escape(CORE_REPAIR_START)}\s*"
+        r"<original>\s*\n(?P<original>.*?)\n\s*</original>\s*"
+        r"<replacement>\s*\n(?P<replacement>.*?)\n\s*</replacement>\s*"
+        rf"{re.escape(CORE_REPAIR_END)}",
+        re.DOTALL,
+    )
+    repairs = list(repair_pattern.finditer(inner))
+    if not repairs or len(repairs) > 6:
         return original
-    if re.search(r"(?m)^#[ \t]+", inner) or re.search(r"(?m)^## 行动建议[ \t]*$", inner):
+    repair_cursor = 0
+    for match in repairs:
+        if inner[repair_cursor:match.start()].strip():
+            return original
+        repair_cursor = match.end()
+    if inner[repair_cursor:].strip():
         return original
-    if _core_has_forbidden_meta_wording(inner):
+
+    parsed: list[tuple[int, int, str]] = []
+    seen_originals: set[str] = set()
+    forbidden_replacement = re.compile(r"(?m)^#{1,2}[ \t]+|<!--CORE")
+    for match in repairs:
+        old = match.group("original").strip()
+        new = match.group("replacement").strip()
+        if not old or not new or old == new or old in seen_originals:
+            return original
+        if len(old) > 1600 or original.count(old) != 1:
+            return original
+        if CORE_START in old or CORE_END in old or re.search(r"(?m)^## 核心结论[ \t]*$", old):
+            return original
+        if forbidden_replacement.search(new) or _core_has_forbidden_meta_wording(new):
+            return original
+        start = original.find(old)
+        parsed.append((start, start + len(old), new))
+        seen_originals.add(old)
+
+    parsed.sort(key=lambda item: item[0])
+    if any(current[0] < previous[1] for previous, current in zip(parsed, parsed[1:])):
         return original
-    return candidate
+
+    chunks: list[str] = []
+    cursor = 0
+    for start, end, replacement in parsed:
+        chunks.append(original[cursor:start])
+        chunks.append(replacement)
+        cursor = end
+    chunks.append(original[cursor:])
+    resolved = "".join(chunks)
+    if not resolved.startswith(CORE_START) or not resolved.endswith(CORE_END):
+        return original
+    if not re.search(r"(?m)^## 核心结论[ \t]*$", resolved):
+        return original
+    return resolved
 
 
 def _build_writer_action_query(
@@ -2534,12 +2728,14 @@ def _build_writer_action_query(
         f"{focus_block}{selected_core_block}\n"
         "要求：\n"
         "1. 只输出这一个模块，以 `## 行动建议` 开头，不要重复或重写其它章节。\n"
-        "2. 给出 3-5 条建议，并只使用一张 Markdown 表格呈现。表头和顺序必须逐字为："
-        "`建议内容 | 优先级 | 产品动作 | 验证方式 | 依据 | 不确定性/前提`。"
-        "`建议内容` 使用加粗短标题加一句核心判断；`优先级` 只能写高/中/低；"
-        "其余列分别说明具体动作、所需数据/用户调研/实验、<stats> 或 <open_text> 中的具体证据、假设或局限。\n"
+        "2. 给出 3-5 条建议，使用 Markdown 编号列表，禁止使用表格。每条固定写为："
+        "`1. **建议短标题**（优先级：高/中/低）`，并在其下依次缩进列出 "
+        "`- **核心判断：**`、`- **产品动作：**`、`- **验证方式：**`、`- **依据：**`、"
+        "`- **不确定性/前提：**`。各字段不得合并成一个长段落，也不得遗漏。\n"
         f"3. {context_clause}每条建议必须能在 <stats> 或 <open_text> 中找到对应依据，不得凭空提出。\n"
-        "4. 如果建议依赖推测、猜测或样本外假设，必须在「不确定性/前提」里明确写出，不能包装成事实。\n"
+        "4. 建议只能承接报告已经成立的事实或已明确标注边界的分析推断。缺失选项、未询问原因、未覆盖人群、"
+        "单条开放回答或仅有“使用过”的统计均不得被包装成已证实的产品判断；如果建议依赖推测、猜测或样本外假设，"
+        "必须在「不确定性/前提」里明确写出，并把补充数据、访谈或实验作为验证动作。\n"
         f"{bug_clause}"
     )
 
@@ -2549,14 +2745,135 @@ def _build_writer_action_repair_query() -> str:
     return (
         "上一轮已经完成行动建议内容，但输出没有使用规定的 Markdown 结构。"
         "请只重新整理上一轮内容的格式，不要改变建议、依据、优先级、验证方式或任何分析结论，"
-        "也不要新增内容。输出必须从独占一行的 `## 行动建议` 开始，后面将原有 3-5 条建议整理为一张表格，"
-        "表头和顺序逐字使用 `建议内容 | 优先级 | 产品动作 | 验证方式 | 依据 | 不确定性/前提`；"
+        "也不要新增内容。输出必须从独占一行的 `## 行动建议` 开始，后面将原有 3-5 条建议整理为 Markdown 编号列表，"
+        "禁止使用表格。每条使用 `1. **建议短标题**（优先级：高/中/低）`，并依次缩进列出"
+        "`- **核心判断：**`、`- **产品动作：**`、`- **验证方式：**`、`- **依据：**`、"
+        "`- **不确定性/前提：**`；"
         "不要输出解释、前言、其它章节或代码围栏。"
     )
 
 
+MAX_COMPARISON_AUTO_REPAIRS = 20
+
+
+def _build_comparison_repair_query(issues: list[dict]) -> str:
+    """Build one constrained, sentence-only repair request for comparison claims."""
+    payload = []
+    for issue in issues[:MAX_COMPARISON_AUTO_REPAIRS]:
+        payload.append({
+            "claim_id": str(issue.get("claim_id") or ""),
+            "original_sentence": str(issue.get("original_sentence") or ""),
+            "context_before": str(issue.get("context_before") or "")[-180:],
+            "context_after": str(issue.get("context_after") or "")[:180],
+            "reasons": list(issue.get("reasons") or []),
+            "metric": str(issue.get("metric") or "量表均值"),
+            "expected_order": list(issue.get("expected_order") or []),
+        })
+    return (
+        "下面列出的报告句子与确定性统计事实不一致。请逐条只改写该句，修正比较关系，"
+        "保留原句的语言、分析口径和非错误信息；不得新增事实、数字、结论、标题、列表或表格，"
+        "不得改写上下文。若一句无法仅凭给定事实安全修复，就不要为该 claim_id 返回结果。\n"
+        "只输出严格 JSON，不要代码围栏或解释。格式必须为："
+        '{"repairs":[{"claim_id":"C001","replacement":"修正后的单句"}]}。\n'
+        "待处理内容：\n"
+        + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    )
+
+
+def _parse_comparison_repairs(raw: str, issues: list[dict]) -> tuple[dict[str, str], list[str]]:
+    """Parse sentence repairs; malformed or unknown items are ignored and audited."""
+    parsed, parse_error = _json_loads_loose(raw)
+    if parsed is None:
+        return {}, [f"修补结果不是有效 JSON：{parse_error}"]
+    items = parsed.get("repairs")
+    if not isinstance(items, list):
+        return {}, ["修补结果缺少 repairs 列表"]
+
+    known = {str(issue.get("claim_id") or "") for issue in issues}
+    repairs: dict[str, str] = {}
+    errors: list[str] = []
+    for index, item in enumerate(items, 1):
+        if not isinstance(item, dict):
+            errors.append(f"repairs[{index}] 不是对象")
+            continue
+        claim_id = str(item.get("claim_id") or "").strip()
+        replacement = str(item.get("replacement") or "").strip()
+        if claim_id not in known:
+            errors.append(f"repairs[{index}] 使用了未知 claim_id")
+            continue
+        if claim_id in repairs:
+            errors.append(f"{claim_id} 重复返回")
+            continue
+        if not replacement:
+            errors.append(f"{claim_id} 的 replacement 为空")
+            continue
+        if "\n" in replacement or replacement.startswith("#") or "|" in replacement:
+            errors.append(f"{claim_id} 不是可替换的单句")
+            continue
+        repairs[claim_id] = replacement
+    return repairs, errors
+
+
+def _split_markdown_table_row(line: str) -> list[str]:
+    """拆分简单 Markdown 表格行，保留被反斜杠转义的竖线。"""
+    raw = str(line or "").strip().strip("|")
+    cells = re.split(r"(?<!\\)\|", raw)
+    return [cell.replace(r"\|", "|").strip() for cell in cells]
+
+
+def _action_table_to_list(body: str) -> str:
+    """将历史六列表格确定性转换为分层编号列表，避免旧格式继续进入导出。"""
+    lines = str(body or "").splitlines()
+    expected = ("建议内容", "优先级", "产品动作", "验证方式", "依据", "不确定性/前提")
+    header_index = -1
+    for index, line in enumerate(lines):
+        if tuple(_split_markdown_table_row(line)) == expected:
+            header_index = index
+            break
+    if header_index < 0 or header_index + 2 >= len(lines):
+        return ""
+    separator = _split_markdown_table_row(lines[header_index + 1])
+    if len(separator) != len(expected) or not all(re.fullmatch(r":?-{3,}:?", cell) for cell in separator):
+        return ""
+
+    output: list[str] = []
+    for line in lines[header_index + 2:]:
+        if not line.strip().startswith("|"):
+            if line.strip():
+                break
+            continue
+        cells = _split_markdown_table_row(line)
+        if len(cells) != len(expected):
+            continue
+        recommendation, priority, action, validation, evidence, uncertainty = cells
+        priority = priority.strip("`* ")
+        if priority not in {"高", "中", "低"}:
+            priority = "中"
+        title_match = re.search(r"\*\*(.+?)\*\*", recommendation)
+        title = (
+            title_match.group(1).strip()
+            if title_match else
+            re.split(r"[：。；]", recommendation, maxsplit=1)[0].strip()
+        )
+        title = re.sub(r"[*_`<>]", "", title) or "建议"
+        core = re.sub(r"\*\*(.+?)\*\*", r"\1", recommendation).strip()
+        core = re.sub(r"<br\s*/?>", "；", core, flags=re.I)
+        fields = (
+            ("核心判断", core or title),
+            ("产品动作", action),
+            ("验证方式", validation),
+            ("依据", evidence),
+            ("不确定性/前提", uncertainty),
+        )
+        item_number = len(output) + 1
+        output.append(f"{item_number}. **{title}**（优先级：{priority}）")
+        output.extend(f"   - **{label}：** {value.strip()}" for label, value in fields)
+        output.append("")
+    return "\n".join(output).rstrip()
+
+
 def _normalize_action_section(text: str) -> str:
-    """把常见的行动建议标题变体规范为固定二级标题；不改正文内容。"""
+    """规范行动建议标题，并将历史六列表格转换为分层列表。"""
     cleaned = str(text or "").strip()
     if not cleaned:
         return ""
@@ -2567,6 +2884,10 @@ def _normalize_action_section(text: str) -> str:
     if not heading:
         return ""
     body = cleaned[heading.end():].lstrip("\r\n ")
+    if re.search(r"(?m)^\s*\|.+\|\s*$", body):
+        body = _action_table_to_list(body)
+        if not body:
+            return ""
     return "## 行动建议" + (f"\n\n{body}" if body else "")
 
 
@@ -2577,7 +2898,25 @@ def _format_rows_for_qa(rows: list[list], plan: dict) -> str:
     headers = rows[0]
     body = rows[1:]
     total = len(body)
-    col_names = [(h or "").strip() or f"col_{i}" for i, h in enumerate(headers)]
+    base_names = [str(h or "").strip() or f"col_{i}" for i, h in enumerate(headers)]
+    name_counts: dict[str, int] = {}
+    for name in base_names:
+        name_counts[name] = name_counts.get(name, 0) + 1
+    plan_columns = {
+        column.get("index"): column
+        for column in (plan or {}).get("columns", [])
+        if isinstance(column, dict) and isinstance(column.get("index"), int)
+    }
+    col_names = []
+    for index, original_name in enumerate(base_names):
+        if name_counts[original_name] == 1:
+            col_names.append(original_name)
+            continue
+        semantic_name = str((plan_columns.get(index) or {}).get("name") or "").strip()
+        disambiguated = f"col_{index}｜{semantic_name or original_name}"
+        if semantic_name and semantic_name != original_name:
+            disambiguated += f"｜原题：{original_name}"
+        col_names.append(disambiguated)
 
     def row_obj(row):
         return {col_names[i]: (row[i] if i < len(row) else "") for i in range(len(col_names))}
