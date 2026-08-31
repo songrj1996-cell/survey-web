@@ -293,6 +293,15 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(direct.await_count, 6)
         self.assertTrue(any('"type": "report_done"' in event for event in events))
+        done = next(
+            payload for payload in _event_payloads(events)
+            if payload.get("type") == "report_done"
+        )
+        self.assertEqual(done["comparison_validation"]["status"], "passed")
+        self.assertEqual(
+            sess["report_versions"][-1]["comparison_validation"],
+            done["comparison_validation"],
+        )
         progress = [
             payload
             for payload in _event_payloads(events)

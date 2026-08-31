@@ -19,8 +19,12 @@ _MIRROR_FIELDS = (
     "report_writer_model",
     "analyst_conv_id",
     "analyst_app",
+    "comparison_validation",
 )
-_TEXT_SNAPSHOT_FIELDS = tuple(field for field in _MIRROR_FIELDS if field != "qa_messages")
+_TEXT_SNAPSHOT_FIELDS = tuple(
+    field for field in _MIRROR_FIELDS
+    if field not in {"qa_messages", "comparison_validation"}
+)
 _SUMMARY_FIELDS = (
     "version",
     "kind",
@@ -128,6 +132,17 @@ def _snapshot_from(
     if not isinstance(qa_messages, list):
         raise ValueError("qa_messages 必须是列表")
     result["qa_messages"] = deepcopy(qa_messages)
+
+    comparison_validation = (
+        snapshot["comparison_validation"]
+        if "comparison_validation" in snapshot
+        else fallback.get("comparison_validation", {})
+    )
+    if comparison_validation is None:
+        comparison_validation = {}
+    if not isinstance(comparison_validation, dict):
+        raise ValueError("comparison_validation 必须是对象")
+    result["comparison_validation"] = deepcopy(comparison_validation)
 
     if not result["title"]:
         result["title"] = _report_title(result["report_md"])

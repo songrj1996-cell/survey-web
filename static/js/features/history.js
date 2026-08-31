@@ -362,6 +362,7 @@ async function openHistoryEntry(id) {
     state.historyReport.reportNo = entry.report_no || '';
     state.historyReport.reportMd = entry.report_md;
     state.historyReport.title = entry.title || reportTitleFromMarkdown(entry.report_md);
+    state.historyReport.comparisonValidation = entry.comparison_validation || {};
     state.historyReport.createdAt = entry.created_at || '';
     state.historyReport.mode = entry.mode || 'survey';
     state.historyReport.analystConvId = entry.analyst_conv_id || null;

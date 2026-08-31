@@ -46,6 +46,7 @@ const state = {
     pendingVersionRequest: null,
     generatingVersion: null,
     lastVersionInstruction: '',
+    comparisonValidation: {},
   },
   historyReport: {
     id: null,
@@ -64,6 +65,7 @@ const state = {
     qaMessages: [],
     feishuLinkHtml: '',
     planData: null,
+    comparisonValidation: {},
   },
   auditFilters: { start: '', end: '', user: '', feature: '' },
 };

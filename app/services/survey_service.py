@@ -101,15 +101,18 @@ from app.services.report_engine import (
     _describe_qa_context_scope,
     _build_writer_action_query,
     _build_writer_action_repair_query,
+    _build_comparison_repair_query,
     _build_writer_bug_query,
     _build_writer_core_query,
     _build_writer_core_review_query,
     _build_writer_first_query,
     _build_writer_part_query,
     _normalize_action_section,
+    _parse_comparison_repairs,
     _render_crosstab_plan_card,
     _resolve_core_coverage_review,
     _writer_parts_meta,
+    MAX_COMPARISON_AUTO_REPAIRS,
 )
 from app.services.report_history import (
     DEFAULT_RERUN_VERSION_INSTRUCTION,
@@ -151,6 +154,122 @@ _REPORT_RERUN_TARGET_LOCKS: dict[str, asyncio.Lock] = {}
 _NON_VERSIONED_REPORT_MODES = {"comment", "interview", "annotate"}
 _CHINESE_CHARACTER_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 _LATIN_WORD_RE = re.compile(r"[A-Za-z]+")
+
+
+def _comparison_section(report_md: str, offset: int) -> str:
+    headings = list(re.finditer(r"^#{1,6}\s+(.+?)\s*$", report_md[:offset], re.MULTILINE))
+    return headings[-1].group(1).strip() if headings else "报告正文"
+
+
+def _comparison_fact_basis(issue: dict) -> str:
+    order = issue.get("expected_order") or []
+    return " > ".join(
+        f"{item.get('entity')} {float(item.get('value')):.2f}"
+        for item in order
+        if item.get("entity") is not None and item.get("value") is not None
+    )
+
+
+def _apply_verified_comparison_repairs(
+    report_md: str,
+    catalog: list[dict],
+    initial_result: dict,
+    candidates: dict[str, str],
+    numeric_sources: str,
+) -> tuple[str, dict]:
+    """Independently validate and apply safe sentence replacements."""
+    initial_issues = list(initial_result.get("issues") or [])
+    accepted: list[tuple[dict, str]] = []
+    rejected: dict[str, str] = {}
+    rejected_by_claim: dict[tuple[str, str], str] = {}
+
+    def reject(issue: dict, reason: str) -> None:
+        claim_id = str(issue.get("claim_id") or "")
+        rejected[claim_id] = reason
+        rejected_by_claim[(
+            str(issue.get("group_id") or ""),
+            str(issue.get("original_sentence") or "").strip(),
+        )] = reason
+
+    for issue in initial_issues:
+        claim_id = str(issue.get("claim_id") or "")
+        replacement = str(candidates.get(claim_id) or "").strip()
+        if not replacement:
+            reject(
+                issue,
+                "未明确绑定量表均值口径，不满足自动修补条件"
+                if not issue.get("repairable")
+                else "未获得可通过复核的修补句，已保留原文",
+            )
+            continue
+        if replacement == str(issue.get("original_sentence") or "").strip():
+            reject(issue, "修补句与原句相同")
+            continue
+        drifted = survey_stats.find_numbers_not_in_stats(replacement, numeric_sources)
+        if drifted:
+            reject(issue, f"修补句出现无法由统计源支持的数字：{', '.join(drifted[:5])}")
+            continue
+        checked = survey_stats.analyze_comparison_claims(replacement, catalog)
+        if checked.get("issues"):
+            reject(issue, "修补句仍与确定性统计比较关系不一致")
+            continue
+        if int(checked.get("checked_claim_count") or 0) < 1:
+            reject(issue, "修补句删除了原有比较结论，未通过等义复核")
+            continue
+        accepted.append((issue, replacement))
+
+    repaired_report = report_md
+    changes: list[dict] = []
+    for issue, replacement in sorted(
+        accepted,
+        key=lambda item: int(item[0].get("start") or 0),
+        reverse=True,
+    ):
+        start = int(issue["start"])
+        end = int(issue["end"])
+        original = repaired_report[start:end]
+        if original.strip() != str(issue.get("original_sentence") or "").strip():
+            reject(issue, "原文定位发生变化，未写入修补")
+            continue
+        repaired_report = repaired_report[:start] + replacement + repaired_report[end:]
+        changes.append({
+            "claim_id": issue.get("claim_id"),
+            "section": _comparison_section(report_md, start),
+            "original": issue.get("original_sentence", ""),
+            "replacement": replacement,
+            "reasons": deepcopy(issue.get("reasons") or []),
+            "factual_basis": _comparison_fact_basis(issue),
+            "risk": "已通过确定性比较复核与数字来源复核；建议查看前后文是否仍然自然。",
+        })
+    changes.reverse()
+
+    final_result = survey_stats.analyze_comparison_claims(repaired_report, catalog)
+    unresolved = []
+    for issue in final_result.get("issues") or []:
+        unresolved.append({
+            "claim_id": issue.get("claim_id"),
+            "section": _comparison_section(repaired_report, int(issue.get("start") or 0)),
+            "original": issue.get("original_sentence", ""),
+            "reasons": deepcopy(issue.get("reasons") or []),
+            "factual_basis": _comparison_fact_basis(issue),
+            "risk": rejected_by_claim.get((
+                str(issue.get("group_id") or ""),
+                str(issue.get("original_sentence") or "").strip(),
+            ))
+            or rejected.get(str(issue.get("claim_id") or ""))
+            or "该句未能通过自动修补复核，报告保留原文，请人工确认。",
+        })
+    status = "needs_review" if unresolved else ("repaired" if changes else "passed")
+    return repaired_report, {
+        "status": status,
+        "checked_claim_count": int(final_result.get("checked_claim_count") or 0),
+        "detected_count": len(initial_issues),
+        "applied_count": len(changes),
+        "unresolved_count": len(unresolved),
+        "changes": changes,
+        "unresolved": unresolved,
+        "repair_limit": MAX_COMPARISON_AUTO_REPAIRS,
+    }
 
 
 def _report_generation_lock(session_id: str) -> asyncio.Lock:
@@ -1994,6 +2113,88 @@ async def report_stream(
         numeric_sources = "\n".join(
             source for source in (stats_md, viewpoint_stats_md) if source
         )
+        comparison_validation = {
+            "status": "incomplete",
+            "checked_claim_count": 0,
+            "detected_count": 0,
+            "applied_count": 0,
+            "unresolved_count": 0,
+            "changes": [],
+            "unresolved": [],
+            "repair_limit": MAX_COMPARISON_AUTO_REPAIRS,
+            "auto_repair_attempted": False,
+            "parser_warnings": [],
+            "coverage": "量表均值的最高/最低、两两关系、排序、名次和并列关系",
+        }
+        try:
+            comparison_catalog = survey_stats.build_comparison_fact_catalog(
+                sess.get("rows") or [],
+                plan,
+            )
+            initial_comparison_result = survey_stats.analyze_comparison_claims(
+                full_report,
+                comparison_catalog,
+            )
+            repairable_issues = [
+                issue
+                for issue in initial_comparison_result.get("issues") or []
+                if issue.get("repairable")
+            ]
+            comparison_candidates: dict[str, str] = {}
+            parser_warnings: list[str] = []
+            repair_error = ""
+            repair_attempted = False
+            if repairable_issues and len(repairable_issues) <= MAX_COMPARISON_AUTO_REPAIRS:
+                repair_attempted = True
+                yield sse_event({
+                    "type": "progress",
+                    "message": (
+                        f"检测到 {len(initial_comparison_result['issues'])} 处统计比较风险，"
+                        "正在进行一次批量句子修补与独立复核…"
+                    ),
+                })
+                try:
+                    async for heartbeat in _writer_call(
+                        _build_comparison_repair_query(repairable_issues)
+                    ):
+                        yield heartbeat
+                    repair_text, repair_model = _writer_call.out
+                    writer_models_used.append(repair_model)
+                    comparison_candidates, parser_warnings = _parse_comparison_repairs(
+                        repair_text,
+                        repairable_issues,
+                    )
+                except Exception as repair_exc:
+                    repair_error = f"自动修补调用失败：{type(repair_exc).__name__}"
+
+            full_report, comparison_validation = _apply_verified_comparison_repairs(
+                full_report,
+                comparison_catalog,
+                initial_comparison_result,
+                comparison_candidates,
+                numeric_sources,
+            )
+            comparison_validation.update({
+                "auto_repair_attempted": repair_attempted,
+                "parser_warnings": parser_warnings,
+                "coverage": "量表均值的最高/最低、两两关系、排序、名次和并列关系",
+                "catalog_group_count": len(comparison_catalog),
+            })
+            if repair_error:
+                comparison_validation["repair_error"] = repair_error
+            if len(repairable_issues) > MAX_COMPARISON_AUTO_REPAIRS:
+                comparison_validation["repair_error"] = (
+                    f"检测到 {len(repairable_issues)} 处可修补风险，超过单次 "
+                    f"{MAX_COMPARISON_AUTO_REPAIRS} 处的安全上限，已保留原文。"
+                )
+        except Exception as comparison_exc:
+            comparison_validation["error"] = (
+                f"确定性比较校验未完整执行：{type(comparison_exc).__name__}"
+            )
+            comparison_validation["risk"] = (
+                "报告已保存，但量表均值比较关系未完成自动复核，请人工检查相关结论。"
+            )
+
         drifted = survey_stats.find_numbers_not_in_stats(full_report, numeric_sources)
         if drifted:
             print(f"[stats] WARN drifted numbers: {drifted[:20]}")
@@ -2036,6 +2237,7 @@ async def report_stream(
             "report_writer_provider": "direct_llm",
             "report_writer_model": writer_model,
             "viewpoint_diagnostics": viewpoint_diagnostics,
+            "comparison_validation": comparison_validation,
         }
         if rerun_history_id:
             if str(sess.get("rerun_target_history_id") or "").strip() != rerun_history_id:
@@ -2088,11 +2290,12 @@ async def report_stream(
         yield _analysis_progress(
             "finalize",
             "completed",
-            "报告已通过最终处理并保存",
+            "报告已完成最终处理并保存",
         )
         yield sse_event({
             "type": "report_done",
             "report_md": full_report,
+            "comparison_validation": comparison_validation,
             "version": committed_version["version"],
             **(
                 {

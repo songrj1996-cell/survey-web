@@ -1401,3 +1401,463 @@ def find_numbers_not_in_stats(report_md: str, stats_md: str) -> list[str]:
             seen.add(x)
             uniq.append(x)
     return uniq
+
+
+# ============================================================================
+# 报告比较关系一致性校验
+# ============================================================================
+
+
+_COMPARISON_ENTITY_RE = _re.compile(
+    r"(?:概念|方案)\s*[0-9一二三四五六七八九十]+|concept\s*[0-9]+",
+    _re.IGNORECASE,
+)
+_HIGH_WORDS = ("最高", "最大", "最多")
+_LOW_WORDS = ("最低", "最小", "最少")
+_HIGH_RELATIONS = ("高于", "超过", "大于")
+_LOW_RELATIONS = ("低于", "不及", "小于")
+_ORDER_WORDS = ("排序", "依次", "从高到低", "由高到低", "从低到高", "由低到高")
+_TIE_WORDS = ("并列", "持平", "相同")
+_STATISTICAL_CUES = ("均值", "平均", "满意度", "排序", "排名", "名次")
+_CHINESE_RANKS = {"一": 1, "二": 2, "三": 3, "1": 1, "2": 2, "3": 3}
+
+
+def _comparison_normalize(value: Any) -> str:
+    return " ".join(str(value or "").strip().casefold().split())
+
+
+def _comparison_entity(name: str) -> tuple[str, list[str], str]:
+    text = str(name or "").strip()
+    match = _COMPARISON_ENTITY_RE.search(text)
+    entity = match.group(0).replace(" ", "") if match else text
+    metric = _COMPARISON_ENTITY_RE.sub("", text).strip(" -_｜|：:")
+    aliases = [entity]
+    if text and text not in aliases:
+        aliases.append(text)
+    return entity, aliases, metric
+
+
+def _scale_mean(body: list[list], index: int) -> float | None:
+    values: list[float] = []
+    for row in body:
+        if index >= len(row):
+            continue
+        try:
+            values.append(float(str(row[index]).strip()))
+        except (TypeError, ValueError):
+            continue
+    return statistics.mean(values) if values else None
+
+
+def _comparison_rows_for_column(
+    body: list[list],
+    plan: dict,
+    column_index: int,
+) -> list[list] | None:
+    """Use the same Part eligibility scope as the rendered deterministic stats."""
+    matching_parts = [
+        part
+        for part in (plan.get("parts") or [])
+        if column_index in (part.get("column_indexes") or [])
+    ]
+    if not matching_parts:
+        return body
+    if len(matching_parts) > 1:
+        filters = [part.get("filter") for part in matching_parts]
+        if any(item != filters[0] for item in filters[1:]):
+            return None
+    columns_by_index = {
+        column["index"]: column
+        for column in (plan.get("columns") or [])
+        if isinstance(column, dict) and isinstance(column.get("index"), int)
+    }
+    return _filter_rows_for_part(body, matching_parts[0], columns_by_index)
+
+
+def build_comparison_fact_catalog(rows: list[list], plan: dict) -> list[dict]:
+    """从原始行与分析方案构造可确定比较的量表均值事实。"""
+    if not rows or len(rows) <= 1 or not isinstance(plan, dict):
+        return []
+    headers = rows[0]
+    body = rows[1:]
+    scale_columns = [
+        column
+        for column in (plan.get("columns") or [])
+        if isinstance(column, dict)
+        and column.get("role") == "scale"
+        and isinstance(column.get("index"), int)
+        and 0 <= column["index"] < len(headers)
+    ]
+    header_counts: Counter = Counter(
+        _comparison_normalize(headers[column["index"]]) for column in scale_columns
+    )
+    groups: dict[tuple, list[dict]] = {}
+    for column in scale_columns:
+        index = column["index"]
+        name = str(column.get("name") or _safe_header(headers, index)).strip()
+        entity, aliases, metric = _comparison_entity(name)
+        raw_header = _comparison_normalize(headers[index])
+        semantic_family = _comparison_normalize(_COMPARISON_ENTITY_RE.sub("#", name))
+        family = (
+            ("header", raw_header)
+            if raw_header and header_counts[raw_header] > 1
+            else ("semantic", semantic_family)
+        )
+        key = (family, column.get("min"), column.get("max"))
+        scoped_body = _comparison_rows_for_column(body, plan, index)
+        if scoped_body is None:
+            continue
+        mean = _scale_mean(scoped_body, index)
+        if mean is None:
+            continue
+        groups.setdefault(key, []).append({
+            "column_index": index,
+            "entity": entity,
+            "aliases": aliases,
+            "name": name,
+            "metric": metric or str(headers[index] or "量表均值").strip(),
+            "value": mean,
+            "sample_size": len(scoped_body),
+        })
+
+    catalog: list[dict] = []
+    for group_index, members in enumerate(groups.values(), 1):
+        entities = [member["entity"] for member in members]
+        if len(members) < 2 or len(set(entities)) != len(entities):
+            continue
+        metrics = [member["metric"] for member in members if member["metric"]]
+        metric = metrics[0] if metrics and len(set(metrics)) == 1 else "量表均值"
+        descending = sorted(members, key=lambda item: (-item["value"], item["entity"]))
+        ascending = sorted(members, key=lambda item: (item["value"], item["entity"]))
+        rank_by_entity: dict[str, int] = {}
+        previous_value: float | None = None
+        current_rank = 0
+        for position, member in enumerate(descending, 1):
+            if previous_value is None or not _values_equal(member["value"], previous_value):
+                current_rank = position
+                previous_value = member["value"]
+            rank_by_entity[member["entity"]] = current_rank
+        catalog.append({
+            "group_id": f"scale_mean_{group_index}",
+            "metric": metric,
+            "members": members,
+            "descending": [member["entity"] for member in descending],
+            "ascending": [member["entity"] for member in ascending],
+            "rank_by_entity": rank_by_entity,
+            "max_value": descending[0]["value"],
+            "min_value": ascending[0]["value"],
+        })
+    return catalog
+
+
+def _values_equal(left: float, right: float, tolerance: float = 0.005) -> bool:
+    return abs(float(left) - float(right)) <= tolerance
+
+
+def _sentence_spans(text: str) -> list[tuple[int, int, str]]:
+    spans: list[tuple[int, int, str]] = []
+    start = 0
+    for match in _re.finditer(r"[。！？!?](?:[\"”’）)])?|\n+", text):
+        end = match.end()
+        raw = text[start:end]
+        leading = len(raw) - len(raw.lstrip())
+        trailing = len(raw.rstrip())
+        if raw.strip():
+            spans.append((start + leading, start + trailing, raw.strip()))
+        start = end
+    raw = text[start:]
+    if raw.strip():
+        leading = len(raw) - len(raw.lstrip())
+        spans.append((start + leading, len(text.rstrip()), raw.strip()))
+    return spans
+
+
+def _entity_mentions(sentence: str, group: dict) -> list[tuple[int, str]]:
+    mentions: list[tuple[int, str]] = []
+    for member in group["members"]:
+        positions = []
+        for alias in sorted(member["aliases"], key=len, reverse=True):
+            match = _re.search(
+                _alias_pattern(alias, member["entity"]),
+                sentence,
+                _re.IGNORECASE,
+            )
+            if match:
+                positions.append(match.start())
+        if positions:
+            mentions.append((min(positions), member["entity"]))
+    mentions.sort()
+    return mentions
+
+
+def _entity_pattern(member: dict) -> str:
+    return "(?:" + "|".join(
+        _alias_pattern(alias, member["entity"])
+        for alias in sorted(member["aliases"], key=len, reverse=True)
+    ) + ")"
+
+
+def _alias_pattern(alias: str, entity: str) -> str:
+    pattern = _re.escape(str(alias or ""))
+    if _comparison_normalize(alias) == _comparison_normalize(entity):
+        pattern += r"(?![0-9一二三四五六七八九十])"
+    return pattern
+
+
+def _claimed_extreme_entity(sentence: str, group: dict, words: tuple[str, ...]) -> str | None:
+    word_pattern = "(?:" + "|".join(_re.escape(word) for word in words) + ")"
+    word_match = _re.search(word_pattern, sentence, _re.IGNORECASE)
+    if not word_match:
+        return None
+    mentions = _entity_mentions(sentence, group)
+    after = [
+        (position, entity)
+        for position, entity in mentions
+        if word_match.end() <= position <= word_match.end() + 16
+    ]
+    if after:
+        return min(after)[1]
+    before = [
+        (position, entity)
+        for position, entity in mentions
+        if 0 <= word_match.start() - position <= 80
+    ]
+    if before:
+        return max(before)[1]
+    return mentions[0][1] if len(mentions) == 1 else None
+
+
+def _comparison_context(text: str, start: int, end: int, width: int = 180) -> tuple[str, str]:
+    return text[max(0, start - width):start].strip(), text[end:min(len(text), end + width)].strip()
+
+
+def _has_comparison_relation(sentence: str) -> bool:
+    return any(
+        word in sentence
+        for word in (
+            *_HIGH_WORDS,
+            *_LOW_WORDS,
+            *_HIGH_RELATIONS,
+            *_LOW_RELATIONS,
+            *_ORDER_WORDS,
+            *_TIE_WORDS,
+        )
+    ) or bool(_re.search(r"(?:排名|位列|排在)\s*第?[一二三123]", sentence))
+
+
+def _comparison_group_score(sentence: str, group: dict) -> int:
+    folded = sentence.casefold()
+    score = 0
+    metric = str(group.get("metric") or "").strip().casefold()
+    if metric and metric != "量表均值" and metric in folded:
+        score += 4
+    for member in group.get("members") or []:
+        entity = str(member.get("entity") or "").casefold()
+        if any(
+            str(alias or "").casefold() in folded
+            for alias in member.get("aliases") or []
+            if str(alias or "").casefold() != entity
+        ):
+            score += 2
+            break
+    return score
+
+
+def analyze_comparison_claims(report_md: str, catalog: list[dict]) -> dict:
+    """确定性检查量表均值的极值、两两关系、排序与名次陈述。"""
+    text = str(report_md or "")
+    checked_claim_count = 0
+    issues: list[dict] = []
+    for start, end, sentence in _sentence_spans(text):
+        if sentence.lstrip().startswith(("#", "|")):
+            continue
+        if not any(cue in sentence for cue in _STATISTICAL_CUES):
+            continue
+        candidate_groups = [
+            group for group in catalog
+            if _entity_mentions(sentence, group)
+        ]
+        if len(candidate_groups) > 1:
+            scores = [_comparison_group_score(sentence, group) for group in candidate_groups]
+            best_score = max(scores)
+            best_groups = [
+                group for group, score in zip(candidate_groups, scores)
+                if score == best_score
+            ]
+            if best_score > 0 and len(best_groups) == 1:
+                candidate_groups = best_groups
+            elif _has_comparison_relation(sentence):
+                checked_claim_count += 1
+                before, after = _comparison_context(text, start, end)
+                issues.append({
+                    "claim_id": "",
+                    "group_id": "ambiguous_scale_group",
+                    "metric": "量表均值",
+                    "start": start,
+                    "end": end,
+                    "original_sentence": sentence,
+                    "context_before": before,
+                    "context_after": after,
+                    "reasons": ["比较表述无法唯一绑定到一个确定性量表组"],
+                    "expected_order": [],
+                    "repairable": False,
+                })
+                continue
+        for group in candidate_groups:
+            mentions = _entity_mentions(sentence, group)
+            has_scale_cue = any(cue in sentence for cue in ("均值", "平均", "满意度"))
+            has_relation = _has_comparison_relation(sentence)
+            if not has_relation:
+                continue
+            violations: list[str] = []
+            repairable = has_scale_cue
+            checked_claim_count += 1
+            if not has_scale_cue:
+                violations.append("比较表述未明确绑定到量表均值口径")
+            else:
+                highest = _claimed_extreme_entity(sentence, group, _HIGH_WORDS)
+                if highest:
+                    member = next(item for item in group["members"] if item["entity"] == highest)
+                    if not _values_equal(member["value"], group["max_value"]):
+                        violations.append(f"{highest}并非{group['metric']}最高项")
+                    elif "唯一" in sentence:
+                        tied = [
+                            item for item in group["members"]
+                            if _values_equal(item["value"], group["max_value"])
+                        ]
+                        if len(tied) > 1:
+                            violations.append(f"{highest}并非唯一最高项")
+                lowest = _claimed_extreme_entity(sentence, group, _LOW_WORDS)
+                if lowest:
+                    member = next(item for item in group["members"] if item["entity"] == lowest)
+                    if not _values_equal(member["value"], group["min_value"]):
+                        violations.append(f"{lowest}并非{group['metric']}最低项")
+                    elif "唯一" in sentence:
+                        tied = [
+                            item for item in group["members"]
+                            if _values_equal(item["value"], group["min_value"])
+                        ]
+                        if len(tied) > 1:
+                            violations.append(f"{lowest}并非唯一最低项")
+
+                for left in group["members"]:
+                    for right in group["members"]:
+                        if left is right:
+                            continue
+                        left_pattern = _entity_pattern(left)
+                        right_pattern = _entity_pattern(right)
+                        high_pattern = "(?:" + "|".join(_HIGH_RELATIONS) + ")"
+                        low_pattern = "(?:" + "|".join(_LOW_RELATIONS) + ")"
+                        if _re.search(
+                            rf"{left_pattern}.{{0,80}}?{high_pattern}.{{0,40}}?{right_pattern}",
+                            sentence,
+                            _re.IGNORECASE,
+                        ) and not left["value"] > right["value"] + 0.005:
+                            violations.append(f"{left['entity']}并不高于{right['entity']}")
+                        if _re.search(
+                            rf"{left_pattern}.{{0,80}}?{low_pattern}.{{0,40}}?{right_pattern}",
+                            sentence,
+                            _re.IGNORECASE,
+                        ) and not left["value"] < right["value"] - 0.005:
+                            violations.append(f"{left['entity']}并不低于{right['entity']}")
+
+                if any(word in sentence for word in _TIE_WORDS) and len(mentions) >= 2:
+                    mentioned_members = [
+                        next(item for item in group["members"] if item["entity"] == entity)
+                        for _, entity in mentions
+                    ]
+                    tie_rank_match = _re.search(
+                        r"并列(?:排名|位列|排在)?\s*第?([一二三123])",
+                        sentence,
+                    )
+                    if tie_rank_match:
+                        claimed_rank = _CHINESE_RANKS[tie_rank_match.group(1)]
+                        if any(
+                            group["rank_by_entity"][member["entity"]] != claimed_rank
+                            for member in mentioned_members
+                        ):
+                            violations.append("正文中的并列名次与确定性统计排序不一致")
+                    elif any(word in sentence for word in _HIGH_WORDS):
+                        if any(
+                            not _values_equal(member["value"], group["max_value"])
+                            for member in mentioned_members
+                        ):
+                            violations.append("正文声称并列最高的项目并未共同处于最高值")
+                    elif any(word in sentence for word in _LOW_WORDS):
+                        if any(
+                            not _values_equal(member["value"], group["min_value"])
+                            for member in mentioned_members
+                        ):
+                            violations.append("正文声称并列最低的项目并未共同处于最低值")
+                    elif any(
+                        not _values_equal(mentioned_members[0]["value"], member["value"])
+                        for member in mentioned_members[1:]
+                    ):
+                        violations.append("正文声称持平的项目均值并不相同")
+
+                if any(word in sentence for word in _ORDER_WORDS) and len(mentions) >= 2:
+                    claimed = [entity for _, entity in mentions]
+                    expected_source = (
+                        group["ascending"]
+                        if any(word in sentence for word in ("从低到高", "由低到高"))
+                        else group["descending"]
+                    )
+                    expected = [entity for entity in expected_source if entity in claimed]
+                    if claimed != expected:
+                        violations.append("正文中的顺序与确定性统计排序不一致")
+
+                for member in group["members"]:
+                    member_pattern = _entity_pattern(member)
+                    rank_match = _re.search(
+                        rf"{member_pattern}.{{0,28}}?(?:排名|位列|排在)\s*第?([一二三123])",
+                        sentence,
+                        _re.IGNORECASE,
+                    )
+                    if not rank_match:
+                        continue
+                    claimed_rank = _CHINESE_RANKS[rank_match.group(1)]
+                    if group["rank_by_entity"][member["entity"]] != claimed_rank:
+                        violations.append(
+                            f"{member['entity']}的名次不是第{claimed_rank}"
+                        )
+
+            if not violations:
+                continue
+            before, after = _comparison_context(text, start, end)
+            expected_order = [
+                {
+                    "entity": entity,
+                    "value": next(
+                        member["value"] for member in group["members"]
+                        if member["entity"] == entity
+                    ),
+                }
+                for entity in group["descending"]
+            ]
+            issues.append({
+                "claim_id": "",
+                "group_id": group["group_id"],
+                "metric": group["metric"],
+                "start": start,
+                "end": end,
+                "original_sentence": sentence,
+                "context_before": before,
+                "context_after": after,
+                "reasons": list(dict.fromkeys(violations)),
+                "expected_order": expected_order,
+                "repairable": repairable,
+            })
+
+    deduplicated: list[dict] = []
+    seen: set[tuple[int, int, str]] = set()
+    for issue in issues:
+        key = (issue["start"], issue["end"], issue["group_id"])
+        if key in seen:
+            continue
+        seen.add(key)
+        issue["claim_id"] = f"C{len(deduplicated) + 1:03d}"
+        deduplicated.append(issue)
+    return {
+        "checked_claim_count": checked_claim_count,
+        "issues": deduplicated,
+    }

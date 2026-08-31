@@ -59,6 +59,7 @@ _VERSION_MIRROR_FIELDS = (
     "report_writer_model",
     "analyst_conv_id",
     "analyst_app",
+    "comparison_validation",
 )
 
 
@@ -454,6 +455,9 @@ def save_to_history(
             "analyst_app": active_source.get("analyst_app", ""),
             "report_writer_provider": active_source.get("report_writer_provider", ""),
             "report_writer_model": active_source.get("report_writer_model", ""),
+            "comparison_validation": deepcopy(
+                active_source.get("comparison_validation") or {}
+            ),
             "qa_provider": active_source.get("qa_provider", "")
             if version_source
             else active_source.get("qa_provider")

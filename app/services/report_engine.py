@@ -2753,6 +2753,67 @@ def _build_writer_action_repair_query() -> str:
     )
 
 
+MAX_COMPARISON_AUTO_REPAIRS = 20
+
+
+def _build_comparison_repair_query(issues: list[dict]) -> str:
+    """Build one constrained, sentence-only repair request for comparison claims."""
+    payload = []
+    for issue in issues[:MAX_COMPARISON_AUTO_REPAIRS]:
+        payload.append({
+            "claim_id": str(issue.get("claim_id") or ""),
+            "original_sentence": str(issue.get("original_sentence") or ""),
+            "context_before": str(issue.get("context_before") or "")[-180:],
+            "context_after": str(issue.get("context_after") or "")[:180],
+            "reasons": list(issue.get("reasons") or []),
+            "metric": str(issue.get("metric") or "量表均值"),
+            "expected_order": list(issue.get("expected_order") or []),
+        })
+    return (
+        "下面列出的报告句子与确定性统计事实不一致。请逐条只改写该句，修正比较关系，"
+        "保留原句的语言、分析口径和非错误信息；不得新增事实、数字、结论、标题、列表或表格，"
+        "不得改写上下文。若一句无法仅凭给定事实安全修复，就不要为该 claim_id 返回结果。\n"
+        "只输出严格 JSON，不要代码围栏或解释。格式必须为："
+        '{"repairs":[{"claim_id":"C001","replacement":"修正后的单句"}]}。\n'
+        "待处理内容：\n"
+        + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    )
+
+
+def _parse_comparison_repairs(raw: str, issues: list[dict]) -> tuple[dict[str, str], list[str]]:
+    """Parse sentence repairs; malformed or unknown items are ignored and audited."""
+    parsed, parse_error = _json_loads_loose(raw)
+    if parsed is None:
+        return {}, [f"修补结果不是有效 JSON：{parse_error}"]
+    items = parsed.get("repairs")
+    if not isinstance(items, list):
+        return {}, ["修补结果缺少 repairs 列表"]
+
+    known = {str(issue.get("claim_id") or "") for issue in issues}
+    repairs: dict[str, str] = {}
+    errors: list[str] = []
+    for index, item in enumerate(items, 1):
+        if not isinstance(item, dict):
+            errors.append(f"repairs[{index}] 不是对象")
+            continue
+        claim_id = str(item.get("claim_id") or "").strip()
+        replacement = str(item.get("replacement") or "").strip()
+        if claim_id not in known:
+            errors.append(f"repairs[{index}] 使用了未知 claim_id")
+            continue
+        if claim_id in repairs:
+            errors.append(f"{claim_id} 重复返回")
+            continue
+        if not replacement:
+            errors.append(f"{claim_id} 的 replacement 为空")
+            continue
+        if "\n" in replacement or replacement.startswith("#") or "|" in replacement:
+            errors.append(f"{claim_id} 不是可替换的单句")
+            continue
+        repairs[claim_id] = replacement
+    return repairs, errors
+
+
 def _split_markdown_table_row(line: str) -> list[str]:
     """拆分简单 Markdown 表格行，保留被反斜杠转义的竖线。"""
     raw = str(line or "").strip().strip("|")

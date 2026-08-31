@@ -579,6 +579,7 @@ class DuplicatePrepareAndGenerationTests(
         done = next(item for item in payloads if item.get("type") == "report_done")
         self.assertEqual(done["history_id"], history_id)
         self.assertEqual(done["version"], 2)
+        self.assertEqual(done["comparison_validation"]["status"], "passed")
         self.assertFalse(done["can_generate_version"])
         self.assertEqual(qa_sources[-1]["rows"][1][0], "new answer")
 
@@ -593,6 +594,10 @@ class DuplicatePrepareAndGenerationTests(
         second = report_versions.resolve_report_version(stored_history[0], 2)
         self.assertEqual(first["qa_messages"][-1]["content"], "生成期间新增回答")
         self.assertEqual(second["base_version"], 1)
+        self.assertEqual(
+            second["comparison_validation"],
+            done["comparison_validation"],
+        )
         self.assertEqual(
             second["instruction"],
             report_history.DEFAULT_RERUN_VERSION_INSTRUCTION,

@@ -30,6 +30,12 @@ def _snapshot(title: str, created_at: str) -> dict:
         "report_writer_model": f"writer-{title}",
         "analyst_conv_id": f"conv-{title}",
         "analyst_app": "standard",
+        "comparison_validation": {
+            "status": "passed",
+            "version_marker": title,
+            "changes": [],
+            "unresolved": [],
+        },
         "created_at": created_at,
     }
 
@@ -109,6 +115,10 @@ class HistoryVersionIntegrationTests(TemporaryHistoryMixin, unittest.TestCase):
         self.assertEqual(selected["active_version"], 2)
         self.assertEqual(selected["next_version"], 6)
         self.assertEqual(selected["version_created_at"], "2026-08-01T10:00:00")
+        self.assertEqual(
+            selected["comparison_validation"]["version_marker"],
+            "第一版",
+        )
 
         with patch.object(history_service, "get_session", return_value=sess):
             with self.assertRaisesRegex(ValueError, "V9 不存在"):

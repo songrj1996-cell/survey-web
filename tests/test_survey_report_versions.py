@@ -50,6 +50,12 @@ def _snapshot(title: str, *, qa_message: str = "") -> dict:
         "report_writer_model": f"writer-{title}",
         "analyst_conv_id": "",
         "analyst_app": "standard",
+        "comparison_validation": {
+            "status": "passed",
+            "coverage": title,
+            "changes": [],
+            "unresolved": [],
+        },
     }
 
 
@@ -231,10 +237,15 @@ class SurveyReportVersionGenerationTests(
         self.assertEqual(done["version"], 1)
         self.assertNotIn("version_data", done)
         self.assertNotIn("qa_context_md", done)
+        self.assertEqual(done["comparison_validation"]["status"], "passed")
         self.assertEqual(sess["active_report_version"], 1)
         self.assertEqual(sess["next_report_version"], 2)
         self.assertEqual(len(sess["report_versions"]), 1)
         self.assertEqual(sess["report_versions"][0]["kind"], "initial")
+        self.assertEqual(
+            sess["report_versions"][0]["comparison_validation"]["status"],
+            "passed",
+        )
         self.assertIsNone(sess["report_versions"][0]["base_version"])
         runtime["save_session"].assert_called_once_with(
             "initial-version-session", sess
@@ -561,6 +572,8 @@ class SurveyReportVersionHistoryPersistenceTests(
         active = report_versions.resolve_report_version(stored, 3)
         self.assertEqual(stored["report_md"], active["report_md"])
         self.assertEqual(stored["qa_messages"], active["qa_messages"])
+        self.assertEqual(stored["comparison_validation"], active["comparison_validation"])
+        self.assertEqual(active["comparison_validation"]["coverage"], "V3 报告")
 
 
 if __name__ == "__main__":

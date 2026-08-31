@@ -10,12 +10,14 @@ from app.services.report_engine import (
     _build_large_sample_writer_query,
     _build_writer_action_query,
     _build_writer_action_repair_query,
+    _build_comparison_repair_query,
     _build_writer_context,
     _build_writer_core_review_query,
     _build_writer_core_query,
     _build_writer_first_query,
     _build_writer_part_query,
     _normalize_action_section,
+    _parse_comparison_repairs,
 )
 
 
@@ -31,6 +33,43 @@ def _analysis_focus() -> dict:
 
 
 class ReportWriterStructureTests(unittest.TestCase):
+    def test_comparison_repair_query_is_sentence_scoped_and_contains_audit_ids(self):
+        query = _build_comparison_repair_query([{
+            "claim_id": "C001",
+            "original_sentence": "概念1满意度均值最高。",
+            "context_before": "## 概念对比",
+            "context_after": "下一句。",
+            "reasons": ["概念1并非最高项"],
+            "metric": "整体满意度",
+            "expected_order": [
+                {"entity": "概念3", "value": 3.92},
+                {"entity": "概念1", "value": 3.84},
+            ],
+        }])
+
+        self.assertIn("C001", query)
+        self.assertIn("不得新增事实、数字、结论、标题、列表或表格", query)
+        self.assertIn('"repairs"', query)
+
+    def test_comparison_repair_parser_keeps_valid_items_and_rejects_unsafe_items(self):
+        issues = [
+            {"claim_id": "C001"},
+            {"claim_id": "C002"},
+        ]
+        repairs, errors = _parse_comparison_repairs(
+            json.dumps({
+                "repairs": [
+                    {"claim_id": "C001", "replacement": "概念3满意度均值最高。"},
+                    {"claim_id": "C002", "replacement": "## 改写\n概念2最低。"},
+                    {"claim_id": "C999", "replacement": "未知句。"},
+                ],
+            }, ensure_ascii=False),
+            issues,
+        )
+
+        self.assertEqual(repairs, {"C001": "概念3满意度均值最高。"})
+        self.assertEqual(len(errors), 2)
+
     def test_default_requirements_use_topic_structure_and_translation_only_evidence(self):
         requirements = DEFAULT_WRITER_REQUIREMENTS
 
