@@ -60,6 +60,8 @@ async function refreshHistoryEntryAfterGeneration(historyId) {
         selected_version: selectedVersion,
         max_versions: detail.max_versions || summary?.max_versions,
         can_generate_version: false,
+        report_duration_seconds: detail.report_duration_seconds,
+        report_completed_at: detail.report_completed_at,
       });
       updateReportVersionUi();
       updateReportContextSwitch();
@@ -198,6 +200,15 @@ function renderHistoryCard(h) {
           </svg>
           <span>改名</span>
         </button>`;
+  const isAnnotate = h.mode === 'annotate';
+  const duration = formatReportDuration(
+    isAnnotate
+      ? h.annotate_quality_duration_seconds
+      : h.report_duration_seconds
+  );
+  const durationText = duration
+    ? `${isAnnotate ? '质量打标总耗时' : '总耗时'} ${duration}`
+    : '';
   return `
     <div class="hist-card hist-card--${esc(source.key)}${isActive ? ' hist-card--active' : ''}" data-hist-id="${esc(h.id)}" data-hist-mode="${esc(h.mode || '')}">
       <div class="hist-card__top">
@@ -219,7 +230,7 @@ function renderHistoryCard(h) {
         </div>
         <div class="hist-card__meta">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
-          <span>${esc(formatTime(h.created_at))}</span>
+          <span>${esc(formatTime(h.created_at))}${durationText ? ` · ${esc(durationText)}` : ''}</span>
         </div>
       </div>
       <div class="hist-card__foot">
@@ -365,6 +376,8 @@ async function openHistoryEntry(id) {
     state.historyReport.comparisonValidation = entry.comparison_validation || {};
     state.historyReport.createdAt = entry.created_at || '';
     state.historyReport.mode = entry.mode || 'survey';
+    state.historyReport.reportDurationSeconds = entry.report_duration_seconds;
+    state.historyReport.reportCompletedAt = entry.report_completed_at || '';
     state.historyReport.analystConvId = entry.analyst_conv_id || null;
     state.historyReport.planData = entry.plan || null;
     syncReportVersionMeta(state.historyReport, {
@@ -374,6 +387,8 @@ async function openHistoryEntry(id) {
       selected_version: entry.active_report_version || entry.version,
       max_versions: entry.max_versions,
       can_generate_version: entry.can_generate_version,
+      report_duration_seconds: entry.report_duration_seconds,
+      report_completed_at: entry.report_completed_at,
     });
     state.historyReport.qaMessages = normalizeQAMessages(entry.qa_messages);
     state.historyReport.qaHtml = '';

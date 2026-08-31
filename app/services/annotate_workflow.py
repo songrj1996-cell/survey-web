@@ -9,6 +9,7 @@ import json
 import re
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 import annotate
@@ -307,6 +308,61 @@ def get_annotate_session(sid: str) -> dict:
     return sess
 
 
+def _quality_now() -> datetime:
+    return datetime.now()
+
+
+def _quality_timing_snapshot(sess: dict) -> dict:
+    keys = (
+        "quality_started_at",
+        "quality_completed_at",
+        "quality_duration_seconds",
+    )
+    return {key: sess[key] for key in keys if key in sess}
+
+
+def _start_quality_timing(
+    sess: dict,
+    *,
+    started_at: datetime | None = None,
+) -> dict:
+    """Start quality wall-clock timing once and preserve it across retries."""
+    if str(sess.get("quality_started_at") or "").strip():
+        return _quality_timing_snapshot(sess)
+    started = started_at or _quality_now()
+    sess["quality_started_at"] = started.isoformat(timespec="milliseconds")
+    return _quality_timing_snapshot(sess)
+
+
+def _complete_quality_timing(
+    sess: dict,
+    *,
+    completed_at: datetime | None = None,
+) -> dict:
+    """Freeze quality timing only after all requested quality labels exist."""
+    if (
+        str(sess.get("quality_completed_at") or "").strip()
+        and sess.get("quality_duration_seconds") is not None
+    ):
+        return _quality_timing_snapshot(sess)
+    started_text = str(sess.get("quality_started_at") or "").strip()
+    if not started_text:
+        return _quality_timing_snapshot(sess)
+    try:
+        started = datetime.fromisoformat(started_text)
+    except ValueError:
+        return _quality_timing_snapshot(sess)
+    completed = completed_at or _quality_now()
+    if started.tzinfo != completed.tzinfo:
+        return _quality_timing_snapshot(sess)
+    sess["quality_completed_at"] = completed.isoformat(timespec="milliseconds")
+    sess["quality_duration_seconds"] = max(
+        0,
+        int(round((completed - started).total_seconds())),
+    )
+    return _quality_timing_snapshot(sess)
+
+
 def validate_annotate_session_for_ai(sid: str) -> None:
     """校验 session 是否具备运行 AI 检测的前置条件，不满足则 raise HTTPException。"""
     sess = get_annotate_session(sid)
@@ -346,6 +402,7 @@ def validate_annotate_session_for_quality(sid: str) -> None:
         and not sess.get("missing_quality_ids")
     ):
         raise HTTPException(status_code=409, detail="质量打标已经完成，无需重复运行")
+    _start_quality_timing(sess)
     sess["quality_status"] = "running"
 
 
@@ -589,6 +646,9 @@ def annotate_set_column_config(
     sess.pop("missing_ai_ids", None)
     sess.pop("missing_quality_ids", None)
     sess.pop("missing_translation_ids", None)
+    sess.pop("quality_started_at", None)
+    sess.pop("quality_completed_at", None)
+    sess.pop("quality_duration_seconds", None)
     task_names = []
     if tasks.get("ai_detect"):
         task_names.append("AI 作答识别")
@@ -1588,6 +1648,7 @@ async def _run_one_quality_batch_strict(
 async def quality_stream(sid: str, request: Request):
     """Run only missing quality rows and retain prior trusted labels."""
     sess = get_annotate_session(sid)
+    _start_quality_timing(sess)
     if sess.get("quality_status") != "running":
         sess["quality_status"] = "running"
     rows = sess.get("rows", [])
@@ -1678,6 +1739,7 @@ async def quality_stream(sid: str, request: Request):
                 })
 
         all_missing_ids = expected_ids - set(results_by_id)
+        labels_completed_at = _quality_now() if not all_missing_ids else None
         ai_by_id = {
             str(result.get("id", "")): result
             for result in sess.get("ai_results", [])
@@ -1711,6 +1773,8 @@ async def quality_stream(sid: str, request: Request):
         sess.pop("missing_quality_ids", None)
         if all_missing_ids:
             sess["missing_quality_ids"] = sorted(all_missing_ids)
+        elif labels_completed_at is not None:
+            _complete_quality_timing(sess, completed_at=labels_completed_at)
         sess.pop("missing_translation_ids", None)
         if missing_translation_ids:
             sess["missing_translation_ids"] = sorted(missing_translation_ids)
@@ -1730,6 +1794,7 @@ async def quality_stream(sid: str, request: Request):
             "type": "quality_done", "count": len(all_results),
             "results": all_results, "missing_ids": sorted(all_missing_ids),
             "missing_translation_ids": sorted(missing_translation_ids),
+            "quality_duration_seconds": sess.get("quality_duration_seconds"),
         })
     except asyncio.CancelledError:
         sess["quality_status"] = "incomplete"

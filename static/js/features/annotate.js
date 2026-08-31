@@ -21,6 +21,7 @@ const annState = {
   confirmedAiIds: new Set(),
   qualityResults: [],
   qualityCount: 0,
+  qualityDurationSeconds: null,
   missingAiIds: [],
   missingQualityIds: [],
   missingTranslationIds: [],
@@ -266,6 +267,7 @@ async function annStartAnnotation() {
     annState.confirmedAiIds = new Set();
     annState.qualityResults = [];
     annState.qualityCount = 0;
+    annState.qualityDurationSeconds = null;
 
     if (annState.tasks.ai_detect) {
       annGoStep(3);
@@ -532,6 +534,7 @@ async function annRunQuality() {
         const missingTranslationIds = ev.missing_translation_ids || [];
         annState.qualityCount = ev.count;
         annState.qualityResults = ev.results || [];
+        annState.qualityDurationSeconds = ev.quality_duration_seconds ?? null;
         annState.missingQualityIds = missingQIds;
         annState.missingTranslationIds = missingTranslationIds;
         if (missingQIds.length > 0) {
@@ -582,6 +585,10 @@ function annBuildDoneSummary() {
     lines.push(
       `<div class="ann-summary-line">质量打标结果：优秀反馈 ${counts['优秀反馈']} 条，普通反馈 ${counts['普通反馈']} 条，无效反馈 ${counts['无效反馈']} 条</div>`
     );
+    const duration = formatReportDuration(annState.qualityDurationSeconds);
+    if (duration) {
+      lines.push(`<div class="ann-summary-line">质量打标总耗时：${esc(duration)}</div>`);
+    }
   }
   return lines.join('');
 }
@@ -667,6 +674,7 @@ $('ann-btn-restart').addEventListener('click', () => {
   annState.confirmedAiIds = new Set();
   annState.qualityResults = [];
   annState.qualityCount = 0;
+  annState.qualityDurationSeconds = null;
   annState.missingAiIds = [];
   annState.missingQualityIds = [];
   annState.missingTranslationIds = [];

@@ -62,6 +62,22 @@ function _formatReportWaitTime(ms) {
   return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
 }
 
+function formatReportDuration(value) {
+  if (value === null || value === undefined || value === '') return '';
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) return '';
+  const totalSeconds = Math.round(parsed);
+  if (totalSeconds < 1) return '少于 1 秒';
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  return [
+    hours ? `${hours} 小时` : '',
+    minutes ? `${minutes} 分` : '',
+    seconds || (!hours && !minutes) ? `${seconds} 秒` : '',
+  ].filter(Boolean).join(' ');
+}
+
 function _parseReportProgress(message) {
   const match = String(message || '').match(/分章生成\s+(\d+)\/(\d+)[：:]\s*(.+)/);
   if (!match) return null;
@@ -305,6 +321,9 @@ function normalizeReportVersions(versions) {
           kind,
           base_version: toFiniteVersion(item.base_version),
           title: item.title || '',
+          plan_approved_at: item.plan_approved_at || '',
+          report_completed_at: item.report_completed_at || '',
+          report_duration_seconds: item.report_duration_seconds,
         };
       }
       const version = Number(item);
@@ -384,6 +403,22 @@ function syncReportVersionMeta(target, meta = {}) {
   if (activeVersion != null) target.activeVersion = activeVersion;
   if (selectedVersion != null) target.selectedVersion = selectedVersion;
   if (!target.selectedVersion) target.selectedVersion = target.version || target.activeVersion || normalized.at(-1)?.version || null;
+  const selectedSummary = normalized.find(item => item.version === target.selectedVersion);
+  const hasDuration = Object.prototype.hasOwnProperty.call(meta, 'report_duration_seconds')
+    || Object.prototype.hasOwnProperty.call(selectedSummary || {}, 'report_duration_seconds');
+  if (hasDuration) {
+    const rawDuration = meta.report_duration_seconds ?? selectedSummary?.report_duration_seconds;
+    const parsedDuration = Number(rawDuration);
+    target.reportDurationSeconds = (
+      rawDuration !== null
+      && rawDuration !== undefined
+      && rawDuration !== ''
+      && Number.isFinite(parsedDuration)
+      && parsedDuration >= 0
+    ) ? parsedDuration : null;
+  }
+  const completedAt = meta.report_completed_at ?? selectedSummary?.report_completed_at;
+  if (completedAt !== undefined) target.reportCompletedAt = completedAt || '';
 }
 
 function activeVersionNumber(ctx = activeReportCtx()) {
@@ -568,6 +603,8 @@ async function runStats(options = {}) {
   state.sessionReport.stream = '';
   state.sessionReport.reportMd = null;
   state.sessionReport.title = '';
+  state.sessionReport.reportDurationSeconds = null;
+  state.sessionReport.reportCompletedAt = '';
   goStep(4);
   resetReportFailureUi();
   $('ps-stats').classList.remove('progress-step--done', 'progress-step--failed');
@@ -1143,6 +1180,10 @@ function renderReportBreadcrumb() {
     html += `<span class="${cls}" data-step="${n}">${displayNum}. ${label}</span>`;
     if (i < steps.length - 1) html += `<span class="report-toolbar__step-sep"> / </span>`;
   });
+  const duration = formatReportDuration(state.sessionReport.reportDurationSeconds);
+  if (duration && state.viewMode === 'session') {
+    html += `<span class="report-toolbar__step-sep"> · </span><span class="report-toolbar__step">总耗时 ${esc(duration)}</span>`;
+  }
   el.innerHTML = html;
   el.querySelectorAll('.report-toolbar__step--clickable').forEach(span => {
     span.addEventListener('click', () => {
@@ -1190,7 +1231,9 @@ function updateReportContextSwitch() {
         createdText = `${created.getFullYear()}-${pad(created.getMonth() + 1)}-${pad(created.getDate())} ${pad(created.getHours())}:${pad(created.getMinutes())}`;
       }
     }
-    historyInfo.textContent = [ctx.reportNo, createdText, modeLabel].filter(Boolean).join(' · ');
+    const duration = formatReportDuration(ctx.reportDurationSeconds);
+    const durationText = duration ? `总耗时 ${duration}` : '';
+    historyInfo.textContent = [ctx.reportNo, createdText, modeLabel, durationText].filter(Boolean).join(' · ');
   }
   updateReportVersionUi();
 }

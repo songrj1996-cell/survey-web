@@ -838,7 +838,7 @@ def confirm_survey_plan(
 ) -> dict:
     """确认当前方案，并在适用时保存同问卷可复用分析预设。"""
     sess = get_session(session_id)
-    sess["plan_approved_at"] = datetime.now().isoformat(timespec="seconds")
+    sess["plan_approved_at"] = datetime.now().isoformat(timespec="milliseconds")
     save_session(session_id, sess)
     try:
         preset = save_analysis_preset(
@@ -858,6 +858,33 @@ def confirm_survey_plan(
         "preset_saved": bool(preset),
         "preset_id": (preset or {}).get("id", ""),
     }
+
+
+def _report_completion_timing(
+    sess: dict,
+    *,
+    completed_at: datetime | None = None,
+) -> dict:
+    """Build persisted wall-clock timing from plan approval to report completion."""
+    finished = completed_at or datetime.now()
+    result = {
+        "report_completed_at": finished.isoformat(timespec="milliseconds"),
+    }
+    approved_text = str(sess.get("plan_approved_at") or "").strip()
+    if not approved_text:
+        return result
+    try:
+        approved = datetime.fromisoformat(approved_text)
+    except ValueError:
+        return result
+    if approved.tzinfo != finished.tzinfo:
+        return result
+    result["plan_approved_at"] = approved_text
+    result["report_duration_seconds"] = max(
+        0,
+        int(round((finished - approved).total_seconds())),
+    )
+    return result
 
 
 def save_qualitative_context(
@@ -2225,6 +2252,8 @@ async def report_stream(
         # 普通首版写回本 session；精确重复重跑则在历史事务里追加到原卡片。
         sess = get_session(session_id)
         precommit_session = deepcopy(sess)
+        completion_timing = _report_completion_timing(sess)
+        sess.update(completion_timing)
         snapshot = {
             "report_md": full_report,
             "title": "",
@@ -2238,6 +2267,7 @@ async def report_stream(
             "report_writer_model": writer_model,
             "viewpoint_diagnostics": viewpoint_diagnostics,
             "comparison_validation": comparison_validation,
+            **completion_timing,
         }
         if rerun_history_id:
             if str(sess.get("rerun_target_history_id") or "").strip() != rerun_history_id:
@@ -2297,6 +2327,7 @@ async def report_stream(
             "report_md": full_report,
             "comparison_validation": comparison_validation,
             "version": committed_version["version"],
+            **completion_timing,
             **(
                 {
                     "history_id": rerun_history_id,
