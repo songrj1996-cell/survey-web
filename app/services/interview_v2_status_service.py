@@ -127,16 +127,39 @@ def get_interview_import_with_structure_status(
             "generated_count": 0,
             "approved_count": 0,
             "needs_changes_count": 0,
+            "stale_count": 0,
+            "analysis_ready": False,
+            "blocking_participant_ids": [],
+        }
+        dossier_source = {
+            "structure_revision_id": boundary_state.get("current_structure_revision_id"),
+            "evidence_revision_id": evidence_revision_id,
+            "boundary_revision_id": boundary_state.get("current_boundary_revision_id"),
+            "boundary_payload_sha256": boundary_state.get("current_boundary_payload_sha256"),
+            "coverage_revision_id": boundary_state.get("current_coverage_revision_id"),
+            "coverage_payload_sha256": boundary_state.get("current_coverage_payload_sha256"),
         }
         for participant in participants:
+            participant_id = str(participant.get("participant_id") or "")
             current = store.load_current_participant_dossier(
                 str(public.get("project_id") or ""),
-                str(participant.get("participant_id") or ""),
+                participant_id,
             )
-            status = str((current or {}).get("revision", {}).get("status") or "not_generated")
+            revision = (current or {}).get("revision") or {}
+            status = str(revision.get("status") or "not_generated")
+            if current is not None and revision.get("source") != dossier_source:
+                status = "stale"
+            elif status not in {"not_generated", "generated", "approved", "needs_changes"}:
+                status = "stale"
             key = f"{status}_count"
             if key not in summary:
                 key = "generated_count"
             summary[key] += 1
+            if status in {"not_generated", "needs_changes", "stale"}:
+                summary["blocking_participant_ids"].append(participant_id)
+        summary["blocking_participant_ids"].sort()
+        summary["analysis_ready"] = bool(participants) and not summary[
+            "blocking_participant_ids"
+        ]
         public["dossier_summary"] = summary
     return public

@@ -36,7 +36,7 @@ _STORE_LOCK = threading.RLock()
 _MAPPING_LOCK_TIMEOUT_SECONDS = 10.0
 _MAPPING_LOCK_POLL_SECONDS = 0.025
 _ID_RE = re.compile(
-    r"^(?:upload|job|project|import|workbook|mapping|structure|evidence|boundary|coverage|dossier)_[0-9a-f]{32}$"
+    r"^(?:upload|job|project|import|workbook|mapping|structure|evidence|boundary|coverage|dossier|analysis)_[0-9a-f]{32}$"
 )
 _EVIDENCE_ID_RE = re.compile(r"^(?:ev|evidence)_[0-9a-f]{32}$")
 _REVIEW_ISSUE_ID_RE = re.compile(r"^(?:issue|review)_[0-9a-f]{32}$")
@@ -4594,3 +4594,144 @@ def review_participant_dossier_cas(
         base_dossier_version_id=base_dossier_version_id,
         revision=revision,
     )
+
+
+# Cross-participant analysis checkpoint -----------------------------------------
+
+def _analysis_dir(project_id: str) -> Path:
+    project_id = validate_resource_id(project_id, "project")
+    return _safe_child("projects", project_id, "analysis_runs")
+
+
+def _analysis_digest(revision: dict[str, Any]) -> str:
+    payload = {
+        key: value for key, value in revision.items()
+        if key != "revision_payload_sha256"
+    }
+    return _canonical_payload_sha256(payload)
+
+
+def load_current_analysis_run(project_id: str) -> dict[str, Any] | None:
+    directory = _analysis_dir(project_id)
+    with _STORE_LOCK:
+        with _mapping_process_lock(project_id):
+            state = _read_json(directory / "state.json")
+            if state is None:
+                return None
+            analysis_run_id = validate_resource_id(
+                str(state.get("current_analysis_run_id") or ""), "analysis"
+            )
+            revision = _read_json(directory / "versions" / f"{analysis_run_id}.json")
+            if revision is None:
+                raise ValueError("current analysis revision is missing")
+            declared = str(revision.get("revision_payload_sha256") or "")
+            if not _SHA256_RE.fullmatch(declared) or _analysis_digest(revision) != declared:
+                raise ValueError("analysis revision digest mismatch")
+            return {"state": state, "revision": revision}
+
+
+def _require_analysis_source_current_locked(
+    project_id: str, source: dict[str, Any]
+) -> None:
+    boundary_state = _read_json(_analysis_boundary_state_path(project_id))
+    if boundary_state is None or bool(boundary_state.get("is_stale")):
+        raise ValueError("analysis input changed")
+    source_fields = (
+        ("current_structure_revision_id", "structure_revision_id"),
+        ("current_evidence_revision_id", "evidence_revision_id"),
+        ("current_boundary_revision_id", "boundary_revision_id"),
+        ("current_boundary_payload_sha256", "boundary_payload_sha256"),
+        ("current_coverage_revision_id", "coverage_revision_id"),
+        ("current_coverage_payload_sha256", "coverage_payload_sha256"),
+    )
+    for state_field, source_field in source_fields:
+        if str(boundary_state.get(state_field) or "") != str(source.get(source_field) or ""):
+            raise ValueError("analysis input changed")
+    dossier_versions = source.get("dossier_versions") or []
+    if not isinstance(dossier_versions, list) or not dossier_versions:
+        raise ValueError("analysis dossier snapshot is empty")
+    seen: set[str] = set()
+    for item in dossier_versions:
+        if not isinstance(item, dict):
+            raise ValueError("analysis dossier snapshot is invalid")
+        participant_id = _validate_entity_id(
+            str(item.get("participant_id") or ""), _PARTICIPANT_ID_RE, "participant"
+        )
+        if participant_id in seen:
+            raise ValueError("analysis dossier snapshot is duplicated")
+        seen.add(participant_id)
+        expected_id = validate_resource_id(
+            str(item.get("dossier_version_id") or ""), "dossier"
+        )
+        expected_digest = str(item.get("revision_payload_sha256") or "")
+        if not _SHA256_RE.fullmatch(expected_digest):
+            raise ValueError("analysis dossier snapshot digest is invalid")
+        dossier_directory = _dossier_participant_dir(project_id, participant_id)
+        state = _read_json(dossier_directory / "state.json")
+        if state is None or str(state.get("current_dossier_version_id") or "") != expected_id:
+            raise ValueError("analysis input changed")
+        dossier_revision = _read_json(
+            dossier_directory / "versions" / f"{expected_id}.json"
+        )
+        if (
+            dossier_revision is None
+            or str(dossier_revision.get("revision_payload_sha256") or "")
+            != expected_digest
+            or _dossier_digest(dossier_revision) != expected_digest
+        ):
+            raise ValueError("analysis input changed")
+
+
+def save_analysis_run_cas(
+    *,
+    project_id: str,
+    base_analysis_run_id: str | None,
+    revision: dict[str, Any],
+) -> dict[str, Any]:
+    directory = _analysis_dir(project_id)
+    analysis_run_id = validate_resource_id(
+        str(revision.get("analysis_run_id") or ""), "analysis"
+    )
+    if base_analysis_run_id is not None:
+        validate_resource_id(base_analysis_run_id, "analysis")
+    with _STORE_LOCK:
+        with _mapping_process_lock(project_id):
+            state_path = directory / "state.json"
+            current = _read_json(state_path)
+            current_id = (
+                str(current.get("current_analysis_run_id") or "") if current else None
+            )
+            if current_id != base_analysis_run_id:
+                raise ValueError("analysis version conflict")
+            durable = deepcopy(revision)
+            durable["project_id"] = project_id
+            _require_analysis_source_current_locked(
+                project_id, durable.get("source") or {}
+            )
+            version_number = int((current or {}).get("current_version_number") or 0) + 1
+            durable["version_number"] = version_number
+            durable["revision_payload_sha256"] = _analysis_digest(durable)
+            version_path = directory / "versions" / f"{analysis_run_id}.json"
+            if version_path.exists():
+                raise ValueError("analysis revision already exists")
+            _atomic_write_json(version_path, durable)
+            history = list((current or {}).get("history") or [])
+            history.append(
+                {
+                    "analysis_run_id": analysis_run_id,
+                    "version_number": version_number,
+                    "revision_payload_sha256": durable["revision_payload_sha256"],
+                    "created_at": durable.get("created_at"),
+                    "status": durable.get("status"),
+                }
+            )
+            next_state = {
+                "project_id": project_id,
+                "current_analysis_run_id": analysis_run_id,
+                "current_version_number": version_number,
+                "status": durable.get("status"),
+                "source": deepcopy(durable.get("source") or {}),
+                "history": history,
+            }
+            _atomic_write_json(state_path, next_state)
+            return {"state": next_state, "revision": durable}

@@ -24,6 +24,7 @@ from app.core.config import (
     DEFAULT_INTERVIEW_REPAIR_SYSTEM_PROMPT,
     DEFAULT_INTERVIEW_REPORT_SYSTEM_PROMPT,
     DEFAULT_INTERVIEW_V2_ATTRIBUTE_SYSTEM_PROMPT,
+    DEFAULT_INTERVIEW_V2_ANALYSIS_SYSTEM_PROMPT,
     DEFAULT_INTERVIEW_V2_DOSSIER_SYSTEM_PROMPT,
     DEFAULT_LARGE_SAMPLE_WRITER_REQUIREMENTS,
     DEFAULT_PLANNER_EXTRA,
@@ -368,6 +369,16 @@ DEFAULT_PROMPTS: dict = {
         kind="system",
         current=DEFAULT_INTERVIEW_V2_DOSSIER_SYSTEM_PROMPT,
     ),
+    "interview_v2_analysis_system": _prompt(
+        "interview_v2_analysis_system",
+        "访谈 V2 跨玩家分析 System Prompt",
+        "基于当前档案、覆盖矩阵和证据白名单生成跨玩家发现，不自行计算人数。",
+        group="访谈报告",
+        group_order=60,
+        order=70,
+        kind="system",
+        current=DEFAULT_INTERVIEW_V2_ANALYSIS_SYSTEM_PROMPT,
+    ),
 }
 
 
@@ -591,3 +602,7 @@ def _get_interview_v2_attribute_system_prompt() -> str:
 
 def _get_interview_v2_dossier_system_prompt() -> str:
     return _get_prompt_text("interview_v2_dossier_system")
+
+
+def _get_interview_v2_analysis_system_prompt() -> str:
+    return _get_prompt_text("interview_v2_analysis_system")

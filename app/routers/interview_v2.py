@@ -24,6 +24,10 @@ from app.schemas.interview_v2_analysis_boundary import (
     InterviewV2AnalysisBoundaryResponse,
     InterviewV2CoveragePreviewResponse,
 )
+from app.schemas.interview_v2_analysis import (
+    InterviewV2AnalysisRunCreateRequest,
+    InterviewV2AnalysisRunResponse,
+)
 from app.schemas.interview_v2_mapping import (
     InterviewV2GroupMappingConfirmRequest,
     InterviewV2GroupMappingDraftRequest,
@@ -60,6 +64,10 @@ from app.services.interview_v2_analysis_boundary_service import (
     get_analysis_boundary,
     get_coverage_preview,
     save_analysis_boundary,
+)
+from app.services.interview_v2_analysis_service import (
+    create_analysis_run,
+    get_current_analysis,
 )
 from app.services.interview_v2_mapping_service import (
     confirm_group_mapping,
@@ -269,6 +277,23 @@ def _analysis_boundary_request_error(
             else "分析边界请求格式无效。"
         ),
         suggested_action="review_analysis_boundary",
+        context={"limit_bytes": _STRUCTURE_JSON_MAX_BYTES} if too_large else {},
+    )
+
+
+def _analysis_request_error(
+    request: Request, *, too_large: bool = False
+) -> JSONResponse:
+    return _error_response(
+        request,
+        status_code=413 if too_large else 422,
+        code="ANALYSIS_REQUEST_INVALID",
+        message=(
+            "跨玩家分析请求超过 1MB 上限。"
+            if too_large
+            else "跨玩家分析请求格式无效。"
+        ),
+        suggested_action="review_analysis_request",
         context={"limit_bytes": _STRUCTURE_JSON_MAX_BYTES} if too_large else {},
     )
 
@@ -1001,5 +1026,47 @@ async def review_interview_v2_dossier(participant_id: str, request: Request):
         return await run_in_threadpool(
             review_dossier, payload["project_id"], participant_id, payload, login
         )
+    except InterviewV2ImportError as exc:
+        return _service_error_response(request, exc)
+
+
+@router.get(
+    "/api/v1/interview-projects/{project_id}/analysis-runs/current",
+    response_model=InterviewV2AnalysisRunResponse,
+)
+async def get_interview_v2_current_analysis(project_id: str, request: Request):
+    login = await _require_feature(request, "interview")
+    if not INTERVIEW_V2_ENABLED:
+        return _disabled_response(request)
+    try:
+        return await run_in_threadpool(get_current_analysis, project_id, login)
+    except InterviewV2ImportError as exc:
+        return _service_error_response(request, exc)
+
+
+@router.post(
+    "/api/v1/interview-projects/{project_id}/analysis-runs",
+    response_model=InterviewV2AnalysisRunResponse,
+)
+async def create_interview_v2_analysis_run(project_id: str, request: Request):
+    login = await _require_feature(request, "interview")
+    if not INTERVIEW_V2_ENABLED:
+        return _disabled_response(request)
+    try:
+        raw = await _read_structure_json(request)
+        payload = InterviewV2AnalysisRunCreateRequest.model_validate(raw).model_dump(
+            mode="json"
+        )
+    except (
+        OverflowError,
+        json.JSONDecodeError,
+        UnicodeDecodeError,
+        ValidationError,
+        ValueError,
+        RecursionError,
+    ):
+        return _analysis_request_error(request)
+    try:
+        return await create_analysis_run(project_id, payload, login)
     except InterviewV2ImportError as exc:
         return _service_error_response(request, exc)

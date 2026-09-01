@@ -169,18 +169,31 @@ class InterviewV2StatusServiceTests(unittest.TestCase):
             patch.object(service.store, "load_analysis_boundary_state", return_value={
                 "is_stale": False, "derived_status": "READY_FOR_DOSSIERS",
                 "current_evidence_revision_id": "evidence_" + "5" * 32,
+                "current_structure_revision_id": "structure_" + "7" * 32,
+                "current_boundary_revision_id": "boundary_" + "8" * 32,
+                "current_boundary_payload_sha256": "9" * 64,
+                "current_coverage_revision_id": "coverage_" + "a" * 32,
+                "current_coverage_payload_sha256": "b" * 64,
             }),
             patch.object(service.store, "load_evidence_revision", return_value={
                 "expected_participants": [{"participant_id": participant_id, "group_id": "group_" + "6" * 32}],
             }),
             patch.object(service.store, "load_current_participant_dossier", return_value={
-                "revision": {"status": "approved"}, "state": {},
+                "revision": {"status": "approved", "source": {
+                    "structure_revision_id": "structure_" + "7" * 32,
+                    "evidence_revision_id": "evidence_" + "5" * 32,
+                    "boundary_revision_id": "boundary_" + "8" * 32,
+                    "boundary_payload_sha256": "9" * 64,
+                    "coverage_revision_id": "coverage_" + "a" * 32,
+                    "coverage_payload_sha256": "b" * 64,
+                }}, "state": {},
             }),
         ):
             result = service.get_interview_import_with_structure_status(IMPORT_ID, LOGIN)
 
         self.assertEqual(1, result["dossier_summary"]["participant_count"])
         self.assertEqual(1, result["dossier_summary"]["approved_count"])
+        self.assertTrue(result["dossier_summary"]["analysis_ready"])
 
     def test_stale_structure_does_not_override_current_mapping_checkpoint(self):
         public = _mapping_status("GROUP_MAPPING_CONFIRMED")
