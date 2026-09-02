@@ -186,7 +186,37 @@ class InterviewV2StatusServiceTests(unittest.TestCase):
                     "boundary_payload_sha256": "9" * 64,
                     "coverage_revision_id": "coverage_" + "a" * 32,
                     "coverage_payload_sha256": "b" * 64,
-                }}, "state": {},
+                }, "dossier_version_id": "dossier_" + "c" * 32},
+                "state": {"current_dossier_version_id": "dossier_" + "c" * 32},
+            }),
+            patch.object(service.store, "load_current_analysis_run", return_value={
+                "revision": {
+                    "analysis_run_id": "analysis_" + "d" * 32,
+                    "revision_payload_sha256": "e" * 64,
+                    "status": "completed", "findings": [{"finding_id": "finding_" + "f" * 32}],
+                    "source": {
+                        "structure_revision_id": "structure_" + "7" * 32,
+                        "evidence_revision_id": "evidence_" + "5" * 32,
+                        "boundary_revision_id": "boundary_" + "8" * 32,
+                        "boundary_payload_sha256": "9" * 64,
+                        "coverage_revision_id": "coverage_" + "a" * 32,
+                        "coverage_payload_sha256": "b" * 64,
+                        "dossier_versions": [{
+                            "participant_id": participant_id,
+                            "dossier_version_id": "dossier_" + "c" * 32,
+                        }],
+                    },
+                }
+            }),
+            patch.object(service.store, "load_current_report_version", return_value={
+                "revision": {
+                    "report_version_id": "report_" + "0" * 32,
+                    "status": "draft", "audit_status": "audited",
+                    "source": {
+                        "analysis_run_id": "analysis_" + "d" * 32,
+                        "analysis_revision_payload_sha256": "e" * 64,
+                    },
+                }
             }),
         ):
             result = service.get_interview_import_with_structure_status(IMPORT_ID, LOGIN)
@@ -194,6 +224,10 @@ class InterviewV2StatusServiceTests(unittest.TestCase):
         self.assertEqual(1, result["dossier_summary"]["participant_count"])
         self.assertEqual(1, result["dossier_summary"]["approved_count"])
         self.assertTrue(result["dossier_summary"]["analysis_ready"])
+        self.assertEqual("completed", result["analysis_summary"]["status"])
+        self.assertEqual(1, result["analysis_summary"]["finding_count"])
+        self.assertEqual("draft", result["report_summary"]["status"])
+        self.assertEqual("audited", result["report_summary"]["audit_status"])
 
     def test_stale_structure_does_not_override_current_mapping_checkpoint(self):
         public = _mapping_status("GROUP_MAPPING_CONFIRMED")

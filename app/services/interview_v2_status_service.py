@@ -139,6 +139,7 @@ def get_interview_import_with_structure_status(
             "coverage_revision_id": boundary_state.get("current_coverage_revision_id"),
             "coverage_payload_sha256": boundary_state.get("current_coverage_payload_sha256"),
         }
+        current_dossier_versions: dict[str, str] = {}
         for participant in participants:
             participant_id = str(participant.get("participant_id") or "")
             current = store.load_current_participant_dossier(
@@ -146,6 +147,12 @@ def get_interview_import_with_structure_status(
                 participant_id,
             )
             revision = (current or {}).get("revision") or {}
+            if current is not None:
+                current_dossier_versions[participant_id] = str(
+                    (current.get("state") or {}).get("current_dossier_version_id")
+                    or revision.get("dossier_version_id")
+                    or ""
+                )
             status = str(revision.get("status") or "not_generated")
             if current is not None and revision.get("source") != dossier_source:
                 status = "stale"
@@ -162,4 +169,60 @@ def get_interview_import_with_structure_status(
             "blocking_participant_ids"
         ]
         public["dossier_summary"] = summary
+        try:
+            analysis = store.load_current_analysis_run(
+                str(public.get("project_id") or "")
+            )
+            report = store.load_current_report_version(
+                str(public.get("project_id") or "")
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            raise InterviewV2ImportError(
+                status_code=500,
+                code="REPORT_PERSISTENCE_FAILED",
+                message="分析或报告状态读取失败，请稍后重试。",
+                retryable=True,
+                suggested_action="retry_report_request",
+            ) from exc
+        analysis_revision = (analysis or {}).get("revision") or {}
+        analysis_status = str(analysis_revision.get("status") or "not_generated")
+        if analysis and analysis_revision.get("source"):
+            source = analysis_revision["source"]
+            if any(
+                source.get(key) != dossier_source.get(key)
+                for key in dossier_source
+            ):
+                analysis_status = "stale"
+            frozen_dossiers = source.get("dossier_versions") or []
+            if (
+                {str(item.get("participant_id") or "") for item in frozen_dossiers}
+                != set(current_dossier_versions)
+                or any(
+                    current_dossier_versions.get(str(item.get("participant_id") or ""))
+                    != str(item.get("dossier_version_id") or "")
+                    for item in frozen_dossiers
+                )
+            ):
+                analysis_status = "stale"
+        report_revision = (report or {}).get("revision") or {}
+        report_status = str(report_revision.get("status") or "not_generated")
+        if report and (
+            analysis_status != "completed"
+            or (report_revision.get("source") or {}).get("analysis_run_id")
+            != analysis_revision.get("analysis_run_id")
+            or (report_revision.get("source") or {}).get("analysis_revision_payload_sha256")
+            != analysis_revision.get("revision_payload_sha256")
+        ):
+            report_status = "stale"
+        public["analysis_summary"] = {
+            "analysis_run_id": analysis_revision.get("analysis_run_id"),
+            "status": analysis_status,
+            "finding_count": len(analysis_revision.get("findings") or []),
+            "report_ready": analysis_status == "completed",
+        }
+        public["report_summary"] = {
+            "report_version_id": report_revision.get("report_version_id"),
+            "status": report_status,
+            "audit_status": report_revision.get("audit_status") or "not_generated",
+        }
     return public

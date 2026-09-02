@@ -36,7 +36,7 @@ _STORE_LOCK = threading.RLock()
 _MAPPING_LOCK_TIMEOUT_SECONDS = 10.0
 _MAPPING_LOCK_POLL_SECONDS = 0.025
 _ID_RE = re.compile(
-    r"^(?:upload|job|project|import|workbook|mapping|structure|evidence|boundary|coverage|dossier|analysis)_[0-9a-f]{32}$"
+    r"^(?:upload|job|project|import|workbook|mapping|structure|evidence|boundary|coverage|dossier|analysis|report)_[0-9a-f]{32}$"
 )
 _EVIDENCE_ID_RE = re.compile(r"^(?:ev|evidence)_[0-9a-f]{32}$")
 _REVIEW_ISSUE_ID_RE = re.compile(r"^(?:issue|review)_[0-9a-f]{32}$")
@@ -4733,5 +4733,168 @@ def save_analysis_run_cas(
                 "source": deepcopy(durable.get("source") or {}),
                 "history": history,
             }
+            _atomic_write_json(state_path, next_state)
+            return {"state": next_state, "revision": durable}
+
+
+# Evidence-bound report checkpoint --------------------------------------------
+
+def _report_dir(project_id: str) -> Path:
+    project_id = validate_resource_id(project_id, "project")
+    return _safe_child("projects", project_id, "reports")
+
+
+def _report_locator_path(report_version_id: str) -> Path:
+    report_version_id = validate_resource_id(report_version_id, "report")
+    return _safe_child("report_locators", f"{report_version_id}.json")
+
+
+def _report_digest(revision: dict[str, Any]) -> str:
+    return _canonical_payload_sha256({
+        key: value for key, value in revision.items()
+        if key != "revision_payload_sha256"
+    })
+
+
+def _load_report_revision_locked(
+    project_id: str, report_version_id: str
+) -> dict[str, Any]:
+    revision = _read_json(
+        _report_dir(project_id) / "versions" / f"{report_version_id}.json"
+    )
+    if revision is None:
+        raise ValueError("report revision is missing")
+    declared = str(revision.get("revision_payload_sha256") or "")
+    if not _SHA256_RE.fullmatch(declared) or _report_digest(revision) != declared:
+        raise ValueError("report revision digest mismatch")
+    return revision
+
+
+def load_current_report_version(project_id: str) -> dict[str, Any] | None:
+    directory = _report_dir(project_id)
+    with _STORE_LOCK:
+        with _mapping_process_lock(project_id):
+            state = _read_json(directory / "state.json")
+            if state is None:
+                return None
+            report_version_id = validate_resource_id(
+                str(state.get("current_report_version_id") or ""), "report"
+            )
+            return {
+                "state": state,
+                "revision": _load_report_revision_locked(project_id, report_version_id),
+            }
+
+
+def load_report_version(report_version_id: str) -> dict[str, Any] | None:
+    report_version_id = validate_resource_id(report_version_id, "report")
+    with _STORE_LOCK:
+        locator = _read_json(_report_locator_path(report_version_id))
+        if locator is None:
+            return None
+        project_id = validate_resource_id(str(locator.get("project_id") or ""), "project")
+        expected = _canonical_payload_sha256({
+            "report_version_id": report_version_id,
+            "project_id": project_id,
+        })
+        if locator.get("locator_payload_sha256") != expected:
+            raise ValueError("report locator integrity check failed")
+        revision = _load_report_revision_locked(project_id, report_version_id)
+        state = _read_json(_report_dir(project_id) / "state.json") or {}
+        return {"project_id": project_id, "state": state, "revision": revision}
+
+
+def load_report_claim(
+    report_version_id: str, claim_id: str
+) -> dict[str, Any] | None:
+    if not re.fullmatch(r"^claim_[0-9a-f]{32}$", str(claim_id or "")):
+        raise ValueError("invalid report claim id")
+    current = load_report_version(report_version_id)
+    if current is None:
+        return None
+    for claim in current["revision"].get("claims") or []:
+        if claim.get("claim_id") == claim_id:
+            return {**current, "claim": claim}
+    return None
+
+
+def _require_report_source_current_locked(
+    project_id: str, source: dict[str, Any]
+) -> None:
+    current = _read_json(_analysis_dir(project_id) / "state.json")
+    if current is None:
+        raise ValueError("report input changed")
+    analysis_run_id = validate_resource_id(
+        str(source.get("analysis_run_id") or ""), "analysis"
+    )
+    if current.get("current_analysis_run_id") != analysis_run_id:
+        raise ValueError("report input changed")
+    analysis = _read_json(_analysis_dir(project_id) / "versions" / f"{analysis_run_id}.json")
+    expected_digest = str(source.get("analysis_revision_payload_sha256") or "")
+    if (
+        analysis is None
+        or not _SHA256_RE.fullmatch(expected_digest)
+        or analysis.get("revision_payload_sha256") != expected_digest
+        or _analysis_digest(analysis) != expected_digest
+        or analysis.get("status") != "completed"
+    ):
+        raise ValueError("report input changed")
+
+
+def save_report_version_cas(
+    *,
+    project_id: str,
+    base_report_version_id: str | None,
+    revision: dict[str, Any],
+) -> dict[str, Any]:
+    directory = _report_dir(project_id)
+    report_version_id = validate_resource_id(
+        str(revision.get("report_version_id") or ""), "report"
+    )
+    if base_report_version_id is not None:
+        validate_resource_id(base_report_version_id, "report")
+    with _STORE_LOCK:
+        with _mapping_process_lock(project_id):
+            state_path = directory / "state.json"
+            current = _read_json(state_path)
+            current_id = str(current.get("current_report_version_id") or "") if current else None
+            if current_id != base_report_version_id:
+                raise ValueError("report version conflict")
+            durable = deepcopy(revision)
+            durable["project_id"] = project_id
+            _require_report_source_current_locked(project_id, durable.get("source") or {})
+            version_number = int((current or {}).get("current_version_number") or 0) + 1
+            durable["version_number"] = version_number
+            durable["revision_payload_sha256"] = _report_digest(durable)
+            version_path = directory / "versions" / f"{report_version_id}.json"
+            if version_path.exists():
+                raise ValueError("report revision already exists")
+            _atomic_write_json(version_path, durable)
+            history = list((current or {}).get("history") or [])
+            history.append({
+                "report_version_id": report_version_id,
+                "version_number": version_number,
+                "revision_payload_sha256": durable["revision_payload_sha256"],
+                "created_at": durable.get("created_at"),
+                "status": durable.get("status"),
+                "audit_status": durable.get("audit_status"),
+            })
+            next_state = {
+                "project_id": project_id,
+                "current_report_version_id": report_version_id,
+                "current_version_number": version_number,
+                "status": durable.get("status"),
+                "audit_status": durable.get("audit_status"),
+                "source": deepcopy(durable.get("source") or {}),
+                "history": history,
+            }
+            locator_payload = {
+                "report_version_id": report_version_id,
+                "project_id": project_id,
+            }
+            locator_payload["locator_payload_sha256"] = _canonical_payload_sha256(
+                locator_payload
+            )
+            _atomic_write_json(_report_locator_path(report_version_id), locator_payload)
             _atomic_write_json(state_path, next_state)
             return {"state": next_state, "revision": durable}

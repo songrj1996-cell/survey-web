@@ -26,6 +26,8 @@ from app.core.config import (
     DEFAULT_INTERVIEW_V2_ATTRIBUTE_SYSTEM_PROMPT,
     DEFAULT_INTERVIEW_V2_ANALYSIS_SYSTEM_PROMPT,
     DEFAULT_INTERVIEW_V2_DOSSIER_SYSTEM_PROMPT,
+    DEFAULT_INTERVIEW_V2_REPORT_AUDIT_SYSTEM_PROMPT,
+    DEFAULT_INTERVIEW_V2_REPORT_SYSTEM_PROMPT,
     DEFAULT_LARGE_SAMPLE_WRITER_REQUIREMENTS,
     DEFAULT_PLANNER_EXTRA,
     DEFAULT_QUESTIONNAIRE_TRANSLATION_SYSTEM_PROMPT,
@@ -379,6 +381,26 @@ DEFAULT_PROMPTS: dict = {
         kind="system",
         current=DEFAULT_INTERVIEW_V2_ANALYSIS_SYSTEM_PROMPT,
     ),
+    "interview_v2_report_system": _prompt(
+        "interview_v2_report_system",
+        "访谈 V2 研究报告写作 System Prompt",
+        "基于冻结分析版本按固定七章结构生成逐句可审计的研究报告。",
+        group="访谈报告",
+        group_order=60,
+        order=80,
+        kind="system",
+        current=DEFAULT_INTERVIEW_V2_REPORT_SYSTEM_PROMPT,
+    ),
+    "interview_v2_report_audit_system": _prompt(
+        "interview_v2_report_audit_system",
+        "访谈 V2 研究报告审校 System Prompt",
+        "在确定性证据审计之上补充检查反例、限定和建议边界。",
+        group="访谈报告",
+        group_order=60,
+        order=90,
+        kind="system",
+        current=DEFAULT_INTERVIEW_V2_REPORT_AUDIT_SYSTEM_PROMPT,
+    ),
 }
 
 
@@ -606,3 +628,11 @@ def _get_interview_v2_dossier_system_prompt() -> str:
 
 def _get_interview_v2_analysis_system_prompt() -> str:
     return _get_prompt_text("interview_v2_analysis_system")
+
+
+def _get_interview_v2_report_system_prompt() -> str:
+    return _get_prompt_text("interview_v2_report_system")
+
+
+def _get_interview_v2_report_audit_system_prompt() -> str:
+    return _get_prompt_text("interview_v2_report_audit_system")

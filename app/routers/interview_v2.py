@@ -28,6 +28,11 @@ from app.schemas.interview_v2_analysis import (
     InterviewV2AnalysisRunCreateRequest,
     InterviewV2AnalysisRunResponse,
 )
+from app.schemas.interview_v2_report import (
+    InterviewV2ReportClaimResponse,
+    InterviewV2ReportCreateRequest,
+    InterviewV2ReportResponse,
+)
 from app.schemas.interview_v2_mapping import (
     InterviewV2GroupMappingConfirmRequest,
     InterviewV2GroupMappingDraftRequest,
@@ -68,6 +73,11 @@ from app.services.interview_v2_analysis_boundary_service import (
 from app.services.interview_v2_analysis_service import (
     create_analysis_run,
     get_current_analysis,
+)
+from app.services.interview_v2_report_service import (
+    create_report,
+    get_report,
+    get_report_claim,
 )
 from app.services.interview_v2_mapping_service import (
     confirm_group_mapping,
@@ -1068,5 +1078,62 @@ async def create_interview_v2_analysis_run(project_id: str, request: Request):
         return _analysis_request_error(request)
     try:
         return await create_analysis_run(project_id, payload, login)
+    except InterviewV2ImportError as exc:
+        return _service_error_response(request, exc)
+
+
+@router.post(
+    "/api/v1/interview-projects/{project_id}/reports",
+    response_model=InterviewV2ReportResponse,
+)
+async def create_interview_v2_report(project_id: str, request: Request):
+    login = await _require_feature(request, "interview")
+    if not INTERVIEW_V2_ENABLED:
+        return _disabled_response(request)
+    try:
+        raw = await _read_structure_json(request)
+        payload = InterviewV2ReportCreateRequest.model_validate(raw).model_dump(mode="json")
+    except (
+        OverflowError, json.JSONDecodeError, UnicodeDecodeError, ValidationError,
+        ValueError, RecursionError,
+    ):
+        return _error_response(
+            request, status_code=400, code="REPORT_REQUEST_INVALID",
+            message="报告生成请求格式无效。", suggested_action="refresh_report_inputs",
+        )
+    try:
+        return await create_report(project_id, payload, login)
+    except InterviewV2ImportError as exc:
+        return _service_error_response(request, exc)
+
+
+@router.get(
+    "/api/v1/interview-reports/{report_version_id}",
+    response_model=InterviewV2ReportResponse,
+)
+async def get_interview_v2_report(report_version_id: str, request: Request):
+    login = await _require_feature(request, "interview")
+    if not INTERVIEW_V2_ENABLED:
+        return _disabled_response(request)
+    try:
+        return await run_in_threadpool(get_report, report_version_id, login)
+    except InterviewV2ImportError as exc:
+        return _service_error_response(request, exc)
+
+
+@router.get(
+    "/api/v1/interview-reports/{report_version_id}/claims/{claim_id}",
+    response_model=InterviewV2ReportClaimResponse,
+)
+async def get_interview_v2_report_claim(
+    report_version_id: str, claim_id: str, request: Request
+):
+    login = await _require_feature(request, "interview")
+    if not INTERVIEW_V2_ENABLED:
+        return _disabled_response(request)
+    try:
+        return await run_in_threadpool(
+            get_report_claim, report_version_id, claim_id, login
+        )
     except InterviewV2ImportError as exc:
         return _service_error_response(request, exc)
