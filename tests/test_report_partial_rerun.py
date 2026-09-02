@@ -17,6 +17,14 @@ from app.services import (
 from app.storage import history as history_storage
 
 
+def _login():
+    return {
+        "email": "partial-rerun@example.com",
+        "open_id": "",
+        "name": "Partial Rerun Tester",
+    }
+
+
 def _plan():
     return {
         "columns": [
@@ -199,6 +207,10 @@ def _entry():
     }
     return {
         "id": "11111111-1111-1111-1111-111111111111",
+        "owner_key": "email:partial-rerun@example.com",
+        "owner_email": "partial-rerun@example.com",
+        "owner_open_id": "",
+        "owner_name": "Partial Rerun Tester",
         "report_no": "R-010",
         "filename": "survey.xlsx",
         "title": "概念研究报告",
@@ -276,7 +288,7 @@ class PartialRerunContractTests(unittest.TestCase):
             "_load_history_with_report_numbers",
             return_value=[deepcopy(entry)],
         ):
-            detail = history_service.get_history_entry(entry["id"], None, 1)
+            detail = history_service.get_history_entry(entry["id"], _login(), 1)
         self.assertNotIn("partial_rerun_source", detail)
         self.assertNotIn("analysis_artifacts", detail)
         self.assertTrue(detail["partial_rerun"]["available"])
@@ -305,7 +317,7 @@ class PartialRerunAtomicHistoryTests(unittest.TestCase):
                 expected_plan_fingerprint="wrong",
                 expected_source_fingerprint="wrong",
                 instruction="test",
-                login=None,
+                login=_login(),
             )
         self.assertEqual(self.history_path.read_bytes(), before)
 
@@ -322,7 +334,7 @@ class PartialRerunAtomicHistoryTests(unittest.TestCase):
             expected_plan_fingerprint=source["plan_fingerprint"],
             expected_source_fingerprint=source["source_fingerprint"],
             instruction="局部更新",
-            login=None,
+            login=_login(),
         )
         self.assertEqual(committed["version"], 2)
         self.assertEqual(report_versions.resolve_report_version(stored, 1)["report_md"], _base_report())
@@ -391,7 +403,7 @@ class PartialRerunStreamTests(unittest.IsolatedAsyncioTestCase):
 
         request = object()
         with (
-            patch.object(survey_service, "_current_login", AsyncMock(return_value=None)),
+            patch.object(survey_service, "_current_login", AsyncMock(return_value=_login())),
             patch.object(survey_service, "_load_history", return_value=[deepcopy(entry)]),
             patch.object(survey_service, "_batch_qualitative_analysis", fake_batch),
             patch.object(survey_service, "build_report_viewpoint_stats", fake_viewpoints),
