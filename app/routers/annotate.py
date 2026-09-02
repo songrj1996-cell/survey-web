@@ -17,6 +17,7 @@ from app.services.annotate_workflow import (
     build_and_save_annotate_download,
     get_annotate_history_file,
     handle_annotate_upload,
+    peek_annotate_session,
     validate_annotate_session_for_ai,
     validate_annotate_session_for_quality,
 )
@@ -27,6 +28,7 @@ from app.services.llm_credentials import (
     run_with_llm_api_key,
     stream_with_llm_api_key,
 )
+from app.services.session_access import require_session_request_access
 
 
 async def _require_annotate_access(request: Request):
@@ -63,6 +65,12 @@ async def annotate_upload(request: Request, file: UploadFile = File(...)):
 
 @router.post("/api/annotate/{sid}/confirm-columns")
 async def annotate_confirm_columns(sid: str, req: AnnotateConfirmRequest, request: Request):
+    await require_session_request_access(
+        request,
+        sid,
+        login_resolver=_current_login,
+        loader=peek_annotate_session,
+    )
     task_names = annotate_set_column_config(sid, req.id_col, req.open_text_cols, req.tasks, req.background)
     await audit_log(
         request, "annotate", "确认标注任务",
@@ -74,6 +82,12 @@ async def annotate_confirm_columns(sid: str, req: AnnotateConfirmRequest, reques
 
 @router.get("/api/annotate/{sid}/run-ai-detect")
 async def annotate_run_ai_detect(sid: str, request: Request):
+    await require_session_request_access(
+        request,
+        sid,
+        login_resolver=_current_login,
+        loader=peek_annotate_session,
+    )
     validate_annotate_session_for_ai(sid)
     api_key = await require_request_llm_api_key(request)
     return StreamingResponse(
@@ -92,6 +106,12 @@ async def annotate_run_ai_detect(sid: str, request: Request):
 
 @router.post("/api/annotate/{sid}/confirm-ai")
 async def annotate_confirm_ai(sid: str, req: AnnotateConfirmAIRequest, request: Request):
+    await require_session_request_access(
+        request,
+        sid,
+        login_resolver=_current_login,
+        loader=peek_annotate_session,
+    )
     await annotate_set_confirmed_ai(sid, req.confirmed_ai_ids, request)
     await audit_log(
         request, "annotate", "确认 AI 作答结果",
@@ -104,6 +124,12 @@ async def annotate_confirm_ai(sid: str, req: AnnotateConfirmAIRequest, request: 
 @router.get("/api/annotate/{sid}/run-quality")
 async def annotate_run_quality(sid: str, request: Request):
     from app.services.annotate_workflow import quality_stream
+    await require_session_request_access(
+        request,
+        sid,
+        login_resolver=_current_login,
+        loader=peek_annotate_session,
+    )
     validate_annotate_session_for_quality(sid)
     api_key = await require_request_llm_api_key(request)
     return StreamingResponse(
@@ -122,6 +148,12 @@ async def annotate_run_quality(sid: str, request: Request):
 
 @router.get("/api/annotate/{sid}/download")
 async def annotate_download(sid: str, request: Request):
+    await require_session_request_access(
+        request,
+        sid,
+        login_resolver=_current_login,
+        loader=peek_annotate_session,
+    )
     excel_bytes, download_name = await build_and_save_annotate_download(sid, request)
     await audit_log(
         request, "annotate", "下载标注结果",

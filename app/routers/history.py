@@ -3,13 +3,21 @@
 列表查询与详情在 services/history_service，改名在 services/report_history。
 """
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import StreamingResponse
 
-from app.schemas.requests import HistoryTitleUpdateByIdRequest, HistoryTitleUpdateRequest
+from app.schemas.requests import (
+    HistoryTitleUpdateByIdRequest,
+    HistoryTitleUpdateRequest,
+    PartialReportRerunRequest,
+)
 from app.services.audit import audit_log
 from app.services.auth import _current_login
 from app.services.history_service import get_history_entry, get_history_list
 from app.services.report_history import _update_history_title_by_id
-from app.services.survey_service import delete_owned_history_report_version
+from app.services.survey_service import (
+    delete_owned_history_report_version,
+    partial_report_rerun_stream,
+)
 
 router = APIRouter()
 
@@ -46,6 +54,25 @@ async def get_history_item(
         },
     )
     return entry
+
+
+@router.post("/api/history/{hist_id}/partial-rerun")
+async def partial_rerun_history_version(
+    hist_id: str,
+    req: PartialReportRerunRequest,
+    request: Request,
+):
+    return StreamingResponse(
+        partial_report_rerun_stream(
+            hist_id,
+            request,
+            base_version=req.base_version,
+            target_type=req.target_type,
+            target_key=req.target_key,
+            instruction=req.instruction,
+        ),
+        media_type="text/event-stream",
+    )
 
 
 @router.delete("/api/history/{hist_id}/versions/{version}")

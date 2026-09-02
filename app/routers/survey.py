@@ -26,6 +26,7 @@ from app.services.llm_credentials import (
     require_request_llm_api_key,
     stream_with_llm_api_key,
 )
+from app.services.session_access import require_session_request_access
 from app.services.survey_service import (
     apply_analysis_preset_to_session,
     columns_stream,
@@ -94,6 +95,9 @@ async def upload_file(
 
 @router.get("/api/columns/{session_id}")
 async def get_columns(session_id: str, request: Request):
+    await require_session_request_access(
+        request, session_id, login_resolver=_current_login,
+    )
     validate_columns_ready(session_id)
     if columns_require_llm(session_id) and not LLM_COLUMN_MODEL:
         raise HTTPException(status_code=500, detail="未配置题型识别 LLM 分发服务")
@@ -113,8 +117,12 @@ async def get_columns(session_id: str, request: Request):
 
 @router.post("/api/columns/{session_id}/confirm")
 async def confirm_columns(session_id: str, req: ColumnConfirmRequest, request: Request):
+    login = await require_session_request_access(
+        request, session_id, login_resolver=_current_login,
+    )
     set_survey_columns(session_id, req.columns)
-    login = await _current_login(request)
+    if login is None:
+        login = await _current_login(request)
     preset_offer = get_analysis_preset_offer_for_session(session_id, login)
     await audit_log(
         request, "survey", "确认数据列",
@@ -130,7 +138,11 @@ async def apply_analysis_preset_route(
     req: AnalysisPresetApplyRequest,
     request: Request,
 ):
-    login = await _current_login(request)
+    login = await require_session_request_access(
+        request, session_id, login_resolver=_current_login,
+    )
+    if login is None:
+        login = await _current_login(request)
     preset = apply_analysis_preset_to_session(session_id, login, req.preset_id)
     await audit_log(
         request,
@@ -144,7 +156,11 @@ async def apply_analysis_preset_route(
 
 @router.post("/api/survey-context/{session_id}")
 async def submit_survey_context(session_id: str, req: QualitativeContextRequest, request: Request):
-    login = await _current_login(request)
+    login = await require_session_request_access(
+        request, session_id, login_resolver=_current_login,
+    )
+    if login is None:
+        login = await _current_login(request)
     duplicate_report = save_qualitative_context(session_id, req, login)
     await audit_log(
         request, "survey", "提交业务上下文",
@@ -156,6 +172,9 @@ async def submit_survey_context(session_id: str, req: QualitativeContextRequest,
 
 @router.get("/api/plan/{session_id}")
 async def get_plan(session_id: str, request: Request):
+    await require_session_request_access(
+        request, session_id, login_resolver=_current_login,
+    )
     validate_plan_ready(session_id)
     if not LLM_PLANNER_MODEL:
         raise HTTPException(status_code=500, detail="未配置方案规划 LLM 分发服务")
@@ -175,9 +194,13 @@ async def get_plan(session_id: str, request: Request):
 
 @router.post("/api/plan/confirm")
 async def confirm_plan(req: PlanConfirmRequest, request: Request):
+    login = await require_session_request_access(
+        request, req.session_id, login_resolver=_current_login,
+    )
     validate_plan_confirm_ready(req.session_id)
     if is_survey_plan_approval(req.user_text):
-        login = await _current_login(request)
+        if login is None:
+            login = await _current_login(request)
         result = confirm_survey_plan(req.session_id, login)
         await audit_log(
             request, "survey", "确认分析方案",
@@ -200,6 +223,9 @@ async def confirm_plan(req: PlanConfirmRequest, request: Request):
 
 @router.post("/api/stats/{session_id}")
 async def compute_stats(session_id: str, request: Request):
+    await require_session_request_access(
+        request, session_id, login_resolver=_current_login,
+    )
     stats_md = await compute_survey_stats(session_id, request)
     return {"stats_md": stats_md}
 
@@ -210,7 +236,11 @@ async def prepare_report_rerun(
     req: PrepareReportRerunRequest,
     request: Request,
 ):
-    login = await _current_login(request)
+    login = await require_session_request_access(
+        request, session_id, login_resolver=_current_login,
+    )
+    if login is None:
+        login = await _current_login(request)
     result = prepare_duplicate_report_rerun(
         session_id,
         login,
@@ -239,6 +269,9 @@ async def generate_report(
     request: Request,
     version: int | None = None,
 ):
+    await require_session_request_access(
+        request, session_id, login_resolver=_current_login,
+    )
     if version is not None:
         return get_session_report_version(session_id, version)
     validate_report_ready(session_id)
@@ -258,7 +291,10 @@ async def generate_report(
 
 
 @router.get("/api/report/{session_id}/versions")
-async def list_report_versions(session_id: str):
+async def list_report_versions(session_id: str, request: Request):
+    await require_session_request_access(
+        request, session_id, login_resolver=_current_login,
+    )
     return get_session_report_versions(session_id)
 
 
@@ -268,6 +304,9 @@ async def generate_report_version(
     req: ReportVersionRequest,
     request: Request,
 ):
+    await require_session_request_access(
+        request, session_id, login_resolver=_current_login,
+    )
     raise HTTPException(
         status_code=405,
         detail="报告页不再支持直接生成新版本，请重新上传数据并从数据确认页发起。",
@@ -276,12 +315,19 @@ async def generate_report_version(
 
 @router.delete("/api/report/{session_id}/versions/{version}")
 async def delete_report_version_route(session_id: str, version: int, request: Request):
-    login = await _current_login(request)
+    login = await require_session_request_access(
+        request, session_id, login_resolver=_current_login,
+    )
+    if login is None:
+        login = await _current_login(request)
     return delete_session_report_version(session_id, version, login)
 
 
 @router.post("/api/qa")
 async def qa(req: QARequest, request: Request):
+    await require_session_request_access(
+        request, req.session_id, login_resolver=_current_login,
+    )
     validate_qa_ready(req.session_id, req.version)
     api_key = await require_request_llm_api_key(request)
     return StreamingResponse(

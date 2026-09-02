@@ -44,6 +44,7 @@ from app.core.security import _assign_session_owner, _find_history_for_login
 from app.integrations.llm_client import collect_chat_completion
 from app.services.audit import audit_log
 from app.services.auth import _current_login
+from app.services.session_access import require_loaded_session_access
 from app.services.question_detect import _detect_open_text_cols, _group_googleform_matrix
 from app.services.report_history import save_annotate_to_history
 from app.storage.history import _ensure_history_report_numbers, _load_history
@@ -282,6 +283,7 @@ async def _save_annotate_result_history(sid: str, sess: dict, request: Request) 
     if _annotate_incomplete_detail(sess):
         return
     login = await _current_login(request)
+    require_loaded_session_access(sess, login)
     _assign_session_owner(sess, login)
     loop = asyncio.get_event_loop()
     excel_bytes, download_name = await loop.run_in_executor(
@@ -301,10 +303,16 @@ def _annotate_ai_log(message: str, **fields) -> None:
 
 
 def get_annotate_session(sid: str) -> dict:
+    sess = peek_annotate_session(sid)
+    sess["ts"] = time.time()
+    return sess
+
+
+def peek_annotate_session(sid: str) -> dict:
+    """为授权检查读取标注 session，不刷新其存活时间。"""
     sess = annotate_sessions.get(sid)
     if not sess:
         raise HTTPException(status_code=404, detail="标注会话不存在或已过期，请重新上传文件")
-    sess["ts"] = time.time()
     return sess
 
 

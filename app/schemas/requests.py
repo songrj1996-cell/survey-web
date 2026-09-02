@@ -27,6 +27,13 @@ class PrepareReportRerunRequest(BaseModel):
     base_version: int | None = Field(default=None, ge=1)
 
 
+class PartialReportRerunRequest(BaseModel):
+    base_version: int = Field(ge=1)
+    target_type: str = Field(pattern="^(question|part)$")
+    target_key: str = Field(min_length=1, max_length=128)
+    instruction: str = Field(default="", max_length=4000)
+
+
 class QARequest(BaseModel):
     session_id: str
     question: str

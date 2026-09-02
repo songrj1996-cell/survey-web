@@ -8240,6 +8240,17 @@ body {
   line-height: 1.65;
 }
 
+.report-version-modal__field select {
+  width: 100%;
+  min-height: 44px;
+  padding: 9px 36px 9px 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+}
+
 .report-version-modal__field textarea:focus,
 .report-version-picker__trigger:focus {
   outline: none;
@@ -8330,6 +8341,66 @@ body {
 
 .report-version-delete-row__danger {
   color: var(--red);
+}
+
+.report-partial-rerun-dialog {
+  width: min(680px, calc(100vw - 32px));
+}
+
+.report-partial-rerun-body {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.report-partial-rerun-base,
+.report-partial-rerun-impact,
+.report-partial-rerun-warning,
+.report-partial-rerun-progress {
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+.report-partial-rerun-grid {
+  display: grid;
+  grid-template-columns: minmax(150px, .7fr) minmax(260px, 1.3fr);
+  gap: 12px;
+}
+
+.report-partial-rerun-impact {
+  border-color: rgba(59, 130, 246, .28);
+  background: rgba(59, 130, 246, .07);
+}
+
+.report-partial-rerun-warning {
+  border-style: dashed;
+  border-color: rgba(245, 158, 11, .4);
+  background: rgba(245, 158, 11, .08);
+}
+
+.report-partial-rerun-progress {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.report-partial-rerun-progress[hidden] {
+  display: none;
+}
+
+.report-partial-rerun-progress .spinner {
+  flex: 0 0 auto;
+}
+
+@media (max-width: 640px) {
+  .report-partial-rerun-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 /* ============================================================
