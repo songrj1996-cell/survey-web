@@ -9,7 +9,9 @@ from contextlib import suppress
 from copy import deepcopy
 from datetime import datetime
 import hashlib
+import json
 import re
+import time
 
 import crosstab_parser
 import survey_plan
@@ -118,11 +120,24 @@ from app.services.report_history import (
     DEFAULT_RERUN_VERSION_INSTRUCTION,
     _copy_report_version_state,
     append_exact_rerun_to_history,
+    append_partial_rerun_to_history,
     delete_history_report_version as _delete_history_report_version,
     find_exact_survey_duplicate_entry,
     find_exact_survey_duplicate_report,
     save_to_history,
     sync_exact_rerun_qa_to_history,
+)
+from app.services.report_partial_rerun import (
+    build_analysis_artifacts,
+    build_partial_rerun_source,
+    extract_h2_section,
+    partial_rerun_capability,
+    replace_action_section,
+    replace_core_block,
+    replace_h2_section,
+    resolve_partial_rerun_target,
+    scope_tuples_for_keys,
+    validate_single_part,
 )
 from app.services.report_versions import (
     append_report_version,
@@ -134,7 +149,11 @@ from app.services.report_versions import (
     update_report_version,
 )
 from app.services.report_render import _inject_disclaimer, _inject_research_background
-from app.services.stats_presentation import inject_qualitative_stats, render_stats_appendix
+from app.services.stats_presentation import (
+    inject_qualitative_stats,
+    render_qualitative_stats_by_part,
+    render_stats_appendix,
+)
 from app.storage.history import _load_history, mutate_history
 from app.storage.analysis_presets import AnalysisPresetStorageError
 from app.storage.prompts import (
@@ -2254,6 +2273,7 @@ async def report_stream(
         precommit_session = deepcopy(sess)
         completion_timing = _report_completion_timing(sess)
         sess.update(completion_timing)
+        partial_rerun_source = build_partial_rerun_source(sess)
         snapshot = {
             "report_md": full_report,
             "title": "",
@@ -2266,6 +2286,15 @@ async def report_stream(
             "report_writer_provider": "direct_llm",
             "report_writer_model": writer_model,
             "viewpoint_diagnostics": viewpoint_diagnostics,
+            "analysis_artifacts": build_analysis_artifacts(
+                partial_rerun_source,
+                use_large_mode=use_large_mode,
+                clustered_themes=clustered_themes,
+                report_viewpoints=report_viewpoints,
+                viewpoint_stats_md=viewpoint_stats_md,
+                cluster_diagnostics=cluster_diagnostics,
+                cluster_metrics=cluster_metrics,
+            ),
             "comparison_validation": comparison_validation,
             **completion_timing,
         }
@@ -2345,6 +2374,523 @@ async def report_stream(
         if rerun_target_lock is not None and rerun_target_lock_acquired:
             rerun_target_lock.release()
         generation_lock.release()
+
+
+# ── 历史版本局部重做 SSE ────────────────────────────────────────
+
+
+def _partial_scope_evidence(scopes: list) -> str:
+    blocks: list[str] = []
+    for scope_key, col_idx, part_index, part, entries in scopes:
+        lines = [
+            f"### scope={scope_key}｜Part {part_index} {part.get('name', '')}｜列 {col_idx}"
+        ]
+        for entry in entries:
+            ids = " / ".join(
+                str(value).strip()
+                for value in (entry.get("ids") or {}).values()
+                if str(value).strip()
+            )
+            profile = " / ".join(
+                f"{key}={value}"
+                for key, value in (entry.get("profile") or {}).items()
+            )
+            prefix = " | ".join(filter(None, [
+                f"玩家ID={ids}" if ids else "",
+                f"画像={profile}" if profile else "",
+            ]))
+            lines.append(
+                f"- {f'[{prefix}] ' if prefix else ''}{str(entry.get('text') or '').strip()}"
+            )
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks) or "（该范围没有开放题原文）"
+
+
+def _partial_part_theme_evidence(clustered_themes: dict, part_index: int) -> str:
+    selected = {
+        str(scope_key): deepcopy(data)
+        for scope_key, data in (clustered_themes or {}).items()
+        if int(data.get("part_index") or 0) == part_index
+    }
+    return json.dumps(selected, ensure_ascii=False, separators=(",", ":"))
+
+
+def _replace_report_in_qa_context(qa_context: str, report_md: str) -> str:
+    source = str(qa_context or "")
+    pattern = re.compile(r"<report>\n.*?\n</report>", re.DOTALL)
+    replacement = f"<report>\n{report_md.strip()}\n</report>"
+    if len(pattern.findall(source)) == 1:
+        return pattern.sub(lambda _match: replacement, source, count=1)
+    return ""
+
+
+async def partial_report_rerun_stream(
+    history_id: str,
+    request: Request,
+    *,
+    base_version: int,
+    target_type: str,
+    target_key: str,
+    instruction: str = "",
+):
+    """Only rerun selected qualitative scopes and atomically append one version."""
+    login = await _current_login(request)
+    target_id = str(history_id or "").strip()
+    lock = _report_rerun_target_lock(target_id)
+    if lock.locked():
+        yield sse_event({
+            "type": "error",
+            "message": "该报告正在生成新版本，请等待本次生成完成后再试。",
+        })
+        return
+    await lock.acquire()
+    started = time.monotonic()
+    writer_models: list[str] = []
+    writer_round_count = 0
+
+    def progress(phase: str, phase_index: int, status: str, message: str, **extra):
+        return sse_event({
+            "type": "partial_rerun_progress",
+            "phase": phase,
+            "phase_index": phase_index,
+            "phase_total": 5,
+            "status": status,
+            "message": message,
+            **extra,
+        })
+
+    async def writer_round(query: str, *, messages: list[dict] | None = None):
+        nonlocal writer_round_count
+        request_messages = messages or [
+            {"role": "system", "content": _get_report_writer_system_prompt()},
+            {"role": "user", "content": query},
+        ]
+        task = asyncio.create_task(
+            collect_chat_completion(prepare_glossary_messages(request_messages))
+        )
+        try:
+            while True:
+                done, _ = await asyncio.wait(
+                    {task}, timeout=LLM_STREAM_HEARTBEAT_SECONDS
+                )
+                if task in done:
+                    answer, model = task.result()
+                    writer_round_count += 1
+                    writer_models.append(model)
+                    writer_round.out = normalize_glossary_terms(answer)
+                    writer_round.model = model
+                    return
+                yield sse_event({"type": "heartbeat"})
+        finally:
+            if not task.done():
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+
+    try:
+        history = _load_history()
+        entry = _find_history_for_login(history, target_id, login)
+        if not entry:
+            raise HTTPException(status_code=404, detail="历史报告不存在或无权访问")
+        if len(normalize_report_versions(entry)) >= MAX_REPORT_VERSIONS:
+            raise ValueError(
+                f"报告版本已达上限（{MAX_REPORT_VERSIONS} 个），请先删除一个旧版本。"
+            )
+        base = resolve_report_version(entry, base_version)
+        capability = partial_rerun_capability(entry, base)
+        if not capability.get("available"):
+            raise ValueError(capability.get("reason") or "该版本不能局部重做")
+        plan = deepcopy(entry.get("plan") or {})
+        source = deepcopy(entry.get("partial_rerun_source") or {})
+        artifacts = deepcopy(base.get("analysis_artifacts") or {})
+        target = resolve_partial_rerun_target(
+            plan,
+            source,
+            target_type=target_type,
+            target_key=target_key,
+        )
+        expected_plan_fingerprint = str(capability["plan_fingerprint"])
+        expected_source_fingerprint = str(capability["source_fingerprint"])
+        scope_keys = list(target["scope_keys"])
+        target_scopes = scope_tuples_for_keys(plan, source, scope_keys)
+        if {str(scope[0]) for scope in target_scopes} != set(scope_keys):
+            raise ValueError("局部重做范围已与基础版本不一致")
+        yield progress(
+            "validate",
+            1,
+            "completed",
+            f"已绑定基础版本 V{base_version}；只处理 {target['target_label']}",
+            base_version=base_version,
+            target=target,
+        )
+
+        clustered_themes = {
+            str(key): deepcopy(value)
+            for key, value in (artifacts.get("clustered_themes") or {}).items()
+        }
+        cluster_diagnostics = {
+            str(key): deepcopy(value)
+            for key, value in (
+                artifacts.get("open_text_cluster_diagnostics") or {}
+            ).items()
+        }
+        partial_cluster_metrics: dict = {
+            "scope_count": 0,
+            "elapsed_seconds": 0,
+        }
+        changed_themes = False
+        if target_scopes:
+            yield progress(
+                "themes",
+                2,
+                "active",
+                f"正在重做 {len(target_scopes)} 个目标 scope；其他 scope 直接复用",
+                scope_keys=scope_keys,
+            )
+            new_themes: dict = {}
+            new_diagnostics: dict = {}
+            async for item in _batch_qualitative_analysis(
+                source.get("open_text") or {},
+                plan,
+                source.get("headers") or [],
+                target_id,
+                deduplicate_respondents=True,
+                _scopes_override=target_scopes,
+            ):
+                if item[0] == "heartbeat":
+                    yield sse_event({"type": "heartbeat"})
+                elif item[0] in {"progress", "analysis_progress"}:
+                    payload = item[1] if isinstance(item[1], dict) else {"message": item[1]}
+                    yield progress(
+                        "themes",
+                        2,
+                        payload.get("status") or "active",
+                        payload.get("message") or "正在处理目标题目",
+                        scope_key=payload.get("scope_key"),
+                    )
+                elif item[0] == "diagnostics":
+                    new_diagnostics = item[1]
+                elif item[0] == "analysis_metrics":
+                    partial_cluster_metrics = item[1]
+                elif item[0] == "result":
+                    new_themes = item[1]
+            for key, value in new_themes.items():
+                clustered_themes[str(key)] = deepcopy(value)
+            for key, value in new_diagnostics.items():
+                cluster_diagnostics[str(key)] = deepcopy(value)
+            changed_themes = bool(new_themes)
+            yield progress(
+                "themes",
+                2,
+                "completed",
+                f"目标 scope 已处理完成；复用了 {max(0, len(clustered_themes) - len(new_themes))} 个其他 scope",
+                elapsed_seconds=partial_cluster_metrics.get("elapsed_seconds", 0),
+            )
+        else:
+            yield progress(
+                "themes",
+                2,
+                "skipped",
+                "目标 Part 没有开放题，仅重写该 Part 的客观统计解读",
+            )
+
+        report_viewpoints = deepcopy(artifacts.get("report_viewpoints") or [])
+        viewpoint_stats_md = str(artifacts.get("viewpoint_stats_md") or "")
+        if changed_themes:
+            yield progress(
+                "synthesis",
+                3,
+                "active",
+                "目标题目的主题已变化，正在重新执行跨题归纳",
+            )
+            report_viewpoints = []
+            synthesis_seen = False
+            async for item in build_report_viewpoint_stats(
+                clustered_themes,
+                source.get("open_text") or {},
+                plan,
+                source.get("headers") or [],
+            ):
+                if item[0] == "heartbeat":
+                    yield sse_event({"type": "heartbeat"})
+                elif item[0] in {"progress", "analysis_progress"}:
+                    payload = item[1] if isinstance(item[1], dict) else {"message": item[1]}
+                    synthesis_seen = True
+                    yield progress(
+                        "synthesis",
+                        3,
+                        payload.get("status") or "active",
+                        payload.get("message") or "正在重算跨题观点",
+                    )
+                elif item[0] == "result":
+                    report_viewpoints = item[1]
+            viewpoint_stats_md = render_viewpoint_stats(
+                clustered_themes,
+                report_viewpoints,
+            )
+            yield progress(
+                "synthesis",
+                3,
+                "completed" if synthesis_seen else "skipped",
+                "跨题观点已更新" if synthesis_seen else "可用题目不足两道，未生成跨题观点",
+            )
+        else:
+            yield progress(
+                "synthesis",
+                3,
+                "skipped",
+                "主题未变化，沿用基础版本的跨题观点",
+            )
+
+        yield progress(
+            "writing",
+            4,
+            "active",
+            f"正在重写 {target['part_title']}，随后同步核心结论和行动建议",
+        )
+        headers = source.get("headers") or []
+        parts_meta = _writer_parts_meta(plan, headers)
+        part_meta = parts_meta[target["part_index"] - 1]
+        base_report = str(base.get("report_md") or "")
+        base_part = extract_h2_section(base_report, target["part_title"])
+        part_stats = render_qualitative_stats_by_part(
+            source.get("stats_md") or "",
+            plan,
+        ).get(target["part_title"], "")
+        supplement = str(instruction or "").strip()
+        part_query = (
+            "这是一次报告局部重做。只允许重写指定完整 Part；标题、其他 Part、Bug 模块不在本轮范围。\n\n"
+            f"<partial_rerun>\n基础版本：V{base_version}\n重做类型：{target['target_type']}\n"
+            f"重做目标：{target['target_label']}\n补充要求：{supplement or '无'}\n</partial_rerun>\n\n"
+            f"<base_part>\n{base_part}\n</base_part>\n\n"
+            f"<stats>\n{part_stats or '（本 Part 无可注入的客观统计表）'}\n</stats>\n\n"
+            f"<open_text>\n{_partial_scope_evidence(target_scopes)}\n</open_text>\n\n"
+            f"<part_theme_catalog>\n{_partial_part_theme_evidence(clustered_themes, target['part_index'])}\n"
+            "</part_theme_catalog>\n\n"
+            f"{viewpoint_stats_md}\n\n"
+            "基础 Part 中不属于重做目标、且未被新证据影响的有效信息应保留；受新主题影响的总结、观点和引用必须更新。"
+            "不要自行复制客观统计表，系统会在新 Part 校验后确定性注入一次。\n\n"
+            + _build_writer_part_query(part_meta, quantitative_first=False)
+        )
+        async for event in writer_round(part_query):
+            yield event
+        new_part = validate_single_part(writer_round.out, target["part_title"])
+        if part_stats and part_stats in new_part:
+            raise ValueError("模型输出夹带了系统统计块，已拒绝重复插表")
+        new_part = inject_qualitative_stats(
+            new_part,
+            source.get("stats_md") or "",
+            plan,
+        )
+        validate_single_part(new_part, target["part_title"])
+        if part_stats and new_part.count(part_stats) != 1:
+            raise ValueError("新 Part 的客观统计未能安全地只注入一次")
+        patched_report = replace_h2_section(
+            base_report,
+            target["part_title"],
+            new_part,
+        )
+
+        has_bug = "## Bug 或待确认问题" in patched_report
+        analysis_focus = plan.get("analysis_focus") if isinstance(plan, dict) else None
+        core_query = (
+            "下面是只替换了目标 Part 后的完整报告。请把它视为已经生成的全部章节，"
+            "只重新输出核心结论；未受目标变化影响的结论应保持稳定。\n\n"
+            f"<current_report>\n{patched_report}\n</current_report>\n\n"
+            f"{viewpoint_stats_md}\n\n"
+            + _build_writer_core_query(
+                parts_meta,
+                has_bug,
+                source.get("qualitative_context") or {},
+                analysis_focus=analysis_focus,
+            )
+        )
+        async for event in writer_round(core_query):
+            yield event
+        core_block = writer_round.out.strip()
+        review_messages = [
+            {"role": "system", "content": _get_report_writer_system_prompt()},
+            {"role": "user", "content": core_query},
+            {"role": "assistant", "content": core_block},
+            {"role": "user", "content": _build_writer_core_review_query(analysis_focus, has_bug)},
+        ]
+        try:
+            async for event in writer_round("", messages=review_messages):
+                yield event
+            core_block = _resolve_core_coverage_review(core_block, writer_round.out)
+        except Exception as review_error:
+            print(
+                "[partial-rerun] WARN optional core review skipped: "
+                f"{type(review_error).__name__}",
+                flush=True,
+            )
+        patched_report = replace_core_block(patched_report, core_block)
+
+        action_query = (
+            "下面是目标 Part 与核心结论已经更新后的完整报告。只重新输出行动建议；"
+            "建议必须承接新结论，未受影响的有效动作保持稳定。\n\n"
+            f"<current_report>\n{patched_report}\n</current_report>\n\n"
+            f"{viewpoint_stats_md}\n\n"
+            + _build_writer_action_query(
+                parts_meta,
+                has_bug,
+                source.get("qualitative_context") or {},
+                analysis_focus=analysis_focus,
+                selected_core=core_block,
+            )
+        )
+        async for event in writer_round(action_query):
+            yield event
+        action_raw = writer_round.out
+        action_section = _normalize_action_section(action_raw)
+        if not action_section:
+            repair_messages = [
+                {"role": "system", "content": _get_report_writer_system_prompt()},
+                {"role": "user", "content": action_query},
+                {"role": "assistant", "content": action_raw},
+                {"role": "user", "content": _build_writer_action_repair_query()},
+            ]
+            async for event in writer_round("", messages=repair_messages):
+                yield event
+            action_section = _normalize_action_section(writer_round.out)
+        if not action_section:
+            raise ValueError("新行动建议未通过结构校验")
+        patched_report = replace_action_section(patched_report, action_section)
+        yield progress(
+            "writing",
+            4,
+            "completed",
+            "目标 Part、核心结论和行动建议已完成严格结构校验",
+        )
+
+        yield progress(
+            "finalize",
+            5,
+            "active",
+            "正在核对 fingerprints、比较关系并原子保存新版本",
+        )
+        comparison_catalog = source.get("comparison_catalog") or []
+        comparison_result = survey_stats.analyze_comparison_claims(
+            patched_report,
+            comparison_catalog,
+        )
+        patched_report, comparison_validation = _apply_verified_comparison_repairs(
+            patched_report,
+            comparison_catalog,
+            comparison_result,
+            {},
+            "\n".join(filter(None, [source.get("stats_md") or "", viewpoint_stats_md])),
+        )
+        comparison_validation.update({
+            "auto_repair_attempted": False,
+            "coverage": "量表均值的最高/最低、两两关系、排序、名次和并列关系",
+            "catalog_group_count": len(comparison_catalog),
+        })
+        elapsed_seconds = round(time.monotonic() - started, 3)
+        base_cluster_metrics = deepcopy(
+            artifacts.get("open_text_cluster_metrics") or {}
+        )
+        base_cluster_metrics["last_partial_rerun"] = deepcopy(partial_cluster_metrics)
+        updated_artifacts = build_analysis_artifacts(
+            source,
+            use_large_mode=artifacts.get("report_generation_mode") == "large",
+            clustered_themes=clustered_themes,
+            report_viewpoints=report_viewpoints,
+            viewpoint_stats_md=viewpoint_stats_md,
+            cluster_diagnostics=cluster_diagnostics,
+            cluster_metrics=base_cluster_metrics,
+        )
+        rerun_details = {
+            "base_version": base_version,
+            "target_type": target["target_type"],
+            "target_key": target["target_key"],
+            "target_label": target["target_label"],
+            "target_part": target["part_title"],
+            "scope_keys": scope_keys,
+            "changed_sections": [target["part_title"], "核心结论", "行动建议"],
+            "full_report_rerun": False,
+            "elapsed_seconds": elapsed_seconds,
+            "theme_elapsed_seconds": partial_cluster_metrics.get("elapsed_seconds", 0),
+            "writer_round_count": writer_round_count,
+            "writer_models": list(dict.fromkeys(writer_models)),
+            "token_usage": {
+                "available": False,
+                "reason": "当前 LLM 客户端未返回可持久化的 Token usage。",
+            },
+        }
+        version_instruction = supplement or "未填写补充要求，本次为局部重做"
+        qa_context_md = _replace_report_in_qa_context(
+            base.get("qa_context_md") or "",
+            patched_report,
+        ) or _build_qa_context({
+            "plan": plan,
+            "stats_md": source.get("stats_md") or "",
+            "qualitative_context": source.get("qualitative_context") or {},
+        }, patched_report)
+        snapshot = {
+            "report_md": patched_report,
+            "title": str(base.get("title") or ""),
+            "qa_context_md": qa_context_md,
+            "qa_messages": [],
+            "qa_provider": "",
+            "qa_model": "",
+            "report_writer_provider": "direct_llm",
+            "report_writer_model": ",".join(dict.fromkeys(writer_models)),
+            "analyst_conv_id": "",
+            "analyst_app": str(base.get("analyst_app") or "standard"),
+            "comparison_validation": comparison_validation,
+            "analysis_artifacts": updated_artifacts,
+            "rerun_details": rerun_details,
+            "report_completed_at": datetime.now().isoformat(timespec="milliseconds"),
+            "report_duration_seconds": elapsed_seconds,
+        }
+        committed_entry, committed = append_partial_rerun_to_history(
+            target_id,
+            snapshot,
+            base_version=base_version,
+            expected_plan_fingerprint=expected_plan_fingerprint,
+            expected_source_fingerprint=expected_source_fingerprint,
+            instruction=version_instruction,
+            login=login,
+        )
+        await audit_log(
+            request,
+            "survey",
+            "局部重做报告",
+            f"报告：{target_id}；基础版本：V{base_version}；范围：{target['target_label']}",
+            metadata={
+                "history_id": target_id,
+                "base_version": base_version,
+                "version": committed["version"],
+                "target_type": target["target_type"],
+                "scope_keys": scope_keys,
+                "elapsed_seconds": elapsed_seconds,
+                "full_report_rerun": False,
+            },
+        )
+        yield progress(
+            "finalize",
+            5,
+            "completed",
+            f"V{committed['version']} 已原子保存；未执行整份报告重跑",
+        )
+        yield sse_event({
+            "type": "partial_rerun_done",
+            "history_id": target_id,
+            "version": committed["version"],
+            "active_version": committed["version"],
+            "versions": report_version_summaries(committed_entry),
+            "report_md": patched_report,
+            "comparison_validation": comparison_validation,
+            "rerun_details": rerun_details,
+        })
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        message = exc.detail if isinstance(exc, HTTPException) else str(exc)
+        yield sse_event({"type": "error", "message": message or "局部重做失败"})
+    finally:
+        lock.release()
 
 
 # ── 当前会话 QA SSE ─────────────────────────────────────────────

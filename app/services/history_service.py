@@ -13,6 +13,7 @@ from app.services.report_versions import (
     report_version_summaries,
     resolve_report_version,
 )
+from app.services.report_partial_rerun import partial_rerun_capability
 from app.storage.history import _load_history_with_report_numbers
 from app.storage.sessions import get_session  # kept as a stable patch seam for integrations
 
@@ -134,6 +135,7 @@ def get_history_entry(
         return None
 
     result = deepcopy(entry)
+    result.pop("partial_rerun_source", None)
     metadata = _history_version_metadata(entry, login)
     result.update(metadata)
     if metadata["version_count"]:
@@ -153,5 +155,7 @@ def get_history_entry(
             "plan_approved_at": selected.get("plan_approved_at", ""),
             "report_completed_at": selected.get("report_completed_at", ""),
             "report_duration_seconds": selected.get("report_duration_seconds"),
+            "rerun_details": deepcopy(selected.get("rerun_details") or {}),
+            "partial_rerun": partial_rerun_capability(entry, selected),
         })
     return result

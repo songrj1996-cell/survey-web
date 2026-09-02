@@ -607,6 +607,9 @@
             </div>
           </div>
           <div class="report-toolbar__actions">
+            <button class="btn btn--ghost" id="btn-report-partial-rerun" type="button">
+              局部重做
+            </button>
             <div class="export-dropdown" id="export-dropdown">
               <button class="btn btn--ghost" id="btn-export-dropdown" type="button">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -1511,13 +1514,68 @@
     </div>
   </div>
 
+  <div class="modal-shell" id="report-partial-rerun-modal" hidden>
+    <div class="modal-shell__backdrop" data-partial-rerun-close></div>
+    <div class="modal-shell__dialog report-partial-rerun-dialog" role="dialog" aria-modal="true"
+      aria-labelledby="report-partial-rerun-title">
+      <div class="modal-shell__header">
+        <div>
+          <div class="modal-shell__title" id="report-partial-rerun-title">局部重做报告</div>
+          <p class="modal-shell__desc">只重跑所选题目范围，并安全替换所属完整 Part；其他 Part 和标题保持原样。</p>
+        </div>
+        <button class="modal-shell__close" id="btn-report-partial-rerun-close" type="button" aria-label="关闭">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="6" x2="6" y2="18" />
+            <line x1="6" y1="6" x2="18" y2="18" />
+          </svg>
+        </button>
+      </div>
+      <div class="modal-shell__body report-partial-rerun-body">
+        <div class="report-partial-rerun-base" id="report-partial-rerun-base"></div>
+        <div class="report-partial-rerun-grid">
+          <label class="report-version-modal__field" for="report-partial-rerun-type">
+            <span>重做范围</span>
+            <select id="report-partial-rerun-type">
+              <option value="question">重做此题</option>
+              <option value="part">重做此 Part</option>
+            </select>
+          </label>
+          <label class="report-version-modal__field" for="report-partial-rerun-target">
+            <span>选择目标</span>
+            <select id="report-partial-rerun-target"></select>
+          </label>
+        </div>
+        <div class="report-partial-rerun-impact" id="report-partial-rerun-impact"></div>
+        <label class="report-version-modal__field" for="report-partial-rerun-instruction">
+          <span>补充要求（选填）</span>
+          <textarea id="report-partial-rerun-instruction" rows="4"
+            placeholder="例如：重点总结玩家对概念排名原因中的决策标准，并保留少数反对意见"></textarea>
+        </label>
+        <div class="report-partial-rerun-warning">
+          第一阶段使用 SSE：请保持当前页面打开。刷新、关页或断线可能中断任务；失败不会覆盖基础版本。
+        </div>
+        <div class="report-partial-rerun-progress" id="report-partial-rerun-progress" hidden>
+          <div class="spinner"></div>
+          <div>
+            <strong id="report-partial-rerun-progress-title">准备局部重做</strong>
+            <div id="report-partial-rerun-progress-message"></div>
+          </div>
+        </div>
+      </div>
+      <div class="modal-shell__footer">
+        <button class="btn btn--ghost" id="btn-report-partial-rerun-cancel" type="button">取消</button>
+        <button class="btn btn--primary" id="btn-report-partial-rerun-start" type="button">开始局部重做</button>
+      </div>
+    </div>
+  </div>
+
   <div class="toast-container" id="toast-container" aria-live="polite"></div>
 
   <script src="https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js"></script>
   <!-- app.js 已按业务线拆分;顺序固定:core 最先,各 feature 居中(均含原顺序的初始化代码) -->
   <script src="/static/js/core/core.js?v=32"></script>
   <script src="/static/js/features/survey.js?v=38"></script>
-  <script src="/static/js/features/report.js?v=39"></script>
+  <script src="/static/js/features/report.js?v=40"></script>
   <script src="/static/js/features/settings.js?v=34"></script>
   <script src="/static/js/features/history.js?v=35"></script>
   <script src="/static/js/features/interview.js?v=9"></script>

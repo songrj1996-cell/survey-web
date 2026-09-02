@@ -32,6 +32,7 @@ _SUMMARY_FIELDS = (
     "instruction",
     "created_at",
     "title",
+    "rerun_details",
 )
 _IMMUTABLE_UPDATE_FIELDS = {
     "version",
@@ -237,7 +238,11 @@ def resolve_report_version(source: dict, version=None) -> dict:
 def report_version_summaries(source: dict) -> list[dict]:
     """Return metadata safe for list/SSE responses without report bodies."""
     return [
-        {field: deepcopy(snapshot[field]) for field in _SUMMARY_FIELDS}
+        {
+            field: deepcopy(snapshot[field])
+            for field in _SUMMARY_FIELDS
+            if field in snapshot
+        }
         for snapshot in normalize_report_versions(source)
     ]
 

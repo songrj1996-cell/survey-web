@@ -303,6 +303,8 @@ function _renderReportPreparationSteps(element, progressState) {
 }
 
 const EMPTY_RERUN_INSTRUCTION = '未填写补充要求，本次为重新生成';
+let partialRerunRunning = false;
+let partialRerunContext = null;
 
 function normalizeReportVersions(versions) {
   return (Array.isArray(versions) ? versions : [])
@@ -324,6 +326,9 @@ function normalizeReportVersions(versions) {
           plan_approved_at: item.plan_approved_at || '',
           report_completed_at: item.report_completed_at || '',
           report_duration_seconds: item.report_duration_seconds,
+          rerun_details: item.rerun_details && typeof item.rerun_details === 'object'
+            ? item.rerun_details
+            : {},
         };
       }
       const version = Number(item);
@@ -345,6 +350,7 @@ let reportVersionLoadTarget = null;
 function reportInteractionBusy() {
   return !!(
     state.sessionReport.running
+    || partialRerunRunning
     || state.qaLoading
     || state.reportVersionLoading
     || state.historyLoading
@@ -353,6 +359,8 @@ function reportInteractionBusy() {
 
 function activeReportInteractionBusy() {
   return !!(
+    partialRerunRunning
+    ||
     state.qaLoading
     || state.reportVersionLoading
     || state.historyLoading
@@ -366,6 +374,8 @@ function updateReportActionAvailability() {
   if (renameBtn) renameBtn.disabled = !activeReportId() || busy;
   const exportDropdown = $('btn-export-dropdown');
   if (exportDropdown) exportDropdown.disabled = busy;
+  const partialRerunBtn = $('btn-report-partial-rerun');
+  if (partialRerunBtn) partialRerunBtn.disabled = !activeReportId() || busy;
   const hasSession = !!(
     state.sessionId
     || state.sessionReport.reportMd
@@ -423,6 +433,18 @@ function syncReportVersionMeta(target, meta = {}) {
 
 function activeVersionNumber(ctx = activeReportCtx()) {
   return Number(ctx?.selectedVersion || ctx?.version || ctx?.activeVersion || 0) || null;
+}
+
+function reportVersionRevisionText(item) {
+  const details = item?.rerun_details || {};
+  if (details.target_label) {
+    const base = details.base_version ? `基于 V${details.base_version}` : '局部重做';
+    const changed = Array.isArray(details.changed_sections)
+      ? details.changed_sections.join('、')
+      : '';
+    return `${base} · 重做 ${details.target_label}${changed ? ` · 更新 ${changed}` : ''}`;
+  }
+  return item?.instruction || (item?.version === 1 ? '首次生成' : '未记录修订要求');
 }
 
 function withOptionalVersion(url, version) {
@@ -543,7 +565,7 @@ function updateReportVersionUi() {
     menu.innerHTML = versions.map(item => {
       const isSelected = item.version === displayedVersion;
       const isActive = item.version === ctx?.activeVersion;
-      const revision = item.instruction || (item.version === 1 ? '首次生成' : '未记录修订要求');
+      const revision = reportVersionRevisionText(item);
       return `
         <button class="report-version-picker__option${isSelected ? ' report-version-picker__option--selected' : ''}"
           type="button" role="option" aria-selected="${isSelected}" data-report-version-option="${item.version}">
@@ -1546,7 +1568,7 @@ function renderReportVersionManageList() {
   const versions = normalizeReportVersions(state.historyReport.versions);
   list.innerHTML = versions.map(item => {
     const isActive = item.version === state.historyReport.activeVersion;
-    const note = item.instruction || (item.version === 1 ? '首次生成' : EMPTY_RERUN_INSTRUCTION);
+    const note = reportVersionRevisionText(item) || EMPTY_RERUN_INSTRUCTION;
     return `<div class="report-version-delete-row">
       <div class="report-version-delete-row__content">
         <div class="report-version-delete-row__title">V${item.version}${isActive ? ' · 当前生效' : ''}</div>
@@ -1619,6 +1641,209 @@ $('report-version-manage-list')?.addEventListener('click', async e => {
     applyQAAvailability();
     renderReportVersionManageList();
   }
+});
+
+function closePartialRerunModal() {
+  if (partialRerunRunning) return;
+  const modal = $('report-partial-rerun-modal');
+  if (modal) modal.hidden = true;
+  partialRerunContext = null;
+  document.body.style.removeProperty('overflow');
+}
+
+function partialRerunTargets(type) {
+  const capability = partialRerunContext?.capability || {};
+  return type === 'part'
+    ? (Array.isArray(capability.parts) ? capability.parts : [])
+    : (Array.isArray(capability.questions) ? capability.questions : []);
+}
+
+function renderPartialRerunTargetOptions() {
+  const type = $('report-partial-rerun-type')?.value || 'question';
+  const targetSelect = $('report-partial-rerun-target');
+  if (!targetSelect) return;
+  const targets = partialRerunTargets(type);
+  targetSelect.innerHTML = targets.map(item => {
+    const value = type === 'part' ? item.part_index : item.scope_key;
+    const label = type === 'part'
+      ? item.part_title
+      : `${item.question_name}（${item.part_title}，${item.response_count} 条）`;
+    return `<option value="${esc(value)}">${esc(label)}</option>`;
+  }).join('');
+  targetSelect.disabled = partialRerunRunning || !targets.length;
+  renderPartialRerunImpact();
+}
+
+function selectedPartialRerunTarget() {
+  const type = $('report-partial-rerun-type')?.value || 'question';
+  const key = String($('report-partial-rerun-target')?.value || '');
+  const targets = partialRerunTargets(type);
+  const item = targets.find(target => String(
+    type === 'part' ? target.part_index : target.scope_key,
+  ) === key);
+  return { type, key, item };
+}
+
+function renderPartialRerunImpact() {
+  const impact = $('report-partial-rerun-impact');
+  if (!impact) return;
+  const { type, item } = selectedPartialRerunTarget();
+  if (!item) {
+    impact.textContent = '当前类型没有可重做目标。';
+    return;
+  }
+  const scopeCount = type === 'part' ? (item.scope_keys || []).length : 1;
+  const partTitle = item.part_title;
+  impact.textContent = [
+    `实际分析调用：${scopeCount ? `${scopeCount} 个目标 scope` : '无开放题模型分析'}`,
+    `报告写回：${partTitle}、核心结论、行动建议`,
+    '保持不变：一级标题、其他 Part、Bug 模块和无关统计',
+  ].join('；');
+}
+
+async function openPartialRerunModal() {
+  if (reportInteractionBusy()) return;
+  const historyId = String(activeReportId() || '');
+  const baseVersion = activeVersionNumber();
+  if (!historyId || !baseVersion) {
+    showToast('当前报告没有可绑定的历史版本', 'error');
+    return;
+  }
+  const button = $('btn-report-partial-rerun');
+  if (button) button.disabled = true;
+  try {
+    const resp = await fetch(
+      `/api/history/${encodeURIComponent(historyId)}?version=${encodeURIComponent(baseVersion)}`,
+      { credentials: 'same-origin', cache: 'no-store' },
+    );
+    const detail = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(detail.detail || '读取局部重做范围失败');
+    const capability = detail.partial_rerun || {};
+    if (!capability.available) {
+      showToast(capability.reason || '该版本暂不支持局部重做', 'info', 7000);
+      return;
+    }
+    if (Number(detail.version_count || 0) >= Number(detail.max_versions || 5)) {
+      showToast(`报告版本已达上限（${detail.max_versions || 5} 个），请先删除一个旧版本`, 'info', 7000);
+      return;
+    }
+    partialRerunContext = { historyId, baseVersion, capability, detail };
+    $('report-partial-rerun-base').textContent = `基础版本：V${baseVersion} · ${detail.title || '分析报告'}`;
+    const typeSelect = $('report-partial-rerun-type');
+    typeSelect.value = (capability.questions || []).length ? 'question' : 'part';
+    typeSelect.disabled = false;
+    $('report-partial-rerun-instruction').value = '';
+    $('report-partial-rerun-progress').hidden = true;
+    $('btn-report-partial-rerun-start').textContent = '开始局部重做';
+    renderPartialRerunTargetOptions();
+    $('report-partial-rerun-modal').hidden = false;
+    document.body.style.overflow = 'hidden';
+  } catch (error) {
+    showToast(error.message, 'error', 7000);
+  } finally {
+    updateReportActionAvailability();
+  }
+}
+
+async function startPartialRerun() {
+  if (partialRerunRunning || !partialRerunContext) return;
+  const { type, key, item } = selectedPartialRerunTarget();
+  if (!item || !key) {
+    showToast('请选择要重做的题目或 Part', 'info');
+    return;
+  }
+  const { historyId, baseVersion, detail } = partialRerunContext;
+  const instruction = String($('report-partial-rerun-instruction')?.value || '').trim();
+  let doneEvent = null;
+  partialRerunRunning = true;
+  $('report-partial-rerun-progress').hidden = false;
+  $('report-partial-rerun-progress-title').textContent = `基于 V${baseVersion} 局部重做`;
+  $('report-partial-rerun-progress-message').textContent = '正在校验基础版本与数据指纹…';
+  $('btn-report-partial-rerun-start').disabled = true;
+  $('btn-report-partial-rerun-cancel').disabled = true;
+  $('btn-report-partial-rerun-close').disabled = true;
+  $('report-partial-rerun-type').disabled = true;
+  $('report-partial-rerun-target').disabled = true;
+  $('report-partial-rerun-instruction').disabled = true;
+  updateReportActionAvailability();
+  try {
+    await consumeSSEPost(
+      `/api/history/${encodeURIComponent(historyId)}/partial-rerun`,
+      {
+        base_version: baseVersion,
+        target_type: type,
+        target_key: key,
+        instruction,
+      },
+      ev => {
+        if (ev.type === 'partial_rerun_progress') {
+          $('report-partial-rerun-progress-title').textContent = `步骤 ${ev.phase_index || 1}/${ev.phase_total || 5}`;
+          $('report-partial-rerun-progress-message').textContent = ev.message || '正在局部重做';
+        } else if (ev.type === 'partial_rerun_done') {
+          doneEvent = ev;
+          const details = ev.rerun_details || {};
+          const seconds = Number(details.elapsed_seconds || 0);
+          $('report-partial-rerun-progress-title').textContent = `V${ev.version} 已生成`;
+          $('report-partial-rerun-progress-message').textContent = [
+            `重做 ${details.target_label || '目标范围'}`,
+            `更新 ${(details.changed_sections || []).join('、')}`,
+            seconds ? `耗时 ${formatReportDuration(seconds)}` : '',
+            '未执行整份报告重跑',
+          ].filter(Boolean).join('；');
+        }
+      },
+    );
+    if (!doneEvent) throw new Error('局部重做连接结束，但没有收到新版本确认');
+    state.viewMode = 'history';
+    state.historyId = historyId;
+    state.historyReport.id = historyId;
+    state.historyReport.reportNo = detail.report_no || '';
+    state.historyReport.createdAt = detail.created_at || '';
+    state.historyReport.mode = detail.mode || 'survey';
+    syncReportVersionMeta(state.historyReport, {
+      ...doneEvent,
+      versions: doneEvent.versions || [],
+      version: doneEvent.version,
+      selected_version: doneEvent.version,
+    });
+    await loadHistoryReportVersion(doneEvent.version);
+    const details = doneEvent.rerun_details || {};
+    showToast(
+      `V${doneEvent.version} 已生成：只重做 ${details.target_label || '所选范围'}，未整份重跑`,
+      'success',
+      8000,
+    );
+    partialRerunRunning = false;
+    closePartialRerunModal();
+    if (typeof refreshHistoryEntryAfterGeneration === 'function') {
+      refreshHistoryEntryAfterGeneration(historyId).catch(error => {
+        console.warn('[partial-rerun] Refresh history failed:', error);
+      });
+    }
+  } catch (error) {
+    $('report-partial-rerun-progress-title').textContent = '局部重做失败';
+    $('report-partial-rerun-progress-message').textContent = `${error.message}；基础版本未被覆盖。`;
+    showToast(`局部重做失败：${error.message}`, 'error', 8000);
+  } finally {
+    partialRerunRunning = false;
+    $('btn-report-partial-rerun-start').disabled = false;
+    $('btn-report-partial-rerun-cancel').disabled = false;
+    $('btn-report-partial-rerun-close').disabled = false;
+    $('report-partial-rerun-type').disabled = false;
+    $('report-partial-rerun-target').disabled = false;
+    $('report-partial-rerun-instruction').disabled = false;
+    updateReportActionAvailability();
+  }
+}
+
+$('btn-report-partial-rerun')?.addEventListener('click', openPartialRerunModal);
+$('report-partial-rerun-type')?.addEventListener('change', renderPartialRerunTargetOptions);
+$('report-partial-rerun-target')?.addEventListener('change', renderPartialRerunImpact);
+$('btn-report-partial-rerun-start')?.addEventListener('click', startPartialRerun);
+$('btn-report-partial-rerun-cancel')?.addEventListener('click', closePartialRerunModal);
+$('btn-report-partial-rerun-close')?.addEventListener('click', closePartialRerunModal);
+document.querySelectorAll('[data-partial-rerun-close]').forEach(node => {
+  node.addEventListener('click', closePartialRerunModal);
 });
 
 async function updateReportTitle(historyId, title) {
