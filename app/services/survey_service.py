@@ -148,6 +148,7 @@ from app.services.report_versions import (
     sync_active_report_version,
     update_report_version,
 )
+from app.services.session_access import require_session_access
 from app.services.report_render import _inject_disclaimer, _inject_research_background
 from app.services.stats_presentation import (
     inject_qualitative_stats,
@@ -814,7 +815,7 @@ def get_analysis_preset_offer_for_session(
     login: dict | None,
 ) -> dict | None:
     """查询同 owner、同问卷的可复用分析预设；异常时不阻断主流程。"""
-    sess = get_session(session_id)
+    sess = require_session_access(session_id, login, loader=get_session)
     try:
         return get_analysis_preset_offer(
             sess,
@@ -832,7 +833,7 @@ def apply_analysis_preset_to_session(
     preset_id: str,
 ) -> dict:
     """二次校验预设归属和问卷指纹后，将其合并进当前 session。"""
-    sess = get_session(session_id)
+    sess = require_session_access(session_id, login, loader=get_session)
     try:
         preset = apply_analysis_preset(
             sess,
@@ -856,7 +857,7 @@ def confirm_survey_plan(
     login: dict | None,
 ) -> dict:
     """确认当前方案，并在适用时保存同问卷可复用分析预设。"""
-    sess = get_session(session_id)
+    sess = require_session_access(session_id, login, loader=get_session)
     sess["plan_approved_at"] = datetime.now().isoformat(timespec="milliseconds")
     save_session(session_id, sess)
     try:
@@ -912,7 +913,7 @@ def save_qualitative_context(
     login: dict | None = None,
 ) -> dict | None:
     """存储数据确认上下文，并查找严格匹配的成功历史报告。"""
-    sess = get_session(session_id)
+    sess = require_session_access(session_id, login, loader=get_session)
     _assign_session_owner(sess, login)
     if hasattr(ctx, "model_dump"):
         submitted = ctx.model_dump(exclude_unset=True)
@@ -946,7 +947,7 @@ def prepare_duplicate_report_rerun(
     base_version: int | None = None,
 ) -> dict:
     """Bind a fresh exact-match upload to one existing history card for rerun."""
-    sess = get_session(session_id)
+    sess = require_session_access(session_id, login, loader=get_session)
     _assign_session_owner(sess, login)
     if not sess.get("rows") or not isinstance(sess.get("confirmed_columns"), list):
         raise HTTPException(status_code=400, detail="请先完成数据与题型确认")
@@ -1568,6 +1569,7 @@ async def report_stream(
 ):
     """报告生成 SSE 流程（大样本/标准两路，async generator）。"""
     login = await _current_login(request)
+    require_session_access(session_id, login, loader=get_session)
     writer_messages = [
         {"role": "system", "content": _get_report_writer_system_prompt()}
     ]
@@ -1586,7 +1588,7 @@ async def report_stream(
     try:
         # 请求可能在锁外等待登录态刷新；拿锁后必须重读，避免旧快照覆盖
         # 刚完成的新版本或追问。
-        sess = get_session(session_id)
+        sess = require_session_access(session_id, login, loader=get_session)
         _assign_session_owner(sess, login)
         if not _uses_report_versions(sess):
             raise ValueError("该报告类型不支持生成报告版本")
@@ -1759,7 +1761,9 @@ async def report_stream(
                 d.get("col_name", f"列{k}") for k, d in (cluster_diagnostics or {}).items()
                 if d.get("quality_status") == "degraded"
             ]
-            latest_session = get_session(session_id)
+            latest_session = require_session_access(
+                session_id, login, loader=get_session,
+            )
             latest_session["open_text_cluster_diagnostics"] = cluster_diagnostics
             latest_session["open_text_cluster_metrics"] = cluster_metrics
             save_session(session_id, latest_session)
@@ -2269,7 +2273,7 @@ async def report_stream(
         writer_model = ",".join(dict.fromkeys(writer_models_used))
         # 生成期间仍可能发生改名等非模型写入；提交前重读最新 session，
         # 普通首版写回本 session；精确重复重跑则在历史事务里追加到原卡片。
-        sess = get_session(session_id)
+        sess = require_session_access(session_id, login, loader=get_session)
         precommit_session = deepcopy(sess)
         completion_timing = _report_completion_timing(sess)
         sess.update(completion_timing)
@@ -2951,6 +2955,7 @@ def delete_session_report_version(
     login: dict | None = None,
 ) -> dict:
     """在用户明确选择后删除一个旧版本；最后一版受保护。"""
+    sess = require_session_access(session_id, login, loader=get_session)
     generation_lock = _report_generation_lock(session_id)
     if generation_lock.locked():
         raise HTTPException(
@@ -2962,7 +2967,6 @@ def delete_session_report_version(
             status_code=409,
             detail="该报告正在重新生成，完成后才能删除旧版本。",
         )
-    sess = get_session(session_id)
     if not _uses_report_versions(sess):
         raise HTTPException(status_code=400, detail="该报告类型不支持版本管理")
     rerun_history_id = str(sess.get("rerun_target_history_id") or "").strip()
@@ -3033,6 +3037,7 @@ async def qa_stream(
 ):
     """当前会话 QA SSE 流程（async generator）。"""
     login = await _current_login(request)
+    require_session_access(session_id, login, loader=get_session)
     operation_lock = _report_generation_lock(session_id)
     if operation_lock.locked():
         yield sse_event({
@@ -3043,7 +3048,7 @@ async def qa_stream(
     await operation_lock.acquire()
     try:
         # 与报告重跑共用同一把锁；锁内重读，避免排队请求回写旧版本快照。
-        sess = get_session(session_id)
+        sess = require_session_access(session_id, login, loader=get_session)
         _assign_session_owner(sess, login)
         uses_versions = _uses_report_versions(sess)
         if uses_versions:
@@ -3069,7 +3074,7 @@ async def qa_stream(
         for event in _content_events(answer_text):
             yield event
         # 模型回答期间可能发生改名；提交 QA 前重读并在最新版本快照上更新。
-        sess = get_session(session_id)
+        sess = require_session_access(session_id, login, loader=get_session)
         precommit_session = deepcopy(sess)
         snapshot = (
             resolve_report_version(sess, selected_version)

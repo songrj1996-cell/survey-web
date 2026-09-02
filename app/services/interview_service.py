@@ -37,6 +37,7 @@ from app.services.glossary_service import (
     prepare_glossary_messages,
 )
 from app.services.report_history import save_to_history
+from app.services.session_access import require_session_access
 from app.storage.prompts import (
     _get_interview_audit_system_prompt,
     _get_interview_extract_system_prompt,
@@ -304,11 +305,9 @@ def _session_result(sess: dict) -> dict:
 
 
 def _require_owned_interview_session(session_id: str, login: dict | None) -> dict:
-    sess = get_session(session_id)
+    sess = require_session_access(session_id, login, loader=get_session)
     if sess.get("kind") != "interview" or not sess.get("interview_source_text"):
         raise HTTPException(status_code=400, detail="访谈会话无效，请重新上传文件")
-    if not _visible_to_owner(sess, login):
-        raise HTTPException(status_code=404, detail="访谈会话不存在")
     return sess
 
 
