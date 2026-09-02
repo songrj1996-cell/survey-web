@@ -27,6 +27,7 @@ from app.core.config import (
     DEFAULT_INTERVIEW_V2_ANALYSIS_SYSTEM_PROMPT,
     DEFAULT_INTERVIEW_V2_DOSSIER_SYSTEM_PROMPT,
     DEFAULT_INTERVIEW_V2_REPORT_AUDIT_SYSTEM_PROMPT,
+    DEFAULT_INTERVIEW_V2_REPORT_CLAIM_EXTRACT_SYSTEM_PROMPT,
     DEFAULT_INTERVIEW_V2_REPORT_SYSTEM_PROMPT,
     DEFAULT_LARGE_SAMPLE_WRITER_REQUIREMENTS,
     DEFAULT_PLANNER_EXTRA,
@@ -390,6 +391,7 @@ DEFAULT_PROMPTS: dict = {
         order=80,
         kind="system",
         current=DEFAULT_INTERVIEW_V2_REPORT_SYSTEM_PROMPT,
+        version=2,
     ),
     "interview_v2_report_audit_system": _prompt(
         "interview_v2_report_audit_system",
@@ -397,9 +399,20 @@ DEFAULT_PROMPTS: dict = {
         "在确定性证据审计之上补充检查反例、限定和建议边界。",
         group="访谈报告",
         group_order=60,
-        order=90,
+        order=100,
         kind="system",
         current=DEFAULT_INTERVIEW_V2_REPORT_AUDIT_SYSTEM_PROMPT,
+    ),
+    "interview_v2_report_claim_extract_system": _prompt(
+        "interview_v2_report_claim_extract_system",
+        "访谈 V2 单章节主张提取 System Prompt",
+        "从人工编辑后的单章节正文重新提取可审计主张，不改写正文。",
+        group="访谈报告",
+        group_order=60,
+        order=90,
+        kind="system",
+        current=DEFAULT_INTERVIEW_V2_REPORT_CLAIM_EXTRACT_SYSTEM_PROMPT,
+        version=2,
     ),
 }
 
@@ -636,3 +649,7 @@ def _get_interview_v2_report_system_prompt() -> str:
 
 def _get_interview_v2_report_audit_system_prompt() -> str:
     return _get_prompt_text("interview_v2_report_audit_system")
+
+
+def _get_interview_v2_report_claim_extract_system_prompt() -> str:
+    return _get_prompt_text("interview_v2_report_claim_extract_system")

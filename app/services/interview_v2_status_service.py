@@ -214,6 +214,19 @@ def get_interview_import_with_structure_status(
             != analysis_revision.get("revision_payload_sha256")
         ):
             report_status = "stale"
+        report_sections = list(report_revision.get("sections") or [])
+        pending_reaudit_count = sum(
+            1 for item in report_sections
+            if item.get("audit_status") == "pending_reaudit"
+        )
+        audit_failed_count = sum(
+            1 for item in report_sections
+            if item.get("audit_status") == "audit_failed"
+        )
+        blocking_issue_count = sum(
+            1 for item in report_revision.get("audit_issues") or []
+            if item.get("severity") == "blocking"
+        )
         public["analysis_summary"] = {
             "analysis_run_id": analysis_revision.get("analysis_run_id"),
             "status": analysis_status,
@@ -224,5 +237,17 @@ def get_interview_import_with_structure_status(
             "report_version_id": report_revision.get("report_version_id"),
             "status": report_status,
             "audit_status": report_revision.get("audit_status") or "not_generated",
+            "pending_reaudit_count": pending_reaudit_count,
+            "audit_failed_count": audit_failed_count,
+            "blocking_issue_count": blocking_issue_count,
+            "approval_ready": bool(report_sections)
+            and report_status == "draft"
+            and pending_reaudit_count == 0
+            and audit_failed_count == 0
+            and blocking_issue_count == 0
+            and all(
+                item.get("audit_status") == "audit_passed"
+                for item in report_sections
+            ),
         }
     return public

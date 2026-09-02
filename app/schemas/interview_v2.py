@@ -86,4 +86,6 @@ class InterviewV2ImportResponse(InterviewV2Schema):
     physical_snapshot_version: str | None = None
     summary: InterviewV2ImportSummary | None = None
     warnings: list[InterviewV2Warning] = Field(default_factory=list)
-    dossier_summary: dict[str, int] | None = None
+    dossier_summary: dict[str, Any] | None = None
+    analysis_summary: dict[str, Any] | None = None
+    report_summary: dict[str, Any] | None = None

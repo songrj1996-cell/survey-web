@@ -29,9 +29,13 @@ from app.schemas.interview_v2_analysis import (
     InterviewV2AnalysisRunResponse,
 )
 from app.schemas.interview_v2_report import (
+    InterviewV2ReportApproveRequest,
     InterviewV2ReportClaimResponse,
     InterviewV2ReportCreateRequest,
     InterviewV2ReportResponse,
+    InterviewV2ReportSectionMutationResponse,
+    InterviewV2ReportSectionPatchRequest,
+    InterviewV2ReportSectionReauditRequest,
 )
 from app.schemas.interview_v2_mapping import (
     InterviewV2GroupMappingConfirmRequest,
@@ -57,6 +61,7 @@ from app.schemas.interview_v2_structure import (
     InterviewV2StructureCurrentResponse,
 )
 from app.services.auth import _require_feature
+from app.services.audit import audit_log
 from app.services.interview_v2_import_service import (
     InterviewV2ImportError,
     create_upload_attempt,
@@ -78,6 +83,11 @@ from app.services.interview_v2_report_service import (
     create_report,
     get_report,
     get_report_claim,
+)
+from app.services.interview_v2_report_review_service import (
+    approve_report,
+    edit_report_section,
+    reaudit_report_section,
 )
 from app.services.interview_v2_mapping_service import (
     confirm_group_mapping,
@@ -1137,3 +1147,114 @@ async def get_interview_v2_report_claim(
         )
     except InterviewV2ImportError as exc:
         return _service_error_response(request, exc)
+
+
+@router.patch(
+    "/api/v1/interview-report-sections/{section_id}",
+    response_model=InterviewV2ReportSectionMutationResponse,
+)
+async def patch_interview_v2_report_section(section_id: str, request: Request):
+    login = await _require_feature(request, "interview")
+    if not INTERVIEW_V2_ENABLED:
+        return _disabled_response(request)
+    try:
+        raw = await _read_structure_json(request)
+        payload = InterviewV2ReportSectionPatchRequest.model_validate(raw).model_dump(
+            mode="json"
+        )
+    except (
+        OverflowError, json.JSONDecodeError, UnicodeDecodeError, ValidationError,
+        ValueError, RecursionError,
+    ):
+        return _error_response(
+            request, status_code=400, code="REPORT_REQUEST_INVALID",
+            message="报告章节编辑请求格式无效。", suggested_action="refresh_report_inputs",
+        )
+    try:
+        result = await run_in_threadpool(edit_report_section, section_id, payload, login)
+    except InterviewV2ImportError as exc:
+        return _service_error_response(request, exc)
+    await audit_log(
+        request, "interview", "编辑并锁定 V2 报告章节",
+        f"section_id={section_id}; report_version_id={result.get('report_version_id')}",
+        metadata={
+            "section_id": section_id,
+            "section_revision": result.get("section_revision"),
+            "report_version_id": result.get("report_version_id"),
+        },
+    )
+    return result
+
+
+@router.post(
+    "/api/v1/interview-report-sections/{section_id}:reaudit",
+    response_model=InterviewV2ReportSectionMutationResponse,
+)
+async def reaudit_interview_v2_report_section(section_id: str, request: Request):
+    login = await _require_feature(request, "interview")
+    if not INTERVIEW_V2_ENABLED:
+        return _disabled_response(request)
+    try:
+        raw = await _read_structure_json(request)
+        payload = InterviewV2ReportSectionReauditRequest.model_validate(raw).model_dump(
+            mode="json"
+        )
+    except (
+        OverflowError, json.JSONDecodeError, UnicodeDecodeError, ValidationError,
+        ValueError, RecursionError,
+    ):
+        return _error_response(
+            request, status_code=400, code="REPORT_REQUEST_INVALID",
+            message="报告章节重审请求格式无效。", suggested_action="refresh_report_inputs",
+        )
+    try:
+        result = await reaudit_report_section(section_id, payload, login)
+    except InterviewV2ImportError as exc:
+        return _service_error_response(request, exc)
+    await audit_log(
+        request, "interview", "重新审计 V2 报告章节",
+        f"section_id={section_id}; report_version_id={result.get('report_version_id')}",
+        metadata={
+            "section_id": section_id,
+            "section_revision": result.get("section_revision"),
+            "report_version_id": result.get("report_version_id"),
+            "audit_status": result.get("audit_status"),
+        },
+    )
+    return result
+
+
+@router.post(
+    "/api/v1/interview-reports/{report_version_id}:approve",
+    response_model=InterviewV2ReportResponse,
+)
+async def approve_interview_v2_report(report_version_id: str, request: Request):
+    login = await _require_feature(request, "interview")
+    if not INTERVIEW_V2_ENABLED:
+        return _disabled_response(request)
+    try:
+        raw = await _read_structure_json(request)
+        payload = InterviewV2ReportApproveRequest.model_validate(raw).model_dump(mode="json")
+    except (
+        OverflowError, json.JSONDecodeError, UnicodeDecodeError, ValidationError,
+        ValueError, RecursionError,
+    ):
+        return _error_response(
+            request, status_code=400, code="REPORT_REQUEST_INVALID",
+            message="报告批准请求格式无效。", suggested_action="refresh_report_inputs",
+        )
+    try:
+        result = await run_in_threadpool(
+            approve_report, report_version_id, payload, login
+        )
+    except InterviewV2ImportError as exc:
+        return _service_error_response(request, exc)
+    await audit_log(
+        request, "interview", "批准 V2 访谈报告",
+        f"report_version_id={result.get('report_version_id')}",
+        metadata={
+            "report_version_id": result.get("report_version_id"),
+            "approved_from_report_version_id": report_version_id,
+        },
+    )
+    return result

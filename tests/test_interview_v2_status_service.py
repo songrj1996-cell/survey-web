@@ -212,6 +212,8 @@ class InterviewV2StatusServiceTests(unittest.TestCase):
                 "revision": {
                     "report_version_id": "report_" + "0" * 32,
                     "status": "draft", "audit_status": "audited",
+                    "sections": [{"section_id": "section_" + "1" * 32, "audit_status": "audit_passed"}],
+                    "audit_issues": [],
                     "source": {
                         "analysis_run_id": "analysis_" + "d" * 32,
                         "analysis_revision_payload_sha256": "e" * 64,
@@ -228,6 +230,8 @@ class InterviewV2StatusServiceTests(unittest.TestCase):
         self.assertEqual(1, result["analysis_summary"]["finding_count"])
         self.assertEqual("draft", result["report_summary"]["status"])
         self.assertEqual("audited", result["report_summary"]["audit_status"])
+        self.assertTrue(result["report_summary"]["approval_ready"])
+        self.assertEqual(0, result["report_summary"]["pending_reaudit_count"])
 
     def test_stale_structure_does_not_override_current_mapping_checkpoint(self):
         public = _mapping_status("GROUP_MAPPING_CONFIRMED")

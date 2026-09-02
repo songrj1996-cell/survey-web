@@ -102,24 +102,29 @@ def _frozen_config(project: dict[str, Any]) -> dict[str, Any]:
 
 
 def _is_report_current(project_id: str, revision: dict[str, Any]) -> bool:
-    current = store.load_current_analysis_run(project_id)
     source = revision.get("source") or {}
-    return bool(
-        current
-        and current["revision"].get("analysis_run_id") == source.get("analysis_run_id")
-        and current["revision"].get("revision_payload_sha256")
-        == source.get("analysis_revision_payload_sha256")
-        and current["revision"].get("status") == "completed"
+    return store.is_analysis_run_current(
+        project_id,
+        analysis_run_id=str(source.get("analysis_run_id") or ""),
+        revision_payload_sha256=str(
+            source.get("analysis_revision_payload_sha256") or ""
+        ),
     )
 
 
 def _public(saved: dict[str, Any], *, stale: bool = False) -> dict[str, Any]:
     revision, state = saved["revision"], saved.get("state") or {}
+    is_current = state.get("current_report_version_id") == revision.get("report_version_id")
+    status = revision.get("status", "draft")
+    if stale:
+        status = "stale"
+    elif not is_current:
+        status = "superseded"
     return {
         "project_id": revision.get("project_id"),
         "report_version_id": revision.get("report_version_id"),
         "report_version_number": revision.get("version_number", 0),
-        "status": "stale" if stale else revision.get("status", "draft"),
+        "status": status,
         "audit_status": revision.get("audit_status", "audit_failed"),
         "source": revision.get("source") or {},
         "frozen_config": revision.get("frozen_config") or {},
@@ -127,7 +132,9 @@ def _public(saved: dict[str, Any], *, stale: bool = False) -> dict[str, Any]:
         "claims": revision.get("claims") or [],
         "audit_issues": revision.get("audit_issues") or [],
         "model_usage": revision.get("model_usage") or {},
-        "is_current_version": state.get("current_report_version_id") == revision.get("report_version_id"),
+        "is_current_version": is_current,
+        "approved_by": revision.get("approved_by"),
+        "approved_at": revision.get("approved_at"),
     }
 
 
@@ -176,10 +183,16 @@ def get_report_claim(
         for item in saved["revision"].get("frozen_stat_facts") or []
     }
     stale = not _is_report_current(saved["project_id"], saved["revision"])
+    is_current = (saved.get("state") or {}).get("current_report_version_id") == report_version_id
+    status = saved["revision"].get("status", "draft")
+    if stale:
+        status = "stale"
+    elif not is_current:
+        status = "superseded"
     return {
         "project_id": saved["project_id"],
         "report_version_id": report_version_id,
-        "status": "stale" if stale else saved["revision"].get("status", "draft"),
+        "status": status,
         "claim": claim,
         "findings": [findings_by_id[item] for item in claim.get("finding_ids") or [] if item in findings_by_id],
         "stat_fact": stats_by_id.get(claim.get("stat_fact_id")),
@@ -203,6 +216,31 @@ async def create_report(
         raise _error("REPORT_PERSISTENCE_FAILED", "报告输入读取失败。", status=500, retryable=True) from exc
     if current_analysis is None or project is None:
         raise _error("REPORT_INPUT_NOT_READY", "当前报告输入不完整。")
+    base_report_version_id = request.get("base_report_version_id")
+    if base_report_version_id:
+        try:
+            current_report = store.load_current_report_version(project_id)
+        except (OSError, TypeError, ValueError) as exc:
+            raise _error(
+                "REPORT_PERSISTENCE_FAILED", "当前报告版本读取失败。",
+                status=500, retryable=True,
+            ) from exc
+        if (
+            current_report is not None
+            and current_report["revision"].get("report_version_id")
+            == base_report_version_id
+        ):
+            locked_section_ids = sorted(
+                str(section.get("section_id") or "")
+                for section in current_report["revision"].get("sections") or []
+                if bool(section.get("locked"))
+            )
+            if locked_section_ids:
+                raise _error(
+                    "REPORT_LOCKED_SECTIONS_PRESENT",
+                    "当前报告包含人工锁定章节，不能执行整份重生成。",
+                    context={"section_ids": locked_section_ids},
+                )
     try:
         report_input = build_report_input(
             project_id=project_id, project=project,
@@ -275,6 +313,26 @@ async def create_report(
             "context": {"error_type": type(exc).__name__},
         })
 
+    blocking_by_section: dict[str, list[dict[str, Any]]] = {}
+    for issue in audit_issues:
+        if issue.get("severity") == "blocking":
+            blocking_by_section.setdefault(str(issue.get("section_key") or ""), []).append(issue)
+    for section in validated["sections"]:
+        section["audit_status"] = (
+            "audit_failed"
+            if blocking_by_section.get(str(section.get("section_key") or ""))
+            else "audit_passed"
+        )
+    for claim in validated["claims"]:
+        blockers = blocking_by_section.get(str(claim.get("section_key") or ""), [])
+        claim_failed = any(
+            issue.get("claim_id") in {None, claim.get("claim_id")}
+            for issue in blockers
+        )
+        claim["audit_status"] = "audit_failed" if claim_failed else "audit_passed"
+        if claim_failed:
+            claim["qualification_status"] = "failed"
+
     source = {
         "analysis_run_id": current_analysis["revision"].get("analysis_run_id"),
         "analysis_revision_payload_sha256": current_analysis["revision"].get("revision_payload_sha256"),
@@ -305,6 +363,12 @@ async def create_report(
             base_report_version_id=request.get("base_report_version_id"),
             revision=revision,
         )
+    except store.ReportLockedSectionConflictError as exc:
+        raise _error(
+            "REPORT_LOCKED_SECTIONS_PRESENT",
+            "当前报告包含人工锁定章节，不能执行整份重生成。",
+            context={"section_ids": exc.section_ids},
+        ) from exc
     except ValueError as exc:
         code = "REPORT_INPUT_CHANGED" if "input changed" in str(exc) else "REPORT_REVISION_CONFLICT"
         raise _error(

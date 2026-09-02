@@ -36,7 +36,7 @@ _STORE_LOCK = threading.RLock()
 _MAPPING_LOCK_TIMEOUT_SECONDS = 10.0
 _MAPPING_LOCK_POLL_SECONDS = 0.025
 _ID_RE = re.compile(
-    r"^(?:upload|job|project|import|workbook|mapping|structure|evidence|boundary|coverage|dossier|analysis|report)_[0-9a-f]{32}$"
+    r"^(?:upload|job|project|import|workbook|mapping|structure|evidence|boundary|coverage|dossier|analysis|report|section)_[0-9a-f]{32}$"
 )
 _EVIDENCE_ID_RE = re.compile(r"^(?:ev|evidence)_[0-9a-f]{32}$")
 _REVIEW_ISSUE_ID_RE = re.compile(r"^(?:issue|review)_[0-9a-f]{32}$")
@@ -78,6 +78,51 @@ class AnalysisBoundaryInputConflictError(RuntimeError):
         self.current_structure_revision_id = current_structure_revision_id
         self.current_evidence_revision_id = current_evidence_revision_id
         self.current_structure_status = current_structure_status
+
+
+class ReportInputConflictError(ValueError):
+    """The frozen analysis source moved before report publication."""
+
+    def __init__(self) -> None:
+        super().__init__("report input changed")
+
+
+class ReportHeadConflictError(ValueError):
+    """The report head moved after a derived revision started."""
+
+    def __init__(
+        self,
+        *,
+        base_report_version_id: str | None,
+        current_report_version_id: str | None,
+    ) -> None:
+        super().__init__("report version conflict")
+        self.base_report_version_id = base_report_version_id
+        self.current_report_version_id = current_report_version_id
+
+
+class ReportSectionRevisionConflictError(ValueError):
+    """The requested section revision is not the current section head."""
+
+    def __init__(
+        self,
+        *,
+        section_id: str,
+        base_section_revision: int,
+        current_section_revision: int | None,
+    ) -> None:
+        super().__init__("report section revision conflict")
+        self.section_id = section_id
+        self.base_section_revision = base_section_revision
+        self.current_section_revision = current_section_revision
+
+
+class ReportLockedSectionConflictError(ValueError):
+    """A full-report replacement would overwrite an explicitly locked section."""
+
+    def __init__(self, *, section_ids: list[str]) -> None:
+        super().__init__("locked report sections would be overwritten")
+        self.section_ids = list(section_ids)
 
 
 def _root() -> Path:
@@ -4630,11 +4675,67 @@ def load_current_analysis_run(project_id: str) -> dict[str, Any] | None:
             return {"state": state, "revision": revision}
 
 
+def is_analysis_run_current(
+    project_id: str,
+    *,
+    analysis_run_id: str,
+    revision_payload_sha256: str,
+) -> bool:
+    """Check the analysis head and every frozen upstream source under one lock."""
+
+    project_id = validate_resource_id(project_id, "project")
+    analysis_run_id = validate_resource_id(analysis_run_id, "analysis")
+    revision_payload_sha256 = str(revision_payload_sha256 or "")
+    if not _SHA256_RE.fullmatch(revision_payload_sha256):
+        raise ValueError("analysis revision digest is invalid")
+    with _STORE_LOCK:
+        with _mapping_process_lock(project_id):
+            state = _read_json(_analysis_dir(project_id) / "state.json")
+            if (
+                state is None
+                or state.get("current_analysis_run_id") != analysis_run_id
+            ):
+                return False
+            revision = _read_json(
+                _analysis_dir(project_id) / "versions" / f"{analysis_run_id}.json"
+            )
+            if revision is None:
+                raise ValueError("current analysis revision is missing")
+            declared = str(revision.get("revision_payload_sha256") or "")
+            if not _SHA256_RE.fullmatch(declared) or _analysis_digest(revision) != declared:
+                raise ValueError("analysis revision digest mismatch")
+            if (
+                declared != revision_payload_sha256
+                or revision.get("status") != "completed"
+            ):
+                return False
+            try:
+                _require_analysis_source_current_locked(
+                    project_id, revision.get("source") or {}
+                )
+            except ValueError as exc:
+                if str(exc) == "analysis input changed":
+                    return False
+                raise
+            return True
+
+
 def _require_analysis_source_current_locked(
     project_id: str, source: dict[str, Any]
 ) -> None:
     boundary_state = _read_json(_analysis_boundary_state_path(project_id))
-    if boundary_state is None or bool(boundary_state.get("is_stale")):
+    if boundary_state is None:
+        raise ValueError("analysis input changed")
+    has_verified_boundary_state = bool(boundary_state.get("state_payload_sha256"))
+    if has_verified_boundary_state:
+        boundary_state = _load_analysis_boundary_head_locked(boundary_state)["state"]
+    if (
+        bool(boundary_state.get("is_stale"))
+        or (
+            has_verified_boundary_state
+            and boundary_state.get("effective_status") != "READY_FOR_DOSSIERS"
+        )
+    ):
         raise ValueError("analysis input changed")
     source_fields = (
         ("current_structure_revision_id", "structure_revision_id"),
@@ -4749,6 +4850,11 @@ def _report_locator_path(report_version_id: str) -> Path:
     return _safe_child("report_locators", f"{report_version_id}.json")
 
 
+def _report_section_locator_path(section_id: str) -> Path:
+    section_id = validate_resource_id(section_id, "section")
+    return _safe_child("report_section_locators", f"{section_id}.json")
+
+
 def _report_digest(revision: dict[str, Any]) -> str:
     return _canonical_payload_sha256({
         key: value for key, value in revision.items()
@@ -4756,34 +4862,451 @@ def _report_digest(revision: dict[str, Any]) -> str:
     })
 
 
+def _normalize_legacy_report_revision(
+    revision: dict[str, Any],
+) -> dict[str, Any]:
+    """Add 5C runtime fields to an intact 5B revision without rewriting it."""
+
+    sections = revision.get("sections")
+    claims = revision.get("claims")
+    if not isinstance(sections, list) or not isinstance(claims, list):
+        return revision
+    legacy_sections = all(
+        isinstance(item, dict)
+        and "section_revision" not in item
+        and "audit_status" not in item
+        for item in sections
+    )
+    legacy_claims = all(
+        isinstance(item, dict)
+        and "section_revision" not in item
+        and "audit_status" not in item
+        and "superseded_by" not in item
+        for item in claims
+    )
+    if not legacy_sections or not legacy_claims:
+        return revision
+
+    normalized = deepcopy(revision)
+    blocking_issues = [
+        item for item in normalized.get("audit_issues") or []
+        if isinstance(item, dict) and item.get("severity") == "blocking"
+    ]
+    blocking_section_keys = {
+        str(item.get("section_key") or "") for item in blocking_issues
+    }
+    top_audit_status = str(normalized.get("audit_status") or "")
+    has_explicit_blockers = bool(blocking_issues)
+    finding_by_id = {
+        str(item.get("finding_id") or ""): item
+        for item in normalized.get("frozen_findings") or []
+        if isinstance(item, dict) and str(item.get("finding_id") or "")
+    }
+    section_status_by_id: dict[str, str] = {}
+    pending_evidence_inference_section_ids: set[str] = set()
+    for section in normalized["sections"]:
+        section["section_revision"] = 1
+        section_key = str(section.get("section_key") or "")
+        if top_audit_status == "audited":
+            audit_status = (
+                "audit_failed"
+                if section_key in blocking_section_keys
+                else "audit_passed"
+            )
+        elif top_audit_status == "audit_failed" and has_explicit_blockers:
+            audit_status = (
+                "audit_failed"
+                if section_key in blocking_section_keys
+                else "audit_passed"
+            )
+        else:
+            audit_status = "audit_failed"
+        section["audit_status"] = audit_status
+        section_status_by_id[str(section.get("section_id") or "")] = audit_status
+
+    for claim in normalized["claims"]:
+        finding_ids = [str(item or "") for item in claim.get("finding_ids") or []]
+        stored_participant_ids = {
+            str(item or "").strip() for item in claim.get("participant_ids") or []
+            if str(item or "").strip()
+        }
+        stored_evidence_ids = {
+            str(item or "").strip() for item in claim.get("evidence_ids") or []
+            if str(item or "").strip()
+        }
+        role_payloads: dict[str, tuple[set[str], set[str], set[str]]] = {}
+        for role, case_field in (
+            ("support", "supporting_cases"),
+            ("counterexample", "counterexample_cases"),
+            ("observation", "observation_cases"),
+        ):
+            role_participant_ids: set[str] = set()
+            role_evidence_ids: set[str] = set()
+            role_finding_ids: set[str] = set()
+            for finding_id in finding_ids:
+                finding = finding_by_id.get(finding_id) or {}
+                for case in finding.get(case_field) or []:
+                    if not isinstance(case, dict):
+                        continue
+                    participant_id = str(case.get("participant_id") or "").strip()
+                    case_evidence_ids = {
+                        str(item or "").strip()
+                        for item in case.get("evidence_ids") or []
+                        if str(item or "").strip()
+                    }
+                    if not participant_id or not case_evidence_ids:
+                        continue
+                    role_participant_ids.add(participant_id)
+                    role_evidence_ids.update(case_evidence_ids)
+                    role_finding_ids.add(finding_id)
+            role_payloads[role] = (
+                role_participant_ids, role_evidence_ids, role_finding_ids
+            )
+        evidence_roles = [
+            role for role in ("support", "counterexample", "observation")
+            if (
+                stored_evidence_ids & role_payloads[role][1]
+                or (
+                    not stored_evidence_ids
+                    and stored_participant_ids & role_payloads[role][0]
+                )
+            )
+        ] if finding_ids else []
+        inferred_participant_ids = set().union(*(
+            role_payloads[role][0] for role in evidence_roles
+        )) if evidence_roles else set()
+        inferred_evidence_ids = set().union(*(
+            role_payloads[role][1] for role in evidence_roles
+        )) if evidence_roles else set()
+        covered_finding_ids = set().union(*(
+            role_payloads[role][2] for role in evidence_roles
+        )) if evidence_roles else set()
+        inference_complete = bool(
+            not finding_ids
+            or (
+                evidence_roles
+                and stored_participant_ids == inferred_participant_ids
+                and stored_evidence_ids == inferred_evidence_ids
+                and set(finding_ids) <= covered_finding_ids
+            )
+        )
+        if finding_ids and not inference_complete:
+            evidence_roles = []
+        claim["evidence_roles"] = evidence_roles
+        evidence_type_allowlist: list[str] = []
+        if any(role in {"support", "counterexample"} for role in evidence_roles):
+            evidence_type_allowlist.append("participant_self_report")
+        if "observation" in evidence_roles:
+            evidence_type_allowlist.append("researcher_observation")
+        claim["evidence_type_allowlist"] = evidence_type_allowlist
+        if inference_complete and finding_ids:
+            claim["participant_ids"] = sorted(inferred_participant_ids)
+            claim["evidence_ids"] = sorted(inferred_evidence_ids)
+        section_id = str(claim.get("section_id") or "")
+        section_revision = next(
+            (
+                int(section.get("section_revision") or 1)
+                for section in normalized["sections"]
+                if section.get("section_id") == section_id
+            ),
+            1,
+        )
+        claim["section_revision"] = section_revision
+        claim_blocked = any(
+            issue.get("claim_id") in {None, claim.get("claim_id")}
+            and issue.get("section_key") == claim.get("section_key")
+            for issue in blocking_issues
+        )
+        claim["audit_status"] = (
+            "audit_passed"
+            if (
+                section_status_by_id.get(section_id) == "audit_passed"
+                and not claim_blocked
+                and claim.get("qualification_status") != "failed"
+            )
+            else "audit_failed"
+        )
+        if finding_ids and not inference_complete:
+            claim["audit_status"] = "pending_reaudit"
+            pending_evidence_inference_section_ids.add(section_id)
+        claim["superseded_by"] = None
+    # A legacy report may have passed an older deterministic policy while no
+    # longer satisfying 5C (for example a StatFact attached to mixed support
+    # and counterexample evidence). Rebuild each apparently passing section so
+    # status summaries never advertise a version that approval will reject.
+    from app.core.interview_v2_report import (  # local import avoids startup coupling
+        InterviewV2ReportValidationError,
+        validate_report_section_output,
+    )
+
+    claims_by_id = {
+        str(item.get("claim_id") or ""): item
+        for item in normalized["claims"] if isinstance(item, dict)
+    }
+    deterministic_fields = (
+        "claim_id", "report_version_id", "section_id", "section_key",
+        "section_revision", "claim_type", "text", "source_span", "finding_ids",
+        "evidence_roles", "evidence_type_allowlist", "participant_ids",
+        "evidence_ids", "stat_fact_id", "evidence_policy_version",
+        "qualification_status", "content_sha256", "audit_status", "superseded_by",
+    )
+    for section in normalized["sections"]:
+        section_id = str(section.get("section_id") or "")
+        if section.get("audit_status") != "audit_passed":
+            continue
+        current_claims = [
+            claims_by_id.get(str(item or ""))
+            for item in section.get("claim_ids") or []
+        ]
+        if not current_claims:
+            continue
+        if any(item is None for item in current_claims):
+            pending_evidence_inference_section_ids.add(section_id)
+            continue
+        raw_claims = []
+        for claim in current_claims:
+            source_span = claim.get("source_span") or {}
+            raw_claims.append({
+                "claim_type": claim.get("claim_type"),
+                "text": claim.get("text"),
+                "start": source_span.get("start"),
+                "end": source_span.get("end"),
+                "finding_ids": claim.get("finding_ids"),
+                "evidence_roles": claim.get("evidence_roles"),
+                "stat_fact_id": claim.get("stat_fact_id"),
+            })
+        try:
+            rebuilt = validate_report_section_output(
+                {"section_key": section.get("section_key"), "claims": raw_claims},
+                content=str(section.get("content") or ""),
+                report_input={
+                    "findings": normalized.get("frozen_findings"),
+                    "stat_facts": normalized.get("frozen_stat_facts"),
+                },
+                report_version_id=str(normalized.get("report_version_id") or ""),
+                section_id=section_id,
+                section_key=str(section.get("section_key") or ""),
+                section_revision=int(section.get("section_revision") or 1),
+                locked=bool(section.get("locked")),
+            )
+            deterministic_passed = (
+                rebuilt.get("audit_status") == "audit_passed"
+                and len(rebuilt.get("claims") or []) == len(current_claims)
+                and all(
+                    all(current.get(field) == next_claim.get(field) for field in deterministic_fields)
+                    for current, next_claim in zip(
+                        current_claims, rebuilt.get("claims") or [], strict=True
+                    )
+                )
+            )
+        except (InterviewV2ReportValidationError, TypeError, ValueError):
+            deterministic_passed = False
+        if not deterministic_passed:
+            pending_evidence_inference_section_ids.add(section_id)
+            for claim in current_claims:
+                claim["audit_status"] = "pending_reaudit"
+    if pending_evidence_inference_section_ids:
+        for section in normalized["sections"]:
+            if str(section.get("section_id") or "") in pending_evidence_inference_section_ids:
+                section["audit_status"] = "pending_reaudit"
+        normalized["audit_status"] = "pending_reaudit"
+    return normalized
+
+
 def _load_report_revision_locked(
     project_id: str, report_version_id: str
 ) -> dict[str, Any]:
+    project_id = validate_resource_id(project_id, "project")
+    report_version_id = validate_resource_id(report_version_id, "report")
     revision = _read_json(
         _report_dir(project_id) / "versions" / f"{report_version_id}.json"
     )
     if revision is None:
         raise ValueError("report revision is missing")
+    if (
+        validate_resource_id(
+            str(revision.get("report_version_id") or ""), "report"
+        )
+        != report_version_id
+        or validate_resource_id(str(revision.get("project_id") or ""), "project")
+        != project_id
+    ):
+        raise ValueError("report revision identity mismatch")
     declared = str(revision.get("revision_payload_sha256") or "")
     if not _SHA256_RE.fullmatch(declared) or _report_digest(revision) != declared:
         raise ValueError("report revision digest mismatch")
-    return revision
+    # The digest above always covers the immutable on-disk payload. 5B defaults
+    # are applied only to this in-memory copy so the historical JSON stays exact.
+    return _normalize_legacy_report_revision(revision)
+
+
+def _report_history_entry_locked(
+    state: dict[str, Any], report_version_id: str
+) -> dict[str, Any] | None:
+    if not state:
+        return None
+    history = state.get("history")
+    if not isinstance(history, list):
+        raise ValueError("report state history is invalid")
+    matches = [
+        item for item in history
+        if isinstance(item, dict)
+        and item.get("report_version_id") == report_version_id
+    ]
+    if len(matches) > 1:
+        raise ValueError("report state history is duplicated")
+    return matches[0] if matches else None
+
+
+def _report_version_is_committed_locked(
+    state: dict[str, Any], revision: dict[str, Any]
+) -> bool:
+    report_version_id = str(revision.get("report_version_id") or "")
+    entry = _report_history_entry_locked(state, report_version_id)
+    return bool(
+        entry
+        and entry.get("revision_payload_sha256")
+        == revision.get("revision_payload_sha256")
+    )
+
+
+def _write_or_reuse_report_revision_locked(
+    path: Path,
+    incoming: dict[str, Any],
+    *,
+    project_id: str,
+    report_version_id: str,
+) -> dict[str, Any]:
+    existing = _read_json(path)
+    if existing is None:
+        _atomic_write_json(path, incoming)
+        return incoming
+    if (
+        validate_resource_id(str(existing.get("project_id") or ""), "project")
+        != project_id
+        or validate_resource_id(
+            str(existing.get("report_version_id") or ""), "report"
+        )
+        != report_version_id
+    ):
+        raise FileExistsError("report revision identity collision")
+    declared = str(existing.get("revision_payload_sha256") or "")
+    if not _SHA256_RE.fullmatch(declared) or _report_digest(existing) != declared:
+        raise ValueError("report revision digest mismatch")
+    if declared != incoming.get("revision_payload_sha256") or existing != incoming:
+        raise FileExistsError("report revision identity collision")
+    return existing
+
+
+def _report_sections_by_id(
+    revision: dict[str, Any], *, default_missing_revision: bool = False
+) -> dict[str, dict[str, Any]]:
+    sections = revision.get("sections")
+    if not isinstance(sections, list):
+        raise ValueError("report sections payload is invalid")
+    by_id: dict[str, dict[str, Any]] = {}
+    for section in sections:
+        if not isinstance(section, dict):
+            raise ValueError("report section payload is invalid")
+        section_id = validate_resource_id(
+            str(section.get("section_id") or ""), "section"
+        )
+        if section_id in by_id:
+            raise ValueError("report section id is duplicated")
+        if default_missing_revision and section.get("section_revision") is None:
+            section["section_revision"] = 1
+        section_revision = section.get("section_revision")
+        if (
+            isinstance(section_revision, bool)
+            or not isinstance(section_revision, int)
+            or section_revision <= 0
+        ):
+            raise ValueError("report section revision is invalid")
+        content = section.get("content")
+        declared_content_digest = str(section.get("content_sha256") or "")
+        if (
+            not isinstance(content, str)
+            or not _SHA256_RE.fullmatch(declared_content_digest)
+            or _canonical_payload_sha256(content) != declared_content_digest
+        ):
+            raise ValueError("report section content digest mismatch")
+        by_id[section_id] = section
+    return by_id
+
+
+def _require_id_locator_locked(
+    *,
+    path: Path,
+    id_field: str,
+    entity_id: str,
+    project_id: str,
+    label: str,
+) -> dict[str, Any] | None:
+    locator = _read_json(path)
+    if locator is None:
+        return None
+    expected = {
+        id_field: entity_id,
+        "project_id": project_id,
+    }
+    declared = str(locator.get("locator_payload_sha256") or "")
+    if (
+        set(locator) != {*expected, "locator_payload_sha256"}
+        or any(locator.get(key) != value for key, value in expected.items())
+        or not _SHA256_RE.fullmatch(declared)
+        or _canonical_payload_sha256(expected) != declared
+    ):
+        raise ValueError(f"{label} locator integrity check failed")
+    return locator
+
+
+def _write_or_reuse_id_locator_locked(
+    *,
+    path: Path,
+    id_field: str,
+    entity_id: str,
+    project_id: str,
+    label: str,
+) -> dict[str, Any]:
+    existing = _require_id_locator_locked(
+        path=path,
+        id_field=id_field,
+        entity_id=entity_id,
+        project_id=project_id,
+        label=label,
+    )
+    if existing is not None:
+        return existing
+    locator = {
+        id_field: entity_id,
+        "project_id": project_id,
+    }
+    locator["locator_payload_sha256"] = _canonical_payload_sha256(locator)
+    _atomic_write_json(path, locator)
+    return locator
+
+
+def _load_current_report_locked(project_id: str) -> dict[str, Any] | None:
+    project_id = validate_resource_id(project_id, "project")
+    state = _read_json(_report_dir(project_id) / "state.json")
+    if state is None:
+        return None
+    if validate_resource_id(str(state.get("project_id") or ""), "project") != project_id:
+        raise ValueError("report state identity mismatch")
+    report_version_id = validate_resource_id(
+        str(state.get("current_report_version_id") or ""), "report"
+    )
+    return {
+        "state": state,
+        "revision": _load_report_revision_locked(project_id, report_version_id),
+    }
 
 
 def load_current_report_version(project_id: str) -> dict[str, Any] | None:
-    directory = _report_dir(project_id)
+    project_id = validate_resource_id(project_id, "project")
     with _STORE_LOCK:
         with _mapping_process_lock(project_id):
-            state = _read_json(directory / "state.json")
-            if state is None:
-                return None
-            report_version_id = validate_resource_id(
-                str(state.get("current_report_version_id") or ""), "report"
-            )
-            return {
-                "state": state,
-                "revision": _load_report_revision_locked(project_id, report_version_id),
-            }
+            return _load_current_report_locked(project_id)
 
 
 def load_report_version(report_version_id: str) -> dict[str, Any] | None:
@@ -4793,15 +5316,132 @@ def load_report_version(report_version_id: str) -> dict[str, Any] | None:
         if locator is None:
             return None
         project_id = validate_resource_id(str(locator.get("project_id") or ""), "project")
-        expected = _canonical_payload_sha256({
-            "report_version_id": report_version_id,
+        with _mapping_process_lock(project_id):
+            locator = _require_id_locator_locked(
+                path=_report_locator_path(report_version_id),
+                id_field="report_version_id",
+                entity_id=report_version_id,
+                project_id=project_id,
+                label="report",
+            )
+            if locator is None:
+                return None
+            revision = _load_report_revision_locked(project_id, report_version_id)
+            state = _read_json(_report_dir(project_id) / "state.json") or {}
+            if not _report_version_is_committed_locked(state, revision):
+                return None
+            return {"project_id": project_id, "state": state, "revision": revision}
+
+
+def _find_legacy_current_report_for_section_locked(
+    section_id: str,
+) -> dict[str, Any] | None:
+    """Recover a missing 5B section locator from verified current report heads."""
+
+    projects_root = _safe_child("projects")
+    if not projects_root.is_dir():
+        return None
+    matching_projects: list[str] = []
+    for candidate in sorted(projects_root.iterdir(), key=lambda item: item.name):
+        if not candidate.is_dir() or not re.fullmatch(
+            r"project_[0-9a-f]{32}", candidate.name
+        ):
+            continue
+        project_id = candidate.name
+        with _mapping_process_lock(project_id):
+            current = _load_current_report_locked(project_id)
+            if current is None:
+                continue
+            if section_id in _report_sections_by_id(current["revision"]):
+                matching_projects.append(project_id)
+    if not matching_projects:
+        return None
+    if len(matching_projects) != 1:
+        raise ValueError("report section id collision")
+
+    project_id = matching_projects[0]
+    with _mapping_process_lock(project_id):
+        current = _load_current_report_locked(project_id)
+        if current is None:
+            return None
+        section = _report_sections_by_id(current["revision"]).get(section_id)
+        if section is None:
+            return None
+        return {
             "project_id": project_id,
-        })
-        if locator.get("locator_payload_sha256") != expected:
-            raise ValueError("report locator integrity check failed")
-        revision = _load_report_revision_locked(project_id, report_version_id)
-        state = _read_json(_report_dir(project_id) / "state.json") or {}
-        return {"project_id": project_id, "state": state, "revision": revision}
+            "state": current["state"],
+            "revision": current["revision"],
+            "section": section,
+            "section_locator_missing": True,
+        }
+
+
+def ensure_current_report_section_locator(
+    *, project_id: str, report_version_id: str, section_id: str
+) -> None:
+    """Backfill the derived 5C section index after service-level authorization."""
+
+    project_id = validate_resource_id(project_id, "project")
+    report_version_id = validate_resource_id(report_version_id, "report")
+    section_id = validate_resource_id(section_id, "section")
+    with _STORE_LOCK:
+        with _mapping_process_lock(project_id):
+            current = _load_current_report_locked(project_id)
+            if (
+                current is None
+                or current["revision"].get("report_version_id")
+                != report_version_id
+                or section_id not in _report_sections_by_id(current["revision"])
+            ):
+                raise ReportHeadConflictError(
+                    base_report_version_id=report_version_id,
+                    current_report_version_id=(
+                        current["revision"].get("report_version_id")
+                        if current is not None
+                        else None
+                    ),
+                )
+            _write_or_reuse_id_locator_locked(
+                path=_report_section_locator_path(section_id),
+                id_field="section_id",
+                entity_id=section_id,
+                project_id=project_id,
+                label="report section",
+            )
+
+
+def load_current_report_for_section(section_id: str) -> dict[str, Any] | None:
+    """Locate a section globally and return it only when it is on the report head."""
+
+    section_id = validate_resource_id(section_id, "section")
+    with _STORE_LOCK:
+        locator = _read_json(_report_section_locator_path(section_id))
+        if locator is None:
+            return _find_legacy_current_report_for_section_locked(section_id)
+        project_id = validate_resource_id(str(locator.get("project_id") or ""), "project")
+        with _mapping_process_lock(project_id):
+            locator = _require_id_locator_locked(
+                path=_report_section_locator_path(section_id),
+                id_field="section_id",
+                entity_id=section_id,
+                project_id=project_id,
+                label="report section",
+            )
+            if locator is None:
+                return None
+            current = _load_current_report_locked(project_id)
+            if current is None:
+                return None
+            sections_by_id = _report_sections_by_id(current["revision"])
+            section = sections_by_id.get(section_id)
+            if section is None:
+                return None
+            return {
+                "project_id": project_id,
+                "state": current["state"],
+                "revision": current["revision"],
+                "section": section,
+            }
 
 
 def load_report_claim(
@@ -4823,12 +5463,15 @@ def _require_report_source_current_locked(
 ) -> None:
     current = _read_json(_analysis_dir(project_id) / "state.json")
     if current is None:
-        raise ValueError("report input changed")
-    analysis_run_id = validate_resource_id(
-        str(source.get("analysis_run_id") or ""), "analysis"
-    )
+        raise ReportInputConflictError()
+    try:
+        analysis_run_id = validate_resource_id(
+            str(source.get("analysis_run_id") or ""), "analysis"
+        )
+    except ValueError as exc:
+        raise ReportInputConflictError() from exc
     if current.get("current_analysis_run_id") != analysis_run_id:
-        raise ValueError("report input changed")
+        raise ReportInputConflictError()
     analysis = _read_json(_analysis_dir(project_id) / "versions" / f"{analysis_run_id}.json")
     expected_digest = str(source.get("analysis_revision_payload_sha256") or "")
     if (
@@ -4838,7 +5481,241 @@ def _require_report_source_current_locked(
         or _analysis_digest(analysis) != expected_digest
         or analysis.get("status") != "completed"
     ):
-        raise ValueError("report input changed")
+        raise ReportInputConflictError()
+    try:
+        _require_analysis_source_current_locked(
+            project_id, analysis.get("source") or {}
+        )
+    except ValueError as exc:
+        raise ReportInputConflictError() from exc
+
+
+def _require_report_section_cas_locked(
+    *,
+    project_id: str,
+    current_revision: dict[str, Any],
+    durable_revision: dict[str, Any],
+    section_id: str,
+    base_section_revision: int,
+) -> None:
+    locator = _require_id_locator_locked(
+        path=_report_section_locator_path(section_id),
+        id_field="section_id",
+        entity_id=section_id,
+        project_id=project_id,
+        label="report section",
+    )
+    current_sections = _report_sections_by_id(current_revision)
+    current_section = current_sections.get(section_id)
+    current_section_revision = (
+        current_section.get("section_revision") if current_section else None
+    )
+    if (
+        locator is None
+        or current_section is None
+        or current_section_revision != base_section_revision
+    ):
+        raise ReportSectionRevisionConflictError(
+            section_id=section_id,
+            base_section_revision=base_section_revision,
+            current_section_revision=(
+                current_section_revision
+                if isinstance(current_section_revision, int)
+                and not isinstance(current_section_revision, bool)
+                else None
+            ),
+        )
+    next_sections = _report_sections_by_id(durable_revision)
+    next_section = next_sections.get(section_id)
+    if (
+        set(next_sections) != set(current_sections)
+        or next_section is None
+        or next_section.get("section_revision") != base_section_revision + 1
+    ):
+        raise ReportSectionRevisionConflictError(
+            section_id=section_id,
+            base_section_revision=base_section_revision,
+            current_section_revision=current_section_revision,
+        )
+    for field in ("section_key", "title", "order"):
+        if next_section.get(field) != current_section.get(field):
+            raise ValueError("target report section identity changed")
+    for field in (
+        "report_schema_version", "source", "input_fingerprint", "frozen_config",
+        "frozen_findings", "frozen_stat_facts", "analysis_limitations",
+    ):
+        if durable_revision.get(field) != current_revision.get(field):
+            raise ValueError("report immutable context changed")
+    _require_non_target_report_semantics_preserved_locked(
+        current_revision=current_revision,
+        durable_revision=durable_revision,
+        target_section_id=section_id,
+    )
+
+
+def _report_claims_by_id_locked(
+    revision: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    claims = revision.get("claims")
+    if not isinstance(claims, list):
+        raise ValueError("report claims payload is invalid")
+    by_id: dict[str, dict[str, Any]] = {}
+    for claim in claims:
+        if not isinstance(claim, dict):
+            raise ValueError("report claim payload is invalid")
+        claim_id = str(claim.get("claim_id") or "")
+        if not re.fullmatch(r"claim_[0-9a-f]{32}", claim_id):
+            raise ValueError("report claim id is invalid")
+        if claim_id in by_id:
+            raise ValueError("report claim id is duplicated")
+        by_id[claim_id] = claim
+    return by_id
+
+
+def _require_report_sections_semantics_preserved_locked(
+    *,
+    current_revision: dict[str, Any],
+    durable_revision: dict[str, Any],
+    preserved_section_ids: set[str],
+    error_prefix: str,
+) -> None:
+    current_sections = _report_sections_by_id(current_revision)
+    next_sections = _report_sections_by_id(durable_revision)
+    if not preserved_section_ids <= set(current_sections):
+        raise ValueError(f"{error_prefix} report section selection is invalid")
+    current_claims = _report_claims_by_id_locked(current_revision)
+    next_claims = _report_claims_by_id_locked(durable_revision)
+    current_tokens: dict[str, str] = {}
+    next_tokens: dict[str, str] = {}
+
+    for current_id in sorted(preserved_section_ids):
+        current_section = current_sections[current_id]
+        next_section = next_sections.get(current_id)
+        if next_section is None:
+            raise ValueError(f"{error_prefix} report section changed")
+        current_ids = current_section.get("claim_ids")
+        next_ids = next_section.get("claim_ids")
+        if not isinstance(current_ids, list) or not isinstance(next_ids, list):
+            raise ValueError("report section claim membership is invalid")
+        if len(current_ids) != len(next_ids):
+            raise ValueError(f"{error_prefix} report section claims changed")
+        for index, (current_claim_id, next_claim_id) in enumerate(
+            zip(current_ids, next_ids, strict=True)
+        ):
+            current_claim_id = str(current_claim_id or "")
+            next_claim_id = str(next_claim_id or "")
+            current_claim = current_claims.get(current_claim_id)
+            next_claim = next_claims.get(next_claim_id)
+            if (
+                current_claim is None
+                or next_claim is None
+                or current_claim.get("section_id") != current_id
+                or next_claim.get("section_id") != current_id
+            ):
+                raise ValueError("report section claim membership is invalid")
+            token = f"{current_id}:{index}"
+            current_tokens[current_claim_id] = token
+            next_tokens[next_claim_id] = token
+
+    def normalized_section(
+        section: dict[str, Any], tokens: dict[str, str]
+    ) -> dict[str, Any]:
+        value = deepcopy(section)
+        value.pop("report_version_id", None)
+        value["claim_ids"] = [tokens.get(str(item), "__external__") for item in value.get("claim_ids") or []]
+        return value
+
+    def normalized_claim(
+        claim: dict[str, Any], tokens: dict[str, str]
+    ) -> dict[str, Any]:
+        value = deepcopy(claim)
+        value.pop("claim_id", None)
+        value.pop("report_version_id", None)
+        superseded_by = value.get("superseded_by")
+        value["superseded_by"] = (
+            tokens.get(str(superseded_by), "__external__")
+            if superseded_by is not None
+            else None
+        )
+        return value
+
+    for current_id in sorted(preserved_section_ids):
+        current_section = current_sections[current_id]
+        next_section = next_sections[current_id]
+        if normalized_section(current_section, current_tokens) != normalized_section(
+            next_section, next_tokens
+        ):
+            raise ValueError(f"{error_prefix} report section changed")
+        for current_claim_id, next_claim_id in zip(
+            current_section.get("claim_ids") or [],
+            next_section.get("claim_ids") or [],
+            strict=True,
+        ):
+            if normalized_claim(
+                current_claims[str(current_claim_id)], current_tokens
+            ) != normalized_claim(next_claims[str(next_claim_id)], next_tokens):
+                raise ValueError(f"{error_prefix} report section claims changed")
+
+        section_key = current_section.get("section_key")
+        current_issues = [
+            deepcopy(item) for item in current_revision.get("audit_issues") or []
+            if isinstance(item, dict) and item.get("section_key") == section_key
+        ]
+        next_issues = [
+            deepcopy(item) for item in durable_revision.get("audit_issues") or []
+            if isinstance(item, dict) and item.get("section_key") == section_key
+        ]
+        for issue in current_issues:
+            if issue.get("claim_id") is not None:
+                issue["claim_id"] = current_tokens.get(
+                    str(issue.get("claim_id")), "__external__"
+                )
+        for issue in next_issues:
+            if issue.get("claim_id") is not None:
+                issue["claim_id"] = next_tokens.get(
+                    str(issue.get("claim_id")), "__external__"
+                )
+        if current_issues != next_issues:
+            raise ValueError(f"{error_prefix} report section audit changed")
+
+
+def _require_non_target_report_semantics_preserved_locked(
+    *,
+    current_revision: dict[str, Any],
+    durable_revision: dict[str, Any],
+    target_section_id: str,
+) -> None:
+    _require_report_sections_semantics_preserved_locked(
+        current_revision=current_revision,
+        durable_revision=durable_revision,
+        preserved_section_ids=(
+            set(_report_sections_by_id(current_revision)) - {target_section_id}
+        ),
+        error_prefix="non-target",
+    )
+
+
+def _require_locked_report_sections_preserved_locked(
+    current_revision: dict[str, Any], durable_revision: dict[str, Any]
+) -> None:
+    """Reject whole-report replacement that changes any locked-section semantics."""
+
+    current_sections = _report_sections_by_id(current_revision)
+    overwritten: list[str] = []
+    for current_id, current_item in current_sections.items():
+        if not bool(current_item.get("locked")):
+            continue
+        try:
+            _require_report_sections_semantics_preserved_locked(
+                current_revision=current_revision,
+                durable_revision=durable_revision,
+                preserved_section_ids={current_id},
+                error_prefix="locked",
+            )
+        except ValueError:
+            overwritten.append(current_id)
+    if overwritten:
+        raise ReportLockedSectionConflictError(section_ids=sorted(overwritten))
 
 
 def save_report_version_cas(
@@ -4846,6 +5723,8 @@ def save_report_version_cas(
     project_id: str,
     base_report_version_id: str | None,
     revision: dict[str, Any],
+    section_id: str | None = None,
+    base_section_revision: int | None = None,
 ) -> dict[str, Any]:
     directory = _report_dir(project_id)
     report_version_id = validate_resource_id(
@@ -4853,23 +5732,107 @@ def save_report_version_cas(
     )
     if base_report_version_id is not None:
         validate_resource_id(base_report_version_id, "report")
+    if (section_id is None) != (base_section_revision is None):
+        raise ValueError(
+            "section_id and base_section_revision must be provided together"
+        )
+    if section_id is not None:
+        section_id = validate_resource_id(section_id, "section")
+        if (
+            isinstance(base_section_revision, bool)
+            or not isinstance(base_section_revision, int)
+            or base_section_revision <= 0
+        ):
+            raise ValueError("base section revision is invalid")
     with _STORE_LOCK:
         with _mapping_process_lock(project_id):
             state_path = directory / "state.json"
             current = _read_json(state_path)
             current_id = str(current.get("current_report_version_id") or "") if current else None
+            if current_id == report_version_id and current is not None:
+                existing = _load_report_revision_locked(project_id, report_version_id)
+                replay = deepcopy(revision)
+                replay["project_id"] = project_id
+                replay["version_number"] = int(
+                    current.get("current_version_number") or 0
+                )
+                replay["revision_payload_sha256"] = _report_digest(replay)
+                if (
+                    _report_version_is_committed_locked(current, existing)
+                    and existing.get("revision_payload_sha256")
+                    == replay.get("revision_payload_sha256")
+                ):
+                    return {"state": current, "revision": existing}
+                raise ReportHeadConflictError(
+                    base_report_version_id=base_report_version_id,
+                    current_report_version_id=current_id,
+                )
             if current_id != base_report_version_id:
-                raise ValueError("report version conflict")
+                raise ReportHeadConflictError(
+                    base_report_version_id=base_report_version_id,
+                    current_report_version_id=current_id,
+                )
             durable = deepcopy(revision)
             durable["project_id"] = project_id
             _require_report_source_current_locked(project_id, durable.get("source") or {})
             version_number = int((current or {}).get("current_version_number") or 0) + 1
             durable["version_number"] = version_number
+            sections_by_id = _report_sections_by_id(
+                durable, default_missing_revision=True
+            )
+            if section_id is not None:
+                if current_id is None:
+                    raise ReportSectionRevisionConflictError(
+                        section_id=section_id,
+                        base_section_revision=base_section_revision,
+                        current_section_revision=None,
+                    )
+                _require_report_section_cas_locked(
+                    project_id=project_id,
+                    current_revision=_load_report_revision_locked(
+                        project_id, current_id
+                    ),
+                    durable_revision=durable,
+                    section_id=section_id,
+                    base_section_revision=base_section_revision,
+                )
+            elif current_id is not None:
+                _require_locked_report_sections_preserved_locked(
+                    _load_report_revision_locked(project_id, current_id), durable
+                )
             durable["revision_payload_sha256"] = _report_digest(durable)
             version_path = directory / "versions" / f"{report_version_id}.json"
-            if version_path.exists():
-                raise ValueError("report revision already exists")
-            _atomic_write_json(version_path, durable)
+            _require_id_locator_locked(
+                path=_report_locator_path(report_version_id),
+                id_field="report_version_id",
+                entity_id=report_version_id,
+                project_id=project_id,
+                label="report",
+            )
+            for durable_section_id in sections_by_id:
+                existing_section_locator = _read_json(
+                    _report_section_locator_path(durable_section_id)
+                )
+                if existing_section_locator is not None:
+                    located_project_id = validate_resource_id(
+                        str(existing_section_locator.get("project_id") or ""),
+                        "project",
+                    )
+                    if located_project_id != project_id:
+                        raise FileExistsError("report section locator identity collision")
+                    _require_id_locator_locked(
+                        path=_report_section_locator_path(durable_section_id),
+                        id_field="section_id",
+                        entity_id=durable_section_id,
+                        project_id=project_id,
+                        label="report section",
+                    )
+            _write_or_reuse_report_revision_locked(
+                version_path,
+                durable,
+                project_id=project_id,
+                report_version_id=report_version_id,
+            )
             history = list((current or {}).get("history") or [])
             history.append({
                 "report_version_id": report_version_id,
@@ -4888,13 +5851,20 @@ def save_report_version_cas(
                 "source": deepcopy(durable.get("source") or {}),
                 "history": history,
             }
-            locator_payload = {
-                "report_version_id": report_version_id,
-                "project_id": project_id,
-            }
-            locator_payload["locator_payload_sha256"] = _canonical_payload_sha256(
-                locator_payload
+            _write_or_reuse_id_locator_locked(
+                path=_report_locator_path(report_version_id),
+                id_field="report_version_id",
+                entity_id=report_version_id,
+                project_id=project_id,
+                label="report",
             )
-            _atomic_write_json(_report_locator_path(report_version_id), locator_payload)
+            for durable_section_id in sections_by_id:
+                _write_or_reuse_id_locator_locked(
+                    path=_report_section_locator_path(durable_section_id),
+                    id_field="section_id",
+                    entity_id=durable_section_id,
+                    project_id=project_id,
+                    label="report section",
+                )
             _atomic_write_json(state_path, next_state)
             return {"state": next_state, "revision": durable}

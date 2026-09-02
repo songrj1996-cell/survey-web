@@ -7,9 +7,17 @@ from copy import deepcopy
 from unittest.mock import AsyncMock, patch
 
 from fastapi import HTTPException
+from pydantic import ValidationError
 
 from app.core.config import DEFAULT_UPLOAD_GUIDE
 from app.routers import settings_api
+from app.schemas.interview_v2_report import (
+    InterviewV2ReportApproveRequest,
+    InterviewV2ReportResponse,
+    InterviewV2ReportSectionMutationResponse,
+    InterviewV2ReportSectionPatchRequest,
+    InterviewV2ReportSectionReauditRequest,
+)
 from app.schemas.requests import PromptUpdateRequest
 from app.services import interview_service, report_engine, settings_service
 from app.storage import prompts as prompt_storage
@@ -47,6 +55,7 @@ EXPECTED_PROMPT_KEYS = {
     "interview_v2_dossier_system",
     "interview_v2_analysis_system",
     "interview_v2_report_system",
+    "interview_v2_report_claim_extract_system",
     "interview_v2_report_audit_system",
 }
 
@@ -67,11 +76,11 @@ def _sha256(path: str) -> str:
 
 
 class PromptCatalogTests(unittest.TestCase):
-    def test_catalog_has_31_current_non_dify_entries_in_six_groups(self):
+    def test_catalog_has_32_current_non_dify_entries_in_six_groups(self):
         catalog = prompt_storage.DEFAULT_PROMPTS
 
         self.assertEqual(set(catalog), EXPECTED_PROMPT_KEYS)
-        self.assertEqual(len(catalog), 31)
+        self.assertEqual(len(catalog), 32)
         self.assertNotIn("upload_guide", catalog)
         self.assertEqual(
             {entry["group"] for entry in catalog.values()},
@@ -149,6 +158,10 @@ class PromptCatalogTests(unittest.TestCase):
         self.assertEqual(migrated["theme_extract_system"]["version"], 3)
         self.assertEqual(migrated["theme_merge_system"]["version"], 2)
         self.assertEqual(migrated["response_classify_system"]["version"], 2)
+        self.assertEqual(migrated["interview_v2_report_system"]["version"], 2)
+        self.assertEqual(
+            migrated["interview_v2_report_claim_extract_system"]["version"], 2
+        )
         self.assertEqual(
             migrated["writer_requirements"]["current"],
             prompt_storage.DEFAULT_PROMPTS["writer_requirements"]["current"],
@@ -169,6 +182,8 @@ class PromptCatalogTests(unittest.TestCase):
             ("theme_extract_system", 2),
             ("theme_merge_system", 1),
             ("response_classify_system", 1),
+            ("interview_v2_report_system", 1),
+            ("interview_v2_report_claim_extract_system", 1),
         ):
             with self.subTest(key=key, content="default"):
                 stored = deepcopy(prompt_storage.DEFAULT_PROMPTS[key])
@@ -227,6 +242,30 @@ class PromptCatalogTests(unittest.TestCase):
         self.assertIn("最终主题不设置最少或最多数量", merge_prompt)
         self.assertIn("source_candidate_ids", merge_prompt)
         self.assertIn("不设置上限", classify_prompt)
+
+    def test_interview_v2_claim_extract_prompt_only_extracts_single_section(self):
+        prompt = prompt_storage.DEFAULT_PROMPTS[
+            "interview_v2_report_claim_extract_system"
+        ]["current"]
+
+        self.assertIn("单章节", prompt)
+        self.assertIn("不得改写、补写、删减或重新排列正文", prompt)
+        self.assertIn("evidence_roles", prompt)
+        self.assertIn("support、counterexample、observation", prompt)
+        self.assertIn('只返回 JSON：{"claims"', prompt)
+        self.assertNotIn('只返回 JSON：{"sections"', prompt)
+        with patch.object(
+            prompt_storage,
+            "_get_prompt_text",
+            return_value="CLAIM_EXTRACT_PROMPT",
+        ) as get_prompt_text:
+            self.assertEqual(
+                prompt_storage._get_interview_v2_report_claim_extract_system_prompt(),
+                "CLAIM_EXTRACT_PROMPT",
+            )
+        get_prompt_text.assert_called_once_with(
+            "interview_v2_report_claim_extract_system"
+        )
 
     def test_catalog_api_filters_unknown_and_legacy_entries(self):
         with tempfile.TemporaryDirectory(prefix="prompt-api-test-") as temp_dir:
@@ -356,6 +395,115 @@ class PromptCatalogTests(unittest.TestCase):
             [items[0]["content"] for items in messages],
             list(getter_names),
         )
+
+
+class InterviewV2ReportReviewContractTests(unittest.TestCase):
+    def test_section_patch_is_strict_and_defaults_to_locked(self):
+        payload = InterviewV2ReportSectionPatchRequest.model_validate({
+            "base_section_revision": 2,
+            "content": "保留原文并重新审计。",
+        })
+        self.assertTrue(payload.locked)
+        self.assertIsNone(payload.edit_reason)
+
+        invalid_payloads = (
+            {"base_section_revision": 0, "content": "正文"},
+            {"base_section_revision": "2", "content": "正文"},
+            {"base_section_revision": 2, "content": "   "},
+            {"base_section_revision": 2, "content": "正文", "locked": False},
+            {"base_section_revision": 2, "content": "正文", "locked": 1},
+            {"base_section_revision": 2, "content": "正文", "locked": "true"},
+            {"base_section_revision": 2, "content": "字" * 30001},
+            {
+                "base_section_revision": 2,
+                "content": "正文",
+                "edit_reason": "字" * 501,
+            },
+            {"base_section_revision": 2, "content": "正文", "unexpected": True},
+        )
+        for invalid in invalid_payloads:
+            with self.subTest(payload=invalid):
+                with self.assertRaises(ValidationError):
+                    InterviewV2ReportSectionPatchRequest.model_validate(invalid)
+
+    def test_reaudit_and_approve_requests_enforce_ids_and_decisions(self):
+        report_id = "report_" + "a" * 32
+        job_id = "job_" + "b" * 32
+        reaudit = InterviewV2ReportSectionReauditRequest.model_validate({
+            "base_section_revision": 3,
+            "reaudit_job_id": job_id,
+        })
+        self.assertEqual(reaudit.reaudit_job_id, job_id)
+        approval = InterviewV2ReportApproveRequest.model_validate({
+            "base_report_version_id": report_id,
+            "decision": "approved",
+            "note": "证据审计通过",
+        })
+        self.assertEqual(approval.decision, "approved")
+
+        for model, invalid in (
+            (
+                InterviewV2ReportSectionReauditRequest,
+                {"base_section_revision": 3, "reaudit_job_id": "job_bad"},
+            ),
+            (
+                InterviewV2ReportSectionReauditRequest,
+                {"base_section_revision": True, "reaudit_job_id": job_id},
+            ),
+            (
+                InterviewV2ReportApproveRequest,
+                {"base_report_version_id": "report_bad", "decision": "approved"},
+            ),
+            (
+                InterviewV2ReportApproveRequest,
+                {"base_report_version_id": report_id, "decision": "rejected"},
+            ),
+            (
+                InterviewV2ReportApproveRequest,
+                {
+                    "base_report_version_id": report_id,
+                    "decision": "approved",
+                    "note": "字" * 501,
+                },
+            ),
+        ):
+            with self.subTest(model=model.__name__, payload=invalid):
+                with self.assertRaises(ValidationError):
+                    model.model_validate(invalid)
+
+    def test_review_responses_expose_current_approval_and_section_hash(self):
+        report = InterviewV2ReportResponse.model_validate({
+            "project_id": "project_1",
+            "report_version_id": "report_" + "a" * 32,
+            "report_version_number": 4,
+            "status": "approved",
+            "audit_status": "audit_passed",
+            "is_current_version": True,
+            "approved_by": "email:reviewer@example.com",
+            "approved_at": "2026-09-02T10:00:00Z",
+        })
+        self.assertTrue(report.is_current_version)
+        self.assertEqual(report.approved_by, "email:reviewer@example.com")
+
+        section = InterviewV2ReportSectionMutationResponse.model_validate({
+            "project_id": "project_1",
+            "report_version_id": "report_" + "a" * 32,
+            "report_version_number": 4,
+            "section_id": "section_" + "b" * 32,
+            "section_revision": 2,
+            "status": "pending_reaudit",
+            "audit_status": "pending_reaudit",
+            "locked": True,
+            "reaudit_job_id": "job_" + "c" * 32,
+            "content_sha256": "d" * 64,
+        })
+        self.assertEqual(section.content_sha256, "d" * 64)
+        completed_payload = section.model_dump(mode="json")
+        completed_payload["reaudit_job_id"] = None
+        completed = InterviewV2ReportSectionMutationResponse.model_validate(
+            completed_payload
+        )
+        self.assertIsNone(completed.reaudit_job_id)
 
 
 class PromptApiAuthorizationTests(unittest.IsolatedAsyncioTestCase):
