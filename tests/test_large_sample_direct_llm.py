@@ -693,9 +693,14 @@ class LargeSampleDirectLLMTests(unittest.IsolatedAsyncioTestCase):
         }
         active = 0
         max_active = 0
+        attempt_callback = object()
+        callback_forwarded: list[bool] = []
 
         async def direct(system_prompt, query, **_kwargs):
             nonlocal active, max_active
+            callback_forwarded.append(
+                _kwargs.get("on_attempt_event") is attempt_callback
+            )
             active += 1
             max_active = max(max_active, active)
             await asyncio.sleep(0.01 if "问题 A" in query else 0.001)
@@ -729,7 +734,10 @@ class LargeSampleDirectLLMTests(unittest.IsolatedAsyncioTestCase):
                 "duration_seconds": 0.01,
             }
 
-        async def classified(_question, _themes, _batch):
+        async def classified(_question, _themes, _batch, **_kwargs):
+            callback_forwarded.append(
+                _kwargs.get("on_attempt_event") is attempt_callback
+            )
             return {
                 "classifications": [{
                     "response_id": "0",
@@ -755,6 +763,7 @@ class LargeSampleDirectLLMTests(unittest.IsolatedAsyncioTestCase):
                 async for item in report_engine._batch_qualitative_analysis(
                     open_text, plan, ["问题 A", "问题 B"], "sid",
                     deduplicate_respondents=True,
+                    on_attempt_event=attempt_callback,
                 )
             ]
 
@@ -762,6 +771,8 @@ class LargeSampleDirectLLMTests(unittest.IsolatedAsyncioTestCase):
         clustered = next(item[1] for item in items if item[0] == "result")
         diagnostics = next(item[1] for item in items if item[0] == "diagnostics")
         self.assertEqual(max_active, 2)
+        self.assertTrue(callback_forwarded)
+        self.assertTrue(all(callback_forwarded))
         self.assertEqual(metrics["scope_concurrency"], 2)
         self.assertGreater(metrics["elapsed_seconds"], 0)
         self.assertEqual(list(clustered), [0, 1])

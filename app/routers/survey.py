@@ -7,7 +7,6 @@ from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.core.config import (
-    LLM_API_KEY,
     LLM_COLUMN_MODEL,
     LLM_PLANNER_MODEL,
 )
@@ -23,6 +22,10 @@ from app.schemas.requests import (
 )
 from app.services.audit import audit_log
 from app.services.auth import _current_login
+from app.services.llm_credentials import (
+    require_request_llm_api_key,
+    stream_with_llm_api_key,
+)
 from app.services.survey_service import (
     apply_analysis_preset_to_session,
     columns_stream,
@@ -92,9 +95,20 @@ async def upload_file(
 @router.get("/api/columns/{session_id}")
 async def get_columns(session_id: str, request: Request):
     validate_columns_ready(session_id)
-    if columns_require_llm(session_id) and (not LLM_API_KEY or not LLM_COLUMN_MODEL):
+    if columns_require_llm(session_id) and not LLM_COLUMN_MODEL:
         raise HTTPException(status_code=500, detail="未配置题型识别 LLM 分发服务")
-    return StreamingResponse(columns_stream(session_id, request), media_type="text/event-stream")
+    api_key = await require_request_llm_api_key(request)
+    return StreamingResponse(
+        stream_with_llm_api_key(
+            columns_stream(session_id, request),
+            api_key,
+            request=request,
+            category="survey",
+            action="题型识别",
+            reference_id=session_id,
+        ),
+        media_type="text/event-stream",
+    )
 
 
 @router.post("/api/columns/{session_id}/confirm")
@@ -143,9 +157,20 @@ async def submit_survey_context(session_id: str, req: QualitativeContextRequest,
 @router.get("/api/plan/{session_id}")
 async def get_plan(session_id: str, request: Request):
     validate_plan_ready(session_id)
-    if not LLM_API_KEY or not LLM_PLANNER_MODEL:
+    if not LLM_PLANNER_MODEL:
         raise HTTPException(status_code=500, detail="未配置方案规划 LLM 分发服务")
-    return StreamingResponse(plan_stream(session_id, request), media_type="text/event-stream")
+    api_key = await require_request_llm_api_key(request)
+    return StreamingResponse(
+        stream_with_llm_api_key(
+            plan_stream(session_id, request),
+            api_key,
+            request=request,
+            category="survey",
+            action="方案规划",
+            reference_id=session_id,
+        ),
+        media_type="text/event-stream",
+    )
 
 
 @router.post("/api/plan/confirm")
@@ -159,8 +184,16 @@ async def confirm_plan(req: PlanConfirmRequest, request: Request):
             f"会话：{req.session_id}", metadata={"session_id": req.session_id},
         )
         return JSONResponse(result)
+    api_key = await require_request_llm_api_key(request)
     return StreamingResponse(
-        plan_revision_stream(req.session_id, req.user_text, request),
+        stream_with_llm_api_key(
+            plan_revision_stream(req.session_id, req.user_text, request),
+            api_key,
+            request=request,
+            category="survey",
+            action="方案调整",
+            reference_id=req.session_id,
+        ),
         media_type="text/event-stream",
     )
 
@@ -209,8 +242,17 @@ async def generate_report(
     if version is not None:
         return get_session_report_version(session_id, version)
     validate_report_ready(session_id)
+    api_key = await require_request_llm_api_key(request)
     return StreamingResponse(
-        report_stream(session_id, request, generation_kind="initial"),
+        stream_with_llm_api_key(
+            report_stream(session_id, request, generation_kind="initial"),
+            api_key,
+            request=request,
+            category="survey",
+            action="报告生成",
+            reference_id=session_id,
+            history_id=session_id,
+        ),
         media_type="text/event-stream",
     )
 
@@ -241,8 +283,17 @@ async def delete_report_version_route(session_id: str, version: int, request: Re
 @router.post("/api/qa")
 async def qa(req: QARequest, request: Request):
     validate_qa_ready(req.session_id, req.version)
+    api_key = await require_request_llm_api_key(request)
     return StreamingResponse(
-        qa_stream(req.session_id, req.question, request, req.version),
+        stream_with_llm_api_key(
+            qa_stream(req.session_id, req.question, request, req.version),
+            api_key,
+            request=request,
+            category="survey",
+            action="报告追问",
+            reference_id=req.session_id,
+            history_id=req.session_id,
+        ),
         media_type="text/event-stream",
     )
 
@@ -251,13 +302,23 @@ async def qa(req: QARequest, request: Request):
 async def history_qa(req: HistoryQARequest, request: Request):
     login = await _current_login(request)
     history = prepare_history_qa_context(req.history_id, login, req.version)
+    api_key = await require_request_llm_api_key(request)
     return StreamingResponse(
-        history_qa_stream(
-            req.history_id,
-            req.question,
-            history,
-            request,
-            req.version,
+        stream_with_llm_api_key(
+            history_qa_stream(
+                req.history_id,
+                req.question,
+                history,
+                request,
+                req.version,
+            ),
+            api_key,
+            request=request,
+            category="survey",
+            action="历史报告追问",
+            reference_id=req.history_id,
+            title=str(history.get("title") or ""),
+            history_id=req.history_id,
         ),
         media_type="text/event-stream",
     )

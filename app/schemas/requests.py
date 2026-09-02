@@ -85,6 +85,10 @@ class AppSettingsPatch(BaseModel):
     comment_duplicate_reminder_enabled: bool | None = None
 
 
+class UserLlmKeyUpdateRequest(BaseModel):
+    api_key: str = Field(min_length=8, max_length=4096)
+
+
 class GlossaryCreateRequest(BaseModel):
     category: str = ""
     ch: str

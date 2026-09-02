@@ -29,6 +29,7 @@ _SELECTED_VERSION_FIELDS = (
     "analyst_conv_id",
     "analyst_app",
     "comparison_validation",
+    "report_llm_usage",
 )
 
 
@@ -142,7 +143,10 @@ def get_history_entry(
             None if version in (None, "") else version,
         )
         for field in _SELECTED_VERSION_FIELDS:
-            result[field] = deepcopy(selected[field])
+            if field in selected:
+                result[field] = deepcopy(selected[field])
+            else:
+                result.pop(field, None)
         result.update({
             "version": selected["version"],
             "selected_version": selected["version"],

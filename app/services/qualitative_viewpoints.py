@@ -91,6 +91,8 @@ async def build_report_viewpoint_stats(
     open_text: dict,
     plan: dict,
     headers: list[str],
+    *,
+    on_attempt_event=None,
 ):
     """跨题合并观点并回跑全部原文；yield analysis_progress/heartbeat/result。"""
     synthesis_started = time.monotonic()
@@ -137,6 +139,7 @@ async def build_report_viewpoint_stats(
             reasoning_effort=report_engine.LLM_THEME_MERGE_REASONING or None,
             validator=lambda data: report_engine._validate_merged_themes(data, candidates),
             on_repair=lambda error: repair_events.put_nowait({"error": error}),
+            on_attempt_event=on_attempt_event,
         )
 
     merge_result = None
@@ -217,7 +220,10 @@ async def build_report_viewpoint_stats(
     for batch in batches:
         async def _classify(batch=batch):
             return await report_engine._classify_batch_direct(
-                f"跨题报告观点；报告组织方式：{organization}", themes, batch
+                f"跨题报告观点；报告组织方式：{organization}",
+                themes,
+                batch,
+                on_attempt_event=on_attempt_event,
             )
         factories.append(_classify)
 

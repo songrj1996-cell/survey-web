@@ -4,6 +4,7 @@
 
 function resetReportFailureUi() {
   state.sessionReport.error = '';
+  state.sessionReport.reportLlmUsage = null;
   const box = $('report-error');
   if (box) box.hidden = true;
   $('ps-writing')?.classList.remove('progress-step--failed');
@@ -24,6 +25,10 @@ function resetReportFailureUi() {
   });
   const remaining = $('report-progress-remaining');
   if (remaining) remaining.textContent = '正在计算后续处理步骤';
+  renderReportLlmUsage({
+    progressState: { phases: Object.fromEntries(REPORT_PHASE_ORDER.map(phase => [phase, 'pending'])) },
+    running: state.sessionReport.running,
+  });
 }
 
 function showReportFailureUi(message) {
@@ -94,6 +99,8 @@ const REPORT_PHASE_LABELS = {
   writing: '报告撰写',
   finalize: '校验并保存',
 };
+const REPORT_PHASE_ORDER = Object.keys(REPORT_PHASE_LABELS);
+const REPORT_LLM_LEGACY_TEXT = '该版本未记录模型/token用量';
 
 const REPORT_STATUS_LABELS = {
   active: '处理中',
@@ -103,6 +110,280 @@ const REPORT_STATUS_LABELS = {
   degraded: '已降级',
   skipped: '已跳过',
 };
+
+function _normalizeReportUsageNumber(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+}
+
+function _normalizeReportModelList(value) {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.map(item => String(item || '').trim()).filter(Boolean))];
+}
+
+function _normalizeReportActiveModels(value) {
+  if (!value || typeof value !== 'object') return {};
+  return Object.fromEntries(
+    Object.entries(value)
+      .map(([model, count]) => [String(model || '').trim(), _normalizeReportUsageNumber(count)])
+      .filter(([model, count]) => model && count > 0),
+  );
+}
+
+function normalizeReportLlmUsage(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const normalizeNode = node => {
+    const source = node && typeof node === 'object' ? node : {};
+    return {
+      models_used: _normalizeReportModelList(source.models_used),
+      fallback_models_used: _normalizeReportModelList(source.fallback_models_used),
+      input_tokens: _normalizeReportUsageNumber(source.input_tokens),
+      output_tokens: _normalizeReportUsageNumber(source.output_tokens),
+      total_tokens: _normalizeReportUsageNumber(source.total_tokens),
+      call_count: _normalizeReportUsageNumber(source.call_count),
+      usage_reported_call_count: _normalizeReportUsageNumber(source.usage_reported_call_count),
+      usage_missing_call_count: _normalizeReportUsageNumber(source.usage_missing_call_count),
+      active_calls: _normalizeReportUsageNumber(source.active_calls),
+      active_models: _normalizeReportActiveModels(source.active_models),
+    };
+  };
+  const phases = {};
+  let hasAnySignal = false;
+  REPORT_PHASE_ORDER.forEach(phase => {
+    phases[phase] = normalizeNode(raw.phases?.[phase]);
+    const phaseUsage = phases[phase];
+    if (
+      phaseUsage.models_used.length
+      || phaseUsage.fallback_models_used.length
+      || phaseUsage.total_tokens
+      || phaseUsage.call_count
+      || phaseUsage.usage_missing_call_count
+      || phaseUsage.active_calls
+      || Object.keys(phaseUsage.active_models).length
+    ) {
+      hasAnySignal = true;
+    }
+  });
+  const totals = normalizeNode(raw.totals);
+  if (
+    totals.models_used.length
+    || totals.fallback_models_used.length
+    || totals.total_tokens
+    || totals.call_count
+    || totals.usage_missing_call_count
+    || totals.active_calls
+    || Object.keys(totals.active_models).length
+  ) {
+    hasAnySignal = true;
+  }
+  return {
+    phases,
+    totals,
+    hasAnySignal,
+  };
+}
+
+function _reportUsageActiveModelsText(activeModels = {}) {
+  return Object.entries(activeModels)
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], 'zh-CN'))
+    .map(([model, count]) => (count > 1 ? `${model} × ${count}` : model))
+    .join('、');
+}
+
+function _reportUsageModelText(usage, { running = false } = {}) {
+  if (!usage) return running ? '模型待调用' : '未记录模型';
+  const activeModelsText = _reportUsageActiveModelsText(usage.active_models);
+  if (usage.active_calls > 0 && activeModelsText) {
+    return `当前：${activeModelsText}`;
+  }
+  const usedModels = usage.models_used.join('、');
+  const fallbackModels = usage.fallback_models_used.join('、');
+  if (usedModels && fallbackModels) return `已用：${usedModels}；备选：${fallbackModels}`;
+  if (usedModels) return `已用：${usedModels}`;
+  if (fallbackModels) return `已用：${fallbackModels}`;
+  if (usage.call_count > 0) return `已发起 ${usage.call_count} 次调用`;
+  return running ? '等待开始' : '未记录模型';
+}
+
+function _reportUsageTokensText(usage, { waitingText = 'Token 待统计' } = {}) {
+  if (!usage) return waitingText;
+  if (
+    !usage.total_tokens
+    && !usage.usage_missing_call_count
+    && !usage.usage_reported_call_count
+  ) {
+    return usage.call_count > 0 ? waitingText : '等待开始';
+  }
+  const totalText = `${usage.usage_missing_call_count > 0 ? '已统计至少 ' : ''}${(usage.total_tokens || 0).toLocaleString('zh-CN')} token`;
+  return usage.usage_missing_call_count > 0
+    ? `${totalText} · ${usage.usage_missing_call_count}次调用 usage 未返回或不完整`
+    : totalText;
+}
+
+function _reportUsagePhaseMeta(
+  phase,
+  progressState,
+  usageState,
+  { running = false, hasReport = false } = {},
+) {
+  const phaseUsage = usageState?.phases?.[phase] || null;
+  const phaseStatus = progressState?.phases?.[phase] || 'pending';
+  if (!running && usageState && usageState.hasAnySignal === false) {
+    return '未记录模型/token';
+  }
+  if (!phaseUsage || (
+    !phaseUsage.call_count
+    && !phaseUsage.total_tokens
+    && !phaseUsage.usage_missing_call_count
+    && !phaseUsage.active_calls
+    && !phaseUsage.models_used.length
+    && !phaseUsage.fallback_models_used.length
+  )) {
+    if (!running && hasReport && usageState?.hasAnySignal) return '本环节未调用模型';
+    if (!running && hasReport) return '未记录模型/token';
+    if (phaseStatus === 'pending') return running ? '等待开始' : '未开始';
+    if (running && phaseStatus === 'active') return '本地处理中，暂未调用模型';
+    if (running && ['completed', 'degraded', 'skipped'].includes(phaseStatus)) {
+      return '本环节未调用模型';
+    }
+    return running ? '等待写入模型 / Token' : '未记录模型/token';
+  }
+  return `${_reportUsageModelText(phaseUsage, { running })} · ${_reportUsageTokensText(phaseUsage)}`;
+}
+
+function _reportUsagePhaseDetailLines(usage, fallbackText) {
+  if (!usage) return [fallbackText];
+  const lines = [];
+  const activeModelsText = _reportUsageActiveModelsText(usage.active_models);
+  if (usage.active_calls > 0 && activeModelsText) {
+    lines.push(`当前：${activeModelsText}`);
+  }
+  if (usage.models_used.length) {
+    lines.push(`已用：${usage.models_used.join('、')}`);
+  } else if (usage.call_count > 0 && !activeModelsText) {
+    lines.push(`已发起 ${usage.call_count} 次调用`);
+  }
+  if (usage.fallback_models_used.length) {
+    lines.push(`备选：${usage.fallback_models_used.join('、')}`);
+  }
+  if (
+    usage.call_count > 0
+    || usage.active_calls > 0
+    || usage.total_tokens > 0
+    || usage.usage_reported_call_count > 0
+    || usage.usage_missing_call_count > 0
+  ) {
+    let tokenText = _reportUsageTokensText(usage, { waitingText: '待统计' });
+    if (tokenText === '等待开始') tokenText = '待统计';
+    lines.push(`Token 消耗：${tokenText}`);
+  }
+  return lines.length ? lines : [fallbackText];
+}
+
+function _reportUsageSummaryTexts(usageState, { running = false, hasReport = false } = {}) {
+  if (!usageState) {
+    if (running) {
+      return {
+        total: '模型 / Token 将在调用后显示',
+        note: '生成过程中会按环节持续刷新',
+        legacy: false,
+      };
+    }
+    if (hasReport) {
+      return { total: REPORT_LLM_LEGACY_TEXT, note: '', legacy: true };
+    }
+    return { total: '', note: '', legacy: false };
+  }
+  if (!running && hasReport && usageState.hasAnySignal === false) {
+    return { total: REPORT_LLM_LEGACY_TEXT, note: '', legacy: true };
+  }
+  const totals = usageState.totals;
+  const total = _reportUsageTokensText(totals, { waitingText: 'Token 待统计' });
+  const noteParts = [];
+  const modelText = _reportUsageModelText(totals, { running });
+  if (modelText && modelText !== '等待开始' && modelText !== '模型待调用') noteParts.push(modelText);
+  if (totals.call_count > 0) noteParts.push(`共 ${totals.call_count} 次调用`);
+  return {
+    total,
+    note: noteParts.join(' · '),
+    legacy: false,
+  };
+}
+
+function renderReportLlmUsage({ progressState = null, running = false } = {}) {
+  const ctx = activeReportCtx();
+  const usageState = normalizeReportLlmUsage(ctx?.reportLlmUsage);
+  const hasReport = Boolean(ctx?.reportMd);
+  const summary = _reportUsageSummaryTexts(usageState, { running, hasReport });
+
+  document.querySelectorAll('[data-report-phase-meta]').forEach(element => {
+    const phase = element.dataset.reportPhaseMeta;
+    element.textContent = _reportUsagePhaseMeta(
+      phase,
+      progressState,
+      usageState,
+      { running, hasReport },
+    );
+    element.title = element.textContent;
+  });
+
+  const summaryBox = $('report-llm-summary');
+  const summaryTotal = $('report-llm-total');
+  const summaryNote = $('report-llm-summary-note');
+  if (summaryBox && summaryTotal && summaryNote) {
+    const visible = running || hasReport || Boolean(usageState);
+    summaryBox.hidden = !visible;
+    summaryTotal.textContent = summary.total || (running ? '模型 / Token 将在调用后显示' : REPORT_LLM_LEGACY_TEXT);
+    summaryNote.textContent = summary.note;
+  }
+
+  const toolbar = $('report-toolbar-llm');
+  const popover = $('report-llm-popover');
+  const toolbarTotal = $('report-toolbar-llm-total');
+  const toolbarNote = $('report-toolbar-llm-note');
+  const toolbarPhases = $('report-toolbar-llm-phases');
+  if (!toolbar || !popover || !toolbarTotal || !toolbarNote || !toolbarPhases) return;
+
+  const toolbarVisible = hasReport || Boolean(usageState) || running;
+  popover.hidden = !toolbarVisible;
+  if (!toolbarVisible) setReportLlmPopoverOpen(false);
+  toolbarTotal.textContent = summary.total || REPORT_LLM_LEGACY_TEXT;
+  toolbarNote.textContent = summary.note;
+  toolbarPhases.innerHTML = REPORT_PHASE_ORDER.map(phase => {
+    const phaseUsage = usageState?.phases?.[phase] || null;
+    const hasPhaseData = Boolean(
+      phaseUsage
+      && (
+        phaseUsage.call_count
+        || phaseUsage.total_tokens
+        || phaseUsage.usage_missing_call_count
+        || phaseUsage.active_calls
+        || phaseUsage.models_used.length
+        || phaseUsage.fallback_models_used.length
+      )
+    );
+    const phaseStatus = progressState?.phases?.[phase] || '';
+    const className = hasPhaseData
+      ? (phaseUsage?.active_calls > 0 || phaseStatus === 'active'
+        ? 'report-toolbar__llm-phase report-toolbar__llm-phase--active'
+        : 'report-toolbar__llm-phase report-toolbar__llm-phase--done')
+      : `report-toolbar__llm-phase${summary.legacy ? ' report-toolbar__llm-phase--legacy' : ''}`;
+    const meta = _reportUsagePhaseMeta(
+      phase,
+      progressState,
+      usageState,
+      { running: running && state.viewMode === 'session', hasReport },
+    );
+    const detailLines = _reportUsagePhaseDetailLines(phaseUsage, meta);
+    return `
+      <div class="${className}">
+        <strong>${esc(REPORT_PHASE_LABELS[phase])}</strong>
+        <div class="report-toolbar__llm-phase-details" title="${esc(detailLines.join('；'))}">
+          ${detailLines.map(line => `<span>${esc(line)}</span>`).join('')}
+        </div>
+      </div>`;
+  }).join('');
+}
 
 function _createReportTaskProgress() {
   return {
@@ -177,6 +458,10 @@ function _renderReportPhaseTrack(progressState) {
     const phase = element.dataset.reportPhase;
     const status = progressState.phases[phase] || 'pending';
     element.className = `report-phase report-phase--${status}`;
+  });
+  renderReportLlmUsage({
+    progressState: state.viewMode === 'session' ? progressState : null,
+    running: state.viewMode === 'session' && state.sessionReport.running,
   });
 }
 
@@ -419,6 +704,11 @@ function syncReportVersionMeta(target, meta = {}) {
   }
   const completedAt = meta.report_completed_at ?? selectedSummary?.report_completed_at;
   if (completedAt !== undefined) target.reportCompletedAt = completedAt || '';
+  const hasLlmUsage = Object.prototype.hasOwnProperty.call(meta, 'report_llm_usage')
+    || Object.prototype.hasOwnProperty.call(selectedSummary || {}, 'report_llm_usage');
+  if (hasLlmUsage) {
+    target.reportLlmUsage = normalizeReportLlmUsage(meta.report_llm_usage ?? selectedSummary?.report_llm_usage);
+  }
 }
 
 function activeVersionNumber(ctx = activeReportCtx()) {
@@ -452,6 +742,7 @@ async function loadSessionReportVersion(version) {
     state.sessionReport.feishuLinkHtml = '';
     syncReportVersionMeta(state.sessionReport, {
       ...data,
+      report_llm_usage: data.report_llm_usage,
       version: data.version ?? version,
       selected_version: data.version ?? version,
     });
@@ -492,6 +783,7 @@ async function loadHistoryReportVersion(version) {
     state.historyReport.feishuLinkHtml = '';
     syncReportVersionMeta(state.historyReport, {
       ...data,
+      report_llm_usage: data.report_llm_usage,
       version: data.version ?? version,
       selected_version: data.version ?? version,
     });
@@ -605,6 +897,7 @@ async function runStats(options = {}) {
   state.sessionReport.title = '';
   state.sessionReport.reportDurationSeconds = null;
   state.sessionReport.reportCompletedAt = '';
+  state.sessionReport.reportLlmUsage = null;
   goStep(4);
   resetReportFailureUi();
   $('ps-stats').classList.remove('progress-step--done', 'progress-step--failed');
@@ -704,6 +997,12 @@ async function runStats(options = {}) {
         const el = $('report-stream-content');
         if (el && !fullReport) _renderReportPreparationSteps(el, taskProgress);
       }
+      if (ev.type === 'report_llm_status') {
+        state.sessionReport.reportLlmUsage = normalizeReportLlmUsage(ev.report_llm_usage);
+        if (state.viewMode === 'session') {
+          renderReportLlmUsage({ progressState: taskProgress, running: true });
+        }
+      }
       if (ev.type === 'progress') {
         // 服务端按完整章节输出；状态区持续说明当前步骤，避免等待期间像卡死。
         const parsed = _parseReportProgress(ev.message);
@@ -757,6 +1056,7 @@ async function runStats(options = {}) {
         }
       }
       if (ev.type === 'report_done') {
+        const completedLlmUsage = ev.report_llm_usage ?? state.sessionReport.reportLlmUsage;
         generationCompleted = true;
         completedSteps = totalSteps || completedSteps;
         renderGenerationStatus();
@@ -770,6 +1070,9 @@ async function runStats(options = {}) {
         state.sessionReport.qaMessages = [];
         state.sessionReport.qaHtml = '';
         state.sessionReport.feishuLinkHtml = '';
+        state.sessionReport.reportLlmUsage = normalizeReportLlmUsage(
+          completedLlmUsage,
+        );
         const doneVersion = toFiniteVersion(ev.version) || (isLinkedRerun ? targetVersion : null);
         syncReportVersionMeta(state.sessionReport, {
           ...ev,
@@ -1236,6 +1539,7 @@ function updateReportContextSwitch() {
     historyInfo.textContent = [ctx.reportNo, createdText, modeLabel, durationText].filter(Boolean).join(' · ');
   }
   updateReportVersionUi();
+  renderReportLlmUsage({ running: state.viewMode === 'session' && state.sessionReport.running });
 }
 
 function applyQAAvailability() {
@@ -1424,6 +1728,7 @@ function renderReportWorkspace(md, { preserveQa = true } = {}) {
   applyQAAvailability();
   updateReportContextSwitch();
   updateReportVersionUi();
+  renderReportLlmUsage({ running: state.viewMode === 'session' && state.sessionReport.running });
   applyCoreHighlight();
   removeLegacyStatsChartPayloads();
   enhanceReportTables();
@@ -1466,6 +1771,7 @@ function switchReportContext(mode) {
     $('ps-stats').classList.remove('progress-step--active');
     $('ps-stats').classList.add('progress-step--done');
     $('ps-writing').classList.add('progress-step--active');
+    renderReportLlmUsage({ running: true });
   } else if (state.sessionReport.error) {
     goStep(4);
     $('report-stream-content').textContent = state.sessionReport.stream || '';
@@ -1490,6 +1796,25 @@ $('btn-report-history')?.addEventListener('click', () => {
   loadHistory();
 });
 $('btn-report-back-session')?.addEventListener('click', () => switchReportContext('session'));
+function setReportLlmPopoverOpen(open) {
+  const popover = $('report-llm-popover');
+  const trigger = $('btn-report-llm-usage');
+  const panel = $('report-toolbar-llm');
+  if (!popover || !trigger || !panel) return;
+  const nextOpen = Boolean(open) && !popover.hidden;
+  popover.classList.toggle('report-llm-popover--open', nextOpen);
+  trigger.setAttribute('aria-expanded', String(nextOpen));
+  panel.hidden = !nextOpen;
+}
+
+$('btn-report-llm-usage')?.addEventListener('click', e => {
+  e.stopPropagation();
+  const trigger = e.currentTarget;
+  setReportVersionMenuOpen(false);
+  $('export-dropdown-menu')?.classList.remove('open');
+  setReportLlmPopoverOpen(trigger.getAttribute('aria-expanded') !== 'true');
+});
+
 function setReportVersionMenuOpen(open) {
   const picker = $('report-version-picker');
   const trigger = $('report-version-trigger');
@@ -1504,6 +1829,7 @@ function setReportVersionMenuOpen(open) {
 $('report-version-trigger')?.addEventListener('click', e => {
   e.stopPropagation();
   const trigger = e.currentTarget;
+  setReportLlmPopoverOpen(false);
   setReportVersionMenuOpen(trigger.getAttribute('aria-expanded') !== 'true');
 });
 
@@ -1528,10 +1854,14 @@ $('report-version-menu')?.addEventListener('click', async e => {
 
 document.addEventListener('click', e => {
   if (!e.target.closest('#report-version-picker')) setReportVersionMenuOpen(false);
+  if (!e.target.closest('#report-llm-popover')) setReportLlmPopoverOpen(false);
 });
 
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') setReportVersionMenuOpen(false);
+  if (e.key === 'Escape') {
+    setReportVersionMenuOpen(false);
+    setReportLlmPopoverOpen(false);
+  }
 });
 
 function closeReportVersionManageModal() {
@@ -1812,72 +2142,14 @@ async function refreshFeishuStatus() {
   const label = $('feishu-login-label');
   if (label) {
     label.textContent = state.feishu.logged_in
-      ? `飞书：${state.feishu.name || state.feishu.email || '已登录'}`
+      ? `个人中心 · ${state.feishu.name || state.feishu.email || '已登录'}`
       : '登录飞书';
   }
   applyPermGating();
-}
-
-function showFeishuLogoutConfirmModal(account) {
-  return new Promise(resolve => {
-    const existing = $('feishu-logout-modal');
-    if (existing) existing.remove();
-
-    const modal = document.createElement('div');
-    modal.id = 'feishu-logout-modal';
-    modal.style.cssText = 'position:fixed;inset:0;z-index:200;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.5);backdrop-filter:blur(4px);';
-    modal.innerHTML = `
-      <div role="dialog" aria-modal="true" aria-labelledby="feishu-logout-title"
-           style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
-                  padding:24px 28px;width:min(400px,90vw);display:flex;flex-direction:column;gap:16px;
-                  box-shadow:var(--shadow-lg)">
-        <div id="feishu-logout-title" style="font-size:15px;font-weight:600;color:var(--text)">退出飞书登录？</div>
-        <div style="font-size:13px;color:var(--text-2);line-height:1.7">
-          当前账号为 <strong style="color:var(--text)">${esc(account)}</strong>。退出后，如需继续使用飞书相关功能，需要重新登录授权。
-        </div>
-        <div style="display:flex;gap:8px;justify-content:flex-end">
-          <button class="btn btn--ghost" id="feishu-logout-cancel" type="button">取消</button>
-          <button class="btn btn--primary" id="feishu-logout-confirm" type="button">确认退出</button>
-        </div>
-      </div>`;
-    document.body.appendChild(modal);
-
-    const onKeydown = event => {
-      if (event.key === 'Escape') cleanup(false);
-    };
-    const cleanup = result => {
-      document.removeEventListener('keydown', onKeydown);
-      modal.remove();
-      resolve(result);
-    };
-    $('feishu-logout-cancel').onclick = () => cleanup(false);
-    $('feishu-logout-confirm').onclick = () => cleanup(true);
-    modal.addEventListener('click', event => {
-      if (event.target === modal) cleanup(false);
-    });
-    document.addEventListener('keydown', onKeydown);
-    $('feishu-logout-cancel').focus();
-  });
-}
-
-$('btn-feishu-login').addEventListener('click', async () => {
-  if (!state.feishu.configured) {
-    showToast('服务端未配置飞书应用（FEISHU_APP_ID/SECRET/REDIRECT_URI）', 'error');
-    return;
+  if (typeof window.syncProfileFromFeishuStatus === 'function') {
+    window.syncProfileFromFeishuStatus(state.feishu);
   }
-  if (state.feishu.logged_in) {
-    const account = state.feishu.email || state.feishu.name || '当前账号';
-    const confirmed = await showFeishuLogoutConfirmModal(account);
-    if (!confirmed) return;
-    try {
-      await fetch('/api/feishu/logout', { method: 'POST' });
-    } catch { }
-    showToast('已退出飞书登录', 'info');
-    window.location.href = '/login';
-    return;
-  }
-  window.location.href = `/api/feishu/login?next=${encodeURIComponent(location.pathname)}`;
-});
+}
 
 // ── 飞书文档导出 ──
 $('btn-export-pdf').addEventListener('click', () => {
@@ -2002,6 +2274,8 @@ function showFeishuLink(url) {
 // Export dropdown toggle
 $('btn-export-dropdown').addEventListener('click', e => {
   e.stopPropagation();
+  setReportLlmPopoverOpen(false);
+  setReportVersionMenuOpen(false);
   $('export-dropdown-menu').classList.toggle('open');
 });
 document.addEventListener('click', e => {

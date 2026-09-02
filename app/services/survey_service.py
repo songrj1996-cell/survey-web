@@ -153,6 +153,214 @@ _REPORT_GENERATION_LOCKS: dict[str, asyncio.Lock] = {}
 _REPORT_RERUN_TARGET_LOCKS: dict[str, asyncio.Lock] = {}
 _NON_VERSIONED_REPORT_MODES = {"comment", "interview", "annotate"}
 _CHINESE_CHARACTER_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
+_REPORT_LLM_PHASES = ("themes", "synthesis", "writing", "finalize")
+
+
+def _empty_report_llm_phase() -> dict:
+    return {
+        "models_used": [],
+        "fallback_models_used": [],
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "call_count": 0,
+        "usage_reported_call_count": 0,
+        "usage_missing_call_count": 0,
+        "active_calls": 0,
+        "active_models": {},
+    }
+
+
+class _ReportLLMUsageTracker:
+    """汇总一次报告生成中的真实上游模型调用和 usage 快照。"""
+
+    def __init__(self) -> None:
+        self._phases = {
+            phase: _empty_report_llm_phase() for phase in _REPORT_LLM_PHASES
+        }
+        self._active_attempts: dict[str, dict[str, dict]] = {
+            phase: {} for phase in _REPORT_LLM_PHASES
+        }
+        self._closed_call_ids: dict[str, set[str]] = {
+            phase: set() for phase in _REPORT_LLM_PHASES
+        }
+        self._legacy_call_sequence = 0
+        self._changed = asyncio.Event()
+
+    def callback(self, phase: str):
+        if phase not in self._phases:
+            raise ValueError(f"unknown report LLM phase: {phase}")
+
+        def _record(event: dict) -> None:
+            if not isinstance(event, dict):
+                return
+            status = str(event.get("status") or "").strip().lower()
+            attempted_model = str(
+                event.get("model") or event.get("requested_model") or ""
+            ).strip()
+            phase_usage = self._phases[phase]
+            active_attempts = self._active_attempts[phase]
+            closed_call_ids = self._closed_call_ids[phase]
+            call_id = str(event.get("call_id") or "").strip()
+
+            if status == "started":
+                if not call_id:
+                    self._legacy_call_sequence += 1
+                    call_id = f"legacy:{phase}:{self._legacy_call_sequence}"
+                if call_id in active_attempts or call_id in closed_call_ids:
+                    return
+                active_attempts[call_id] = {
+                    "model": attempted_model,
+                    "fallback": bool(event.get("fallback")),
+                }
+                phase_usage["call_count"] += 1
+                phase_usage["active_calls"] += 1
+                if attempted_model:
+                    active_models = phase_usage["active_models"]
+                    active_models[attempted_model] = (
+                        int(active_models.get(attempted_model) or 0) + 1
+                    )
+                self._changed.set()
+                return
+
+            if status not in {"completed", "failed"}:
+                return
+
+            if not call_id:
+                for active_call_id, active_attempt in active_attempts.items():
+                    if not attempted_model or active_attempt["model"] == attempted_model:
+                        call_id = active_call_id
+                        break
+            if not call_id or call_id in closed_call_ids:
+                return
+            active_attempt = active_attempts.pop(call_id, None)
+            if active_attempt is None:
+                return
+            closed_call_ids.add(call_id)
+            started_model = str(active_attempt.get("model") or "").strip()
+            response_model = str(event.get("response_model") or "").strip()
+            resolved_model = response_model or attempted_model or started_model
+
+            phase_usage["active_calls"] = max(
+                0, int(phase_usage["active_calls"] or 0) - 1
+            )
+            if started_model:
+                active_models = phase_usage["active_models"]
+                remaining = max(0, int(active_models.get(started_model) or 0) - 1)
+                if remaining:
+                    active_models[started_model] = remaining
+                else:
+                    active_models.pop(started_model, None)
+            if resolved_model and resolved_model not in phase_usage["models_used"]:
+                phase_usage["models_used"].append(resolved_model)
+            if (
+                active_attempt.get("fallback")
+                and resolved_model
+                and resolved_model not in phase_usage["fallback_models_used"]
+            ):
+                phase_usage["fallback_models_used"].append(resolved_model)
+
+            usage = event.get("usage")
+            usage_values = None
+            if isinstance(usage, dict):
+                values = []
+                for key in ("input_tokens", "output_tokens", "total_tokens"):
+                    value = usage.get(key)
+                    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                        values.append(value)
+                    else:
+                        break
+                if len(values) == 3:
+                    usage_values = values
+
+            if usage_values is not None:
+                phase_usage["input_tokens"] += usage_values[0]
+                phase_usage["output_tokens"] += usage_values[1]
+                phase_usage["total_tokens"] += usage_values[2]
+                phase_usage["usage_reported_call_count"] += 1
+            usage_complete = event.get("usage_complete") is True
+            if "usage_complete" not in event and status == "completed":
+                # 兼容现有测试桩/调用方；正式客户端始终显式提供完整性标记。
+                usage_complete = usage_values is not None
+            if usage_values is None or not usage_complete:
+                phase_usage["usage_missing_call_count"] += 1
+            self._changed.set()
+
+        return _record
+
+    def finalize_open_attempts(self) -> bool:
+        """报告结束时把异常遗留的调用闭合为 usage 未知，避免保留活动态。"""
+        changed = False
+        for phase in _REPORT_LLM_PHASES:
+            phase_usage = self._phases[phase]
+            active_attempts = self._active_attempts[phase]
+            closed_call_ids = self._closed_call_ids[phase]
+            for call_id, active_attempt in list(active_attempts.items()):
+                attempted_model = str(active_attempt.get("model") or "").strip()
+                phase_usage["active_calls"] = max(
+                    0, int(phase_usage["active_calls"] or 0) - 1
+                )
+                if attempted_model:
+                    active_models = phase_usage["active_models"]
+                    remaining = max(
+                        0, int(active_models.get(attempted_model) or 0) - 1
+                    )
+                    if remaining:
+                        active_models[attempted_model] = remaining
+                    else:
+                        active_models.pop(attempted_model, None)
+                    if attempted_model not in phase_usage["models_used"]:
+                        phase_usage["models_used"].append(attempted_model)
+                    if (
+                        active_attempt.get("fallback")
+                        and attempted_model not in phase_usage["fallback_models_used"]
+                    ):
+                        phase_usage["fallback_models_used"].append(attempted_model)
+                phase_usage["usage_missing_call_count"] += 1
+                closed_call_ids.add(call_id)
+                active_attempts.pop(call_id, None)
+                changed = True
+        if changed:
+            self._changed.set()
+        return changed
+
+    async def wait_for_change(self) -> None:
+        await self._changed.wait()
+
+    def consume_change(self) -> bool:
+        if not self._changed.is_set():
+            return False
+        self._changed.clear()
+        return True
+
+    def snapshot(self) -> dict:
+        phases = deepcopy(self._phases)
+        totals = _empty_report_llm_phase()
+        for phase in _REPORT_LLM_PHASES:
+            phase_usage = phases[phase]
+            for key in (
+                "input_tokens",
+                "output_tokens",
+                "total_tokens",
+                "call_count",
+                "usage_reported_call_count",
+                "usage_missing_call_count",
+                "active_calls",
+            ):
+                totals[key] += int(phase_usage.get(key) or 0)
+            for key in ("models_used", "fallback_models_used"):
+                for model in phase_usage.get(key) or []:
+                    if model not in totals[key]:
+                        totals[key].append(model)
+            for model, count in (phase_usage.get("active_models") or {}).items():
+                totals["active_models"][model] = (
+                    int(totals["active_models"].get(model) or 0) + int(count or 0)
+                )
+        return {
+            "schema_version": 1,
+            "phases": phases,
+            "totals": totals,
+        }
 _LATIN_WORD_RE = re.compile(r"[A-Za-z]+")
 
 
@@ -1482,11 +1690,14 @@ def _content_events(text: str, chunk_size: int = 1200):
 async def _direct_writer_round(
     messages: list[dict],
     query: str,
+    *,
+    on_attempt_event=None,
 ) -> tuple[str, str]:
     """直连 LLM 完成一轮写作；成功后才把本轮加入本地对话历史。"""
     user_message = {"role": "user", "content": query}
     answer, model = await collect_chat_completion(
-        prepare_glossary_messages([*messages, user_message])
+        prepare_glossary_messages([*messages, user_message]),
+        on_attempt_event=on_attempt_event,
     )
     answer = normalize_glossary_terms(answer)
     messages.extend([
@@ -1553,6 +1764,14 @@ async def report_stream(
         {"role": "system", "content": _get_report_writer_system_prompt()}
     ]
     writer_models_used: list[str] = []
+    report_llm_usage = _ReportLLMUsageTracker()
+
+    def _report_llm_status_event() -> str:
+        return sse_event({
+            "type": "report_llm_status",
+            "report_llm_usage": report_llm_usage.snapshot(),
+        })
+
     generation_lock = _report_generation_lock(session_id)
     rerun_target_lock: asyncio.Lock | None = None
     rerun_target_lock_acquired = False
@@ -1651,19 +1870,82 @@ async def report_stream(
                 f"报告版本已达上限（{MAX_REPORT_VERSIONS} 个），请先删除一个旧版本。"
             )
 
-        async def _writer_call(query: str):
-            """等待完整写作轮次时发送轻量心跳，避免 SSE 代理空闲超时。"""
-            task = asyncio.create_task(_direct_writer_round(writer_messages, query))
+        async def _iterate_report_llm_stage(source):
+            """让内部生成器事件与即时模型/usage 快照并行向外透传。"""
+            iterator = source.__aiter__()
+            next_item = asyncio.create_task(iterator.__anext__())
+            changed = asyncio.create_task(report_llm_usage.wait_for_change())
             try:
                 while True:
                     done, _ = await asyncio.wait(
-                        {task}, timeout=LLM_STREAM_HEARTBEAT_SECONDS
+                        {next_item, changed},
+                        return_when=asyncio.FIRST_COMPLETED,
                     )
+                    has_change = changed in done
+                    if report_llm_usage.consume_change():
+                        has_change = True
+                    if has_change:
+                        yield "llm_status", _report_llm_status_event()
+                        if not changed.done():
+                            changed.cancel()
+                            with suppress(asyncio.CancelledError):
+                                await changed
+                        changed = asyncio.create_task(
+                            report_llm_usage.wait_for_change()
+                        )
+                    if next_item not in done:
+                        continue
+                    try:
+                        item = next_item.result()
+                    except StopAsyncIteration:
+                        return
+                    yield "item", item
+                    next_item = asyncio.create_task(iterator.__anext__())
+            finally:
+                for task in (next_item, changed):
+                    if not task.done():
+                        task.cancel()
+                for task in (next_item, changed):
+                    with suppress(asyncio.CancelledError, StopAsyncIteration):
+                        await task
+
+        async def _writer_call(query: str, *, phase: str = "writing"):
+            """等待完整写作轮次时发送轻量心跳，避免 SSE 代理空闲超时。"""
+            task = asyncio.create_task(_direct_writer_round(
+                writer_messages,
+                query,
+                on_attempt_event=report_llm_usage.callback(phase),
+            ))
+            changed = asyncio.create_task(report_llm_usage.wait_for_change())
+            try:
+                while True:
+                    done, _ = await asyncio.wait(
+                        {task, changed},
+                        timeout=LLM_STREAM_HEARTBEAT_SECONDS,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    has_change = changed in done
+                    if report_llm_usage.consume_change():
+                        has_change = True
+                    if has_change:
+                        yield _report_llm_status_event()
+                        if not changed.done():
+                            changed.cancel()
+                            with suppress(asyncio.CancelledError):
+                                await changed
+                        changed = asyncio.create_task(
+                            report_llm_usage.wait_for_change()
+                        )
                     if task in done:
                         _writer_call.out = task.result()
                         return
-                    yield sse_event({"type": "heartbeat"})
+                    if not done:
+                        yield sse_event({"type": "heartbeat"})
             finally:
+                if not changed.done():
+                    changed.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await changed
                 if not task.done():
                     task.cancel()
                     with suppress(asyncio.CancelledError):
@@ -1700,6 +1982,7 @@ async def report_stream(
         viewpoint_stats_md = ""
         viewpoint_diagnostics = build_viewpoint_diagnostics({}, [], "")
         writer_context_included = False
+        yield _report_llm_status_event()
 
         if use_large_mode:
             total_open_text = sum(len(v) for v in open_text.values())
@@ -1712,13 +1995,21 @@ async def report_stream(
             clustered_themes: dict = {}
             cluster_diagnostics: dict = {}
             cluster_metrics: dict = {}
-            async for item in _batch_qualitative_analysis(
-                open_text,
-                plan,
-                rows[0],
-                session_id,
-                deduplicate_respondents=not quantitative_first and not is_crosstab,
+            async for stream_kind, item in _iterate_report_llm_stage(
+                _batch_qualitative_analysis(
+                    open_text,
+                    plan,
+                    rows[0],
+                    session_id,
+                    deduplicate_respondents=(
+                        not quantitative_first and not is_crosstab
+                    ),
+                    on_attempt_event=report_llm_usage.callback("themes"),
+                )
             ):
+                if stream_kind == "llm_status":
+                    yield item
+                    continue
                 if item[0] == "progress":
                     yield sse_event({"type": "progress", "message": item[1]})
                 elif item[0] == "analysis_progress":
@@ -1772,9 +2063,18 @@ async def report_stream(
             report_viewpoints: list[dict] = []
             if not quantitative_first and not is_crosstab:
                 synthesis_event_seen = False
-                async for item in build_report_viewpoint_stats(
-                    clustered_themes, open_text, plan, rows[0]
+                async for stream_kind, item in _iterate_report_llm_stage(
+                    build_report_viewpoint_stats(
+                        clustered_themes,
+                        open_text,
+                        plan,
+                        rows[0],
+                        on_attempt_event=report_llm_usage.callback("synthesis"),
+                    )
                 ):
+                    if stream_kind == "llm_status":
+                        yield item
+                        continue
                     if item[0] == "progress":
                         yield sse_event({"type": "progress", "message": item[1]})
                     elif item[0] == "analysis_progress":
@@ -1865,13 +2165,19 @@ async def report_stream(
                     "active",
                     "正在逐题提炼主题并按玩家去重统计提及人数",
                 )
-                async for item in _batch_qualitative_analysis(
-                    open_text,
-                    plan,
-                    rows[0],
-                    session_id,
-                    deduplicate_respondents=True,
+                async for stream_kind, item in _iterate_report_llm_stage(
+                    _batch_qualitative_analysis(
+                        open_text,
+                        plan,
+                        rows[0],
+                        session_id,
+                        deduplicate_respondents=True,
+                        on_attempt_event=report_llm_usage.callback("themes"),
+                    )
                 ):
+                    if stream_kind == "llm_status":
+                        yield item
+                        continue
                     if item[0] == "progress":
                         yield sse_event({"type": "progress", "message": item[1]})
                     elif item[0] == "analysis_progress":
@@ -1915,9 +2221,18 @@ async def report_stream(
                 )
 
                 synthesis_event_seen = False
-                async for item in build_report_viewpoint_stats(
-                    clustered_themes, open_text, plan, rows[0]
+                async for stream_kind, item in _iterate_report_llm_stage(
+                    build_report_viewpoint_stats(
+                        clustered_themes,
+                        open_text,
+                        plan,
+                        rows[0],
+                        on_attempt_event=report_llm_usage.callback("synthesis"),
+                    )
                 ):
+                    if stream_kind == "llm_status":
+                        yield item
+                        continue
                     if item[0] == "progress":
                         yield sse_event({"type": "progress", "message": item[1]})
                     elif item[0] == "analysis_progress":
@@ -2182,7 +2497,8 @@ async def report_stream(
                 })
                 try:
                     async for heartbeat in _writer_call(
-                        _build_comparison_repair_query(repairable_issues)
+                        _build_comparison_repair_query(repairable_issues),
+                        phase="finalize",
                     ):
                         yield heartbeat
                     repair_text, repair_model = _writer_call.out
@@ -2254,6 +2570,7 @@ async def report_stream(
         precommit_session = deepcopy(sess)
         completion_timing = _report_completion_timing(sess)
         sess.update(completion_timing)
+        report_llm_usage.finalize_open_attempts()
         snapshot = {
             "report_md": full_report,
             "title": "",
@@ -2265,6 +2582,7 @@ async def report_stream(
             "analyst_app": "large" if use_large_mode else "standard",
             "report_writer_provider": "direct_llm",
             "report_writer_model": writer_model,
+            "report_llm_usage": report_llm_usage.snapshot(),
             "viewpoint_diagnostics": viewpoint_diagnostics,
             "comparison_validation": comparison_validation,
             **completion_timing,
@@ -2326,6 +2644,7 @@ async def report_stream(
             "type": "report_done",
             "report_md": full_report,
             "comparison_validation": comparison_validation,
+            "report_llm_usage": report_llm_usage.snapshot(),
             "version": committed_version["version"],
             **completion_timing,
             **(
@@ -2340,6 +2659,8 @@ async def report_stream(
         })
     except Exception as e:
         import traceback; traceback.print_exc()
+        report_llm_usage.finalize_open_attempts()
+        yield _report_llm_status_event()
         yield sse_event({"type": "error", "message": str(e)})
     finally:
         if rerun_target_lock is not None and rerun_target_lock_acquired:

@@ -60,6 +60,7 @@ _VERSION_MIRROR_FIELDS = (
     "analyst_conv_id",
     "analyst_app",
     "comparison_validation",
+    "report_llm_usage",
 )
 
 
@@ -489,6 +490,10 @@ def save_to_history(
                 "active_report_version": version_source["active_report_version"],
                 "next_report_version": version_source["next_report_version"],
             })
+            if "report_llm_usage" in active_source:
+                entry["report_llm_usage"] = deepcopy(
+                    active_source["report_llm_usage"]
+                )
         if sess.get("mode") == "comment":
             entry.update({
                 "comment_file_hash": sess.get("comment_file_hash", ""),
@@ -535,6 +540,8 @@ def _copy_report_version_state(target: dict, source: dict) -> None:
     ):
         if field in source:
             target[field] = deepcopy(source[field])
+        elif field == "report_llm_usage":
+            target.pop(field, None)
 
 
 def append_exact_rerun_to_history(

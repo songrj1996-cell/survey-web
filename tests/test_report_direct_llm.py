@@ -479,7 +479,7 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
             (ACTION_SECTION_MD, "model-a"),
         ])
 
-        async def slow_writer(*_args):
+        async def slow_writer(*_args, **_kwargs):
             import asyncio
             await asyncio.sleep(0.01)
             return next(answers)
@@ -547,7 +547,7 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
         ])
         writer_calls: list[tuple[list[dict], str]] = []
 
-        async def capture_writer(messages, query):
+        async def capture_writer(messages, query, **_kwargs):
             writer_calls.append((deepcopy(messages), query))
             answer, model = next(answers)
             messages.extend([

@@ -260,7 +260,9 @@ class CrossQuestionViewpointTests(unittest.IsolatedAsyncioTestCase):
             ]
         }
 
+        attempt_callback = object()
         merge_call = AsyncMock(return_value={"data": {"themes": merged_themes}})
+        classify_call = AsyncMock(return_value=classified)
         with (
             patch.object(
                 report_engine,
@@ -275,12 +277,16 @@ class CrossQuestionViewpointTests(unittest.IsolatedAsyncioTestCase):
             patch.object(
                 report_engine,
                 "_classify_batch_direct",
-                new=AsyncMock(return_value=classified),
+                new=classify_call,
             ),
         ):
             events = [
                 item async for item in build_report_viewpoint_stats(
-                    clustered, open_text, plan, ["ID", "界面反馈", "使用反馈"]
+                    clustered,
+                    open_text,
+                    plan,
+                    ["ID", "界面反馈", "使用反馈"],
+                    on_attempt_event=attempt_callback,
                 )
             ]
 
@@ -294,6 +300,14 @@ class CrossQuestionViewpointTests(unittest.IsolatedAsyncioTestCase):
         merge_query = merge_call.await_args.args[1]
         self.assertIn("最终主题不设置最少或最多数量", merge_system_prompt)
         self.assertIn('"candidate_id": "c0001"', merge_query)
+        self.assertIs(
+            merge_call.await_args.kwargs["on_attempt_event"],
+            attempt_callback,
+        )
+        self.assertIs(
+            classify_call.await_args.kwargs["on_attempt_event"],
+            attempt_callback,
+        )
 
 
 if __name__ == "__main__":

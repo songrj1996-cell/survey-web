@@ -2,10 +2,9 @@
 
 业务编排、SSE 流程、session 推进、历史落库全部在 services/annotate_workflow。
 """
-from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Request, UploadFile
 from fastapi.responses import StreamingResponse
 
-from app.core.config import LLM_API_KEY
 from app.core.responses import _make_download_response
 from app.schemas.requests import (
     AnnotateConfirmAIRequest,
@@ -23,6 +22,11 @@ from app.services.annotate_workflow import (
 )
 from app.services.audit import audit_log
 from app.services.auth import _current_login, _require_feature
+from app.services.llm_credentials import (
+    require_request_llm_api_key,
+    run_with_llm_api_key,
+    stream_with_llm_api_key,
+)
 
 
 async def _require_annotate_access(request: Request):
@@ -40,7 +44,15 @@ _ANNOTATE_SSE_HEADERS = {
 async def annotate_upload(request: Request, file: UploadFile = File(...)):
     content = await file.read()
     login = await _current_login(request)
-    result = await handle_annotate_upload(file.filename or "upload.csv", content, login)
+    api_key = await require_request_llm_api_key(request)
+    result = await run_with_llm_api_key(
+        handle_annotate_upload(file.filename or "upload.csv", content, login),
+        api_key,
+        request=request,
+        category="annotate",
+        action="上传翻译与识别",
+        title=file.filename or "upload.csv",
+    )
     await audit_log(
         request, "annotate", "上传标注数据",
         f"文件：{result['filename']}；样本行数：{result['total_rows']}",
@@ -62,11 +74,17 @@ async def annotate_confirm_columns(sid: str, req: AnnotateConfirmRequest, reques
 
 @router.get("/api/annotate/{sid}/run-ai-detect")
 async def annotate_run_ai_detect(sid: str, request: Request):
-    if not LLM_API_KEY:
-        raise HTTPException(status_code=500, detail="未配置 LLM_API_KEY")
     validate_annotate_session_for_ai(sid)
+    api_key = await require_request_llm_api_key(request)
     return StreamingResponse(
-        ai_detect_stream(sid, request),
+        stream_with_llm_api_key(
+            ai_detect_stream(sid, request),
+            api_key,
+            request=request,
+            category="annotate",
+            action="AI 作答识别",
+            reference_id=sid,
+        ),
         media_type="text/event-stream",
         headers=_ANNOTATE_SSE_HEADERS,
     )
@@ -86,11 +104,17 @@ async def annotate_confirm_ai(sid: str, req: AnnotateConfirmAIRequest, request: 
 @router.get("/api/annotate/{sid}/run-quality")
 async def annotate_run_quality(sid: str, request: Request):
     from app.services.annotate_workflow import quality_stream
-    if not LLM_API_KEY:
-        raise HTTPException(status_code=500, detail="未配置 LLM_API_KEY")
     validate_annotate_session_for_quality(sid)
+    api_key = await require_request_llm_api_key(request)
     return StreamingResponse(
-        quality_stream(sid, request),
+        stream_with_llm_api_key(
+            quality_stream(sid, request),
+            api_key,
+            request=request,
+            category="annotate",
+            action="回答质量识别",
+            reference_id=sid,
+        ),
         media_type="text/event-stream",
         headers=_ANNOTATE_SSE_HEADERS,
     )

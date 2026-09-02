@@ -69,6 +69,9 @@ COMMENT_QUOTE_SELECT_CONCURRENCY = max(
 # 问卷题型识别、方案规划、报告写作与报告追问直连公司 LLM 分发服务。
 LLM_API_BASE = os.getenv("LLM_API_BASE", "https://llm.moontontech.net/v1").rstrip("/")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "").strip()
+USER_LLM_KEY_ENCRYPTION_KEY = os.getenv(
+    "USER_LLM_KEY_ENCRYPTION_KEY", ""
+).strip()
 LLM_COLUMN_MODEL = os.getenv("LLM_COLUMN_MODEL", "gpt-5.6-terra").strip()
 LLM_COLUMN_FALLBACK_MODELS = (
     _env_csv_list("LLM_COLUMN_FALLBACK_MODELS") or ("qwen3.7-plus",)
@@ -361,6 +364,8 @@ AUDIT_LOG_FILE = os.path.join(DATA_DIR, "audit_logs.json")
 APP_SETTINGS_FILE = os.path.join(DATA_DIR, "app_settings.json")
 UI_TEXTS_FILE = os.path.join(DATA_DIR, "ui_texts.json")
 GLOSSARY_FILE = os.path.join(DATA_DIR, "glossary.json")
+USER_LLM_CREDENTIALS_FILE = os.path.join(DATA_DIR, "user_llm_credentials.json")
+USER_LLM_USAGE_FILE = os.path.join(DATA_DIR, "user_llm_usage.json")
 ANNOTATE_RESULT_DIR = Path(DATA_DIR) / "annotate_results"
 MAX_HISTORY  = 20
 MAX_REPORT_VERSIONS = 5

@@ -704,6 +704,7 @@ async def _direct_json_call(
     reasoning_effort: str | None,
     validator,
     on_repair=None,
+    on_attempt_event=None,
 ) -> dict:
     """调用直连 LLM 并做一次针对 JSON/业务 schema 的纠错重试。"""
     call_started = time.monotonic()
@@ -715,6 +716,7 @@ async def _direct_json_call(
                 models=models,
                 max_tokens=max_tokens,
                 reasoning_effort=reasoning_effort,
+                on_attempt_event=on_attempt_event,
             ),
             timeout=LLM_QUALITATIVE_CALL_TIMEOUT_SECONDS,
         )
@@ -771,6 +773,7 @@ async def _direct_json_call(
                 models=repair_models,
                 max_tokens=max_tokens,
                 reasoning_effort=reasoning_effort,
+                on_attempt_event=on_attempt_event,
             ),
             timeout=LLM_QUALITATIVE_CALL_TIMEOUT_SECONDS,
         )
@@ -1157,6 +1160,8 @@ async def _classify_batch_direct(
     question: str,
     final_themes: list[dict],
     batch: list[dict],
+    *,
+    on_attempt_event=None,
 ) -> dict:
     expected_ids = [str(index) for index in range(len(batch))]
     valid_theme_ids = {theme["id"] for theme in final_themes} | {"other"}
@@ -1177,6 +1182,7 @@ async def _classify_batch_direct(
         max_tokens=LLM_CLASSIFY_MAX_TOKENS,
         reasoning_effort=LLM_CLASSIFY_REASONING or None,
         validator=_root_validator,
+        on_attempt_event=on_attempt_event,
     )
     normalized = _normalize_classifications(
         first.get("data"), expected_ids, valid_theme_ids
@@ -1199,6 +1205,7 @@ async def _classify_batch_direct(
             max_tokens=LLM_CLASSIFY_MAX_TOKENS,
             reasoning_effort=LLM_CLASSIFY_REASONING or None,
             validator=_root_validator,
+            on_attempt_event=on_attempt_event,
         )
         repaired = _normalize_classifications(
             miss.get("data"), missing_ids, valid_theme_ids
@@ -1242,6 +1249,7 @@ async def _batch_qualitative_analysis(
     _scopes_override: list | None = None,
     _scope_position: tuple[int, int] | None = None,
     _batch_concurrency_override: int | None = None,
+    on_attempt_event=None,
 ):
     """大样本定性分析四阶段批处理。
 
@@ -1289,6 +1297,7 @@ async def _batch_qualitative_analysis(
                     _scopes_override=[scope],
                     _scope_position=(scope_index + 1, len(scopes)),
                     _batch_concurrency_override=1,
+                    on_attempt_event=on_attempt_event,
                 ):
                     if event[0] == "diagnostics":
                         scope_diagnostics = event[1]
@@ -1477,6 +1486,7 @@ async def _batch_qualitative_analysis(
                     on_repair=lambda error: repair_events.put_nowait(
                         {"batch": bi, "error": error}
                     ),
+                    on_attempt_event=on_attempt_event,
                 )
                 result["data"] = _hydrate_theme_candidate_quotes(
                     result.get("data"), source_texts
@@ -1620,6 +1630,7 @@ async def _batch_qualitative_analysis(
                 on_repair=lambda error: merge_repair_events.put_nowait(
                     {"error": error}
                 ),
+                on_attempt_event=on_attempt_event,
             )
 
         async for event_type, payload in _run_bounded_calls(
@@ -1714,7 +1725,12 @@ async def _batch_qualitative_analysis(
             )
 
             async def _classify(batch=batch):
-                return await _classify_batch_direct(col_name, final_themes, batch)
+                return await _classify_batch_direct(
+                    col_name,
+                    final_themes,
+                    batch,
+                    on_attempt_event=on_attempt_event,
+                )
 
             classify_factories.append(_classify)
 

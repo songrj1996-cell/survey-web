@@ -11,7 +11,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/style.css?v=43" />
+  <link rel="stylesheet" href="/static/style.css?v=47" />
 </head>
 
 <body>
@@ -145,7 +145,7 @@
             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M3.5 5h7L15 9.2 20.5 7l-3.8 8-4 3-4 2.3-5.2-3.5V9.5l7 4.4 6.2 1.1" />
           </svg>
-          <span id="feishu-login-label">登录飞书</span>
+          <span id="feishu-login-label">个人中心</span>
         </button>
       </div>
     </aside>
@@ -548,10 +548,38 @@
               <div class="report-generation-progress__bar" id="report-generation-progress-bar"></div>
             </div>
             <div class="report-phase-track" id="report-phase-track" aria-label="报告处理阶段">
-              <div class="report-phase" data-report-phase="themes"><span>1</span><strong>逐题主题分析</strong></div>
-              <div class="report-phase" data-report-phase="synthesis"><span>2</span><strong>跨题观点归纳</strong></div>
-              <div class="report-phase" data-report-phase="writing"><span>3</span><strong>报告撰写</strong></div>
-              <div class="report-phase" data-report-phase="finalize"><span>4</span><strong>校验并保存</strong></div>
+              <div class="report-phase" data-report-phase="themes">
+                <span class="report-phase__marker">1</span>
+                <div class="report-phase__body">
+                  <strong>逐题主题分析</strong>
+                  <small class="report-phase__meta" data-report-phase-meta="themes">等待开始</small>
+                </div>
+              </div>
+              <div class="report-phase" data-report-phase="synthesis">
+                <span class="report-phase__marker">2</span>
+                <div class="report-phase__body">
+                  <strong>跨题观点归纳</strong>
+                  <small class="report-phase__meta" data-report-phase-meta="synthesis">等待开始</small>
+                </div>
+              </div>
+              <div class="report-phase" data-report-phase="writing">
+                <span class="report-phase__marker">3</span>
+                <div class="report-phase__body">
+                  <strong>报告撰写</strong>
+                  <small class="report-phase__meta" data-report-phase-meta="writing">等待开始</small>
+                </div>
+              </div>
+              <div class="report-phase" data-report-phase="finalize">
+                <span class="report-phase__marker">4</span>
+                <div class="report-phase__body">
+                  <strong>校验并保存</strong>
+                  <small class="report-phase__meta" data-report-phase-meta="finalize">等待开始</small>
+                </div>
+              </div>
+            </div>
+            <div class="report-llm-summary" id="report-llm-summary" hidden>
+              <strong id="report-llm-total">模型 / Token 将在调用后显示</strong>
+              <span id="report-llm-summary-note"></span>
             </div>
             <div class="report-progress-remaining" id="report-progress-remaining">正在计算后续处理步骤</div>
           </div>
@@ -607,6 +635,25 @@
             </div>
           </div>
           <div class="report-toolbar__actions">
+            <div class="report-llm-popover" id="report-llm-popover" hidden>
+              <button class="btn btn--ghost report-llm-popover__trigger" id="btn-report-llm-usage" type="button"
+                aria-haspopup="true" aria-expanded="false" aria-controls="report-toolbar-llm">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <line x1="4" y1="19" x2="20" y2="19" />
+                  <rect x="6" y="11" width="3" height="5" rx="1" />
+                  <rect x="11" y="7" width="3" height="9" rx="1" />
+                  <rect x="16" y="4" width="3" height="12" rx="1" />
+                </svg>
+                模型用量
+              </button>
+              <div class="report-toolbar__llm" id="report-toolbar-llm" role="region" aria-label="当前报告模型用量" hidden>
+                <div class="report-toolbar__llm-head">
+                  <strong id="report-toolbar-llm-total">该版本未记录模型/token用量</strong>
+                  <span id="report-toolbar-llm-note"></span>
+                </div>
+                <div class="report-toolbar__llm-phases" id="report-toolbar-llm-phases"></div>
+              </div>
+            </div>
             <div class="export-dropdown" id="export-dropdown">
               <button class="btn btn--ghost" id="btn-export-dropdown" type="button">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -1511,15 +1558,133 @@
     </div>
   </div>
 
+  <div class="profile-modal" id="profile-modal" hidden aria-hidden="true">
+    <div class="profile-modal__backdrop" data-profile-close></div>
+    <section class="profile-modal__dialog" role="dialog" aria-modal="true"
+      aria-labelledby="profile-modal-title">
+      <header class="profile-modal__header">
+        <div class="profile-modal__identity">
+          <div class="profile-modal__avatar" id="profile-avatar">我</div>
+          <div>
+            <h2 id="profile-modal-title">个人中心</h2>
+            <p id="profile-account-text">正在读取账号信息…</p>
+          </div>
+        </div>
+        <button class="profile-modal__close" id="btn-profile-close" type="button" aria-label="关闭个人中心">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="6" x2="6" y2="18" />
+            <line x1="6" y1="6" x2="18" y2="18" />
+          </svg>
+        </button>
+      </header>
+
+      <div class="profile-modal__body">
+        <nav class="profile-tabs" aria-label="个人中心功能">
+          <button class="profile-tab profile-tab--active" id="profile-tab-key" type="button"
+            data-profile-tab="key" aria-selected="true">API Key</button>
+          <button class="profile-tab" id="profile-tab-usage" type="button"
+            data-profile-tab="usage" aria-selected="false">用量记录</button>
+        </nav>
+
+        <section class="profile-panel" id="profile-key-panel">
+          <div class="profile-key-heading">
+            <div>
+              <div class="profile-key-heading__title">个人 LLM API Key</div>
+              <p>用于问卷、访谈、评论和标注任务。平台不会显示或记录你的完整 Key。</p>
+            </div>
+            <span class="profile-key-status" id="profile-key-status">检查中</span>
+          </div>
+
+          <div class="profile-key-notice" id="profile-key-notice" role="status"></div>
+
+          <form id="profile-key-form">
+            <label class="profile-key-field" for="profile-key-input">
+              <span id="profile-key-field-label">填写 API Key</span>
+              <div class="profile-key-input-wrap">
+                <input id="profile-key-input" type="password" autocomplete="new-password"
+                  spellcheck="false" placeholder="输入AI Vital后台中，你的个人API KEY。" />
+                <button id="btn-profile-key-toggle" type="button" aria-label="显示 API Key">显示</button>
+              </div>
+            </label>
+            <p class="profile-key-help">保存时会发送一次极小的连接验证请求，产生少量个人额度消耗。模型和服务地址仍由平台统一配置。</p>
+            <div class="profile-key-actions">
+              <button class="btn btn--ghost" id="btn-profile-key-delete" type="button">删除已有 Key</button>
+              <button class="btn btn--primary" id="btn-profile-key-save" type="submit">验证并保存</button>
+            </div>
+          </form>
+        </section>
+
+        <section class="profile-panel profile-usage" id="profile-usage-panel" hidden>
+          <div class="profile-usage__head">
+            <div>
+              <h3>本平台用量</h3>
+              <p>仅统计当前飞书账号通过本平台产生的模型调用，不代表该 Key 在 AI Vital 中的全部消耗。</p>
+            </div>
+            <div class="profile-periods" role="group" aria-label="用量时间范围">
+              <button type="button" data-profile-period="7d">近 7 天</button>
+              <button class="is-active" type="button" data-profile-period="30d">近 30 天</button>
+              <button type="button" data-profile-period="all">全部</button>
+            </div>
+          </div>
+
+          <div class="profile-usage-summary" aria-live="polite">
+            <div class="profile-usage-card"><span>总 Token</span><strong id="profile-usage-total">—</strong></div>
+            <div class="profile-usage-card"><span>输入 Token</span><strong id="profile-usage-input">—</strong></div>
+            <div class="profile-usage-card"><span>输出 Token</span><strong id="profile-usage-output">—</strong></div>
+            <div class="profile-usage-card"><span>任务数量</span><strong id="profile-usage-tasks">—</strong></div>
+          </div>
+
+          <div class="profile-usage-incomplete" id="profile-usage-incomplete" hidden></div>
+
+          <div class="profile-usage-controls">
+            <label>
+              <span>任务类型</span>
+              <select id="profile-usage-category">
+                <option value="">全部类型</option>
+                <option value="survey">问卷</option>
+                <option value="comment">评论</option>
+                <option value="interview">访谈</option>
+                <option value="annotate">标注</option>
+                <option value="other">其他</option>
+              </select>
+            </label>
+            <label>
+              <span>任务状态</span>
+              <select id="profile-usage-status">
+                <option value="">全部状态</option>
+                <option value="running">进行中</option>
+                <option value="completed">已完成</option>
+                <option value="failed">失败</option>
+                <option value="cancelled">已取消</option>
+              </select>
+            </label>
+            <span class="profile-usage-synced" id="profile-usage-synced"></span>
+          </div>
+
+          <div class="profile-usage-list" id="profile-usage-list"></div>
+          <div class="profile-usage-empty" id="profile-usage-empty" hidden>当前范围还没有可显示的模型用量记录。</div>
+          <button class="btn btn--ghost profile-usage-load-more" id="profile-usage-load-more"
+            type="button" hidden>加载更多</button>
+        </section>
+      </div>
+
+      <footer class="profile-modal__footer">
+        <span>密钥按飞书账号隔离并加密保存</span>
+        <button class="btn btn--ghost" id="btn-profile-logout" type="button">退出飞书登录</button>
+      </footer>
+    </section>
+  </div>
+
   <div class="toast-container" id="toast-container" aria-live="polite"></div>
 
   <script src="https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js"></script>
   <!-- app.js 已按业务线拆分;顺序固定:core 最先,各 feature 居中(均含原顺序的初始化代码) -->
   <script src="/static/js/core/core.js?v=32"></script>
   <script src="/static/js/features/survey.js?v=38"></script>
-  <script src="/static/js/features/report.js?v=39"></script>
+  <script src="/static/js/features/report.js?v=42"></script>
+  <script src="/static/js/features/profile.js?v=2"></script>
   <script src="/static/js/features/settings.js?v=34"></script>
-  <script src="/static/js/features/history.js?v=35"></script>
+  <script src="/static/js/features/history.js?v=36"></script>
   <script src="/static/js/features/interview.js?v=9"></script>
   <script src="/static/js/features/nav.js?v=37"></script>
   <script src="/static/js/features/comment.js?v=29"></script>
