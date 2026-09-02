@@ -11,7 +11,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/style.css?v=44" />
+  <link rel="stylesheet" href="/static/style.css?v=45" />
 </head>
 
 <body>
@@ -796,6 +796,7 @@
             <button class="step-bar__item" data-iv-v2-step="2"><span class="step-bar__num">2</span><span class="step-bar__label">分组映射</span></button>
             <button class="step-bar__item" data-iv-v2-step="3"><span class="step-bar__num">3</span><span class="step-bar__label">确认检查点</span></button>
             <button class="step-bar__item" data-iv-v2-step="4"><span class="step-bar__num">4</span><span class="step-bar__label">玩家档案</span></button>
+            <button class="step-bar__item" data-iv-v2-step="5"><span class="step-bar__num">5</span><span class="step-bar__label">分析与报告审核</span></button>
           </div>
           <div class="panel__header">
             <div class="iv-eyebrow">INTERVIEW REPORT V2</div>
@@ -927,6 +928,7 @@
             <button class="step-bar__item step-bar__item--active" data-iv-v2-step="2"><span class="step-bar__num">2</span><span class="step-bar__label">分组映射</span></button>
             <button class="step-bar__item" data-iv-v2-step="3"><span class="step-bar__num">3</span><span class="step-bar__label">确认检查点</span></button>
             <button class="step-bar__item" data-iv-v2-step="4"><span class="step-bar__num">4</span><span class="step-bar__label">玩家档案</span></button>
+            <button class="step-bar__item" data-iv-v2-step="5"><span class="step-bar__num">5</span><span class="step-bar__label">分析与报告审核</span></button>
           </div>
           <div class="iv-v2-editor-shell" id="iv-v2-editor-shell">
             <div class="iv-v2-toolbar">
@@ -1055,6 +1057,7 @@
             <button class="step-bar__item step-bar__item--done" data-iv-v2-step="2"><span class="step-bar__num">2</span><span class="step-bar__label">分组映射</span></button>
             <button class="step-bar__item step-bar__item--active" data-iv-v2-step="3"><span class="step-bar__num">3</span><span class="step-bar__label">确认检查点</span></button>
             <button class="step-bar__item" data-iv-v2-step="4"><span class="step-bar__num">4</span><span class="step-bar__label">玩家档案</span></button>
+            <button class="step-bar__item" data-iv-v2-step="5"><span class="step-bar__num">5</span><span class="step-bar__label">分析与报告审核</span></button>
           </div>
           <div class="panel__header">
             <div class="iv-eyebrow">GROUP_MAPPING_CONFIRMED</div>
@@ -1099,6 +1102,41 @@
                 <aside class="iv-v2-dossier-evidence" id="iv-v2-dossier-evidence">
                   <div class="iv-v2-side-card__title">证据来源</div>
                   <div id="iv-v2-dossier-evidence-content" class="iv-v2-empty">点击档案中的证据编号查看原始来源。</div>
+                </aside>
+              </div>
+            </section>
+            <section class="iv-v2-report-workbench" id="iv-v2-report-workbench" hidden aria-label="分析与报告审核工作台">
+              <header class="iv-v2-report-head">
+                <div>
+                  <div class="iv-eyebrow">ANALYSIS &amp; REPORT REVIEW</div>
+                  <h2>跨玩家分析与报告审核</h2>
+                  <p>这里按服务端当前检查点显示分析、报告和批准状态；章节编辑、重审和批准都必须携带版本基线。</p>
+                </div>
+                <div class="iv-v2-toolbar__actions">
+                  <button class="btn btn--ghost btn--sm" type="button" data-iv-v2-action="report-back">返回玩家档案</button>
+                  <button class="btn btn--ghost btn--sm" type="button" data-iv-v2-action="report-refresh">刷新审核状态</button>
+                </div>
+              </header>
+              <div id="iv-v2-report-status" role="status" aria-live="polite"></div>
+              <div class="iv-v2-report-layout">
+                <aside class="iv-v2-report-side">
+                  <section class="iv-v2-side-card">
+                    <div class="iv-v2-side-card__title">章节目录</div>
+                    <div id="iv-v2-report-section-list"></div>
+                  </section>
+                </aside>
+                <section class="iv-v2-report-main" aria-label="报告章节正文与批准操作">
+                  <section class="iv-v2-side-card">
+                    <div id="iv-v2-report-meta"></div>
+                    <div id="iv-v2-report-body"></div>
+                    <div id="iv-v2-report-approval"></div>
+                  </section>
+                </section>
+                <aside class="iv-v2-report-detail">
+                  <section class="iv-v2-side-card">
+                    <div class="iv-v2-side-card__title">主张与证据详情</div>
+                    <div id="iv-v2-report-drawer"></div>
+                  </section>
                 </aside>
               </div>
             </section>
@@ -1713,7 +1751,7 @@
   <script src="/static/js/features/settings.js?v=34"></script>
   <script src="/static/js/features/history.js?v=35"></script>
   <script src="/static/js/features/interview.js?v=10"></script>
-  <script src="/static/js/features/interview-v2.js?v=1"></script>
+  <script src="/static/js/features/interview-v2.js?v=2"></script>
   <script src="/static/js/features/nav.js?v=37"></script>
   <script src="/static/js/features/comment.js?v=29"></script>
 <script src="/static/js/features/annotate.js?v=35"></script>
