@@ -1083,7 +1083,8 @@ def _normalize_classifications(
     for item in data["classifications"]:
         if not isinstance(item, dict):
             continue
-        response_id = str(item.get("response_id") or "")
+        raw_response_id = item.get("response_id")
+        response_id = "" if raw_response_id is None else str(raw_response_id)
         if response_id not in expected:
             continue
         if response_id in normalized:

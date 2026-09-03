@@ -290,6 +290,52 @@ class LargeSampleDirectLLMTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(normalized["0"], assignments)
 
+    async def test_classification_accepts_numeric_zero_response_id(self):
+        final_themes = [
+            {"id": "t01", "name": "界面设计", "description": "界面体验"}
+        ]
+        batch = [{"text": "Clean UI"}, {"text": "Small buttons"}]
+        first = {
+            "data": {
+                "classifications": [
+                    {
+                        "response_id": 0,
+                        "assignments": [
+                            {"theme_id": "t01", "sentiment": "positive"}
+                        ],
+                    },
+                    {
+                        "response_id": 1,
+                        "assignments": [
+                            {"theme_id": "t01", "sentiment": "negative"}
+                        ],
+                    },
+                ]
+            },
+            "model": "gpt-5.6-terra",
+            "raw_len": 100,
+            "error": "",
+        }
+
+        with patch.object(
+            report_engine,
+            "_direct_json_call",
+            new=AsyncMock(return_value=first),
+        ) as call:
+            result = await report_engine._classify_batch_direct(
+                "界面反馈",
+                final_themes,
+                batch,
+            )
+
+        self.assertEqual(call.await_count, 1)
+        self.assertEqual(result["repaired_count"], 0)
+        self.assertEqual(result["fallback_count"], 0)
+        self.assertEqual(
+            result["classifications"][0]["assignments"],
+            [{"theme_id": "t01", "sentiment": "positive"}],
+        )
+
     async def test_classification_repairs_missing_ids_then_falls_back_to_other(self):
         final_themes = [
             {"id": "t01", "name": "界面设计", "description": "界面体验"}
