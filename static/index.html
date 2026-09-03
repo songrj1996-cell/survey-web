@@ -11,7 +11,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/style.css?v=48" />
+  <link rel="stylesheet" href="/static/style.css?v=49" />
 </head>
 
 <body>
@@ -1141,21 +1141,99 @@
           <button class="step-bar__item" data-ann-step="6"><span class="step-bar__num">6</span><span
               class="step-bar__label">结果预览</span></button>
         </div>
-        <div class="panel__header">
-          <h1 class="panel__title">AI 作答识别结果确认</h1>
-          <p class="panel__desc" id="ann-confirm-desc">请结合内容生成概率、原文证据与反向证据逐行确认；仅润色不属于违规 AI 作答</p>
+        <div class="panel__header ann-ai-confirm-header">
+          <div>
+            <h1 class="panel__title">AI 作答识别结果确认</h1>
+            <p class="panel__desc" id="ann-confirm-desc">先看候选人风险概览，再进入玩家档案逐题确认</p>
+          </div>
+          <div class="ann-ai-layout-switch" role="group" aria-label="审阅布局">
+            <button class="ann-ai-layout-btn ann-ai-layout-btn--active" id="ann-ai-layout-split" type="button">分栏档案</button>
+            <button class="ann-ai-layout-btn" id="ann-ai-layout-focus" type="button">专注审阅</button>
+          </div>
         </div>
         <div class="ann-confirm-actions-top">
-          <button class="btn btn--ghost btn--sm" id="ann-btn-check-all">全选</button>
-          <button class="btn btn--ghost btn--sm" id="ann-btn-uncheck-all">全不选</button>
-          <span class="ann-confirm-hint">勾选 = 确认为 AI 作答；取消勾选 = 视为正常回答并纳入质量打标</span>
+          <button class="btn btn--ghost btn--sm" id="ann-btn-check-all" type="button">全选 AI</button>
+          <button class="btn btn--ghost btn--sm" id="ann-btn-uncheck-all" type="button">全部正常</button>
+          <span class="ann-confirm-hint">判定针对该玩家的全部开放题；润色概率不参与违规判断</span>
         </div>
-        <div class="ann-confirm-table-wrap">
-          <table class="ann-confirm-table" id="ann-confirm-table">
-            <!-- 由 JS 渲染 -->
-          </table>
+        <div class="ann-ai-confirm-summary">
+          <div class="ann-ai-summary-stat"><span>待复核</span><strong id="ann-ai-review-total">0 位玩家</strong></div>
+          <div class="ann-ai-summary-stat"><span>系统预选</span><strong id="ann-ai-default-total">0 位 AI 作答</strong></div>
+          <div class="ann-ai-summary-stat"><span>人工进度</span><strong id="ann-ai-reviewed-total">0 / 0</strong></div>
+          <div class="ann-ai-summary-progress" id="ann-ai-summary-progress" role="progressbar" aria-label="人工复核进度"
+            aria-valuemin="0" aria-valuemax="0" aria-valuenow="0"><span id="ann-ai-summary-progress-bar"></span></div>
         </div>
-        <div class="col-confirm-actions">
+        <div class="ann-ai-confirm-workspace" id="ann-ai-confirm-workspace">
+          <aside class="ann-ai-candidate-pane" aria-label="候选人概览">
+            <div class="ann-ai-pane-heading">
+              <div><strong>候选人概览</strong><span>按内容生成概率从高到低排列</span></div>
+            </div>
+            <div class="ann-ai-candidate-list" id="ann-ai-candidate-list"></div>
+          </aside>
+          <section class="ann-ai-profile-pane" aria-label="玩家档案">
+            <div class="ann-ai-player-nav">
+              <button type="button" id="ann-ai-prev-player" aria-label="上一位玩家">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6" /></svg>
+              </button>
+              <span id="ann-ai-player-index">玩家 0 / 0</span>
+              <button type="button" id="ann-ai-next-player" aria-label="下一位玩家">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6" /></svg>
+              </button>
+            </div>
+            <div class="ann-ai-profile-header">
+              <div class="ann-ai-player-identity">
+                <span>玩家档案</span>
+                <h2 id="ann-ai-player-id">—</h2>
+                <em id="ann-ai-review-state">待人工确认</em>
+              </div>
+              <div class="ann-ai-probability-grid">
+                <div><span>内容生成概率</span><strong id="ann-ai-probability">0%</strong></div>
+                <div><span>润色概率</span><strong id="ann-ai-polish-probability">0%</strong></div>
+              </div>
+            </div>
+            <div class="ann-ai-judgement">
+              <div><strong id="ann-ai-suggestion">AI 建议</strong><span>润色概率仅供参考，不参与违规判断</span></div>
+              <p id="ann-ai-reason"></p>
+            </div>
+            <div class="ann-ai-evidence-grid">
+              <div>
+                <strong>AI 支持证据</strong>
+                <p id="ann-ai-evidence"></p>
+              </div>
+              <div>
+                <strong>反向证据</strong>
+                <p id="ann-ai-counter-evidence"></p>
+              </div>
+            </div>
+            <div class="ann-ai-question-panel">
+              <div class="ann-ai-question-heading">
+                <div><span id="ann-ai-question-index">第 0 / 0 题</span><strong id="ann-ai-question-title">—</strong></div>
+                <div class="ann-ai-question-nav">
+                  <button type="button" id="ann-ai-prev-question">上一题</button>
+                  <button type="button" id="ann-ai-next-question">下一题</button>
+                </div>
+              </div>
+              <div class="ann-ai-question-dots" id="ann-ai-question-dots" aria-label="题目列表"></div>
+              <div class="ann-ai-answer-block"><span>玩家原文</span><p id="ann-ai-answer-original"></p></div>
+              <div class="ann-ai-answer-block ann-ai-answer-block--translation"><span>中文翻译</span><p id="ann-ai-answer-translation"></p></div>
+            </div>
+            <div class="ann-ai-decision" role="group" aria-label="对这位玩家的整体人工判定">
+              <strong>对这位玩家的整体人工判定</strong>
+              <div>
+                <button class="ann-ai-decision-btn" id="ann-ai-mark-normal" type="button">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21a8 8 0 0 0-16 0"/><circle cx="12" cy="7" r="4"/><polyline points="16 11 18 13 22 9"/></svg>
+                  正常反馈
+                </button>
+                <button class="ann-ai-decision-btn" id="ann-ai-mark-ai" type="button">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="7" width="16" height="12" rx="2"/><path d="M9 3h6M12 3v4M8 12h.01M16 12h.01M9 16h6"/></svg>
+                  AI 作答
+                </button>
+              </div>
+            </div>
+          </section>
+        </div>
+        <div class="col-confirm-actions ann-ai-confirm-footer">
+          <span id="ann-ai-confirm-footer-status">请逐位完成人工确认</span>
           <button class="btn btn--primary" id="ann-btn-confirm-ai">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
               <polyline points="20 6 9 17 4 12" />
@@ -1781,7 +1859,7 @@
   <script src="/static/js/features/interview.js?v=9"></script>
   <script src="/static/js/features/nav.js?v=37"></script>
   <script src="/static/js/features/comment.js?v=29"></script>
-<script src="/static/js/features/annotate.js?v=35"></script>
+<script src="/static/js/features/annotate.js?v=36"></script>
 </body>
 
 </html>
