@@ -6,12 +6,72 @@ from app.services.question_detect import (
     _group_googleform_matrix,
     _heuristic_questions,
     _heuristic_type,
+    _reconcile_matrix_ranking_questions,
     _reconcile_question_roles,
     _sanitize_choice_options,
 )
+from app.core.ranking import diagnose_matrix_ranking, parse_rank_value
 
 
 class QuestionDetectTests(unittest.TestCase):
+    def test_rank_parser_accepts_only_explicit_rank_values(self):
+        accepted = [1, 1.0, "1", "1.0", "Peringkat 1", "rank 1", "第1名"]
+        self.assertEqual(
+            [parse_rank_value(value, max_rank=3) for value in accepted],
+            [1] * len(accepted),
+        )
+        for value in ["concept 1", "第1名（首选）", "Ranked 1", "1st", "1.5", 0, 4]:
+            self.assertIsNone(parse_rank_value(value, max_rank=3), value)
+
+    def test_mixed_localized_rank_matrix_is_corrected_after_llm_result(self):
+        permutations = (
+            [(1, 2, 3)] * 10
+            + [(1, 3, 2)] * 27
+            + [(2, 1, 3)] * 9
+            + [(2, 3, 1)] * 12
+            + [(3, 1, 2)] * 13
+            + [(3, 2, 1)] * 21
+        )
+        rows = [["概念排名 [概念1]", "概念排名 [概念2]", "概念排名 [概念3]"]]
+        rows.extend([
+            [float(rank) if row_index < 33 else f"Peringkat {rank}" for rank in ranks]
+            for row_index, ranks in enumerate(permutations)
+        ])
+        questions = [{
+            "name_zh": "概念排名",
+            "role": "matrix_scale",
+            "column_indexes": [0, 1, 2],
+            "rows": ["概念1", "概念2", "概念3"],
+            "scale_min": 1,
+            "scale_max": 3,
+        }]
+
+        corrected = _reconcile_matrix_ranking_questions(rows, questions)
+        corrected = _sanitize_choice_options(rows, corrected)[0]
+
+        self.assertEqual(corrected["role"], "matrix_single")
+        self.assertEqual(corrected["analysis_semantic"], "ranking")
+        self.assertEqual(corrected["ranking_size"], 3)
+        self.assertEqual(corrected["rank_direction"], "lower_is_better")
+        self.assertEqual(corrected["options"], ["第1名", "第2名", "第3名"])
+        self.assertEqual(corrected["value_aliases"]["第1名"], ["1.0", "Peringkat 1"])
+        self.assertNotIn("scale_min", corrected)
+
+    def test_matrix_ranking_requires_every_response_to_be_complete_and_valid(self):
+        valid = [[1, 2, 3], [2, 3, 1], [3, 1, 2], [1, 3, 2], [2, 1, 3]]
+        cases = {
+            "ordinary scale": [[1, 1, 2], [2, 2, 3], [3, 3, 2], [1, 2, 2], [2, 3, 3]],
+            "duplicate": [*valid[:-1], [1, 1, 3]],
+            "missing": [*valid[:-1], [1, "", 3]],
+            "out of range": [*valid[:-1], [1, 2, 4]],
+            "unrelated digits": [*valid[:-1], ["concept 1", "Rank 2", "Rank 3"]],
+        }
+        for label, body in cases.items():
+            with self.subTest(label=label):
+                self.assertFalse(
+                    diagnose_matrix_ranking(body, [0, 1, 2])["eligible"]
+                )
+
     def test_multilingual_query_contains_real_values_without_duplicating_schema(self):
         rows = [
             ["Which role do you usually play?", "Seberapa puas Anda?"],

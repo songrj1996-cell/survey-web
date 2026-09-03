@@ -70,6 +70,7 @@ from app.services.question_detect import (
     _enrich_questions,
     _group_googleform_matrix,
     _heuristic_questions,
+    _reconcile_matrix_ranking_questions,
     _reconcile_question_roles,
     _sanitize_choice_options,
 )
@@ -733,6 +734,11 @@ async def columns_stream(session_id: str, request: Request):
     try:
         if sess.get("column_provider") == "questionnaire":
             questions = sess.get("columns_detected") or []
+            before_ranking_reconcile = deepcopy(questions)
+            questions = _reconcile_matrix_ranking_questions(rows, questions)
+            ranking_reconciled = questions != before_ranking_reconcile
+            sess["columns_detected"] = questions
+            session_saved = False
             if (
                 sess.get("questionnaire_translation_status") != "translated"
                 and _questionnaire_titles_are_chinese(questions)
@@ -740,6 +746,7 @@ async def columns_stream(session_id: str, request: Request):
                 sess["questionnaire_translation_status"] = "translated"
                 sess["questionnaire_translation_model"] = ""
                 save_session(session_id, sess)
+                session_saved = True
             if sess.get("questionnaire_translation_status") != "translated":
                 yield sse_event({
                     "type": "chunk",
@@ -803,6 +810,9 @@ async def columns_stream(session_id: str, request: Request):
                 sess["columns_detected"] = questions
                 sess["questionnaire_translation_status"] = "translated"
                 sess["questionnaire_translation_model"] = used_model
+                save_session(session_id, sess)
+                session_saved = True
+            if ranking_reconciled and not session_saved:
                 save_session(session_id, sess)
             source_text_preserved = not bool(
                 sess.get("questionnaire_translation_model")
@@ -887,6 +897,7 @@ async def columns_stream(session_id: str, request: Request):
         questions = _normalize_question_display_texts(questions)
         questions = _enrich_questions(questions, rows[0], groups)
         questions = _reconcile_question_roles(rows, questions)
+        questions = _reconcile_matrix_ranking_questions(rows, questions)
         questions = _sanitize_choice_options(rows, questions)
         if sess.get("mode") == "crosstab":
             hdrs = rows[0]
@@ -916,6 +927,7 @@ async def columns_stream(session_id: str, request: Request):
 def set_survey_columns(session_id: str, columns: list) -> None:
     """存储用户确认后的列题型配置。"""
     sess = get_session(session_id)
+    columns = _reconcile_matrix_ranking_questions(sess.get("rows") or [], columns)
     previous_fingerprint = str(
         sess.get("analysis_preference_fingerprint")
         or build_analysis_preset_fingerprint(sess)

@@ -5,6 +5,8 @@
 import re
 from collections import Counter
 
+from app.core.ranking import diagnose_matrix_ranking
+
 
 ROLE_LABEL_MAP = {
     "id":            "用户ID",
@@ -128,6 +130,33 @@ def _reconcile_question_roles(rows: list[list], questions: list[dict]) -> list[d
         question["low_confidence"] = True
         if structure["role"] == "multi_choice":
             question["delimiter"] = structure["delimiter"]
+    return questions
+
+
+def _reconcile_matrix_ranking_questions(
+    rows: list[list], questions: list[dict]
+) -> list[dict]:
+    """Correct matrix rankings only when row-level permutation evidence is complete."""
+    body = rows[1:] if rows else []
+    for question in questions:
+        if question.get("role") not in {"matrix_scale", "matrix_single"}:
+            continue
+        indexes = question.get("column_indexes") or []
+        if len(indexes) < 2 or not all(isinstance(index, int) for index in indexes):
+            continue
+        diagnostic = diagnose_matrix_ranking(body, indexes)
+        if not diagnostic["eligible"]:
+            continue
+        question["role"] = "matrix_single"
+        question["options"] = diagnostic["options"]
+        question["value_aliases"] = diagnostic["value_aliases"]
+        question["analysis_semantic"] = "ranking"
+        question["ranking_size"] = diagnostic["column_count"]
+        question["rank_direction"] = "lower_is_better"
+        question.pop("scale_min", None)
+        question.pop("scale_max", None)
+        question.pop("delimiter", None)
+        question.pop("low_confidence", None)
     return questions
 
 
