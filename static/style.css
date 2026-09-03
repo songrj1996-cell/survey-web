@@ -6008,10 +6008,11 @@ body {
   }
 }
 
-/* AI 确认表格 */
+/* AI 确认卡片 */
 .ann-confirm-actions-top {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
   margin-bottom: 12px;
 }
@@ -6023,10 +6024,609 @@ body {
 
 .ann-confirm-hint {
   font-size: 12px;
-  color: var(--text-secondary);
+  color: var(--text-2);
   margin-left: 4px;
 }
 
+.ann-ai-confirm-header {
+  flex-direction: row;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.ann-ai-layout-switch {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 3px;
+  padding: 3px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+
+.ann-ai-layout-btn {
+  padding: 6px 10px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.ann-ai-layout-btn--active {
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: var(--shadow);
+}
+
+.ann-ai-confirm-summary {
+  display: grid;
+  grid-template-columns: repeat(3, max-content) minmax(120px, 1fr);
+  align-items: center;
+  gap: 24px;
+  padding: 12px 16px;
+  margin-bottom: 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+
+.ann-ai-summary-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.ann-ai-summary-stat span {
+  color: var(--text-2);
+  font-size: 11px;
+}
+
+.ann-ai-summary-stat strong {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.ann-ai-summary-progress {
+  height: 7px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--surface-2);
+}
+
+.ann-ai-summary-progress span {
+  display: block;
+  width: 0;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  transition: width var(--transition);
+}
+
+.ann-ai-confirm-workspace {
+  display: grid;
+  grid-template-columns: minmax(260px, 31%) minmax(0, 1fr);
+  gap: 14px;
+}
+
+.ann-ai-candidate-pane,
+.ann-ai-profile-pane {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+
+.ann-ai-candidate-pane {
+  align-self: start;
+  padding: 14px;
+}
+
+.ann-ai-pane-heading {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 0 2px 12px;
+}
+
+.ann-ai-pane-heading strong,
+.ann-ai-pane-heading span {
+  display: block;
+}
+
+.ann-ai-pane-heading strong {
+  color: var(--text);
+  font-size: 13px;
+}
+
+.ann-ai-pane-heading span {
+  margin-top: 2px;
+  color: var(--text-2);
+  font-size: 11px;
+}
+
+.ann-ai-candidate-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 690px;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+.ann-ai-candidate-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 7px 10px;
+  width: 100%;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+  transition: border-color var(--transition), background var(--transition);
+}
+
+.ann-ai-candidate-card:hover {
+  border-color: var(--border-act);
+}
+
+.ann-ai-candidate-card--active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.ann-ai-candidate-id {
+  overflow-wrap: anywhere;
+  font-family: monospace;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.ann-ai-candidate-prob {
+  color: var(--red);
+  font-size: 17px;
+  line-height: 1.2;
+}
+
+.ann-ai-candidate-reason {
+  display: -webkit-box;
+  grid-column: 1 / -1;
+  overflow: hidden;
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 1.5;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
+
+.ann-ai-candidate-status {
+  grid-column: 1 / -1;
+  width: max-content;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: var(--glass-hover);
+  color: var(--text-2);
+  font-size: 11px;
+  font-style: normal;
+}
+
+.ann-ai-candidate-status--ai {
+  background: color-mix(in srgb, var(--red) 12%, transparent);
+  color: var(--red);
+}
+
+.ann-ai-candidate-status--normal {
+  background: color-mix(in srgb, var(--green) 12%, transparent);
+  color: var(--green);
+}
+
+.ann-ai-profile-pane {
+  padding: 18px;
+}
+
+.ann-ai-player-nav {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 7px;
+  color: var(--text-2);
+  font-size: 11px;
+}
+
+.ann-ai-player-nav button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.ann-ai-player-nav button:disabled,
+.ann-ai-question-nav button:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.ann-ai-player-nav svg,
+.ann-ai-decision-btn svg {
+  width: 15px;
+  height: 15px;
+}
+
+.ann-ai-profile-header {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 8px 0 16px;
+}
+
+.ann-ai-player-identity > span {
+  color: var(--text-2);
+  font-size: 11px;
+}
+
+.ann-ai-player-identity h2 {
+  margin: 3px 0 7px;
+  overflow-wrap: anywhere;
+  color: var(--text);
+  font-family: monospace;
+  font-size: 20px;
+  line-height: 1.3;
+}
+
+.ann-ai-review-state {
+  display: inline-block;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: var(--glass-hover);
+  color: var(--text-2);
+  font-size: 11px;
+  font-style: normal;
+}
+
+.ann-ai-review-state--ai {
+  background: color-mix(in srgb, var(--red) 12%, transparent);
+  color: var(--red);
+}
+
+.ann-ai-review-state--normal {
+  background: color-mix(in srgb, var(--green) 12%, transparent);
+  color: var(--green);
+}
+
+.ann-ai-probability-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(108px, 1fr));
+  gap: 8px;
+}
+
+.ann-ai-probability-grid > div {
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+
+.ann-ai-probability-grid span,
+.ann-ai-probability-grid strong {
+  display: block;
+}
+
+.ann-ai-probability-grid span {
+  color: var(--text-2);
+  font-size: 10px;
+}
+
+.ann-ai-probability-grid strong {
+  margin-top: 2px;
+  color: var(--text);
+  font-size: 20px;
+}
+
+#ann-ai-probability {
+  color: var(--red);
+}
+
+.ann-ai-judgement {
+  padding: 13px 14px;
+  border-radius: var(--radius-sm);
+  background: var(--accent-soft);
+}
+
+.ann-ai-judgement > div {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.ann-ai-judgement strong {
+  color: var(--accent);
+  font-size: 12px;
+}
+
+.ann-ai-judgement span {
+  color: var(--text-2);
+  font-size: 10px;
+}
+
+.ann-ai-judgement p {
+  margin-top: 7px;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.ann-ai-evidence-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin: 10px 0;
+}
+
+.ann-ai-evidence-grid > div {
+  padding: 12px 13px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+
+.ann-ai-evidence-grid strong {
+  color: var(--text);
+  font-size: 11px;
+}
+
+.ann-ai-evidence-grid p {
+  margin-top: 5px;
+  color: var(--text-2);
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+.ann-ai-question-panel {
+  padding: 13px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.ann-ai-question-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.ann-ai-question-heading > div:first-child {
+  min-width: 0;
+}
+
+.ann-ai-question-heading span,
+.ann-ai-question-heading strong {
+  display: block;
+}
+
+.ann-ai-question-heading span {
+  color: var(--accent);
+  font-size: 10px;
+}
+
+.ann-ai-question-heading strong {
+  margin-top: 3px;
+  overflow-wrap: anywhere;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.ann-ai-question-nav {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 5px;
+}
+
+.ann-ai-question-nav button,
+.ann-ai-question-dots button {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-2);
+  cursor: pointer;
+}
+
+.ann-ai-question-nav button {
+  padding: 5px 9px;
+  font-size: 11px;
+}
+
+.ann-ai-question-dots {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin: 10px 0;
+}
+
+.ann-ai-question-dots button {
+  width: 26px;
+  height: 26px;
+  font-size: 10px;
+}
+
+.ann-ai-question-dots .ann-ai-question-dot--active {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #fff;
+}
+
+.ann-ai-answer-block {
+  padding: 10px 12px;
+  background: var(--surface-2);
+}
+
+.ann-ai-answer-block + .ann-ai-answer-block {
+  margin-top: 6px;
+}
+
+.ann-ai-answer-block > span {
+  color: var(--text-2);
+  font-size: 10px;
+}
+
+.ann-ai-answer-block p {
+  margin-top: 4px;
+  overflow-wrap: anywhere;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
+
+.ann-ai-answer-block--translation {
+  border-left: 3px solid var(--accent);
+}
+
+.ann-ai-decision {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.ann-ai-decision > strong {
+  color: var(--text);
+  font-size: 12px;
+}
+
+.ann-ai-decision > div {
+  display: flex;
+  gap: 7px;
+}
+
+.ann-ai-decision-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 38px;
+  padding: 0 13px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+  transition: border-color var(--transition), background var(--transition), color var(--transition);
+}
+
+#ann-ai-mark-normal.ann-ai-decision-btn--active {
+  border-color: var(--green);
+  background: color-mix(in srgb, var(--green) 10%, transparent);
+  color: var(--green);
+}
+
+#ann-ai-mark-ai.ann-ai-decision-btn--active {
+  border-color: var(--red);
+  background: color-mix(in srgb, var(--red) 10%, transparent);
+  color: var(--red);
+}
+
+.ann-ai-confirm-workspace--focus {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.ann-ai-confirm-workspace--focus .ann-ai-candidate-pane {
+  display: none;
+}
+
+.ann-ai-confirm-workspace--focus .ann-ai-profile-pane {
+  width: min(900px, 100%);
+  margin: 0 auto;
+}
+
+.ann-ai-confirm-footer {
+  align-items: center;
+  justify-content: space-between;
+  padding-top: 14px;
+}
+
+.ann-ai-confirm-footer > span {
+  color: var(--text-2);
+  font-size: 12px;
+}
+
+@media (max-width: 900px) {
+  .ann-ai-confirm-workspace {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .ann-ai-candidate-list {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    max-height: none;
+  }
+}
+
+@media (max-width: 640px) {
+  .ann-ai-confirm-header,
+  .ann-ai-profile-header,
+  .ann-ai-decision,
+  .ann-ai-confirm-footer {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .ann-ai-layout-switch {
+    align-self: flex-start;
+  }
+
+  .ann-ai-confirm-summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+  }
+
+  .ann-ai-summary-progress {
+    grid-column: 1 / -1;
+  }
+
+  .ann-ai-candidate-list,
+  .ann-ai-evidence-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .ann-ai-probability-grid {
+    width: 100%;
+  }
+
+  .ann-ai-question-heading {
+    flex-direction: column;
+  }
+
+  .ann-ai-decision > div {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .ann-ai-decision-btn {
+    padding: 8px 10px;
+    white-space: normal;
+  }
+
+  .ann-ai-confirm-footer .btn {
+    justify-content: center;
+    width: 100%;
+  }
+}
+
+/* 质量结果预览表格 */
 .ann-confirm-table-wrap {
   overflow-x: auto;
   max-height: 560px;
