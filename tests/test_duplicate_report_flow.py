@@ -492,7 +492,7 @@ class DuplicatePrepareAndGenerationTests(
         ]
         writer_calls = 0
 
-        async def writer_side_effect(_messages, _query):
+        async def writer_side_effect(_messages, _query, **_kwargs):
             nonlocal writer_calls
             if writer_calls == 0:
                 def add_history_qa(history: list) -> None:

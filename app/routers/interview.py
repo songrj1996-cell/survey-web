@@ -5,6 +5,10 @@ from fastapi.responses import StreamingResponse
 from app.schemas.requests import InterviewBatchReviewRequest
 from app.services.audit import audit_log
 from app.services.auth import _require_feature
+from app.services.llm_credentials import (
+    require_request_llm_api_key,
+    stream_with_llm_api_key,
+)
 from app.services.interview_service import (
     handle_interview_upload,
     get_interview_status,
@@ -50,8 +54,17 @@ async def interview_upload(
 async def interview_run(session_id: str, request: Request):
     login = await _require_feature(request, "interview")
     validate_interview_session(session_id, login)
+    api_key = await require_request_llm_api_key(request)
     return StreamingResponse(
-        interview_report_stream(session_id, request, login),
+        stream_with_llm_api_key(
+            interview_report_stream(session_id, request, login),
+            api_key,
+            request=request,
+            category="interview",
+            action="访谈报告生成",
+            reference_id=session_id,
+            history_id=session_id,
+        ),
         media_type="text/event-stream",
     )
 
@@ -95,12 +108,21 @@ async def interview_revise_review_issue(
         f"会话：{session_id}；提醒序号：{issue_index + 1}",
         metadata={"session_id": session_id, "issue_index": issue_index},
     )
+    api_key = await require_request_llm_api_key(request)
     return StreamingResponse(
-        revise_interview_audit_issue_stream(
-            session_id,
-            issue_index,
-            request,
-            login,
+        stream_with_llm_api_key(
+            revise_interview_audit_issue_stream(
+                session_id,
+                issue_index,
+                request,
+                login,
+            ),
+            api_key,
+            request=request,
+            category="interview",
+            action="访谈报告修订",
+            reference_id=session_id,
+            history_id=session_id,
         ),
         media_type="text/event-stream",
     )
@@ -125,12 +147,21 @@ async def interview_revise_review_batch(
             "issue_indexes": [item["issue_index"] for item in items],
         },
     )
+    api_key = await require_request_llm_api_key(request)
     return StreamingResponse(
-        revise_interview_audit_issues_stream(
-            session_id,
-            items,
-            request,
-            login,
+        stream_with_llm_api_key(
+            revise_interview_audit_issues_stream(
+                session_id,
+                items,
+                request,
+                login,
+            ),
+            api_key,
+            request=request,
+            category="interview",
+            action="访谈报告批量修订",
+            reference_id=session_id,
+            history_id=session_id,
         ),
         media_type="text/event-stream",
     )

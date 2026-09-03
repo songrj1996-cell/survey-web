@@ -704,6 +704,7 @@ async def _direct_json_call(
     reasoning_effort: str | None,
     validator,
     on_repair=None,
+    on_attempt_event=None,
 ) -> dict:
     """调用直连 LLM 并做一次针对 JSON/业务 schema 的纠错重试。"""
     call_started = time.monotonic()
@@ -715,6 +716,7 @@ async def _direct_json_call(
                 models=models,
                 max_tokens=max_tokens,
                 reasoning_effort=reasoning_effort,
+                on_attempt_event=on_attempt_event,
             ),
             timeout=LLM_QUALITATIVE_CALL_TIMEOUT_SECONDS,
         )
@@ -771,6 +773,7 @@ async def _direct_json_call(
                 models=repair_models,
                 max_tokens=max_tokens,
                 reasoning_effort=reasoning_effort,
+                on_attempt_event=on_attempt_event,
             ),
             timeout=LLM_QUALITATIVE_CALL_TIMEOUT_SECONDS,
         )
@@ -1032,6 +1035,37 @@ def _validate_merged_themes(data: dict | None, candidates: list[dict]) -> str | 
     return None
 
 
+def _recover_single_batch_themes(
+    candidates: list[dict],
+) -> tuple[dict | None, str | None]:
+    """把单个已校验批次的候选确定性提升为最终主题。
+
+    单批 Phase A 已经看过本题全部回答，并按与 Phase B 相同的语义边界合并
+    同义、多语言和措辞差异。Phase B 调用失败时，可以安全地保留这些候选，
+    由代码补齐连续主题 ID 与一对一候选 lineage，再复用最终合并校验保证
+    没有候选遗漏或重复。多批次不得使用此恢复，避免跳过跨批去重。
+    """
+    recovered_themes: list[dict] = []
+    for index, candidate in enumerate(candidates, 1):
+        if not isinstance(candidate, dict):
+            return None, f"候选 {index} 不是对象"
+        recovered_themes.append({
+            "id": f"t{index:02d}",
+            "name": candidate.get("name"),
+            "description": candidate.get("description"),
+            "positive_summary": candidate.get("positive_summary"),
+            "negative_summary": candidate.get("negative_summary"),
+            "source_candidate_ids": [f"c{index:04d}"],
+            "representative_quotes": list(
+                dict.fromkeys(candidate.get("representative_quotes") or [])
+            )[:3],
+        })
+
+    recovered = {"themes": recovered_themes}
+    validation_error = _validate_merged_themes(recovered, candidates)
+    return (None, validation_error) if validation_error else (recovered, None)
+
+
 _VALID_SENTIMENTS = {"positive", "negative", "neutral", "mixed"}
 
 
@@ -1049,7 +1083,8 @@ def _normalize_classifications(
     for item in data["classifications"]:
         if not isinstance(item, dict):
             continue
-        response_id = str(item.get("response_id") or "")
+        raw_response_id = item.get("response_id")
+        response_id = "" if raw_response_id is None else str(raw_response_id)
         if response_id not in expected:
             continue
         if response_id in normalized:
@@ -1157,6 +1192,8 @@ async def _classify_batch_direct(
     question: str,
     final_themes: list[dict],
     batch: list[dict],
+    *,
+    on_attempt_event=None,
 ) -> dict:
     expected_ids = [str(index) for index in range(len(batch))]
     valid_theme_ids = {theme["id"] for theme in final_themes} | {"other"}
@@ -1177,6 +1214,7 @@ async def _classify_batch_direct(
         max_tokens=LLM_CLASSIFY_MAX_TOKENS,
         reasoning_effort=LLM_CLASSIFY_REASONING or None,
         validator=_root_validator,
+        on_attempt_event=on_attempt_event,
     )
     normalized = _normalize_classifications(
         first.get("data"), expected_ids, valid_theme_ids
@@ -1199,6 +1237,7 @@ async def _classify_batch_direct(
             max_tokens=LLM_CLASSIFY_MAX_TOKENS,
             reasoning_effort=LLM_CLASSIFY_REASONING or None,
             validator=_root_validator,
+            on_attempt_event=on_attempt_event,
         )
         repaired = _normalize_classifications(
             miss.get("data"), missing_ids, valid_theme_ids
@@ -1242,6 +1281,7 @@ async def _batch_qualitative_analysis(
     _scopes_override: list | None = None,
     _scope_position: tuple[int, int] | None = None,
     _batch_concurrency_override: int | None = None,
+    on_attempt_event=None,
 ):
     """大样本定性分析四阶段批处理。
 
@@ -1289,6 +1329,7 @@ async def _batch_qualitative_analysis(
                     _scopes_override=[scope],
                     _scope_position=(scope_index + 1, len(scopes)),
                     _batch_concurrency_override=1,
+                    on_attempt_event=on_attempt_event,
                 ):
                     if event[0] == "diagnostics":
                         scope_diagnostics = event[1]
@@ -1477,6 +1518,7 @@ async def _batch_qualitative_analysis(
                     on_repair=lambda error: repair_events.put_nowait(
                         {"batch": bi, "error": error}
                     ),
+                    on_attempt_event=on_attempt_event,
                 )
                 result["data"] = _hydrate_theme_candidate_quotes(
                     result.get("data"), source_texts
@@ -1620,6 +1662,7 @@ async def _batch_qualitative_analysis(
                 on_repair=lambda error: merge_repair_events.put_nowait(
                     {"error": error}
                 ),
+                on_attempt_event=on_attempt_event,
             )
 
         async for event_type, payload in _run_bounded_calls(
@@ -1646,15 +1689,41 @@ async def _batch_qualitative_analysis(
         merge_result = merge_result or {}
         merged = merge_result.get("data")
         final_themes = merged.get("themes", []) if isinstance(merged, dict) else []
+        merge_error = str(merge_result.get("error") or "")
+        recovery_strategy = ""
+        recovery_error = ""
+        if (
+            not final_themes
+            and len(batches) == 1
+            and len(extracted_by_batch) == 1
+        ):
+            recovered, recovery_error = _recover_single_batch_themes(all_candidates)
+            if recovered:
+                merged = recovered
+                final_themes = recovered["themes"]
+                recovery_strategy = "single_batch_candidate_recovery"
+
+        phase_b_error = "" if recovery_strategy else merge_error
+        if not recovery_strategy and recovery_error:
+            phase_b_error = "; ".join(
+                item for item in (merge_error, f"单批次恢复未通过：{recovery_error}")
+                if item
+            )
         diag["phase_b"] = {
             "raw_len": merge_result.get("raw_len", 0),
             "parsed": bool(final_themes),
             "themes": len(final_themes),
             "model": merge_result.get("model", ""),
             "repaired": bool(merge_result.get("repaired")),
-            "error": merge_result.get("error", ""),
+            "error": phase_b_error,
             "duration_seconds": merge_result.get("duration_seconds", 0),
+            "strategy": recovery_strategy or "llm_merge",
+            "recovered": bool(recovery_strategy),
+            "candidate_count": len(all_candidates),
+            "source_candidate_coverage": 1.0 if final_themes else 0.0,
         }
+        if recovery_strategy:
+            diag["phase_b"]["initial_error"] = merge_error or "未返回 themes"
         diag["themes"] = len(final_themes)
 
         if not final_themes:
@@ -1677,7 +1746,25 @@ async def _batch_qualitative_analysis(
                 },
             )
             continue
-        if merge_result.get("repaired"):
+        if recovery_strategy:
+            yield (
+                "analysis_progress",
+                {
+                    **progress_base,
+                    "status": "recovered",
+                    "step": "merging",
+                    "message": (
+                        "主题合并调用未完成，已使用单批次候选恢复最终主题，"
+                        "继续逐条归类"
+                    ),
+                    "impact": (
+                        "本题全部回答已由同一批次读取，候选映射完整保留；"
+                        "主题人数仍将基于全部回答重新归类计算"
+                    ),
+                    "recovery_strategy": recovery_strategy,
+                },
+            )
+        elif merge_result.get("repaired"):
             yield (
                 "analysis_progress",
                 {
@@ -1714,7 +1801,12 @@ async def _batch_qualitative_analysis(
             )
 
             async def _classify(batch=batch):
-                return await _classify_batch_direct(col_name, final_themes, batch)
+                return await _classify_batch_direct(
+                    col_name,
+                    final_themes,
+                    batch,
+                    on_attempt_event=on_attempt_event,
+                )
 
             classify_factories.append(_classify)
 
@@ -1790,6 +1882,9 @@ async def _batch_qualitative_analysis(
         # ── 统计汇总 ──────────────────────────────────────────────────────
         classified_responses = sum(
             item.get("classifications", 0) for item in diag["phase_c"]
+        )
+        diag["classification_coverage"] = (
+            round(classified_responses / total, 4) if total else 0.0
         )
         if classified_responses == 0 or total == 0:
             diag["status"] = "failed"
@@ -1879,6 +1974,7 @@ async def _batch_qualitative_analysis(
         fallback_count = sum(
             item.get("missing_fallback", 0) for item in diag["phase_c"]
         )
+        diag["classification_fallback_count"] = fallback_count
         degraded_reasons = []
         if failed_extract_batches:
             degraded_reasons.append(

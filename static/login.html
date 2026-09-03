@@ -68,8 +68,15 @@
           footnote.textContent = '配置完成并重启服务后即可登录。';
           return;
         }
-        if (data.logged_in && data.allowed !== false) {
-          location.href = next.startsWith('/') && !next.startsWith('//') ? next : '/';
+        if (data.logged_in) {
+          if (data.allowed !== false) {
+            location.href = next.startsWith('/') && !next.startsWith('//') ? next : '/';
+          }
+          return;
+        }
+        if (!error) {
+          footnote.textContent = '正在跳转至飞书完成身份验证…';
+          location.replace(btn.href);
         }
       })
       .catch(() => {

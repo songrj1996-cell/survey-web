@@ -8,12 +8,17 @@ from fastapi.responses import StreamingResponse
 
 from app.services.audit import audit_log
 from app.services.auth import _current_login
+from app.services.session_access import require_session_request_access
 from app.services.comment_preprocess import (
     comment_preprocess_stream,
     validate_comment_session_for_preprocess,
 )
 from app.services.comment_run import comment_run_stream, validate_comment_session_for_run
 from app.services.comment_upload import handle_comment_upload
+from app.services.llm_credentials import (
+    require_request_llm_api_key,
+    stream_with_llm_api_key,
+)
 
 router = APIRouter()
 
@@ -40,11 +45,29 @@ async def comment_analysis_upload(
 
 @router.get("/api/comment-analysis/preprocess/{session_id}")
 async def comment_analysis_preprocess(session_id: str, request: Request):
+    await require_session_request_access(
+        request, session_id, login_resolver=_current_login,
+    )
     validate_comment_session_for_preprocess(session_id)
     return StreamingResponse(comment_preprocess_stream(session_id, request), media_type="text/event-stream")
 
 
 @router.get("/api/comment-analysis/run/{session_id}")
 async def comment_analysis_run(session_id: str, request: Request):
+    await require_session_request_access(
+        request, session_id, login_resolver=_current_login,
+    )
     validate_comment_session_for_run(session_id)
-    return StreamingResponse(comment_run_stream(session_id, request), media_type="text/event-stream")
+    api_key = await require_request_llm_api_key(request)
+    return StreamingResponse(
+        stream_with_llm_api_key(
+            comment_run_stream(session_id, request),
+            api_key,
+            request=request,
+            category="comment",
+            action="评论分析",
+            reference_id=session_id,
+            history_id=session_id,
+        ),
+        media_type="text/event-stream",
+    )

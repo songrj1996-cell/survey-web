@@ -67,6 +67,10 @@ from app.schemas.interview_v2_structure import (
 )
 from app.services.auth import _require_feature
 from app.services.audit import audit_log
+from app.services.llm_credentials import (
+    require_request_llm_api_key,
+    run_with_llm_api_key,
+)
 from app.services.interview_v2_import_service import (
     InterviewV2ImportError,
     create_upload_attempt,
@@ -93,6 +97,7 @@ from app.services.interview_v2_report_review_service import (
     approve_report,
     edit_report_section,
     reaudit_report_section,
+    validate_report_section_access,
 )
 from app.services.interview_v2_export_service import (
     create_export,
@@ -1032,8 +1037,19 @@ async def regenerate_interview_v2_dossier(participant_id: str, request: Request)
     except (OverflowError, json.JSONDecodeError, UnicodeDecodeError, ValidationError, ValueError, RecursionError):
         return _analysis_boundary_request_error(request)
     try:
-        return await regenerate_dossier(
-            payload["project_id"], participant_id, payload, login
+        await run_in_threadpool(
+            get_current_dossier, payload["project_id"], participant_id, login
+        )
+        api_key = await require_request_llm_api_key(request)
+        return await run_with_llm_api_key(
+            regenerate_dossier(
+                payload["project_id"], participant_id, payload, login
+            ),
+            api_key,
+            request=request,
+            category="interview",
+            action="V2 玩家档案生成",
+            reference_id=participant_id,
         )
     except InterviewV2ImportError as exc:
         return _service_error_response(request, exc)
@@ -1097,7 +1113,16 @@ async def create_interview_v2_analysis_run(project_id: str, request: Request):
     ):
         return _analysis_request_error(request)
     try:
-        return await create_analysis_run(project_id, payload, login)
+        await run_in_threadpool(get_current_analysis, project_id, login)
+        api_key = await require_request_llm_api_key(request)
+        return await run_with_llm_api_key(
+            create_analysis_run(project_id, payload, login),
+            api_key,
+            request=request,
+            category="interview",
+            action="V2 跨玩家分析",
+            reference_id=project_id,
+        )
     except InterviewV2ImportError as exc:
         return _service_error_response(request, exc)
 
@@ -1122,7 +1147,16 @@ async def create_interview_v2_report(project_id: str, request: Request):
             message="报告生成请求格式无效。", suggested_action="refresh_report_inputs",
         )
     try:
-        return await create_report(project_id, payload, login)
+        await run_in_threadpool(get_current_analysis, project_id, login)
+        api_key = await require_request_llm_api_key(request)
+        return await run_with_llm_api_key(
+            create_report(project_id, payload, login),
+            api_key,
+            request=request,
+            category="interview",
+            action="V2 访谈报告生成",
+            reference_id=project_id,
+        )
     except InterviewV2ImportError as exc:
         return _service_error_response(request, exc)
 
@@ -1218,7 +1252,16 @@ async def reaudit_interview_v2_report_section(section_id: str, request: Request)
             message="报告章节重审请求格式无效。", suggested_action="refresh_report_inputs",
         )
     try:
-        result = await reaudit_report_section(section_id, payload, login)
+        await run_in_threadpool(validate_report_section_access, section_id, login)
+        api_key = await require_request_llm_api_key(request)
+        result = await run_with_llm_api_key(
+            reaudit_report_section(section_id, payload, login),
+            api_key,
+            request=request,
+            category="interview",
+            action="V2 报告章节重审",
+            reference_id=section_id,
+        )
     except InterviewV2ImportError as exc:
         return _service_error_response(request, exc)
     await audit_log(

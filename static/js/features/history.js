@@ -53,7 +53,12 @@ async function refreshHistoryEntryAfterGeneration(historyId) {
       : `/api/history/${encodeURIComponent(targetId)}`;
     const detailResp = await fetch(detailUrl);
     const detail = await detailResp.json().catch(() => ({}));
-    if (detailResp.ok && state.viewMode === 'history' && String(state.historyReport.id || '') === targetId) {
+    if (
+      detailResp.ok
+      && state.viewMode === 'history'
+      && String(state.historyReport.id || '') === targetId
+      && activeVersionNumber(state.historyReport) === selectedVersion
+    ) {
       syncReportVersionMeta(state.historyReport, {
         versions: detail.report_versions || summary?.report_versions || [],
         active_version: detail.active_report_version || detail.active_version || summary?.active_report_version,
@@ -62,6 +67,7 @@ async function refreshHistoryEntryAfterGeneration(historyId) {
         can_generate_version: false,
         report_duration_seconds: detail.report_duration_seconds,
         report_completed_at: detail.report_completed_at,
+        report_llm_usage: detail.report_llm_usage,
       });
       updateReportVersionUi();
       updateReportContextSwitch();
@@ -389,6 +395,7 @@ async function openHistoryEntry(id) {
       can_generate_version: entry.can_generate_version,
       report_duration_seconds: entry.report_duration_seconds,
       report_completed_at: entry.report_completed_at,
+      report_llm_usage: entry.report_llm_usage,
     });
     state.historyReport.qaMessages = normalizeQAMessages(entry.qa_messages);
     state.historyReport.qaHtml = '';

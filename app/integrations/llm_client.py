@@ -7,13 +7,17 @@
 使用 OpenAI Responses；若网关明确报告协议不兼容，会自动尝试下一种协议。
 """
 import asyncio
+import inspect
 import json
+import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 import httpx
 
 from app.core.config import (
+    FEISHU_LOGIN_REQUIRED,
     LLM_API_BASE,
     LLM_API_KEY,
     LLM_CONNECT_TIMEOUT,
@@ -23,9 +27,11 @@ from app.core.config import (
     LLM_REPORT_MAX_TOKENS,
     LLM_REPORT_MODEL,
 )
+from app.core.llm_context import current_llm_api_key, current_llm_attempt_observer
 
 
 _Protocol = Literal["messages", "responses", "chat"]
+_AttemptEventCallback = Callable[[dict[str, Any]], Awaitable[None] | None]
 
 
 @dataclass
@@ -34,9 +40,27 @@ class _LLMRequestError(RuntimeError):
     retryable: bool = False
     status_code: int | None = None
     endpoint_incompatible: bool = False
+    chat_usage_option_incompatible: bool = False
 
     def __str__(self) -> str:
         return self.message
+
+
+@dataclass(frozen=True)
+class _LLMResult:
+    answer: str
+    response_model: str | None = None
+    usage: dict[str, int] | None = None
+    usage_complete: bool = False
+
+
+@dataclass
+class _AttemptObservation:
+    """Upstream facts observed before one HTTP attempt reaches a terminal state."""
+
+    response_model: str | None = None
+    usage: dict[str, int] | None = None
+    usage_complete: bool = False
 
 
 def _configured_models(model_overrides=None) -> list[str]:
@@ -58,14 +82,95 @@ def _protocol_order(model: str) -> tuple[_Protocol, ...]:
     return ("responses", "chat", "messages")
 
 
-def _safe_error_text(raw: bytes | str) -> str:
+def _safe_error_text(raw: bytes | str, api_key: str = "") -> str:
     if isinstance(raw, bytes):
         text = raw.decode("utf-8", errors="replace")
     else:
         text = str(raw or "")
-    if LLM_API_KEY:
-        text = text.replace(LLM_API_KEY, "***")
+    for secret in {str(api_key or "").strip(), LLM_API_KEY}:
+        if secret:
+            text = text.replace(secret, "***")
     return " ".join(text.split())[:800]
+
+
+def _token_count(value) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, str):
+        text = value.strip()
+        if text.isdigit():
+            return int(text)
+    return None
+
+
+def _normalized_usage(value) -> dict[str, int] | None:
+    if not isinstance(value, dict):
+        return None
+    input_tokens = _token_count(value.get("input_tokens"))
+    if input_tokens is None:
+        input_tokens = _token_count(value.get("prompt_tokens"))
+    output_tokens = _token_count(value.get("output_tokens"))
+    if output_tokens is None:
+        output_tokens = _token_count(value.get("completion_tokens"))
+    if input_tokens is None or output_tokens is None:
+        return None
+    total_tokens = _token_count(value.get("total_tokens"))
+    if total_tokens is None:
+        total_tokens = input_tokens + output_tokens
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
+async def _emit_attempt_event(
+    callback: _AttemptEventCallback | None,
+    event: dict[str, Any],
+) -> None:
+    if callback is None:
+        return
+    try:
+        result = callback(dict(event))
+        if inspect.isawaitable(result):
+            await result
+    except Exception:
+        # Usage/progress instrumentation must never make a successful LLM call fail.
+        return
+
+
+async def _emit_attempt_events(
+    callback: _AttemptEventCallback | None,
+    event: dict[str, Any],
+) -> None:
+    context_observer = current_llm_attempt_observer()
+    await _emit_attempt_event(context_observer, event)
+    if callback is not context_observer:
+        await _emit_attempt_event(callback, event)
+
+
+def _chat_usage_option_incompatible(status: int, body: str) -> bool:
+    if status not in {400, 422}:
+        return False
+    lowered = body.lower()
+    field_named = "stream_options" in lowered or "include_usage" in lowered
+    rejection_markers = (
+        "unsupported",
+        "not supported",
+        "does not support",
+        "unknown parameter",
+        "unknown field",
+        "unrecognized",
+        "unexpected",
+        "extra inputs",
+        "extra fields",
+        "not permitted",
+        "not allowed",
+        "invalid parameter",
+    )
+    return field_named and any(marker in lowered for marker in rejection_markers)
 
 
 def _content_text(value) -> str:
@@ -162,7 +267,11 @@ async def _request_chat(
     messages: list[dict],
     model: str,
     max_tokens: int,
-) -> str:
+    observation: _AttemptObservation,
+    *,
+    api_key: str,
+    include_usage: bool = True,
+) -> _LLMResult:
     protocol: _Protocol = "chat"
     payload = {
         "model": model,
@@ -170,15 +279,32 @@ async def _request_chat(
         "stream": True,
         "max_tokens": max_tokens,
     }
+    if include_usage:
+        payload["stream_options"] = {"include_usage": True}
     headers = {
-        "Authorization": f"Bearer {LLM_API_KEY}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
     url = f"{LLM_API_BASE}/chat/completions"
 
-    async with client.stream("POST", url, headers=headers, json=payload) as response:
+    async with client.stream(
+        "POST",
+        url,
+        headers=headers,
+        json=payload,
+    ) as response:
         if response.status_code >= 400:
-            body = _safe_error_text(await response.aread())
+            body = _safe_error_text(await response.aread(), api_key)
+            if include_usage and _chat_usage_option_incompatible(
+                response.status_code,
+                body,
+            ):
+                raise _LLMRequestError(
+                    f"LLM HTTP {response.status_code} model={model} "
+                    f"protocol={protocol}: {body or 'empty response'}",
+                    status_code=response.status_code,
+                    chat_usage_option_incompatible=True,
+                )
             raise _http_error(model, protocol, response.status_code, body)
 
         chunks: list[str] = []
@@ -198,13 +324,30 @@ async def _request_chat(
             if not isinstance(data, dict):
                 continue
             if data.get("error"):
-                error_text = _safe_error_text(json.dumps(data["error"], ensure_ascii=False))
+                error_text = _safe_error_text(
+                    json.dumps(data["error"], ensure_ascii=False),
+                    api_key,
+                )
                 raise _LLMRequestError(
                     f"LLM stream error model={model} protocol={protocol}: {error_text}",
                     retryable=True,
                 )
+            if isinstance(data.get("model"), str) and data["model"].strip():
+                observation.response_model = data["model"].strip()
             choices = data.get("choices")
-            if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            chunk_usage = _normalized_usage(data.get("usage"))
+            if chunk_usage is not None:
+                observation.usage = chunk_usage
+                # With stream_options.include_usage, only the trailing chunk with
+                # an empty choices list is the final usage snapshot.
+                observation.usage_complete = (
+                    isinstance(choices, list) and not choices
+                )
+            if (
+                isinstance(choices, list)
+                and choices
+                and isinstance(choices[0], dict)
+            ):
                 reason = choices[0].get("finish_reason")
                 if reason:
                     finish_reason = str(reason)
@@ -224,7 +367,12 @@ async def _request_chat(
             f"LLM returned empty output model={model} protocol={protocol}",
             retryable=True,
         )
-    return answer
+    return _LLMResult(
+        answer=answer,
+        response_model=observation.response_model,
+        usage=observation.usage if include_usage else None,
+        usage_complete=bool(include_usage and observation.usage_complete),
+    )
 
 
 async def _request_messages(
@@ -233,7 +381,10 @@ async def _request_messages(
     model: str,
     max_tokens: int,
     reasoning_effort: str | None,
-) -> str:
+    observation: _AttemptObservation,
+    *,
+    api_key: str,
+) -> _LLMResult:
     protocol: _Protocol = "messages"
     system, conversation = _split_messages(messages)
     payload = {
@@ -250,8 +401,8 @@ async def _request_messages(
         payload["thinking"] = {"type": "adaptive"}
         payload["output_config"] = {"effort": reasoning_effort}
     headers = {
-        "Authorization": f"Bearer {LLM_API_KEY}",
-        "x-api-key": LLM_API_KEY,
+        "Authorization": f"Bearer {api_key}",
+        "x-api-key": api_key,
         "anthropic-version": "2023-06-01",
         "Content-Type": "application/json",
     }
@@ -259,11 +410,13 @@ async def _request_messages(
 
     async with client.stream("POST", url, headers=headers, json=payload) as response:
         if response.status_code >= 400:
-            body = _safe_error_text(await response.aread())
+            body = _safe_error_text(await response.aread(), api_key)
             raise _http_error(model, protocol, response.status_code, body)
 
         chunks: list[str] = []
         stop_reason = ""
+        input_tokens: int | None = None
+        output_tokens: int | None = None
         async for raw_line in response.aiter_lines():
             line = raw_line.strip()
             if not line or line.startswith(":") or line.startswith("event:"):
@@ -281,12 +434,38 @@ async def _request_messages(
             event_type = str(data.get("type") or "")
             if event_type == "error" or data.get("error"):
                 error = data.get("error") or data
-                error_text = _safe_error_text(json.dumps(error, ensure_ascii=False))
+                error_text = _safe_error_text(
+                    json.dumps(error, ensure_ascii=False),
+                    api_key,
+                )
                 raise _LLMRequestError(
                     f"LLM stream error model={model} protocol={protocol}: {error_text}",
                     retryable=True,
                 )
-            if event_type == "content_block_delta":
+            if event_type == "message_start":
+                message = (
+                    data.get("message")
+                    if isinstance(data.get("message"), dict)
+                    else {}
+                )
+                if isinstance(message.get("model"), str) and message["model"].strip():
+                    observation.response_model = message["model"].strip()
+                start_usage = message.get("usage")
+                if isinstance(start_usage, dict):
+                    parsed_input = _token_count(start_usage.get("input_tokens"))
+                    parsed_output = _token_count(start_usage.get("output_tokens"))
+                    if parsed_input is not None:
+                        input_tokens = parsed_input
+                    if parsed_output is not None:
+                        output_tokens = parsed_output
+                    observed_usage = _normalized_usage({
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                    })
+                    if observed_usage is not None:
+                        observation.usage = observed_usage
+                        observation.usage_complete = False
+            elif event_type == "content_block_delta":
                 delta = data.get("delta") if isinstance(data.get("delta"), dict) else {}
                 text = delta.get("text")
                 if isinstance(text, str):
@@ -295,12 +474,45 @@ async def _request_messages(
                 delta = data.get("delta") if isinstance(data.get("delta"), dict) else {}
                 if delta.get("stop_reason"):
                     stop_reason = str(delta["stop_reason"])
+                delta_usage = data.get("usage")
+                if isinstance(delta_usage, dict):
+                    parsed_input = _token_count(delta_usage.get("input_tokens"))
+                    parsed_output = _token_count(delta_usage.get("output_tokens"))
+                    if parsed_input is not None:
+                        input_tokens = parsed_input
+                    if parsed_output is not None:
+                        # Anthropic message_delta output usage is cumulative.
+                        output_tokens = parsed_output
+                    observed_usage = _normalized_usage({
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                    })
+                    if observed_usage is not None:
+                        observation.usage = observed_usage
+                        observation.usage_complete = bool(delta.get("stop_reason"))
             elif not event_type and isinstance(data.get("content"), list):
                 text = _content_text(data["content"])
                 if text:
                     chunks.append(text)
                 if data.get("stop_reason"):
                     stop_reason = str(data["stop_reason"])
+                if isinstance(data.get("model"), str) and data["model"].strip():
+                    observation.response_model = data["model"].strip()
+                raw_usage = data.get("usage")
+                if isinstance(raw_usage, dict):
+                    parsed_input = _token_count(raw_usage.get("input_tokens"))
+                    parsed_output = _token_count(raw_usage.get("output_tokens"))
+                    if parsed_input is not None:
+                        input_tokens = parsed_input
+                    if parsed_output is not None:
+                        output_tokens = parsed_output
+                    observed_usage = _normalized_usage({
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                    })
+                    if observed_usage is not None:
+                        observation.usage = observed_usage
+                        observation.usage_complete = True
 
     answer = "".join(chunks).strip()
     if stop_reason in {"max_tokens", "refusal"}:
@@ -314,7 +526,18 @@ async def _request_messages(
             f"LLM returned empty output model={model} protocol={protocol}",
             retryable=True,
         )
-    return answer
+    usage = _normalized_usage(
+        {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+        }
+    )
+    return _LLMResult(
+        answer=answer,
+        response_model=observation.response_model,
+        usage=usage,
+        usage_complete=observation.usage_complete,
+    )
 
 
 async def _request_responses(
@@ -323,7 +546,10 @@ async def _request_responses(
     model: str,
     max_tokens: int,
     reasoning_effort: str | None,
-) -> str:
+    observation: _AttemptObservation,
+    *,
+    api_key: str,
+) -> _LLMResult:
     protocol: _Protocol = "responses"
     instructions, conversation = _split_messages(messages)
     payload = {
@@ -337,14 +563,14 @@ async def _request_responses(
     if reasoning_effort:
         payload["reasoning"] = {"effort": reasoning_effort}
     headers = {
-        "Authorization": f"Bearer {LLM_API_KEY}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
     url = f"{LLM_API_BASE}/responses"
 
     async with client.stream("POST", url, headers=headers, json=payload) as response:
         if response.status_code >= 400:
-            body = _safe_error_text(await response.aread())
+            body = _safe_error_text(await response.aread(), api_key)
             raise _http_error(model, protocol, response.status_code, body)
 
         chunks: list[str] = []
@@ -365,13 +591,38 @@ async def _request_responses(
             if not isinstance(data, dict):
                 continue
             event_type = str(data.get("type") or "")
+            response_data = (
+                data.get("response")
+                if isinstance(data.get("response"), dict)
+                else data
+            )
+            if (
+                isinstance(response_data.get("model"), str)
+                and response_data["model"].strip()
+            ):
+                observation.response_model = response_data["model"].strip()
+            response_usage = _normalized_usage(response_data.get("usage"))
+            if response_usage is not None:
+                observation.usage = response_usage
+                observation.usage_complete = (
+                    event_type in {
+                        "response.completed",
+                        "response.incomplete",
+                        "response.failed",
+                    }
+                    or str(response_data.get("status") or "").strip().lower()
+                    in {"completed", "incomplete", "failed"}
+                )
             if event_type == "response.output_text.delta":
                 delta = data.get("delta")
                 if isinstance(delta, str):
                     chunks.append(delta)
             elif event_type in {"response.failed", "error"} or data.get("error"):
                 error = data.get("error") or data.get("response") or data
-                error_text = _safe_error_text(json.dumps(error, ensure_ascii=False))
+                error_text = _safe_error_text(
+                    json.dumps(error, ensure_ascii=False),
+                    api_key,
+                )
                 raise _LLMRequestError(
                     f"LLM stream error model={model} protocol={protocol}: {error_text}",
                     retryable=True,
@@ -408,7 +659,12 @@ async def _request_responses(
             f"LLM returned empty output model={model} protocol={protocol}",
             retryable=True,
         )
-    return answer
+    return _LLMResult(
+        answer=answer,
+        response_model=observation.response_model,
+        usage=observation.usage,
+        usage_complete=observation.usage_complete,
+    )
 
 
 async def _request_once(
@@ -418,7 +674,11 @@ async def _request_once(
     protocol: _Protocol,
     max_tokens: int,
     reasoning_effort: str | None,
-) -> str:
+    observation: _AttemptObservation,
+    *,
+    api_key: str,
+    chat_include_usage: bool = True,
+) -> _LLMResult:
     if protocol == "messages":
         return await _request_messages(
             client,
@@ -426,6 +686,8 @@ async def _request_once(
             model,
             max_tokens,
             reasoning_effort,
+            observation,
+            api_key=api_key,
         )
     if protocol == "responses":
         return await _request_responses(
@@ -434,8 +696,18 @@ async def _request_once(
             model,
             max_tokens,
             reasoning_effort,
+            observation,
+            api_key=api_key,
         )
-    return await _request_chat(client, messages, model, max_tokens)
+    return await _request_chat(
+        client,
+        messages,
+        model,
+        max_tokens,
+        observation,
+        api_key=api_key,
+        include_usage=chat_include_usage,
+    )
 
 
 async def collect_chat_completion(
@@ -444,12 +716,22 @@ async def collect_chat_completion(
     models=None,
     max_tokens: int | None = None,
     reasoning_effort: str | None = None,
+    on_attempt_event: _AttemptEventCallback | None = None,
+    api_key: str | None = None,
 ) -> tuple[str, str]:
-    """返回完整回答和实际模型；失败轮次不会向调用方暴露半截文本。"""
+    """返回完整回答和实际请求模型；失败轮次不会暴露半截文本。
+
+    若提供 ``on_attempt_event``，每次真实 HTTP 请求都会发送一条 ``started``
+    和一条 ``completed``/``failed``；同一对事件共享 ``call_id``，``attempt``
+    则在本次 collect 调用内按真实请求顺序递增。
+    """
     if not LLM_API_BASE:
         raise RuntimeError("未配置 LLM_API_BASE")
-    if not LLM_API_KEY:
-        raise RuntimeError("未配置 LLM_API_KEY")
+    request_api_key = str(api_key or current_llm_api_key()).strip()
+    if not request_api_key and not FEISHU_LOGIN_REQUIRED:
+        request_api_key = LLM_API_KEY
+    if not request_api_key:
+        raise RuntimeError("未提供当前用户的 LLM API Key")
     configured_models = _configured_models(models)
     if not configured_models:
         raise RuntimeError("未配置 LLM_REPORT_MODEL")
@@ -462,21 +744,121 @@ async def collect_chat_completion(
         pool=LLM_CONNECT_TIMEOUT,
     )
     last_error: Exception | None = None
+    requested_model = configured_models[0]
+    attempt_number = 0
+
+    def _terminal_event(
+        status: str,
+        event_base: dict[str, Any],
+        observation: _AttemptObservation,
+        result: _LLMResult | None = None,
+    ) -> dict[str, Any]:
+        event = {
+            "status": status,
+            **event_base,
+            "usage": result.usage if result is not None else observation.usage,
+            "usage_complete": (
+                result.usage_complete
+                if result is not None
+                else observation.usage_complete
+            ),
+        }
+        response_model = (
+            result.response_model if result is not None else observation.response_model
+        )
+        if response_model:
+            event["response_model"] = response_model
+        return event
+
     async with httpx.AsyncClient(timeout=timeout) as client:
-        for model in configured_models:
+        async def _run_http_attempt(
+            model: str,
+            model_index: int,
+            protocol: _Protocol,
+            *,
+            chat_include_usage: bool = True,
+        ) -> _LLMResult:
+            nonlocal attempt_number
+            attempt_number += 1
+            event_base = {
+                "call_id": uuid.uuid4().hex,
+                "model": model,
+                "requested_model": requested_model,
+                "protocol": protocol,
+                "fallback": model_index > 0,
+                "attempt": attempt_number,
+            }
+            observation = _AttemptObservation()
+            await _emit_attempt_events(
+                on_attempt_event,
+                {"status": "started", **event_base},
+            )
+            try:
+                result = await _request_once(
+                    client,
+                    messages,
+                    model,
+                    protocol,
+                    request_max_tokens,
+                    reasoning_effort,
+                    observation,
+                    api_key=request_api_key,
+                    chat_include_usage=chat_include_usage,
+                )
+            except asyncio.CancelledError:
+                await _emit_attempt_events(
+                    on_attempt_event,
+                    _terminal_event("failed", event_base, observation),
+                )
+                raise
+            except Exception:
+                await _emit_attempt_events(
+                    on_attempt_event,
+                    _terminal_event("failed", event_base, observation),
+                )
+                raise
+
+            await _emit_attempt_events(
+                on_attempt_event,
+                _terminal_event("completed", event_base, observation, result),
+            )
+            return result
+
+        async def _request_with_chat_compatibility(
+            model: str,
+            model_index: int,
+            protocol: _Protocol,
+        ) -> _LLMResult:
+            chat_include_usage = True
+            while True:
+                try:
+                    return await _run_http_attempt(
+                        model,
+                        model_index,
+                        protocol,
+                        chat_include_usage=chat_include_usage,
+                    )
+                except _LLMRequestError as exc:
+                    if (
+                        protocol == "chat"
+                        and chat_include_usage
+                        and exc.chat_usage_option_incompatible
+                    ):
+                        chat_include_usage = False
+                        continue
+                    raise
+
+        for model_index, model in enumerate(configured_models):
             for protocol in _protocol_order(model):
                 switch_protocol = False
                 for attempt in range(1, LLM_REPORT_MAX_ATTEMPTS + 1):
                     try:
-                        answer = await _request_once(
-                            client,
-                            messages,
+                        result = await _request_with_chat_compatibility(
                             model,
+                            model_index,
                             protocol,
-                            request_max_tokens,
-                            reasoning_effort,
                         )
-                        return answer, model
+                        return result.answer, model
                     except _LLMRequestError as exc:
                         last_error = exc
                         if exc.endpoint_incompatible:
@@ -493,7 +875,10 @@ async def collect_chat_completion(
                 if not switch_protocol:
                     break
 
-    detail = _safe_error_text(str(last_error or "unknown error"))
+    detail = _safe_error_text(
+        str(last_error or "unknown error"),
+        request_api_key,
+    )
     raise RuntimeError(
         "LLM generation failed after retries; "
         f"models={','.join(configured_models)}; last_error={detail}"

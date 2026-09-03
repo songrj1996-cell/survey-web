@@ -20,11 +20,13 @@ _MIRROR_FIELDS = (
     "analyst_conv_id",
     "analyst_app",
     "comparison_validation",
+    "report_llm_usage",
 )
 _TEXT_SNAPSHOT_FIELDS = tuple(
     field for field in _MIRROR_FIELDS
-    if field not in {"qa_messages", "comparison_validation"}
+    if field not in {"qa_messages", "comparison_validation", "report_llm_usage"}
 )
+_OPTIONAL_OBJECT_SNAPSHOT_FIELDS = ("report_llm_usage",)
 _SUMMARY_FIELDS = (
     "version",
     "kind",
@@ -32,6 +34,7 @@ _SUMMARY_FIELDS = (
     "instruction",
     "created_at",
     "title",
+    "rerun_details",
 )
 _IMMUTABLE_UPDATE_FIELDS = {
     "version",
@@ -144,6 +147,21 @@ def _snapshot_from(
         raise ValueError("comparison_validation 必须是对象")
     result["comparison_validation"] = deepcopy(comparison_validation)
 
+    for field in _OPTIONAL_OBJECT_SNAPSHOT_FIELDS:
+        if field in snapshot:
+            value = snapshot[field]
+        elif field in fallback:
+            value = fallback[field]
+        else:
+            result.pop(field, None)
+            continue
+        if value is None:
+            result.pop(field, None)
+            continue
+        if not isinstance(value, dict):
+            raise ValueError(f"{field} 必须是对象")
+        result[field] = deepcopy(value)
+
     if not result["title"]:
         result["title"] = _report_title(result["report_md"])
     return result
@@ -237,7 +255,11 @@ def resolve_report_version(source: dict, version=None) -> dict:
 def report_version_summaries(source: dict) -> list[dict]:
     """Return metadata safe for list/SSE responses without report bodies."""
     return [
-        {field: deepcopy(snapshot[field]) for field in _SUMMARY_FIELDS}
+        {
+            field: deepcopy(snapshot[field])
+            for field in _SUMMARY_FIELDS
+            if field in snapshot
+        }
         for snapshot in normalize_report_versions(source)
     ]
 
@@ -262,13 +284,17 @@ def _synced_state(
         ),
     }
     for field in _MIRROR_FIELDS:
-        state[field] = deepcopy(active_snapshot[field])
+        if field in active_snapshot:
+            state[field] = deepcopy(active_snapshot[field])
     return state, deepcopy(active_snapshot)
 
 
 def _commit_state(source: dict, state: dict) -> None:
     for key, value in state.items():
         source[key] = value
+    for field in _OPTIONAL_OBJECT_SNAPSHOT_FIELDS:
+        if field not in state:
+            source.pop(field, None)
 
 
 def sync_active_report_version(source: dict) -> dict:
@@ -333,9 +359,16 @@ def append_report_version(
         or snapshot.get("created_at")
         or datetime.now().isoformat(timespec="seconds")
     )
+    snapshot_fallback = source
+    if versions and "report_llm_usage" in source:
+        snapshot_fallback = {
+            key: value
+            for key, value in source.items()
+            if key != "report_llm_usage"
+        }
     new_snapshot = _snapshot_from(
         snapshot,
-        fallback=source,
+        fallback=snapshot_fallback,
         version=new_version,
         kind=resolved_kind,
         base_version=resolved_base,

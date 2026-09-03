@@ -66,6 +66,7 @@ from app.routers import (
     feishu,
     history,
     interview,
+    profile,
     settings_api,
     survey,
 )
@@ -80,6 +81,7 @@ app.include_router(export.router)
 app.include_router(comment_analysis.router)
 app.include_router(annotate.router)
 app.include_router(interview.router)
+app.include_router(profile.router)
 
 if INTERVIEW_V2_ENABLED:
     from app.routers import interview_v2

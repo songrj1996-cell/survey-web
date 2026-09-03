@@ -22,6 +22,7 @@ from app.services.export_history import (
 )
 from app.services.export_service import _export_to_feishu, _feishu_export_error
 from app.services.feishu_auth import require_feishu_configured
+from app.services.session_access import require_session_request_access
 
 router = APIRouter()
 
@@ -32,6 +33,9 @@ async def export_word(
     request: Request,
     version: str | None = None,
 ):
+    await require_session_request_access(
+        request, session_id, login_resolver=_current_login,
+    )
     docx_bytes, safe_title, title = await prepare_word_download(session_id, version)
     await audit_log(
         request,
@@ -53,6 +57,9 @@ async def export_markdown(
     request: Request,
     version: str | None = None,
 ):
+    await require_session_request_access(
+        request, session_id, login_resolver=_current_login,
+    )
     md_bytes, safe_title, title = await prepare_markdown_download(session_id, version)
     await audit_log(
         request,
@@ -70,6 +77,9 @@ async def export_pdf(
     request: Request,
     version: str | None = None,
 ):
+    await require_session_request_access(
+        request, session_id, login_resolver=_current_login,
+    )
     pdf_bytes, safe_title, title = await prepare_pdf_download(session_id, version)
     await audit_log(
         request,
@@ -161,8 +171,12 @@ async def export_feishu(
     request: Request,
     version: str | None = None,
 ):
+    login = await require_session_request_access(
+        request, session_id, login_resolver=_current_login,
+    )
+    if login is None:
+        login = await _current_login(request)
     require_feishu_configured()
-    login = await _current_login(request)
     if not login:
         raise HTTPException(status_code=401, detail="请先登录飞书")
     report_md, mode = get_session_export_data(session_id, version)

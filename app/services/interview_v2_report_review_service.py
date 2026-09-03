@@ -178,6 +178,13 @@ def _load_current_section(
     return saved
 
 
+def validate_report_section_access(
+    section_id: str, login: dict[str, Any] | None
+) -> None:
+    """Authorize a section-scoped AI action before resolving the user's LLM key."""
+    _load_current_section(section_id, login)
+
+
 def _section_public(saved: dict[str, Any], section_id: str) -> dict[str, Any]:
     section = next(
         item for item in saved["revision"].get("sections") or []

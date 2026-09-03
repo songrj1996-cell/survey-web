@@ -4,6 +4,7 @@
 
 function resetReportFailureUi() {
   state.sessionReport.error = '';
+  state.sessionReport.reportLlmUsage = null;
   const box = $('report-error');
   if (box) box.hidden = true;
   $('ps-writing')?.classList.remove('progress-step--failed');
@@ -24,6 +25,10 @@ function resetReportFailureUi() {
   });
   const remaining = $('report-progress-remaining');
   if (remaining) remaining.textContent = '正在计算后续处理步骤';
+  renderReportLlmUsage({
+    progressState: { phases: Object.fromEntries(REPORT_PHASE_ORDER.map(phase => [phase, 'pending'])) },
+    running: state.sessionReport.running,
+  });
 }
 
 function showReportFailureUi(message) {
@@ -94,6 +99,8 @@ const REPORT_PHASE_LABELS = {
   writing: '报告撰写',
   finalize: '校验并保存',
 };
+const REPORT_PHASE_ORDER = Object.keys(REPORT_PHASE_LABELS);
+const REPORT_LLM_LEGACY_TEXT = '该版本未记录模型/token用量';
 
 const REPORT_STATUS_LABELS = {
   active: '处理中',
@@ -103,6 +110,280 @@ const REPORT_STATUS_LABELS = {
   degraded: '已降级',
   skipped: '已跳过',
 };
+
+function _normalizeReportUsageNumber(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+}
+
+function _normalizeReportModelList(value) {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.map(item => String(item || '').trim()).filter(Boolean))];
+}
+
+function _normalizeReportActiveModels(value) {
+  if (!value || typeof value !== 'object') return {};
+  return Object.fromEntries(
+    Object.entries(value)
+      .map(([model, count]) => [String(model || '').trim(), _normalizeReportUsageNumber(count)])
+      .filter(([model, count]) => model && count > 0),
+  );
+}
+
+function normalizeReportLlmUsage(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const normalizeNode = node => {
+    const source = node && typeof node === 'object' ? node : {};
+    return {
+      models_used: _normalizeReportModelList(source.models_used),
+      fallback_models_used: _normalizeReportModelList(source.fallback_models_used),
+      input_tokens: _normalizeReportUsageNumber(source.input_tokens),
+      output_tokens: _normalizeReportUsageNumber(source.output_tokens),
+      total_tokens: _normalizeReportUsageNumber(source.total_tokens),
+      call_count: _normalizeReportUsageNumber(source.call_count),
+      usage_reported_call_count: _normalizeReportUsageNumber(source.usage_reported_call_count),
+      usage_missing_call_count: _normalizeReportUsageNumber(source.usage_missing_call_count),
+      active_calls: _normalizeReportUsageNumber(source.active_calls),
+      active_models: _normalizeReportActiveModels(source.active_models),
+    };
+  };
+  const phases = {};
+  let hasAnySignal = false;
+  REPORT_PHASE_ORDER.forEach(phase => {
+    phases[phase] = normalizeNode(raw.phases?.[phase]);
+    const phaseUsage = phases[phase];
+    if (
+      phaseUsage.models_used.length
+      || phaseUsage.fallback_models_used.length
+      || phaseUsage.total_tokens
+      || phaseUsage.call_count
+      || phaseUsage.usage_missing_call_count
+      || phaseUsage.active_calls
+      || Object.keys(phaseUsage.active_models).length
+    ) {
+      hasAnySignal = true;
+    }
+  });
+  const totals = normalizeNode(raw.totals);
+  if (
+    totals.models_used.length
+    || totals.fallback_models_used.length
+    || totals.total_tokens
+    || totals.call_count
+    || totals.usage_missing_call_count
+    || totals.active_calls
+    || Object.keys(totals.active_models).length
+  ) {
+    hasAnySignal = true;
+  }
+  return {
+    phases,
+    totals,
+    hasAnySignal,
+  };
+}
+
+function _reportUsageActiveModelsText(activeModels = {}) {
+  return Object.entries(activeModels)
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], 'zh-CN'))
+    .map(([model, count]) => (count > 1 ? `${model} × ${count}` : model))
+    .join('、');
+}
+
+function _reportUsageModelText(usage, { running = false } = {}) {
+  if (!usage) return running ? '模型待调用' : '未记录模型';
+  const activeModelsText = _reportUsageActiveModelsText(usage.active_models);
+  if (usage.active_calls > 0 && activeModelsText) {
+    return `当前：${activeModelsText}`;
+  }
+  const usedModels = usage.models_used.join('、');
+  const fallbackModels = usage.fallback_models_used.join('、');
+  if (usedModels && fallbackModels) return `已用：${usedModels}；备选：${fallbackModels}`;
+  if (usedModels) return `已用：${usedModels}`;
+  if (fallbackModels) return `已用：${fallbackModels}`;
+  if (usage.call_count > 0) return `已发起 ${usage.call_count} 次调用`;
+  return running ? '等待开始' : '未记录模型';
+}
+
+function _reportUsageTokensText(usage, { waitingText = 'Token 待统计' } = {}) {
+  if (!usage) return waitingText;
+  if (
+    !usage.total_tokens
+    && !usage.usage_missing_call_count
+    && !usage.usage_reported_call_count
+  ) {
+    return usage.call_count > 0 ? waitingText : '等待开始';
+  }
+  const totalText = `${usage.usage_missing_call_count > 0 ? '已统计至少 ' : ''}${(usage.total_tokens || 0).toLocaleString('zh-CN')} token`;
+  return usage.usage_missing_call_count > 0
+    ? `${totalText} · ${usage.usage_missing_call_count}次调用 usage 未返回或不完整`
+    : totalText;
+}
+
+function _reportUsagePhaseMeta(
+  phase,
+  progressState,
+  usageState,
+  { running = false, hasReport = false } = {},
+) {
+  const phaseUsage = usageState?.phases?.[phase] || null;
+  const phaseStatus = progressState?.phases?.[phase] || 'pending';
+  if (!running && usageState && usageState.hasAnySignal === false) {
+    return '未记录模型/token';
+  }
+  if (!phaseUsage || (
+    !phaseUsage.call_count
+    && !phaseUsage.total_tokens
+    && !phaseUsage.usage_missing_call_count
+    && !phaseUsage.active_calls
+    && !phaseUsage.models_used.length
+    && !phaseUsage.fallback_models_used.length
+  )) {
+    if (!running && hasReport && usageState?.hasAnySignal) return '本环节未调用模型';
+    if (!running && hasReport) return '未记录模型/token';
+    if (phaseStatus === 'pending') return running ? '等待开始' : '未开始';
+    if (running && phaseStatus === 'active') return '本地处理中，暂未调用模型';
+    if (running && ['completed', 'degraded', 'skipped'].includes(phaseStatus)) {
+      return '本环节未调用模型';
+    }
+    return running ? '等待写入模型 / Token' : '未记录模型/token';
+  }
+  return `${_reportUsageModelText(phaseUsage, { running })} · ${_reportUsageTokensText(phaseUsage)}`;
+}
+
+function _reportUsagePhaseDetailLines(usage, fallbackText) {
+  if (!usage) return [fallbackText];
+  const lines = [];
+  const activeModelsText = _reportUsageActiveModelsText(usage.active_models);
+  if (usage.active_calls > 0 && activeModelsText) {
+    lines.push(`当前：${activeModelsText}`);
+  }
+  if (usage.models_used.length) {
+    lines.push(`已用：${usage.models_used.join('、')}`);
+  } else if (usage.call_count > 0 && !activeModelsText) {
+    lines.push(`已发起 ${usage.call_count} 次调用`);
+  }
+  if (usage.fallback_models_used.length) {
+    lines.push(`备选：${usage.fallback_models_used.join('、')}`);
+  }
+  if (
+    usage.call_count > 0
+    || usage.active_calls > 0
+    || usage.total_tokens > 0
+    || usage.usage_reported_call_count > 0
+    || usage.usage_missing_call_count > 0
+  ) {
+    let tokenText = _reportUsageTokensText(usage, { waitingText: '待统计' });
+    if (tokenText === '等待开始') tokenText = '待统计';
+    lines.push(`Token 消耗：${tokenText}`);
+  }
+  return lines.length ? lines : [fallbackText];
+}
+
+function _reportUsageSummaryTexts(usageState, { running = false, hasReport = false } = {}) {
+  if (!usageState) {
+    if (running) {
+      return {
+        total: '模型 / Token 将在调用后显示',
+        note: '生成过程中会按环节持续刷新',
+        legacy: false,
+      };
+    }
+    if (hasReport) {
+      return { total: REPORT_LLM_LEGACY_TEXT, note: '', legacy: true };
+    }
+    return { total: '', note: '', legacy: false };
+  }
+  if (!running && hasReport && usageState.hasAnySignal === false) {
+    return { total: REPORT_LLM_LEGACY_TEXT, note: '', legacy: true };
+  }
+  const totals = usageState.totals;
+  const total = _reportUsageTokensText(totals, { waitingText: 'Token 待统计' });
+  const noteParts = [];
+  const modelText = _reportUsageModelText(totals, { running });
+  if (modelText && modelText !== '等待开始' && modelText !== '模型待调用') noteParts.push(modelText);
+  if (totals.call_count > 0) noteParts.push(`共 ${totals.call_count} 次调用`);
+  return {
+    total,
+    note: noteParts.join(' · '),
+    legacy: false,
+  };
+}
+
+function renderReportLlmUsage({ progressState = null, running = false } = {}) {
+  const ctx = activeReportCtx();
+  const usageState = normalizeReportLlmUsage(ctx?.reportLlmUsage);
+  const hasReport = Boolean(ctx?.reportMd);
+  const summary = _reportUsageSummaryTexts(usageState, { running, hasReport });
+
+  document.querySelectorAll('[data-report-phase-meta]').forEach(element => {
+    const phase = element.dataset.reportPhaseMeta;
+    element.textContent = _reportUsagePhaseMeta(
+      phase,
+      progressState,
+      usageState,
+      { running, hasReport },
+    );
+    element.title = element.textContent;
+  });
+
+  const summaryBox = $('report-llm-summary');
+  const summaryTotal = $('report-llm-total');
+  const summaryNote = $('report-llm-summary-note');
+  if (summaryBox && summaryTotal && summaryNote) {
+    const visible = running || hasReport || Boolean(usageState);
+    summaryBox.hidden = !visible;
+    summaryTotal.textContent = summary.total || (running ? '模型 / Token 将在调用后显示' : REPORT_LLM_LEGACY_TEXT);
+    summaryNote.textContent = summary.note;
+  }
+
+  const toolbar = $('report-toolbar-llm');
+  const popover = $('report-llm-popover');
+  const toolbarTotal = $('report-toolbar-llm-total');
+  const toolbarNote = $('report-toolbar-llm-note');
+  const toolbarPhases = $('report-toolbar-llm-phases');
+  if (!toolbar || !popover || !toolbarTotal || !toolbarNote || !toolbarPhases) return;
+
+  const toolbarVisible = hasReport || Boolean(usageState) || running;
+  popover.hidden = !toolbarVisible;
+  if (!toolbarVisible) setReportLlmPopoverOpen(false);
+  toolbarTotal.textContent = summary.total || REPORT_LLM_LEGACY_TEXT;
+  toolbarNote.textContent = summary.note;
+  toolbarPhases.innerHTML = REPORT_PHASE_ORDER.map(phase => {
+    const phaseUsage = usageState?.phases?.[phase] || null;
+    const hasPhaseData = Boolean(
+      phaseUsage
+      && (
+        phaseUsage.call_count
+        || phaseUsage.total_tokens
+        || phaseUsage.usage_missing_call_count
+        || phaseUsage.active_calls
+        || phaseUsage.models_used.length
+        || phaseUsage.fallback_models_used.length
+      )
+    );
+    const phaseStatus = progressState?.phases?.[phase] || '';
+    const className = hasPhaseData
+      ? (phaseUsage?.active_calls > 0 || phaseStatus === 'active'
+        ? 'report-toolbar__llm-phase report-toolbar__llm-phase--active'
+        : 'report-toolbar__llm-phase report-toolbar__llm-phase--done')
+      : `report-toolbar__llm-phase${summary.legacy ? ' report-toolbar__llm-phase--legacy' : ''}`;
+    const meta = _reportUsagePhaseMeta(
+      phase,
+      progressState,
+      usageState,
+      { running: running && state.viewMode === 'session', hasReport },
+    );
+    const detailLines = _reportUsagePhaseDetailLines(phaseUsage, meta);
+    return `
+      <div class="${className}">
+        <strong>${esc(REPORT_PHASE_LABELS[phase])}</strong>
+        <div class="report-toolbar__llm-phase-details" title="${esc(detailLines.join('；'))}">
+          ${detailLines.map(line => `<span>${esc(line)}</span>`).join('')}
+        </div>
+      </div>`;
+  }).join('');
+}
 
 function _createReportTaskProgress() {
   return {
@@ -177,6 +458,10 @@ function _renderReportPhaseTrack(progressState) {
     const phase = element.dataset.reportPhase;
     const status = progressState.phases[phase] || 'pending';
     element.className = `report-phase report-phase--${status}`;
+  });
+  renderReportLlmUsage({
+    progressState: state.viewMode === 'session' ? progressState : null,
+    running: state.viewMode === 'session' && state.sessionReport.running,
   });
 }
 
@@ -303,6 +588,8 @@ function _renderReportPreparationSteps(element, progressState) {
 }
 
 const EMPTY_RERUN_INSTRUCTION = '未填写补充要求，本次为重新生成';
+let partialRerunRunning = false;
+let partialRerunContext = null;
 
 function normalizeReportVersions(versions) {
   return (Array.isArray(versions) ? versions : [])
@@ -324,6 +611,9 @@ function normalizeReportVersions(versions) {
           plan_approved_at: item.plan_approved_at || '',
           report_completed_at: item.report_completed_at || '',
           report_duration_seconds: item.report_duration_seconds,
+          rerun_details: item.rerun_details && typeof item.rerun_details === 'object'
+            ? item.rerun_details
+            : {},
         };
       }
       const version = Number(item);
@@ -345,6 +635,7 @@ let reportVersionLoadTarget = null;
 function reportInteractionBusy() {
   return !!(
     state.sessionReport.running
+    || partialRerunRunning
     || state.qaLoading
     || state.reportVersionLoading
     || state.historyLoading
@@ -353,6 +644,8 @@ function reportInteractionBusy() {
 
 function activeReportInteractionBusy() {
   return !!(
+    partialRerunRunning
+    ||
     state.qaLoading
     || state.reportVersionLoading
     || state.historyLoading
@@ -366,6 +659,10 @@ function updateReportActionAvailability() {
   if (renameBtn) renameBtn.disabled = !activeReportId() || busy;
   const exportDropdown = $('btn-export-dropdown');
   if (exportDropdown) exportDropdown.disabled = busy;
+  const partialRerunBtn = $('btn-report-partial-rerun');
+  if (partialRerunBtn) partialRerunBtn.disabled = !activeReportId() || busy;
+  const validationBtn = $('btn-comparison-validation');
+  if (validationBtn) validationBtn.disabled = !activeReportId() || busy;
   const hasSession = !!(
     state.sessionId
     || state.sessionReport.reportMd
@@ -419,10 +716,27 @@ function syncReportVersionMeta(target, meta = {}) {
   }
   const completedAt = meta.report_completed_at ?? selectedSummary?.report_completed_at;
   if (completedAt !== undefined) target.reportCompletedAt = completedAt || '';
+  const hasLlmUsage = Object.prototype.hasOwnProperty.call(meta, 'report_llm_usage')
+    || Object.prototype.hasOwnProperty.call(selectedSummary || {}, 'report_llm_usage');
+  if (hasLlmUsage) {
+    target.reportLlmUsage = normalizeReportLlmUsage(meta.report_llm_usage ?? selectedSummary?.report_llm_usage);
+  }
 }
 
 function activeVersionNumber(ctx = activeReportCtx()) {
   return Number(ctx?.selectedVersion || ctx?.version || ctx?.activeVersion || 0) || null;
+}
+
+function reportVersionRevisionText(item) {
+  const details = item?.rerun_details || {};
+  if (details.target_label) {
+    const base = details.base_version ? `基于 V${details.base_version}` : '局部重做';
+    const changed = Array.isArray(details.changed_sections)
+      ? details.changed_sections.join('、')
+      : '';
+    return `${base} · 重做 ${details.target_label}${changed ? ` · 更新 ${changed}` : ''}`;
+  }
+  return item?.instruction || (item?.version === 1 ? '首次生成' : '未记录修订要求');
 }
 
 function withOptionalVersion(url, version) {
@@ -452,6 +766,7 @@ async function loadSessionReportVersion(version) {
     state.sessionReport.feishuLinkHtml = '';
     syncReportVersionMeta(state.sessionReport, {
       ...data,
+      report_llm_usage: data.report_llm_usage,
       version: data.version ?? version,
       selected_version: data.version ?? version,
     });
@@ -492,6 +807,7 @@ async function loadHistoryReportVersion(version) {
     state.historyReport.feishuLinkHtml = '';
     syncReportVersionMeta(state.historyReport, {
       ...data,
+      report_llm_usage: data.report_llm_usage,
       version: data.version ?? version,
       selected_version: data.version ?? version,
     });
@@ -543,7 +859,7 @@ function updateReportVersionUi() {
     menu.innerHTML = versions.map(item => {
       const isSelected = item.version === displayedVersion;
       const isActive = item.version === ctx?.activeVersion;
-      const revision = item.instruction || (item.version === 1 ? '首次生成' : '未记录修订要求');
+      const revision = reportVersionRevisionText(item);
       return `
         <button class="report-version-picker__option${isSelected ? ' report-version-picker__option--selected' : ''}"
           type="button" role="option" aria-selected="${isSelected}" data-report-version-option="${item.version}">
@@ -605,6 +921,7 @@ async function runStats(options = {}) {
   state.sessionReport.title = '';
   state.sessionReport.reportDurationSeconds = null;
   state.sessionReport.reportCompletedAt = '';
+  state.sessionReport.reportLlmUsage = null;
   goStep(4);
   resetReportFailureUi();
   $('ps-stats').classList.remove('progress-step--done', 'progress-step--failed');
@@ -704,6 +1021,12 @@ async function runStats(options = {}) {
         const el = $('report-stream-content');
         if (el && !fullReport) _renderReportPreparationSteps(el, taskProgress);
       }
+      if (ev.type === 'report_llm_status') {
+        state.sessionReport.reportLlmUsage = normalizeReportLlmUsage(ev.report_llm_usage);
+        if (state.viewMode === 'session') {
+          renderReportLlmUsage({ progressState: taskProgress, running: true });
+        }
+      }
       if (ev.type === 'progress') {
         // 服务端按完整章节输出；状态区持续说明当前步骤，避免等待期间像卡死。
         const parsed = _parseReportProgress(ev.message);
@@ -757,6 +1080,7 @@ async function runStats(options = {}) {
         }
       }
       if (ev.type === 'report_done') {
+        const completedLlmUsage = ev.report_llm_usage ?? state.sessionReport.reportLlmUsage;
         generationCompleted = true;
         completedSteps = totalSteps || completedSteps;
         renderGenerationStatus();
@@ -770,6 +1094,9 @@ async function runStats(options = {}) {
         state.sessionReport.qaMessages = [];
         state.sessionReport.qaHtml = '';
         state.sessionReport.feishuLinkHtml = '';
+        state.sessionReport.reportLlmUsage = normalizeReportLlmUsage(
+          completedLlmUsage,
+        );
         const doneVersion = toFiniteVersion(ev.version) || (isLinkedRerun ? targetVersion : null);
         syncReportVersionMeta(state.sessionReport, {
           ...ev,
@@ -1236,6 +1563,7 @@ function updateReportContextSwitch() {
     historyInfo.textContent = [ctx.reportNo, createdText, modeLabel, durationText].filter(Boolean).join(' · ');
   }
   updateReportVersionUi();
+  renderReportLlmUsage({ running: state.viewMode === 'session' && state.sessionReport.running });
 }
 
 function applyQAAvailability() {
@@ -1288,15 +1616,61 @@ function comparisonAuditRow(label, value, className = '') {
   return row;
 }
 
+function setComparisonValidationModalOpen(open) {
+  const modal = $('comparison-validation-modal');
+  const trigger = $('btn-comparison-validation');
+  if (!modal || !trigger) return;
+  const nextOpen = Boolean(open) && !trigger.disabled;
+  modal.hidden = !nextOpen;
+  trigger.setAttribute('aria-expanded', String(nextOpen));
+  if (nextOpen) {
+    document.body.style.overflow = 'hidden';
+    $('btn-comparison-validation-close')?.focus();
+  } else {
+    document.body.style.removeProperty('overflow');
+  }
+}
+
+function openComparisonValidationModal() {
+  setReportVersionMenuOpen(false);
+  setReportLlmPopoverOpen(false);
+  $('export-dropdown-menu')?.classList.remove('open');
+  setComparisonValidationModalOpen(true);
+}
+
+function normalizedComparisonValidationStatus(validation = activeReportCtx()?.comparisonValidation) {
+  const status = String(validation?.status || 'legacy');
+  return ['passed', 'repaired', 'needs_review', 'incomplete', 'legacy'].includes(status)
+    ? status
+    : 'incomplete';
+}
+
+function confirmComparisonValidationExport() {
+  const audit = activeReportCtx()?.comparisonValidation || {};
+  const status = normalizedComparisonValidationStatus(audit);
+  if (status !== 'needs_review' && status !== 'incomplete') return true;
+  const unresolved = Number(audit.unresolved_count || 0);
+  const warning = status === 'needs_review'
+    ? `统计比较校验仍有 ${unresolved} 项待人工确认，导出的报告可能包含未通过复核的比较结论。`
+    : '统计比较校验未完整执行，导出的报告可能包含未经完整复核的比较结论。';
+  return window.confirm(`${warning}\n\n仍要继续导出吗？`);
+}
+
 function renderComparisonValidation(validation) {
   const panel = $('comparison-validation');
+  const trigger = $('btn-comparison-validation');
+  const triggerLabel = $('comparison-validation-trigger-label');
+  const alert = $('comparison-validation-alert');
+  const alertTitle = $('comparison-validation-alert-title');
+  const alertText = $('comparison-validation-alert-text');
   const statusNode = $('comparison-validation-status');
   const countsNode = $('comparison-validation-counts');
   const body = $('comparison-validation-body');
-  if (!panel || !statusNode || !countsNode || !body) return;
+  if (!panel || !trigger || !triggerLabel || !alert || !alertTitle || !alertText
+    || !statusNode || !countsNode || !body) return;
 
   const audit = validation && typeof validation === 'object' ? validation : {};
-  const status = String(audit.status || 'legacy');
+  const status = normalizedComparisonValidationStatus(audit);
   const labels = {
     passed: '统计比较校验通过',
     repaired: '统计比较校验已自动修正',
@@ -1304,13 +1678,38 @@ function renderComparisonValidation(validation) {
     incomplete: '统计比较校验未完整执行',
     legacy: '此版本无统计比较校验记录',
   };
-  panel.dataset.status = labels[status] ? status : 'incomplete';
+  const detected = Number(audit.detected_count || 0);
+  const applied = Number(audit.applied_count || 0);
+  const unresolved = Number(audit.unresolved_count || 0);
+  const triggerLabels = {
+    passed: '校验通过',
+    repaired: applied ? `已修正 ${applied}` : '已修正',
+    needs_review: unresolved ? `待确认 ${unresolved}` : '待确认',
+    incomplete: '校验异常',
+    legacy: '未校验',
+  };
+
+  panel.dataset.status = status;
+  trigger.dataset.status = status;
+  triggerLabel.textContent = triggerLabels[status];
+  trigger.title = labels[status];
   statusNode.textContent = (
     status === 'passed' && Number(audit.catalog_group_count || 0) === 0
       ? '未发现可确定校验的量表比较'
-      : labels[status] || labels.incomplete
+      : labels[status]
   );
   body.replaceChildren();
+
+  const needsAttention = status === 'needs_review' || status === 'incomplete';
+  alert.hidden = !needsAttention;
+  alert.dataset.status = status;
+  if (status === 'needs_review') {
+    alertTitle.textContent = '统计比较校验有待确认项';
+    alertText.textContent = `发现 ${unresolved} 项需要人工确认，报告中可能保留未通过复核的比较结论。`;
+  } else if (status === 'incomplete') {
+    alertTitle.textContent = '统计比较校验未完整执行';
+    alertText.textContent = '请人工检查报告中的量表比较结论，再决定是否导出使用。';
+  }
 
   if (status === 'legacy') {
     countsNode.textContent = '';
@@ -1318,13 +1717,9 @@ function renderComparisonValidation(validation) {
       '说明',
       '该版本生成于本校验功能上线之前，不能据此判断正文中的比较结论已经通过复核。',
     ));
-    panel.open = false;
     return;
   }
 
-  const detected = Number(audit.detected_count || 0);
-  const applied = Number(audit.applied_count || 0);
-  const unresolved = Number(audit.unresolved_count || 0);
   countsNode.textContent = `发现 ${detected} · 修改 ${applied} · 待确认 ${unresolved}`;
   if (audit.coverage) body.append(comparisonAuditRow('校验范围', audit.coverage));
   if (status === 'passed' && Number(audit.catalog_group_count || 0) === 0) {
@@ -1382,7 +1777,6 @@ function renderComparisonValidation(validation) {
   if (!body.childElementCount) {
     body.append(comparisonAuditRow('结果', '未发现需要修改的统计比较表述。'));
   }
-  panel.open = status !== 'passed';
 }
 
 function renderReportWorkspace(md, { preserveQa = true } = {}) {
@@ -1424,6 +1818,7 @@ function renderReportWorkspace(md, { preserveQa = true } = {}) {
   applyQAAvailability();
   updateReportContextSwitch();
   updateReportVersionUi();
+  renderReportLlmUsage({ running: state.viewMode === 'session' && state.sessionReport.running });
   applyCoreHighlight();
   removeLegacyStatsChartPayloads();
   enhanceReportTables();
@@ -1466,6 +1861,7 @@ function switchReportContext(mode) {
     $('ps-stats').classList.remove('progress-step--active');
     $('ps-stats').classList.add('progress-step--done');
     $('ps-writing').classList.add('progress-step--active');
+    renderReportLlmUsage({ running: true });
   } else if (state.sessionReport.error) {
     goStep(4);
     $('report-stream-content').textContent = state.sessionReport.stream || '';
@@ -1490,6 +1886,32 @@ $('btn-report-history')?.addEventListener('click', () => {
   loadHistory();
 });
 $('btn-report-back-session')?.addEventListener('click', () => switchReportContext('session'));
+function setReportLlmPopoverOpen(open) {
+  const popover = $('report-llm-popover');
+  const trigger = $('btn-report-llm-usage');
+  const panel = $('report-toolbar-llm');
+  if (!popover || !trigger || !panel) return;
+  const nextOpen = Boolean(open) && !popover.hidden;
+  popover.classList.toggle('report-llm-popover--open', nextOpen);
+  trigger.setAttribute('aria-expanded', String(nextOpen));
+  panel.hidden = !nextOpen;
+}
+
+$('btn-report-llm-usage')?.addEventListener('click', e => {
+  e.stopPropagation();
+  const trigger = e.currentTarget;
+  setReportVersionMenuOpen(false);
+  $('export-dropdown-menu')?.classList.remove('open');
+  setReportLlmPopoverOpen(trigger.getAttribute('aria-expanded') !== 'true');
+});
+
+$('btn-comparison-validation')?.addEventListener('click', openComparisonValidationModal);
+$('btn-comparison-validation-alert')?.addEventListener('click', openComparisonValidationModal);
+$('btn-comparison-validation-close')?.addEventListener('click', () => setComparisonValidationModalOpen(false));
+document.querySelectorAll('[data-comparison-validation-close]').forEach(node => {
+  node.addEventListener('click', () => setComparisonValidationModalOpen(false));
+});
+
 function setReportVersionMenuOpen(open) {
   const picker = $('report-version-picker');
   const trigger = $('report-version-trigger');
@@ -1504,6 +1926,7 @@ function setReportVersionMenuOpen(open) {
 $('report-version-trigger')?.addEventListener('click', e => {
   e.stopPropagation();
   const trigger = e.currentTarget;
+  setReportLlmPopoverOpen(false);
   setReportVersionMenuOpen(trigger.getAttribute('aria-expanded') !== 'true');
 });
 
@@ -1528,10 +1951,15 @@ $('report-version-menu')?.addEventListener('click', async e => {
 
 document.addEventListener('click', e => {
   if (!e.target.closest('#report-version-picker')) setReportVersionMenuOpen(false);
+  if (!e.target.closest('#report-llm-popover')) setReportLlmPopoverOpen(false);
 });
 
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') setReportVersionMenuOpen(false);
+  if (e.key === 'Escape') {
+    setReportVersionMenuOpen(false);
+    setReportLlmPopoverOpen(false);
+    setComparisonValidationModalOpen(false);
+  }
 });
 
 function closeReportVersionManageModal() {
@@ -1546,7 +1974,7 @@ function renderReportVersionManageList() {
   const versions = normalizeReportVersions(state.historyReport.versions);
   list.innerHTML = versions.map(item => {
     const isActive = item.version === state.historyReport.activeVersion;
-    const note = item.instruction || (item.version === 1 ? '首次生成' : EMPTY_RERUN_INSTRUCTION);
+    const note = reportVersionRevisionText(item) || EMPTY_RERUN_INSTRUCTION;
     return `<div class="report-version-delete-row">
       <div class="report-version-delete-row__content">
         <div class="report-version-delete-row__title">V${item.version}${isActive ? ' · 当前生效' : ''}</div>
@@ -1619,6 +2047,210 @@ $('report-version-manage-list')?.addEventListener('click', async e => {
     applyQAAvailability();
     renderReportVersionManageList();
   }
+});
+
+function closePartialRerunModal() {
+  if (partialRerunRunning) return;
+  const modal = $('report-partial-rerun-modal');
+  if (modal) modal.hidden = true;
+  partialRerunContext = null;
+  document.body.style.removeProperty('overflow');
+}
+
+function partialRerunTargets(type) {
+  const capability = partialRerunContext?.capability || {};
+  return type === 'part'
+    ? (Array.isArray(capability.parts) ? capability.parts : [])
+    : (Array.isArray(capability.questions) ? capability.questions : []);
+}
+
+function renderPartialRerunTargetOptions() {
+  const type = $('report-partial-rerun-type')?.value || 'question';
+  const targetSelect = $('report-partial-rerun-target');
+  if (!targetSelect) return;
+  const targets = partialRerunTargets(type);
+  targetSelect.innerHTML = targets.map(item => {
+    const value = type === 'part' ? item.part_index : item.scope_key;
+    const label = type === 'part'
+      ? item.part_title
+      : `${item.question_name}（${item.part_title}，${item.response_count} 条）`;
+    return `<option value="${esc(value)}">${esc(label)}</option>`;
+  }).join('');
+  targetSelect.disabled = partialRerunRunning || !targets.length;
+  renderPartialRerunImpact();
+}
+
+function selectedPartialRerunTarget() {
+  const type = $('report-partial-rerun-type')?.value || 'question';
+  const key = String($('report-partial-rerun-target')?.value || '');
+  const targets = partialRerunTargets(type);
+  const item = targets.find(target => String(
+    type === 'part' ? target.part_index : target.scope_key,
+  ) === key);
+  return { type, key, item };
+}
+
+function renderPartialRerunImpact() {
+  const impact = $('report-partial-rerun-impact');
+  if (!impact) return;
+  const { type, item } = selectedPartialRerunTarget();
+  if (!item) {
+    impact.textContent = '当前类型没有可重做目标。';
+    return;
+  }
+  const scopeCount = type === 'part' ? (item.scope_keys || []).length : 1;
+  const partTitle = item.part_title;
+  impact.textContent = [
+    `实际分析调用：${scopeCount ? `${scopeCount} 个目标 scope` : '无开放题模型分析'}`,
+    `报告写回：${partTitle}、核心结论、行动建议`,
+    '保持不变：一级标题、其他 Part、Bug 模块和无关统计',
+  ].join('；');
+}
+
+async function openPartialRerunModal() {
+  if (reportInteractionBusy()) return;
+  const historyId = String(activeReportId() || '');
+  const baseVersion = activeVersionNumber();
+  if (!historyId || !baseVersion) {
+    showToast('当前报告没有可绑定的历史版本', 'error');
+    return;
+  }
+  setComparisonValidationModalOpen(false);
+  const button = $('btn-report-partial-rerun');
+  if (button) button.disabled = true;
+  try {
+    const resp = await fetch(
+      `/api/history/${encodeURIComponent(historyId)}?version=${encodeURIComponent(baseVersion)}`,
+      { credentials: 'same-origin', cache: 'no-store' },
+    );
+    const detail = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(detail.detail || '读取局部重做范围失败');
+    const capability = detail.partial_rerun || {};
+    if (!capability.available) {
+      showToast(capability.reason || '该版本暂不支持局部重做', 'info', 7000);
+      return;
+    }
+    if (Number(detail.version_count || 0) >= Number(detail.max_versions || 5)) {
+      showToast(`报告版本已达上限（${detail.max_versions || 5} 个），请先删除一个旧版本`, 'info', 7000);
+      return;
+    }
+    partialRerunContext = { historyId, baseVersion, capability, detail };
+    $('report-partial-rerun-base').textContent = `基础版本：V${baseVersion} · ${detail.title || '分析报告'}`;
+    const typeSelect = $('report-partial-rerun-type');
+    typeSelect.value = (capability.questions || []).length ? 'question' : 'part';
+    typeSelect.disabled = false;
+    $('report-partial-rerun-instruction').value = '';
+    $('report-partial-rerun-progress').hidden = true;
+    $('btn-report-partial-rerun-start').textContent = '开始局部重做';
+    renderPartialRerunTargetOptions();
+    $('report-partial-rerun-modal').hidden = false;
+    document.body.style.overflow = 'hidden';
+  } catch (error) {
+    showToast(error.message, 'error', 7000);
+  } finally {
+    updateReportActionAvailability();
+  }
+}
+
+async function startPartialRerun() {
+  if (partialRerunRunning || !partialRerunContext) return;
+  const { type, key, item } = selectedPartialRerunTarget();
+  if (!item || !key) {
+    showToast('请选择要重做的题目或 Part', 'info');
+    return;
+  }
+  const { historyId, baseVersion, detail } = partialRerunContext;
+  const instruction = String($('report-partial-rerun-instruction')?.value || '').trim();
+  let doneEvent = null;
+  partialRerunRunning = true;
+  $('report-partial-rerun-progress').hidden = false;
+  $('report-partial-rerun-progress-title').textContent = `基于 V${baseVersion} 局部重做`;
+  $('report-partial-rerun-progress-message').textContent = '正在校验基础版本与数据指纹…';
+  $('btn-report-partial-rerun-start').disabled = true;
+  $('btn-report-partial-rerun-cancel').disabled = true;
+  $('btn-report-partial-rerun-close').disabled = true;
+  $('report-partial-rerun-type').disabled = true;
+  $('report-partial-rerun-target').disabled = true;
+  $('report-partial-rerun-instruction').disabled = true;
+  updateReportActionAvailability();
+  try {
+    await consumeSSEPost(
+      `/api/history/${encodeURIComponent(historyId)}/partial-rerun`,
+      {
+        base_version: baseVersion,
+        target_type: type,
+        target_key: key,
+        instruction,
+      },
+      ev => {
+        if (ev.type === 'partial_rerun_progress') {
+          $('report-partial-rerun-progress-title').textContent = `步骤 ${ev.phase_index || 1}/${ev.phase_total || 5}`;
+          $('report-partial-rerun-progress-message').textContent = ev.message || '正在局部重做';
+        } else if (ev.type === 'partial_rerun_done') {
+          doneEvent = ev;
+          const details = ev.rerun_details || {};
+          const seconds = Number(details.elapsed_seconds || 0);
+          $('report-partial-rerun-progress-title').textContent = `V${ev.version} 已生成`;
+          $('report-partial-rerun-progress-message').textContent = [
+            `重做 ${details.target_label || '目标范围'}`,
+            `更新 ${(details.changed_sections || []).join('、')}`,
+            seconds ? `耗时 ${formatReportDuration(seconds)}` : '',
+            '未执行整份报告重跑',
+          ].filter(Boolean).join('；');
+        }
+      },
+    );
+    if (!doneEvent) throw new Error('局部重做连接结束，但没有收到新版本确认');
+    state.viewMode = 'history';
+    state.historyId = historyId;
+    state.historyReport.id = historyId;
+    state.historyReport.reportNo = detail.report_no || '';
+    state.historyReport.createdAt = detail.created_at || '';
+    state.historyReport.mode = detail.mode || 'survey';
+    syncReportVersionMeta(state.historyReport, {
+      ...doneEvent,
+      versions: doneEvent.versions || [],
+      version: doneEvent.version,
+      selected_version: doneEvent.version,
+    });
+    await loadHistoryReportVersion(doneEvent.version);
+    const details = doneEvent.rerun_details || {};
+    showToast(
+      `V${doneEvent.version} 已生成：只重做 ${details.target_label || '所选范围'}，未整份重跑`,
+      'success',
+      8000,
+    );
+    partialRerunRunning = false;
+    closePartialRerunModal();
+    if (typeof refreshHistoryEntryAfterGeneration === 'function') {
+      refreshHistoryEntryAfterGeneration(historyId).catch(error => {
+        console.warn('[partial-rerun] Refresh history failed:', error);
+      });
+    }
+  } catch (error) {
+    $('report-partial-rerun-progress-title').textContent = '局部重做失败';
+    $('report-partial-rerun-progress-message').textContent = `${error.message}；基础版本未被覆盖。`;
+    showToast(`局部重做失败：${error.message}`, 'error', 8000);
+  } finally {
+    partialRerunRunning = false;
+    $('btn-report-partial-rerun-start').disabled = false;
+    $('btn-report-partial-rerun-cancel').disabled = false;
+    $('btn-report-partial-rerun-close').disabled = false;
+    $('report-partial-rerun-type').disabled = false;
+    $('report-partial-rerun-target').disabled = false;
+    $('report-partial-rerun-instruction').disabled = false;
+    updateReportActionAvailability();
+  }
+}
+
+$('btn-report-partial-rerun')?.addEventListener('click', openPartialRerunModal);
+$('report-partial-rerun-type')?.addEventListener('change', renderPartialRerunTargetOptions);
+$('report-partial-rerun-target')?.addEventListener('change', renderPartialRerunImpact);
+$('btn-report-partial-rerun-start')?.addEventListener('click', startPartialRerun);
+$('btn-report-partial-rerun-cancel')?.addEventListener('click', closePartialRerunModal);
+$('btn-report-partial-rerun-close')?.addEventListener('click', closePartialRerunModal);
+document.querySelectorAll('[data-partial-rerun-close]').forEach(node => {
+  node.addEventListener('click', closePartialRerunModal);
 });
 
 async function updateReportTitle(historyId, title) {
@@ -1751,6 +2383,7 @@ $('btn-export-word').addEventListener('click', () => {
     showToast('当前报告版本准备完成后再导出', 'info');
     return;
   }
+  if (!confirmComparisonValidationExport()) return;
   const version = activeVersionNumber();
   if (state.viewMode === 'history' && state.historyId) {
     window.location.href = withOptionalVersion(`/api/export/word-history/${state.historyId}`, version);
@@ -1812,72 +2445,14 @@ async function refreshFeishuStatus() {
   const label = $('feishu-login-label');
   if (label) {
     label.textContent = state.feishu.logged_in
-      ? `飞书：${state.feishu.name || state.feishu.email || '已登录'}`
+      ? `个人中心 · ${state.feishu.name || state.feishu.email || '已登录'}`
       : '登录飞书';
   }
   applyPermGating();
-}
-
-function showFeishuLogoutConfirmModal(account) {
-  return new Promise(resolve => {
-    const existing = $('feishu-logout-modal');
-    if (existing) existing.remove();
-
-    const modal = document.createElement('div');
-    modal.id = 'feishu-logout-modal';
-    modal.style.cssText = 'position:fixed;inset:0;z-index:200;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.5);backdrop-filter:blur(4px);';
-    modal.innerHTML = `
-      <div role="dialog" aria-modal="true" aria-labelledby="feishu-logout-title"
-           style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
-                  padding:24px 28px;width:min(400px,90vw);display:flex;flex-direction:column;gap:16px;
-                  box-shadow:var(--shadow-lg)">
-        <div id="feishu-logout-title" style="font-size:15px;font-weight:600;color:var(--text)">退出飞书登录？</div>
-        <div style="font-size:13px;color:var(--text-2);line-height:1.7">
-          当前账号为 <strong style="color:var(--text)">${esc(account)}</strong>。退出后，如需继续使用飞书相关功能，需要重新登录授权。
-        </div>
-        <div style="display:flex;gap:8px;justify-content:flex-end">
-          <button class="btn btn--ghost" id="feishu-logout-cancel" type="button">取消</button>
-          <button class="btn btn--primary" id="feishu-logout-confirm" type="button">确认退出</button>
-        </div>
-      </div>`;
-    document.body.appendChild(modal);
-
-    const onKeydown = event => {
-      if (event.key === 'Escape') cleanup(false);
-    };
-    const cleanup = result => {
-      document.removeEventListener('keydown', onKeydown);
-      modal.remove();
-      resolve(result);
-    };
-    $('feishu-logout-cancel').onclick = () => cleanup(false);
-    $('feishu-logout-confirm').onclick = () => cleanup(true);
-    modal.addEventListener('click', event => {
-      if (event.target === modal) cleanup(false);
-    });
-    document.addEventListener('keydown', onKeydown);
-    $('feishu-logout-cancel').focus();
-  });
-}
-
-$('btn-feishu-login').addEventListener('click', async () => {
-  if (!state.feishu.configured) {
-    showToast('服务端未配置飞书应用（FEISHU_APP_ID/SECRET/REDIRECT_URI）', 'error');
-    return;
+  if (typeof window.syncProfileFromFeishuStatus === 'function') {
+    window.syncProfileFromFeishuStatus(state.feishu);
   }
-  if (state.feishu.logged_in) {
-    const account = state.feishu.email || state.feishu.name || '当前账号';
-    const confirmed = await showFeishuLogoutConfirmModal(account);
-    if (!confirmed) return;
-    try {
-      await fetch('/api/feishu/logout', { method: 'POST' });
-    } catch { }
-    showToast('已退出飞书登录', 'info');
-    window.location.href = '/login';
-    return;
-  }
-  window.location.href = `/api/feishu/login?next=${encodeURIComponent(location.pathname)}`;
-});
+}
 
 // ── 飞书文档导出 ──
 $('btn-export-pdf').addEventListener('click', () => {
@@ -1885,6 +2460,7 @@ $('btn-export-pdf').addEventListener('click', () => {
     showToast('当前报告版本准备完成后再导出', 'info');
     return;
   }
+  if (!confirmComparisonValidationExport()) return;
   const version = activeVersionNumber();
   if (state.viewMode === 'history' && state.historyId) {
     window.location.href = withOptionalVersion(`/api/export/pdf-history/${state.historyId}`, version);
@@ -1933,6 +2509,7 @@ async function exportFeishu() {
     showToast('当前报告版本准备完成后再导出', 'info');
     return;
   }
+  if (!confirmComparisonValidationExport()) return;
   if (!state.feishu.configured) {
     showToast('服务端未配置飞书应用', 'error');
     return;
@@ -2002,6 +2579,9 @@ function showFeishuLink(url) {
 // Export dropdown toggle
 $('btn-export-dropdown').addEventListener('click', e => {
   e.stopPropagation();
+  setComparisonValidationModalOpen(false);
+  setReportLlmPopoverOpen(false);
+  setReportVersionMenuOpen(false);
   $('export-dropdown-menu').classList.toggle('open');
 });
 document.addEventListener('click', e => {
@@ -2014,6 +2594,7 @@ $('btn-export-md').addEventListener('click', () => {
     showToast('当前报告版本准备完成后再导出', 'info');
     return;
   }
+  if (!confirmComparisonValidationExport()) return;
   const blob = new Blob([state.reportMd || ''], { type: 'text/markdown;charset=utf-8' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
