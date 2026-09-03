@@ -86,6 +86,12 @@ class AnnotateRuleTests(unittest.TestCase):
         self.assertIn('"It\'s not good"', prompt)
         self.assertIn("仅仅完整表达态度仍属于无效反馈", prompt)
         self.assertIn("标签必须是无效反馈，不能是普通反馈", prompt)
+        self.assertIn("不适合射手", prompt)
+        self.assertIn("至少形成一条可理解的最小信息链", prompt)
+        self.assertIn("文字长不等于优秀", prompt)
+        self.assertIn("严禁补造原文没有的因果关系", prompt)
+        self.assertIn("优秀 1、普通 1、无效 3", prompt)
+        self.assertIn("Brody", prompt)
 
     def test_workflow_queries_only_contain_task_data(self):
         rows = [["P1", "answer one", "answer two"]]
@@ -179,6 +185,150 @@ class AnnotateRuleTests(unittest.TestCase):
 
         self.assertEqual(overall, "优秀反馈")
         self.assertIn("非N/A题目3道", reason)
+
+    def test_quality_v3_standard_case_one_keeps_invalid_majority_hard_gate(self):
+        overall, reason = annotate.calculate_overall_quality(
+            {
+                "col_1": "优秀反馈",
+                "col_2": "普通反馈",
+                "col_3": "无效反馈",
+                "col_4": "无效反馈",
+                "col_5": "无效反馈",
+            },
+            [1, 2, 3, 4, 5],
+        )
+
+        self.assertEqual(overall, "无效反馈")
+        self.assertIn("无效3、普通1、优秀1", reason)
+        self.assertIn("无效比例60.00%", reason)
+        self.assertIn("加权总分3分、平均分0.60", reason)
+        self.assertIn("整体硬门槛：已触发", reason)
+        self.assertIn("无效比例超过50%", reason)
+
+    def test_quality_v3_weighted_threshold_boundaries(self):
+        scenarios = (
+            (
+                "below-invalid-threshold",
+                ["无效反馈", "无效反馈", "普通反馈", "普通反馈"],
+                "无效反馈",
+                "平均分0.50",
+            ),
+            (
+                "exactly-invalid-threshold",
+                ["无效反馈", "无效反馈", "普通反馈", "普通反馈", "普通反馈"],
+                "普通反馈",
+                "平均分0.60",
+            ),
+            (
+                "excellent-at-threshold",
+                ["无效反馈", "普通反馈", "优秀反馈", "优秀反馈", "优秀反馈"],
+                "优秀反馈",
+                "平均分1.40",
+            ),
+            (
+                "excellent-score-but-too-many-invalid",
+                ["无效反馈", "无效反馈", *(["优秀反馈"] * 5)],
+                "普通反馈",
+                "平均分1.43",
+            ),
+        )
+        for name, labels, expected, metric in scenarios:
+            with self.subTest(name=name):
+                q_labels = {
+                    f"col_{index}": label
+                    for index, label in enumerate(labels, 1)
+                }
+                overall, reason = annotate.calculate_overall_quality(
+                    q_labels, list(range(1, len(labels) + 1)),
+                )
+                self.assertEqual(overall, expected)
+                self.assertIn(metric, reason)
+
+    def test_quality_v3_standard_case_two_detects_cross_type_low_effort(self):
+        headers = [
+            "ID",
+            "Rating Track A",
+            "Rating Track B",
+            "Rating Track C",
+            "Rating Track D",
+            "Rating Track E",
+            "Rank all tracks",
+            "Q1",
+            "Q2",
+            "Q3",
+            "Q4",
+            "Q5",
+        ]
+        row = [
+            "P1",
+            1,
+            1,
+            1,
+            1,
+            1,
+            "Track A, Track B, Track C, Track D, Track E",
+            "浮夸",
+            "僵硬",
+            "粗犷",
+            "不适合灵活射手",
+            "Brody很夸张",
+        ]
+        open_text_cols = [7, 8, 9, 10, 11]
+        q_labels = {f"col_{col}": "无效反馈" for col in open_text_cols}
+        model_result = {
+            "id": "P1",
+            "q_labels": q_labels,
+            "q_reasons": {
+                f"col_{col}": "只有元素或结论，没有原因、影响或作用机制"
+                for col in open_text_cols
+            },
+            "q_evidence": {f"col_{col}": str(row[col]) for col in open_text_cols},
+            "translations": {},
+        }
+
+        valid, missing, errors = annotate_workflow._validated_quality_results(
+            [model_result],
+            [row],
+            0,
+            open_text_cols,
+            False,
+            headers=headers,
+            headers_zh=headers,
+        )
+
+        self.assertEqual(missing, set())
+        self.assertEqual(errors, [])
+        self.assertEqual(valid[0]["overall"], "无效反馈")
+        reason = valid[0]["overall_reason"]
+        self.assertIn("无效5、普通0、优秀0", reason)
+        self.assertIn("无效比例100.00%", reason)
+        self.assertIn("加权总分0分、平均分0.00", reason)
+        self.assertIn("5个明确评分项全部为1", reason)
+        self.assertIn("A→B→C→D→E", reason)
+        self.assertIn("5道非N/A主观回答全部为极短表达", reason)
+        self.assertIn("低投入组合信号：已触发", reason)
+
+    def test_single_uniform_score_signal_cannot_force_low_effort_invalid(self):
+        headers = ["ID", *[f"Rating Track {letter}" for letter in "ABCDE"], *[f"Q{i}" for i in range(1, 6)]]
+        answers = [
+            f"The melody builds gradually in section {index} and makes the transition feel natural in the match highlight."
+            for index in range(1, 6)
+        ]
+        row = ["P1", 1, 1, 1, 1, 1, *answers]
+        open_text_cols = [6, 7, 8, 9, 10]
+        q_labels = {f"col_{col}": "普通反馈" for col in open_text_cols}
+
+        low_effort = annotate.detect_low_effort_signals(
+            row, headers, open_text_cols, 0, q_labels,
+        )
+        overall, reason = annotate.calculate_overall_quality(
+            q_labels, open_text_cols, low_effort=low_effort,
+        )
+
+        self.assertFalse(low_effort["triggered"])
+        self.assertEqual([signal["code"] for signal in low_effort["signals"]], ["uniform_scores"])
+        self.assertEqual(overall, "普通反馈")
+        self.assertIn("低投入组合信号：未触发（发现1项", reason)
 
     def test_missing_and_duplicate_ids_are_blocked_before_annotation(self):
         sid = "test-id-validation"

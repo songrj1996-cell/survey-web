@@ -69,6 +69,9 @@ COMMENT_QUOTE_SELECT_CONCURRENCY = max(
 # 问卷题型识别、方案规划、报告写作与报告追问直连公司 LLM 分发服务。
 LLM_API_BASE = os.getenv("LLM_API_BASE", "https://llm.moontontech.net/v1").rstrip("/")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "").strip()
+USER_LLM_KEY_ENCRYPTION_KEY = os.getenv(
+    "USER_LLM_KEY_ENCRYPTION_KEY", ""
+).strip()
 LLM_COLUMN_MODEL = os.getenv("LLM_COLUMN_MODEL", "gpt-5.6-terra").strip()
 LLM_COLUMN_FALLBACK_MODELS = (
     _env_csv_list("LLM_COLUMN_FALLBACK_MODELS") or ("qwen3.7-plus",)
@@ -297,6 +300,48 @@ ANNOTATE_QUALITY_MAX_QUERY_CHARS = max(
     4000,
     _env_int("ANNOTATE_QUALITY_MAX_QUERY_CHARS", 40000),
 )
+ANNOTATE_QUALITY_INVALID_HARD_RATIO = min(
+    1.0,
+    max(0.0, _env_float("ANNOTATE_QUALITY_INVALID_HARD_RATIO", 0.5)),
+)
+ANNOTATE_QUALITY_INVALID_AVG_THRESHOLD = min(
+    2.0,
+    max(0.0, _env_float("ANNOTATE_QUALITY_INVALID_AVG_THRESHOLD", 0.6)),
+)
+ANNOTATE_QUALITY_EXCELLENT_AVG_THRESHOLD = min(
+    2.0,
+    max(
+        ANNOTATE_QUALITY_INVALID_AVG_THRESHOLD,
+        _env_float("ANNOTATE_QUALITY_EXCELLENT_AVG_THRESHOLD", 1.4),
+    ),
+)
+ANNOTATE_QUALITY_EXCELLENT_MAX_INVALID_RATIO = min(
+    1.0,
+    max(
+        0.0,
+        _env_float("ANNOTATE_QUALITY_EXCELLENT_MAX_INVALID_RATIO", 0.2),
+    ),
+)
+ANNOTATE_QUALITY_LOW_EFFORT_MIN_SIGNALS = min(
+    4,
+    max(2, _env_int("ANNOTATE_QUALITY_LOW_EFFORT_MIN_SIGNALS", 3)),
+)
+ANNOTATE_QUALITY_LOW_EFFORT_MIN_ANSWERS = max(
+    2,
+    _env_int("ANNOTATE_QUALITY_LOW_EFFORT_MIN_ANSWERS", 4),
+)
+ANNOTATE_QUALITY_LOW_EFFORT_MIN_STRUCTURED_ITEMS = max(
+    3,
+    _env_int("ANNOTATE_QUALITY_LOW_EFFORT_MIN_STRUCTURED_ITEMS", 5),
+)
+ANNOTATE_QUALITY_SHORT_TEXT_MAX_CHARS = max(
+    1,
+    _env_int("ANNOTATE_QUALITY_SHORT_TEXT_MAX_CHARS", 18),
+)
+ANNOTATE_QUALITY_SHORT_TEXT_MAX_WORDS = max(
+    1,
+    _env_int("ANNOTATE_QUALITY_SHORT_TEXT_MAX_WORDS", 5),
+)
 
 
 FEISHU_LOGIN_REQUIRED = _env_bool("FEISHU_LOGIN_REQUIRED", False)
@@ -319,6 +364,8 @@ AUDIT_LOG_FILE = os.path.join(DATA_DIR, "audit_logs.json")
 APP_SETTINGS_FILE = os.path.join(DATA_DIR, "app_settings.json")
 UI_TEXTS_FILE = os.path.join(DATA_DIR, "ui_texts.json")
 GLOSSARY_FILE = os.path.join(DATA_DIR, "glossary.json")
+USER_LLM_CREDENTIALS_FILE = os.path.join(DATA_DIR, "user_llm_credentials.json")
+USER_LLM_USAGE_FILE = os.path.join(DATA_DIR, "user_llm_usage.json")
 ANNOTATE_RESULT_DIR = Path(DATA_DIR) / "annotate_results"
 MAX_HISTORY  = 20
 MAX_REPORT_VERSIONS = 5
@@ -1226,24 +1273,32 @@ DEFAULT_ANNOTATE_QUALITY_SYSTEM_PROMPT = """\
 
 2. 无效反馈
 - 内容无法理解、明显与题目无关。
-- 只表达喜欢、不喜欢、很好、很差、无聊、有趣等结论，没有任何超出该评价本身的可理解原因或信息。
+- 只有态度、形容词、元素名、角色名、比较结果或结论，没有解释该具体因素为什么重要、造成什么影响，或在哪种适用场景下成立。
 - 纯抱怨、纯夸奖、随机字符、复制题目但没有实际回答。
 - “直接回答了题目”不等于“提供了有效反馈”。即使题目本身询问感受或评价，只回答 "most boring"、"It's not good"、"bad"、"I don't like it" 或其他语言中的同类裸评价，也必须判为无效反馈。
+- 仅仅完整表达态度仍属于无效反馈；必须以原文实际存在的信息链判断，不能因为语句完整而提升标签。
 - very、most、too、非常、最、太等程度词只是在加强评价，不构成原因或额外信息。
+- “很僵硬”“很浮夸”“旋转太慢”“不适合射手”“Brody 很夸张”等仅有属性或结论的回答仍是无效反馈；英雄名、角色定位或夸张说法本身不是原因、作用机制、具体经历或可核验案例。
 - 如果 q_reasons 的核心判断是“没有说明原因”“未提供任何额外信息”或同义表述，标签必须是无效反馈，不能是普通反馈。
 - 不得仅因为回答较短就判为无效。
 
 3. 普通反馈
-- 回答了题目，并提供了超出喜欢/不喜欢、好/坏、无聊/有趣等裸评价的至少一项可理解信息或原因。
-- 观点和原因存在，但缺少具体经历、场景、操作过程、案例或可核验细节。
-- 回答虽然简短，但包含了具体对象特征、行为、影响、期望或原因等实际信息时，可以判为普通反馈；仅仅完整表达态度仍属于无效反馈。
-- 例如 "The rotation is too slow" 提供了“旋转速度慢”的实际信息，可判为普通反馈；"It's not good" 没有提供任何额外信息，必须判为无效反馈。
+- 至少形成一条可理解的最小信息链：明确指出具体因素，并明确给出原因、影响或适用场景中的至少一项。
+- 观点与信息链成立，但缺少具体位置、过程、实际案例、可核验细节或可执行建议。
+- 例如“开头有铺垫并逐步进入高潮，因此适合作为高光时刻音乐”包含因素、原因和适用场景，可判普通反馈；仅说“有高潮”或“适合高光音乐”仍不足以判普通。
+- 回答简短不妨碍判普通，但不能把模型推测出的原因补进信息链。原文没有说明的原因、影响或场景一律视为不存在。
 
 4. 优秀反馈
-- 清楚回答题目并表达明确观点。
-- 说明了形成该观点的原因。
-- 提供与观点直接相关的具体经历、对局场景、操作过程、英雄或技能互动、实际案例或其他可核验细节。
-- 仅提到英雄名、技能名或泛泛的游戏术语，不足以单独构成优秀反馈。
+- 场景、具体因素和原因或影响构成完整逻辑，且额外提供具体位置、过程、实际案例、可核验细节或可执行建议中的至少一项。
+- 例如指出歌曲缺少史诗高潮、说明这削弱了高潮体验，并建议在歌曲中段增加高潮，包含因素、影响、具体位置和可执行建议，可判优秀反馈。
+- 文字长不等于优秀；重复描述、堆砌形容词或泛泛展开，即使很长也不能提升标签。
+- 仅提到英雄名、技能名、另一首歌曲或泛泛的游戏术语，不足以构成具体经历或案例。
+- 严禁补造原文没有的因果关系、使用场景、经历、机制或建议。
+
+【标准案例校准】
+
+- 案例一的五道主观题应严格得到“优秀 1、普通 1、无效 3”：指出缺少史诗高潮并建议在歌曲中段增加高潮的是优秀；指出已有高潮和开头铺垫、因此适合高光音乐的是普通；其余仅比较、引用另一首歌曲或泛泛夸奖的回答均为无效。
+- 案例二中“浮夸、僵硬、粗犷、不适合灵活射手”等简短元素或结论，因为没有解释原因、影响或作用机制，逐题均为无效；有关 Brody 的夸张说法不是具体经历或可核验案例。
 
 【证据和原因】
 

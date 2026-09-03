@@ -29,6 +29,11 @@ from app.services.report_versions import (
     sync_active_report_version,
     update_report_version,
 )
+from app.services.report_partial_rerun import (
+    build_partial_rerun_source,
+    build_plan_fingerprint,
+    verify_partial_rerun_source,
+)
 from app.storage.history import (
     _ensure_history_report_numbers,
     _load_history,
@@ -60,6 +65,7 @@ _VERSION_MIRROR_FIELDS = (
     "analyst_conv_id",
     "analyst_app",
     "comparison_validation",
+    "report_llm_usage",
 )
 
 
@@ -426,6 +432,9 @@ def save_to_history(
             "owner_open_id": sess.get("owner_open_id") or (old_entry or {}).get("owner_open_id", ""),
             "owner_name": sess.get("owner_name") or (old_entry or {}).get("owner_name", ""),
         }
+        partial_rerun_source = build_partial_rerun_source(sess)
+        if partial_rerun_source is None and old_entry:
+            partial_rerun_source = deepcopy(old_entry.get("partial_rerun_source"))
         entry = {
             "id": session_id,
             "report_no": old_entry.get("report_no") if old_entry else _next_history_report_no(history),
@@ -483,12 +492,18 @@ def save_to_history(
             or (old_entry or {}).get("row_count", 0),
             **owner,
         }
+        if partial_rerun_source:
+            entry["partial_rerun_source"] = partial_rerun_source
         if version_source:
             entry.update({
                 "report_versions": deepcopy(version_source["report_versions"]),
                 "active_report_version": version_source["active_report_version"],
                 "next_report_version": version_source["next_report_version"],
             })
+            if "report_llm_usage" in active_source:
+                entry["report_llm_usage"] = deepcopy(
+                    active_source["report_llm_usage"]
+                )
         if sess.get("mode") == "comment":
             entry.update({
                 "comment_file_hash": sess.get("comment_file_hash", ""),
@@ -535,6 +550,8 @@ def _copy_report_version_state(target: dict, source: dict) -> None:
     ):
         if field in source:
             target[field] = deepcopy(source[field])
+        elif field == "report_llm_usage":
+            target.pop(field, None)
 
 
 def append_exact_rerun_to_history(
@@ -590,6 +607,69 @@ def append_exact_rerun_to_history(
             "row_count": max(0, len(sess.get("rows") or []) - 1),
             "rows_fed": False,
         })
+        partial_rerun_source = build_partial_rerun_source(sess)
+        if partial_rerun_source:
+            entry["partial_rerun_source"] = partial_rerun_source
+        return deepcopy(entry), deepcopy(committed)
+
+    return mutate_history(persist)
+
+
+def append_partial_rerun_to_history(
+    history_id: str,
+    snapshot: dict,
+    *,
+    base_version: int,
+    expected_plan_fingerprint: str,
+    expected_source_fingerprint: str,
+    instruction: str,
+    login: dict | None,
+) -> tuple[dict, dict]:
+    """Atomically append a validated partial-rerun snapshot to one history card."""
+    target_id = str(history_id or "").strip()
+
+    def persist(history: list) -> tuple[dict, dict]:
+        entry = _find_history_for_login(history, target_id, login)
+        if not entry:
+            raise HTTPException(status_code=404, detail="历史报告不存在或无权访问")
+        source = entry.get("partial_rerun_source")
+        if not isinstance(source, dict):
+            raise HTTPException(status_code=409, detail="该报告缺少局部重做来源数据")
+        if (
+            not verify_partial_rerun_source(source)
+            or build_plan_fingerprint(entry.get("plan") or {})
+            != expected_plan_fingerprint
+            or source.get("plan_fingerprint") != expected_plan_fingerprint
+            or source.get("source_fingerprint") != expected_source_fingerprint
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="报告的数据或分析方案已变化，本次结果未保存。",
+            )
+        try:
+            base = resolve_report_version(entry, base_version)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        artifacts = base.get("analysis_artifacts")
+        if (
+            not isinstance(artifacts, dict)
+            or artifacts.get("plan_fingerprint") != expected_plan_fingerprint
+            or artifacts.get("source_fingerprint") != expected_source_fingerprint
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="基础版本的局部分析产物已变化，本次结果未保存。",
+            )
+        try:
+            committed = append_report_version(
+                entry,
+                snapshot,
+                kind="regenerate",
+                base_version=base_version,
+                instruction=instruction,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return deepcopy(entry), deepcopy(committed)
 
     return mutate_history(persist)
@@ -651,6 +731,11 @@ def delete_history_report_version(
             deleted = delete_report_version(entry, version)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if not any(
+            isinstance(snapshot.get("analysis_artifacts"), dict)
+            for snapshot in normalize_report_versions(entry)
+        ):
+            entry.pop("partial_rerun_source", None)
         return deepcopy(entry), deepcopy(deleted)
 
     entry, deleted = mutate_history(persist)

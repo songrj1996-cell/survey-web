@@ -6,7 +6,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from app.services import report_versions
+from app.services import history_service, report_history, report_versions
 from app.storage import history as history_storage
 
 
@@ -23,6 +23,35 @@ def _snapshot(title: str, *, created_at: str) -> dict:
         "analyst_conv_id": f"conv-{title}",
         "analyst_app": "standard",
         "created_at": created_at,
+    }
+
+
+def _usage(model: str, *, total_tokens: int) -> dict:
+    input_tokens = total_tokens - 10
+    return {
+        "schema_version": 1,
+        "phases": {
+            "writing": {
+                "models_used": [model],
+                "fallback_models_used": [],
+                "input_tokens": input_tokens,
+                "output_tokens": 10,
+                "total_tokens": total_tokens,
+                "call_count": 1,
+                "usage_reported_call_count": 1,
+                "usage_missing_call_count": 0,
+            },
+        },
+        "totals": {
+            "models_used": [model],
+            "fallback_models_used": [],
+            "input_tokens": input_tokens,
+            "output_tokens": 10,
+            "total_tokens": total_tokens,
+            "call_count": 1,
+            "usage_reported_call_count": 1,
+            "usage_missing_call_count": 0,
+        },
     }
 
 
@@ -75,6 +104,77 @@ class ReportVersionTests(unittest.TestCase):
         )
         self.assertNotIn("report_md", summaries[0])
         self.assertNotIn("qa_context_md", summaries[0])
+        self.assertNotIn("report_llm_usage", versions[0])
+        self.assertNotIn("report_llm_usage", summaries[0])
+
+    def test_usage_is_bound_to_each_version_and_absent_usage_never_inherits(self):
+        first_usage = _usage("writer-v1", total_tokens=110)
+        second_usage = _usage("writer-v2", total_tokens=220)
+        source = {
+            "report_md": "# 第一版\n\n正文",
+            "title": "第一版",
+            "created_at": "2026-08-01T10:00:00",
+            "report_llm_usage": first_usage,
+        }
+        report_versions.sync_active_report_version(source)
+        second_input = _snapshot("第二版", created_at="2026-08-02T10:00:00")
+        second_input["report_llm_usage"] = second_usage
+
+        report_versions.append_report_version(source, second_input)
+
+        self.assertEqual(
+            report_versions.resolve_report_version(source, 1)["report_llm_usage"],
+            first_usage,
+        )
+        self.assertEqual(
+            report_versions.resolve_report_version(source, 2)["report_llm_usage"],
+            second_usage,
+        )
+        self.assertEqual(source["report_llm_usage"], second_usage)
+        self.assertIsNot(source["report_llm_usage"], second_input["report_llm_usage"])
+
+        report_versions.append_report_version(
+            source,
+            _snapshot("第三版", created_at="2026-08-03T10:00:00"),
+        )
+        self.assertNotIn(
+            "report_llm_usage",
+            report_versions.resolve_report_version(source, 3),
+        )
+        self.assertNotIn("report_llm_usage", source)
+
+        source["active_report_version"] = 1
+        report_versions.sync_active_report_version(source)
+        self.assertEqual(source["report_llm_usage"], first_usage)
+        source["active_report_version"] = 3
+        report_versions.sync_active_report_version(source)
+        self.assertNotIn("report_llm_usage", source)
+
+    def test_usage_requires_an_object_and_can_be_explicitly_cleared(self):
+        source = {
+            "report_md": "# 第一版\n\n正文",
+            "title": "第一版",
+            "created_at": "2026-08-01T10:00:00",
+            "report_llm_usage": _usage("writer-v1", total_tokens=110),
+        }
+        report_versions.sync_active_report_version(source)
+
+        cleared = report_versions.update_report_version(
+            source,
+            1,
+            report_llm_usage=None,
+        )
+
+        self.assertNotIn("report_llm_usage", cleared)
+        self.assertNotIn("report_llm_usage", source)
+        self.assertNotIn("report_llm_usage", source["report_versions"][0])
+
+        with self.assertRaisesRegex(ValueError, "report_llm_usage 必须是对象"):
+            report_versions.update_report_version(
+                source,
+                1,
+                report_llm_usage=123,
+            )
 
     def test_append_legacy_v1_to_v2_and_mirrors_active_snapshot(self):
         source = {
@@ -379,6 +479,61 @@ class HistoryStorageTransactionTests(unittest.TestCase):
 
         self.assertEqual(loaded, original)
         save.assert_not_called()
+
+    def test_history_detail_projects_usage_for_selected_version_without_leakage(self):
+        session = {
+            "id": "usage-history",
+            "filename": "responses.xlsx",
+            "mode": "",
+            "rows": [["id"], ["p1"]],
+            "plan": {"parts": []},
+            "report_md": "# 第一版\n\n正文",
+            "title": "第一版",
+            "created_at": "2026-08-01T10:00:00",
+        }
+        report_versions.sync_active_report_version(session)
+        second = _snapshot("第二版", created_at="2026-08-02T10:00:00")
+        second["report_llm_usage"] = _usage("writer-v2", total_tokens=220)
+        report_versions.append_report_version(session, second)
+
+        saved = report_history.save_to_history(session["id"], session)
+        stored = history_storage._load_history()[0]
+
+        self.assertEqual(stored["report_llm_usage"], second["report_llm_usage"])
+        self.assertNotIn("report_llm_usage", stored["report_versions"][0])
+        self.assertEqual(
+            stored["report_versions"][1]["report_llm_usage"],
+            second["report_llm_usage"],
+        )
+
+        with patch.object(
+            history_service,
+            "_find_history_for_login",
+            return_value=saved,
+        ):
+            first_detail = history_service.get_history_entry(
+                session["id"],
+                None,
+                1,
+            )
+            second_detail = history_service.get_history_entry(
+                session["id"],
+                None,
+                2,
+            )
+
+        self.assertNotIn("report_llm_usage", first_detail)
+        self.assertEqual(
+            second_detail["report_llm_usage"],
+            second["report_llm_usage"],
+        )
+
+        target = {"report_llm_usage": _usage("stale", total_tokens=999)}
+        source = deepcopy(stored)
+        source["active_report_version"] = 1
+        report_versions.sync_active_report_version(source)
+        report_history._copy_report_version_state(target, source)
+        self.assertNotIn("report_llm_usage", target)
 
 
 if __name__ == "__main__":
