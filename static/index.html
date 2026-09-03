@@ -11,7 +11,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/style.css?v=47" />
+  <link rel="stylesheet" href="/static/style.css?v=48" />
 </head>
 
 <body>
@@ -638,6 +638,15 @@
             <button class="btn btn--ghost" id="btn-report-partial-rerun" type="button">
               局部重做
             </button>
+            <button class="btn btn--ghost comparison-validation-trigger" id="btn-comparison-validation" type="button"
+              aria-haspopup="dialog" aria-expanded="false" aria-controls="comparison-validation-modal"
+              data-status="legacy">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+                <polyline points="9 12 11 14 15 10" />
+              </svg>
+              <span id="comparison-validation-trigger-label">校验结果</span>
+            </button>
             <div class="report-llm-popover" id="report-llm-popover" hidden>
               <button class="btn btn--ghost report-llm-popover__trigger" id="btn-report-llm-usage" type="button"
                 aria-haspopup="true" aria-expanded="false" aria-controls="report-toolbar-llm">
@@ -707,13 +716,13 @@
                 <ul class="report-toc__list" id="report-toc-list"></ul>
               </nav>
               <div class="report-body">
-                <details class="comparison-validation" id="comparison-validation">
-                  <summary class="comparison-validation__summary">
-                    <span class="comparison-validation__status" id="comparison-validation-status"></span>
-                    <span class="comparison-validation__counts" id="comparison-validation-counts"></span>
-                  </summary>
-                  <div class="comparison-validation__body" id="comparison-validation-body"></div>
-                </details>
+                <div class="comparison-validation-alert" id="comparison-validation-alert" data-status="needs_review" hidden>
+                  <div class="comparison-validation-alert__copy">
+                    <strong id="comparison-validation-alert-title">统计比较校验需要关注</strong>
+                    <span id="comparison-validation-alert-text"></span>
+                  </div>
+                  <button type="button" id="btn-comparison-validation-alert">查看详情</button>
+                </div>
                 <div class="report-content markdown-body" id="report-content"></div>
               </div>
             </div>
@@ -1678,6 +1687,32 @@
     </section>
   </div>
 
+  <div class="modal-shell comparison-validation-modal" id="comparison-validation-modal" hidden>
+    <div class="modal-shell__backdrop" data-comparison-validation-close></div>
+    <div class="modal-shell__dialog comparison-validation-dialog" role="dialog" aria-modal="true"
+      aria-labelledby="comparison-validation-title">
+      <div class="modal-shell__header">
+        <div>
+          <div class="modal-shell__title" id="comparison-validation-title">统计比较校验</div>
+          <p class="modal-shell__desc">查看报告中的量表比较是否与确定性统计结果一致。</p>
+        </div>
+        <button class="modal-shell__close" id="btn-comparison-validation-close" type="button" aria-label="关闭">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="6" x2="6" y2="18" />
+            <line x1="6" y1="6" x2="18" y2="18" />
+          </svg>
+        </button>
+      </div>
+      <div class="modal-shell__body comparison-validation-modal__body">
+        <div class="comparison-validation__summary" id="comparison-validation" data-status="legacy">
+          <span class="comparison-validation__status" id="comparison-validation-status"></span>
+          <span class="comparison-validation__counts" id="comparison-validation-counts"></span>
+        </div>
+        <div class="comparison-validation__body" id="comparison-validation-body"></div>
+      </div>
+    </div>
+  </div>
+
   <div class="modal-shell" id="report-partial-rerun-modal" hidden>
     <div class="modal-shell__backdrop" data-partial-rerun-close></div>
     <div class="modal-shell__dialog report-partial-rerun-dialog" role="dialog" aria-modal="true"
@@ -1739,7 +1774,7 @@
   <!-- app.js 已按业务线拆分;顺序固定:core 最先,各 feature 居中(均含原顺序的初始化代码) -->
   <script src="/static/js/core/core.js?v=32"></script>
   <script src="/static/js/features/survey.js?v=38"></script>
-  <script src="/static/js/features/report.js?v=42"></script>
+  <script src="/static/js/features/report.js?v=43"></script>
   <script src="/static/js/features/profile.js?v=2"></script>
   <script src="/static/js/features/settings.js?v=34"></script>
   <script src="/static/js/features/history.js?v=36"></script>

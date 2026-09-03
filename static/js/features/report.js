@@ -661,6 +661,8 @@ function updateReportActionAvailability() {
   if (exportDropdown) exportDropdown.disabled = busy;
   const partialRerunBtn = $('btn-report-partial-rerun');
   if (partialRerunBtn) partialRerunBtn.disabled = !activeReportId() || busy;
+  const validationBtn = $('btn-comparison-validation');
+  if (validationBtn) validationBtn.disabled = !activeReportId() || busy;
   const hasSession = !!(
     state.sessionId
     || state.sessionReport.reportMd
@@ -1614,15 +1616,61 @@ function comparisonAuditRow(label, value, className = '') {
   return row;
 }
 
+function setComparisonValidationModalOpen(open) {
+  const modal = $('comparison-validation-modal');
+  const trigger = $('btn-comparison-validation');
+  if (!modal || !trigger) return;
+  const nextOpen = Boolean(open) && !trigger.disabled;
+  modal.hidden = !nextOpen;
+  trigger.setAttribute('aria-expanded', String(nextOpen));
+  if (nextOpen) {
+    document.body.style.overflow = 'hidden';
+    $('btn-comparison-validation-close')?.focus();
+  } else {
+    document.body.style.removeProperty('overflow');
+  }
+}
+
+function openComparisonValidationModal() {
+  setReportVersionMenuOpen(false);
+  setReportLlmPopoverOpen(false);
+  $('export-dropdown-menu')?.classList.remove('open');
+  setComparisonValidationModalOpen(true);
+}
+
+function normalizedComparisonValidationStatus(validation = activeReportCtx()?.comparisonValidation) {
+  const status = String(validation?.status || 'legacy');
+  return ['passed', 'repaired', 'needs_review', 'incomplete', 'legacy'].includes(status)
+    ? status
+    : 'incomplete';
+}
+
+function confirmComparisonValidationExport() {
+  const audit = activeReportCtx()?.comparisonValidation || {};
+  const status = normalizedComparisonValidationStatus(audit);
+  if (status !== 'needs_review' && status !== 'incomplete') return true;
+  const unresolved = Number(audit.unresolved_count || 0);
+  const warning = status === 'needs_review'
+    ? `统计比较校验仍有 ${unresolved} 项待人工确认，导出的报告可能包含未通过复核的比较结论。`
+    : '统计比较校验未完整执行，导出的报告可能包含未经完整复核的比较结论。';
+  return window.confirm(`${warning}\n\n仍要继续导出吗？`);
+}
+
 function renderComparisonValidation(validation) {
   const panel = $('comparison-validation');
+  const trigger = $('btn-comparison-validation');
+  const triggerLabel = $('comparison-validation-trigger-label');
+  const alert = $('comparison-validation-alert');
+  const alertTitle = $('comparison-validation-alert-title');
+  const alertText = $('comparison-validation-alert-text');
   const statusNode = $('comparison-validation-status');
   const countsNode = $('comparison-validation-counts');
   const body = $('comparison-validation-body');
-  if (!panel || !statusNode || !countsNode || !body) return;
+  if (!panel || !trigger || !triggerLabel || !alert || !alertTitle || !alertText
+    || !statusNode || !countsNode || !body) return;
 
   const audit = validation && typeof validation === 'object' ? validation : {};
-  const status = String(audit.status || 'legacy');
+  const status = normalizedComparisonValidationStatus(audit);
   const labels = {
     passed: '统计比较校验通过',
     repaired: '统计比较校验已自动修正',
@@ -1630,13 +1678,38 @@ function renderComparisonValidation(validation) {
     incomplete: '统计比较校验未完整执行',
     legacy: '此版本无统计比较校验记录',
   };
-  panel.dataset.status = labels[status] ? status : 'incomplete';
+  const detected = Number(audit.detected_count || 0);
+  const applied = Number(audit.applied_count || 0);
+  const unresolved = Number(audit.unresolved_count || 0);
+  const triggerLabels = {
+    passed: '校验通过',
+    repaired: applied ? `已修正 ${applied}` : '已修正',
+    needs_review: unresolved ? `待确认 ${unresolved}` : '待确认',
+    incomplete: '校验异常',
+    legacy: '未校验',
+  };
+
+  panel.dataset.status = status;
+  trigger.dataset.status = status;
+  triggerLabel.textContent = triggerLabels[status];
+  trigger.title = labels[status];
   statusNode.textContent = (
     status === 'passed' && Number(audit.catalog_group_count || 0) === 0
       ? '未发现可确定校验的量表比较'
-      : labels[status] || labels.incomplete
+      : labels[status]
   );
   body.replaceChildren();
+
+  const needsAttention = status === 'needs_review' || status === 'incomplete';
+  alert.hidden = !needsAttention;
+  alert.dataset.status = status;
+  if (status === 'needs_review') {
+    alertTitle.textContent = '统计比较校验有待确认项';
+    alertText.textContent = `发现 ${unresolved} 项需要人工确认，报告中可能保留未通过复核的比较结论。`;
+  } else if (status === 'incomplete') {
+    alertTitle.textContent = '统计比较校验未完整执行';
+    alertText.textContent = '请人工检查报告中的量表比较结论，再决定是否导出使用。';
+  }
 
   if (status === 'legacy') {
     countsNode.textContent = '';
@@ -1644,13 +1717,9 @@ function renderComparisonValidation(validation) {
       '说明',
       '该版本生成于本校验功能上线之前，不能据此判断正文中的比较结论已经通过复核。',
     ));
-    panel.open = false;
     return;
   }
 
-  const detected = Number(audit.detected_count || 0);
-  const applied = Number(audit.applied_count || 0);
-  const unresolved = Number(audit.unresolved_count || 0);
   countsNode.textContent = `发现 ${detected} · 修改 ${applied} · 待确认 ${unresolved}`;
   if (audit.coverage) body.append(comparisonAuditRow('校验范围', audit.coverage));
   if (status === 'passed' && Number(audit.catalog_group_count || 0) === 0) {
@@ -1708,7 +1777,6 @@ function renderComparisonValidation(validation) {
   if (!body.childElementCount) {
     body.append(comparisonAuditRow('结果', '未发现需要修改的统计比较表述。'));
   }
-  panel.open = status !== 'passed';
 }
 
 function renderReportWorkspace(md, { preserveQa = true } = {}) {
@@ -1837,6 +1905,13 @@ $('btn-report-llm-usage')?.addEventListener('click', e => {
   setReportLlmPopoverOpen(trigger.getAttribute('aria-expanded') !== 'true');
 });
 
+$('btn-comparison-validation')?.addEventListener('click', openComparisonValidationModal);
+$('btn-comparison-validation-alert')?.addEventListener('click', openComparisonValidationModal);
+$('btn-comparison-validation-close')?.addEventListener('click', () => setComparisonValidationModalOpen(false));
+document.querySelectorAll('[data-comparison-validation-close]').forEach(node => {
+  node.addEventListener('click', () => setComparisonValidationModalOpen(false));
+});
+
 function setReportVersionMenuOpen(open) {
   const picker = $('report-version-picker');
   const trigger = $('report-version-trigger');
@@ -1883,6 +1958,7 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Escape') {
     setReportVersionMenuOpen(false);
     setReportLlmPopoverOpen(false);
+    setComparisonValidationModalOpen(false);
   }
 });
 
@@ -2039,6 +2115,7 @@ async function openPartialRerunModal() {
     showToast('当前报告没有可绑定的历史版本', 'error');
     return;
   }
+  setComparisonValidationModalOpen(false);
   const button = $('btn-report-partial-rerun');
   if (button) button.disabled = true;
   try {
@@ -2306,6 +2383,7 @@ $('btn-export-word').addEventListener('click', () => {
     showToast('当前报告版本准备完成后再导出', 'info');
     return;
   }
+  if (!confirmComparisonValidationExport()) return;
   const version = activeVersionNumber();
   if (state.viewMode === 'history' && state.historyId) {
     window.location.href = withOptionalVersion(`/api/export/word-history/${state.historyId}`, version);
@@ -2382,6 +2460,7 @@ $('btn-export-pdf').addEventListener('click', () => {
     showToast('当前报告版本准备完成后再导出', 'info');
     return;
   }
+  if (!confirmComparisonValidationExport()) return;
   const version = activeVersionNumber();
   if (state.viewMode === 'history' && state.historyId) {
     window.location.href = withOptionalVersion(`/api/export/pdf-history/${state.historyId}`, version);
@@ -2430,6 +2509,7 @@ async function exportFeishu() {
     showToast('当前报告版本准备完成后再导出', 'info');
     return;
   }
+  if (!confirmComparisonValidationExport()) return;
   if (!state.feishu.configured) {
     showToast('服务端未配置飞书应用', 'error');
     return;
@@ -2499,6 +2579,7 @@ function showFeishuLink(url) {
 // Export dropdown toggle
 $('btn-export-dropdown').addEventListener('click', e => {
   e.stopPropagation();
+  setComparisonValidationModalOpen(false);
   setReportLlmPopoverOpen(false);
   setReportVersionMenuOpen(false);
   $('export-dropdown-menu').classList.toggle('open');
@@ -2513,6 +2594,7 @@ $('btn-export-md').addEventListener('click', () => {
     showToast('当前报告版本准备完成后再导出', 'info');
     return;
   }
+  if (!confirmComparisonValidationExport()) return;
   const blob = new Blob([state.reportMd || ''], { type: 'text/markdown;charset=utf-8' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
