@@ -13,6 +13,7 @@ from app.core.config import (
     INTERVIEW_V2_ENABLED,
     INTERVIEW_V2_MAX_FILE_BYTES,
 )
+from app.core.responses import _make_download_response
 from app.schemas.interview_v2 import (
     InterviewV2ErrorResponse,
     InterviewV2ImportResponse,
@@ -36,6 +37,10 @@ from app.schemas.interview_v2_report import (
     InterviewV2ReportSectionMutationResponse,
     InterviewV2ReportSectionPatchRequest,
     InterviewV2ReportSectionReauditRequest,
+)
+from app.schemas.interview_v2_export import (
+    InterviewV2ExportArtifactResponse,
+    InterviewV2ExportCreateRequest,
 )
 from app.schemas.interview_v2_mapping import (
     InterviewV2GroupMappingConfirmRequest,
@@ -88,6 +93,11 @@ from app.services.interview_v2_report_review_service import (
     approve_report,
     edit_report_section,
     reaudit_report_section,
+)
+from app.services.interview_v2_export_service import (
+    create_export,
+    get_export_artifact,
+    get_export_download,
 )
 from app.services.interview_v2_mapping_service import (
     confirm_group_mapping,
@@ -1258,3 +1268,107 @@ async def approve_interview_v2_report(report_version_id: str, request: Request):
         },
     )
     return result
+
+
+@router.post(
+    "/api/v1/interview-reports/{report_version_id}/exports",
+    response_model=InterviewV2ExportArtifactResponse,
+)
+async def create_interview_v2_report_export(report_version_id: str, request: Request):
+    login = await _require_feature(request, "interview")
+    if not INTERVIEW_V2_ENABLED:
+        return _disabled_response(request)
+    try:
+        raw = await _read_structure_json(request)
+        payload = InterviewV2ExportCreateRequest.model_validate(raw).model_dump(
+            mode="json"
+        )
+    except (
+        OverflowError,
+        json.JSONDecodeError,
+        UnicodeDecodeError,
+        ValidationError,
+        ValueError,
+        RecursionError,
+    ):
+        return _error_response(
+            request,
+            status_code=400,
+            code="EXPORT_REQUEST_INVALID",
+            message="报告导出请求格式无效。",
+            suggested_action="refresh_report",
+        )
+    try:
+        result = await run_in_threadpool(
+            create_export, report_version_id, payload, login
+        )
+    except InterviewV2ImportError as exc:
+        return _service_error_response(request, exc)
+    await audit_log(
+        request,
+        "interview",
+        "创建 V2 报告导出",
+        (
+            f"export_artifact_id={result.get('export_artifact_id')}; "
+            f"report_version_id={result.get('report_version_id')}"
+        ),
+        metadata={
+            "export_artifact_id": result.get("export_artifact_id"),
+            "report_version_id": result.get("report_version_id"),
+            "report_revision_payload_sha256": result.get(
+                "report_revision_payload_sha256"
+            ),
+            "content_sha256": result.get("content_sha256"),
+            "format": result.get("format"),
+            "byte_size": result.get("byte_size"),
+        },
+    )
+    return result
+
+
+@router.get(
+    "/api/v1/interview-export-artifacts/{artifact_id}",
+    response_model=InterviewV2ExportArtifactResponse,
+)
+async def get_interview_v2_export_artifact(artifact_id: str, request: Request):
+    login = await _require_feature(request, "interview")
+    if not INTERVIEW_V2_ENABLED:
+        return _disabled_response(request)
+    try:
+        return await run_in_threadpool(get_export_artifact, artifact_id, login)
+    except InterviewV2ImportError as exc:
+        return _service_error_response(request, exc)
+
+
+@router.get("/api/v1/interview-export-artifacts/{artifact_id}/download")
+async def download_interview_v2_export_artifact(artifact_id: str, request: Request):
+    login = await _require_feature(request, "interview")
+    if not INTERVIEW_V2_ENABLED:
+        return _disabled_response(request)
+    try:
+        result = await run_in_threadpool(get_export_download, artifact_id, login)
+    except InterviewV2ImportError as exc:
+        return _service_error_response(request, exc)
+    artifact = result["artifact"]
+    await audit_log(
+        request,
+        "interview",
+        "下载 V2 报告导出",
+        (
+            f"export_artifact_id={artifact.get('export_artifact_id')}; "
+            f"report_version_id={artifact.get('report_version_id')}"
+        ),
+        metadata={
+            "export_artifact_id": artifact.get("export_artifact_id"),
+            "report_version_id": artifact.get("report_version_id"),
+            "content_sha256": artifact.get("content_sha256"),
+            "format": artifact.get("format"),
+            "byte_size": artifact.get("byte_size"),
+        },
+    )
+    response = _make_download_response(
+        result["content"], result["media_type"], result["file_name"]
+    )
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["Pragma"] = "no-cache"
+    return response

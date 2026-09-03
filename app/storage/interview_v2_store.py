@@ -36,7 +36,7 @@ _STORE_LOCK = threading.RLock()
 _MAPPING_LOCK_TIMEOUT_SECONDS = 10.0
 _MAPPING_LOCK_POLL_SECONDS = 0.025
 _ID_RE = re.compile(
-    r"^(?:upload|job|project|import|workbook|mapping|structure|evidence|boundary|coverage|dossier|analysis|report|section)_[0-9a-f]{32}$"
+    r"^(?:upload|job|project|import|workbook|mapping|structure|evidence|boundary|coverage|dossier|analysis|report|section|export)_[0-9a-f]{32}$"
 )
 _EVIDENCE_ID_RE = re.compile(r"^(?:ev|evidence)_[0-9a-f]{32}$")
 _REVIEW_ISSUE_ID_RE = re.compile(r"^(?:issue|review)_[0-9a-f]{32}$")
@@ -123,6 +123,13 @@ class ReportLockedSectionConflictError(ValueError):
     def __init__(self, *, section_ids: list[str]) -> None:
         super().__init__("locked report sections would be overwritten")
         self.section_ids = list(section_ids)
+
+
+class ExportInputConflictError(ValueError):
+    """The approved report or its upstream input moved during export."""
+
+    def __init__(self) -> None:
+        super().__init__("export input changed")
 
 
 def _root() -> Path:
@@ -5868,3 +5875,441 @@ def save_report_version_cas(
                 )
             _atomic_write_json(state_path, next_state)
             return {"state": next_state, "revision": durable}
+
+
+# Approved-report export artifacts -------------------------------------------
+
+_DOCX_MEDIA_TYPE = (
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+)
+
+
+def _export_artifact_dir(project_id: str, export_artifact_id: str) -> Path:
+    project_id = validate_resource_id(project_id, "project")
+    export_artifact_id = validate_resource_id(export_artifact_id, "export")
+    return _safe_child(
+        "projects", project_id, "exports", "artifacts", export_artifact_id
+    )
+
+
+def _export_artifact_locator_path(export_artifact_id: str) -> Path:
+    export_artifact_id = validate_resource_id(export_artifact_id, "export")
+    return _safe_child(
+        "export_artifact_locators", f"{export_artifact_id}.json"
+    )
+
+
+def export_artifact_payload_sha256(artifact: dict[str, Any]) -> str:
+    """Digest all immutable export metadata except the digest itself."""
+
+    return _canonical_payload_sha256(
+        {
+            key: value
+            for key, value in artifact.items()
+            if key != "artifact_payload_sha256"
+        }
+    )
+
+
+def _require_export_artifact_metadata(
+    artifact: dict[str, Any],
+    *,
+    project_id: str | None = None,
+    export_artifact_id: str | None = None,
+) -> dict[str, Any]:
+    if not isinstance(artifact, dict):
+        raise ValueError("export artifact metadata is invalid")
+    actual_artifact_id = validate_resource_id(
+        str(artifact.get("export_artifact_id") or ""), "export"
+    )
+    actual_project_id = validate_resource_id(
+        str(artifact.get("project_id") or ""), "project"
+    )
+    report_version_id = validate_resource_id(
+        str(artifact.get("report_version_id") or ""), "report"
+    )
+    if (
+        (project_id is not None and actual_project_id != project_id)
+        or (
+            export_artifact_id is not None
+            and actual_artifact_id != export_artifact_id
+        )
+    ):
+        raise ValueError("export artifact identity mismatch")
+
+    report_version_number = artifact.get("report_version_number")
+    byte_size = artifact.get("byte_size")
+    file_name = str(artifact.get("file_name") or "")
+    manifest = artifact.get("manifest")
+    export_profile = artifact.get("export_profile")
+    if (
+        artifact.get("status") != "READY"
+        or artifact.get("format") != "docx"
+        or artifact.get("media_type") != _DOCX_MEDIA_TYPE
+        or isinstance(report_version_number, bool)
+        or not isinstance(report_version_number, int)
+        or report_version_number < 1
+        or isinstance(byte_size, bool)
+        or not isinstance(byte_size, int)
+        or byte_size < 1
+        or not file_name
+        or len(file_name) > 240
+        or not file_name.lower().endswith(".docx")
+        or any(character in file_name for character in ("/", "\\", "\r", "\n", "\0"))
+        or not isinstance(manifest, dict)
+        or not isinstance(export_profile, dict)
+        or not str(artifact.get("created_at") or "")
+        or not str(artifact.get("ready_at") or "")
+        or not isinstance(artifact.get("created_by"), str)
+        or artifact.get("created_at") != artifact.get("ready_at")
+    ):
+        raise ValueError("export artifact metadata is invalid")
+
+    digest_fields = (
+        "report_revision_payload_sha256",
+        "request_fingerprint",
+        "manifest_sha256",
+        "export_profile_sha256",
+        "content_sha256",
+        "artifact_payload_sha256",
+    )
+    if any(
+        not _SHA256_RE.fullmatch(str(artifact.get(field) or ""))
+        for field in digest_fields
+    ):
+        raise ValueError("export artifact digest is invalid")
+    if (
+        _canonical_payload_sha256(manifest) != artifact.get("manifest_sha256")
+        or _canonical_payload_sha256(export_profile)
+        != artifact.get("export_profile_sha256")
+        or export_artifact_payload_sha256(artifact)
+        != artifact.get("artifact_payload_sha256")
+    ):
+        raise ValueError("export artifact metadata digest mismatch")
+    if (
+        actual_artifact_id
+        != f"export_{str(artifact.get('request_fingerprint'))[:32]}"
+        or artifact.get("request_fingerprint")
+        != _canonical_payload_sha256(
+            {
+                "report_version_id": report_version_id,
+                "report_revision_payload_sha256": artifact.get(
+                    "report_revision_payload_sha256"
+                ),
+                "format": artifact.get("format"),
+                "include_evidence_appendix": True,
+                "export_profile_version": export_profile.get(
+                    "profile_version"
+                ),
+            }
+        )
+        or report_version_id != manifest.get("report_version_id")
+        or report_version_number != manifest.get("report_version_number")
+        or artifact.get("report_revision_payload_sha256")
+        != manifest.get("report_revision_payload_sha256")
+        or artifact.get("format") != manifest.get("format")
+        or manifest.get("approval_status") != "approved"
+        or export_profile.get("profile_version")
+        != manifest.get("export_profile_version")
+        or export_profile.get("format") != artifact.get("format")
+        or export_profile.get("include_evidence_appendix") is not True
+    ):
+        raise ValueError("export artifact manifest binding mismatch")
+    return artifact
+
+
+def _same_export_request(
+    first: dict[str, Any], second: dict[str, Any]
+) -> bool:
+    identity_fields = (
+        "export_artifact_id",
+        "project_id",
+        "report_version_id",
+        "report_version_number",
+        "report_revision_payload_sha256",
+        "request_fingerprint",
+        "format",
+        "export_profile_sha256",
+        "manifest_sha256",
+    )
+    return all(first.get(field) == second.get(field) for field in identity_fields)
+
+
+def _load_export_artifact_locked(
+    project_id: str, export_artifact_id: str
+) -> dict[str, Any]:
+    project_id = validate_resource_id(project_id, "project")
+    export_artifact_id = validate_resource_id(export_artifact_id, "export")
+    artifact = _read_json(
+        _export_artifact_dir(project_id, export_artifact_id) / "metadata.json"
+    )
+    if artifact is None:
+        raise ValueError("export artifact metadata is missing")
+    _require_export_artifact_metadata(
+        artifact,
+        project_id=project_id,
+        export_artifact_id=export_artifact_id,
+    )
+
+    report_version_id = str(artifact.get("report_version_id") or "")
+    report = _load_report_revision_locked(project_id, report_version_id)
+    report_state = _read_json(_report_dir(project_id) / "state.json") or {}
+    if (
+        not _report_version_is_committed_locked(report_state, report)
+        or report.get("revision_payload_sha256")
+        != artifact.get("report_revision_payload_sha256")
+        or report.get("version_number") != artifact.get("report_version_number")
+    ):
+        raise ValueError("export artifact report binding mismatch")
+    return artifact
+
+
+def _require_export_content(
+    artifact: dict[str, Any], content: bytes
+) -> bytes:
+    if not isinstance(content, bytes):
+        raise TypeError("export artifact content must be bytes")
+    if (
+        not content.startswith(b"PK\x03\x04")
+        or len(content) != artifact.get("byte_size")
+        or hashlib.sha256(content).hexdigest() != artifact.get("content_sha256")
+    ):
+        raise ValueError("export artifact content integrity check failed")
+    return content
+
+
+def load_export_artifact(export_artifact_id: str) -> dict[str, Any] | None:
+    """Load verified immutable metadata through its global locator."""
+
+    export_artifact_id = validate_resource_id(export_artifact_id, "export")
+    with _STORE_LOCK:
+        locator_path = _export_artifact_locator_path(export_artifact_id)
+        locator = _read_json(locator_path)
+        if locator is None:
+            return None
+        project_id = validate_resource_id(
+            str(locator.get("project_id") or ""), "project"
+        )
+        with _mapping_process_lock(project_id):
+            locator = _require_id_locator_locked(
+                path=locator_path,
+                id_field="export_artifact_id",
+                entity_id=export_artifact_id,
+                project_id=project_id,
+                label="export artifact",
+            )
+            if locator is None:
+                return None
+            artifact = _load_export_artifact_locked(
+                project_id, export_artifact_id
+            )
+            return {"project_id": project_id, "artifact": artifact}
+
+
+def locate_export_artifact(
+    export_artifact_id: str,
+) -> dict[str, str] | None:
+    """Return ownership identity only, without reading metadata or DOCX bytes."""
+
+    export_artifact_id = validate_resource_id(export_artifact_id, "export")
+    with _STORE_LOCK:
+        locator_path = _export_artifact_locator_path(export_artifact_id)
+        locator = _read_json(locator_path)
+        if locator is None:
+            return None
+        project_id = validate_resource_id(
+            str(locator.get("project_id") or ""), "project"
+        )
+        _require_id_locator_locked(
+            path=locator_path,
+            id_field="export_artifact_id",
+            entity_id=export_artifact_id,
+            project_id=project_id,
+            label="export artifact",
+        )
+        return {
+            "export_artifact_id": export_artifact_id,
+            "project_id": project_id,
+        }
+
+
+def load_export_artifact_bytes(
+    export_artifact_id: str,
+) -> dict[str, Any] | None:
+    """Load the exact persisted bytes and recheck their digest and size."""
+
+    export_artifact_id = validate_resource_id(export_artifact_id, "export")
+    with _STORE_LOCK:
+        locator_path = _export_artifact_locator_path(export_artifact_id)
+        locator = _read_json(locator_path)
+        if locator is None:
+            return None
+        project_id = validate_resource_id(
+            str(locator.get("project_id") or ""), "project"
+        )
+        with _mapping_process_lock(project_id):
+            locator = _require_id_locator_locked(
+                path=locator_path,
+                id_field="export_artifact_id",
+                entity_id=export_artifact_id,
+                project_id=project_id,
+                label="export artifact",
+            )
+            if locator is None:
+                return None
+            artifact = _load_export_artifact_locked(
+                project_id, export_artifact_id
+            )
+            content_path = (
+                _export_artifact_dir(project_id, export_artifact_id)
+                / "report.docx"
+            )
+            try:
+                content = content_path.read_bytes()
+            except FileNotFoundError as exc:
+                raise ValueError("export artifact content is missing") from exc
+            _require_export_content(artifact, content)
+            return {
+                "project_id": project_id,
+                "artifact": artifact,
+                "content": content,
+            }
+
+
+def save_export_artifact(
+    *,
+    project_id: str,
+    artifact: dict[str, Any],
+    content: bytes,
+) -> dict[str, Any]:
+    """Publish one immutable READY artifact, with its locator written last."""
+
+    project_id = validate_resource_id(project_id, "project")
+    if not isinstance(content, bytes):
+        raise TypeError("export artifact content must be bytes")
+    durable = deepcopy(artifact)
+    durable["project_id"] = project_id
+    export_artifact_id = validate_resource_id(
+        str(durable.get("export_artifact_id") or ""), "export"
+    )
+    actual_content_sha256 = hashlib.sha256(content).hexdigest()
+    supplied_content_sha256 = durable.get("content_sha256")
+    supplied_byte_size = durable.get("byte_size")
+    if (
+        supplied_content_sha256 is not None
+        and supplied_content_sha256 != actual_content_sha256
+    ):
+        raise ValueError("export artifact content digest mismatch")
+    if supplied_byte_size is not None and supplied_byte_size != len(content):
+        raise ValueError("export artifact byte size mismatch")
+    durable["content_sha256"] = actual_content_sha256
+    durable["byte_size"] = len(content)
+    durable["artifact_payload_sha256"] = export_artifact_payload_sha256(
+        durable
+    )
+    _require_export_artifact_metadata(
+        durable,
+        project_id=project_id,
+        export_artifact_id=export_artifact_id,
+    )
+
+    with _STORE_LOCK:
+        with _mapping_process_lock(project_id):
+            report_version_id = str(durable.get("report_version_id") or "")
+            report = _load_report_revision_locked(project_id, report_version_id)
+            report_state = _read_json(_report_dir(project_id) / "state.json") or {}
+            if (
+                not _report_version_is_committed_locked(report_state, report)
+                or report_state.get("current_report_version_id")
+                != report_version_id
+                or report.get("status") != "approved"
+                or report.get("revision_payload_sha256")
+                != durable.get("report_revision_payload_sha256")
+                or report.get("version_number")
+                != durable.get("report_version_number")
+            ):
+                raise ExportInputConflictError()
+            try:
+                _require_report_source_current_locked(
+                    project_id, report.get("source") or {}
+                )
+            except ValueError as exc:
+                raise ExportInputConflictError() from exc
+
+            locator_path = _export_artifact_locator_path(export_artifact_id)
+            existing_locator = _read_json(locator_path)
+            if existing_locator is not None:
+                _require_id_locator_locked(
+                    path=locator_path,
+                    id_field="export_artifact_id",
+                    entity_id=export_artifact_id,
+                    project_id=project_id,
+                    label="export artifact",
+                )
+                existing = _load_export_artifact_locked(
+                    project_id, export_artifact_id
+                )
+                if not _same_export_request(existing, durable):
+                    raise FileExistsError(
+                        "export artifact identity collision"
+                    )
+                content_path = (
+                    _export_artifact_dir(project_id, export_artifact_id)
+                    / "report.docx"
+                )
+                try:
+                    existing_content = content_path.read_bytes()
+                except FileNotFoundError as exc:
+                    raise ValueError(
+                        "export artifact content is missing"
+                    ) from exc
+                _require_export_content(existing, existing_content)
+                return {
+                    "project_id": project_id,
+                    "artifact": existing,
+                }
+
+            artifact_dir = _export_artifact_dir(
+                project_id, export_artifact_id
+            )
+            metadata_path = artifact_dir / "metadata.json"
+            content_path = artifact_dir / "report.docx"
+            existing_metadata = _read_json(metadata_path)
+            if existing_metadata is not None:
+                _require_export_artifact_metadata(
+                    existing_metadata,
+                    project_id=project_id,
+                    export_artifact_id=export_artifact_id,
+                )
+                if not _same_export_request(existing_metadata, durable):
+                    raise FileExistsError(
+                        "export artifact identity collision"
+                    )
+                try:
+                    existing_content = content_path.read_bytes()
+                except FileNotFoundError as exc:
+                    raise ValueError(
+                        "export artifact content is missing"
+                    ) from exc
+                _require_export_content(existing_metadata, existing_content)
+                _write_or_reuse_id_locator_locked(
+                    path=locator_path,
+                    id_field="export_artifact_id",
+                    entity_id=export_artifact_id,
+                    project_id=project_id,
+                    label="export artifact",
+                )
+                return {
+                    "project_id": project_id,
+                    "artifact": existing_metadata,
+                }
+            _atomic_write_bytes(content_path, content)
+            _atomic_write_json(metadata_path, durable)
+            _write_or_reuse_id_locator_locked(
+                path=locator_path,
+                id_field="export_artifact_id",
+                entity_id=export_artifact_id,
+                project_id=project_id,
+                label="export artifact",
+            )
+            return {"project_id": project_id, "artifact": durable}

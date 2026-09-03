@@ -67,6 +67,7 @@ const ivV2State = {
   dossierEvidenceCache: {},
   selectedDossierEvidenceId: '',
   reportBusy: false,
+  reportExportBusy: false,
   reportToken: 0,
   analysisResponse: null,
   reportResponse: null,
@@ -78,6 +79,7 @@ const ivV2State = {
   reportSectionDrafts: {},
   reportApprovalNote: '',
   reportDirty: false,
+  reportExportArtifact: null,
 };
 
 function ivV2$(id) {
@@ -146,6 +148,7 @@ function ivV2OperationBusy() {
     || ivV2State.coverageBusy
     || ivV2State.dossierBusy
     || ivV2State.reportBusy
+    || ivV2State.reportExportBusy
   );
 }
 
@@ -445,14 +448,26 @@ function ivV2ReportAuditLabel(status) {
   }[status] || status || '未知';
 }
 
+function ivV2ReportExportReady(report = ivV2State.reportResponse) {
+  const auditStatus = String(report?.audit_status || '');
+  return Boolean(
+    report?.is_current_version
+    && String(report?.status || '') === 'approved'
+    && ['audited', 'audit_passed'].includes(auditStatus)
+    && !ivV2State.reportDirty
+  );
+}
+
 function ivV2InvalidateReportWorkspace() {
   ivV2NextReportToken();
+  ivV2State.reportExportBusy = false;
   ivV2State.analysisResponse = null;
   ivV2State.reportResponse = null;
   ivV2State.reportClaimCache = {};
   ivV2State.reportEvidenceCache = {};
   ivV2State.selectedReportClaimId = '';
   ivV2State.selectedReportEvidenceId = '';
+  ivV2State.reportExportArtifact = null;
 }
 
 function ivV2RecomputeReportDirty() {
@@ -3865,6 +3880,10 @@ function ivV2SyncConfirmedControls() {
       control.disabled = operationBusy || !ivV2CurrentDraftReport() || !ivV2ReportSummary().approval_ready || ivV2State.reportDirty;
       return;
     }
+    if (action === 'report-export-word') {
+      control.disabled = operationBusy || !ivV2ReportExportReady();
+      return;
+    }
     control.disabled = operationBusy;
     if (!control.disabled && control.dataset?.ivV2Locked === 'true') control.disabled = true;
   });
@@ -4266,6 +4285,7 @@ async function ivV2LoadReportWorkspace({ force = false, focusSectionId = '', foc
     } else {
       ivV2State.reportResponse = null;
       ivV2State.reportApprovalNote = '';
+      ivV2State.reportExportArtifact = null;
       ivV2State.selectedReportSectionId = '';
       ivV2State.selectedReportClaimId = '';
     }
@@ -4312,6 +4332,13 @@ async function ivV2LoadCurrentReport(reportVersionId, { token = ivV2State.report
     || String(data.status || '') !== 'draft'
   ) {
     ivV2State.reportApprovalNote = '';
+  }
+  if (
+    previousReportVersionId !== String(data.report_version_id || '')
+    || !data.is_current_version
+    || String(data.status || '') !== 'approved'
+  ) {
+    ivV2State.reportExportArtifact = null;
   }
   const previousSelectedSection = (previousReport?.sections || []).find(
     section => section.section_id === ivV2State.selectedReportSectionId
@@ -4651,6 +4678,102 @@ async function ivV2ApproveReport() {
   }
 }
 
+function ivV2ExportFileName(response, fallbackName) {
+  const disposition = String(response?.headers?.get?.('content-disposition') || '');
+  const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+  const plainMatch = disposition.match(/filename="?([^";]+)"?/i);
+  const encoded = String(utf8Match?.[1] || plainMatch?.[1] || '').trim();
+  if (!encoded) return fallbackName;
+  try {
+    return decodeURIComponent(encoded.replace(/^"|"$/g, '')) || fallbackName;
+  } catch (_) {
+    return encoded.replace(/^"|"$/g, '') || fallbackName;
+  }
+}
+
+function ivV2DownloadExportBlob(response, blob, fallbackName) {
+  const objectUrl = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = objectUrl;
+  anchor.download = ivV2ExportFileName(response, fallbackName);
+  document.body.appendChild(anchor);
+  try {
+    anchor.click();
+  } finally {
+    anchor.remove();
+    URL.revokeObjectURL(objectUrl);
+  }
+}
+
+async function ivV2ExportApprovedReport() {
+  const report = ivV2State.reportResponse;
+  if (
+    ivV2State.reportExportBusy
+    || !report?.report_version_id
+    || !ivV2ReportExportReady(report)
+  ) return;
+  const token = ivV2State.reportToken;
+  const reportVersionId = String(report.report_version_id);
+  const fallbackName = `访谈研究报告-v${Number(report.report_version_number || 1)}.docx`;
+  ivV2State.reportExportBusy = true;
+  ivV2ClearStatusError();
+  ivV2RenderConfirmed();
+  try {
+    const createResponse = await fetch(`/api/v1/interview-reports/${reportVersionId}/exports`, {
+      method: 'POST',
+      cache: 'no-store',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        format: 'docx',
+        include_evidence_appendix: true,
+      }),
+    });
+    const artifact = await createResponse.json().catch(() => ({}));
+    if (token !== ivV2State.reportToken || reportVersionId !== ivV2CurrentReportVersionId()) return;
+    if (!createResponse.ok) {
+      if (createResponse.status === 409) {
+        await ivV2LoadReportWorkspace({ force: false, token });
+      }
+      if (token === ivV2State.reportToken) {
+        ivV2SetStatusError(artifact, createResponse.status, '导出报告失败');
+      }
+      return;
+    }
+    const artifactId = String(artifact.export_artifact_id || '');
+    if (!artifactId) {
+      ivV2State.statusCode = 'EXPORT_RESPONSE_INVALID';
+      ivV2State.errorMessage = '导出已创建，但服务端未返回可下载的导出编号';
+      ivV2RenderUploadStatus();
+      return;
+    }
+    const downloadResponse = await fetch(`/api/v1/interview-export-artifacts/${artifactId}/download`, {
+      cache: 'no-store',
+    });
+    if (token !== ivV2State.reportToken || reportVersionId !== ivV2CurrentReportVersionId()) return;
+    if (!downloadResponse.ok) {
+      const errorPayload = await downloadResponse.json().catch(() => ({}));
+      ivV2SetStatusError(errorPayload, downloadResponse.status, '下载导出文件失败');
+      return;
+    }
+    const blob = await downloadResponse.blob();
+    if (token !== ivV2State.reportToken || reportVersionId !== ivV2CurrentReportVersionId()) return;
+    ivV2DownloadExportBlob(downloadResponse, blob, artifact.file_name || fallbackName);
+    ivV2State.reportExportArtifact = artifact;
+    showToast('Word 报告已生成并下载', 'success');
+  } catch (error) {
+    if (token === ivV2State.reportToken) {
+      ivV2State.statusCode = ivV2State.statusCode || 'REPORT_EXPORT_FAILED';
+      ivV2State.errorMessage = String(error?.message || '导出报告失败');
+      ivV2RenderUploadStatus();
+    }
+  } finally {
+    if (token === ivV2State.reportToken) {
+      ivV2State.reportExportBusy = false;
+      ivV2RenderConfirmed();
+    }
+  }
+}
+
 function ivV2ReportClaimCacheKey(claimId) {
   return `${ivV2CurrentReportVersionId()}:${claimId}`;
 }
@@ -4896,8 +5019,10 @@ function ivV2ReportApprovalHtml() {
       </label>
       <div class="iv-v2-toolbar__actions">
         <button class="btn btn--primary btn--sm" type="button" data-iv-v2-action="report-approve"${!editable || !summary.approval_ready || ivV2State.reportDirty || ivV2OperationBusy() ? ' disabled' : ''}>批准当前报告</button>
+        <button class="btn btn--ghost btn--sm" type="button" data-iv-v2-action="report-export-word"${!ivV2ReportExportReady(report) || ivV2OperationBusy() ? ' disabled' : ''}>${ivV2State.reportExportBusy ? '正在生成 Word...' : '导出 Word（含证据附录）'}</button>
       </div>
       ${report.approved_at ? `<p class="iv-v2-report-approval__meta">批准时间：${ivV2Esc(ivV2FormatTime(report.approved_at))} · ${ivV2Esc(report.approved_by || '--')}</p>` : ''}
+      ${ivV2State.reportExportArtifact ? `<p class="iv-v2-report-approval__meta">最近导出：${ivV2Esc(ivV2State.reportExportArtifact.file_name || 'Word 报告')} · ${ivV2Esc(ivV2FormatSize(Number(ivV2State.reportExportArtifact.byte_size || 0)))} · ${ivV2Esc(ivV2FormatTime(ivV2State.reportExportArtifact.created_at))}</p>` : ''}
     </section>
   `;
 }
@@ -5414,6 +5539,11 @@ function ivV2HandleEditorClick(event) {
     return;
   }
 
+  if (action === 'report-export-word') {
+    ivV2ExportApprovedReport();
+    return;
+  }
+
   if (action === 'remove-group') {
     ivV2State.draft.groups = ivV2State.draft.groups.filter(group => group.temp_id !== button.dataset.groupId);
     ivV2NormalizeDraft();
@@ -5792,6 +5922,7 @@ function ivV2Reset() {
   ivV2State.dossierEvidenceCache = {};
   ivV2State.selectedDossierEvidenceId = '';
   ivV2State.reportBusy = false;
+  ivV2State.reportExportBusy = false;
   ivV2State.reportToken += 1;
   ivV2State.analysisResponse = null;
   ivV2State.reportResponse = null;
@@ -5803,6 +5934,7 @@ function ivV2Reset() {
   ivV2State.reportSectionDrafts = {};
   ivV2State.reportApprovalNote = '';
   ivV2State.reportDirty = false;
+  ivV2State.reportExportArtifact = null;
   ivV2State.importData = null;
   ivV2State.mappingResponse = null;
   ivV2State.draft = null;
