@@ -39,6 +39,8 @@ import statistics
 from collections import Counter
 from typing import Any, Callable
 
+from app.core.ranking import parse_rank_value
+
 _MATRIX_ROLES = ("matrix_scale", "matrix_single", "matrix_multi")
 _OTHER_OPTION_LABEL = "Other / 其他"
 
@@ -1274,6 +1276,53 @@ def _render_matrix(
         return "\n".join(lines)
 
     if role == "matrix_single":
+        if members[0].get("analysis_semantic") == "ranking":
+            rank_count = members[0].get("ranking_size") or len(members)
+            try:
+                rank_count = int(rank_count)
+            except (TypeError, ValueError):
+                rank_count = len(members)
+            options = [f"第{rank}名" for rank in range(1, rank_count + 1)]
+            lines = [
+                f"{title}",
+                "",
+                "矩阵单选排名（每个子项一行；单元格 = 该名次人数(占比)，分母 = 该子项有效排名回答人数）：",
+                "",
+                "| 子项 | " + " | ".join(options) + " | 回答人数 |",
+                "|" + "|".join(["---"] * (len(options) + 2)) + "|",
+            ]
+            mean_summaries: list[str] = []
+            for member in members:
+                row_label = member.get("matrix_row") or _safe_header(headers, member["index"])
+                ranks = [
+                    rank
+                    for value in _column_values(body, member["index"])
+                    if (rank := parse_rank_value(value, max_rank=rank_count)) is not None
+                ]
+                counts = Counter(ranks)
+                denom = len(ranks)
+                cells = [_md_escape(row_label)]
+                for rank in range(1, rank_count + 1):
+                    count = counts.get(rank, 0)
+                    cells.append(f"{count} ({_pct(count, denom)})" if denom else "0")
+                cells.append(str(denom))
+                lines.append("| " + " | ".join(cells) + " |")
+                if ranks:
+                    mean_summaries.append(
+                        f"{_md_escape(row_label)} {statistics.mean(ranks):.2f}（n={denom}）"
+                    )
+            if mean_summaries:
+                lines.extend([
+                    "",
+                    "> 平均名次按有效名次计算，数值越低表示整体越靠前："
+                    + "；".join(mean_summaries),
+                ])
+            lines.extend([
+                "",
+                "> （矩阵题 × 画像维度的交叉分析本期暂未提供）",
+            ])
+            return "\n".join(lines)
+
         shared_options = members[0].get("options")
         norm = _make_normalizer(members[0].get("value_aliases"))
         opt_order: list[str] = []

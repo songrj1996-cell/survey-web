@@ -19,6 +19,10 @@ const annState = {
   aiHighThreshold: 80,
   aiConfirmationComplete: false,
   confirmedAiIds: new Set(),
+  aiReviewedIds: new Set(),
+  aiReviewIndex: 0,
+  aiQuestionIndex: 0,
+  aiConfirmLayout: 'split',
   qualityResults: [],
   qualityCount: 0,
   qualityDurationSeconds: null,
@@ -265,6 +269,10 @@ async function annStartAnnotation() {
     annState.reviewAiResults = [];
     annState.aiConfirmationComplete = false;
     annState.confirmedAiIds = new Set();
+    annState.aiReviewedIds = new Set();
+    annState.aiReviewIndex = 0;
+    annState.aiQuestionIndex = 0;
+    annState.aiConfirmLayout = 'split';
     annState.qualityResults = [];
     annState.qualityCount = 0;
     annState.qualityDurationSeconds = null;
@@ -405,62 +413,231 @@ async function annRunAiDetect() {
 // ── ANN STEP 4: AI 确认 ────────────────────────────────────
 
 function annRenderAiConfirm(reviewResults) {
-  const table = $('ann-confirm-table');
-  const headers = annState.headers;
-  const otCols = annState.openTextCols;
-
-  // 构建表头
-  let thCells = `<th class="ann-th-check"><input type="checkbox" id="ann-check-master" /></th>
-    <th class="ann-th-id">玩家 ID</th><th class="ann-th-prob">内容生成概率</th><th class="ann-th-polish">润色概率</th><th class="ann-th-fixed">判断理由</th><th class="ann-th-fixed">AI 支持证据</th><th class="ann-th-fixed">反向证据</th>`;
-  for (const ci of otCols) {
-    const hdr = headers[ci] || `列${ci}`;
-    thCells += `<th class="ann-th-fixed">${esc(hdr)}（原文）</th><th class="ann-th-fixed">${esc(hdr)}（中文译）</th>`;
-  }
-
-  let rows = '';
-  reviewResults.forEach((r, i) => {
-    const checked = r.ai_prob >= annState.aiHighThreshold ? 'checked' : '';
-    let tdCols = '';
-    for (const ci of otCols) {
-      const key = `col_${ci}`;
-      const original = (r.originals || {})[key] || '';
-      const trans = (r.translations || {})[key] || '';
-      tdCols += `<td class="ann-cell-text ann-cell-fixed">${esc(original)}</td>
-                 <td class="ann-cell-text ann-cell-trans ann-cell-fixed">${esc(trans)}</td>`;
-    }
-    rows += `<tr data-row="${i}">
-      <td><input type="checkbox" class="ann-ai-check" data-id="${esc(r.id)}" ${checked} /></td>
-      <td class="ann-cell-id">${esc(r.id)}</td>
-      <td class="ann-cell-prob">${r.ai_prob}%</td>
-      <td class="ann-cell-polish">${r.polish_prob}%</td>
-      <td class="ann-cell-reason ann-cell-fixed">${esc(r.reason || '')}</td>
-      <td class="ann-cell-evidence ann-cell-fixed">${esc(r.evidence || '')}</td>
-      <td class="ann-cell-evidence ann-cell-fixed">${esc(r.counter_evidence || '')}</td>
-      ${tdCols}
-    </tr>`;
-  });
-
-  table.innerHTML = `<thead><tr>${thCells}</tr></thead><tbody>${rows}</tbody>`;
-
-  // 主控勾选
-  $('ann-check-master').addEventListener('change', e => {
-    table.querySelectorAll('.ann-ai-check').forEach(cb => { cb.checked = e.target.checked; });
-  });
+  annState.reviewAiResults = [...(reviewResults || [])].sort(
+    (a, b) => Number(b.ai_prob || 0) - Number(a.ai_prob || 0)
+  );
+  annState.confirmedAiIds = new Set(
+    annState.reviewAiResults
+      .filter(result => Number(result.ai_prob || 0) >= annState.aiHighThreshold)
+      .map(result => String(result.id))
+  );
+  annState.aiReviewedIds = new Set();
+  annState.aiReviewIndex = 0;
+  annState.aiQuestionIndex = 0;
+  annSetAiConfirmLayout('split');
+  annRenderAiCandidateList();
+  annRenderAiProfile();
+  annUpdateAiReviewProgress();
 
   $('ann-confirm-desc').textContent =
-    `以下 ${reviewResults.length} 位玩家的内容生成概率 ≥ ${annState.aiReviewThreshold}%。达到 ${annState.aiHighThreshold}% 的已默认勾选；润色概率不参与违规判断。`;
+    `以下 ${annState.reviewAiResults.length} 位玩家的内容生成概率 ≥ ${annState.aiReviewThreshold}%。达到 ${annState.aiHighThreshold}% 的已默认选择为 AI 作答。`;
 }
 
+function annCurrentAiReviewResult() {
+  return annState.reviewAiResults[annState.aiReviewIndex] || null;
+}
+
+function annAiProbabilityText(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? `${Math.round(numeric)}%` : '—';
+}
+
+function annAiReviewDecision(result) {
+  const rowId = String(result?.id || '');
+  if (!annState.aiReviewedIds.has(rowId)) return 'pending';
+  return annState.confirmedAiIds.has(rowId) ? 'ai' : 'normal';
+}
+
+function annAiReviewStatusText(result) {
+  const decision = annAiReviewDecision(result);
+  if (decision === 'ai') return '已确认 · AI 作答';
+  if (decision === 'normal') return '已确认 · 正常反馈';
+  return Number(result?.ai_prob || 0) >= annState.aiHighThreshold
+    ? '待确认 · 系统预选 AI'
+    : '待人工确认';
+}
+
+function annRenderAiCandidateList() {
+  const list = $('ann-ai-candidate-list');
+  list.innerHTML = annState.reviewAiResults.map((result, index) => {
+    const decision = annAiReviewDecision(result);
+    return `<button class="ann-ai-candidate-card${index === annState.aiReviewIndex ? ' ann-ai-candidate-card--active' : ''}"
+      type="button" data-ann-ai-player-index="${index}">
+      <span class="ann-ai-candidate-id">${esc(result.id)}</span>
+      <strong class="ann-ai-candidate-prob">${annAiProbabilityText(result.ai_prob)}</strong>
+      <span class="ann-ai-candidate-reason">${esc(result.reason || '暂无判断理由')}</span>
+      <em class="ann-ai-candidate-status ann-ai-candidate-status--${decision}">${esc(annAiReviewStatusText(result))}</em>
+    </button>`;
+  }).join('');
+}
+
+function annRenderAiQuestion(result) {
+  const columns = annState.openTextCols || [];
+  const total = columns.length;
+  if (!total) {
+    $('ann-ai-question-index').textContent = '第 0 / 0 题';
+    $('ann-ai-question-title').textContent = '没有可查看的开放题';
+    $('ann-ai-question-dots').innerHTML = '';
+    $('ann-ai-answer-original').textContent = '—';
+    $('ann-ai-answer-translation').textContent = '—';
+    $('ann-ai-prev-question').disabled = true;
+    $('ann-ai-next-question').disabled = true;
+    return;
+  }
+
+  annState.aiQuestionIndex = Math.max(0, Math.min(annState.aiQuestionIndex, total - 1));
+  const columnIndex = columns[annState.aiQuestionIndex];
+  const key = `col_${columnIndex}`;
+  const original = (result.originals || {})[key] || '';
+  const translation = (result.translations || {})[key] || '';
+  $('ann-ai-question-index').textContent = `第 ${annState.aiQuestionIndex + 1} / ${total} 题`;
+  $('ann-ai-question-title').textContent = annState.headers[columnIndex] || `列 ${columnIndex}`;
+  $('ann-ai-answer-original').textContent = original || '（未作答）';
+  $('ann-ai-answer-translation').textContent = translation || '（暂无中文翻译）';
+  $('ann-ai-prev-question').disabled = annState.aiQuestionIndex === 0;
+  $('ann-ai-next-question').disabled = annState.aiQuestionIndex === total - 1;
+  $('ann-ai-question-dots').innerHTML = columns.map((_, index) =>
+    `<button type="button" data-ann-ai-question-index="${index}"
+      class="${index === annState.aiQuestionIndex ? 'ann-ai-question-dot--active' : ''}"
+      aria-label="查看第 ${index + 1} 题">${index + 1}</button>`
+  ).join('');
+}
+
+function annRenderAiProfile() {
+  const total = annState.reviewAiResults.length;
+  if (!total) return;
+  annState.aiReviewIndex = Math.max(0, Math.min(annState.aiReviewIndex, total - 1));
+  const result = annCurrentAiReviewResult();
+  const rowId = String(result.id);
+  const decision = annAiReviewDecision(result);
+  const selectedAsAi = annState.confirmedAiIds.has(rowId);
+
+  $('ann-ai-player-index').textContent = `玩家 ${annState.aiReviewIndex + 1} / ${total}`;
+  $('ann-ai-player-id').textContent = rowId;
+  $('ann-ai-probability').textContent = annAiProbabilityText(result.ai_prob);
+  $('ann-ai-polish-probability').textContent = annAiProbabilityText(result.polish_prob);
+  $('ann-ai-review-state').textContent = annAiReviewStatusText(result);
+  $('ann-ai-review-state').className = `ann-ai-review-state ann-ai-review-state--${decision}`;
+  $('ann-ai-suggestion').textContent = Number(result.ai_prob || 0) >= annState.aiHighThreshold
+    ? 'AI 建议：高概率 AI 作答'
+    : 'AI 建议：需结合原文判断';
+  $('ann-ai-reason').textContent = result.reason || '暂无判断理由';
+  $('ann-ai-evidence').textContent = result.evidence || '暂无明确支持证据';
+  $('ann-ai-counter-evidence').textContent = result.counter_evidence || '暂无明确反向证据';
+  $('ann-ai-prev-player').disabled = annState.aiReviewIndex === 0;
+  $('ann-ai-next-player').disabled = annState.aiReviewIndex === total - 1;
+  $('ann-ai-mark-normal').classList.toggle('ann-ai-decision-btn--active', !selectedAsAi);
+  $('ann-ai-mark-normal').setAttribute('aria-pressed', String(!selectedAsAi));
+  $('ann-ai-mark-ai').classList.toggle('ann-ai-decision-btn--active', selectedAsAi);
+  $('ann-ai-mark-ai').setAttribute('aria-pressed', String(selectedAsAi));
+  annRenderAiQuestion(result);
+}
+
+function annUpdateAiReviewProgress() {
+  const total = annState.reviewAiResults.length;
+  const reviewed = annState.aiReviewedIds.size;
+  const defaultAi = annState.reviewAiResults.filter(
+    result => Number(result.ai_prob || 0) >= annState.aiHighThreshold
+  ).length;
+  $('ann-ai-review-total').textContent = `${total} 位玩家`;
+  $('ann-ai-default-total').textContent = `${defaultAi} 位 AI 作答`;
+  $('ann-ai-reviewed-total').textContent = `${reviewed} / ${total}`;
+  $('ann-ai-summary-progress').setAttribute('aria-valuemax', String(total));
+  $('ann-ai-summary-progress').setAttribute('aria-valuenow', String(reviewed));
+  $('ann-ai-summary-progress-bar').style.width = total ? `${reviewed / total * 100}%` : '0%';
+  $('ann-ai-confirm-footer-status').textContent = reviewed === total
+    ? `已完成 ${total} 位玩家的人工确认`
+    : `请完成剩余 ${total - reviewed} 位玩家的人工确认`;
+  $('ann-btn-confirm-ai').disabled = !total || reviewed !== total;
+}
+
+function annSetAiDecision(decision) {
+  const result = annCurrentAiReviewResult();
+  if (!result) return;
+  const rowId = String(result.id);
+  annState.aiReviewedIds.add(rowId);
+  if (decision === 'ai') annState.confirmedAiIds.add(rowId);
+  else annState.confirmedAiIds.delete(rowId);
+  annRenderAiCandidateList();
+  annRenderAiProfile();
+  annUpdateAiReviewProgress();
+}
+
+function annGoToAiPlayer(index) {
+  const total = annState.reviewAiResults.length;
+  if (!total) return;
+  annState.aiReviewIndex = Math.max(0, Math.min(index, total - 1));
+  annState.aiQuestionIndex = 0;
+  annRenderAiCandidateList();
+  annRenderAiProfile();
+}
+
+function annSetAiConfirmLayout(layout) {
+  annState.aiConfirmLayout = layout === 'focus' ? 'focus' : 'split';
+  $('ann-ai-confirm-workspace').classList.toggle('ann-ai-confirm-workspace--focus', annState.aiConfirmLayout === 'focus');
+  $('ann-ai-layout-split').classList.toggle('ann-ai-layout-btn--active', annState.aiConfirmLayout === 'split');
+  $('ann-ai-layout-split').setAttribute('aria-pressed', String(annState.aiConfirmLayout === 'split'));
+  $('ann-ai-layout-focus').classList.toggle('ann-ai-layout-btn--active', annState.aiConfirmLayout === 'focus');
+  $('ann-ai-layout-focus').setAttribute('aria-pressed', String(annState.aiConfirmLayout === 'focus'));
+}
+
+$('ann-ai-candidate-list').addEventListener('click', event => {
+  const card = event.target.closest('[data-ann-ai-player-index]');
+  if (card) annGoToAiPlayer(Number(card.dataset.annAiPlayerIndex));
+});
+
+$('ann-ai-question-dots').addEventListener('click', event => {
+  const button = event.target.closest('[data-ann-ai-question-index]');
+  if (!button) return;
+  annState.aiQuestionIndex = Number(button.dataset.annAiQuestionIndex);
+  const result = annCurrentAiReviewResult();
+  if (result) annRenderAiQuestion(result);
+});
+
+$('ann-ai-prev-player').addEventListener('click', () => annGoToAiPlayer(annState.aiReviewIndex - 1));
+$('ann-ai-next-player').addEventListener('click', () => annGoToAiPlayer(annState.aiReviewIndex + 1));
+$('ann-ai-prev-question').addEventListener('click', () => {
+  annState.aiQuestionIndex -= 1;
+  const result = annCurrentAiReviewResult();
+  if (result) annRenderAiQuestion(result);
+});
+$('ann-ai-next-question').addEventListener('click', () => {
+  annState.aiQuestionIndex += 1;
+  const result = annCurrentAiReviewResult();
+  if (result) annRenderAiQuestion(result);
+});
+$('ann-ai-mark-normal').addEventListener('click', () => annSetAiDecision('normal'));
+$('ann-ai-mark-ai').addEventListener('click', () => annSetAiDecision('ai'));
+$('ann-ai-layout-split').addEventListener('click', () => annSetAiConfirmLayout('split'));
+$('ann-ai-layout-focus').addEventListener('click', () => annSetAiConfirmLayout('focus'));
+
 $('ann-btn-check-all').addEventListener('click', () => {
-  document.querySelectorAll('.ann-ai-check').forEach(cb => { cb.checked = true; });
+  annState.reviewAiResults.forEach(result => {
+    const rowId = String(result.id);
+    annState.confirmedAiIds.add(rowId);
+    annState.aiReviewedIds.add(rowId);
+  });
+  annRenderAiCandidateList();
+  annRenderAiProfile();
+  annUpdateAiReviewProgress();
 });
 $('ann-btn-uncheck-all').addEventListener('click', () => {
-  document.querySelectorAll('.ann-ai-check').forEach(cb => { cb.checked = false; });
+  annState.reviewAiResults.forEach(result => {
+    const rowId = String(result.id);
+    annState.confirmedAiIds.delete(rowId);
+    annState.aiReviewedIds.add(rowId);
+  });
+  annRenderAiCandidateList();
+  annRenderAiProfile();
+  annUpdateAiReviewProgress();
 });
 
 $('ann-btn-confirm-ai').addEventListener('click', async () => {
-  const checked = [...document.querySelectorAll('.ann-ai-check:checked')].map(cb => cb.dataset.id);
-  annState.confirmedAiIds = new Set(checked);
+  if (annState.aiReviewedIds.size !== annState.reviewAiResults.length) {
+    showToast('请先完成所有待复核玩家的人工判定', 'error');
+    return;
+  }
+  const checked = [...annState.confirmedAiIds];
 
   try {
     const resp = await fetch(`/api/annotate/${annState.sessionId}/confirm-ai`, {
@@ -672,6 +849,10 @@ $('ann-btn-restart').addEventListener('click', () => {
   annState.reviewAiResults = [];
   annState.aiConfirmationComplete = false;
   annState.confirmedAiIds = new Set();
+  annState.aiReviewedIds = new Set();
+  annState.aiReviewIndex = 0;
+  annState.aiQuestionIndex = 0;
+  annState.aiConfirmLayout = 'split';
   annState.qualityResults = [];
   annState.qualityCount = 0;
   annState.qualityDurationSeconds = null;
@@ -692,6 +873,7 @@ $('ann-btn-restart').addEventListener('click', () => {
 
 
 // ── 上传说明文案 ──
+
 fetch('/api/upload-guide')
   .then(r => r.json())
   .then(({ content }) => {

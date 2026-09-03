@@ -787,6 +787,10 @@ def expand_confirmed_to_columns(confirmed: list[dict]) -> list[dict]:
                         col["delimiter"] = q["delimiter"]
                     if aliases:
                         col["value_aliases"] = aliases
+                    if role == "matrix_single" and q.get("analysis_semantic") == "ranking":
+                        col["analysis_semantic"] = "ranking"
+                        col["ranking_size"] = q.get("ranking_size") or len(cis)
+                        col["rank_direction"] = "lower_is_better"
                 out.append(col)
         else:
             idx = cis[0]
