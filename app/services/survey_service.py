@@ -79,6 +79,7 @@ from app.services.questionnaire_import import (
     parse_bested_qualitative_upload,
     parse_questionnaire_translations,
 )
+from app.services.google_forms_family_binding import QuestionnaireFamilySurveyBinding
 from app.services.qualitative_viewpoints import (
     build_viewpoint_diagnostics,
     build_report_viewpoint_stats,
@@ -606,8 +607,18 @@ async def handle_survey_upload(
     source_type: str = "google",
     questionnaire_filename: str | None = None,
     questionnaire_content: bytes | None = None,
+    bound_questionnaire: QuestionnaireFamilySurveyBinding | None = None,
 ) -> dict:
     """解析上传文件，创建 session，返回前端所需的 result dict。"""
+    if bound_questionnaire is not None:
+        if not isinstance(bound_questionnaire, QuestionnaireFamilySurveyBinding):
+            raise TypeError("bound_questionnaire 类型无效")
+        if questionnaire_content is not None or questionnaire_filename is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="已保存问卷项目不能与原问卷文件同时提交",
+            )
+        source_type = bound_questionnaire.source_type
     if source_type not in {"google", "bested"}:
         raise HTTPException(status_code=400, detail="不支持的数据来源")
     if questionnaire_content and source_type != "bested":
@@ -616,7 +627,13 @@ async def handle_survey_upload(
     deterministic_questions: list[dict] | None = None
     questionnaire_text = ""
     matched_questions = 0
-    if questionnaire_content:
+    if bound_questionnaire is not None:
+        rows = bound_questionnaire.session_rows()
+        deterministic_questions = bound_questionnaire.session_columns()
+        questionnaire_text = bound_questionnaire.questionnaire_text
+        questionnaire_filename = bound_questionnaire.questionnaire_filename
+        matched_questions = bound_questionnaire.matched_questions
+    elif questionnaire_content:
         q_name = (questionnaire_filename or "").lower()
         if not q_name.endswith((".xls", ".xlsx")):
             raise HTTPException(
@@ -647,11 +664,19 @@ async def handle_survey_upload(
     sess["rows"] = rows
     sess["filename"] = filename
     sess["source_type"] = source_type
-    sess["file_sha256"] = hashlib.sha256(content).hexdigest()
+    sess["file_sha256"] = (
+        bound_questionnaire.response_fingerprint
+        if bound_questionnaire is not None
+        else hashlib.sha256(content).hexdigest()
+    )
     sess["questionnaire_sha256"] = (
-        hashlib.sha256(questionnaire_content).hexdigest()
-        if deterministic_questions is not None and questionnaire_content is not None
-        else ""
+        bound_questionnaire.family.mapping_fingerprint
+        if bound_questionnaire is not None
+        else (
+            hashlib.sha256(questionnaire_content).hexdigest()
+            if deterministic_questions is not None and questionnaire_content is not None
+            else ""
+        )
     )
     sess["questionnaire_used"] = deterministic_questions is not None
     if deterministic_questions is not None:
@@ -659,10 +684,22 @@ async def handle_survey_upload(
         sess["column_provider"] = "questionnaire"
         sess["questionnaire_text"] = questionnaire_text
         sess["questionnaire_filename"] = questionnaire_filename
+    if bound_questionnaire is not None:
+        sess["questionnaire_family_input_kind"] = "google_forms_family"
+        sess["questionnaire_family_ref"] = bound_questionnaire.session_family_ref()
+        sess["google_forms_response_provenance"] = (
+            bound_questionnaire.session_response_provenance()
+        )
+        sess["google_forms_response_diagnostics"] = {
+            "duplicate_response_count": bound_questionnaire.duplicate_response_count,
+            "unmatched_answer_count": bound_questionnaire.unmatched_answer_count,
+            "file_upload_answer_count": bound_questionnaire.file_upload_answer_count,
+            "blocking_issue_count": bound_questionnaire.blocking_issue_count,
+        }
     _assign_session_owner(sess, login)
     save_session(sid, sess)
 
-    return {
+    result = {
         "session_id": sid,
         "filename": filename,
         "total_rows": len(rows) - 1,
@@ -672,6 +709,19 @@ async def handle_survey_upload(
         "questionnaire_used": deterministic_questions is not None,
         "matched_questions": matched_questions,
     }
+    if bound_questionnaire is not None:
+        result.update({
+            "questionnaire_family_id": bound_questionnaire.family.family_id,
+            "languages": [
+                item.language for item in bound_questionnaire.family.variants
+            ],
+            "duplicate_response_count": (
+                bound_questionnaire.duplicate_response_count
+            ),
+            "unmatched_answer_count": bound_questionnaire.unmatched_answer_count,
+            "file_upload_answer_count": bound_questionnaire.file_upload_answer_count,
+        })
+    return result
 
 
 # ── 列题型识别 SSE ───────────────────────────────────────────────

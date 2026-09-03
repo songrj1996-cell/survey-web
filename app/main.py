@@ -9,7 +9,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.core.config import COOKIE_NAME, FEISHU_LOGIN_REQUIRED
+from app.core.config import (
+    COOKIE_NAME,
+    FEISHU_LOGIN_REQUIRED,
+    GOOGLE_FORMS_API_BASE,
+    GOOGLE_FORMS_CONNECT_TIMEOUT,
+    GOOGLE_FORMS_QUALITATIVE_ENABLED,
+    GOOGLE_FORMS_READ_TIMEOUT,
+    GOOGLE_FORMS_SERVICE_ACCOUNT_ENABLED,
+    GOOGLE_FORMS_SERVICE_ACCOUNT_FILE,
+    RESEARCH_ASSET_STORAGE_DIR,
+)
 from app.core.security import _forbidden_response, _is_public_path, _safe_next_path, _unauthorized_response
 from app.services.auth import _current_login, _login_allowed
 from app.storage.sessions import _sweep_old_sessions
@@ -70,6 +80,36 @@ from app.routers import (
     settings_api,
     survey,
 )
+
+if GOOGLE_FORMS_QUALITATIVE_ENABLED:
+    if not GOOGLE_FORMS_SERVICE_ACCOUNT_ENABLED:
+        raise RuntimeError("已启用 Google Forms 定性入口，但未启用服务账号连接")
+    if GOOGLE_FORMS_SERVICE_ACCOUNT_FILE is None:
+        raise RuntimeError("已启用 Google Forms 定性入口，但未配置凭据文件")
+
+    from app.integrations.google_forms_service_account_client import (
+        GoogleFormsServiceAccountClient,
+    )
+    from app.routers.questionnaire_source_runtime import (
+        create_questionnaire_source_runtime_router,
+    )
+    from app.services.questionnaire_source_runtime import (
+        create_questionnaire_source_runtime,
+    )
+
+    _google_forms_client = GoogleFormsServiceAccountClient(
+        GOOGLE_FORMS_SERVICE_ACCOUNT_FILE,
+        forms_api_base=GOOGLE_FORMS_API_BASE,
+        connect_timeout=GOOGLE_FORMS_CONNECT_TIMEOUT,
+        read_timeout=GOOGLE_FORMS_READ_TIMEOUT,
+    )
+    _questionnaire_source_runtime = create_questionnaire_source_runtime(
+        RESEARCH_ASSET_STORAGE_DIR,
+        google_forms_client=_google_forms_client,
+    )
+    app.include_router(
+        create_questionnaire_source_runtime_router(_questionnaire_source_runtime)
+    )
 
 app.include_router(survey.router)
 app.include_router(settings_api.router)

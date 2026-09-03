@@ -3,6 +3,10 @@ from copy import deepcopy
 
 from app.core.config import MAX_REPORT_VERSIONS
 from app.core.security import _find_history_for_login, _visible_to_owner
+from app.services.questionnaire_family_history import (
+    family_history_fields,
+    family_history_summary,
+)
 from app.services.report_history import (
     _history_effective_row_count,
     _qa_user_count,
@@ -113,6 +117,7 @@ def get_history_list(login: dict | None, mode: str = "") -> list[dict]:
             "annotate_confirmed_ai_count": h.get("annotate_confirmed_ai_count", 0),
             "annotate_quality_count": h.get("annotate_quality_count", 0),
             "annotate_has_download": bool(h.get("annotate_result_path")),
+            **family_history_summary(h),
             "annotate_quality_duration_seconds": h.get(
                 "annotate_quality_duration_seconds"
             ),
@@ -137,8 +142,17 @@ def get_history_entry(
 
     result = deepcopy(entry)
     result.pop("partial_rerun_source", None)
+    for field in (
+        "questionnaire_family_input_kind",
+        "questionnaire_family_ref",
+        "questionnaire_family_summary",
+        "google_forms_response_provenance",
+        "google_forms_response_diagnostics",
+    ):
+        result.pop(field, None)
     metadata = _history_version_metadata(entry, login)
     result.update(metadata)
+    result.update(family_history_fields(entry))
     if metadata["version_count"]:
         selected = resolve_report_version(
             entry,

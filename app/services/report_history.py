@@ -20,6 +20,10 @@ from app.core.security import (
     _trim_history_for_owner,
     _visible_to_owner,
 )
+from app.services.questionnaire_family_history import (
+    family_history_fields,
+    has_matching_family_provenance,
+)
 from app.services.report_versions import (
     append_report_version,
     delete_report_version,
@@ -275,6 +279,8 @@ def _has_complete_survey_duplicate_fingerprint(source: dict) -> bool:
         field not in context for field in _SURVEY_DUPLICATE_CONTEXT_FIELDS
     ):
         return False
+    if not has_matching_family_provenance(source, source):
+        return False
     questionnaire_sha256 = str(source.get("questionnaire_sha256") or "").strip().lower()
     return not bool(source.get("questionnaire_used")) or bool(
         re.fullmatch(r"[0-9a-f]{64}", questionnaire_sha256)
@@ -321,6 +327,8 @@ def _is_exact_survey_duplicate(entry: dict, sess: dict, login: dict | None) -> b
         str(entry.get("questionnaire_sha256") or "").strip().lower()
         != questionnaire_sha256
     ):
+        return False
+    if not has_matching_family_provenance(entry, sess):
         return False
 
     entry_context = entry.get("qualitative_context")
@@ -492,6 +500,7 @@ def save_to_history(
             or (old_entry or {}).get("row_count", 0),
             **owner,
         }
+        entry.update(family_history_fields(sess, fallback=old_entry))
         if partial_rerun_source:
             entry["partial_rerun_source"] = partial_rerun_source
         if version_source:
@@ -607,6 +616,12 @@ def append_exact_rerun_to_history(
             "row_count": max(0, len(sess.get("rows") or []) - 1),
             "rows_fed": False,
         })
+        for field in (
+            "questionnaire_family_input_kind",
+            "questionnaire_family_ref",
+        ):
+            entry.pop(field, None)
+        entry.update(family_history_fields(sess))
         partial_rerun_source = build_partial_rerun_source(sess)
         if partial_rerun_source:
             entry["partial_rerun_source"] = partial_rerun_source
