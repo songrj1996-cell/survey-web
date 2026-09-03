@@ -611,27 +611,6 @@ $('ann-ai-mark-ai').addEventListener('click', () => annSetAiDecision('ai'));
 $('ann-ai-layout-split').addEventListener('click', () => annSetAiConfirmLayout('split'));
 $('ann-ai-layout-focus').addEventListener('click', () => annSetAiConfirmLayout('focus'));
 
-$('ann-btn-check-all').addEventListener('click', () => {
-  annState.reviewAiResults.forEach(result => {
-    const rowId = String(result.id);
-    annState.confirmedAiIds.add(rowId);
-    annState.aiReviewedIds.add(rowId);
-  });
-  annRenderAiCandidateList();
-  annRenderAiProfile();
-  annUpdateAiReviewProgress();
-});
-$('ann-btn-uncheck-all').addEventListener('click', () => {
-  annState.reviewAiResults.forEach(result => {
-    const rowId = String(result.id);
-    annState.confirmedAiIds.delete(rowId);
-    annState.aiReviewedIds.add(rowId);
-  });
-  annRenderAiCandidateList();
-  annRenderAiProfile();
-  annUpdateAiReviewProgress();
-});
-
 $('ann-btn-confirm-ai').addEventListener('click', async () => {
   if (annState.aiReviewedIds.size !== annState.reviewAiResults.length) {
     showToast('请先完成所有待复核玩家的人工判定', 'error');
