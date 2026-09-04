@@ -15,6 +15,8 @@ _VIEWPOINT_BLOCK_RE = re.compile(r"(?m)^[ \t]*\*\*观点：")
 _MENTION_BLOCK_RE = re.compile(r"(?m)^[ \t]*(?:-[ \t]+)?\*\*提及情况：")
 _INFERENCE_BLOCK_RE = re.compile(r"(?m)^[ \t]*\*\*分析推断：")
 _VAGUE_VIEWPOINT_TERMS = ("多数玩家", "多位玩家", "部分玩家", "少数玩家")
+_CROSS_QUESTION_MERGE_BATCH_SIZE = 36
+_CROSS_QUESTION_MAX_REDUCTION_LEVELS = 3
 
 
 def _question_label(data: dict) -> str:
@@ -41,6 +43,7 @@ def _cross_question_candidates(clustered_themes: dict) -> list[dict]:
                 continue
             candidates.append({
                 "name": str(theme.get("name") or "").strip(),
+                "source_question": question,
                 "description": (
                     f"来源问题：{question}。{str(theme.get('description') or '').strip()}"
                 ),
@@ -49,6 +52,69 @@ def _cross_question_candidates(clustered_themes: dict) -> list[dict]:
                 "representative_quotes": quotes,
             })
     return candidates
+
+
+def _balanced_candidate_batches(
+    candidates: list[dict],
+    batch_size: int = _CROSS_QUESTION_MERGE_BATCH_SIZE,
+) -> list[list[dict]]:
+    """让同一批尽量覆盖不同题目，避免先在单题内部做无效归并。"""
+    grouped: dict[str, list[dict]] = {}
+    for candidate in candidates:
+        key = str(candidate.get("source_question") or "__merged__")
+        grouped.setdefault(key, []).append(candidate)
+    interleaved: list[dict] = []
+    while any(grouped.values()):
+        for group in grouped.values():
+            if group:
+                interleaved.append(group.pop(0))
+    return [
+        interleaved[index:index + batch_size]
+        for index in range(0, len(interleaved), batch_size)
+    ]
+
+
+def _merge_call_diagnostic(
+    stage: str,
+    batch_index: int,
+    candidates: list[dict],
+    call_result: dict,
+) -> dict:
+    data = call_result.get("data") if isinstance(call_result, dict) else None
+    themes = data.get("themes") if isinstance(data, dict) else None
+    error = str(call_result.get("error") or "")[:300]
+    return {
+        "stage": stage,
+        "batch_index": batch_index,
+        "input_candidate_count": len(candidates),
+        "output_theme_count": len(themes) if isinstance(themes, list) else 0,
+        "status": "completed" if themes else "failed",
+        "model": str(call_result.get("model") or ""),
+        "repaired": bool(call_result.get("repaired")),
+        "raw_len": int(call_result.get("raw_len") or 0),
+        "error": error,
+        "error_type": _diagnostic_error_type(error) if error else "",
+        "finish_reason": "length" if "finish_reason=length" in error else "",
+        "duration_seconds": float(call_result.get("duration_seconds") or 0),
+    }
+
+
+def _merged_themes_as_candidates(themes: list[dict]) -> list[dict]:
+    """下一层只保留候选语义和引用，移除上一层局部 ID，避免协议混淆。"""
+    return [
+        {
+            "name": str(theme.get("name") or "").strip(),
+            "source_question": "__merged__",
+            "description": str(theme.get("description") or "").strip(),
+            "positive_summary": theme.get("positive_summary") or None,
+            "negative_summary": theme.get("negative_summary") or None,
+            "representative_quotes": list(
+                dict.fromkeys(theme.get("representative_quotes") or [])
+            )[:3],
+        }
+        for theme in themes
+        if isinstance(theme, dict)
+    ]
 
 
 def _flatten_evidence(open_text: dict, plan: dict, headers: list[str]) -> list[dict]:
@@ -116,35 +182,159 @@ async def build_report_viewpoint_stats(
     )
     organization = _report_organization(plan)
     repair_events: asyncio.Queue = asyncio.Queue()
+    merge_prompt = report_engine._get_theme_merge_system_prompt() + (
+        "\n\n跨题观点额外规则：最终主题必须是玩家能够在一条回答中直接表达的具体观点。"
+        "可以合并不同题目里意思相同的玩家说法，但禁止创造‘A影响B’‘A导致B’‘A与B有关’"
+        "等需要比较多题、客观统计或多类证据才能得出的关系、标准、框架或产品判断；"
+        "这类内容属于分析推断，不进入玩家观点目录。"
+    )
+    merge_calls: list[dict] = []
 
-    async def _merge():
-        return await report_engine._direct_json_call(
-            report_engine._get_theme_merge_system_prompt()
-            + (
-                "\n\n跨题观点额外规则：最终主题必须是玩家能够在一条回答中直接表达的具体观点。"
-                "可以合并不同题目里意思相同的玩家说法，但禁止创造‘A影响B’‘A导致B’‘A与B有关’"
-                "等需要比较多题、客观统计或多类证据才能得出的关系、标准、框架或产品判断；"
-                "这类内容属于分析推断，不进入玩家观点目录。"
-            ),
-            report_engine._build_theme_merge_query(
-                f"跨题报告观点；报告组织方式：{organization}",
-                candidates,
-                len(evidence),
-            ),
-            models=(
-                report_engine.LLM_THEME_MERGE_MODEL,
-                *report_engine.LLM_THEME_MERGE_FALLBACK_MODELS,
-            ),
-            max_tokens=report_engine.LLM_THEME_MERGE_MAX_TOKENS,
-            reasoning_effort=report_engine.LLM_THEME_MERGE_REASONING or None,
-            validator=lambda data: report_engine._validate_merged_themes(data, candidates),
-            on_repair=lambda error: repair_events.put_nowait({"error": error}),
-            on_attempt_event=on_attempt_event,
+    def _merge_factory(batch: list[dict], stage: str, batch_index: int):
+        async def _merge():
+            return await report_engine._direct_json_call(
+                merge_prompt,
+                report_engine._build_theme_merge_query(
+                    f"跨题报告观点；报告组织方式：{organization}",
+                    batch,
+                    len(evidence),
+                ),
+                models=(
+                    report_engine.LLM_THEME_MERGE_MODEL,
+                    *report_engine.LLM_THEME_MERGE_FALLBACK_MODELS,
+                ),
+                max_tokens=report_engine.LLM_THEME_MERGE_MAX_TOKENS,
+                reasoning_effort=report_engine.LLM_THEME_MERGE_REASONING or None,
+                validator=lambda data: report_engine._validate_merged_themes(data, batch),
+                on_repair=lambda error: repair_events.put_nowait({
+                    "stage": stage,
+                    "batch_index": batch_index,
+                    "error": str(error)[:300],
+                }),
+                on_attempt_event=on_attempt_event,
+            )
+        return _merge
+
+    current_candidates = candidates
+    reduction_levels = 0
+    partial_failure_count = 0
+    while (
+        len(current_candidates) > _CROSS_QUESTION_MERGE_BATCH_SIZE
+        and reduction_levels < _CROSS_QUESTION_MAX_REDUCTION_LEVELS
+    ):
+        reduction_levels += 1
+        batches = _balanced_candidate_batches(current_candidates)
+        yield (
+            "analysis_progress",
+            {
+                "phase": "synthesis",
+                "phase_index": 2,
+                "phase_total": 4,
+                "status": "active",
+                "step": "merging",
+                "message": (
+                    f"正在分层归并跨题观点（第 {reduction_levels} 层，共 {len(batches)} 批）"
+                ),
+                "impact": "none",
+            },
         )
+        factories = [
+            _merge_factory(batch, f"level_{reduction_levels}", batch_index)
+            for batch_index, batch in enumerate(batches, 1)
+        ]
+        batch_results: dict[int, dict] = {}
+        async for event_type, payload in report_engine._run_bounded_calls(
+            factories, 1, repair_events
+        ):
+            if event_type == "heartbeat":
+                yield ("heartbeat", "")
+            elif event_type == "call_progress":
+                yield (
+                    "analysis_progress",
+                    {
+                        "phase": "synthesis",
+                        "phase_index": 2,
+                        "phase_total": 4,
+                        "status": "retrying",
+                        "step": "merging",
+                        "message": "跨题分批归纳未通过校验，正在自动修正",
+                        "impact": "各题主题和原文仍完整保留",
+                        **payload,
+                    },
+                )
+            else:
+                batch_zero_index, call_result = payload
+                batch_results[batch_zero_index] = call_result
 
+        next_candidates: list[dict] = []
+        for batch_zero_index, batch in enumerate(batches):
+            call_result = batch_results.get(batch_zero_index) or {}
+            diagnostic = _merge_call_diagnostic(
+                f"level_{reduction_levels}",
+                batch_zero_index + 1,
+                batch,
+                call_result,
+            )
+            merge_calls.append(diagnostic)
+            data = call_result.get("data") if isinstance(call_result, dict) else None
+            batch_themes = data.get("themes") if isinstance(data, dict) else None
+            if batch_themes:
+                next_candidates.extend(_merged_themes_as_candidates(batch_themes))
+            else:
+                partial_failure_count += 1
+                next_candidates.extend(batch)
+        if not next_candidates:
+            break
+        current_candidates = next_candidates
+
+    if len(current_candidates) > _CROSS_QUESTION_MERGE_BATCH_SIZE:
+        guard_error = (
+            "hierarchical_reduction_limit_exceeded: "
+            f"{len(current_candidates)} candidates remain after {reduction_levels} levels"
+        )
+        merge_calls.append({
+            "stage": "reduction_guard",
+            "batch_index": 1,
+            "input_candidate_count": len(current_candidates),
+            "output_theme_count": 0,
+            "status": "failed",
+            "model": "",
+            "repaired": False,
+            "raw_len": 0,
+            "error": guard_error,
+            "error_type": "reduction_limit",
+            "finish_reason": "",
+            "duration_seconds": 0.0,
+        })
+        yield ("diagnostics", {
+            "status": "failed",
+            "input_candidate_count": len(candidates),
+            "final_input_candidate_count": len(current_candidates),
+            "reduction_levels": reduction_levels,
+            "partial_failure_count": partial_failure_count,
+            "calls": merge_calls,
+        })
+        yield (
+            "analysis_progress",
+            {
+                "phase": "synthesis",
+                "phase_index": 2,
+                "phase_total": 4,
+                "status": "degraded",
+                "step": "completed",
+                "message": "跨题观点未能压缩到安全规模，继续使用各题分析结果撰写报告",
+                "impact": "各题主题和原文均保留，但本次不生成跨题共同观点",
+                "elapsed_seconds": round(time.monotonic() - synthesis_started, 3),
+            },
+        )
+        yield ("result", [])
+        return
+
+    final_stage = "final"
+    final_factory = _merge_factory(current_candidates, final_stage, 1)
     merge_result = None
     async for event_type, payload in report_engine._run_bounded_calls(
-        [_merge], 1, repair_events
+        [final_factory], 1, repair_events
     ):
         if event_type == "heartbeat":
             yield ("heartbeat", "")
@@ -157,15 +347,32 @@ async def build_report_viewpoint_stats(
                     "phase_total": 4,
                     "status": "retrying",
                     "step": "merging",
-                    "retry_index": 1,
-                    "retry_total": 1,
-                    "message": "跨题归纳未通过校验，正在自动修正并重新调用（1/1）",
+                    "message": "跨题最终归纳未通过校验，正在自动修正",
                     "impact": "各题主题和原文仍完整保留",
+                    **payload,
                 },
             )
         else:
             _batch_index, merge_result = payload
     merge_result = merge_result or {}
+    merge_calls.append(
+        _merge_call_diagnostic(final_stage, 1, current_candidates, merge_result)
+    )
+    synthesis_diagnostics = {
+        "status": (
+            "recovered"
+            if merge_result.get("data") and partial_failure_count
+            else "completed"
+            if merge_result.get("data")
+            else "failed"
+        ),
+        "input_candidate_count": len(candidates),
+        "final_input_candidate_count": len(current_candidates),
+        "reduction_levels": reduction_levels,
+        "partial_failure_count": partial_failure_count,
+        "calls": merge_calls,
+    }
+    yield ("diagnostics", synthesis_diagnostics)
     merged = merge_result.get("data") if isinstance(merge_result, dict) else None
     themes = merged.get("themes", []) if isinstance(merged, dict) else []
     if not themes:
@@ -284,6 +491,7 @@ async def build_report_viewpoint_stats(
                 item["question"] for item in evidence
                 if item["scope_key"] in source_scopes
             }),
+            "source_scope_keys": sorted(source_scopes),
             "quotes": quotes[theme_id],
         })
     result.sort(key=lambda item: item["count"], reverse=True)
@@ -310,8 +518,18 @@ async def build_report_viewpoint_stats(
     yield ("result", result)
 
 
-def render_viewpoint_stats(clustered_themes: dict, report_viewpoints: list[dict]) -> str:
-    """渲染给 Writer 的只读观点统计目录。"""
+def render_viewpoint_stats(
+    clustered_themes: dict,
+    report_viewpoints: list[dict],
+    *,
+    part_index: int | None = None,
+) -> str:
+    """渲染给 Writer 的只读观点目录；可严格裁到单个 Part。"""
+    selected_scope_keys = {
+        str(scope_key)
+        for scope_key, data in clustered_themes.items()
+        if part_index is None or int(data.get("part_index") or 0) == part_index
+    }
     lines = [
         "<subjective_viewpoint_stats>",
         "口径：人数均按玩家去重；同一玩家可提及多个观点，所以占比之和可能超过100%。",
@@ -320,6 +538,8 @@ def render_viewpoint_stats(clustered_themes: dict, report_viewpoints: list[dict]
         "## 单题观点",
     ]
     for scope_key, data in clustered_themes.items():
+        if part_index is not None and str(scope_key) not in selected_scope_keys:
+            continue
         question = _question_label(data)
         denominator = int(data.get("total") or 0)
         for theme in data.get("all_themes") or data.get("themes") or []:
@@ -331,9 +551,20 @@ def render_viewpoint_stats(clustered_themes: dict, report_viewpoints: list[dict]
                 f"{count}名玩家提及，占本题{denominator}名有效回答玩家的{theme['percentage']}%。"
             )
 
-    if report_viewpoints:
+    selected_report_viewpoints = []
+    for item in report_viewpoints:
+        source_scope_keys = {
+            str(scope_key) for scope_key in item.get("source_scope_keys") or []
+        }
+        if (
+            part_index is None
+            or not source_scope_keys
+            or source_scope_keys & selected_scope_keys
+        ):
+            selected_report_viewpoints.append(item)
+    if selected_report_viewpoints:
         lines.extend(["", "## 跨题重组观点"])
-        for item in report_viewpoints:
+        for item in selected_report_viewpoints:
             sources = "；".join(item.get("source_questions") or [])
             lines.append(
                 f"- [{item['id']}] {item['name']}：{item['count']}名玩家提及，"
@@ -399,6 +630,7 @@ def build_viewpoint_diagnostics(
     *,
     cluster_diagnostics: dict | None = None,
     cluster_metrics: dict | None = None,
+    synthesis_diagnostics: dict | None = None,
 ) -> dict:
     """Build a per-report, privacy-safe snapshot of the viewpoint pipeline."""
     catalog_entries: list[dict] = []
@@ -468,8 +700,44 @@ def build_viewpoint_diagnostics(
             safe_metrics[key] = value
 
     rendered = str(viewpoint_stats_md or "")
+    synthesis = synthesis_diagnostics or {}
+    safe_synthesis_calls = []
+    for call in synthesis.get("calls") or []:
+        if not isinstance(call, dict):
+            continue
+        safe_synthesis_calls.append({
+            key: call.get(key)
+            for key in (
+                "stage",
+                "batch_index",
+                "input_candidate_count",
+                "output_theme_count",
+                "status",
+                "model",
+                "repaired",
+                "raw_len",
+                "error",
+                "error_type",
+                "finish_reason",
+                "duration_seconds",
+            )
+        })
+    safe_synthesis = {
+        "status": str(synthesis.get("status") or (
+            "completed" if report_viewpoints else "not_run"
+        )),
+        "input_candidate_count": int(synthesis.get("input_candidate_count") or 0),
+        "final_input_candidate_count": int(
+            synthesis.get("final_input_candidate_count") or 0
+        ),
+        "reduction_levels": int(synthesis.get("reduction_levels") or 0),
+        "partial_failure_count": int(
+            synthesis.get("partial_failure_count") or 0
+        ),
+        "calls": safe_synthesis_calls,
+    }
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "cluster": {
             "status": cluster_status,
             "scope_count": len(clustered_themes or {}),
@@ -491,6 +759,7 @@ def build_viewpoint_diagnostics(
             ),
             "entries": catalog_entries,
         },
+        "synthesis": safe_synthesis,
         "writer_context": {
             "included": False,
         },

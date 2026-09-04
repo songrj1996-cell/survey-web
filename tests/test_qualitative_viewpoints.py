@@ -64,6 +64,57 @@ class QualitativeViewpointTests(unittest.TestCase):
         self.assertIn("占相关题目4名有效回答玩家的50.0%", rendered)
         self.assertIn("目录外的综合判断必须标为“分析推断”", rendered)
 
+    def test_writer_catalog_can_be_scoped_to_one_part(self):
+        clustered = {
+            1: {
+                "col_name": "界面反馈",
+                "part_index": 1,
+                "total": 2,
+                "themes": [{
+                    "id": "t01", "name": "按钮数量", "count": 1, "percentage": 50.0,
+                }],
+            },
+            2: {
+                "col_name": "功能反馈",
+                "part_index": 2,
+                "total": 2,
+                "themes": [{
+                    "id": "t01", "name": "入口理解", "count": 1, "percentage": 50.0,
+                }],
+            },
+        }
+        report_viewpoints = [
+            {
+                "id": "RVIEW:t01",
+                "name": "界面共同观点",
+                "count": 1,
+                "denominator": 2,
+                "percentage": 50.0,
+                "source_questions": ["界面反馈"],
+                "source_scope_keys": ["1"],
+            },
+            {
+                "id": "RVIEW:t02",
+                "name": "功能共同观点",
+                "count": 1,
+                "denominator": 2,
+                "percentage": 50.0,
+                "source_questions": ["功能反馈"],
+                "source_scope_keys": ["2"],
+            },
+        ]
+
+        rendered = render_viewpoint_stats(
+            clustered,
+            report_viewpoints,
+            part_index=1,
+        )
+
+        self.assertIn("[QVIEW:1:t01]", rendered)
+        self.assertNotIn("[QVIEW:2:t01]", rendered)
+        self.assertIn("[RVIEW:t01]", rendered)
+        self.assertNotIn("[RVIEW:t02]", rendered)
+
     def test_viewpoint_diagnostics_persist_only_sanitized_catalog_fields(self):
         clustered = {
             1: {
@@ -110,6 +161,28 @@ class QualitativeViewpointTests(unittest.TestCase):
                 "elapsed_seconds": 1.5,
                 "unsafe_extra": "secret-metric",
             },
+            synthesis_diagnostics={
+                "status": "failed",
+                "input_candidate_count": 170,
+                "final_input_candidate_count": 170,
+                "reduction_levels": 0,
+                "partial_failure_count": 0,
+                "calls": [{
+                    "stage": "final",
+                    "batch_index": 1,
+                    "input_candidate_count": 170,
+                    "output_theme_count": 0,
+                    "status": "failed",
+                    "model": "claude-sonnet-5",
+                    "repaired": True,
+                    "raw_len": 16000,
+                    "error": "finish_reason=length",
+                    "error_type": "other",
+                    "finish_reason": "length",
+                    "duration_seconds": 12.5,
+                    "unsafe_extra": "secret-synthesis",
+                }],
+            },
         )
         serialized = json.dumps(diagnostics, ensure_ascii=False)
 
@@ -126,6 +199,15 @@ class QualitativeViewpointTests(unittest.TestCase):
         )
         self.assertEqual(
             diagnostics["cluster"]["error_stage_counts"], {"phase_a": 1}
+        )
+        self.assertEqual(diagnostics["synthesis"]["status"], "failed")
+        self.assertEqual(
+            diagnostics["synthesis"]["calls"][0]["error"],
+            "finish_reason=length",
+        )
+        self.assertEqual(
+            diagnostics["synthesis"]["calls"][0]["finish_reason"],
+            "length",
         )
         self.assertNotIn("secret-", serialized)
         self.assertNotIn("respondent_keys", serialized)
@@ -308,6 +390,189 @@ class CrossQuestionViewpointTests(unittest.IsolatedAsyncioTestCase):
             classify_call.await_args.kwargs["on_attempt_event"],
             attempt_callback,
         )
+
+    async def test_large_candidate_catalog_is_hierarchically_merged_in_bounded_batches(self):
+        clustered = {}
+        open_text = {}
+        columns = []
+        for question_index in range(10):
+            column_index = question_index + 1
+            columns.append({
+                "index": column_index,
+                "name": f"问题{column_index}",
+                "role": "open_text",
+            })
+            clustered[column_index] = {
+                "col_name": f"问题{column_index}",
+                "part_index": 1,
+                "all_themes": [
+                    {
+                        "id": f"t{theme_index + 1:02d}",
+                        "name": f"问题{column_index}观点{theme_index + 1}",
+                        "description": "具体玩家观点",
+                        "count": 1,
+                        "source_quotes": [f"引用-{column_index}-{theme_index + 1}"],
+                    }
+                    for theme_index in range(17)
+                ],
+            }
+            open_text[column_index] = [{
+                "respondent_key": f"p{column_index}",
+                "text": f"回答-{column_index}",
+            }]
+        plan = {
+            "columns": columns,
+            "parts": [{
+                "name": "综合体验",
+                "column_indexes": [column["index"] for column in columns],
+            }],
+        }
+        observed_batch_sizes = []
+
+        async def merge_call(_system, query, **_kwargs):
+            payload = query.split("<theme_candidates_json>\n", 1)[1].split(
+                "\n</theme_candidates_json>", 1
+            )[0]
+            candidates = json.loads(payload)
+            observed_batch_sizes.append(len(candidates))
+            candidate_ids = [item["candidate_id"] for item in candidates]
+            quote = candidates[0]["representative_quotes"][0]
+            return {
+                "data": {"themes": [{
+                    "id": "t01",
+                    "name": "跨题共同观点",
+                    "description": "跨题共同含义",
+                    "source_candidate_ids": candidate_ids,
+                    "representative_quotes": [quote],
+                }]},
+                "model": "model-a",
+                "raw_len": 500,
+                "repaired": False,
+                "error": "",
+                "duration_seconds": 0.1,
+            }
+
+        async def classify_call(_question, _themes, batch, **_kwargs):
+            return {
+                "classifications": [
+                    {
+                        "response_id": str(index),
+                        "assignments": [{
+                            "theme_id": "t01",
+                            "sentiment": "neutral",
+                        }],
+                    }
+                    for index in range(len(batch))
+                ],
+                "fallback_count": 0,
+            }
+
+        with (
+            patch.object(report_engine, "_direct_json_call", new=merge_call),
+            patch.object(report_engine, "_classify_batch_direct", new=classify_call),
+        ):
+            events = [
+                item async for item in build_report_viewpoint_stats(
+                    clustered,
+                    open_text,
+                    plan,
+                    ["玩家ID", *(column["name"] for column in columns)],
+                )
+            ]
+
+        diagnostics = next(item[1] for item in events if item[0] == "diagnostics")
+        result = next(item[1] for item in events if item[0] == "result")
+        self.assertEqual(diagnostics["input_candidate_count"], 170)
+        self.assertEqual(diagnostics["reduction_levels"], 1)
+        self.assertEqual(diagnostics["final_input_candidate_count"], 5)
+        self.assertEqual(diagnostics["status"], "completed")
+        self.assertEqual(len(diagnostics["calls"]), 6)
+        self.assertEqual(observed_batch_sizes, [36, 36, 36, 36, 26, 5])
+        self.assertEqual(len(result), 1)
+        self.assertEqual(set(result[0]["source_scope_keys"]), {
+            str(index) for index in range(1, 11)
+        })
+
+    async def test_hierarchical_merge_never_sends_oversized_final_batch(self):
+        clustered = {}
+        open_text = {}
+        columns = []
+        for column_index in (1, 2):
+            columns.append({
+                "index": column_index,
+                "name": f"问题{column_index}",
+                "role": "open_text",
+            })
+            clustered[column_index] = {
+                "col_name": f"问题{column_index}",
+                "part_index": 1,
+                "all_themes": [
+                    {
+                        "id": f"t{theme_index + 1:02d}",
+                        "name": f"问题{column_index}观点{theme_index + 1}",
+                        "description": "具体玩家观点",
+                        "count": 1,
+                        "source_quotes": [f"引用-{column_index}-{theme_index + 1}"],
+                    }
+                    for theme_index in range(25)
+                ],
+            }
+            open_text[column_index] = [{
+                "respondent_key": f"p{column_index}",
+                "text": f"回答-{column_index}",
+            }]
+        plan = {
+            "columns": columns,
+            "parts": [{"name": "综合体验", "column_indexes": [1, 2]}],
+        }
+        observed_batch_sizes = []
+
+        async def nonreducing_merge(_system, query, **_kwargs):
+            payload = query.split("<theme_candidates_json>\n", 1)[1].split(
+                "\n</theme_candidates_json>", 1
+            )[0]
+            candidates = json.loads(payload)
+            observed_batch_sizes.append(len(candidates))
+            return {
+                "data": {"themes": [
+                    {
+                        "id": f"t{index:02d}",
+                        "name": candidate["name"],
+                        "description": candidate["description"],
+                        "source_candidate_ids": [candidate["candidate_id"]],
+                        "representative_quotes": candidate["representative_quotes"],
+                    }
+                    for index, candidate in enumerate(candidates, 1)
+                ]},
+                "model": "model-a",
+                "raw_len": 1000,
+                "repaired": False,
+                "error": "",
+                "duration_seconds": 0.1,
+            }
+
+        classify_call = AsyncMock()
+        with (
+            patch.object(report_engine, "_direct_json_call", new=nonreducing_merge),
+            patch.object(report_engine, "_classify_batch_direct", new=classify_call),
+        ):
+            events = [
+                item async for item in build_report_viewpoint_stats(
+                    clustered,
+                    open_text,
+                    plan,
+                    ["玩家ID", "问题1", "问题2"],
+                )
+            ]
+
+        diagnostics = next(item[1] for item in events if item[0] == "diagnostics")
+        result = next(item[1] for item in events if item[0] == "result")
+        self.assertEqual(diagnostics["status"], "failed")
+        self.assertEqual(diagnostics["calls"][-1]["stage"], "reduction_guard")
+        self.assertEqual(observed_batch_sizes, [36, 14, 36, 14, 36, 14])
+        self.assertLessEqual(max(observed_batch_sizes), 36)
+        self.assertEqual(result, [])
+        classify_call.assert_not_awaited()
 
 
 if __name__ == "__main__":
