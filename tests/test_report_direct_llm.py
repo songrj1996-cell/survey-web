@@ -90,12 +90,16 @@ async def _stub_report_viewpoint_stats(*_args, **_kwargs):
 async def _stub_failed_report_viewpoint_stats(*_args, **_kwargs):
     yield ("diagnostics", {
         "status": "failed",
+        "strategy": "single_pass_selective_grouping",
+        "stage_budget_seconds": 300,
         "input_candidate_count": 170,
-        "final_input_candidate_count": 36,
-        "reduction_levels": 1,
-        "partial_failure_count": 0,
+        "final_input_candidate_count": 170,
+        "selected_candidate_count": 0,
+        "excluded_candidate_count": 170,
+        "reduction_levels": 0,
+        "partial_failure_count": 1,
         "calls": [{
-            "stage": "final",
+            "stage": "selective_grouping",
             "batch_index": 1,
             "input_candidate_count": 36,
             "output_theme_count": 0,
@@ -421,6 +425,9 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
         persisted = save_session.call_args.args[1]
         synthesis = persisted["report_viewpoint_diagnostics"]["synthesis"]
         self.assertEqual(synthesis["status"], "failed")
+        self.assertEqual(synthesis["strategy"], "single_pass_selective_grouping")
+        self.assertEqual(synthesis["stage_budget_seconds"], 300)
+        self.assertEqual(synthesis["excluded_candidate_count"], 170)
         self.assertEqual(synthesis["calls"][0]["error"], "finish_reason=length")
         self.assertNotIn("report_viewpoint_diagnostics", sess)
 

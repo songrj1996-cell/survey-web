@@ -1,3 +1,4 @@
+import asyncio
 import json
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -286,6 +287,52 @@ class QualitativeViewpointTests(unittest.TestCase):
 
 
 class CrossQuestionViewpointTests(unittest.IsolatedAsyncioTestCase):
+    def test_cross_question_contract_allows_omissions_and_requires_two_questions(self):
+        candidates = [
+            {
+                "source_question_id": "q1",
+                "representative_quotes": ["入口难找"],
+            },
+            {
+                "source_question_id": "q2",
+                "representative_quotes": ["按钮入口不明显"],
+            },
+            {
+                "source_question_id": "q3",
+                "representative_quotes": ["仅本题出现"],
+            },
+        ]
+        data = {"themes": [{
+            "id": "t01",
+            "name": "入口不易识别",
+            "description": "不同题目都提到入口识别困难",
+            "source_candidate_ids": ["c0001", "c0002"],
+            "representative_quotes": [],
+        }]}
+
+        self.assertIsNone(
+            report_engine._validate_cross_question_themes(data, candidates)
+        )
+        self.assertEqual(
+            data["themes"][0]["representative_quotes"],
+            ["入口难找", "按钮入口不明显"],
+        )
+
+        same_question = {"themes": [{
+            "id": "t01",
+            "name": "同题候选",
+            "description": "不应成为跨题观点",
+            "source_candidate_ids": ["c0001", "c0002"],
+        }]}
+        candidates[1]["source_question_id"] = "q1"
+        self.assertIn(
+            "至少两个不同题目",
+            report_engine._validate_cross_question_themes(
+                same_question,
+                candidates,
+            ),
+        )
+
     async def test_cross_question_count_deduplicates_players_and_uses_relevant_sources(self):
         clustered = {
             1: {
@@ -293,6 +340,7 @@ class CrossQuestionViewpointTests(unittest.IsolatedAsyncioTestCase):
                 "all_themes": [{
                     "id": "t01", "name": "按钮数量", "count": 2,
                     "source_quotes": ["按钮太多"],
+                    "respondent_keys": ["p1", "p2"],
                 }],
             },
             2: {
@@ -300,6 +348,7 @@ class CrossQuestionViewpointTests(unittest.IsolatedAsyncioTestCase):
                 "all_themes": [{
                     "id": "t01", "name": "入口理解", "count": 2,
                     "source_quotes": ["入口难找"],
+                    "respondent_keys": ["p1", "p3"],
                 }],
             },
         }
@@ -320,31 +369,16 @@ class CrossQuestionViewpointTests(unittest.IsolatedAsyncioTestCase):
             ],
             "parts": [{"name": "界面体验", "column_indexes": [1, 2]}],
         }
-        merged_themes = [
-            {"id": "t01", "name": "按钮数量", "description": "按钮多少"},
-            {"id": "t02", "name": "熟悉度与理解", "description": "熟悉度和理解难度"},
-        ]
-        classified = {
-            "classifications": [
-                {"response_id": "0", "assignments": [
-                    {"theme_id": "t01", "sentiment": "negative"},
-                    {"theme_id": "t02", "sentiment": "neutral"},
-                ]},
-                {"response_id": "1", "assignments": [
-                    {"theme_id": "t01", "sentiment": "positive"},
-                ]},
-                {"response_id": "2", "assignments": [
-                    {"theme_id": "t02", "sentiment": "negative"},
-                ]},
-                {"response_id": "3", "assignments": [
-                    {"theme_id": "t02", "sentiment": "positive"},
-                ]},
-            ]
-        }
+        merged_themes = [{
+            "id": "t01",
+            "name": "界面入口复杂",
+            "description": "界面控件和入口增加理解成本",
+            "source_candidate_ids": ["c0001", "c0002"],
+        }]
 
         attempt_callback = object()
         merge_call = AsyncMock(return_value={"data": {"themes": merged_themes}})
-        classify_call = AsyncMock(return_value=classified)
+        classify_call = AsyncMock()
         with (
             patch.object(
                 report_engine,
@@ -374,24 +408,22 @@ class CrossQuestionViewpointTests(unittest.IsolatedAsyncioTestCase):
 
         result = next(item[1] for item in events if item[0] == "result")
         by_id = {item["id"]: item for item in result}
-        self.assertEqual(by_id["RVIEW:t01"]["count"], 2)
-        self.assertEqual(by_id["RVIEW:t01"]["denominator"], 2)
-        self.assertEqual(by_id["RVIEW:t02"]["count"], 2)
-        self.assertEqual(by_id["RVIEW:t02"]["denominator"], 3)
+        self.assertEqual(by_id["RVIEW:t01"]["count"], 3)
+        self.assertEqual(by_id["RVIEW:t01"]["denominator"], 3)
+        self.assertEqual(by_id["RVIEW:t01"]["source_scope_keys"], ["1", "2"])
         merge_system_prompt = merge_call.await_args.args[0]
         merge_query = merge_call.await_args.args[1]
-        self.assertIn("最终主题不设置最少或最多数量", merge_system_prompt)
+        self.assertIn("无需分配全部候选", merge_system_prompt)
         self.assertIn('"candidate_id": "c0001"', merge_query)
+        self.assertNotIn("representative_quotes", merge_query)
+        self.assertNotIn("respondent_keys", merge_query)
         self.assertIs(
             merge_call.await_args.kwargs["on_attempt_event"],
             attempt_callback,
         )
-        self.assertIs(
-            classify_call.await_args.kwargs["on_attempt_event"],
-            attempt_callback,
-        )
+        classify_call.assert_not_awaited()
 
-    async def test_large_candidate_catalog_is_hierarchically_merged_in_bounded_batches(self):
+    async def test_large_candidate_catalog_is_grouped_in_one_compact_call(self):
         clustered = {}
         open_text = {}
         columns = []
@@ -412,6 +444,7 @@ class CrossQuestionViewpointTests(unittest.IsolatedAsyncioTestCase):
                         "description": "具体玩家观点",
                         "count": 1,
                         "source_quotes": [f"引用-{column_index}-{theme_index + 1}"],
+                        "respondent_keys": [f"p{column_index}"],
                     }
                     for theme_index in range(17)
                 ],
@@ -430,20 +463,19 @@ class CrossQuestionViewpointTests(unittest.IsolatedAsyncioTestCase):
         observed_batch_sizes = []
 
         async def merge_call(_system, query, **_kwargs):
-            payload = query.split("<theme_candidates_json>\n", 1)[1].split(
-                "\n</theme_candidates_json>", 1
+            payload = query.split("<cross_question_candidates_json>\n", 1)[1].split(
+                "\n</cross_question_candidates_json>", 1
             )[0]
             candidates = json.loads(payload)
             observed_batch_sizes.append(len(candidates))
             candidate_ids = [item["candidate_id"] for item in candidates]
-            quote = candidates[0]["representative_quotes"][0]
             return {
                 "data": {"themes": [{
                     "id": "t01",
                     "name": "跨题共同观点",
                     "description": "跨题共同含义",
                     "source_candidate_ids": candidate_ids,
-                    "representative_quotes": [quote],
+                    "representative_quotes": [],
                 }]},
                 "model": "model-a",
                 "raw_len": 500,
@@ -452,21 +484,7 @@ class CrossQuestionViewpointTests(unittest.IsolatedAsyncioTestCase):
                 "duration_seconds": 0.1,
             }
 
-        async def classify_call(_question, _themes, batch, **_kwargs):
-            return {
-                "classifications": [
-                    {
-                        "response_id": str(index),
-                        "assignments": [{
-                            "theme_id": "t01",
-                            "sentiment": "neutral",
-                        }],
-                    }
-                    for index in range(len(batch))
-                ],
-                "fallback_count": 0,
-            }
-
+        classify_call = AsyncMock()
         with (
             patch.object(report_engine, "_direct_json_call", new=merge_call),
             patch.object(report_engine, "_classify_batch_direct", new=classify_call),
@@ -483,17 +501,20 @@ class CrossQuestionViewpointTests(unittest.IsolatedAsyncioTestCase):
         diagnostics = next(item[1] for item in events if item[0] == "diagnostics")
         result = next(item[1] for item in events if item[0] == "result")
         self.assertEqual(diagnostics["input_candidate_count"], 170)
-        self.assertEqual(diagnostics["reduction_levels"], 1)
-        self.assertEqual(diagnostics["final_input_candidate_count"], 5)
+        self.assertEqual(diagnostics["reduction_levels"], 0)
+        self.assertEqual(diagnostics["final_input_candidate_count"], 170)
+        self.assertEqual(diagnostics["selected_candidate_count"], 170)
+        self.assertEqual(diagnostics["excluded_candidate_count"], 0)
         self.assertEqual(diagnostics["status"], "completed")
-        self.assertEqual(len(diagnostics["calls"]), 6)
-        self.assertEqual(observed_batch_sizes, [36, 36, 36, 36, 26, 5])
+        self.assertEqual(len(diagnostics["calls"]), 1)
+        self.assertEqual(observed_batch_sizes, [170])
         self.assertEqual(len(result), 1)
         self.assertEqual(set(result[0]["source_scope_keys"]), {
             str(index) for index in range(1, 11)
         })
+        classify_call.assert_not_awaited()
 
-    async def test_hierarchical_merge_never_sends_oversized_final_batch(self):
+    async def test_cross_question_stage_has_one_total_timeout_budget(self):
         clustered = {}
         open_text = {}
         columns = []
@@ -513,6 +534,7 @@ class CrossQuestionViewpointTests(unittest.IsolatedAsyncioTestCase):
                         "description": "具体玩家观点",
                         "count": 1,
                         "source_quotes": [f"引用-{column_index}-{theme_index + 1}"],
+                        "respondent_keys": [f"p{column_index}"],
                     }
                     for theme_index in range(25)
                 ],
@@ -525,36 +547,19 @@ class CrossQuestionViewpointTests(unittest.IsolatedAsyncioTestCase):
             "columns": columns,
             "parts": [{"name": "综合体验", "column_indexes": [1, 2]}],
         }
-        observed_batch_sizes = []
+        call_count = 0
 
-        async def nonreducing_merge(_system, query, **_kwargs):
-            payload = query.split("<theme_candidates_json>\n", 1)[1].split(
-                "\n</theme_candidates_json>", 1
-            )[0]
-            candidates = json.loads(payload)
-            observed_batch_sizes.append(len(candidates))
-            return {
-                "data": {"themes": [
-                    {
-                        "id": f"t{index:02d}",
-                        "name": candidate["name"],
-                        "description": candidate["description"],
-                        "source_candidate_ids": [candidate["candidate_id"]],
-                        "representative_quotes": candidate["representative_quotes"],
-                    }
-                    for index, candidate in enumerate(candidates, 1)
-                ]},
-                "model": "model-a",
-                "raw_len": 1000,
-                "repaired": False,
-                "error": "",
-                "duration_seconds": 0.1,
-            }
+        async def slow_merge(*_args, **_kwargs):
+            nonlocal call_count
+            call_count += 1
+            await asyncio.sleep(1)
+            return {"data": {"themes": []}}
 
         classify_call = AsyncMock()
         with (
-            patch.object(report_engine, "_direct_json_call", new=nonreducing_merge),
+            patch.object(report_engine, "_direct_json_call", new=slow_merge),
             patch.object(report_engine, "_classify_batch_direct", new=classify_call),
+            patch.object(report_engine, "LLM_QUALITATIVE_CALL_TIMEOUT_SECONDS", 0.01),
         ):
             events = [
                 item async for item in build_report_viewpoint_stats(
@@ -568,9 +573,23 @@ class CrossQuestionViewpointTests(unittest.IsolatedAsyncioTestCase):
         diagnostics = next(item[1] for item in events if item[0] == "diagnostics")
         result = next(item[1] for item in events if item[0] == "result")
         self.assertEqual(diagnostics["status"], "failed")
-        self.assertEqual(diagnostics["calls"][-1]["stage"], "reduction_guard")
-        self.assertEqual(observed_batch_sizes, [36, 14, 36, 14, 36, 14])
-        self.assertLessEqual(max(observed_batch_sizes), 36)
+        self.assertEqual(diagnostics["calls"], [
+            {
+                "stage": "selective_grouping",
+                "batch_index": 1,
+                "input_candidate_count": 50,
+                "output_theme_count": 0,
+                "status": "failed",
+                "model": "",
+                "repaired": False,
+                "raw_len": 0,
+                "error": "cross_question_synthesis_stage_timeout",
+                "error_type": "timeout",
+                "finish_reason": "",
+                "duration_seconds": diagnostics["calls"][0]["duration_seconds"],
+            }
+        ])
+        self.assertEqual(call_count, 1)
         self.assertEqual(result, [])
         classify_call.assert_not_awaited()
 
