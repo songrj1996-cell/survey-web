@@ -1,0 +1,1291 @@
+{
+  "snapshot": {
+    "schema_version": 1,
+    "snapshot_id": "qsn_google_demo_closed",
+    "document_id": "doc_google_demo",
+    "provider": "google_forms",
+    "provider_form_id": "DEMO_INVALID_FORM_ID",
+    "source_mode": "official_api",
+    "title": "脱敏概念测试",
+    "retrieved_at": "2026-08-12T04:00:00Z",
+    "provider_modified_at": null,
+    "provider_revision": "demo-opaque-revision",
+    "content_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "collection_state": "closed",
+    "item_count": 10,
+    "question_count": 4,
+    "asset_count": 6,
+    "mapping_status": "exact",
+    "provider_raw_definition": {
+      "formId": "DEMO_INVALID_FORM_ID",
+      "info": {
+        "title": "脱敏概念测试",
+        "documentTitle": "脱敏概念测试（API 样例）",
+        "description": "仅含合成内容"
+      },
+      "settings": {
+        "quizSettings": {"isQuiz": false},
+        "emailCollectionType": "DO_NOT_COLLECT"
+      },
+      "revisionId": "demo-opaque-revision",
+      "responderUri": "https://docs.google.com/forms/d/e/DEMO_INVALID_FORM_ID/viewform",
+      "linkedSheetId": "DEMO_INVALID_SHEET_ID",
+      "publishSettings": {
+        "publishState": {
+          "isPublished": true
+        }
+      },
+      "items": [
+        {
+          "itemId": "item-section-intro",
+          "title": "第一部分",
+          "description": "概念素材",
+          "pageBreakItem": {}
+        },
+        {
+          "itemId": "item-text-intro",
+          "title": "作答说明",
+          "description": "以下名称、ID 与媒体均为不可访问的演示占位。",
+          "textItem": {}
+        },
+        {
+          "itemId": "item-image-standalone",
+          "title": "独立概念图",
+          "imageItem": {
+            "image": {
+              "altText": "独立概念图",
+              "properties": {"alignment": "CENTER", "width": 640}
+            }
+          }
+        },
+        {
+          "itemId": "item-video",
+          "title": "演示视频",
+          "videoItem": {
+            "video": {
+              "youtubeUri": "https://www.youtube.com/watch?v=DEMO_INVALID_VIDEO",
+              "properties": {"alignment": "CENTER", "width": 640}
+            },
+            "caption": "仅验证 VideoItem 的 Provider 表达"
+          }
+        },
+        {
+          "itemId": "item-choice",
+          "title": "你更喜欢哪个方案？",
+          "description": "请结合题干图和选项图选择",
+          "questionItem": {
+            "question": {
+              "questionId": "gf-q-choice",
+              "required": true,
+              "choiceQuestion": {
+                "type": "RADIO",
+                "options": [
+                  {
+                    "value": "方案 A",
+                    "image": {
+                      "altText": "方案 A"
+                    },
+                    "goToSectionId": "item-section-details"
+                  },
+                  {"value": "方案 B", "goToAction": "NEXT_SECTION"},
+                  {"value": "重新开始", "goToAction": "RESTART_FORM"},
+                  {"value": "直接提交", "goToAction": "SUBMIT_FORM"}
+                ],
+                "shuffle": false
+              }
+            },
+            "image": {
+              "altText": "题干说明图",
+              "properties": {"alignment": "LEFT", "width": 600}
+            }
+          }
+        },
+        {
+          "itemId": "item-grid",
+          "title": "功能评价",
+          "description": "每一行都有独立 Question ID",
+          "questionGroupItem": {
+            "questions": [
+              {
+                "questionId": "gf-q-grid-usability",
+                "required": true,
+                "rowQuestion": {"title": "易用性"}
+              },
+              {
+                "questionId": "gf-q-grid-art",
+                "required": true,
+                "rowQuestion": {"title": "美术表现"}
+              }
+            ],
+            "image": {
+              "altText": "矩阵共用说明图"
+            },
+            "grid": {
+              "columns": {
+                "type": "RADIO",
+                "options": [{"value": "满意"}, {"value": "不满意"}],
+                "shuffle": false
+              },
+              "shuffleQuestions": false
+            }
+          }
+        },
+        {
+          "itemId": "item-open",
+          "title": "请补充理由",
+          "questionItem": {
+            "question": {
+              "questionId": "gf-q-open",
+              "required": false,
+              "textQuestion": {"paragraph": true}
+            }
+          }
+        },
+        {
+          "itemId": "item-upload",
+          "title": "上传参考文件",
+          "description": "文件存入演示 Drive 文件夹；平台仍需按当前用户权限读取。",
+          "questionItem": {
+            "question": {
+              "questionId": "gf-q-upload",
+              "required": false,
+              "fileUploadQuestion": {
+                "folderId": "DEMO_INVALID_UPLOAD_FOLDER_ID",
+                "types": ["IMAGE", "PDF"],
+                "maxFiles": 2,
+                "maxFileSize": "10485760"
+              }
+            }
+          }
+        },
+        {
+          "itemId": "item-section-details",
+          "title": "第二部分",
+          "description": "跳转目标",
+          "pageBreakItem": {}
+        },
+        {
+          "itemId": "item-text-drive",
+          "title": "外部参考材料",
+          "description": "https://drive.google.com/file/d/DEMO_INVALID_DRIVE_FILE_ID/view",
+          "textItem": {}
+        }
+      ],
+      "custom_provider_field": {
+        "must_survive_round_trip": true,
+        "synthetic": true
+      }
+    },
+    "provider_items": [
+      {
+        "provider": "google_forms",
+        "provider_item_id": "item-section-intro",
+        "provider_item_type": "pageBreakItem",
+        "provider_position": 0,
+        "provider_question_ids": [],
+        "raw_definition": {
+          "itemId": "item-section-intro",
+          "title": "第一部分",
+          "description": "概念素材",
+          "pageBreakItem": {}
+        },
+        "source_locator": {
+          "provider": "google_forms",
+          "provider_form_id": "DEMO_INVALID_FORM_ID",
+          "provider_item_id": "item-section-intro",
+          "question_position": 0
+        }
+      },
+      {
+        "provider": "google_forms",
+        "provider_item_id": "item-text-intro",
+        "provider_item_type": "textItem",
+        "provider_position": 1,
+        "provider_question_ids": [],
+        "raw_definition": {
+          "itemId": "item-text-intro",
+          "title": "作答说明",
+          "description": "以下名称、ID 与媒体均为不可访问的演示占位。",
+          "textItem": {}
+        },
+        "source_locator": {
+          "provider": "google_forms",
+          "provider_form_id": "DEMO_INVALID_FORM_ID",
+          "provider_item_id": "item-text-intro",
+          "question_position": 1
+        }
+      },
+      {
+        "provider": "google_forms",
+        "provider_item_id": "item-image-standalone",
+        "provider_item_type": "imageItem",
+        "provider_position": 2,
+        "provider_question_ids": [],
+        "raw_definition": {
+          "itemId": "item-image-standalone",
+          "title": "独立概念图",
+          "imageItem": {
+            "image": {
+              "altText": "独立概念图",
+              "properties": {"alignment": "CENTER", "width": 640}
+            }
+          }
+        },
+        "source_locator": {
+          "provider": "google_forms",
+          "provider_form_id": "DEMO_INVALID_FORM_ID",
+          "provider_item_id": "item-image-standalone",
+          "question_position": 2
+        }
+      },
+      {
+        "provider": "google_forms",
+        "provider_item_id": "item-video",
+        "provider_item_type": "videoItem",
+        "provider_position": 3,
+        "provider_question_ids": [],
+        "raw_definition": {
+          "itemId": "item-video",
+          "title": "演示视频",
+          "videoItem": {
+            "video": {
+              "youtubeUri": "https://www.youtube.com/watch?v=DEMO_INVALID_VIDEO",
+              "properties": {"alignment": "CENTER", "width": 640}
+            },
+            "caption": "仅验证 VideoItem 的 Provider 表达"
+          }
+        },
+        "source_locator": {
+          "provider": "google_forms",
+          "provider_form_id": "DEMO_INVALID_FORM_ID",
+          "provider_item_id": "item-video",
+          "question_position": 3
+        }
+      },
+      {
+        "provider": "google_forms",
+        "provider_item_id": "item-choice",
+        "provider_item_type": "questionItem.choiceQuestion",
+        "provider_position": 4,
+        "provider_question_ids": ["gf-q-choice"],
+        "raw_definition": {
+          "itemId": "item-choice",
+          "title": "你更喜欢哪个方案？",
+          "description": "请结合题干图和选项图选择",
+          "questionItem": {
+            "question": {
+              "questionId": "gf-q-choice",
+              "required": true,
+              "choiceQuestion": {
+                "type": "RADIO",
+                "options": [
+                  {
+                    "value": "方案 A",
+                    "image": {
+                      "altText": "方案 A"
+                    },
+                    "goToSectionId": "item-section-details"
+                  },
+                  {"value": "方案 B", "goToAction": "NEXT_SECTION"},
+                  {"value": "重新开始", "goToAction": "RESTART_FORM"},
+                  {"value": "直接提交", "goToAction": "SUBMIT_FORM"}
+                ],
+                "shuffle": false
+              }
+            },
+            "image": {
+              "altText": "题干说明图",
+              "properties": {"alignment": "LEFT", "width": 600}
+            }
+          }
+        },
+        "source_locator": {
+          "provider": "google_forms",
+          "provider_form_id": "DEMO_INVALID_FORM_ID",
+          "provider_question_id": "gf-q-choice",
+          "provider_item_id": "item-choice",
+          "question_position": 4
+        }
+      },
+      {
+        "provider": "google_forms",
+        "provider_item_id": "item-grid",
+        "provider_item_type": "questionGroupItem.grid",
+        "provider_position": 5,
+        "provider_question_ids": ["gf-q-grid-usability", "gf-q-grid-art"],
+        "raw_definition": {
+          "itemId": "item-grid",
+          "title": "功能评价",
+          "description": "每一行都有独立 Question ID",
+          "questionGroupItem": {
+            "questions": [
+              {
+                "questionId": "gf-q-grid-usability",
+                "required": true,
+                "rowQuestion": {"title": "易用性"}
+              },
+              {
+                "questionId": "gf-q-grid-art",
+                "required": true,
+                "rowQuestion": {"title": "美术表现"}
+              }
+            ],
+            "image": {
+              "altText": "矩阵共用说明图"
+            },
+            "grid": {
+              "columns": {
+                "type": "RADIO",
+                "options": [{"value": "满意"}, {"value": "不满意"}],
+                "shuffle": false
+              },
+              "shuffleQuestions": false
+            }
+          }
+        },
+        "source_locator": {
+          "provider": "google_forms",
+          "provider_form_id": "DEMO_INVALID_FORM_ID",
+          "provider_item_id": "item-grid",
+          "question_position": 5,
+          "provider_question_ids": ["gf-q-grid-usability", "gf-q-grid-art"]
+        }
+      },
+      {
+        "provider": "google_forms",
+        "provider_item_id": "item-open",
+        "provider_item_type": "questionItem.textQuestion",
+        "provider_position": 6,
+        "provider_question_ids": ["gf-q-open"],
+        "raw_definition": {
+          "itemId": "item-open",
+          "title": "请补充理由",
+          "questionItem": {
+            "question": {
+              "questionId": "gf-q-open",
+              "required": false,
+              "textQuestion": {"paragraph": true}
+            }
+          }
+        },
+        "source_locator": {
+          "provider": "google_forms",
+          "provider_form_id": "DEMO_INVALID_FORM_ID",
+          "provider_question_id": "gf-q-open",
+          "provider_item_id": "item-open",
+          "question_position": 6
+        }
+      },
+      {
+        "provider": "google_forms",
+        "provider_item_id": "item-upload",
+        "provider_item_type": "questionItem.fileUploadQuestion",
+        "provider_position": 7,
+        "provider_question_ids": ["gf-q-upload"],
+        "raw_definition": {
+          "itemId": "item-upload",
+          "title": "上传参考文件",
+          "description": "文件存入演示 Drive 文件夹；平台仍需按当前用户权限读取。",
+          "questionItem": {
+            "question": {
+              "questionId": "gf-q-upload",
+              "required": false,
+              "fileUploadQuestion": {
+                "folderId": "DEMO_INVALID_UPLOAD_FOLDER_ID",
+                "types": ["IMAGE", "PDF"],
+                "maxFiles": 2,
+                "maxFileSize": "10485760"
+              }
+            }
+          }
+        },
+        "source_locator": {
+          "provider": "google_forms",
+          "provider_form_id": "DEMO_INVALID_FORM_ID",
+          "provider_question_id": "gf-q-upload",
+          "provider_item_id": "item-upload",
+          "question_position": 7,
+          "drive_folder_id": "DEMO_INVALID_UPLOAD_FOLDER_ID"
+        }
+      },
+      {
+        "provider": "google_forms",
+        "provider_item_id": "item-section-details",
+        "provider_item_type": "pageBreakItem",
+        "provider_position": 8,
+        "provider_question_ids": [],
+        "raw_definition": {
+          "itemId": "item-section-details",
+          "title": "第二部分",
+          "description": "跳转目标",
+          "pageBreakItem": {}
+        },
+        "source_locator": {
+          "provider": "google_forms",
+          "provider_form_id": "DEMO_INVALID_FORM_ID",
+          "provider_item_id": "item-section-details",
+          "question_position": 8
+        }
+      },
+      {
+        "provider": "google_forms",
+        "provider_item_id": "item-text-drive",
+        "provider_item_type": "textItem",
+        "provider_position": 9,
+        "provider_question_ids": [],
+        "raw_definition": {
+          "itemId": "item-text-drive",
+          "title": "外部参考材料",
+          "description": "https://drive.google.com/file/d/DEMO_INVALID_DRIVE_FILE_ID/view",
+          "textItem": {}
+        },
+        "source_locator": {
+          "provider": "google_forms",
+          "provider_form_id": "DEMO_INVALID_FORM_ID",
+          "provider_item_id": "item-text-drive",
+          "question_position": 9,
+          "drive_file_id": "DEMO_INVALID_DRIVE_FILE_ID"
+        }
+      }
+    ],
+    "canonical_questions": [
+      {
+        "question_id": "q_section_intro",
+        "provider_question_id": null,
+        "provider_item_id": "item-section-intro",
+        "canonical_type": "section",
+        "title": "第一部分",
+        "description": "概念素材",
+        "required": false,
+        "rows": [],
+        "options": [],
+        "branching": [],
+        "asset_reference_ids": [],
+        "mapping_status": "exact",
+        "mapping_confidence": 1.0,
+        "warnings": []
+      },
+      {
+        "question_id": "q_static_intro",
+        "provider_question_id": null,
+        "provider_item_id": "item-text-intro",
+        "canonical_type": "static_text",
+        "title": "作答说明",
+        "description": "以下名称、ID 与媒体均为不可访问的演示占位。",
+        "required": false,
+        "rows": [],
+        "options": [],
+        "branching": [],
+        "asset_reference_ids": [],
+        "mapping_status": "exact",
+        "mapping_confidence": 1.0,
+        "warnings": []
+      },
+      {
+        "question_id": "q_static_image",
+        "provider_question_id": null,
+        "provider_item_id": "item-image-standalone",
+        "canonical_type": "static_text",
+        "title": "独立概念图",
+        "description": "",
+        "required": false,
+        "rows": [],
+        "options": [],
+        "branching": [],
+        "asset_reference_ids": ["aref_standalone_image"],
+        "mapping_status": "exact",
+        "mapping_confidence": 1.0,
+        "warnings": []
+      },
+      {
+        "question_id": "q_static_video",
+        "provider_question_id": null,
+        "provider_item_id": "item-video",
+        "canonical_type": "static_text",
+        "title": "演示视频",
+        "description": "仅验证 VideoItem 的 Provider 表达",
+        "required": false,
+        "rows": [],
+        "options": [],
+        "branching": [],
+        "asset_reference_ids": ["aref_youtube_video"],
+        "mapping_status": "exact",
+        "mapping_confidence": 1.0,
+        "warnings": []
+      },
+      {
+        "question_id": "q_concept_choice",
+        "provider_question_id": "gf-q-choice",
+        "provider_item_id": "item-choice",
+        "canonical_type": "single_choice",
+        "title": "你更喜欢哪个方案？",
+        "description": "请结合题干图和选项图选择",
+        "required": true,
+        "rows": [],
+        "options": [
+          {
+            "option_key": "A",
+            "value": "方案 A",
+            "label": "方案 A",
+            "asset_reference_ids": ["aref_option_a"],
+            "provider_option_id": null
+          },
+          {
+            "option_key": "B",
+            "value": "方案 B",
+            "label": "方案 B",
+            "asset_reference_ids": [],
+            "provider_option_id": null
+          },
+          {
+            "option_key": "restart",
+            "value": "重新开始",
+            "label": "重新开始",
+            "asset_reference_ids": [],
+            "provider_option_id": null
+          },
+          {
+            "option_key": "submit",
+            "value": "直接提交",
+            "label": "直接提交",
+            "asset_reference_ids": [],
+            "provider_option_id": null
+          }
+        ],
+        "branching": [
+          {
+            "option_key": "A",
+            "action": "go_to_section",
+            "target_section_id": "q_section_details",
+            "provider_raw_action": "item-section-details"
+          },
+          {
+            "option_key": "B",
+            "action": "next_section",
+            "target_section_id": null,
+            "provider_raw_action": "NEXT_SECTION"
+          },
+          {
+            "option_key": "restart",
+            "action": "restart_form",
+            "target_section_id": null,
+            "provider_raw_action": "RESTART_FORM"
+          },
+          {
+            "option_key": "submit",
+            "action": "submit_form",
+            "target_section_id": null,
+            "provider_raw_action": "SUBMIT_FORM"
+          }
+        ],
+        "asset_reference_ids": ["aref_question_image"],
+        "mapping_status": "exact",
+        "mapping_confidence": 1.0,
+        "warnings": []
+      },
+      {
+        "question_id": "q_grid",
+        "provider_question_id": null,
+        "provider_item_id": "item-grid",
+        "canonical_type": "matrix_single",
+        "title": "功能评价",
+        "description": "每一行都有独立 Question ID",
+        "required": true,
+        "rows": [
+          {
+            "row_key": "row-usability",
+            "label": "易用性",
+            "provider_question_id": "gf-q-grid-usability",
+            "asset_reference_ids": ["aref_grid_row_usability"]
+          },
+          {
+            "row_key": "row-art",
+            "label": "美术表现",
+            "provider_question_id": "gf-q-grid-art",
+            "asset_reference_ids": []
+          }
+        ],
+        "options": [
+          {
+            "option_key": "satisfied",
+            "value": "满意",
+            "label": "满意",
+            "asset_reference_ids": [],
+            "provider_option_id": null
+          },
+          {
+            "option_key": "unsatisfied",
+            "value": "不满意",
+            "label": "不满意",
+            "asset_reference_ids": [],
+            "provider_option_id": null
+          }
+        ],
+        "branching": [],
+        "asset_reference_ids": ["aref_grid_group_image"],
+        "mapping_status": "exact",
+        "mapping_confidence": 1.0,
+        "warnings": []
+      },
+      {
+        "question_id": "q_open",
+        "provider_question_id": "gf-q-open",
+        "provider_item_id": "item-open",
+        "canonical_type": "open_text",
+        "title": "请补充理由",
+        "description": "",
+        "required": false,
+        "rows": [],
+        "options": [],
+        "branching": [],
+        "asset_reference_ids": [],
+        "mapping_status": "exact",
+        "mapping_confidence": 1.0,
+        "warnings": []
+      },
+      {
+        "question_id": "q_upload",
+        "provider_question_id": "gf-q-upload",
+        "provider_item_id": "item-upload",
+        "canonical_type": "file_upload",
+        "title": "上传参考文件",
+        "description": "接受 IMAGE/PDF；最多 2 个；单文件上限 10485760 字节。",
+        "required": false,
+        "rows": [],
+        "options": [],
+        "branching": [],
+        "asset_reference_ids": [],
+        "mapping_status": "partial",
+        "mapping_confidence": 0.95,
+        "warnings": [
+          {
+            "code": "drive_response_access_required",
+            "message": "回收文件是回答期产生的 Drive 资源，读取时仍须按当前平台用户权限检查。",
+            "field_path": "provider_items[7].raw_definition.questionItem.question.fileUploadQuestion",
+            "blocking": false,
+            "source_locator": {
+              "provider": "google_drive",
+              "drive_file_id": "DEMO_INVALID_UPLOAD_FOLDER_ID"
+            }
+          }
+        ]
+      },
+      {
+        "question_id": "q_section_details",
+        "provider_question_id": null,
+        "provider_item_id": "item-section-details",
+        "canonical_type": "section",
+        "title": "第二部分",
+        "description": "跳转目标",
+        "required": false,
+        "rows": [],
+        "options": [],
+        "branching": [],
+        "asset_reference_ids": [],
+        "mapping_status": "exact",
+        "mapping_confidence": 1.0,
+        "warnings": []
+      },
+      {
+        "question_id": "q_static_drive",
+        "provider_question_id": null,
+        "provider_item_id": "item-text-drive",
+        "canonical_type": "static_text",
+        "title": "外部参考材料",
+        "description": "演示 Drive 链接",
+        "required": false,
+        "rows": [],
+        "options": [],
+        "branching": [],
+        "asset_reference_ids": ["aref_drive_text"],
+        "mapping_status": "exact",
+        "mapping_confidence": 1.0,
+        "warnings": []
+      }
+    ],
+    "response_column_mappings": [
+      {
+        "question_id": "q_concept_choice",
+        "bindings": [
+          {
+            "provider_question_id": "gf-q-choice",
+            "row_key": null,
+            "response_key": "gf-q-choice",
+            "column_index": 1,
+            "column_header": "你更喜欢哪个方案？",
+            "source_locator": {
+              "provider": "google_forms",
+              "provider_form_id": "DEMO_INVALID_FORM_ID",
+              "provider_question_id": "gf-q-choice",
+              "provider_item_id": "item-choice"
+            }
+          }
+        ],
+        "mapping_status": "exact",
+        "mapping_confidence": 1.0,
+        "warnings": []
+      },
+      {
+        "question_id": "q_grid",
+        "bindings": [
+          {
+            "provider_question_id": "gf-q-grid-usability",
+            "row_key": "row-usability",
+            "response_key": "gf-q-grid-usability",
+            "column_index": 2,
+            "column_header": "功能评价 [易用性]",
+            "source_locator": {
+              "provider": "google_forms",
+              "provider_form_id": "DEMO_INVALID_FORM_ID",
+              "provider_question_id": "gf-q-grid-usability",
+              "provider_item_id": "item-grid"
+            }
+          },
+          {
+            "provider_question_id": "gf-q-grid-art",
+            "row_key": "row-art",
+            "response_key": "gf-q-grid-art",
+            "column_index": 3,
+            "column_header": "功能评价 [美术表现]",
+            "source_locator": {
+              "provider": "google_forms",
+              "provider_form_id": "DEMO_INVALID_FORM_ID",
+              "provider_question_id": "gf-q-grid-art",
+              "provider_item_id": "item-grid"
+            }
+          }
+        ],
+        "mapping_status": "exact",
+        "mapping_confidence": 1.0,
+        "warnings": []
+      },
+      {
+        "question_id": "q_open",
+        "bindings": [
+          {
+            "provider_question_id": "gf-q-open",
+            "row_key": null,
+            "response_key": "gf-q-open",
+            "column_index": 4,
+            "column_header": "请补充理由",
+            "source_locator": {
+              "provider": "google_forms",
+              "provider_form_id": "DEMO_INVALID_FORM_ID",
+              "provider_question_id": "gf-q-open",
+              "provider_item_id": "item-open"
+            }
+          }
+        ],
+        "mapping_status": "exact",
+        "mapping_confidence": 1.0,
+        "warnings": []
+      },
+      {
+        "question_id": "q_upload",
+        "bindings": [
+          {
+            "provider_question_id": "gf-q-upload",
+            "row_key": null,
+            "response_key": "gf-q-upload",
+            "column_index": 5,
+            "column_header": "上传参考文件",
+            "source_locator": {
+              "provider": "google_forms",
+              "provider_form_id": "DEMO_INVALID_FORM_ID",
+              "provider_question_id": "gf-q-upload",
+              "provider_item_id": "item-upload"
+            }
+          }
+        ],
+        "mapping_status": "exact",
+        "mapping_confidence": 1.0,
+        "warnings": []
+      }
+    ],
+    "warnings": []
+  },
+  "collection": {
+    "schema_version": 1,
+    "collection_id": "rac_google_demo",
+    "owner_ref": "fixture-user",
+    "sources": [
+      {
+        "source_id": "src_google_demo",
+        "source_kind": "provider_connection",
+        "provider": "google_forms",
+        "original_name": "脱敏概念测试",
+        "original_url": "https://docs.google.com/forms/d/DEMO_INVALID_FORM_ID/edit",
+        "owner_ref": "fixture-user",
+        "created_at": "2026-08-12T04:00:00Z",
+        "acquisition_status": "completed",
+        "access_status": "accessible",
+        "warnings": [],
+        "issues": []
+      },
+      {
+        "source_id": "src_youtube_demo",
+        "source_kind": "remote_url",
+        "provider": "youtube",
+        "original_name": "演示视频",
+        "original_url": "https://www.youtube.com/watch?v=DEMO_INVALID_VIDEO",
+        "owner_ref": "fixture-user",
+        "created_at": "2026-08-12T04:00:00Z",
+        "acquisition_status": "completed",
+        "access_status": "accessible",
+        "warnings": [],
+        "issues": []
+      },
+      {
+        "source_id": "src_drive_demo",
+        "source_kind": "remote_url",
+        "provider": "google_drive",
+        "original_name": "演示外部参考材料",
+        "original_url": "https://drive.google.com/file/d/DEMO_INVALID_DRIVE_FILE_ID/view",
+        "owner_ref": "fixture-user",
+        "created_at": "2026-08-12T04:00:00Z",
+        "acquisition_status": "partial",
+        "access_status": "permission_required",
+        "warnings": [],
+        "issues": [
+          {
+            "code": "permission_required",
+            "message": "演示文件需要授权，fixture 不发起真实访问。",
+            "retryable": true,
+            "suggested_action": "切换有权限账号或上传副本",
+            "safe_log_ref": "fixture-drive-permission",
+            "source_locator": {
+              "provider": "google_drive",
+              "drive_file_id": "DEMO_INVALID_DRIVE_FILE_ID"
+            }
+          }
+        ]
+      }
+    ],
+    "documents": [
+      {
+        "document_id": "doc_google_demo",
+        "source_id": "src_google_demo",
+        "document_type": "questionnaire",
+        "title": "脱敏概念测试",
+        "filename": null,
+        "mime_type": "application/vnd.google-apps.form",
+        "size_bytes": null,
+        "content_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "provider_modified_at": null,
+        "retrieved_at": "2026-08-12T04:00:00Z",
+        "snapshot_policy": "full_copy",
+        "parse_status": "completed",
+        "source_locator": {
+          "source_id": "src_google_demo",
+          "document_id": "doc_google_demo",
+          "provider": "google_forms",
+          "provider_form_id": "DEMO_INVALID_FORM_ID",
+          "provider_revision": "demo-opaque-revision"
+        },
+        "warnings": [],
+        "issues": []
+      },
+      {
+        "document_id": "doc_youtube_demo",
+        "source_id": "src_youtube_demo",
+        "document_type": "video",
+        "title": "演示视频",
+        "filename": null,
+        "mime_type": "video/youtube",
+        "size_bytes": null,
+        "content_hash": null,
+        "provider_modified_at": null,
+        "retrieved_at": "2026-08-12T04:00:00Z",
+        "snapshot_policy": "metadata_only",
+        "parse_status": "completed",
+        "source_locator": {
+          "source_id": "src_youtube_demo",
+          "document_id": "doc_youtube_demo",
+          "provider": "youtube",
+          "video_id": "DEMO_INVALID_VIDEO"
+        },
+        "warnings": [],
+        "issues": []
+      },
+      {
+        "document_id": "doc_drive_demo",
+        "source_id": "src_drive_demo",
+        "document_type": "external_resource",
+        "title": "演示外部参考材料",
+        "filename": null,
+        "mime_type": "application/octet-stream",
+        "size_bytes": null,
+        "content_hash": null,
+        "provider_modified_at": null,
+        "retrieved_at": "2026-08-12T04:00:00Z",
+        "snapshot_policy": "reference_only",
+        "parse_status": "partial",
+        "source_locator": {
+          "source_id": "src_drive_demo",
+          "document_id": "doc_drive_demo",
+          "provider": "google_drive",
+          "drive_file_id": "DEMO_INVALID_DRIVE_FILE_ID"
+        },
+        "warnings": [],
+        "issues": [
+          {
+            "code": "permission_required",
+            "message": "演示文件需要授权，未获取文件内容。",
+            "retryable": true,
+            "suggested_action": "获取权限后重试",
+            "safe_log_ref": "fixture-drive-permission",
+            "source_locator": {
+              "provider": "google_drive",
+              "drive_file_id": "DEMO_INVALID_DRIVE_FILE_ID"
+            }
+          }
+        ]
+      }
+    ],
+    "assets": [
+      {
+        "asset_id": "asset_standalone_image",
+        "document_id": "doc_google_demo",
+        "media_type": "image",
+        "mime_type": "image/png",
+        "filename": "standalone.png",
+        "display_name": "独立概念图",
+        "size_bytes": 1100,
+        "content_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "provider": "google_forms",
+        "provider_resource_id": "item-image-standalone",
+        "provider_version": "demo-opaque-revision",
+        "access_status": "accessible",
+        "processing_status": "completed",
+        "sensitivity_status": "internal",
+        "export_policy": "manual_confirmation",
+        "source_locator": {
+          "provider": "google_forms",
+          "provider_form_id": "DEMO_INVALID_FORM_ID",
+          "provider_item_id": "item-image-standalone",
+          "question_position": 2
+        },
+        "warnings": [],
+        "issues": []
+      },
+      {
+        "asset_id": "asset_youtube_video",
+        "document_id": "doc_youtube_demo",
+        "media_type": "video",
+        "mime_type": "video/youtube",
+        "filename": null,
+        "display_name": "演示视频",
+        "size_bytes": null,
+        "content_hash": null,
+        "provider": "youtube",
+        "provider_resource_id": "DEMO_INVALID_VIDEO",
+        "provider_version": null,
+        "access_status": "accessible",
+        "processing_status": "completed",
+        "sensitivity_status": "public",
+        "export_policy": "allowed",
+        "source_locator": {
+          "provider": "youtube",
+          "video_id": "DEMO_INVALID_VIDEO",
+          "time_start_seconds": 0,
+          "time_end_seconds": 30,
+          "provider_form_id": "DEMO_INVALID_FORM_ID",
+          "provider_item_id": "item-video"
+        },
+        "warnings": [],
+        "issues": []
+      },
+      {
+        "asset_id": "asset_question_image",
+        "document_id": "doc_google_demo",
+        "media_type": "image",
+        "mime_type": "image/png",
+        "filename": "question.png",
+        "display_name": "题干说明图",
+        "size_bytes": 1200,
+        "content_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "provider": "google_forms",
+        "provider_resource_id": "item-choice-question-image",
+        "provider_version": "demo-opaque-revision",
+        "access_status": "accessible",
+        "processing_status": "completed",
+        "sensitivity_status": "internal",
+        "export_policy": "manual_confirmation",
+        "source_locator": {
+          "provider": "google_forms",
+          "provider_form_id": "DEMO_INVALID_FORM_ID",
+          "provider_question_id": "gf-q-choice",
+          "provider_item_id": "item-choice",
+          "question_position": 4
+        },
+        "warnings": [],
+        "issues": []
+      },
+      {
+        "asset_id": "asset_option_a",
+        "document_id": "doc_google_demo",
+        "media_type": "image",
+        "mime_type": "image/png",
+        "filename": "option-a.png",
+        "display_name": "方案 A",
+        "size_bytes": 2400,
+        "content_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "provider": "google_forms",
+        "provider_resource_id": "item-choice-option-a",
+        "provider_version": "demo-opaque-revision",
+        "access_status": "accessible",
+        "processing_status": "completed",
+        "sensitivity_status": "internal",
+        "export_policy": "manual_confirmation",
+        "source_locator": {
+          "provider": "google_forms",
+          "provider_form_id": "DEMO_INVALID_FORM_ID",
+          "provider_question_id": "gf-q-choice",
+          "provider_option_id": "A",
+          "provider_item_id": "item-choice",
+          "question_position": 4
+        },
+        "warnings": [],
+        "issues": []
+      },
+      {
+        "asset_id": "asset_grid_group_image",
+        "document_id": "doc_google_demo",
+        "media_type": "image",
+        "mime_type": "image/png",
+        "filename": "grid.png",
+        "display_name": "矩阵共用说明图",
+        "size_bytes": 1800,
+        "content_hash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "provider": "google_forms",
+        "provider_resource_id": "item-grid-group-image",
+        "provider_version": "demo-opaque-revision",
+        "access_status": "accessible",
+        "processing_status": "completed",
+        "sensitivity_status": "internal",
+        "export_policy": "manual_confirmation",
+        "source_locator": {
+          "provider": "google_forms",
+          "provider_form_id": "DEMO_INVALID_FORM_ID",
+          "provider_item_id": "item-grid",
+          "question_position": 5
+        },
+        "warnings": [],
+        "issues": []
+      },
+      {
+        "asset_id": "asset_drive_link",
+        "document_id": "doc_drive_demo",
+        "media_type": "external_link",
+        "mime_type": "application/octet-stream",
+        "filename": null,
+        "display_name": "演示外部参考材料",
+        "size_bytes": null,
+        "content_hash": null,
+        "provider": "google_drive",
+        "provider_resource_id": "DEMO_INVALID_DRIVE_FILE_ID",
+        "provider_version": null,
+        "access_status": "permission_required",
+        "processing_status": "needs_review",
+        "sensitivity_status": "unknown",
+        "export_policy": "never",
+        "source_locator": {
+          "provider": "google_drive",
+          "source_id": "src_drive_demo",
+          "document_id": "doc_drive_demo",
+          "drive_file_id": "DEMO_INVALID_DRIVE_FILE_ID"
+        },
+        "warnings": [
+          {
+            "code": "permission_required",
+            "message": "演示 Drive 文件无权限；不包含任何真实文件。",
+            "field_path": "assets[5]",
+            "blocking": false,
+            "source_locator": {
+              "provider": "google_drive",
+              "drive_file_id": "DEMO_INVALID_DRIVE_FILE_ID"
+            }
+          }
+        ],
+        "issues": []
+      }
+    ],
+    "references": [
+      {
+        "reference_id": "aref_standalone_image",
+        "asset_id": "asset_standalone_image",
+        "context_type": "survey_question",
+        "context_id": "q_static_image",
+        "role": "question_stimulus",
+        "option_key": null,
+        "row_key": null,
+        "source_locator": {
+          "provider": "google_forms",
+          "provider_form_id": "DEMO_INVALID_FORM_ID",
+          "provider_item_id": "item-image-standalone",
+          "question_position": 2
+        },
+        "binding_status": "confirmed",
+        "binding_confidence": 1.0,
+        "warnings": []
+      },
+      {
+        "reference_id": "aref_youtube_video",
+        "asset_id": "asset_youtube_video",
+        "context_type": "survey_question",
+        "context_id": "q_static_video",
+        "role": "question_stimulus",
+        "option_key": null,
+        "row_key": null,
+        "source_locator": {
+          "provider": "google_forms",
+          "provider_form_id": "DEMO_INVALID_FORM_ID",
+          "provider_item_id": "item-video"
+        },
+        "binding_status": "confirmed",
+        "binding_confidence": 1.0,
+        "warnings": []
+      },
+      {
+        "reference_id": "aref_question_image",
+        "asset_id": "asset_question_image",
+        "context_type": "survey_question",
+        "context_id": "q_concept_choice",
+        "role": "question_instruction",
+        "option_key": null,
+        "row_key": null,
+        "source_locator": {
+          "provider": "google_forms",
+          "provider_form_id": "DEMO_INVALID_FORM_ID",
+          "provider_question_id": "gf-q-choice",
+          "provider_item_id": "item-choice",
+          "question_position": 4
+        },
+        "binding_status": "confirmed",
+        "binding_confidence": 1.0,
+        "warnings": []
+      },
+      {
+        "reference_id": "aref_option_a",
+        "asset_id": "asset_option_a",
+        "context_type": "survey_option",
+        "context_id": "q_concept_choice",
+        "role": "option_stimulus",
+        "option_key": "A",
+        "row_key": null,
+        "source_locator": {
+          "provider": "google_forms",
+          "provider_form_id": "DEMO_INVALID_FORM_ID",
+          "provider_question_id": "gf-q-choice",
+          "provider_option_id": "A",
+          "provider_item_id": "item-choice",
+          "question_position": 4
+        },
+        "binding_status": "confirmed",
+        "binding_confidence": 1.0,
+        "warnings": []
+      },
+      {
+        "reference_id": "aref_grid_group_image",
+        "asset_id": "asset_grid_group_image",
+        "context_type": "survey_question",
+        "context_id": "q_grid",
+        "role": "question_instruction",
+        "option_key": null,
+        "row_key": null,
+        "source_locator": {
+          "provider": "google_forms",
+          "provider_form_id": "DEMO_INVALID_FORM_ID",
+          "provider_item_id": "item-grid",
+          "question_position": 5
+        },
+        "binding_status": "confirmed",
+        "binding_confidence": 1.0,
+        "warnings": []
+      },
+      {
+        "reference_id": "aref_grid_row_usability",
+        "asset_id": "asset_grid_group_image",
+        "context_type": "survey_row",
+        "context_id": "q_grid",
+        "role": "question_instruction",
+        "option_key": null,
+        "row_key": "row-usability",
+        "source_locator": {
+          "provider": "google_forms",
+          "provider_form_id": "DEMO_INVALID_FORM_ID",
+          "provider_question_id": "gf-q-grid-usability",
+          "provider_item_id": "item-grid",
+          "question_position": 5
+        },
+        "binding_status": "needs_review",
+        "binding_confidence": 0.5,
+        "warnings": [
+          {
+            "code": "group_image_not_row_specific",
+            "message": "Provider 仅表达矩阵组图；行级解释必须人工确认。",
+            "field_path": "canonical_questions[5].rows[0]",
+            "blocking": false,
+            "source_locator": {
+              "provider": "google_forms",
+              "provider_form_id": "DEMO_INVALID_FORM_ID",
+              "provider_question_id": "gf-q-grid-usability",
+              "provider_item_id": "item-grid"
+            }
+          }
+        ]
+      },
+      {
+        "reference_id": "aref_drive_text",
+        "asset_id": "asset_drive_link",
+        "context_type": "survey_question",
+        "context_id": "q_static_drive",
+        "role": "researcher_material",
+        "option_key": null,
+        "row_key": null,
+        "source_locator": {
+          "provider": "google_forms",
+          "drive_file_id": "DEMO_INVALID_DRIVE_FILE_ID",
+          "provider_form_id": "DEMO_INVALID_FORM_ID",
+          "provider_item_id": "item-text-drive"
+        },
+        "binding_status": "needs_review",
+        "binding_confidence": 0.5,
+        "warnings": []
+      }
+    ],
+    "derivatives": [
+      {
+        "derivative_id": "der_question_understanding",
+        "asset_id": "asset_question_image",
+        "derivative_type": "image_understanding",
+        "status": "completed",
+        "model": "fixture-model",
+        "model_version": "demo-v1",
+        "created_at": "2026-08-12T04:01:00Z",
+        "payload": {
+          "objective_description": "纯合成的占位描述",
+          "contextual_description": "仅用于契约测试"
+        },
+        "review_status": "revised",
+        "created_by_ref": "fixture-model-run",
+        "revised_from_derivative_id": null
+      },
+      {
+        "derivative_id": "der_question_human_revision",
+        "asset_id": "asset_question_image",
+        "derivative_type": "human_revision",
+        "status": "completed",
+        "model": null,
+        "model_version": null,
+        "created_at": "2026-08-12T04:02:00Z",
+        "payload": {
+          "objective_description": "人工修订后的纯合成描述"
+        },
+        "review_status": "approved",
+        "created_by_ref": "fixture-reviewer",
+        "revised_from_derivative_id": "der_question_understanding"
+      }
+    ]
+  }
+}

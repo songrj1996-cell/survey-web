@@ -31,6 +31,62 @@ function surveyUploadIsLocked() {
   return !!state.sessionId && state.currentStep > 1;
 }
 
+function acceptGoogleFormsFamilySession(data) {
+  const familyId = typeof data?.questionnaire_family_id === 'string'
+    ? data.questionnaire_family_id.trim()
+    : '';
+  if (!familyId || !Array.isArray(data?.languages) || !data?.session_id) {
+    throw new Error('Google Forms 统一会话返回结果无效');
+  }
+  if (surveyUploadIsLocked()) {
+    throw new Error('当前分析已经开始，不能替换回答来源');
+  }
+
+  state.sessionId = data.session_id;
+  state.surveySource = 'google';
+  state.questionnaireUsed = data.questionnaire_used === true;
+  state.viewMode = 'session';
+  state.historyId = null;
+  state.reportVersionLoading = false;
+  clearPlanInput();
+  currentContextFileSignature = '';
+  clearContextDraft();
+  clearContextForm();
+  state.sessionReport = {
+    reportMd: null,
+    title: '',
+    reportNo: '',
+    qaHtml: '',
+    qaMessages: [],
+    feishuLinkHtml: '',
+    running: false,
+    stream: '',
+    generatingVersion: null,
+  };
+  renderUploadedFileState(data.filename, 'google', '', familyId);
+  renderPreview(data);
+  goStep(2);
+  const fileUploadCount = Math.max(0, Number(data.file_upload_answer_count) || 0);
+  const languages = data.languages
+    .map(value => String(value || '').trim())
+    .filter(Boolean);
+  showToast(
+    fileUploadCount > 0
+      ? `已创建统一分析会话；${fileUploadCount} 个文件上传回答仅保留 Drive 元数据，文件内容未进入分析`
+      : `已合并 ${languages.join(' / ')} 回答并创建统一分析会话`,
+    fileUploadCount > 0 ? 'info' : 'success',
+    fileUploadCount > 0 ? 8000 : 4000,
+  );
+  loadColumns();
+}
+
+Object.defineProperty(window, 'surveySessionIngress', {
+  value: Object.freeze({ acceptGoogleFormsFamilySession }),
+  configurable: true,
+  enumerable: false,
+  writable: false,
+});
+
 uploadZone.addEventListener('click', () => {
   if (!surveyUploadIsLocked()) fileInput.click();
 });
@@ -164,7 +220,12 @@ async function handleUpload(file, { sourceType = 'google', questionnaireFile = n
   }
 }
 
-function renderUploadedFileState(filename, sourceType = 'google', questionnaireFilename = '') {
+function renderUploadedFileState(
+  filename,
+  sourceType = 'google',
+  questionnaireFilename = '',
+  familyId = '',
+) {
   state.uploadedFilename = String(filename || '').trim();
   document.querySelectorAll('[data-survey-source]').forEach(card => {
     card.disabled = true;
@@ -185,6 +246,19 @@ function renderUploadedFileState(filename, sourceType = 'google', questionnaireF
   uploadZone.classList.remove('drag-over');
   uploadZone.classList.add('upload-zone--readonly');
   uploadZone.setAttribute('aria-disabled', 'true');
+  if (familyId) {
+    uploadZone.innerHTML = `
+      <div class="upload-zone__icon upload-zone__icon--complete">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+          <path d="M7 7h10v10H7z"/><polyline points="9 12 11 14 15 10"/>
+        </svg>
+      </div>
+      <div class="upload-zone__text">
+        <span class="upload-zone__primary">已连接多语言 Google Forms 回答</span>
+        <span class="upload-zone__secondary">已直接创建统一分析会话，无需上传或合并回答文件</span>
+      </div>`;
+    return;
+  }
   uploadZone.innerHTML = `
     <div class="upload-zone__icon upload-zone__icon--complete">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
@@ -233,8 +307,12 @@ function resetUploadZone() {
 }
 
 function renderPreview(data) {
+  const fileUploadCount = Math.max(0, Number(data.file_upload_answer_count) || 0);
+  const fileUploadNotice = fileUploadCount > 0
+    ? ` · 注意：${fileUploadCount} 个文件上传回答仅保留 Drive 元数据，文件内容未读取且不会进入本次分析`
+    : '';
   $('preview-meta').textContent =
-    `${data.filename} · 已读取 ${data.total_rows} 行数据 · ${data.headers.length} 列`;
+    `${data.filename} · 已读取 ${data.total_rows} 行数据 · ${data.headers.length} 列${fileUploadNotice}`;
 }
 
 // ============================================================

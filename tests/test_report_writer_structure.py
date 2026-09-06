@@ -214,7 +214,7 @@ class ReportWriterStructureTests(unittest.TestCase):
         self.assertIn("优先沿用玩家中文翻译中的具体词语", query)
         self.assertIn("功能性增益", query)
         self.assertIn("具体希望增加、取消或改变什么", query)
-        self.assertIn("解释和例子只能来自 <open_text> 或已生成章节", query)
+        self.assertIn("解释和例子只能来自 <generated_parts>", query)
         self.assertIn("未参与调研立项、未看过问卷提纲的读者也能独立理解", query)
         self.assertIn("分别回车成短段，不使用 1、2、3 编号", query)
         self.assertIn("不得写成一个超长段落", query)
@@ -420,6 +420,14 @@ class ReportWriterStructureTests(unittest.TestCase):
         self.assertIn("Markdown 编号列表", repair)
         self.assertIn("禁止使用表格", repair)
         self.assertNotIn("整理为一张表格", repair)
+
+        selected_without_focus = _build_writer_action_query(
+            [{"i": 1, "name": "聊天体验", "col_desc": "体验反馈(open_text)"}],
+            has_bug=False,
+            selected_core="<!--CORE_START-->\n## 核心结论\n已确认判断。\n<!--CORE_END-->",
+        )
+        self.assertIn("<selected_core>", selected_without_focus)
+        self.assertIn("已确认判断", selected_without_focus)
 
     def test_action_normalizer_accepts_nested_list_and_converts_table(self):
         valid = (

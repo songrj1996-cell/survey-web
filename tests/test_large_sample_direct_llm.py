@@ -375,11 +375,17 @@ class LargeSampleDirectLLMTests(unittest.IsolatedAsyncioTestCase):
             "raw_len": 80,
             "error": "",
         }
+        miss_again = {
+            "data": {"classifications": []},
+            "model": "claude-sonnet-5",
+            "raw_len": 20,
+            "error": "",
+        }
 
         with patch.object(
             report_engine,
             "_direct_json_call",
-            new=AsyncMock(side_effect=[first, miss]),
+            new=AsyncMock(side_effect=[first, miss, miss_again]),
         ) as call:
             result = await report_engine._classify_batch_direct(
                 "界面反馈",
@@ -387,9 +393,11 @@ class LargeSampleDirectLLMTests(unittest.IsolatedAsyncioTestCase):
                 batch,
             )
 
-        self.assertEqual(call.await_count, 2)
+        self.assertEqual(call.await_count, 3)
         self.assertEqual(result["repaired_count"], 1)
         self.assertEqual(result["fallback_count"], 1)
+        self.assertEqual(result["repair_attempt_count"], 2)
+        self.assertEqual(result["fallback_response_ids"], ["2"])
         self.assertEqual(
             result["classifications"][2]["assignments"],
             [{"theme_id": "other", "sentiment": "neutral"}],
@@ -398,6 +406,58 @@ class LargeSampleDirectLLMTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("[1] Small buttons", miss_query)
         self.assertIn("[2] 😂", miss_query)
         self.assertNotIn("[0] Clean UI", miss_query)
+        singleton_query = call.await_args_list[2].args[1]
+        self.assertIn("[2] 😂", singleton_query)
+        self.assertNotIn("[1] Small buttons", singleton_query)
+
+    async def test_classification_splits_large_missing_set_into_small_repair_batches(self):
+        final_themes = [
+            {"id": "t01", "name": "界面设计", "description": "界面体验"}
+        ]
+        batch = [{"text": f"回答-{index}"} for index in range(12)]
+
+        def classifications(response_ids):
+            return {
+                "data": {
+                    "classifications": [
+                        {
+                            "response_id": response_id,
+                            "assignments": [{
+                                "theme_id": "t01",
+                                "sentiment": "neutral",
+                            }],
+                        }
+                        for response_id in response_ids
+                    ]
+                },
+                "model": "model-a",
+                "raw_len": 100,
+                "error": "",
+            }
+
+        direct = AsyncMock(side_effect=[
+            classifications(["0"]),
+            classifications([str(index) for index in range(1, 9)]),
+            classifications(["9", "10", "11"]),
+        ])
+        with patch.object(report_engine, "_direct_json_call", new=direct):
+            result = await report_engine._classify_batch_direct(
+                "界面反馈",
+                final_themes,
+                batch,
+            )
+
+        self.assertEqual(direct.await_count, 3)
+        self.assertEqual(result["repaired_count"], 11)
+        self.assertEqual(result["fallback_count"], 0)
+        self.assertEqual(result["repair_attempt_count"], 2)
+        first_repair_query = direct.await_args_list[1].args[1]
+        second_repair_query = direct.await_args_list[2].args[1]
+        self.assertIn("[1] 回答-1", first_repair_query)
+        self.assertIn("[8] 回答-8", first_repair_query)
+        self.assertNotIn("[9] 回答-9", first_repair_query)
+        self.assertIn("[9] 回答-9", second_repair_query)
+        self.assertIn("[11] 回答-11", second_repair_query)
 
     async def test_pipeline_uses_unique_respondent_coverage_percentage(self):
         entries = [
