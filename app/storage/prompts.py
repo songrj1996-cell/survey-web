@@ -28,6 +28,7 @@ from app.core.config import (
     DEFAULT_INTERVIEW_V2_DOSSIER_SYSTEM_PROMPT,
     DEFAULT_INTERVIEW_V2_REPORT_AUDIT_SYSTEM_PROMPT,
     DEFAULT_INTERVIEW_V2_REPORT_CLAIM_EXTRACT_SYSTEM_PROMPT,
+    DEFAULT_INTERVIEW_V2_REPORT_SECTION_RERUN_SYSTEM_PROMPT,
     DEFAULT_INTERVIEW_V2_REPORT_SYSTEM_PROMPT,
     DEFAULT_LARGE_SAMPLE_WRITER_REQUIREMENTS,
     DEFAULT_PLANNER_EXTRA,
@@ -393,6 +394,16 @@ DEFAULT_PROMPTS: dict = {
         current=DEFAULT_INTERVIEW_V2_REPORT_SYSTEM_PROMPT,
         version=2,
     ),
+    "interview_v2_report_section_rerun_system": _prompt(
+        "interview_v2_report_section_rerun_system",
+        "访谈 V2 报告单章节重写 System Prompt",
+        "只重写指定的未锁定章节，并生成逐句可审计的主张和证据绑定。",
+        group="访谈报告",
+        group_order=60,
+        order=85,
+        kind="system",
+        current=DEFAULT_INTERVIEW_V2_REPORT_SECTION_RERUN_SYSTEM_PROMPT,
+    ),
     "interview_v2_report_audit_system": _prompt(
         "interview_v2_report_audit_system",
         "访谈 V2 研究报告审校 System Prompt",
@@ -645,6 +656,10 @@ def _get_interview_v2_analysis_system_prompt() -> str:
 
 def _get_interview_v2_report_system_prompt() -> str:
     return _get_prompt_text("interview_v2_report_system")
+
+
+def _get_interview_v2_report_section_rerun_system_prompt() -> str:
+    return _get_prompt_text("interview_v2_report_section_rerun_system")
 
 
 def _get_interview_v2_report_audit_system_prompt() -> str:

@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 _REPORT_VERSION_PATTERN = r"^report_[0-9a-f]{32}$"
+_SECTION_PATTERN = r"^section_[0-9a-f]{32}$"
 _REAUDIT_JOB_PATTERN = r"^job_[0-9a-f]{32}$"
 
 
@@ -21,6 +22,22 @@ class InterviewV2ReportCreateRequest(_StrictRequest):
         pattern=_REPORT_VERSION_PATTERN,
     )
     freeze_current: Literal[True] = True
+
+
+class InterviewV2ReportRerunRequest(_StrictRequest):
+    from_stage: Literal["report_section"]
+    base_report_version_id: str = Field(pattern=_REPORT_VERSION_PATTERN)
+    section_id: str = Field(pattern=_SECTION_PATTERN)
+    base_section_revision: int = Field(strict=True, ge=1)
+    instruction: str = Field(default="", max_length=2000)
+    preserve_manual_report_edits: Literal[True] = True
+    reuse_unchanged_artifacts: Literal[True] = True
+    force: Literal[False] = False
+
+    @field_validator("instruction")
+    @classmethod
+    def _normalize_instruction(cls, value: str) -> str:
+        return value.strip()
 
 
 class InterviewV2ReportSectionPatchRequest(_StrictRequest):
@@ -71,6 +88,10 @@ class InterviewV2ReportResponse(BaseModel):
     is_current_version: bool = False
     approved_by: str | None = None
     approved_at: str | None = None
+
+
+class InterviewV2ReportRerunResponse(InterviewV2ReportResponse):
+    rerun: dict[str, Any]
 
 
 class InterviewV2ReportSectionMutationResponse(BaseModel):

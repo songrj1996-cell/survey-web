@@ -212,6 +212,138 @@ def build_report_input(
     return frozen
 
 
+def build_report_section_rerun_input(
+    *,
+    report_revision: dict[str, Any],
+    section_id: str,
+    instruction: str,
+    prompt_snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    """Freeze one unlocked report section and its immutable analysis context."""
+
+    if not isinstance(report_revision, dict):
+        raise InterviewV2ReportValidationError("report rerun source is invalid")
+    report_version_id = _text(report_revision.get("report_version_id"))
+    revision_sha256 = _text(report_revision.get("revision_payload_sha256"))
+    if (
+        not _REPORT_RE.fullmatch(report_version_id)
+        or not re.fullmatch(r"[0-9a-f]{64}", revision_sha256)
+        or not _SECTION_RE.fullmatch(_text(section_id))
+    ):
+        raise InterviewV2ReportValidationError("report rerun source identity is invalid")
+    sections = report_revision.get("sections")
+    if not isinstance(sections, list):
+        raise InterviewV2ReportValidationError("report rerun sections are invalid")
+    matches = [
+        item for item in sections
+        if isinstance(item, dict) and item.get("section_id") == section_id
+    ]
+    if len(matches) != 1:
+        raise InterviewV2ReportValidationError("report rerun section is invalid")
+    target = matches[0]
+    if bool(target.get("locked")):
+        raise InterviewV2ReportValidationError("report rerun section is locked")
+    section_revision = target.get("section_revision")
+    if (
+        isinstance(section_revision, bool)
+        or not isinstance(section_revision, int)
+        or section_revision < 1
+    ):
+        raise InterviewV2ReportValidationError("report rerun section revision is invalid")
+    normalized_instruction = _text(instruction)
+    if len(normalized_instruction) > 2000:
+        raise InterviewV2ReportValidationError("report rerun instruction is too long")
+    if not isinstance(prompt_snapshot, dict) or not prompt_snapshot:
+        raise InterviewV2ReportValidationError("report rerun prompt snapshot is invalid")
+
+    report_input = {
+        "report_schema_version": report_revision.get("report_schema_version")
+        or REPORT_SCHEMA_VERSION,
+        "claim_policy_version": REPORT_CLAIM_POLICY_VERSION,
+        "project_id": report_revision.get("project_id"),
+        "analysis_run_id": (report_revision.get("source") or {}).get(
+            "analysis_run_id"
+        ),
+        "analysis_revision_payload_sha256": (
+            report_revision.get("source") or {}
+        ).get("analysis_revision_payload_sha256"),
+        "analysis_source": (report_revision.get("source") or {}).get(
+            "analysis_source"
+        ) or {},
+        "research_focus": (report_revision.get("frozen_config") or {}).get(
+            "research_focus", ""
+        ),
+        "section_specs": [
+            {"section_key": key, "title": title, "order": index + 1}
+            for index, (key, title) in enumerate(REPORT_SECTION_SPECS)
+        ],
+        "findings": report_revision.get("frozen_findings") or [],
+        "stat_facts": report_revision.get("frozen_stat_facts") or [],
+        "analysis_limitations": report_revision.get("analysis_limitations") or [],
+        "input_fingerprint": report_revision.get("input_fingerprint"),
+    }
+    _report_indexes(report_input)
+    frozen = {
+        "operation_schema_version": "interview-report-section-rerun/1.0",
+        "base_report": {
+            "report_version_id": report_version_id,
+            "revision_payload_sha256": revision_sha256,
+            "input_fingerprint": report_revision.get("input_fingerprint"),
+        },
+        "target_section": {
+            "section_id": section_id,
+            "section_key": target.get("section_key"),
+            "title": target.get("title"),
+            "order": target.get("order"),
+            "section_revision": section_revision,
+            "content": target.get("content"),
+        },
+        "instruction": normalized_instruction,
+        "preserve_manual_report_edits": True,
+        "reuse_unchanged_artifacts": True,
+        "force": False,
+        "prompts": prompt_snapshot,
+        "report_input": report_input,
+    }
+    frozen["input_fingerprint"] = payload_sha256(frozen)
+    return frozen
+
+
+def validate_report_section_rerun_output(
+    raw: dict[str, Any],
+    *,
+    rerun_input: dict[str, Any],
+    report_version_id: str,
+) -> dict[str, Any]:
+    """Validate a model-authored replacement for exactly one frozen section."""
+
+    if not isinstance(raw, dict) or set(raw) != {"section_key", "content", "claims"}:
+        raise InterviewV2ReportValidationError("report rerun output shape is invalid")
+    target = rerun_input.get("target_section")
+    report_input = rerun_input.get("report_input")
+    if not isinstance(target, dict) or not isinstance(report_input, dict):
+        raise InterviewV2ReportValidationError("report rerun input is invalid")
+    section_key = _text(target.get("section_key"))
+    if _text(raw.get("section_key")) != section_key:
+        raise InterviewV2ReportValidationError("report rerun output changed section identity")
+    content = raw.get("content")
+    if not isinstance(content, str) or content != content.strip():
+        raise InterviewV2ReportValidationError("report rerun content is invalid")
+    base_revision = target.get("section_revision")
+    if isinstance(base_revision, bool) or not isinstance(base_revision, int):
+        raise InterviewV2ReportValidationError("report rerun revision is invalid")
+    return validate_report_section_output(
+        {"section_key": section_key, "claims": raw.get("claims")},
+        content=content,
+        report_input=report_input,
+        report_version_id=report_version_id,
+        section_id=_text(target.get("section_id")),
+        section_key=section_key,
+        section_revision=base_revision + 1,
+        locked=False,
+    )
+
+
 def _issue(
     *, code: str, severity: str, message: str, section_key: str, claim_id: str | None
 ) -> dict[str, Any]:
@@ -1233,7 +1365,8 @@ def validate_model_audit(
 
 __all__ = [
     "REPORT_CLAIM_POLICY_VERSION", "REPORT_SCHEMA_VERSION", "REPORT_SECTION_SPECS",
-    "InterviewV2ReportValidationError", "build_report_input", "payload_sha256",
+    "InterviewV2ReportValidationError", "build_report_input",
+    "build_report_section_rerun_input", "payload_sha256",
     "validate_model_audit", "validate_report_approval", "validate_report_output",
-    "validate_report_section_output",
+    "validate_report_section_output", "validate_report_section_rerun_output",
 ]

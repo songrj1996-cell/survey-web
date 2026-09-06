@@ -36,7 +36,7 @@ _STORE_LOCK = threading.RLock()
 _MAPPING_LOCK_TIMEOUT_SECONDS = 10.0
 _MAPPING_LOCK_POLL_SECONDS = 0.025
 _ID_RE = re.compile(
-    r"^(?:upload|job|project|import|workbook|mapping|structure|evidence|boundary|coverage|dossier|analysis|report|section|export)_[0-9a-f]{32}$"
+    r"^(?:upload|job|project|import|workbook|mapping|structure|evidence|boundary|coverage|dossier|analysis|report|section|rerun|export)_[0-9a-f]{32}$"
 )
 _EVIDENCE_ID_RE = re.compile(r"^(?:ev|evidence)_[0-9a-f]{32}$")
 _REVIEW_ISSUE_ID_RE = re.compile(r"^(?:issue|review)_[0-9a-f]{32}$")
@@ -123,6 +123,13 @@ class ReportLockedSectionConflictError(ValueError):
     def __init__(self, *, section_ids: list[str]) -> None:
         super().__init__("locked report sections would be overwritten")
         self.section_ids = list(section_ids)
+
+
+class ReportRerunIdempotencyConflictError(ValueError):
+    """One owner-scoped idempotency key was reused for different rerun input."""
+
+    def __init__(self) -> None:
+        super().__init__("report rerun idempotency conflict")
 
 
 class ExportInputConflictError(ValueError):
@@ -4860,6 +4867,289 @@ def _report_locator_path(report_version_id: str) -> Path:
 def _report_section_locator_path(section_id: str) -> Path:
     section_id = validate_resource_id(section_id, "section")
     return _safe_child("report_section_locators", f"{section_id}.json")
+
+
+def _report_rerun_operation_path(
+    owner_key: str, project_id: str, idempotency_key: str
+) -> Path:
+    project_id = validate_resource_id(project_id, "project")
+    combined = json.dumps(
+        [str(owner_key), str(idempotency_key)],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    operation_digest = hashlib.sha256(
+        combined.encode("utf-8")
+    ).hexdigest()[:32]
+    return _report_dir(project_id) / "reruns" / f"{operation_digest}.json"
+
+
+def _report_rerun_operation_digest(record: dict[str, Any]) -> str:
+    return _canonical_payload_sha256({
+        key: value
+        for key, value in record.items()
+        if key not in {"operation_payload_sha256", "_claim_acquired"}
+    })
+
+
+def _validate_report_rerun_operation_locked(
+    record: dict[str, Any],
+    *,
+    owner_key: str,
+    project_id: str,
+    idempotency_key: str,
+) -> dict[str, Any]:
+    expected_owner_digest = hashlib.sha256(
+        str(owner_key).encode("utf-8")
+    ).hexdigest()
+    expected_key_digest = hashlib.sha256(
+        str(idempotency_key).encode("utf-8")
+    ).hexdigest()
+    if (
+        record.get("operation_schema_version")
+        != "interview-report-section-rerun-operation/1.0"
+        or record.get("owner_key_sha256") != expected_owner_digest
+        or record.get("idempotency_key_sha256") != expected_key_digest
+        or validate_resource_id(str(record.get("project_id") or ""), "project")
+        != project_id
+        or validate_resource_id(str(record.get("rerun_id") or ""), "rerun")
+        != record.get("rerun_id")
+        or validate_resource_id(
+            str(record.get("base_report_version_id") or ""), "report"
+        )
+        != record.get("base_report_version_id")
+        or validate_resource_id(
+            str(record.get("report_version_id") or ""), "report"
+        )
+        != record.get("report_version_id")
+        or validate_resource_id(str(record.get("section_id") or ""), "section")
+        != record.get("section_id")
+        or not _SHA256_RE.fullmatch(str(record.get("request_fingerprint") or ""))
+        or not str(record.get("created_at") or "").strip()
+        or record.get("status") not in {"pending", "completed"}
+        or not _SHA256_RE.fullmatch(
+            str(record.get("operation_payload_sha256") or "")
+        )
+        or record.get("operation_payload_sha256")
+        != _report_rerun_operation_digest(record)
+    ):
+        raise ValueError("report rerun operation integrity check failed")
+    base_section_revision = record.get("base_section_revision")
+    if (
+        isinstance(base_section_revision, bool)
+        or not isinstance(base_section_revision, int)
+        or base_section_revision <= 0
+    ):
+        raise ValueError("report rerun operation revision is invalid")
+    if record.get("status") == "completed" and (
+        not str(record.get("completed_at") or "").strip()
+        or not _SHA256_RE.fullmatch(
+            str(record.get("revision_payload_sha256") or "")
+        )
+    ):
+        raise ValueError("completed report rerun operation is invalid")
+    return record
+
+
+def _committed_report_rerun_revision_locked(
+    project_id: str, report_version_id: str
+) -> dict[str, Any] | None:
+    state = _read_json(_report_dir(project_id) / "state.json") or {}
+    try:
+        revision = _load_report_revision_locked(project_id, report_version_id)
+    except ValueError as exc:
+        if "missing" in str(exc):
+            return None
+        raise
+    return revision if _report_version_is_committed_locked(state, revision) else None
+
+
+def _recover_report_rerun_operation_locked(
+    path: Path, record: dict[str, Any]
+) -> dict[str, Any]:
+    if record.get("status") != "pending":
+        return record
+    revision = _committed_report_rerun_revision_locked(
+        str(record.get("project_id") or ""),
+        str(record.get("report_version_id") or ""),
+    )
+    if revision is None:
+        return record
+    recovered = deepcopy(record)
+    recovered["status"] = "completed"
+    recovered["completed_at"] = (
+        recovered.get("completed_at") or revision.get("created_at")
+    )
+    recovered["revision_payload_sha256"] = revision.get(
+        "revision_payload_sha256"
+    )
+    recovered["operation_payload_sha256"] = _report_rerun_operation_digest(
+        recovered
+    )
+    _atomic_write_json(path, recovered)
+    return recovered
+
+
+def claim_report_rerun_operation(
+    *,
+    owner_key: str,
+    project_id: str,
+    idempotency_key: str,
+    request_fingerprint: str,
+    rerun_id: str,
+    report_version_id: str,
+    base_report_version_id: str,
+    section_id: str,
+    base_section_revision: int,
+    created_at: str,
+) -> dict[str, Any]:
+    """Claim one durable owner/key pair, or return its verified prior state."""
+
+    project_id = validate_resource_id(project_id, "project")
+    rerun_id = validate_resource_id(rerun_id, "rerun")
+    report_version_id = validate_resource_id(report_version_id, "report")
+    base_report_version_id = validate_resource_id(
+        base_report_version_id, "report"
+    )
+    section_id = validate_resource_id(section_id, "section")
+    if not str(owner_key) or not str(idempotency_key):
+        raise ValueError("report rerun owner or idempotency key is empty")
+    if not _SHA256_RE.fullmatch(str(request_fingerprint or "")):
+        raise ValueError("report rerun request fingerprint is invalid")
+    if (
+        isinstance(base_section_revision, bool)
+        or not isinstance(base_section_revision, int)
+        or base_section_revision <= 0
+    ):
+        raise ValueError("report rerun base section revision is invalid")
+    path = _report_rerun_operation_path(owner_key, project_id, idempotency_key)
+    with _STORE_LOCK:
+        with _mapping_process_lock(project_id):
+            existing = _read_json(path)
+            if existing is not None:
+                existing = _validate_report_rerun_operation_locked(
+                    existing,
+                    owner_key=owner_key,
+                    project_id=project_id,
+                    idempotency_key=idempotency_key,
+                )
+                if existing.get("request_fingerprint") != request_fingerprint:
+                    raise ReportRerunIdempotencyConflictError()
+                recovered = _recover_report_rerun_operation_locked(path, existing)
+                return {**recovered, "_claim_acquired": False}
+            record = {
+                "operation_schema_version": (
+                    "interview-report-section-rerun-operation/1.0"
+                ),
+                "owner_key_sha256": hashlib.sha256(
+                    str(owner_key).encode("utf-8")
+                ).hexdigest(),
+                "idempotency_key_sha256": hashlib.sha256(
+                    str(idempotency_key).encode("utf-8")
+                ).hexdigest(),
+                "request_fingerprint": request_fingerprint,
+                "rerun_id": rerun_id,
+                "project_id": project_id,
+                "base_report_version_id": base_report_version_id,
+                "report_version_id": report_version_id,
+                "section_id": section_id,
+                "base_section_revision": base_section_revision,
+                "status": "pending",
+                "created_at": str(created_at),
+            }
+            record["operation_payload_sha256"] = (
+                _report_rerun_operation_digest(record)
+            )
+            _atomic_write_json(path, record)
+            return {**record, "_claim_acquired": True}
+
+
+def complete_report_rerun_operation(
+    *,
+    owner_key: str,
+    project_id: str,
+    idempotency_key: str,
+    request_fingerprint: str,
+    report_version_id: str,
+    completed_at: str,
+) -> dict[str, Any]:
+    """Mark a claimed rerun complete only after its report is committed."""
+
+    project_id = validate_resource_id(project_id, "project")
+    report_version_id = validate_resource_id(report_version_id, "report")
+    path = _report_rerun_operation_path(owner_key, project_id, idempotency_key)
+    with _STORE_LOCK:
+        with _mapping_process_lock(project_id):
+            record = _read_json(path)
+            if record is None:
+                raise ValueError("report rerun operation is missing")
+            record = _validate_report_rerun_operation_locked(
+                record,
+                owner_key=owner_key,
+                project_id=project_id,
+                idempotency_key=idempotency_key,
+            )
+            if record.get("request_fingerprint") != request_fingerprint:
+                raise ReportRerunIdempotencyConflictError()
+            if record.get("report_version_id") != report_version_id:
+                raise ValueError("report rerun result identity mismatch")
+            revision = _committed_report_rerun_revision_locked(
+                project_id, report_version_id
+            )
+            if revision is None:
+                raise ValueError("report rerun result is not committed")
+            completed = deepcopy(record)
+            completed["status"] = "completed"
+            completed["completed_at"] = str(completed_at)
+            completed["revision_payload_sha256"] = revision.get(
+                "revision_payload_sha256"
+            )
+            completed["operation_payload_sha256"] = (
+                _report_rerun_operation_digest(completed)
+            )
+            _atomic_write_json(path, completed)
+            return completed
+
+
+def release_report_rerun_operation(
+    *,
+    owner_key: str,
+    project_id: str,
+    idempotency_key: str,
+    request_fingerprint: str,
+    report_version_id: str,
+) -> bool:
+    """Release a failed pre-commit claim; never remove a committed operation."""
+
+    project_id = validate_resource_id(project_id, "project")
+    report_version_id = validate_resource_id(report_version_id, "report")
+    path = _report_rerun_operation_path(owner_key, project_id, idempotency_key)
+    with _STORE_LOCK:
+        with _mapping_process_lock(project_id):
+            record = _read_json(path)
+            if record is None:
+                return False
+            record = _validate_report_rerun_operation_locked(
+                record,
+                owner_key=owner_key,
+                project_id=project_id,
+                idempotency_key=idempotency_key,
+            )
+            if (
+                record.get("request_fingerprint") != request_fingerprint
+                or record.get("report_version_id") != report_version_id
+            ):
+                return False
+            if (
+                record.get("status") == "completed"
+                or _committed_report_rerun_revision_locked(
+                    project_id, report_version_id
+                )
+                is not None
+            ):
+                return False
+            path.unlink(missing_ok=True)
+            return True
 
 
 def _report_digest(revision: dict[str, Any]) -> str:

@@ -55,6 +55,7 @@ EXPECTED_PROMPT_KEYS = {
     "interview_v2_dossier_system",
     "interview_v2_analysis_system",
     "interview_v2_report_system",
+    "interview_v2_report_section_rerun_system",
     "interview_v2_report_claim_extract_system",
     "interview_v2_report_audit_system",
 }
@@ -76,11 +77,11 @@ def _sha256(path: str) -> str:
 
 
 class PromptCatalogTests(unittest.TestCase):
-    def test_catalog_has_32_current_non_dify_entries_in_six_groups(self):
+    def test_catalog_has_33_current_non_dify_entries_in_six_groups(self):
         catalog = prompt_storage.DEFAULT_PROMPTS
 
         self.assertEqual(set(catalog), EXPECTED_PROMPT_KEYS)
-        self.assertEqual(len(catalog), 32)
+        self.assertEqual(len(catalog), 33)
         self.assertNotIn("upload_guide", catalog)
         self.assertEqual(
             {entry["group"] for entry in catalog.values()},
@@ -265,6 +266,29 @@ class PromptCatalogTests(unittest.TestCase):
             )
         get_prompt_text.assert_called_once_with(
             "interview_v2_report_claim_extract_system"
+        )
+
+    def test_interview_v2_section_rerun_prompt_only_rewrites_target_section(self):
+        prompt = prompt_storage.DEFAULT_PROMPTS[
+            "interview_v2_report_section_rerun_system"
+        ]["current"]
+
+        self.assertIn("只能重写 target_section", prompt)
+        self.assertIn("不得改变章节身份", prompt)
+        self.assertIn("精确 start/end", prompt)
+        self.assertIn("evidence_roles", prompt)
+        self.assertIn('只返回 JSON：{"section_key"', prompt)
+        with patch.object(
+            prompt_storage,
+            "_get_prompt_text",
+            return_value="SECTION_RERUN_PROMPT",
+        ) as get_prompt_text:
+            self.assertEqual(
+                prompt_storage._get_interview_v2_report_section_rerun_system_prompt(),
+                "SECTION_RERUN_PROMPT",
+            )
+        get_prompt_text.assert_called_once_with(
+            "interview_v2_report_section_rerun_system"
         )
 
     def test_catalog_api_filters_unknown_and_legacy_entries(self):

@@ -79,6 +79,7 @@ const ivV2State = {
   reportSectionDrafts: {},
   reportApprovalNote: '',
   reportDirty: false,
+  reportRerunKeys: {},
   reportExportArtifact: null,
 };
 
@@ -3854,13 +3855,14 @@ function ivV2SyncConfirmedControls() {
       control.disabled = operationBusy || ivV2AnalysisSummary().report_ready !== true || ivV2HasUnsavedReportWork();
       return;
     }
-    if (action === 'report-save-section' || action === 'report-reset-section' || action === 'report-reaudit-section') {
+    if (action === 'report-save-section' || action === 'report-reset-section' || action === 'report-reaudit-section' || action === 'report-rerun-section') {
       const section = ivV2ReportSections().find(item => item.section_id === control.dataset.sectionId);
       const draft = ivV2ReportSectionDraft(section);
       const editable = ivV2CurrentReportEditable();
       if (action === 'report-save-section') control.disabled = operationBusy || !editable || !draft?.dirty || Boolean(draft?.conflict);
       if (action === 'report-reset-section') control.disabled = operationBusy || !draft?.dirty;
       if (action === 'report-reaudit-section') control.disabled = operationBusy || !ivV2CurrentDraftReport() || section?.audit_status !== 'pending_reaudit' || !section?.reaudit_job_id || Boolean(draft?.dirty) || Boolean(draft?.conflict);
+      if (action === 'report-rerun-section') control.disabled = operationBusy || !editable || !section || Boolean(section.locked) || ivV2HasUnsavedReportWork() || Boolean(draft?.conflict);
       return;
     }
     if (action === 'report-edit-content' || action === 'report-edit-reason') {
@@ -4537,6 +4539,33 @@ function ivV2ReportSectionReauditPayload(section) {
   };
 }
 
+function ivV2ReportSectionRerunKey(section) {
+  const fingerprint = [
+    ivV2State.reportResponse?.report_version_id || '',
+    section?.section_id || '',
+    Number(section?.section_revision || 1),
+  ].join(':');
+  if (!ivV2State.reportRerunKeys[fingerprint]) {
+    ivV2State.reportRerunKeys[fingerprint] = window.crypto?.randomUUID
+      ? window.crypto.randomUUID()
+      : `rerun-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  }
+  return ivV2State.reportRerunKeys[fingerprint];
+}
+
+function ivV2ReportSectionRerunPayload(section) {
+  return {
+    from_stage: 'report_section',
+    base_report_version_id: String(ivV2State.reportResponse?.report_version_id || ''),
+    section_id: String(section?.section_id || ''),
+    base_section_revision: Number(section?.section_revision || 1),
+    instruction: '',
+    preserve_manual_report_edits: true,
+    reuse_unchanged_artifacts: true,
+    force: false,
+  };
+}
+
 function ivV2ReportApprovePayload() {
   return {
     base_report_version_id: ivV2State.reportResponse?.report_version_id || '',
@@ -4631,6 +4660,75 @@ async function ivV2ReauditReportSection(sectionId) {
     else showToast('章节仍待重审，请查看阻塞提醒后重试', 'info');
   } catch (error) {
     if (token === ivV2State.reportToken) ivV2State.errorMessage = String(error?.message || '章节重审失败');
+  } finally {
+    if (token === ivV2State.reportToken) {
+      ivV2State.reportBusy = false;
+      ivV2RenderConfirmed();
+    }
+  }
+}
+
+async function ivV2RerunReportSection(sectionId) {
+  const report = ivV2State.reportResponse;
+  const section = ivV2ReportSections().find(item => item.section_id === sectionId);
+  const draft = ivV2ReportSectionDraft(section);
+  if (
+    !report?.report_version_id
+    || !section
+    || ivV2State.reportBusy
+    || !ivV2CurrentReportEditable()
+    || Boolean(section.locked)
+    || ivV2HasUnsavedReportWork()
+    || Boolean(draft?.conflict)
+  ) return;
+  if (
+    report.status === 'approved'
+    && !window.confirm('重生成后会基于当前已批准版本创建新的草稿，原批准版和已有 Word 导出都会保留。确定继续吗？')
+  ) return;
+  const payload = ivV2ReportSectionRerunPayload(section);
+  const idempotencyKey = ivV2ReportSectionRerunKey(section);
+  const token = ivV2NextReportToken();
+  ivV2State.reportBusy = true;
+  ivV2ClearStatusError();
+  ivV2RenderConfirmed();
+  try {
+    const response = await fetch(`/api/v1/interview-projects/${ivV2State.projectId}/reruns`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Idempotency-Key': idempotencyKey,
+      },
+      body: JSON.stringify(payload),
+    });
+    const data = await response.json();
+    if (token !== ivV2State.reportToken) return;
+    if (!response.ok) {
+      if (response.status === 409) {
+        await ivV2LoadReportWorkspace({ force: false, focusSectionId: sectionId, token });
+        if (token === ivV2State.reportToken) {
+          ivV2SetStatusError(data, response.status, '章节或报告版本已变化，请刷新后重试');
+        }
+        return;
+      }
+      throw new Error(ivV2NormalizeApiError(data, response.status, '重生成章节失败').message);
+    }
+    ivV2ClearUnsavedReportWork();
+    await ivV2LoadCurrentReport(data.report_version_id, {
+      token,
+      focusSectionId: sectionId,
+    });
+    await ivV2LoadImportBundle(ivV2State.importId, {
+      keepStep: true,
+      token: ivV2State.requestToken,
+      resetWorkspace: false,
+    });
+    if (token !== ivV2State.reportToken) return;
+    ivV2ResetReportSectionDraft(sectionId);
+    showToast(data.rerun?.reused ? '已恢复先前完成的章节重生成结果' : '章节已重生成并创建新草稿', 'success');
+  } catch (error) {
+    if (token === ivV2State.reportToken) {
+      ivV2State.errorMessage = String(error?.message || '重生成章节失败');
+    }
   } finally {
     if (token === ivV2State.reportToken) {
       ivV2State.reportBusy = false;
@@ -4969,6 +5067,7 @@ function ivV2ReportBodyHtml() {
   const pending = section.audit_status === 'pending_reaudit';
   const saveEnabled = editable && draft?.dirty && !draft?.conflict;
   const reauditEnabled = ivV2CurrentDraftReport() && pending && !draft?.dirty && !draft?.conflict && section.reaudit_job_id;
+  const rerunEnabled = editable && !section.locked && !ivV2HasUnsavedReportWork() && !draft?.conflict;
   const claims = ivV2CurrentSectionClaims();
   return `
     <div class="iv-v2-report-section-head">
@@ -4978,6 +5077,7 @@ function ivV2ReportBodyHtml() {
       </div>
       <div class="iv-v2-toolbar__actions">
         <button class="btn btn--ghost btn--sm" type="button" data-iv-v2-action="report-reset-section" data-section-id="${ivV2Esc(section.section_id)}"${!draft?.dirty || ivV2OperationBusy() ? ' disabled' : ''}>恢复服务端正文</button>
+        <button class="btn btn--ghost btn--sm" type="button" data-iv-v2-action="report-rerun-section" data-section-id="${ivV2Esc(section.section_id)}"${!rerunEnabled || ivV2OperationBusy() ? ' disabled' : ''}>重生成本章节</button>
         <button class="btn btn--ghost btn--sm" type="button" data-iv-v2-action="report-reaudit-section" data-section-id="${ivV2Esc(section.section_id)}"${!reauditEnabled || ivV2OperationBusy() ? ' disabled' : ''}>重新重审</button>
         <button class="btn btn--primary btn--sm" type="button" data-iv-v2-action="report-save-section" data-section-id="${ivV2Esc(section.section_id)}"${!saveEnabled || ivV2OperationBusy() ? ' disabled' : ''}>${report.status === 'approved' ? '创建新草稿并锁定章节' : '保存并锁定章节'}</button>
       </div>
@@ -5531,6 +5631,11 @@ function ivV2HandleEditorClick(event) {
 
   if (action === 'report-reaudit-section') {
     ivV2ReauditReportSection(button.dataset.sectionId || '');
+    return;
+  }
+
+  if (action === 'report-rerun-section') {
+    ivV2RerunReportSection(button.dataset.sectionId || '');
     return;
   }
 

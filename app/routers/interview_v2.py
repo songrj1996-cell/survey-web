@@ -33,6 +33,8 @@ from app.schemas.interview_v2_report import (
     InterviewV2ReportApproveRequest,
     InterviewV2ReportClaimResponse,
     InterviewV2ReportCreateRequest,
+    InterviewV2ReportRerunRequest,
+    InterviewV2ReportRerunResponse,
     InterviewV2ReportResponse,
     InterviewV2ReportSectionMutationResponse,
     InterviewV2ReportSectionPatchRequest,
@@ -98,6 +100,11 @@ from app.services.interview_v2_report_review_service import (
     edit_report_section,
     reaudit_report_section,
     validate_report_section_access,
+)
+from app.services.interview_v2_report_rerun_service import (
+    create_report_section_rerun,
+    validate_report_rerun_access,
+    validate_report_rerun_idempotency_key,
 )
 from app.services.interview_v2_export_service import (
     create_export,
@@ -1159,6 +1166,96 @@ async def create_interview_v2_report(project_id: str, request: Request):
         )
     except InterviewV2ImportError as exc:
         return _service_error_response(request, exc)
+
+
+@router.post(
+    "/api/v1/interview-projects/{project_id}/reruns",
+    response_model=InterviewV2ReportRerunResponse,
+    responses={
+        400: {"model": InterviewV2ErrorResponse},
+        403: {"description": "沿用平台现有功能权限错误响应"},
+        404: {"model": InterviewV2ErrorResponse},
+        409: {"model": InterviewV2ErrorResponse},
+        422: {"model": InterviewV2ErrorResponse},
+        500: {"model": InterviewV2ErrorResponse},
+        502: {"model": InterviewV2ErrorResponse},
+        503: {"model": InterviewV2ErrorResponse},
+    },
+)
+async def rerun_interview_v2_report_section(
+    project_id: str, request: Request
+):
+    login = await _require_feature(request, "interview")
+    if not INTERVIEW_V2_ENABLED:
+        return _disabled_response(request)
+    try:
+        raw = await _read_structure_json(request)
+        payload = InterviewV2ReportRerunRequest.model_validate(raw).model_dump(
+            mode="json"
+        )
+    except (
+        OverflowError,
+        json.JSONDecodeError,
+        UnicodeDecodeError,
+        ValidationError,
+        ValueError,
+        RecursionError,
+    ):
+        return _error_response(
+            request,
+            status_code=400,
+            code="REPORT_RERUN_REQUEST_INVALID",
+            message="报告章节重生成请求格式无效。",
+            suggested_action="refresh_report_inputs",
+        )
+    idempotency_key = str(
+        request.headers.get("Idempotency-Key", "")
+    ).strip()
+    if not idempotency_key:
+        return _error_response(
+            request,
+            status_code=400,
+            code="RERUN_IDEMPOTENCY_KEY_INVALID",
+            message="请求缺少有效的 Idempotency-Key。",
+            suggested_action="retry_report",
+        )
+    try:
+        await run_in_threadpool(
+            validate_report_rerun_access, project_id, payload, login
+        )
+        idempotency_key = validate_report_rerun_idempotency_key(
+            idempotency_key
+        )
+        api_key = await require_request_llm_api_key(request)
+        result = await run_with_llm_api_key(
+            create_report_section_rerun(
+                project_id, payload, login, idempotency_key
+            ),
+            api_key,
+            request=request,
+            category="interview",
+            action="V2 报告单章节重生成",
+            reference_id=payload["section_id"],
+        )
+    except InterviewV2ImportError as exc:
+        return _service_error_response(request, exc)
+    await audit_log(
+        request,
+        "interview",
+        "重生成 V2 报告单章节",
+        (
+            f"section_id={payload['section_id']}; "
+            f"report_version_id={result.get('report_version_id')}"
+        ),
+        metadata={
+            "section_id": payload["section_id"],
+            "base_report_version_id": payload["base_report_version_id"],
+            "report_version_id": result.get("report_version_id"),
+            "rerun_id": (result.get("rerun") or {}).get("rerun_id"),
+            "reused": bool((result.get("rerun") or {}).get("reused")),
+        },
+    )
+    return result
 
 
 @router.get(
