@@ -87,6 +87,35 @@ async def _stub_report_viewpoint_stats(*_args, **_kwargs):
     }])
 
 
+async def _stub_failed_report_viewpoint_stats(*_args, **_kwargs):
+    yield ("diagnostics", {
+        "status": "failed",
+        "strategy": "single_pass_selective_grouping",
+        "stage_budget_seconds": 300,
+        "input_candidate_count": 170,
+        "final_input_candidate_count": 170,
+        "selected_candidate_count": 0,
+        "excluded_candidate_count": 170,
+        "reduction_levels": 0,
+        "partial_failure_count": 1,
+        "calls": [{
+            "stage": "selective_grouping",
+            "batch_index": 1,
+            "input_candidate_count": 36,
+            "output_theme_count": 0,
+            "status": "failed",
+            "model": "model-a",
+            "repaired": True,
+            "raw_len": 16000,
+            "error": "finish_reason=length",
+            "error_type": "other",
+            "finish_reason": "length",
+            "duration_seconds": 1.0,
+        }],
+    })
+    yield ("result", [])
+
+
 class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
     def test_core_coverage_review_pass_and_invalid_outputs_preserve_original(self):
         original = (
@@ -334,7 +363,73 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("## Part 1 聊天体验", sess["report_md"])
         self.assertIn("## 行动建议", sess["report_md"])
         save_session.assert_called_once()
+        self.assertIn(
+            "viewpoint_diagnostics",
+            save_session.call_args.args[1]["report_versions"][-1],
+        )
         save_history.assert_called_once()
+
+    async def test_failed_synthesis_diagnostics_survive_writer_failure(self):
+        sess = {
+            "filename": "responses.xlsx",
+            "rows": [["玩家ID", "聊天反馈"], ["p-1", "消息会消失"]],
+            "plan": {
+                "columns": [
+                    {"index": 1, "name": "聊天反馈", "role": "open_text"},
+                ],
+                "parts": [{"name": "聊天体验", "column_indexes": [1]}],
+                "branch_rules": [],
+            },
+            "branch_rules": [],
+            "stats_md": "有效样本(总计):总体=1",
+            "open_text": {
+                1: [{
+                    "ids": {"玩家ID": "p-1"},
+                    "profile": {},
+                    "text": "消息会消失",
+                }],
+            },
+        }
+
+        with (
+            patch.object(survey_service, "get_session", return_value=sess),
+            patch.object(
+                survey_service,
+                "_current_login",
+                new=AsyncMock(return_value=None),
+            ),
+            patch.object(
+                survey_service,
+                "_batch_qualitative_analysis",
+                new=_stub_qualitative_analysis,
+            ),
+            patch.object(
+                survey_service,
+                "build_report_viewpoint_stats",
+                new=_stub_failed_report_viewpoint_stats,
+            ),
+            patch.object(
+                survey_service,
+                "_direct_writer_round",
+                new=AsyncMock(side_effect=RuntimeError("writer failed")),
+            ),
+            patch.object(survey_service, "save_session") as save_session,
+            patch("traceback.print_exc"),
+        ):
+            events = [
+                event async for event in survey_service.report_stream("sid", object())
+            ]
+
+        self.assertTrue(any('"type": "error"' in event for event in events))
+        save_session.assert_called_once()
+        persisted = save_session.call_args.args[1]
+        synthesis = persisted["report_viewpoint_diagnostics"]["synthesis"]
+        self.assertEqual(synthesis["status"], "failed")
+        self.assertEqual(synthesis["strategy"], "single_pass_selective_grouping")
+        self.assertEqual(synthesis["stage_budget_seconds"], 300)
+        self.assertEqual(synthesis["excluded_candidate_count"], 170)
+        self.assertEqual(synthesis["calls"][0]["error"], "finish_reason=length")
+        self.assertNotIn("report_viewpoint_diagnostics", sess)
 
     async def test_core_review_failure_keeps_original_and_continues_report(self):
         sess = {
@@ -423,6 +518,10 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
         ])
 
         with (
+            patch.object(
+                survey_service, "_report_writer_attempt_callback",
+                wraps=survey_service._report_writer_attempt_callback,
+            ) as diagnostic_callback,
             patch.object(survey_service, "get_session", return_value=sess),
             patch.object(survey_service, "_current_login", new=AsyncMock(return_value=None)),
             patch.object(
@@ -449,6 +548,13 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
             events = [event async for event in survey_service.report_stream("sid", object())]
 
         self.assertEqual(direct.await_count, 7)
+        contexts = [call.kwargs for call in diagnostic_callback.call_args_list]
+        self.assertEqual([ctx["step"] for ctx in contexts], [
+            "title", "part", "bug_check", "core", "core_review", "action", "action_repair",
+        ])
+        self.assertEqual(len({ctx["run_id"] for ctx in contexts}), 1)
+        self.assertEqual({ctx["session_id"] for ctx in contexts}, {"sid"})
+        self.assertEqual(contexts[1]["part_index"], 1)
         self.assertIn("不要改变建议", direct.await_args_list[-1].args[1])
         self.assertIn("## 行动建议\n\n1. **修复消息丢失**", sess["report_md"])
         self.assertNotIn("| 建议内容 |", sess["report_md"])
@@ -584,7 +690,9 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(any('"type": "report_done"' in event for event in events))
         self.assertEqual(len(writer_calls), 6)
-        self.assertIn(VIEWPOINT_STATS_MD, writer_calls[0][1])
+        self.assertNotIn(VIEWPOINT_STATS_MD, writer_calls[0][1])
+        self.assertNotIn("消息会消失", writer_calls[0][1])
+        self.assertIn(VIEWPOINT_STATS_MD, writer_calls[1][1])
         self.assertIn("事实边界也必须逐条复核", writer_calls[-2][1])
         final_messages, final_query = writer_calls[-1]
         final_prompt = "\n".join(
@@ -603,6 +711,91 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             diagnostics["writer_output"]["mention_block_count"], 0
         )
+
+    async def test_standard_writer_isolates_part_raw_text_and_conversation_history(self):
+        sess = {
+            "filename": "responses.xlsx",
+            "analysis_mode": "quantitative",
+            "rows": [
+                ["玩家ID", "界面反馈", "功能反馈"],
+                ["p-1", "RAW-PART-ONE-SECRET", "RAW-PART-TWO-SECRET"],
+            ],
+            "plan": {
+                "columns": [
+                    {"index": 1, "name": "界面反馈", "role": "open_text"},
+                    {"index": 2, "name": "功能反馈", "role": "open_text"},
+                ],
+                "parts": [
+                    {"name": "界面体验", "column_indexes": [1]},
+                    {"name": "功能体验", "column_indexes": [2]},
+                ],
+                "branch_rules": [],
+            },
+            "branch_rules": [],
+            "stats_md": "<metadata>总样本: 1, 有效样本: 1</metadata>",
+            "open_text": {
+                1: [{"ids": {"玩家ID": "p-1"}, "profile": {}, "text": "RAW-PART-ONE-SECRET"}],
+                2: [{"ids": {"玩家ID": "p-1"}, "profile": {}, "text": "RAW-PART-TWO-SECRET"}],
+            },
+        }
+        answers = iter([
+            ("# 双主题调研", "model-a"),
+            ("## Part 1 界面体验\n\n**本节总结：** 界面发现。", "model-a"),
+            ("## Part 2 功能体验\n\n**本节总结：** 功能发现。", "model-a"),
+            ("NONE", "model-a"),
+            ("<!--CORE_START-->\n## 核心结论\n综合判断。\n<!--CORE_END-->", "model-a"),
+            ("PASS", "model-a"),
+            (ACTION_SECTION_MD, "model-a"),
+        ])
+        writer_calls: list[tuple[list[dict], str]] = []
+
+        async def capture_writer(messages, query, **_kwargs):
+            writer_calls.append((deepcopy(messages), query))
+            answer, model = next(answers)
+            messages.extend([
+                {"role": "user", "content": query},
+                {"role": "assistant", "content": answer},
+            ])
+            return answer, model
+
+        with (
+            patch.object(survey_service, "get_session", return_value=sess),
+            patch.object(survey_service, "_current_login", new=AsyncMock(return_value=None)),
+            patch.object(survey_service, "_direct_writer_round", new=capture_writer),
+            patch.object(survey_service, "save_session"),
+            patch.object(survey_service, "save_to_history"),
+            patch.object(survey_service, "audit_log", new=AsyncMock()),
+            patch.object(survey_service.survey_stats, "find_numbers_not_in_stats", return_value=[]),
+        ):
+            events = [event async for event in survey_service.report_stream("sid", object())]
+
+        self.assertTrue(any('"type": "report_done"' in event for event in events))
+        self.assertEqual(len(writer_calls), 7)
+        title_query = writer_calls[0][1]
+        part_one_query = writer_calls[1][1]
+        part_two_query = writer_calls[2][1]
+        bug_query = writer_calls[3][1]
+        core_query = writer_calls[4][1]
+        action_query = writer_calls[6][1]
+
+        self.assertNotIn("RAW-PART-ONE-SECRET", title_query)
+        self.assertNotIn("RAW-PART-TWO-SECRET", title_query)
+        self.assertIn("RAW-PART-ONE-SECRET", part_one_query)
+        self.assertNotIn("RAW-PART-TWO-SECRET", part_one_query)
+        self.assertIn("RAW-PART-TWO-SECRET", part_two_query)
+        self.assertNotIn("RAW-PART-ONE-SECRET", part_two_query)
+        self.assertIn("RAW-PART-ONE-SECRET", bug_query)
+        self.assertIn("RAW-PART-TWO-SECRET", bug_query)
+        self.assertNotIn("RAW-PART-ONE-SECRET", core_query)
+        self.assertNotIn("RAW-PART-TWO-SECRET", core_query)
+        self.assertNotIn("RAW-PART-ONE-SECRET", action_query)
+        self.assertNotIn("RAW-PART-TWO-SECRET", action_query)
+        self.assertEqual(len(writer_calls[1][0]), 1)
+        self.assertEqual(len(writer_calls[2][0]), 1)
+        self.assertEqual(len(writer_calls[3][0]), 1)
+        self.assertEqual(len(writer_calls[4][0]), 1)
+        self.assertEqual(len(writer_calls[5][0]), 3)
+        self.assertEqual(len(writer_calls[6][0]), 1)
 
     async def test_direct_qa_uses_context_history_and_configured_model_chain(self):
         source = {

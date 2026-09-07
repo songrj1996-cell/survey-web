@@ -58,6 +58,21 @@ _THEME_MERGE_RUNTIME_CONTRACT = """\
 5. representative_quotes 只能来自该主题 source_candidate_ids 对应候选的原文引用。
 </protected_theme_merge_contract>"""
 
+_CROSS_QUESTION_MAX_VIEWPOINTS = 36
+_CROSS_QUESTION_CANDIDATE_DESCRIPTION_CHARS = 240
+_CROSS_QUESTION_MERGE_RUNTIME_CONTRACT = f"""\
+<protected_cross_question_merge_contract>
+以下运行时契约专用于筛选跨题共同观点，并优先于上文的覆盖式主题合并规则：
+1. 这一步不是要求覆盖全部候选；只输出至少由两个不同 source_question_id 共同支持的具体玩家观点。
+2. 单题独有、无法确认跨题同义或仅能形成分析推断的候选必须省略，不得为了覆盖率强行合并。
+3. 最终最多输出 {_CROSS_QUESTION_MAX_VIEWPOINTS} 个观点；没有真实跨题共同观点时允许输出空 themes 数组。
+4. 每个 source_candidate_ids 至少包含两个候选 ID，且必须覆盖至少两个不同 source_question_id。
+5. 每个候选 ID 最多出现在一个观点中；无需分配全部候选。
+6. 不得创造“A影响B”“A导致B”“A与B有关”等玩家原话没有直接表达的关系、标准、框架或产品判断。
+7. 只输出 JSON 对象：{{"themes":[{{"id":"t01","name":"...","description":"...","source_candidate_ids":["c0001","c0002"],"positive_summary":null,"negative_summary":null,"representative_quotes":[]}}]}}。
+   主题 ID 必须从 t01 连续编号；representative_quotes 由代码根据候选 ID 还原，模型保持空数组即可。
+</protected_cross_question_merge_contract>"""
+
 
 def _get_theme_merge_system_prompt() -> str:
     """Append the non-configurable merge protocol to the editable business prompt."""
@@ -65,6 +80,15 @@ def _get_theme_merge_system_prompt() -> str:
         _get_theme_merge_system_prompt_base().rstrip()
         + "\n\n"
         + _THEME_MERGE_RUNTIME_CONTRACT
+    )
+
+
+def _get_cross_question_merge_system_prompt() -> str:
+    """Use a filtering contract instead of the exhaustive per-question merge contract."""
+    return (
+        _get_theme_merge_system_prompt_base().rstrip()
+        + "\n\n"
+        + _CROSS_QUESTION_MERGE_RUNTIME_CONTRACT
     )
 
 _QUALITATIVE_CONTEXT_LABELS = [
@@ -817,6 +841,8 @@ async def _run_bounded_calls(
     call_factories: list,
     concurrency: int,
     event_queue: asyncio.Queue | None = None,
+    *,
+    deadline: float | None = None,
 ):
     """有限并发执行批次，并在等待期间产生 heartbeat 事件。"""
     semaphore = asyncio.Semaphore(max(1, concurrency))
@@ -833,12 +859,20 @@ async def _run_bounded_calls(
     try:
         while pending:
             waiters = pending | ({queue_task} if queue_task else set())
+            wait_timeout = LLM_STREAM_HEARTBEAT_SECONDS
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError("stage deadline exceeded")
+                wait_timeout = min(wait_timeout, remaining)
             done, _ = await asyncio.wait(
                 waiters,
-                timeout=LLM_STREAM_HEARTBEAT_SECONDS,
+                timeout=wait_timeout,
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if not done:
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise asyncio.TimeoutError("stage deadline exceeded")
                 yield ("heartbeat", None)
                 continue
             if queue_task and queue_task in done:
@@ -1035,6 +1069,87 @@ def _validate_merged_themes(data: dict | None, candidates: list[dict]) -> str | 
     return None
 
 
+def _validate_cross_question_themes(
+    data: dict | None,
+    candidates: list[dict],
+) -> str | None:
+    """Validate selective cross-question groups without requiring full coverage."""
+    if not isinstance(data, dict):
+        return "JSON 根节点必须是对象"
+    themes = data.get("themes")
+    if not isinstance(themes, list):
+        return "themes 必须是数组"
+    if len(themes) > _CROSS_QUESTION_MAX_VIEWPOINTS:
+        return f"跨题观点不得超过 {_CROSS_QUESTION_MAX_VIEWPOINTS} 个"
+
+    candidate_lookup = {
+        f"c{index:04d}": candidate
+        for index, candidate in enumerate(candidates, 1)
+        if isinstance(candidate, dict)
+    }
+    expected_ids = [f"t{i:02d}" for i in range(1, len(themes) + 1)]
+    actual_ids = [theme.get("id") if isinstance(theme, dict) else None for theme in themes]
+    if actual_ids != expected_ids:
+        return f"主题 ID 必须从 t01 连续编号，期望 {expected_ids}"
+
+    assigned_candidate_ids: set[str] = set()
+    seen_names: set[str] = set()
+    for theme in themes:
+        name = str(theme.get("name") or "").strip()
+        if not name or not str(theme.get("description") or "").strip():
+            return f"主题 {theme.get('id')} 缺少 name 或 description"
+        name_key = name.casefold()
+        if name_key in seen_names:
+            return f"最终主题名称重复：{name}"
+        seen_names.add(name_key)
+        for field in ("positive_summary", "negative_summary"):
+            value = theme.get(field)
+            if value is not None and not isinstance(value, str):
+                return f"主题「{name}」的 {field} 必须是字符串或 null"
+
+        source_candidate_ids = theme.get("source_candidate_ids")
+        if (
+            not isinstance(source_candidate_ids, list)
+            or len(source_candidate_ids) < 2
+            or not all(isinstance(candidate_id, str) for candidate_id in source_candidate_ids)
+            or len(set(source_candidate_ids)) != len(source_candidate_ids)
+        ):
+            return f"主题「{name}」必须包含至少两个不重复的 source_candidate_ids"
+        invalid_candidate_ids = [
+            candidate_id
+            for candidate_id in source_candidate_ids
+            if candidate_id not in candidate_lookup
+        ]
+        if invalid_candidate_ids:
+            return f"主题「{name}」引用了不存在的候选 ID：{invalid_candidate_ids[0]}"
+        repeated_candidate_ids = [
+            candidate_id
+            for candidate_id in source_candidate_ids
+            if candidate_id in assigned_candidate_ids
+        ]
+        if repeated_candidate_ids:
+            return f"候选 ID 被重复分配：{repeated_candidate_ids[0]}"
+        source_question_ids = {
+            str(candidate_lookup[candidate_id].get("source_question_id") or "").strip()
+            for candidate_id in source_candidate_ids
+        }
+        source_question_ids.discard("")
+        if len(source_question_ids) < 2:
+            return f"主题「{name}」没有覆盖至少两个不同题目"
+        assigned_candidate_ids.update(source_candidate_ids)
+
+        allowed_quotes = list(dict.fromkeys(
+            quote
+            for candidate_id in source_candidate_ids
+            for quote in (
+                candidate_lookup[candidate_id].get("representative_quotes") or []
+            )
+            if isinstance(quote, str) and _text_key(quote)
+        ))
+        theme["representative_quotes"] = allowed_quotes[:3]
+    return None
+
+
 def _recover_single_batch_themes(
     candidates: list[dict],
 ) -> tuple[dict | None, str | None]:
@@ -1067,6 +1182,7 @@ def _recover_single_batch_themes(
 
 
 _VALID_SENTIMENTS = {"positive", "negative", "neutral", "mixed"}
+_CLASSIFY_REPAIR_BATCH_SIZE = 8
 
 
 def _normalize_classifications(
@@ -1162,6 +1278,33 @@ def _build_theme_merge_query(
     )
 
 
+def _build_cross_question_merge_query(
+    report_organization: str,
+    candidates: list[dict],
+) -> str:
+    """Send compact semantic metadata; evidence is hydrated locally after grouping."""
+    indexed_candidates = []
+    for index, candidate in enumerate(candidates, 1):
+        indexed_candidates.append({
+            "candidate_id": f"c{index:04d}",
+            "name": str(candidate.get("name") or "").strip(),
+            "source_question_id": str(
+                candidate.get("source_question_id") or ""
+            ).strip(),
+            "source_question": str(candidate.get("source_question") or "").strip(),
+            "description": str(candidate.get("description") or "").strip()[
+                :_CROSS_QUESTION_CANDIDATE_DESCRIPTION_CHARS
+            ],
+        })
+    return (
+        f"<report_organization>\n{report_organization}\n</report_organization>\n"
+        f"<candidate_count>{len(indexed_candidates)}</candidate_count>\n"
+        "<cross_question_candidates_json>\n"
+        f"{json.dumps(indexed_candidates, ensure_ascii=False)}\n"
+        "</cross_question_candidates_json>"
+    )
+
+
 def _build_classify_query(
     question: str,
     final_themes: list[dict],
@@ -1220,18 +1363,24 @@ async def _classify_batch_direct(
         first.get("data"), expected_ids, valid_theme_ids
     )
     missing_ids = [response_id for response_id in expected_ids if response_id not in normalized]
-    repaired_count = 0
+    initial_classified_count = len(normalized)
     repair_model = ""
     duration_seconds = float(first.get("duration_seconds") or 0)
+    repair_attempt_count = 0
+    repair_errors: list[str] = []
 
-    if missing_ids:
+    async def _repair_ids(response_ids: list[str]) -> dict:
+        nonlocal repair_model, duration_seconds, repair_attempt_count
+        if not response_ids:
+            return {}
+        repair_attempt_count += 1
         miss = await _direct_json_call(
             system_prompt,
             _build_classify_query(
                 question,
                 final_themes,
                 batch,
-                response_ids=missing_ids,
+                response_ids=response_ids,
             ),
             models=models,
             max_tokens=LLM_CLASSIFY_MAX_TOKENS,
@@ -1240,16 +1389,37 @@ async def _classify_batch_direct(
             on_attempt_event=on_attempt_event,
         )
         repaired = _normalize_classifications(
-            miss.get("data"), missing_ids, valid_theme_ids
+            miss.get("data"), response_ids, valid_theme_ids
         )
         normalized.update(repaired)
-        repaired_count = len(repaired)
-        repair_model = miss.get("model", "")
+        if miss.get("model"):
+            repair_model = miss.get("model", "")
+        if miss.get("error"):
+            repair_errors.append(str(miss.get("error"))[:300])
         duration_seconds += float(miss.get("duration_seconds") or 0)
+        return miss
+
+    singleton_retry_ids: set[str] = set()
+    for start in range(0, len(missing_ids), _CLASSIFY_REPAIR_BATCH_SIZE):
+        repair_batch = missing_ids[start:start + _CLASSIFY_REPAIR_BATCH_SIZE]
+        repair_result = await _repair_ids(repair_batch)
+        if not repair_result.get("error"):
+            singleton_retry_ids.update(
+                response_id for response_id in repair_batch
+                if response_id not in normalized
+            )
+
+    still_missing = [
+        response_id for response_id in expected_ids if response_id not in normalized
+    ]
+    for response_id in still_missing:
+        if response_id in singleton_retry_ids:
+            await _repair_ids([response_id])
 
     fallback_ids = [
         response_id for response_id in expected_ids if response_id not in normalized
     ]
+    repaired_count = len(normalized) - initial_classified_count
     for response_id in fallback_ids:
         normalized[response_id] = [{"theme_id": "other", "sentiment": "neutral"}]
 
@@ -1265,7 +1435,10 @@ async def _classify_batch_direct(
         "repair_model": repair_model,
         "raw_len": first.get("raw_len", 0),
         "repaired_count": repaired_count,
+        "repair_attempt_count": repair_attempt_count,
+        "repair_errors": repair_errors,
         "fallback_count": len(fallback_ids),
+        "fallback_response_ids": fallback_ids,
         "error": first.get("error", ""),
         "duration_seconds": round(duration_seconds, 3),
     }
@@ -1836,6 +2009,9 @@ async def _batch_qualitative_analysis(
                 "repair_model": result.get("repair_model", ""),
                 "missing_repaired": result.get("repaired_count", 0),
                 "missing_fallback": result.get("fallback_count", 0),
+                "repair_attempt_count": result.get("repair_attempt_count", 0),
+                "repair_errors": result.get("repair_errors", []),
+                "fallback_response_ids": result.get("fallback_response_ids", []),
                 "error": result.get("error", ""),
                 "duration_seconds": result.get("duration_seconds", 0),
             }
@@ -2313,19 +2489,27 @@ def _build_writer_context(
     headers: list[str],
     analysis_focus: dict | None = None,
     viewpoint_stats_md: str = "",
+    part_index: int | None = None,
 ) -> tuple[str, str, str]:
-    """构造 Writer 的完整上下文：(plan_summary, open_text_md, requirements)。
-    plan_summary/open_text/stats 仅在多轮生成的第 1 轮发送一次，后续轮次复用会话历史。"""
+    """构造 Writer 上下文；``part_index`` 可将计划和原文严格裁到单个 Part。"""
     parts_meta = _writer_parts_meta(plan, headers)
+    selected_parts = [
+        item for item in parts_meta
+        if part_index is None or item["i"] == part_index
+    ]
     parts_lines = [
         f"  Part {m['i']} {m['name']}: {m['col_desc']}"
         + (f"；{m['filter_desc']}" if m["filter_desc"] else "")
-        for m in parts_meta
+        for m in selected_parts
     ]
     plan_summary = "<plan>\n报告结构：\n" + "\n".join(parts_lines) + "\n</plan>"
     analysis_focus_block = _build_analysis_focus_block(
         analysis_focus,
-        "用于约束标题、核心结论与行动建议；分章轮次沿用本会话历史",
+        (
+            "用于约束当前 Part；本轮只使用当前 Part 的统计和原文"
+            if part_index is not None
+            else "用于约束报告结构和证据边界"
+        ),
     )
     if analysis_focus_block:
         plan_summary += analysis_focus_block
@@ -2334,7 +2518,9 @@ def _build_writer_context(
         plan_summary += "\n\n" + branch_logic_block
 
     open_text_blocks = []
-    for _, col_idx, part_index, part, texts in _open_text_scopes(open_text, plan):
+    for _, col_idx, scope_part_index, part, texts in _open_text_scopes(open_text, plan):
+        if part_index is not None and scope_part_index != part_index:
+            continue
         if not texts:
             continue
         col = next((c for c in plan["columns"] if c["index"] == col_idx), None)
@@ -2354,7 +2540,7 @@ def _build_writer_context(
         joined = "\n".join(joined_lines)
         scope_suffix = f"；{scope}" if scope else ""
         open_text_blocks.append(
-            f"### Part {part_index} {part.get('name')} / {name}"
+            f"### Part {scope_part_index} {part.get('name')} / {name}"
             f"（列 {col_idx}, 共 {len(texts)} 条非空回答{scope_suffix}）\n{joined}"
         )
 
@@ -2370,7 +2556,7 @@ def _build_writer_context(
             "不得合并回答池。每条分支结论都要说明适用人群，并使用进入该分支人数或该题有效回答数作为分母，"
             "不得使用问卷总样本替代。不同题干、不同使用程度人群的主观反馈不得直接比较高低。"
         )
-    if any(m["filter_desc"] for m in parts_meta):
+    if any(m["filter_desc"] for m in selected_parts):
         requirements += (
             "\n\n分组选项成章强制规则：带有“适用人群”的 Part 只能使用该筛选人群对应的 <stats> "
             "和 <open_text>；不得引用其他选项人群的回答，不得用问卷总样本替代该 Part 的有效人群分母。"
@@ -2387,6 +2573,18 @@ def _build_writer_context(
     return plan_summary, open_text_md, requirements
 
 
+def _writer_stats_metadata(stats_md: str) -> str:
+    """标题轮只保留样本口径，避免为了一个标题发送整份统计。"""
+    match = re.search(r"<metadata>.*?</metadata>", str(stats_md or ""), re.DOTALL)
+    if match:
+        return match.group(0).strip()
+    first_line = next(
+        (line.strip() for line in str(stats_md or "").splitlines() if line.strip()),
+        "",
+    )
+    return first_line[:1000]
+
+
 def _build_writer_first_query(
     stats_md: str,
     open_text: dict,
@@ -2396,30 +2594,65 @@ def _build_writer_first_query(
     analysis_focus: dict | None | object = _ANALYSIS_FOCUS_FROM_PLAN,
     viewpoint_stats_md: str = "",
 ) -> str:
-    """多轮生成第 1 轮：发送全部上下文 + 要求，但本轮只让模型输出一级标题。"""
+    """标题轮只发送结构、业务主线和样本口径，不发送开放题原文。"""
     if analysis_focus is _ANALYSIS_FOCUS_FROM_PLAN:
         analysis_focus = plan.get("analysis_focus")
+    parts_meta = _writer_parts_meta(plan, headers)
+    parts_lines = [
+        f"  Part {item['i']} {item['name']}: {item['col_desc']}"
+        + (f"；{item['filter_desc']}" if item["filter_desc"] else "")
+        for item in parts_meta
+    ]
+    plan_summary = "<plan>\n报告结构：\n" + "\n".join(parts_lines) + "\n</plan>"
+    focus_block = _build_analysis_focus_block(
+        analysis_focus,
+        "用于约束报告标题；各章节将在独立轮次接收各自证据",
+    )
+    metadata = _writer_stats_metadata(stats_md)
+    return (
+        "**协作方式**：本次报告将分成彼此独立的写作轮次；本轮只生成标题，后续章节会分别收到"
+        "与该章节直接相关的统计和开放题证据。\n\n"
+        f"{plan_summary}\n\n"
+        + (f"{focus_block}\n\n" if focus_block else "")
+        + (f"<stats_metadata>\n{metadata}\n</stats_metadata>\n\n" if metadata else "")
+        + f"{_build_business_context_block(qualitative_context, '仅用于确定标题方向')}\n\n"
+        "**本轮任务（第 1 轮）**：**只**输出报告的一级标题（`# 一级标题`）。"
+        "如果 <stats_metadata> 中存在「被排除」样本依据，可在标题下另起一行用一句话说明依据。"
+        "除此之外**什么都不要写**——不要写核心结论、不要写任何 Part、不要写 Bug 模块、不要写本节总结。"
+        "本轮输出仅一级标题。"
+    )
+
+
+def _build_writer_part_context_query(
+    part: dict,
+    *,
+    part_stats_md: str,
+    open_text: dict,
+    plan: dict,
+    headers: list[str],
+    qualitative_context: dict | None = None,
+    analysis_focus: dict | None = None,
+    viewpoint_stats_md: str = "",
+    quantitative_first: bool = False,
+) -> str:
+    """为单个 Part 构造自包含且不含其它 Part 原文的写作请求。"""
     plan_summary, open_text_md, requirements = _build_writer_context(
-        stats_md,
+        "",
         open_text,
         plan,
         headers,
         analysis_focus=analysis_focus,
         viewpoint_stats_md=viewpoint_stats_md,
+        part_index=part["i"],
     )
     return (
-        "**协作方式**：本次报告将**分多轮**生成。下面先给你全部数据（<plan> 报告结构、<stats> 确定性统计、"
-        "<open_text> 全部开放题原文）和完整的写作要求。请通读并牢记——后续每一轮我会指定你写其中**某一个章节**，"
-        "你要从这些数据里取材，但**每轮只写我当轮指定的部分，绝不提前写其它章节**。\n\n"
+        "下面只提供当前 Part 可使用的证据；不得假设或引用其它 Part 的原文。\n\n"
         f"{plan_summary}\n\n"
-        f"<stats>\n{stats_md}\n</stats>\n\n"
+        f"<stats>\n{part_stats_md or '（本 Part 没有可用的客观统计）'}\n</stats>\n\n"
         f"{open_text_md}\n\n"
-        f"<report_spec>\n以下是整篇报告最终要满足的写作要求（供你理解全局，后续逐轮执行）：\n{requirements}\n</report_spec>"
-        f"{_build_business_context_block(qualitative_context, '仅本轮注入，后续 part/bug/core 轮次请依赖本会话历史，不会重复提供')}\n\n"
-        "**本轮任务（第 1 轮）**：**只**输出报告的一级标题（`# 一级标题`）。"
-        "如果 <stats> 或 metadata 中存在「被排除」样本依据，可在标题下另起一行用一句话说明依据。"
-        "除此之外**什么都不要写**——不要写核心结论、不要写任何 Part、不要写 Bug 模块、不要写本节总结。"
-        "确认你已读完全部数据，本轮输出仅一级标题。"
+        f"<report_spec>\n{requirements}\n</report_spec>"
+        f"{_build_business_context_block(qualitative_context, '仅用于约束当前 Part 的业务表达')}\n\n"
+        + _build_writer_part_query(part, quantitative_first=quantitative_first)
     )
 
 
@@ -2428,7 +2661,7 @@ def _build_writer_part_query(
     *,
     quantitative_first: bool = False,
 ) -> str:
-    """多轮生成中的某个 Part 轮：仅指示写这一个 Part。原文已在会话历史中。"""
+    """单个 Part 的独立写作轮：仅指示写当前上下文中的这一个 Part。"""
     quantitative_rule = (
         "本次为定量优先报告：本节先说明所有相关客观题的主要分布、最高/最低项和显著差异，"
         "再用开放题解释原因。至少引用一组最关键的客观统计作为判断依据；"
@@ -2547,14 +2780,14 @@ def _build_writer_core_query(
             "不要按 Part 机械复述，也不要只做资料摘要。\n"
             if has_context else
             "用户未提供 `<business_context>`：本模块是「基础发现层」，不得编造业务目标或假装知道产品决策背景。"
-            "只能根据问卷题目、<stats>、<open_text> 和已生成章节归纳主要发现；如果需要判断这份调研可能关注什么，必须写成「从问卷内容推测/看起来」，并说明推测依据。\n"
+            "只能根据问卷题目、<stats>、<subjective_viewpoint_stats> 和 <generated_parts> 归纳主要发现；如果需要判断这份调研可能关注什么，必须写成「从问卷内容推测/看起来」，并说明推测依据。\n"
         )
         organization_clause = (
             "根据问卷题目和已生成章节中的真实业务语义设置 `###` 小标题；小标题应直接说明对象、场景或决策内容，"
             f"必要时可以沿用真实章节名（{part_titles}），但不得机械逐 Part 复述；"
         )
     return (
-        "**本轮任务**：基于你前面已经生成的全部章节，撰写整篇报告的「核心结论」模块。"
+        "**本轮任务**：基于 <generated_parts> 中已经生成的全部章节，撰写整篇报告的「核心结论」模块。"
         "这个模块最终会被放到报告**最顶部**（一级标题之后、各 Part 之前），所以请独立、完整地写出来。\n"
         f"{focus_prefix}"
         f"{mode_clause}"
@@ -2613,7 +2846,7 @@ def _build_writer_core_query(
         "让未参与调研立项、未看过问卷提纲的读者也能独立理解。若涉及多个容易混淆的范围，须按真实业务语义"
         "分别回车成短段，不使用 1、2、3 编号，不得写成一个超长段落，也不得使用无明确指代的「该方案」"
         "「这一问题」「核心分歧」开门见山。`### 少数但值得关注的反馈` 每条也必须在短标题或首句明确对应的"
-        "对象、功能、方案、场景、人群或研究范围，不同范围不得混写；范围名称只能来自 plan、题目、<open_text>"
+        "对象、功能、方案、场景、人群或研究范围，不同范围不得混写；范围名称只能来自 plan、题目、<generated_parts>"
         "或已生成章节，不得机械套用标签或补造研究阶段。\n"
         "不要复述、转述或重新提出业务问题或调研需求，第一句话就用「谁/什么因素 + 与什么评价或结果有关 + 具体表现」直接下结论。"
         "禁止使用「针对……这一核心问题」「关于……是否……」「证据显示相关」「结果给出了明确信号」"
@@ -2626,12 +2859,12 @@ def _build_writer_core_query(
         "若会话中存在 <subjective_viewpoint_stats>，玩家观点提及人数与占比必须逐字来自该目录；"
         "不得自行计算、合并、四舍五入或改写；"
         "③ 涉及分支题、筛选人群或不同使用程度人群时，必须说明对应分母或有效回答范围，不得用问卷总样本替代；"
-        "④ 玩家观点必须来自 <open_text> 或已生成章节，不得编造；"
+        "④ 玩家观点必须来自 <generated_parts> 或 <subjective_viewpoint_stats>，不得编造；"
         "⑤ 凡是玩家原话没有直接表达、而是系统根据跨题关系、客观统计、人群差异或多类证据综合得出的判断，"
         "应在有决策价值时主动形成，并必须明确标为“分析推断”、写清依据和边界；不得写成玩家的逻辑，不得使用“X名玩家提及”；"
         "⑥ 使用不看玩家原文也能立即理解的大白话，优先沿用玩家中文翻译中的具体词语。"
         "不要只写「功能性增益」「价值感知」「分层机制」等抽象概括；确需使用时，必须在同一句用「也就是……」"
-        "或等价表达说明玩家具体希望增加、取消或改变什么，解释和例子只能来自 <open_text> 或已生成章节。"
+        "或等价表达说明玩家具体希望增加、取消或改变什么，解释和例子只能来自 <generated_parts>。"
     )
 
 
@@ -2811,7 +3044,7 @@ def _build_writer_action_query(
     )
     selected_core_block = (
         f"\n\n<selected_core>\n{selected_core.strip()}\n</selected_core>"
-        if focus and selected_core.strip() else ""
+        if selected_core.strip() else ""
     )
     bug_clause = (
         "正文包含 `## Bug 或待确认问题` 模块，行动建议里不要重复该模块已列出的具体问题项，必要时可提及但不展开。"
@@ -2829,7 +3062,7 @@ def _build_writer_action_query(
             "用户未提供 `<business_context>`，建议只能基于本报告中已经出现的证据提出，不要假设产品团队的具体目标；"
         )
     return (
-        "**本轮任务（最后一轮）**：基于你前面已经生成的全部章节（"
+        "**本轮任务（最后一轮）**：基于 <generated_parts> 中已经生成的全部章节（"
         f"{part_titles}），撰写 `## 行动建议` 模块，这是整篇报告的最后一节。"
         f"{focus_block}{selected_core_block}\n"
         "要求：\n"
@@ -2838,7 +3071,8 @@ def _build_writer_action_query(
         "`1. **建议短标题**（优先级：高/中/低）`，并在其下依次缩进列出 "
         "`- **核心判断：**`、`- **产品动作：**`、`- **验证方式：**`、`- **依据：**`、"
         "`- **不确定性/前提：**`。各字段不得合并成一个长段落，也不得遗漏。\n"
-        f"3. {context_clause}每条建议必须能在 <stats> 或 <open_text> 中找到对应依据，不得凭空提出。\n"
+        f"3. {context_clause}每条建议必须能在 <stats>、<subjective_viewpoint_stats>、"
+        "<generated_parts> 或 <selected_core> 中找到对应依据，不得凭空提出。\n"
         "4. 建议只能承接报告已经成立的事实或已明确标注边界的分析推断。缺失选项、未询问原因、未覆盖人群、"
         "单条开放回答或仅有“使用过”的统计均不得被包装成已证实的产品判断；如果建议依赖推测、猜测或样本外假设，"
         "必须在「不确定性/前提」里明确写出，并把补充数据、访谈或实验作为验证动作。\n"
@@ -2856,6 +3090,101 @@ def _build_writer_action_repair_query() -> str:
         "`- **核心判断：**`、`- **产品动作：**`、`- **验证方式：**`、`- **依据：**`、"
         "`- **不确定性/前提：**`；"
         "不要输出解释、前言、其它章节或代码围栏。"
+    )
+
+
+def _build_writer_bug_context_query(
+    open_text: dict,
+    plan: dict,
+    headers: list[str],
+    qualitative_context: dict | None = None,
+) -> str:
+    """Bug 轮独立读取一次全量原文，但不继承任何章节写作历史。"""
+    plan_summary, open_text_md, _requirements = _build_writer_context(
+        "", open_text, plan, headers,
+    )
+    return (
+        f"{plan_summary}\n\n{open_text_md}"
+        f"{_build_business_context_block(qualitative_context, '仅用于判断是否存在待确认问题')}\n\n"
+        + _build_writer_bug_query()
+    )
+
+
+def _build_writer_core_context_query(
+    parts_meta: list[dict],
+    part_sections: list[str],
+    *,
+    stats_md: str,
+    viewpoint_stats_md: str,
+    bug_section: str,
+    qualitative_context: dict | None = None,
+    analysis_focus: dict | None = None,
+) -> str:
+    """核心结论轮只读取章节成品和压缩统计，不再读取全量原始回答。"""
+    generated_parts = "\n\n".join(section.strip() for section in part_sections if section.strip())
+    evidence_blocks = [
+        f"<generated_parts>\n{generated_parts}\n</generated_parts>",
+        f"<stats>\n{stats_md or '（没有可用的客观统计摘要）'}\n</stats>",
+    ]
+    if viewpoint_stats_md:
+        evidence_blocks.append(viewpoint_stats_md)
+    if bug_section:
+        evidence_blocks.append(f"<bug_section>\n{bug_section}\n</bug_section>")
+    evidence_blocks.append(
+        _build_business_context_block(
+            qualitative_context,
+            "用于约束核心结论，原始回答已在各 Part 中完成归纳",
+        )
+    )
+    return (
+        "\n\n".join(block for block in evidence_blocks if block)
+        + "\n\n"
+        + _build_writer_core_query(
+            parts_meta,
+            bool(bug_section),
+            qualitative_context,
+            analysis_focus=analysis_focus,
+        )
+    )
+
+
+def _build_writer_action_context_query(
+    parts_meta: list[dict],
+    part_sections: list[str],
+    *,
+    stats_md: str,
+    viewpoint_stats_md: str,
+    bug_section: str,
+    qualitative_context: dict | None = None,
+    analysis_focus: dict | None = None,
+    selected_core: str = "",
+) -> str:
+    """行动建议轮使用最终核心结论和章节成品，避免继承原文及审校历史。"""
+    generated_parts = "\n\n".join(section.strip() for section in part_sections if section.strip())
+    evidence_blocks = [
+        f"<generated_parts>\n{generated_parts}\n</generated_parts>",
+        f"<stats>\n{stats_md or '（没有可用的客观统计摘要）'}\n</stats>",
+    ]
+    if viewpoint_stats_md:
+        evidence_blocks.append(viewpoint_stats_md)
+    if bug_section:
+        evidence_blocks.append(f"<bug_section>\n{bug_section}\n</bug_section>")
+    evidence_blocks.append(
+        _build_business_context_block(
+            qualitative_context,
+            "用于约束行动建议，原始回答已在各 Part 中完成归纳",
+        )
+    )
+    return (
+        "\n\n".join(block for block in evidence_blocks if block)
+        + "\n\n"
+        + _build_writer_action_query(
+            parts_meta,
+            bool(bug_section),
+            qualitative_context,
+            analysis_focus=analysis_focus,
+            selected_core=selected_core,
+        )
     )
 
 
