@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi import HTTPException
 
+from app.core import security
 from app.routers import annotate as annotate_router
 from app.routers import comment_analysis as comment_router
 from app.routers import export as export_router
@@ -29,6 +30,31 @@ def _denied() -> HTTPException:
 
 
 class SessionAccessPolicyTests(unittest.TestCase):
+    def test_history_retention_keeps_40_entries_for_one_owner(self):
+        owner_entries = [
+            {"id": f"owner-a-{index}", "owner_key": OWNER_A}
+            for index in range(45)
+        ]
+        other_entries = [
+            {"id": f"owner-b-{index}", "owner_key": OWNER_B}
+            for index in range(3)
+        ]
+
+        retained = security._trim_history_for_owner(
+            owner_entries + other_entries,
+            OWNER_A,
+        )
+
+        self.assertEqual(security.MAX_HISTORY, 40)
+        self.assertEqual(
+            [item["id"] for item in retained if item["owner_key"] == OWNER_A],
+            [f"owner-a-{index}" for index in range(40)],
+        )
+        self.assertEqual(
+            [item["id"] for item in retained if item["owner_key"] == OWNER_B],
+            [f"owner-b-{index}" for index in range(3)],
+        )
+
     def test_login_required_distinguishes_authentication_from_ownership(self):
         loader = Mock(return_value={"owner_key": OWNER_A})
         with patch.object(session_access.config, "FEISHU_LOGIN_REQUIRED", True):
