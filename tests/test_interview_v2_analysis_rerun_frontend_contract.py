@@ -47,7 +47,7 @@ class AnalysisModuleRerunFrontendTests(unittest.TestCase):
     def test_markup_dispatch_and_cache_version(self):
         self.assertIn('data-iv-v2-action="analysis-select-module"', JS)
         self.assertIn("ivV2RerunAnalysisModule(ivV2State.selectedAnalysisModuleId)", JS)
-        self.assertIn('/static/js/features/interview-v2.js?v=3', (ROOT / "static/index.html").read_text(encoding="utf-8"))
+        self.assertIn('/static/js/features/interview-v2.js?v=6', (ROOT / "static/index.html").read_text(encoding="utf-8"))
         self.run_js("""
           const html = ivV2AnalysisModuleRerunHtml();
           assert(html.includes('重跑所选模块'));

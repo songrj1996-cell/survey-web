@@ -64,6 +64,10 @@ const ivV2State = {
   participantResponse: null,
   selectedParticipantId: '',
   dossierResponse: null,
+  dossierReviewNote: '',
+  dossierReviewDirty: false,
+  dossierRerunKeys: {},
+  dossierRerunActiveParticipantId: '',
   dossierEvidenceCache: {},
   selectedDossierEvidenceId: '',
   reportBusy: false,
@@ -3854,6 +3858,13 @@ function ivV2SyncConfirmedControls() {
       control.disabled = operationBusy || ivV2DossierSummary().analysis_ready !== true || ivV2HasUnsavedReportWork();
       return;
     }
+    if (action === 'dossier-generate') {
+      const status = String(ivV2State.dossierResponse?.status || '');
+      control.disabled = ['generated', 'approved', 'needs_changes'].includes(status)
+        ? !ivV2CanRerunCurrentDossier()
+        : operationBusy;
+      return;
+    }
     if (action === 'analysis-rerun-module' || action === 'analysis-select-module') {
       control.disabled = !ivV2CanRerunAnalysisModule(ivV2State.selectedAnalysisModuleId);
       return;
@@ -4050,11 +4061,13 @@ function ivV2DossierMainHtml() {
   const contradictions = response.dossier?.contradictions || [];
   const missing = response.dossier?.missing_context || [];
   const canReview = status === 'generated' || status === 'needs_changes';
+  const rerunDisabled = ['generated', 'approved', 'needs_changes'].includes(status)
+    && !ivV2CanRerunCurrentDossier();
   return `
     <section class="iv-v2-dossier-toolbar">
       <div><span class="iv-v2-badge iv-v2-badge--${ivV2DossierStatusTone(status)}">${ivV2Esc(ivV2DossierStatusLabel(status))}</span><small>档案版 ${ivV2Esc(response.dossier_version_number || '--')} · ${ivV2Esc(response.dossier_version_id || '')}</small></div>
       <div class="iv-v2-toolbar__actions">
-        <button class="btn btn--ghost btn--sm" type="button" data-iv-v2-action="dossier-generate">${status === 'stale' ? '按最新证据重新生成' : '重新生成当前玩家'}</button>
+        <button class="btn btn--ghost btn--sm" type="button" data-iv-v2-action="dossier-generate"${rerunDisabled ? ' disabled' : ''}>${status === 'stale' ? '按最新证据重新生成' : ivV2State.dossierRerunActiveParticipantId === response.participant_id ? '正在重跑当前玩家…' : '重新生成当前玩家'}</button>
         <button class="btn btn--primary btn--sm" type="button" data-iv-v2-action="report-open"${!analysisReady && !(ivV2ReportSummary().report_version_id || ivV2AnalysisSummary().analysis_run_id) ? ' disabled' : ''}>进入分析与报告审核</button>
       </div>
     </section>
@@ -4064,7 +4077,7 @@ function ivV2DossierMainHtml() {
     <section class="iv-v2-dossier-section"><h3>分析标签</h3>${labels.length ? labels.map(label => `<article class="iv-v2-dossier-label"><strong>${ivV2Esc(label.label || label.label_key)}</strong><small>系统归纳，不代表玩家原话</small><div>${ivV2DossierEvidenceButtons(label.source_evidence_ids)}</div></article>`).join('') : '<div class="iv-v2-empty">没有分析标签。</div>'}</section>
     <section class="iv-v2-dossier-section"><h3>玩家逻辑</h3>${claims.length ? claims.map(ivV2DossierClaimHtml).join('') : '<div class="iv-v2-empty">没有通过证据校验的档案判断。</div>'}</section>
     <section class="iv-v2-dossier-section iv-v2-dossier-limits"><h3>矛盾与信息缺口</h3><div><strong>矛盾</strong>${contradictions.length ? `<ul>${contradictions.map(item => `<li>${ivV2Esc(typeof item === 'string' ? item : JSON.stringify(item))}</li>`).join('')}</ul>` : '<p>未识别到明确矛盾。</p>'}</div><div><strong>缺失信息</strong>${missing.length ? `<ul>${missing.map(item => `<li>${ivV2Esc(typeof item === 'string' ? item : JSON.stringify(item))}</li>`).join('')}</ul>` : '<p>未标记信息缺口。</p>'}</div></section>
-    ${canReview ? `<section class="iv-v2-dossier-review"><label><span>审阅备注</span><textarea id="iv-v2-dossier-review-note" maxlength="2000" placeholder="说明批准依据或需要修改的内容"></textarea></label><div><button class="btn btn--ghost" type="button" data-iv-v2-action="dossier-review" data-decision="needs_changes">退回修改</button><button class="btn btn--primary" type="button" data-iv-v2-action="dossier-review" data-decision="approved">批准档案</button></div></section>` : ''}
+    ${canReview ? `<section class="iv-v2-dossier-review"><label><span>审阅备注</span><textarea id="iv-v2-dossier-review-note" data-iv-v2-action="dossier-review-note" maxlength="2000" placeholder="说明批准依据或需要修改的内容"></textarea></label><div><button class="btn btn--ghost" type="button" data-iv-v2-action="dossier-review" data-decision="needs_changes">退回修改</button><button class="btn btn--primary" type="button" data-iv-v2-action="dossier-review" data-decision="approved">批准档案</button></div></section>` : ''}
   `;
 }
 
@@ -4088,6 +4101,8 @@ function ivV2RenderDossierWorkbench() {
   ivV2$('iv-v2-dossier-status').innerHTML = ivV2DossierStatusHtml();
   ivV2$('iv-v2-dossier-participant-list').innerHTML = ivV2ParticipantListHtml();
   ivV2$('iv-v2-dossier-main').innerHTML = ivV2DossierMainHtml();
+  const reviewNote = ivV2$('iv-v2-dossier-review-note');
+  if (reviewNote) reviewNote.value = ivV2State.dossierReviewNote;
   ivV2$('iv-v2-dossier-evidence-content').innerHTML = ivV2DossierEvidenceHtml();
 }
 
@@ -4132,6 +4147,8 @@ async function ivV2LoadCurrentDossier(participantId, { token = ++ivV2State.dossi
   if (token !== ivV2State.dossierToken) return false;
   if (!response.ok) throw new Error(ivV2NormalizeApiError(data, response.status, '读取玩家档案失败').message);
   ivV2State.dossierResponse = data;
+  ivV2State.dossierReviewNote = '';
+  ivV2State.dossierReviewDirty = false;
   return true;
 }
 
@@ -4140,6 +4157,8 @@ async function ivV2SelectDossierParticipant(participantId) {
   const token = ++ivV2State.dossierToken;
   ivV2State.selectedParticipantId = participantId;
   ivV2State.dossierResponse = null;
+  ivV2State.dossierReviewNote = '';
+  ivV2State.dossierReviewDirty = false;
   ivV2State.dossierBusy = true;
   ivV2ClearStatusError();
   ivV2RenderConfirmed();
@@ -4158,6 +4177,10 @@ async function ivV2SelectDossierParticipant(participantId) {
 async function ivV2RegenerateDossier() {
   const participantId = ivV2State.selectedParticipantId;
   if (!participantId || ivV2State.dossierBusy) return;
+  if (['generated', 'approved', 'needs_changes'].includes(ivV2State.dossierResponse?.status)) {
+    await ivV2RerunCurrentDossier();
+    return;
+  }
   const token = ++ivV2State.dossierToken;
   ivV2State.dossierBusy = true;
   ivV2ClearStatusError();
@@ -4188,10 +4211,95 @@ async function ivV2RegenerateDossier() {
   }
 }
 
+function ivV2CanRerunCurrentDossier() {
+  const response = ivV2State.dossierResponse;
+  return Boolean(
+    ivV2State.projectId
+    && ivV2State.selectedParticipantId
+    && response?.participant_id === ivV2State.selectedParticipantId
+    && response?.dossier_version_id
+    && ['generated', 'approved', 'needs_changes'].includes(response.status)
+    && !ivV2OperationBusy()
+    && !ivV2State.dossierReviewDirty
+    && !ivV2State.reportDirty
+    && !ivV2State.boundaryDirty
+    && !ivV2State.draftDirty
+    && !(ivV2State.reportApprovalNote || '').trim()
+  );
+}
+
+function ivV2DossierRerunPayload() {
+  return {
+    from_stage: 'participant_dossier',
+    participant_id: String(ivV2State.selectedParticipantId || ''),
+    base_dossier_version_id: String(ivV2State.dossierResponse?.dossier_version_id || ''),
+    preserve_manual_report_edits: true,
+    reuse_unchanged_artifacts: true,
+    force: false,
+  };
+}
+
+function ivV2DossierRerunKey(payload) {
+  const fingerprint = `${ivV2State.projectId}:${payload.base_dossier_version_id}:${payload.participant_id}`;
+  if (!ivV2State.dossierRerunKeys[fingerprint]) {
+    ivV2State.dossierRerunKeys[fingerprint] = window.crypto?.randomUUID
+      ? window.crypto.randomUUID()
+      : `dossier-rerun-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  }
+  return ivV2State.dossierRerunKeys[fingerprint];
+}
+
+async function ivV2RerunCurrentDossier() {
+  if (!ivV2CanRerunCurrentDossier()) return;
+  if (!window.confirm('重跑会创建该玩家的新档案版本，新版本恢复为待审阅；其他玩家、人工修正、报告、锁定正文、批准记录和导出文件都不会改写。继续吗？')) return;
+  const payload = ivV2DossierRerunPayload();
+  const idempotencyKey = ivV2DossierRerunKey(payload);
+  const token = ++ivV2State.dossierToken;
+  ivV2State.dossierBusy = true;
+  ivV2State.dossierRerunActiveParticipantId = payload.participant_id;
+  ivV2ClearStatusError();
+  ivV2RenderConfirmed();
+  try {
+    const response = await fetch(`/api/v1/interview-projects/${ivV2State.projectId}/reruns`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Idempotency-Key': idempotencyKey },
+      body: JSON.stringify(payload),
+    });
+    const data = await response.json();
+    if (token !== ivV2State.dossierToken) return;
+    if (!response.ok) {
+      const normalized = ivV2NormalizeApiError(data, response.status, '玩家档案重跑失败');
+      ivV2State.statusCode = normalized.code;
+      if (response.status === 409) {
+        ivV2State.dossierRerunActiveParticipantId = '';
+        await ivV2LoadParticipants({ preserveSelection: true, allowBusy: true });
+        ivV2SetStatusError(data, response.status, '玩家档案重跑存在版本或请求冲突，请刷新当前档案');
+        return;
+      }
+      throw new Error(normalized.message);
+    }
+    ivV2State.dossierRerunActiveParticipantId = '';
+    const refreshed = await ivV2LoadParticipants({ preserveSelection: true, allowBusy: true });
+    if (refreshed) {
+      showToast(data.rerun?.reused ? '已复用档案重跑结果，并刷新当前版本' : '当前玩家档案已生成新版本，等待重新审阅', 'success');
+    }
+  } catch (error) {
+    if (token === ivV2State.dossierToken) {
+      ivV2State.errorMessage = String(error?.message || '玩家档案重跑失败，可使用同一请求重试');
+    }
+  } finally {
+    if (token === ivV2State.dossierToken) {
+      ivV2State.dossierBusy = false;
+      ivV2State.dossierRerunActiveParticipantId = '';
+      ivV2RenderConfirmed();
+    }
+  }
+}
+
 async function ivV2ReviewDossier(decision) {
   if (!ivV2State.selectedParticipantId || !ivV2State.dossierResponse?.dossier_version_id || ivV2State.dossierBusy) return;
   const token = ++ivV2State.dossierToken;
-  const note = ivV2$('iv-v2-dossier-review-note')?.value || '';
+  const note = ivV2State.dossierReviewNote;
   ivV2State.dossierBusy = true;
   ivV2ClearStatusError();
   ivV2RenderConfirmed();
@@ -4204,6 +4312,8 @@ async function ivV2ReviewDossier(decision) {
     if (token !== ivV2State.dossierToken) return;
     if (!response.ok) throw new Error(ivV2NormalizeApiError(data, response.status, '审阅玩家档案失败').message);
     ivV2State.dossierResponse = data;
+    ivV2State.dossierReviewNote = '';
+    ivV2State.dossierReviewDirty = false;
     await ivV2LoadParticipants({ preserveSelection: true, allowBusy: true });
     showToast(decision === 'approved' ? '玩家档案已批准' : '玩家档案已退回修改', 'success');
   } catch (error) {
@@ -5914,6 +6024,13 @@ function ivV2HandleEditorInputOrChange(event) {
   const target = event.target;
   const action = target.dataset.ivV2Action;
   if (!action) return;
+  if (action === 'dossier-review-note') {
+    if (ivV2State.dossierBusy) return;
+    ivV2State.dossierReviewNote = String(target.value || '');
+    ivV2State.dossierReviewDirty = Boolean(ivV2State.dossierReviewNote.trim());
+    ivV2SyncConfirmedControls();
+    return;
+  }
   if (action === 'analysis-select-module') {
     if (ivV2OperationBusy()) return;
     ivV2State.selectedAnalysisModuleId = target.value;
@@ -6145,6 +6262,10 @@ function ivV2Reset() {
   ivV2State.participantResponse = null;
   ivV2State.selectedParticipantId = '';
   ivV2State.dossierResponse = null;
+  ivV2State.dossierReviewNote = '';
+  ivV2State.dossierReviewDirty = false;
+  ivV2State.dossierRerunKeys = {};
+  ivV2State.dossierRerunActiveParticipantId = '';
   ivV2State.dossierEvidenceCache = {};
   ivV2State.selectedDossierEvidenceId = '';
   ivV2State.reportBusy = false;

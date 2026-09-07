@@ -140,6 +140,13 @@ class AnalysisRerunIdempotencyConflictError(ValueError):
         super().__init__("analysis rerun idempotency conflict")
 
 
+class DossierRerunIdempotencyConflictError(ValueError):
+    """A shared rerun key already belongs to another input or stage."""
+
+    def __init__(self) -> None:
+        super().__init__("dossier rerun idempotency conflict")
+
+
 class ExportInputConflictError(ValueError):
     """The approved report or its upstream input moved during export."""
 
@@ -4663,6 +4670,355 @@ def review_participant_dossier_cas(
     )
 
 
+def _dossier_rerun_operation_path(
+    owner_key: str, project_id: str, idempotency_key: str
+) -> Path:
+    project_id = validate_resource_id(project_id, "project")
+    digest = _canonical_payload_sha256([owner_key, idempotency_key])[:32]
+    return _safe_child("projects", project_id, "dossier_reruns", f"{digest}.json")
+
+
+def _dossier_rerun_operation_digest(record: dict[str, Any]) -> str:
+    return _canonical_payload_sha256({
+        key: value for key, value in record.items()
+        if key not in {"operation_payload_sha256", "_claim_acquired"}
+    })
+
+
+def _validate_dossier_rerun_operation_locked(
+    record: dict[str, Any], *, owner_key: str, project_id: str,
+    idempotency_key: str,
+) -> dict[str, Any]:
+    for field, prefix in (
+        ("project_id", "project"), ("rerun_id", "rerun"),
+        ("participant_id", "participant"),
+        ("base_dossier_version_id", "dossier"),
+        ("dossier_version_id", "dossier"),
+    ):
+        if prefix == "participant":
+            _validate_entity_id(str(record.get(field) or ""), _PARTICIPANT_ID_RE, prefix)
+        else:
+            validate_resource_id(str(record.get(field) or ""), prefix)
+    source = record.get("source")
+    frozen_input = record.get("frozen_participant_input")
+    prompt_snapshot = record.get("prompt_snapshot")
+    model_configuration = record.get("model_configuration")
+    if (
+        record.get("operation_schema_version")
+        != "interview-participant-dossier-rerun-operation/1.0"
+        or record.get("project_id") != project_id
+        or record.get("owner_key_sha256")
+        != hashlib.sha256(owner_key.encode("utf-8")).hexdigest()
+        or record.get("idempotency_key_sha256")
+        != hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
+        or not _SHA256_RE.fullmatch(str(record.get("request_fingerprint") or ""))
+        or not _SHA256_RE.fullmatch(str(record.get("base_revision_payload_sha256") or ""))
+        or not isinstance(source, dict)
+        or not isinstance(frozen_input, dict)
+        or not isinstance(prompt_snapshot, dict)
+        or not isinstance(model_configuration, dict)
+        or record.get("source_payload_sha256") != _canonical_payload_sha256(source)
+        or record.get("status") not in {"pending", "completed"}
+        or not str(record.get("created_at") or "").strip()
+        or record.get("operation_payload_sha256")
+        != _dossier_rerun_operation_digest(record)
+    ):
+        raise ValueError("dossier rerun operation integrity check failed")
+    if record["status"] == "completed" and (
+        not str(record.get("completed_at") or "").strip()
+        or not _SHA256_RE.fullmatch(str(record.get("revision_payload_sha256") or ""))
+    ):
+        raise ValueError("completed dossier rerun operation is invalid")
+    return record
+
+
+def _committed_dossier_revision_locked(
+    project_id: str, participant_id: str, dossier_version_id: str,
+) -> dict[str, Any] | None:
+    directory = _dossier_participant_dir(project_id, participant_id)
+    dossier_version_id = validate_resource_id(dossier_version_id, "dossier")
+    state = _read_json(directory / "state.json")
+    if state is None:
+        return None
+    history = state.get("history")
+    if not isinstance(history, list) or any(not isinstance(item, dict) for item in history):
+        raise ValueError("participant dossier history is invalid")
+    entries = [
+        item for item in history
+        if item.get("dossier_version_id") == dossier_version_id
+    ]
+    if not entries:
+        return None
+    revision = _read_json(directory / "versions" / f"{dossier_version_id}.json")
+    if (
+        len(entries) != 1 or revision is None
+        or revision.get("project_id") != project_id
+        or revision.get("participant_id") != participant_id
+        or revision.get("dossier_version_id") != dossier_version_id
+        or _dossier_digest(revision) != revision.get("revision_payload_sha256")
+        or revision.get("revision_payload_sha256")
+        != entries[0].get("revision_payload_sha256")
+        or revision.get("version_number") != entries[0].get("version_number")
+    ):
+        raise ValueError("committed dossier integrity check failed")
+    return {"project_id": project_id, "state": state, "revision": revision}
+
+
+def load_participant_dossier(
+    project_id: str, participant_id: str, dossier_version_id: str,
+) -> dict[str, Any] | None:
+    """Read one verified historical dossier without changing its current head."""
+    with _STORE_LOCK:
+        with _mapping_process_lock(project_id):
+            return _committed_dossier_revision_locked(
+                project_id, participant_id, dossier_version_id
+            )
+
+
+def _require_dossier_source_current_locked(
+    project_id: str, source: dict[str, Any]
+) -> None:
+    state = _read_json(_analysis_boundary_state_path(project_id))
+    if state is None:
+        raise ValueError("dossier input changed")
+    verified = bool(state.get("state_payload_sha256"))
+    if verified:
+        state = _load_analysis_boundary_head_locked(state)["state"]
+    if bool(state.get("is_stale")) or (
+        verified and state.get("effective_status") != "READY_FOR_DOSSIERS"
+    ):
+        raise ValueError("dossier input changed")
+    for state_field, source_field in (
+        ("current_structure_revision_id", "structure_revision_id"),
+        ("current_evidence_revision_id", "evidence_revision_id"),
+        ("current_boundary_revision_id", "boundary_revision_id"),
+        ("current_boundary_payload_sha256", "boundary_payload_sha256"),
+        ("current_coverage_revision_id", "coverage_revision_id"),
+        ("current_coverage_payload_sha256", "coverage_payload_sha256"),
+    ):
+        if str(state.get(state_field) or "") != str(source.get(source_field) or ""):
+            raise ValueError("dossier input changed")
+
+
+def _recover_dossier_rerun_operation_locked(
+    path: Path, record: dict[str, Any]
+) -> dict[str, Any]:
+    saved = _committed_dossier_revision_locked(
+        record["project_id"], record["participant_id"], record["dossier_version_id"]
+    )
+    if saved is None:
+        if record["status"] == "completed":
+            raise ValueError("completed dossier rerun result is missing")
+        return record
+    revision = saved["revision"]
+    provenance = revision.get("rerun") or {}
+    if (
+        provenance.get("rerun_id") != record["rerun_id"]
+        or provenance.get("input_fingerprint") != record["request_fingerprint"]
+        or provenance.get("base_dossier_version_id")
+        != record["base_dossier_version_id"]
+        or revision.get("source") != record["source"]
+    ):
+        raise ValueError("dossier rerun result identity mismatch")
+    if record["status"] == "completed":
+        if record["revision_payload_sha256"] != revision["revision_payload_sha256"]:
+            raise ValueError("dossier rerun result digest mismatch")
+        return record
+    completed = {
+        **record, "status": "completed",
+        "completed_at": revision.get("created_at"),
+        "revision_payload_sha256": revision["revision_payload_sha256"],
+    }
+    completed["operation_payload_sha256"] = _dossier_rerun_operation_digest(completed)
+    _atomic_write_json(path, completed)
+    return completed
+
+
+def load_dossier_rerun_operation(
+    *, owner_key: str, project_id: str, idempotency_key: str,
+) -> dict[str, Any] | None:
+    path = _dossier_rerun_operation_path(owner_key, project_id, idempotency_key)
+    with _STORE_LOCK:
+        with _mapping_process_lock(project_id):
+            record = _read_json(path)
+            if record is None:
+                return None
+            record = _validate_dossier_rerun_operation_locked(
+                record, owner_key=owner_key, project_id=project_id,
+                idempotency_key=idempotency_key,
+            )
+            return _recover_dossier_rerun_operation_locked(path, record)
+
+
+def claim_participant_dossier_rerun(
+    *, owner_key: str, project_id: str, idempotency_key: str,
+    request_fingerprint: str, base_dossier_version_id: str,
+    base_revision_payload_sha256: str, participant_id: str,
+    source: dict[str, Any], frozen_participant_input: dict[str, Any],
+    prompt_snapshot: dict[str, Any], model_configuration: dict[str, Any],
+    created_at: str,
+) -> dict[str, Any]:
+    """Reserve one owner/project key across all shared rerun stages."""
+    project_id = validate_resource_id(project_id, "project")
+    base_dossier_version_id = validate_resource_id(base_dossier_version_id, "dossier")
+    participant_id = _validate_entity_id(participant_id, _PARTICIPANT_ID_RE, "participant")
+    if not owner_key or not idempotency_key or not created_at:
+        raise ValueError("dossier rerun identity is missing")
+    if any(not _SHA256_RE.fullmatch(str(value or "")) for value in (
+        request_fingerprint, base_revision_payload_sha256,
+    )):
+        raise ValueError("dossier rerun fingerprint is invalid")
+    if any(not isinstance(value, dict) for value in (
+        source, frozen_participant_input, prompt_snapshot, model_configuration,
+    )):
+        raise ValueError("dossier rerun frozen input is invalid")
+    path = _dossier_rerun_operation_path(owner_key, project_id, idempotency_key)
+    with _STORE_LOCK:
+        with _mapping_process_lock(project_id):
+            if (
+                _read_json(_analysis_rerun_operation_path(owner_key, project_id, idempotency_key)) is not None
+                or _read_json(_report_rerun_operation_path(owner_key, project_id, idempotency_key)) is not None
+            ):
+                raise DossierRerunIdempotencyConflictError()
+            existing = _read_json(path)
+            if existing is not None:
+                existing = _validate_dossier_rerun_operation_locked(
+                    existing, owner_key=owner_key, project_id=project_id,
+                    idempotency_key=idempotency_key,
+                )
+                if existing["request_fingerprint"] != request_fingerprint:
+                    raise DossierRerunIdempotencyConflictError()
+                return {
+                    **_recover_dossier_rerun_operation_locked(path, existing),
+                    "_claim_acquired": False,
+                }
+            record = {
+                "operation_schema_version": "interview-participant-dossier-rerun-operation/1.0",
+                "project_id": project_id,
+                "owner_key_sha256": hashlib.sha256(owner_key.encode("utf-8")).hexdigest(),
+                "idempotency_key_sha256": hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest(),
+                "request_fingerprint": request_fingerprint,
+                "base_dossier_version_id": base_dossier_version_id,
+                "base_revision_payload_sha256": base_revision_payload_sha256,
+                "participant_id": participant_id,
+                "source": deepcopy(source),
+                "source_payload_sha256": _canonical_payload_sha256(source),
+                "frozen_participant_input": deepcopy(frozen_participant_input),
+                "prompt_snapshot": deepcopy(prompt_snapshot),
+                "model_configuration": deepcopy(model_configuration),
+                "rerun_id": f"rerun_{uuid.uuid4().hex}",
+                "dossier_version_id": f"dossier_{uuid.uuid4().hex}",
+                "status": "pending", "created_at": created_at,
+            }
+            record["operation_payload_sha256"] = _dossier_rerun_operation_digest(record)
+            _atomic_write_json(path, record)
+            return {**record, "_claim_acquired": True}
+
+
+def save_participant_dossier_rerun_cas(
+    *, owner_key: str, project_id: str, idempotency_key: str,
+    request_fingerprint: str, revision: dict[str, Any],
+) -> dict[str, Any]:
+    """Commit the dossier version and head after one locked base/source check."""
+    path = _dossier_rerun_operation_path(owner_key, project_id, idempotency_key)
+    with _STORE_LOCK:
+        with _mapping_process_lock(project_id):
+            operation = _read_json(path)
+            if operation is None:
+                raise ValueError("dossier rerun operation is missing")
+            operation = _validate_dossier_rerun_operation_locked(
+                operation, owner_key=owner_key, project_id=project_id,
+                idempotency_key=idempotency_key,
+            )
+            if operation["request_fingerprint"] != request_fingerprint:
+                raise DossierRerunIdempotencyConflictError()
+            provenance = revision.get("rerun") or {}
+            if (
+                operation["status"] != "pending"
+                or revision.get("dossier_version_id") != operation["dossier_version_id"]
+                or revision.get("participant_id") not in {None, operation["participant_id"]}
+                or revision.get("status") != "generated"
+                or (revision.get("review") or {}) != {}
+                or revision.get("source") != operation["source"]
+                or provenance.get("rerun_id") != operation["rerun_id"]
+                or provenance.get("input_fingerprint") != request_fingerprint
+                or provenance.get("base_dossier_version_id")
+                != operation["base_dossier_version_id"]
+            ):
+                raise ValueError("dossier rerun result identity mismatch")
+            directory = _dossier_participant_dir(project_id, operation["participant_id"])
+            state_path = directory / "state.json"
+            state = _read_json(state_path)
+            if state is None or state.get("current_dossier_version_id") != operation["base_dossier_version_id"]:
+                raise ValueError("participant dossier version conflict")
+            base = _committed_dossier_revision_locked(
+                project_id, operation["participant_id"], operation["base_dossier_version_id"]
+            )
+            if (
+                base is None
+                or base["revision"].get("revision_payload_sha256")
+                != operation["base_revision_payload_sha256"]
+            ):
+                raise ValueError("participant dossier digest changed")
+            _require_dossier_source_current_locked(project_id, operation["source"])
+            durable = deepcopy(revision)
+            durable["project_id"] = project_id
+            durable["participant_id"] = operation["participant_id"]
+            next_number = int(state.get("current_version_number") or 0) + 1
+            durable["version_number"] = next_number
+            durable["revision_payload_sha256"] = _dossier_digest(durable)
+            version_path = directory / "versions" / f"{operation['dossier_version_id']}.json"
+            if version_path.exists():
+                raise ValueError("participant dossier rerun revision already exists")
+            _atomic_write_json(version_path, durable)
+            next_state = {
+                **state,
+                "current_dossier_version_id": durable["dossier_version_id"],
+                "current_version_number": next_number,
+                "status": durable["status"],
+                "source": deepcopy(durable["source"]),
+                "history": [*list(state.get("history") or []), {
+                    "dossier_version_id": durable["dossier_version_id"],
+                    "version_number": next_number,
+                    "revision_payload_sha256": durable["revision_payload_sha256"],
+                    "created_at": durable.get("created_at"),
+                    "status": durable["status"],
+                }],
+            }
+            _atomic_write_json(state_path, next_state)
+            completed = _recover_dossier_rerun_operation_locked(path, operation)
+            return {"state": next_state, "revision": durable, "operation": completed}
+
+
+def release_participant_dossier_rerun(
+    *, owner_key: str, project_id: str, idempotency_key: str,
+    request_fingerprint: str, dossier_version_id: str,
+) -> bool:
+    """Release only a matching uncommitted reservation."""
+    dossier_version_id = validate_resource_id(dossier_version_id, "dossier")
+    path = _dossier_rerun_operation_path(owner_key, project_id, idempotency_key)
+    with _STORE_LOCK:
+        with _mapping_process_lock(project_id):
+            record = _read_json(path)
+            if record is None:
+                return False
+            record = _validate_dossier_rerun_operation_locked(
+                record, owner_key=owner_key, project_id=project_id,
+                idempotency_key=idempotency_key,
+            )
+            if (
+                record["status"] == "completed"
+                or record["request_fingerprint"] != request_fingerprint
+                or record["dossier_version_id"] != dossier_version_id
+                or _committed_dossier_revision_locked(
+                    project_id, record["participant_id"], dossier_version_id
+                ) is not None
+            ):
+                return False
+            path.unlink(missing_ok=True)
+            return True
+
+
 # Cross-participant analysis checkpoint -----------------------------------------
 
 def _analysis_dir(project_id: str) -> Path:
@@ -4977,7 +5333,10 @@ def claim_analysis_module_rerun(
     path = _analysis_rerun_operation_path(owner_key, project_id, idempotency_key)
     with _STORE_LOCK:
         with _mapping_process_lock(project_id):
-            if _read_json(_report_rerun_operation_path(owner_key, project_id, idempotency_key)) is not None:
+            if (
+                _read_json(_report_rerun_operation_path(owner_key, project_id, idempotency_key)) is not None
+                or _read_json(_dossier_rerun_operation_path(owner_key, project_id, idempotency_key)) is not None
+            ):
                 raise AnalysisRerunIdempotencyConflictError()
             existing = _read_json(path)
             if existing is not None:
@@ -5261,7 +5620,10 @@ def claim_report_rerun_operation(
     path = _report_rerun_operation_path(owner_key, project_id, idempotency_key)
     with _STORE_LOCK:
         with _mapping_process_lock(project_id):
-            if _read_json(_analysis_rerun_operation_path(owner_key, project_id, idempotency_key)) is not None:
+            if (
+                _read_json(_analysis_rerun_operation_path(owner_key, project_id, idempotency_key)) is not None
+                or _read_json(_dossier_rerun_operation_path(owner_key, project_id, idempotency_key)) is not None
+            ):
                 raise ReportRerunIdempotencyConflictError()
             existing = _read_json(path)
             if existing is not None:

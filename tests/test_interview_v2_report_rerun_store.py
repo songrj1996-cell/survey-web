@@ -230,6 +230,28 @@ class InterviewV2ReportRerunStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "integrity"):
             self._claim()
 
+    def test_report_key_conflicts_with_participant_dossier_stage(self):
+        store.claim_participant_dossier_rerun(
+            owner_key=OWNER, project_id=PROJECT,
+            idempotency_key="dossier-stage-first",
+            request_fingerprint="b" * 64,
+            base_dossier_version_id="dossier_" + "7" * 32,
+            base_revision_payload_sha256="c" * 64,
+            participant_id="participant_" + "8" * 32,
+            source={}, frozen_participant_input={}, prompt_snapshot={},
+            model_configuration={}, created_at="2026-09-03T00:04:00Z",
+        )
+        with self.assertRaises(store.ReportRerunIdempotencyConflictError):
+            store.claim_report_rerun_operation(
+                owner_key=OWNER, project_id=PROJECT,
+                idempotency_key="dossier-stage-first",
+                request_fingerprint=FINGERPRINT, rerun_id=RERUN,
+                report_version_id=NEXT_REPORT,
+                base_report_version_id=BASE_REPORT,
+                section_id=SECTION, base_section_revision=1,
+                created_at="2026-09-03T00:05:00Z",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -26,6 +26,9 @@ class DossierFrontendContractTests(unittest.TestCase):
     def test_regenerate_and_review_send_version_heads(self):
         self.assertIn('base_dossier_version_id: ivV2State.dossierResponse?.dossier_version_id || null', JS)
         self.assertIn('base_dossier_version_id: ivV2State.dossierResponse.dossier_version_id', JS)
+        self.assertIn("['generated', 'approved', 'needs_changes'].includes(ivV2State.dossierResponse?.status)", JS)
+        self.assertIn("from_stage: 'participant_dossier'", JS)
+        self.assertIn("'Idempotency-Key': idempotencyKey", JS)
         self.assertIn("if (response.status === 409)", JS)
 
     def test_all_dossier_states_are_rendered(self):

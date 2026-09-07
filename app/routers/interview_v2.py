@@ -93,6 +93,10 @@ from app.services.interview_v2_analysis_rerun_service import (
     create_analysis_module_rerun,
     validate_analysis_rerun_access,
 )
+from app.services.interview_v2_dossier_rerun_service import (
+    create_participant_dossier_rerun,
+    validate_dossier_rerun_access,
+)
 from app.services.interview_v2_report_service import (
     create_report,
     get_report,
@@ -1208,7 +1212,13 @@ async def rerun_interview_v2_report_section(
         return _error_response(
             request,
             status_code=400,
-            code=("ANALYSIS_RERUN_REQUEST_INVALID" if isinstance(raw, dict) and raw.get("from_stage") == "analysis_module" else "REPORT_RERUN_REQUEST_INVALID"),
+            code=(
+                "ANALYSIS_RERUN_REQUEST_INVALID"
+                if isinstance(raw, dict) and raw.get("from_stage") == "analysis_module"
+                else "DOSSIER_RERUN_REQUEST_INVALID"
+                if isinstance(raw, dict) and raw.get("from_stage") == "participant_dossier"
+                else "REPORT_RERUN_REQUEST_INVALID"
+            ),
             message="局部重跑请求格式无效。",
             suggested_action="refresh_report_inputs",
         )
@@ -1224,6 +1234,10 @@ async def rerun_interview_v2_report_section(
             suggested_action="retry_report",
         )
     try:
+        if payload["from_stage"] == "participant_dossier":
+            return await _run_participant_dossier_rerun_response(
+                project_id, payload, login, request, idempotency_key,
+            )
         if payload["from_stage"] == "analysis_module":
             return await _run_analysis_module_rerun_response(
                 project_id, payload, login, request, idempotency_key,
@@ -1259,6 +1273,44 @@ async def rerun_interview_v2_report_section(
             "section_id": payload["section_id"],
             "base_report_version_id": payload["base_report_version_id"],
             "report_version_id": result.get("report_version_id"),
+            "rerun_id": (result.get("rerun") or {}).get("rerun_id"),
+            "reused": bool((result.get("rerun") or {}).get("reused")),
+        },
+    )
+    return result
+
+
+async def _run_participant_dossier_rerun_response(
+    project_id: str, payload: dict, login: dict | None, request: Request,
+    idempotency_key: str,
+) -> dict:
+    await run_in_threadpool(
+        validate_dossier_rerun_access, project_id, payload, login
+    )
+    idempotency_key = validate_report_rerun_idempotency_key(idempotency_key)
+    api_key = await require_request_llm_api_key(request)
+    result = await run_with_llm_api_key(
+        create_participant_dossier_rerun(
+            project_id, payload, login, idempotency_key
+        ),
+        api_key,
+        request=request,
+        category="interview",
+        action="V2 单玩家档案重跑",
+        reference_id=payload["participant_id"],
+    )
+    await audit_log(
+        request,
+        "interview",
+        "重跑 V2 单玩家档案",
+        (
+            f"participant_id={payload['participant_id']}; "
+            f"dossier_version_id={result.get('dossier_version_id')}"
+        ),
+        metadata={
+            "participant_id": payload["participant_id"],
+            "base_dossier_version_id": payload["base_dossier_version_id"],
+            "dossier_version_id": result.get("dossier_version_id"),
             "rerun_id": (result.get("rerun") or {}).get("rerun_id"),
             "reused": bool((result.get("rerun") or {}).get("reused")),
         },

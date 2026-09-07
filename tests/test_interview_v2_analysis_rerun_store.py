@@ -199,3 +199,20 @@ class AnalysisModuleRerunStoreTests(unittest.TestCase):
             r"^report rerun idempotency conflict$",
         ):
             store.claim_report_rerun_operation(**{**report_args, "idempotency_key": self.args["idempotency_key"]})
+
+        dossier = store.load_current_participant_dossier(f.PROJECT, f.fixtures.P1)["revision"]
+        dossier_args = {
+            "owner_key": self.args["owner_key"], "project_id": f.PROJECT,
+            "idempotency_key": "dossier-first", "request_fingerprint": "2" * 64,
+            "base_dossier_version_id": dossier["dossier_version_id"],
+            "base_revision_payload_sha256": dossier["revision_payload_sha256"],
+            "participant_id": f.fixtures.P1, "source": dossier["source"],
+            "frozen_participant_input": {"participant_id": f.fixtures.P1},
+            "prompt_snapshot": {}, "model_configuration": {},
+            "created_at": self.args["created_at"],
+        }
+        store.claim_participant_dossier_rerun(**dossier_args)
+        with self.assertRaises(store.AnalysisRerunIdempotencyConflictError):
+            store.claim_analysis_module_rerun(**{
+                **self.args, "idempotency_key": "dossier-first"
+            })
