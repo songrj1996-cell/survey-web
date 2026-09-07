@@ -518,6 +518,10 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
         ])
 
         with (
+            patch.object(
+                survey_service, "_report_writer_attempt_callback",
+                wraps=survey_service._report_writer_attempt_callback,
+            ) as diagnostic_callback,
             patch.object(survey_service, "get_session", return_value=sess),
             patch.object(survey_service, "_current_login", new=AsyncMock(return_value=None)),
             patch.object(
@@ -544,6 +548,13 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
             events = [event async for event in survey_service.report_stream("sid", object())]
 
         self.assertEqual(direct.await_count, 7)
+        contexts = [call.kwargs for call in diagnostic_callback.call_args_list]
+        self.assertEqual([ctx["step"] for ctx in contexts], [
+            "title", "part", "bug_check", "core", "core_review", "action", "action_repair",
+        ])
+        self.assertEqual(len({ctx["run_id"] for ctx in contexts}), 1)
+        self.assertEqual({ctx["session_id"] for ctx in contexts}, {"sid"})
+        self.assertEqual(contexts[1]["part_index"], 1)
         self.assertIn("不要改变建议", direct.await_args_list[-1].args[1])
         self.assertIn("## 行动建议\n\n1. **修复消息丢失**", sess["report_md"])
         self.assertNotIn("| 建议内容 |", sess["report_md"])

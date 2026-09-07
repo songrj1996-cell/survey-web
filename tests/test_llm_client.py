@@ -1,5 +1,6 @@
 import asyncio
 import json
+from datetime import datetime
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -79,6 +80,17 @@ class DirectLLMClientTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsInstance(event.get("usage_complete"), bool)
                 self.assertNotIn(call_id, terminal)
                 terminal[call_id] = event
+                self.assertGreaterEqual(event["elapsed_seconds"], 0)
+                self.assertGreaterEqual(
+                    datetime.fromisoformat(event["completed_at"]),
+                    datetime.fromisoformat(event["started_at"]),
+                )
+                if event["status"] == "completed":
+                    self.assertIsNone(event["error_category"])
+                    self.assertIsNone(event["error_type"])
+                else:
+                    self.assertTrue(event["error_category"])
+                    self.assertTrue(event["error_type"])
 
         self.assertEqual(set(started), set(terminal))
         for call_id, start_event in started.items():
@@ -89,6 +101,8 @@ class DirectLLMClientTests(unittest.IsolatedAsyncioTestCase):
                 "requested_model",
                 "protocol",
                 "fallback",
+                "request_id", "previous_call_id", "attempt_kind", "started_at",
+                "max_output_tokens",
             ):
                 self.assertEqual(start_event[key], terminal_event[key])
 
@@ -150,6 +164,8 @@ class DirectLLMClientTests(unittest.IsolatedAsyncioTestCase):
             "total_tokens": 7,
         })
         self.assertFalse(events[1]["usage_complete"])
+        self.assertEqual(events[1]["error_category"], "cancelled")
+        self.assertEqual(events[1]["error_type"], "CancelledError")
 
     async def test_claude_uses_messages_and_retries_midstream_safely(self):
         client = _FakeClient([
@@ -285,7 +301,120 @@ class DirectLLMClientTests(unittest.IsolatedAsyncioTestCase):
             "total_tokens": 17,
         })
         self.assertTrue(events[1]["usage_complete"])
+
         self.assertEqual(events[1]["response_model"], "gpt-test-2026-08-31")
+
+    async def test_chat_and_responses_truncation_have_safe_diagnostics(self):
+        for protocol, line, reason in (
+            ("chat", _sse({"choices": [{"delta": {"content": "partial"}, "finish_reason": "length"}]}), "length"),
+            ("responses", _sse({"type": "response.incomplete", "response": {
+                "status": "incomplete", "output_text": "partial",
+                "incomplete_details": {"reason": "max_output_tokens"},
+            }}), "max_output_tokens"),
+        ):
+            with self.subTest(protocol=protocol):
+                events = []
+                client = _FakeClient([_FakeResponse(lines=[line])])
+                with (
+                    patch.object(llm_client, "LLM_API_BASE", "https://llm.example/v1"),
+                    patch.object(llm_client, "LLM_API_KEY", "secret"),
+                    patch.object(llm_client, "_protocol_order", return_value=(protocol,)),
+                    patch.object(llm_client, "LLM_REPORT_MAX_ATTEMPTS", 3),
+                    patch.object(llm_client.httpx, "AsyncClient", return_value=client),
+                ):
+                    with self.assertRaises(RuntimeError):
+                        await llm_client.collect_chat_completion(
+                            [{"role": "user", "content": "private prompt"}],
+                            models=("model-a",), on_attempt_event=events.append,
+                        )
+                self.assert_attempt_pairs(events)
+                self.assertEqual(len(client.calls), 1)
+                self.assertEqual(events[-1]["error_category"], "output_truncated")
+                self.assertEqual(events[-1]["finish_reason"], reason)
+                self.assertEqual(events[-1]["http_status"], 200)
+                self.assertNotIn("private prompt", json.dumps(events))
+                self.assertNotIn("partial", json.dumps(events))
+
+    async def test_retry_and_protocol_switch_are_distinguishable(self):
+        for status, protocols, category, kind in (
+            (429, ("chat",), "rate_limited", "retry"),
+            (503, ("chat",), "http_error", "retry"),
+            (404, ("responses", "chat"), "protocol_incompatible", "protocol_fallback"),
+        ):
+            with self.subTest(status=status):
+                events = []
+                client = _FakeClient([
+                    _FakeResponse(status, body=b'private body secret'),
+                    _FakeResponse(lines=[_sse({"choices": [{
+                        "delta": {"content": "ok"}, "finish_reason": "stop",
+                    }]})]),
+                ])
+                with (
+                    patch.object(llm_client, "LLM_API_BASE", "https://llm.example/v1"),
+                    patch.object(llm_client, "LLM_API_KEY", "secret"),
+                    patch.object(llm_client, "_protocol_order", return_value=protocols),
+                    patch.object(llm_client, "LLM_REPORT_MAX_ATTEMPTS", 2),
+                    patch.object(llm_client.httpx, "AsyncClient", return_value=client),
+                    patch.object(llm_client.asyncio, "sleep", new=AsyncMock()) as sleep,
+                ):
+                    result = await llm_client.collect_chat_completion(
+                        [{"role": "user", "content": "private prompt"}],
+                        models=("model-a",), on_attempt_event=events.append,
+                    )
+                self.assertEqual(result, ("ok", "model-a"))
+                self.assert_attempt_pairs(events)
+                self.assertEqual(len(client.calls), 2)
+                self.assertEqual(events[1]["http_status"], status)
+                self.assertEqual(events[1]["error_category"], category)
+                self.assertEqual(events[2]["attempt_kind"], kind)
+                self.assertEqual(events[2]["previous_call_id"], events[0]["call_id"])
+                self.assertEqual(events[2]["request_id"], events[0]["request_id"])
+                self.assertEqual(sleep.await_count, 1 if kind == "retry" else 0)
+                for private in ("private body", "private prompt", "secret"):
+                    self.assertNotIn(private, json.dumps(events))
+
+    async def test_timeout_retries_keep_cause_and_unknown_usage(self):
+        events = []
+        request = AsyncMock(side_effect=[
+            httpx.ReadTimeout("private endpoint and secret"),
+            llm_client._LLMResult(answer="ok"),
+        ])
+        with (
+            patch.object(llm_client, "LLM_API_BASE", "https://llm.example/v1"),
+            patch.object(llm_client, "LLM_API_KEY", "secret"),
+            patch.object(llm_client, "_protocol_order", return_value=("chat",)),
+            patch.object(llm_client, "LLM_REPORT_MAX_ATTEMPTS", 2),
+            patch.object(llm_client, "_request_once", new=request),
+            patch.object(llm_client.httpx, "AsyncClient", return_value=_FakeClient([])),
+            patch.object(llm_client.asyncio, "sleep", new=AsyncMock()),
+        ):
+            result = await llm_client.collect_chat_completion(
+                [{"role": "user", "content": "prompt"}],
+                models=("model-a",), on_attempt_event=events.append,
+            )
+        self.assertEqual(result, ("ok", "model-a"))
+        self.assert_attempt_pairs(events)
+        self.assertEqual(request.await_count, 2)
+        self.assertEqual(events[1]["error_category"], "read_timeout")
+        self.assertEqual(events[1]["error_type"], "ReadTimeout")
+        self.assertIsNone(events[1]["http_status"])
+        self.assertIsNone(events[1]["usage"])
+        self.assertFalse(events[1]["usage_complete"])
+        self.assertEqual(events[2]["attempt_kind"], "retry")
+        self.assertNotIn("private endpoint", json.dumps(events))
+
+    def test_diagnostic_codes_do_not_copy_unknown_upstream_text(self):
+        self.assertEqual(llm_client._diagnostic_finish_reason("private response secret"), "unknown")
+        self.assertIsNone(llm_client._diagnostic_finish_reason(None))
+        for error, expected in (
+            (httpx.ConnectTimeout("private"), "connect_timeout"),
+            (httpx.WriteTimeout("private"), "write_timeout"),
+            (httpx.PoolTimeout("private"), "pool_timeout"),
+            (httpx.ConnectError("private"), "transport_error"),
+            (ValueError("private"), "unexpected_error"),
+            (llm_client._http_error("model", "chat", 401, "private"), "authentication_error"),
+        ):
+            self.assertEqual(llm_client._attempt_error_category(error), expected)
 
     async def test_messages_combines_input_with_final_cumulative_output_usage(self):
         client = _FakeClient([_FakeResponse(lines=[
@@ -428,6 +557,9 @@ class DirectLLMClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(events[1]["usage_complete"])
         self.assertIsNone(events[-1]["usage"])
         self.assertFalse(events[-1]["usage_complete"])
+        self.assertEqual(events[1]["error_category"], "usage_option_incompatible")
+        self.assertEqual(events[2]["attempt_kind"], "usage_compatibility")
+        self.assertEqual(events[2]["previous_call_id"], events[0]["call_id"])
 
     async def test_claude_5_uses_adaptive_thinking_and_effort(self):
         client = _FakeClient([_FakeResponse(lines=[
@@ -705,6 +837,13 @@ class DirectLLMClientTests(unittest.IsolatedAsyncioTestCase):
             "total_tokens": 40,
         })
         self.assertTrue(events[1]["usage_complete"])
+        self.assertEqual(events[1]["error_category"], "output_truncated")
+        self.assertEqual(events[1]["finish_reason"], "max_tokens")
+        # 400 is a local validation flag; the actual upstream HTTP response was 200.
+        self.assertEqual(events[1]["http_status"], 200)
+        self.assertEqual(events[2]["attempt_kind"], "model_fallback")
+        self.assertEqual(events[2]["previous_call_id"], events[0]["call_id"])
+        self.assertEqual(events[2]["request_id"], events[0]["request_id"])
 
 
 if __name__ == "__main__":
