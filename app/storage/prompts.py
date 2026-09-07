@@ -17,6 +17,7 @@ from app.core.config import (
     DEFAULT_COMMENT_QUOTE_BATCH_SYSTEM_PROMPT,
     DEFAULT_COMMENT_QUOTE_FINAL_SYSTEM_PROMPT,
     DEFAULT_COMMENT_RELEVANCE_SYSTEM_PROMPT,
+    DEFAULT_CROSS_QUESTION_VIEWPOINT_SYSTEM_PROMPT,
     DEFAULT_COMMENT_REPORT_SYSTEM_PROMPT,
     DEFAULT_CROSSTAB_PLANNER_SYSTEM_PROMPT,
     DEFAULT_INTERVIEW_AUDIT_SYSTEM_PROMPT,
@@ -193,6 +194,17 @@ DEFAULT_PROMPTS: dict = {
         kind="system",
         current=DEFAULT_THEME_MERGE_SYSTEM_PROMPT,
         version=2,
+    ),
+    "cross_question_viewpoint_system": _prompt(
+        "cross_question_viewpoint_system",
+        "跨题共同观点筛选 System Prompt",
+        "用于从逐题主题中筛选至少跨越两道题的共同玩家观点。",
+        group="大样本开放题",
+        group_order=30,
+        order=25,
+        kind="system",
+        current=DEFAULT_CROSS_QUESTION_VIEWPOINT_SYSTEM_PROMPT,
+        version=1,
     ),
     "response_classify_system": _prompt(
         "response_classify_system",
@@ -501,6 +513,10 @@ def _get_theme_extract_system_prompt() -> str:
 
 def _get_theme_merge_system_prompt() -> str:
     return _get_prompt_text("theme_merge_system")
+
+
+def _get_cross_question_viewpoint_system_prompt() -> str:
+    return _get_prompt_text("cross_question_viewpoint_system")
 
 
 def _get_response_classify_system_prompt() -> str:

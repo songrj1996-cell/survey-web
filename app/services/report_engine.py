@@ -841,6 +841,8 @@ async def _run_bounded_calls(
     call_factories: list,
     concurrency: int,
     event_queue: asyncio.Queue | None = None,
+    *,
+    deadline: float | None = None,
 ):
     """有限并发执行批次，并在等待期间产生 heartbeat 事件。"""
     semaphore = asyncio.Semaphore(max(1, concurrency))
@@ -857,12 +859,20 @@ async def _run_bounded_calls(
     try:
         while pending:
             waiters = pending | ({queue_task} if queue_task else set())
+            wait_timeout = LLM_STREAM_HEARTBEAT_SECONDS
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError("stage deadline exceeded")
+                wait_timeout = min(wait_timeout, remaining)
             done, _ = await asyncio.wait(
                 waiters,
-                timeout=LLM_STREAM_HEARTBEAT_SECONDS,
+                timeout=wait_timeout,
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if not done:
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise asyncio.TimeoutError("stage deadline exceeded")
                 yield ("heartbeat", None)
                 continue
             if queue_task and queue_task in done:

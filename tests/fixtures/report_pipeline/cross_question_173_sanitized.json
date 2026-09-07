@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "source": "sanitized_synthetic_scale_from_173_candidate_incident",
+  "expected_candidate_count": 173,
+  "respondents_per_question": 60,
+  "question_theme_counts": [18, 18, 18, 17, 17, 17, 17, 17, 17, 17],
+  "common_viewpoints": [
+    "入口与操作路径不够清楚",
+    "运行流畅度影响体验",
+    "奖励反馈缺少吸引力",
+    "新手说明不够直观"
+  ],
+  "unique_theme_prefix": "仅本题出现的独有反馈"
+}
