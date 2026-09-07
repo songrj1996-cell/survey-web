@@ -17,13 +17,18 @@ from app.routers.google_forms_families import create_google_forms_families_route
 from app.services import report_history
 from app.services.google_forms_family_api import GoogleFormsFamilyApi
 from app.services.google_forms_snapshot_api import GoogleFormsQuestionnaireSnapshotApi
+from app.services.questionnaire_family_mapping import (
+    FamilyVariantSnapshot,
+    build_questionnaire_family,
+)
 from app.services.report_engine import _batch_qualitative_analysis
 from app.services.survey_service import columns_require_llm
 from app.storage.questionnaire_families import FileQuestionnaireFamilyStorage
 from app.storage.research_assets import FileResearchAssetStorage
 from app.storage.sessions import get_session
-from tests.test_google_forms_family_api import LOGIN, OWNER, _Client, _family
+from tests.test_google_forms_family_api import LOGIN, OWNER, _Client
 from tests.test_google_forms_family_binding import _response
+from tests.test_questionnaire_family_mapping import TITLE, semantics, snapshot
 
 
 class GoogleFormsFamilyAnalysisFlowTests(unittest.IsolatedAsyncioTestCase):
@@ -49,7 +54,7 @@ class GoogleFormsFamilyAnalysisFlowTests(unittest.IsolatedAsyncioTestCase):
             "FORM_ID": GoogleFormResponsesCapture(
                 form_id="FORM_ID",
                 responses=(
-                    _response("shared", "id", "Peringkat", "Jawaban asli"),
+                    _response("shared", "id", "Mode khusus", "Jawaban asli"),
                 ),
                 page_count=1,
             ),
@@ -66,7 +71,20 @@ class GoogleFormsFamilyAnalysisFlowTests(unittest.IsolatedAsyncioTestCase):
             family_storage=self.family_storage,
             semantic_translator=AsyncMock(return_value={}),
         )
-        family = _family()
+        en = snapshot("FORM_EN", "en", include_discord=True, include_other=True)
+        id_form = snapshot(
+            "FORM_ID", "id", reorder=True, include_other=True
+        )
+        declared = [("en", "FORM_EN", en), ("id", "FORM_ID", id_form)]
+        family = build_questionnaire_family(
+            owner_ref=OWNER,
+            title=TITLE,
+            variants=[
+                FamilyVariantSnapshot(language=language, snapshot=source)
+                for language, _, source in declared
+            ],
+            semantic_questions=semantics(declared),
+        )
         self.family_storage.save_family(family)
         self.family = family
 
@@ -87,6 +105,10 @@ class GoogleFormsFamilyAnalysisFlowTests(unittest.IsolatedAsyncioTestCase):
             patch(
                 "app.routers.google_forms_families._owner_key",
                 return_value=OWNER,
+            ),
+            patch(
+                "app.routers.survey._current_login",
+                new=AsyncMock(return_value=LOGIN),
             ),
             patch("app.storage.sessions._SESSION_DIR", self.session_dir),
             patch(
@@ -157,6 +179,37 @@ class GoogleFormsFamilyAnalysisFlowTests(unittest.IsolatedAsyncioTestCase):
                 for item in provenance
                 for answer in item["answers"]
             ),
+        )
+
+        choice_column = next(
+            item
+            for item in stored["columns_detected"]
+            if item["role"] == "single_choice"
+        )
+        self.assertEqual(choice_column["other_text"]["count"], 1)
+        self.assertEqual(choice_column["other_text"]["values"], ["Mode khusus"])
+        choice_index = choice_column["column_indexes"][0]
+        choice_plan = {
+            "columns": [{
+                "index": choice_index,
+                "name": choice_column["name_zh"],
+                "role": choice_column["role"],
+                "options": choice_column["options"],
+                "other_text": choice_column["other_text"],
+            }],
+            "parts": [{"name": "Choice", "column_indexes": [choice_index]}],
+        }
+        choice_stats, choice_open_text = survey_stats.compute(
+            stored["rows"], choice_plan
+        )
+        self.assertIn("Other / 其他", choice_stats)
+        self.assertEqual(
+            [item["text"] for item in choice_open_text[choice_index]],
+            ["Mode khusus"],
+        )
+        self.assertEqual(
+            choice_open_text[choice_index][0]["source"],
+            "choice_other_text",
         )
 
         plan = {

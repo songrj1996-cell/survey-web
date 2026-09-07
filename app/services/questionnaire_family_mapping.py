@@ -40,6 +40,7 @@ _NON_SUBSTANTIVE_TYPES = {
     CanonicalQuestionType.SECTION,
     CanonicalQuestionType.STATIC_TEXT,
 }
+_OTHER_OPTION_LABEL = "Other / 其他"
 _METADATA_PATTERNS = (
     re.compile(r"\bdiscord(?:\s*id)?\b", re.IGNORECASE),
     re.compile(r"\be-?mail(?:\s*address)?\b", re.IGNORECASE),
@@ -113,7 +114,7 @@ def _semantic(
     variant_id: str,
     question: CanonicalQuestion,
 ) -> SemanticQuestionText:
-    return semantic_questions.get(
+    semantic = semantic_questions.get(
         (variant_id, question.question_id),
         SemanticQuestionText(
             title=question.title,
@@ -121,22 +122,42 @@ def _semantic(
             rows=tuple(row.label for row in question.rows),
         ),
     )
+    if len(semantic.options) != len(question.options):
+        return semantic
+    return SemanticQuestionText(
+        title=semantic.title,
+        options=tuple(
+            _OTHER_OPTION_LABEL if option.is_other else semantic.options[index]
+            for index, option in enumerate(question.options)
+        ),
+        rows=semantic.rows,
+    )
+
+
+def _other_option_count(question: CanonicalQuestion) -> int:
+    return sum(option.is_other for option in question.options)
+
+
+def _family_other_option_count(question: FamilyCanonicalQuestion) -> int:
+    return sum(option.is_other for option in question.options)
 
 
 def _compatible(left: CanonicalQuestion, right: CanonicalQuestion) -> bool:
     return (
         left.canonical_type == right.canonical_type
         and len(left.options) == len(right.options)
+        and _other_option_count(left) == _other_option_count(right)
         and len(left.rows) == len(right.rows)
     )
 
 
 def _structural_signature(
     question: CanonicalQuestion,
-) -> tuple[CanonicalQuestionType, int, int]:
+) -> tuple[CanonicalQuestionType, int, int, int]:
     return (
         question.canonical_type,
         len(question.options),
+        _other_option_count(question),
         len(question.rows),
     )
 
@@ -145,8 +166,8 @@ def _structural_position_offset(
     base_questions: list[CanonicalQuestion],
     provider_questions: list[CanonicalQuestion],
 ) -> int | None:
-    base_positions: dict[tuple[CanonicalQuestionType, int, int], list[int]] = {}
-    provider_positions: dict[tuple[CanonicalQuestionType, int, int], list[int]] = {}
+    base_positions: dict[tuple[CanonicalQuestionType, int, int, int], list[int]] = {}
+    provider_positions: dict[tuple[CanonicalQuestionType, int, int, int], list[int]] = {}
     for index, question in enumerate(base_questions):
         base_positions.setdefault(_structural_signature(question), []).append(index)
     for index, question in enumerate(provider_questions):
@@ -245,7 +266,12 @@ def _canonical_options(
             canonical_option_key=_stable_id(
                 "opt", family_id, question.question_id, str(index)
             ),
-            label=str(values[index] or question.options[index].value),
+            label=(
+                _OTHER_OPTION_LABEL
+                if question.options[index].is_other
+                else str(values[index] or question.options[index].value)
+            ),
+            is_other=question.options[index].is_other,
         )
         for index in range(len(question.options))
     ]
@@ -467,6 +493,8 @@ def build_questionnaire_family(
                 if canonical.role == FamilyQuestionRole.OPTIONAL_RESPONDENT_METADATA
                 and canonical.canonical_type == question.canonical_type
                 and len(canonical.options) == len(question.options)
+                and _family_other_option_count(canonical)
+                == _other_option_count(question)
                 and len(canonical.rows) == len(question.rows)
                 and not any(m.variant_id == variant_id for m in canonical.variant_mappings)
             ]
@@ -635,6 +663,8 @@ def build_questionnaire_family(
                 if not any(m.variant_id == variant_id for m in canonical.variant_mappings)
                 and canonical.canonical_type == question.canonical_type
                 and len(canonical.options) == len(question.options)
+                and _family_other_option_count(canonical)
+                == _other_option_count(question)
                 and len(canonical.rows) == len(question.rows)
             ]
             semantic_matches = [

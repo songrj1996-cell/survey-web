@@ -90,12 +90,16 @@ async def _stub_report_viewpoint_stats(*_args, **_kwargs):
 async def _stub_failed_report_viewpoint_stats(*_args, **_kwargs):
     yield ("diagnostics", {
         "status": "failed",
+        "strategy": "single_pass_selective_grouping",
+        "stage_budget_seconds": 300,
         "input_candidate_count": 170,
-        "final_input_candidate_count": 36,
-        "reduction_levels": 1,
-        "partial_failure_count": 0,
+        "final_input_candidate_count": 170,
+        "selected_candidate_count": 0,
+        "excluded_candidate_count": 170,
+        "reduction_levels": 0,
+        "partial_failure_count": 1,
         "calls": [{
-            "stage": "final",
+            "stage": "selective_grouping",
             "batch_index": 1,
             "input_candidate_count": 36,
             "output_theme_count": 0,
@@ -421,6 +425,9 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
         persisted = save_session.call_args.args[1]
         synthesis = persisted["report_viewpoint_diagnostics"]["synthesis"]
         self.assertEqual(synthesis["status"], "failed")
+        self.assertEqual(synthesis["strategy"], "single_pass_selective_grouping")
+        self.assertEqual(synthesis["stage_budget_seconds"], 300)
+        self.assertEqual(synthesis["excluded_candidate_count"], 170)
         self.assertEqual(synthesis["calls"][0]["error"], "finish_reason=length")
         self.assertNotIn("report_viewpoint_diagnostics", sess)
 
@@ -511,6 +518,10 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
         ])
 
         with (
+            patch.object(
+                survey_service, "_report_writer_attempt_callback",
+                wraps=survey_service._report_writer_attempt_callback,
+            ) as diagnostic_callback,
             patch.object(survey_service, "get_session", return_value=sess),
             patch.object(survey_service, "_current_login", new=AsyncMock(return_value=None)),
             patch.object(
@@ -537,6 +548,13 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
             events = [event async for event in survey_service.report_stream("sid", object())]
 
         self.assertEqual(direct.await_count, 7)
+        contexts = [call.kwargs for call in diagnostic_callback.call_args_list]
+        self.assertEqual([ctx["step"] for ctx in contexts], [
+            "title", "part", "bug_check", "core", "core_review", "action", "action_repair",
+        ])
+        self.assertEqual(len({ctx["run_id"] for ctx in contexts}), 1)
+        self.assertEqual({ctx["session_id"] for ctx in contexts}, {"sid"})
+        self.assertEqual(contexts[1]["part_index"], 1)
         self.assertIn("不要改变建议", direct.await_args_list[-1].args[1])
         self.assertIn("## 行动建议\n\n1. **修复消息丢失**", sess["report_md"])
         self.assertNotIn("| 建议内容 |", sess["report_md"])

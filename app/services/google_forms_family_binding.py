@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, replace
 from typing import Any
 
 from app.integrations.google_forms_responses_client import (
@@ -35,6 +36,7 @@ class SnapshotDetectedColumn:
     rows: tuple[str, ...] = ()
     scale_min: int | None = None
     scale_max: int | None = None
+    other_text: dict[str, Any] | None = None
 
     def to_session_value(self) -> dict[str, Any]:
         value: dict[str, Any] = {
@@ -55,6 +57,8 @@ class SnapshotDetectedColumn:
             value["scale_min"] = self.scale_min
         if self.scale_max is not None:
             value["scale_max"] = self.scale_max
+        if self.other_text is not None:
+            value["other_text"] = dict(self.other_text)
         return value
 
 
@@ -156,6 +160,18 @@ def _question_columns(
         headers.append(question.title)
         indexes[(question.canonical_question_key, None)] = target
         options = tuple(item.label for item in question.options)
+        other_text = (
+            {
+                "enabled": True,
+                "option": "Other / 其他",
+                "provider_declared": True,
+                "count": 0,
+                "examples": [],
+                "values": [],
+            }
+            if any(item.is_other for item in question.options)
+            else None
+        )
         scale_min = scale_max = None
         if role == "scale" and options:
             numeric: list[int] = []
@@ -175,6 +191,7 @@ def _question_columns(
             options=options,
             scale_min=scale_min,
             scale_max=scale_max,
+            other_text=other_text,
         ))
     language_index = len(headers)
     headers.append("来源语言")
@@ -219,9 +236,9 @@ def _answer_value(
     question: FamilyCanonicalQuestion,
     mapping,
     answer: GoogleResponseAnswer,
-) -> str:
+) -> tuple[str, tuple[str, ...]]:
     if answer.file_uploads:
-        return ""
+        return "", ()
     option_labels = {
         item.canonical_option_key: item.label for item in question.options
     }
@@ -230,10 +247,14 @@ def _answer_value(
         for item in mapping.option_mappings
     }
     values: list[str] = []
+    other_candidates: list[str] = []
+    provider_allows_other = any(item.is_other for item in question.options)
     for raw in answer.text_values:
         canonical_key = provider_to_canonical.get(raw)
         values.append(option_labels.get(canonical_key, raw))
-    return "\n".join(values)
+        if canonical_key is None and provider_allows_other and raw.strip():
+            other_candidates.append(raw)
+    return "\n".join(values), tuple(other_candidates)
 
 
 def bind_google_forms_family_responses(
@@ -274,6 +295,7 @@ def bind_google_forms_family_responses(
     unmatched = 0
     file_uploads = 0
     blocking = 0
+    other_candidates: dict[str, Counter[str]] = {}
 
     for variant in family.variants:
         capture = captures_by_form[variant.provider_form_id]
@@ -303,7 +325,15 @@ def bind_google_forms_family_responses(
                     unmatched += 1
                     blocking += 1
                     continue
-                row[target_index] = _answer_value(question, mapping, answer)
+                answer_value, answer_other_candidates = _answer_value(
+                    question, mapping, answer
+                )
+                row[target_index] = answer_value
+                if answer_other_candidates:
+                    counts = other_candidates.setdefault(
+                        question.canonical_question_key, Counter()
+                    )
+                    counts.update(answer_other_candidates)
                 file_ids = [item.file_id for item in answer.file_uploads]
                 file_uploads += len(file_ids)
                 evidence.append(UnifiedAnswerEvidence(
@@ -325,6 +355,23 @@ def bind_google_forms_family_responses(
                 respondent_email=response.respondent_email,
                 answers=evidence,
             ))
+
+    detected_with_other_candidates: list[SnapshotDetectedColumn] = []
+    for column in detected:
+        if column.other_text is None or column.source_question_id is None:
+            detected_with_other_candidates.append(column)
+            continue
+        counts = other_candidates.get(column.source_question_id, Counter())
+        values = list(counts)
+        detected_with_other_candidates.append(replace(
+            column,
+            other_text={
+                **column.other_text,
+                "count": sum(counts.values()),
+                "examples": values[:5],
+                "values": values,
+            },
+        ))
 
     fingerprint_source = {
         "mapping_fingerprint": family.mapping_fingerprint,
@@ -349,7 +396,7 @@ def bind_google_forms_family_responses(
     return QuestionnaireFamilySurveyBinding(
         family=family,
         rows=tuple(rows),
-        columns_detected=tuple(detected),
+        columns_detected=tuple(detected_with_other_candidates),
         questionnaire_text=_questionnaire_text(family),
         response_fingerprint=response_fingerprint,
         response_provenance=tuple(provenance),

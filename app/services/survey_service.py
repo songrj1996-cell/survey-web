@@ -12,6 +12,7 @@ import hashlib
 import json
 import re
 import time
+import uuid
 
 import crosstab_parser
 import survey_plan
@@ -43,6 +44,7 @@ from app.core.config import (
     MAX_REPORT_VERSIONS,
 )
 from app.core.parsing import _parse_file
+from app.core.llm_context import current_llm_api_key
 from app.core.responses import sse_event
 from app.core.security import (
     _assign_session_owner,
@@ -181,6 +183,67 @@ _REPORT_RERUN_TARGET_LOCKS: dict[str, asyncio.Lock] = {}
 _NON_VERSIONED_REPORT_MODES = {"comment", "interview", "annotate"}
 _CHINESE_CHARACTER_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 _REPORT_LLM_PHASES = ("themes", "synthesis", "writing", "finalize")
+
+
+def _report_writer_attempt_callback(
+    record_usage, *, session_id: str, run_id: str, phase: str,
+    step: str, part_index: int | None = None,
+):
+    """关联写作步骤与 HTTP 尝试；只输出白名单元数据，不改变 usage 或重试。"""
+    def _record(event: dict) -> None:
+        record_usage(event)
+        try:
+            if event.get("status") not in {"started", "completed", "failed"}:
+                return
+            secrets = (current_llm_api_key(), LLM_API_KEY)
+
+            def identifier(value):
+                if value is None:
+                    return None
+                if not isinstance(value, str) or not re.fullmatch(
+                    r"[A-Za-z0-9_.:+/-]{1,128}", value,
+                ) or "://" in value or any(secret and secret in value for secret in secrets):
+                    return "redacted"
+                return value
+
+            def count(value):
+                return value if type(value) is int and value >= 0 else None
+
+            entry = {
+                "schema_version": 1,
+                "session_id": identifier(session_id),
+                "run_id": identifier(run_id),
+                "phase": identifier(phase),
+                "step": identifier(step),
+                "part_index": count(part_index),
+            }
+            for key in (
+                "status", "request_id", "call_id", "previous_call_id", "attempt_kind",
+                "model", "requested_model", "response_model", "protocol",
+                "started_at", "completed_at", "error_type", "error_category", "finish_reason",
+            ):
+                entry[key] = identifier(event.get(key))
+            for key in ("attempt", "max_output_tokens", "http_status"):
+                entry[key] = count(event.get(key))
+            elapsed = event.get("elapsed_seconds")
+            entry["elapsed_seconds"] = (
+                elapsed if type(elapsed) in (int, float) and 0 <= elapsed < float("inf") else None
+            )
+            for key in ("fallback", "usage_complete"):
+                value = event.get(key)
+                entry[key] = value if type(value) is bool else None
+            usage = event.get("usage")
+            entry["usage"] = {
+                key: count(usage.get(key))
+                for key in ("input_tokens", "output_tokens", "total_tokens")
+            } if isinstance(usage, dict) else None
+            # 和现有后端日志走同一 stdout；立即刷新，运行中即可排查。
+            print("[report-llm-attempt] " + json.dumps(entry, ensure_ascii=True), flush=True)
+        except Exception:
+            # 日志输出失败也不能导致重写、漏记 usage 或中断报告。
+            return
+
+    return _record
 
 
 def _empty_report_llm_phase() -> dict:
@@ -1850,6 +1913,7 @@ async def report_stream(
     require_session_access(session_id, login, loader=get_session)
     writer_models_used: list[str] = []
     report_llm_usage = _ReportLLMUsageTracker()
+    report_run_id = uuid.uuid4().hex
 
     def _new_writer_messages() -> list[dict]:
         return [{"role": "system", "content": _get_report_writer_system_prompt()}]
@@ -2000,6 +2064,8 @@ async def report_stream(
         async def _writer_call(
             query: str,
             *,
+            step: str,
+            part_index: int | None = None,
             phase: str = "writing",
             messages: list[dict] | None = None,
         ):
@@ -2008,7 +2074,10 @@ async def report_stream(
             task = asyncio.create_task(_direct_writer_round(
                 active_messages,
                 query,
-                on_attempt_event=report_llm_usage.callback(phase),
+                on_attempt_event=_report_writer_attempt_callback(
+                    report_llm_usage.callback(phase), session_id=session_id,
+                    run_id=report_run_id, phase=phase, step=step, part_index=part_index,
+                ),
             ))
             changed = asyncio.create_task(report_llm_usage.wait_for_change())
             try:
@@ -2264,7 +2333,7 @@ async def report_stream(
             writer_context_included = bool(
                 viewpoint_stats_md and viewpoint_stats_md in writer_query
             )
-            async for heartbeat in _writer_call(writer_query):
+            async for heartbeat in _writer_call(writer_query, step="large_sample_report"):
                 yield heartbeat
             full_report, model_used = _writer_call.out
             writer_models_used.append(model_used)
@@ -2415,8 +2484,12 @@ async def report_stream(
                 block for block in summary_stats_blocks if str(block or "").strip()
             ) or str(stats_md or "")
 
-            async def _round(query: str, messages: list[dict]):
-                async for heartbeat in _writer_call(query, messages=messages):
+            async def _round(
+                query: str, messages: list[dict], *, step: str, part_index: int | None = None,
+            ):
+                async for heartbeat in _writer_call(
+                    query, messages=messages, step=step, part_index=part_index,
+                ):
                     yield heartbeat
                 text, model = _writer_call.out
                 writer_models_used.append(model)
@@ -2437,7 +2510,7 @@ async def report_stream(
                 viewpoint_stats_md=viewpoint_stats_md,
             )
             first_q = writer_instruction_block + first_q
-            async for ev in _round(first_q, _new_writer_messages()):
+            async for ev in _round(first_q, _new_writer_messages(), step="title"):
                 yield ev
             title_text = _round.out
             title_lines = []
@@ -2472,7 +2545,9 @@ async def report_stream(
                 )
                 if viewpoint_stats_md and "<subjective_viewpoint_stats>" in part_viewpoint_stats_md:
                     writer_context_included = True
-                async for ev in _round(part_query, _new_writer_messages()):
+                async for ev in _round(
+                    part_query, _new_writer_messages(), step="part", part_index=m["i"],
+                ):
                     yield ev
                 sec = _round.out
                 part_sections.append(sec.strip())
@@ -2485,7 +2560,7 @@ async def report_stream(
                 rows[0],
                 qualitative_context,
             )
-            async for ev in _round(bug_query, _new_writer_messages()):
+            async for ev in _round(bug_query, _new_writer_messages(), step="bug_check"):
                 yield ev
             bug_text = _round.out
             bug_clean = bug_text.strip()
@@ -2505,7 +2580,7 @@ async def report_stream(
                 analysis_focus=analysis_focus,
             )
             core_messages = _new_writer_messages()
-            async for heartbeat in _writer_call(core_query, messages=core_messages):
+            async for heartbeat in _writer_call(core_query, messages=core_messages, step="core"):
                 yield heartbeat
             core_text, core_model = _writer_call.out
             writer_models_used.append(core_model)
@@ -2520,6 +2595,7 @@ async def report_stream(
                 async for heartbeat in _writer_call(
                     _build_writer_core_review_query(analysis_focus, has_bug),
                     messages=core_messages,
+                    step="core_review",
                 ):
                     yield heartbeat
                 review_text, review_model = _writer_call.out
@@ -2560,6 +2636,7 @@ async def report_stream(
             async for heartbeat in _writer_call(
                 action_query,
                 messages=action_messages,
+                step="action",
             ):
                 yield heartbeat
             action_text, action_model = _writer_call.out
@@ -2573,6 +2650,7 @@ async def report_stream(
                 async for heartbeat in _writer_call(
                     _build_writer_action_repair_query(),
                     messages=action_messages,
+                    step="action_repair",
                 ):
                     yield heartbeat
                 repaired_text, repaired_model = _writer_call.out
@@ -2663,6 +2741,7 @@ async def report_stream(
                     async for heartbeat in _writer_call(
                         _build_comparison_repair_query(repairable_issues),
                         phase="finalize",
+                        step="comparison_repair",
                     ):
                         yield heartbeat
                     repair_text, repair_model = _writer_call.out

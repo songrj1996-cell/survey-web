@@ -58,6 +58,21 @@ _THEME_MERGE_RUNTIME_CONTRACT = """\
 5. representative_quotes 只能来自该主题 source_candidate_ids 对应候选的原文引用。
 </protected_theme_merge_contract>"""
 
+_CROSS_QUESTION_MAX_VIEWPOINTS = 36
+_CROSS_QUESTION_CANDIDATE_DESCRIPTION_CHARS = 240
+_CROSS_QUESTION_MERGE_RUNTIME_CONTRACT = f"""\
+<protected_cross_question_merge_contract>
+以下运行时契约专用于筛选跨题共同观点，并优先于上文的覆盖式主题合并规则：
+1. 这一步不是要求覆盖全部候选；只输出至少由两个不同 source_question_id 共同支持的具体玩家观点。
+2. 单题独有、无法确认跨题同义或仅能形成分析推断的候选必须省略，不得为了覆盖率强行合并。
+3. 最终最多输出 {_CROSS_QUESTION_MAX_VIEWPOINTS} 个观点；没有真实跨题共同观点时允许输出空 themes 数组。
+4. 每个 source_candidate_ids 至少包含两个候选 ID，且必须覆盖至少两个不同 source_question_id。
+5. 每个候选 ID 最多出现在一个观点中；无需分配全部候选。
+6. 不得创造“A影响B”“A导致B”“A与B有关”等玩家原话没有直接表达的关系、标准、框架或产品判断。
+7. 只输出 JSON 对象：{{"themes":[{{"id":"t01","name":"...","description":"...","source_candidate_ids":["c0001","c0002"],"positive_summary":null,"negative_summary":null,"representative_quotes":[]}}]}}。
+   主题 ID 必须从 t01 连续编号；representative_quotes 由代码根据候选 ID 还原，模型保持空数组即可。
+</protected_cross_question_merge_contract>"""
+
 
 def _get_theme_merge_system_prompt() -> str:
     """Append the non-configurable merge protocol to the editable business prompt."""
@@ -65,6 +80,15 @@ def _get_theme_merge_system_prompt() -> str:
         _get_theme_merge_system_prompt_base().rstrip()
         + "\n\n"
         + _THEME_MERGE_RUNTIME_CONTRACT
+    )
+
+
+def _get_cross_question_merge_system_prompt() -> str:
+    """Use a filtering contract instead of the exhaustive per-question merge contract."""
+    return (
+        _get_theme_merge_system_prompt_base().rstrip()
+        + "\n\n"
+        + _CROSS_QUESTION_MERGE_RUNTIME_CONTRACT
     )
 
 _QUALITATIVE_CONTEXT_LABELS = [
@@ -1045,6 +1069,87 @@ def _validate_merged_themes(data: dict | None, candidates: list[dict]) -> str | 
     return None
 
 
+def _validate_cross_question_themes(
+    data: dict | None,
+    candidates: list[dict],
+) -> str | None:
+    """Validate selective cross-question groups without requiring full coverage."""
+    if not isinstance(data, dict):
+        return "JSON 根节点必须是对象"
+    themes = data.get("themes")
+    if not isinstance(themes, list):
+        return "themes 必须是数组"
+    if len(themes) > _CROSS_QUESTION_MAX_VIEWPOINTS:
+        return f"跨题观点不得超过 {_CROSS_QUESTION_MAX_VIEWPOINTS} 个"
+
+    candidate_lookup = {
+        f"c{index:04d}": candidate
+        for index, candidate in enumerate(candidates, 1)
+        if isinstance(candidate, dict)
+    }
+    expected_ids = [f"t{i:02d}" for i in range(1, len(themes) + 1)]
+    actual_ids = [theme.get("id") if isinstance(theme, dict) else None for theme in themes]
+    if actual_ids != expected_ids:
+        return f"主题 ID 必须从 t01 连续编号，期望 {expected_ids}"
+
+    assigned_candidate_ids: set[str] = set()
+    seen_names: set[str] = set()
+    for theme in themes:
+        name = str(theme.get("name") or "").strip()
+        if not name or not str(theme.get("description") or "").strip():
+            return f"主题 {theme.get('id')} 缺少 name 或 description"
+        name_key = name.casefold()
+        if name_key in seen_names:
+            return f"最终主题名称重复：{name}"
+        seen_names.add(name_key)
+        for field in ("positive_summary", "negative_summary"):
+            value = theme.get(field)
+            if value is not None and not isinstance(value, str):
+                return f"主题「{name}」的 {field} 必须是字符串或 null"
+
+        source_candidate_ids = theme.get("source_candidate_ids")
+        if (
+            not isinstance(source_candidate_ids, list)
+            or len(source_candidate_ids) < 2
+            or not all(isinstance(candidate_id, str) for candidate_id in source_candidate_ids)
+            or len(set(source_candidate_ids)) != len(source_candidate_ids)
+        ):
+            return f"主题「{name}」必须包含至少两个不重复的 source_candidate_ids"
+        invalid_candidate_ids = [
+            candidate_id
+            for candidate_id in source_candidate_ids
+            if candidate_id not in candidate_lookup
+        ]
+        if invalid_candidate_ids:
+            return f"主题「{name}」引用了不存在的候选 ID：{invalid_candidate_ids[0]}"
+        repeated_candidate_ids = [
+            candidate_id
+            for candidate_id in source_candidate_ids
+            if candidate_id in assigned_candidate_ids
+        ]
+        if repeated_candidate_ids:
+            return f"候选 ID 被重复分配：{repeated_candidate_ids[0]}"
+        source_question_ids = {
+            str(candidate_lookup[candidate_id].get("source_question_id") or "").strip()
+            for candidate_id in source_candidate_ids
+        }
+        source_question_ids.discard("")
+        if len(source_question_ids) < 2:
+            return f"主题「{name}」没有覆盖至少两个不同题目"
+        assigned_candidate_ids.update(source_candidate_ids)
+
+        allowed_quotes = list(dict.fromkeys(
+            quote
+            for candidate_id in source_candidate_ids
+            for quote in (
+                candidate_lookup[candidate_id].get("representative_quotes") or []
+            )
+            if isinstance(quote, str) and _text_key(quote)
+        ))
+        theme["representative_quotes"] = allowed_quotes[:3]
+    return None
+
+
 def _recover_single_batch_themes(
     candidates: list[dict],
 ) -> tuple[dict | None, str | None]:
@@ -1170,6 +1275,33 @@ def _build_theme_merge_query(
         "<theme_candidates_json>\n"
         f"{json.dumps(indexed_candidates, ensure_ascii=False)}\n"
         "</theme_candidates_json>"
+    )
+
+
+def _build_cross_question_merge_query(
+    report_organization: str,
+    candidates: list[dict],
+) -> str:
+    """Send compact semantic metadata; evidence is hydrated locally after grouping."""
+    indexed_candidates = []
+    for index, candidate in enumerate(candidates, 1):
+        indexed_candidates.append({
+            "candidate_id": f"c{index:04d}",
+            "name": str(candidate.get("name") or "").strip(),
+            "source_question_id": str(
+                candidate.get("source_question_id") or ""
+            ).strip(),
+            "source_question": str(candidate.get("source_question") or "").strip(),
+            "description": str(candidate.get("description") or "").strip()[
+                :_CROSS_QUESTION_CANDIDATE_DESCRIPTION_CHARS
+            ],
+        })
+    return (
+        f"<report_organization>\n{report_organization}\n</report_organization>\n"
+        f"<candidate_count>{len(indexed_candidates)}</candidate_count>\n"
+        "<cross_question_candidates_json>\n"
+        f"{json.dumps(indexed_candidates, ensure_ascii=False)}\n"
+        "</cross_question_candidates_json>"
     )
 
 

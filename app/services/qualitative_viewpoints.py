@@ -22,6 +22,7 @@ _MENTION_BLOCK_RE = re.compile(r"(?m)^[ \t]*(?:-[ \t]+)?\*\*提及情况：")
 _INFERENCE_BLOCK_RE = re.compile(r"(?m)^[ \t]*\*\*分析推断：")
 _VAGUE_VIEWPOINT_TERMS = ("多数玩家", "多位玩家", "部分玩家", "少数玩家")
 _CROSS_QUESTION_CONTRACT_VERSION = 1
+_CROSS_QUESTION_SYNTHESIS_STRATEGY = "single_pass_selective_grouping"
 _CROSS_QUESTION_RUNTIME_CONTRACT = """\
 <protected_cross_question_viewpoint_contract>
 以下运行时契约优先于上文任何旧主题合并规则或输出示例：
@@ -407,6 +408,7 @@ async def build_report_viewpoint_stats(
 
     synthesis_diagnostics = {
         "contract_version": _CROSS_QUESTION_CONTRACT_VERSION,
+        "strategy": _CROSS_QUESTION_SYNTHESIS_STRATEGY,
         "status": "failed" if stop_reason else "completed",
         "stop_reason": stop_reason,
         "stage_budget_seconds": LLM_CROSS_QUESTION_STAGE_TIMEOUT_SECONDS,
@@ -841,6 +843,7 @@ def build_viewpoint_diagnostics(
         })
     safe_synthesis = {
         "contract_version": int(synthesis.get("contract_version") or 0),
+        "strategy": str(synthesis.get("strategy") or ""),
         "status": str(synthesis.get("status") or (
             "completed" if report_viewpoints else "not_run"
         )),

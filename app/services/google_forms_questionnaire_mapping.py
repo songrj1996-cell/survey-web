@@ -435,13 +435,15 @@ def _google_options(value: Any) -> list[CanonicalOption]:
     for index, raw in enumerate(value):
         if not isinstance(raw, dict):
             continue
-        text = raw.get("value")
+        is_other = raw.get("isOther") is True
+        text = "Other / 其他" if is_other else raw.get("value")
         if not isinstance(text, str) or not text:
             text = f"未命名选项 {index + 1}"
         options.append(CanonicalOption(
             option_key=_option_key(index),
             value=text,
             label=text,
+            is_other=is_other,
         ))
     return options
 
