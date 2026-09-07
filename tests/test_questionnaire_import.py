@@ -856,6 +856,38 @@ class BestedQuestionnaireImportTests(unittest.TestCase):
             },
         )
 
+    def test_translation_cannot_overwrite_provider_declared_other_semantics(self):
+        questions = [{
+            "source_question_id": "Q-other",
+            "name_zh": "Preferred mode",
+            "role": "single_choice",
+            "column_indexes": [0],
+            "options": ["Ranked", "Other / 其他"],
+            "other_text": {
+                "enabled": True,
+                "option": "Other / 其他",
+                "provider_declared": True,
+                "count": 1,
+                "examples": ["Custom mode"],
+                "values": ["Custom mode"],
+            },
+        }]
+        translations = {
+            "Q-other": {
+                "name_zh": "偏好模式",
+                "options_zh": ["排位", "被模型覆盖的其他选项"],
+                "rows_zh": [],
+            },
+        }
+
+        translated = apply_questionnaire_translations(
+            questions, translations,
+        )[0]
+
+        self.assertEqual(translated["options"], ["排位", "Other / 其他"])
+        self.assertEqual(translated["other_text"], questions[0]["other_text"])
+        self.assertEqual(translated["value_aliases"], {"排位": ["Ranked"]})
+
     def test_translation_rejects_changed_matrix_shape(self):
         questions = [{
             "source_question_id": "Q5",

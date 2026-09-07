@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 import unittest
@@ -88,6 +89,33 @@ def _google_capture(*, closed: bool = False) -> GoogleFormCapture:
 
 
 class GoogleQuestionnaireMappingTests(unittest.TestCase):
+    def test_google_other_without_value_keeps_provider_semantics(self):
+        capture = _google_capture()
+        raw_form = deepcopy(capture.raw_form)
+        raw_form["items"][1]["questionItem"]["question"][
+            "choiceQuestion"
+        ]["options"].append({"isOther": True})
+        mapped = map_google_form_capture(
+            GoogleFormCapture(
+                form_id=capture.form_id,
+                raw_form=raw_form,
+                images=capture.images,
+                image_failures=capture.image_failures,
+            ),
+            owner_ref="mapping-user",
+            retrieved_at=RETRIEVED_AT,
+        )
+
+        choice = next(
+            item
+            for item in mapped.bundle.snapshot.canonical_questions
+            if item.provider_item_id == "item-choice"
+        )
+        self.assertEqual(choice.options[-1].value, "Other / 其他")
+        self.assertEqual(choice.options[-1].label, "Other / 其他")
+        self.assertTrue(choice.options[-1].is_other)
+        self.assertNotIn("未命名选项", choice.options[-1].value)
+
     def test_maps_provider_items_questions_images_branches_and_response_ids(self):
         result = map_google_form_capture(
             _google_capture(),
