@@ -80,6 +80,9 @@ const ivV2State = {
   reportApprovalNote: '',
   reportDirty: false,
   reportRerunKeys: {},
+  analysisRerunKeys: {},
+  selectedAnalysisModuleId: '',
+  analysisRerunActiveModuleId: '',
   reportExportArtifact: null,
 };
 
@@ -3851,6 +3854,10 @@ function ivV2SyncConfirmedControls() {
       control.disabled = operationBusy || ivV2DossierSummary().analysis_ready !== true || ivV2HasUnsavedReportWork();
       return;
     }
+    if (action === 'analysis-rerun-module' || action === 'analysis-select-module') {
+      control.disabled = !ivV2CanRerunAnalysisModule(ivV2State.selectedAnalysisModuleId);
+      return;
+    }
     if (action === 'report-generate') {
       control.disabled = operationBusy || ivV2AnalysisSummary().report_ready !== true || ivV2HasUnsavedReportWork();
       return;
@@ -4459,6 +4466,106 @@ async function ivV2CreateAnalysisRun() {
   }
 }
 
+function ivV2AnalysisRerunModules() {
+  const names = new Map(ivV2Modules().map(item => [item.module_id, item.canonical_name || item.title || item.display_name || item.module_id]));
+  return (ivV2State.analysisResponse?.model_usage?.modules || [])
+    .filter(item => /^module_[0-9a-f]{32}$/.test(String(item.module_id || '')))
+    .map(item => ({ module_id: item.module_id, label: names.get(item.module_id) || item.module_id }));
+}
+
+function ivV2CanRerunAnalysisModule(moduleId) {
+  const analysis = ivV2State.analysisResponse;
+  const summary = ivV2AnalysisSummary();
+  return Boolean(
+    ivV2State.projectId && !ivV2OperationBusy() && !ivV2HasUnsavedReportWork()
+    && !ivV2State.boundaryDirty && !ivV2State.boundaryConflict && !ivV2State.draftDirty
+    && analysis?.status === 'completed' && summary.report_ready === true
+    && analysis.analysis_run_id === summary.analysis_run_id
+    && ivV2AnalysisRerunModules().some(item => item.module_id === moduleId)
+  );
+}
+
+function ivV2AnalysisModuleRerunPayload(moduleId) {
+  return {
+    from_stage: 'analysis_module',
+    base_analysis_run_id: String(ivV2State.analysisResponse?.analysis_run_id || ''),
+    module_id: moduleId,
+    preserve_manual_report_edits: true,
+    reuse_unchanged_artifacts: true,
+    force: false,
+  };
+}
+
+function ivV2AnalysisModuleRerunKey(payload) {
+  const fingerprint = `${ivV2State.projectId}:${payload.base_analysis_run_id}:${payload.module_id}`;
+  if (!ivV2State.analysisRerunKeys[fingerprint]) {
+    ivV2State.analysisRerunKeys[fingerprint] = window.crypto?.randomUUID
+      ? window.crypto.randomUUID()
+      : `module-rerun-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  }
+  return ivV2State.analysisRerunKeys[fingerprint];
+}
+
+async function ivV2RerunAnalysisModule(moduleId) {
+  if (!ivV2CanRerunAnalysisModule(moduleId)) return;
+  if (ivV2State.reportResponse && !window.confirm('重跑后将创建新分析版本。已有报告、锁定正文和导出文件会保留，但报告会提示依赖已更新；本次不会自动改写报告。继续吗？')) return;
+  const payload = ivV2AnalysisModuleRerunPayload(moduleId);
+  const idempotencyKey = ivV2AnalysisModuleRerunKey(payload);
+  const token = ivV2NextReportToken();
+  ivV2State.reportBusy = true;
+  ivV2State.analysisRerunActiveModuleId = moduleId;
+  ivV2ClearStatusError();
+  ivV2RenderConfirmed();
+  try {
+    const response = await fetch(`/api/v1/interview-projects/${ivV2State.projectId}/reruns`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Idempotency-Key': idempotencyKey },
+      body: JSON.stringify(payload),
+    });
+    const data = await response.json();
+    if (token !== ivV2State.reportToken) return;
+    if (!response.ok) {
+      if (response.status === 409) {
+        await ivV2LoadReportWorkspace({ force: false, token });
+        if (token === ivV2State.reportToken) ivV2SetStatusError(data, response.status, '模块重跑存在版本或请求冲突，请检查当前状态');
+        return;
+      }
+      throw new Error(ivV2NormalizeApiError(data, response.status, '模块重跑失败').message);
+    }
+    // Reload the actual head: an idempotent replay can return a historical result.
+    const refreshed = await ivV2LoadReportWorkspace({ force: false, token });
+    if (token === ivV2State.reportToken && refreshed) {
+      showToast(data.rerun?.reused ? '已复用模块重跑结果，并刷新当前版本' : '模块分析已更新；已有报告和人工内容未改写', 'success');
+    }
+  } catch (error) {
+    if (token === ivV2State.reportToken) ivV2State.errorMessage = String(error?.message || '模块重跑失败，可使用同一请求重试');
+  } finally {
+    if (token === ivV2State.reportToken) {
+      ivV2State.analysisRerunActiveModuleId = '';
+      ivV2State.reportBusy = false;
+      ivV2RenderConfirmed();
+    }
+  }
+}
+
+function ivV2AnalysisModuleRerunHtml() {
+  const modules = ivV2AnalysisRerunModules();
+  if (!modules.length) return '';
+  if (!modules.some(item => item.module_id === ivV2State.selectedAnalysisModuleId)) {
+    ivV2State.selectedAnalysisModuleId = modules[0].module_id;
+  }
+  const disabled = !ivV2CanRerunAnalysisModule(ivV2State.selectedAnalysisModuleId);
+  return `<div class="iv-v2-report-toolbar">
+    <label class="iv-v2-inline-field"><span>局部重跑模块</span>
+      <select data-iv-v2-action="analysis-select-module"${disabled ? ' disabled' : ''}>
+        ${modules.map(item => `<option value="${ivV2Esc(item.module_id)}"${item.module_id === ivV2State.selectedAnalysisModuleId ? ' selected' : ''}>${ivV2Esc(item.label)}</option>`).join('')}
+      </select>
+    </label>
+    <button class="btn btn--ghost btn--sm" type="button" data-iv-v2-action="analysis-rerun-module"${disabled ? ' disabled' : ''}>${ivV2State.analysisRerunActiveModuleId ? '正在重跑模块…' : '重跑所选模块'}</button>
+  </div>
+  <p class="iv-v2-review-head__desc" role="status">${ivV2State.analysisRerunActiveModuleId ? '正在分析所选模块，请稍候；其余模块不重复调用模型。' : '仅适用于上游输入未变化的当前分析。已有报告、锁定正文和导出文件均保留，不自动重写。'}</p>`;
+}
+
 async function ivV2CreateReportVersion() {
   if (!ivV2State.projectId || ivV2State.reportBusy || ivV2HasUnsavedReportWork()) return;
   const token = ivV2NextReportToken();
@@ -5051,6 +5158,7 @@ function ivV2ReportMetaHtml() {
         <button class="btn btn--primary btn--sm" type="button" data-iv-v2-action="report-generate"${!canGenerateReport || ivV2OperationBusy() || ivV2HasUnsavedReportWork() ? ' disabled' : ''}>${report?.report_version_id && currentEditable ? '整份重生成' : '生成报告'}</button>
       </div>
     </div>
+    ${ivV2AnalysisModuleRerunHtml()}
     ${(report && !report.is_current_version) ? '<div class="iv-v2-status-banner iv-v2-status-banner--warning"><strong>当前查看的是旧版本</strong><p>section_id 会指向当前报告，旧版本只允许查看，不允许编辑或重审。</p></div>' : ''}
     ${(report?.status === 'stale') ? '<div class="iv-v2-status-banner iv-v2-status-banner--danger"><strong>报告已过期</strong><p>上游分析已变化；当前版本只可查看，不能批准。</p></div>' : ''}
     ${ivV2State.reportDirty ? '<div class="iv-v2-status-banner iv-v2-status-banner--warning"><strong>当前有未保存章节草稿</strong><p>请先保存或恢复服务端正文，再执行跨玩家分析或整份重生成。</p></div>' : ''}
@@ -5591,6 +5699,10 @@ function ivV2HandleEditorClick(event) {
     ivV2CreateAnalysisRun();
     return;
   }
+  if (action === 'analysis-rerun-module') {
+    ivV2RerunAnalysisModule(ivV2State.selectedAnalysisModuleId);
+    return;
+  }
 
   if (action === 'report-generate') {
     ivV2CreateReportVersion();
@@ -5802,6 +5914,12 @@ function ivV2HandleEditorInputOrChange(event) {
   const target = event.target;
   const action = target.dataset.ivV2Action;
   if (!action) return;
+  if (action === 'analysis-select-module') {
+    if (ivV2OperationBusy()) return;
+    ivV2State.selectedAnalysisModuleId = target.value;
+    ivV2RenderConfirmed();
+    return;
+  }
   if (action.startsWith('boundary-')) {
     if (ivV2OperationBusy()) return;
     if (action === 'boundary-object-name') {
@@ -6001,6 +6119,9 @@ function ivV2HandleEditorInputOrChange(event) {
 }
 
 function ivV2Reset() {
+  ivV2State.analysisRerunKeys = {};
+  ivV2State.selectedAnalysisModuleId = '';
+  ivV2State.analysisRerunActiveModuleId = '';
   ivV2InvalidateAsync();
   ivV2State.currentStep = 1;
   ivV2State.selectedFile = null;

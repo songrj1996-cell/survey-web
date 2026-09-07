@@ -33,8 +33,6 @@ from app.schemas.interview_v2_report import (
     InterviewV2ReportApproveRequest,
     InterviewV2ReportClaimResponse,
     InterviewV2ReportCreateRequest,
-    InterviewV2ReportRerunRequest,
-    InterviewV2ReportRerunResponse,
     InterviewV2ReportResponse,
     InterviewV2ReportSectionMutationResponse,
     InterviewV2ReportSectionPatchRequest,
@@ -44,6 +42,7 @@ from app.schemas.interview_v2_export import (
     InterviewV2ExportArtifactResponse,
     InterviewV2ExportCreateRequest,
 )
+from app.schemas.interview_v2_rerun import RERUN_REQUEST_ADAPTER, InterviewV2RerunResponse
 from app.schemas.interview_v2_mapping import (
     InterviewV2GroupMappingConfirmRequest,
     InterviewV2GroupMappingDraftRequest,
@@ -89,6 +88,10 @@ from app.services.interview_v2_analysis_boundary_service import (
 from app.services.interview_v2_analysis_service import (
     create_analysis_run,
     get_current_analysis,
+)
+from app.services.interview_v2_analysis_rerun_service import (
+    create_analysis_module_rerun,
+    validate_analysis_rerun_access,
 )
 from app.services.interview_v2_report_service import (
     create_report,
@@ -1170,7 +1173,7 @@ async def create_interview_v2_report(project_id: str, request: Request):
 
 @router.post(
     "/api/v1/interview-projects/{project_id}/reruns",
-    response_model=InterviewV2ReportRerunResponse,
+    response_model=InterviewV2RerunResponse,
     responses={
         400: {"model": InterviewV2ErrorResponse},
         403: {"description": "沿用平台现有功能权限错误响应"},
@@ -1188,9 +1191,10 @@ async def rerun_interview_v2_report_section(
     login = await _require_feature(request, "interview")
     if not INTERVIEW_V2_ENABLED:
         return _disabled_response(request)
+    raw = None
     try:
         raw = await _read_structure_json(request)
-        payload = InterviewV2ReportRerunRequest.model_validate(raw).model_dump(
+        payload = RERUN_REQUEST_ADAPTER.validate_python(raw).model_dump(
             mode="json"
         )
     except (
@@ -1204,8 +1208,8 @@ async def rerun_interview_v2_report_section(
         return _error_response(
             request,
             status_code=400,
-            code="REPORT_RERUN_REQUEST_INVALID",
-            message="报告章节重生成请求格式无效。",
+            code=("ANALYSIS_RERUN_REQUEST_INVALID" if isinstance(raw, dict) and raw.get("from_stage") == "analysis_module" else "REPORT_RERUN_REQUEST_INVALID"),
+            message="局部重跑请求格式无效。",
             suggested_action="refresh_report_inputs",
         )
     idempotency_key = str(
@@ -1220,6 +1224,10 @@ async def rerun_interview_v2_report_section(
             suggested_action="retry_report",
         )
     try:
+        if payload["from_stage"] == "analysis_module":
+            return await _run_analysis_module_rerun_response(
+                project_id, payload, login, request, idempotency_key,
+            )
         await run_in_threadpool(
             validate_report_rerun_access, project_id, payload, login
         )
@@ -1251,6 +1259,30 @@ async def rerun_interview_v2_report_section(
             "section_id": payload["section_id"],
             "base_report_version_id": payload["base_report_version_id"],
             "report_version_id": result.get("report_version_id"),
+            "rerun_id": (result.get("rerun") or {}).get("rerun_id"),
+            "reused": bool((result.get("rerun") or {}).get("reused")),
+        },
+    )
+    return result
+
+
+async def _run_analysis_module_rerun_response(
+    project_id: str, payload: dict, login: dict | None, request: Request, idempotency_key: str,
+) -> dict:
+    await run_in_threadpool(validate_analysis_rerun_access, project_id, payload, login)
+    idempotency_key = validate_report_rerun_idempotency_key(idempotency_key)
+    api_key = await require_request_llm_api_key(request)
+    result = await run_with_llm_api_key(
+        create_analysis_module_rerun(project_id, payload, login, idempotency_key),
+        api_key, request=request, category="interview",
+        action="V2 单模块分析重跑", reference_id=payload["module_id"],
+    )
+    await audit_log(
+        request, "interview", "重跑 V2 单模块分析",
+        f"module_id={payload['module_id']}; analysis_run_id={result.get('analysis_run_id')}",
+        metadata={
+            "module_id": payload["module_id"], "base_analysis_run_id": payload["base_analysis_run_id"],
+            "analysis_run_id": result.get("analysis_run_id"),
             "rerun_id": (result.get("rerun") or {}).get("rerun_id"),
             "reused": bool((result.get("rerun") or {}).get("reused")),
         },

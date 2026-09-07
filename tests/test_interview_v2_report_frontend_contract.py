@@ -31,7 +31,7 @@ class InterviewV2ReportFrontendContractTests(unittest.TestCase):
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, HTML)
-        self.assertIn('/static/style.css?v=52', HTML)
+        self.assertIn('/static/style.css?v=53', HTML)
         self.assertNotIn('<main class="iv-v2-report-main"', HTML)
 
     def test_frontend_uses_report_and_analysis_routes_with_exact_cas_fields(self):

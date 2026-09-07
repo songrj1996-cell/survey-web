@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 import hashlib
 import json
 import re
@@ -427,6 +428,172 @@ def validate_module_findings(
         "findings": findings,
         "stat_facts": stat_facts,
     }
+
+
+ANALYSIS_MODULE_RERUN_SCHEMA_VERSION = "interview-analysis-module-rerun/1.0"
+
+
+def analysis_module_rerun_fingerprint(
+    *, base_revision: dict[str, Any], module_id: str,
+    prompt_snapshot: dict[str, Any], model_configuration: dict[str, Any],
+) -> str:
+    """The immutable base includes all upstream versions and reusable outputs."""
+    declared = base_revision.get("revision_payload_sha256")
+    actual = payload_sha256({
+        key: value for key, value in base_revision.items()
+        if key != "revision_payload_sha256"
+    })
+    if declared != actual or base_revision.get("status") != "completed":
+        raise InterviewV2AnalysisValidationError("analysis rerun base is not verified")
+    if base_revision.get("analysis_schema_version") != ANALYSIS_SCHEMA_VERSION:
+        raise InterviewV2AnalysisValidationError("analysis rerun base schema is unsupported")
+    modules = (base_revision.get("model_usage") or {}).get("modules") or []
+    module_ids = [item.get("module_id") for item in modules]
+    if (
+        not _MODULE_RE.fullmatch(module_id)
+        or len(module_ids) != len(set(module_ids))
+        or module_ids.count(module_id) != 1
+    ):
+        raise InterviewV2AnalysisValidationError("analysis rerun module is not in the base")
+    if not prompt_snapshot or not model_configuration:
+        raise InterviewV2AnalysisValidationError("analysis rerun configuration is missing")
+    return payload_sha256({
+        "schema_version": ANALYSIS_MODULE_RERUN_SCHEMA_VERSION,
+        "analysis_schema_version": ANALYSIS_SCHEMA_VERSION,
+        "base_analysis_run_id": base_revision.get("analysis_run_id"),
+        "base_revision_payload_sha256": declared,
+        "module_id": module_id,
+        "from_stage": "analysis_module",
+        "preserve_manual_report_edits": True,
+        "reuse_unchanged_artifacts": True,
+        "force": False,
+        "prompt_snapshot": prompt_snapshot,
+        "model_configuration": model_configuration,
+    })
+
+
+def build_analysis_module_rerun_input(
+    *, base_revision: dict[str, Any], analysis_input: dict[str, Any],
+    module_id: str, prompt_snapshot: dict[str, Any],
+    model_configuration: dict[str, Any],
+) -> dict[str, Any]:
+    fingerprint = analysis_module_rerun_fingerprint(
+        base_revision=base_revision, module_id=module_id,
+        prompt_snapshot=prompt_snapshot, model_configuration=model_configuration,
+    )
+    actual = payload_sha256({
+        key: value for key, value in analysis_input.items() if key != "input_fingerprint"
+    })
+    if (
+        analysis_input.get("input_fingerprint") != actual
+        or base_revision.get("input_fingerprint") != actual
+        or base_revision.get("source") != analysis_input.get("source")
+        or base_revision.get("project_id") != analysis_input.get("project_id")
+    ):
+        raise InterviewV2AnalysisValidationError("analysis rerun upstream input changed")
+    modules = analysis_input.get("modules") or []
+    module_ids = [item.get("module_id") for item in modules]
+    base_ids = [item.get("module_id") for item in base_revision["model_usage"]["modules"]]
+    if len(module_ids) != len(set(module_ids)) or set(module_ids) != set(base_ids):
+        raise InterviewV2AnalysisValidationError("analysis rerun module set changed")
+    target = next(item for item in modules if item["module_id"] == module_id)
+    return deepcopy({
+        "rerun_schema_version": ANALYSIS_MODULE_RERUN_SCHEMA_VERSION,
+        "analysis_schema_version": ANALYSIS_SCHEMA_VERSION,
+        "base_analysis_run_id": base_revision["analysis_run_id"],
+        "source": analysis_input["source"],
+        "unreviewed_participant_ids": analysis_input["unreviewed_participant_ids"],
+        "module_input": target,
+        "input_fingerprint": fingerprint,
+        "prompt_snapshot": prompt_snapshot,
+        "model_configuration": model_configuration,
+    })
+
+
+def _analysis_result_indexes(revision: dict[str, Any]) -> tuple[dict, dict]:
+    findings, stats = revision.get("findings"), revision.get("stat_facts")
+    if not isinstance(findings, list) or not isinstance(stats, list):
+        raise InterviewV2AnalysisValidationError("analysis result lists are invalid")
+    by_finding = {item["finding_id"]: item for item in findings}
+    by_stat = {item["stat_fact_id"]: item for item in stats}
+    if len(by_finding) != len(findings) or len(by_stat) != len(stats) or len(findings) != len(stats):
+        raise InterviewV2AnalysisValidationError("analysis result identities are duplicated")
+    for finding in findings:
+        stat = by_stat.get(finding.get("stat_fact_id"))
+        if (
+            stat is None or stat.get("finding_id") != finding["finding_id"]
+            or stat.get("analysis_run_id") != revision.get("analysis_run_id")
+        ):
+            raise InterviewV2AnalysisValidationError("analysis statistic binding is invalid")
+    return by_finding, by_stat
+
+
+def merge_analysis_module_result(
+    *, base_revision: dict[str, Any], module_id: str,
+    result: dict[str, Any], analysis_run_id: str,
+) -> dict[str, Any]:
+    """Reuse non-target semantics; rebind only their version-scoped StatFact IDs."""
+    _, old_stats = _analysis_result_indexes(base_revision)
+    _analysis_result_indexes({**result, "analysis_run_id": analysis_run_id})
+    module_ids = [item["module_id"] for item in base_revision["model_usage"]["modules"]]
+    if (
+        module_ids.count(module_id) != 1
+        or result.get("module_id") != module_id
+        or any(item.get("module_id") != module_id for item in result["findings"])
+        or any(item.get("module_id") not in module_ids for item in base_revision["findings"])
+    ):
+        raise InterviewV2AnalysisValidationError("analysis replacement crosses module scope")
+    findings, stats = [], []
+    for current_module in module_ids:
+        if current_module == module_id:
+            findings.extend(deepcopy(result["findings"]))
+            stats.extend(deepcopy(result["stat_facts"]))
+            continue
+        for old in base_revision["findings"]:
+            if old["module_id"] != current_module:
+                continue
+            finding = deepcopy(old)
+            stat = deepcopy(old_stats[finding["stat_fact_id"]])
+            stat["analysis_run_id"] = analysis_run_id
+            stat["stat_fact_id"] = _stable_id(
+                "stat", analysis_run_id, finding["finding_id"],
+                *sorted({item["participant_id"] for item in stat["numerator_cases"]}),
+            )
+            finding["stat_fact_id"] = stat["stat_fact_id"]
+            findings.append(finding)
+            stats.append(stat)
+    merged = {"findings": findings, "stat_facts": stats}
+    _analysis_result_indexes({**merged, "analysis_run_id": analysis_run_id})
+    return merged
+
+
+def validate_analysis_module_replacement(
+    base_revision: dict[str, Any], revision: dict[str, Any], module_id: str,
+) -> None:
+    """Storage-side invariant: a module rerun cannot silently rewrite other work."""
+    for field in ("source", "input_fingerprint", "analysis_schema_version", "limitations", "import_id"):
+        if revision.get(field) != base_revision.get(field):
+            raise InterviewV2AnalysisValidationError(f"analysis rerun changed protected {field}")
+    target_findings = [item for item in revision["findings"] if item["module_id"] == module_id]
+    target_ids = {item["finding_id"] for item in target_findings}
+    expected = merge_analysis_module_result(
+        base_revision=base_revision, module_id=module_id,
+        analysis_run_id=revision["analysis_run_id"],
+        result={
+            "module_id": module_id, "findings": target_findings,
+            "stat_facts": [item for item in revision["stat_facts"] if item["finding_id"] in target_ids],
+        },
+    )
+    if any(revision[field] != expected[field] for field in ("findings", "stat_facts")):
+        raise InterviewV2AnalysisValidationError("analysis rerun changed a reused module")
+    old_usage, new_usage = base_revision["model_usage"], revision["model_usage"]
+    old_modules, new_modules = old_usage["modules"], new_usage["modules"]
+    if [item["module_id"] for item in old_modules] != [item["module_id"] for item in new_modules]:
+        raise InterviewV2AnalysisValidationError("analysis rerun changed module inventory")
+    if [item for item in old_modules if item["module_id"] != module_id] != [
+        item for item in new_modules if item["module_id"] != module_id
+    ]:
+        raise InterviewV2AnalysisValidationError("analysis rerun changed reused module provenance")
 
 
 __all__ = [

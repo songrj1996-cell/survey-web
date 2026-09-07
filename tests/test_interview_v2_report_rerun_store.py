@@ -121,7 +121,10 @@ class InterviewV2ReportRerunStoreTests(unittest.TestCase):
             r"^[0-9a-f]{64}$",
         )
 
-        with self.assertRaises(store.ReportRerunIdempotencyConflictError):
+        with self.assertRaisesRegex(
+            store.ReportRerunIdempotencyConflictError,
+            r"^report rerun idempotency conflict$",
+        ):
             self._claim("b" * 64)
 
     def test_failed_precommit_claim_can_be_released_and_reclaimed(self):

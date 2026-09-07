@@ -30,13 +30,14 @@ else:
     import fcntl
 
 from app.core import config
+from app.core.interview_v2_analysis import validate_analysis_module_replacement
 
 
 _STORE_LOCK = threading.RLock()
 _MAPPING_LOCK_TIMEOUT_SECONDS = 10.0
 _MAPPING_LOCK_POLL_SECONDS = 0.025
 _ID_RE = re.compile(
-    r"^(?:upload|job|project|import|workbook|mapping|structure|evidence|boundary|coverage|dossier|analysis|report|section|rerun|export)_[0-9a-f]{32}$"
+    r"^(?:upload|job|project|import|workbook|mapping|structure|evidence|boundary|coverage|dossier|analysis|report|section|rerun|export|module)_[0-9a-f]{32}$"
 )
 _EVIDENCE_ID_RE = re.compile(r"^(?:ev|evidence)_[0-9a-f]{32}$")
 _REVIEW_ISSUE_ID_RE = re.compile(r"^(?:issue|review)_[0-9a-f]{32}$")
@@ -130,6 +131,13 @@ class ReportRerunIdempotencyConflictError(ValueError):
 
     def __init__(self) -> None:
         super().__init__("report rerun idempotency conflict")
+
+
+class AnalysisRerunIdempotencyConflictError(ValueError):
+    """A shared rerun key already belongs to a different module or stage."""
+
+    def __init__(self) -> None:
+        super().__init__("analysis rerun idempotency conflict")
 
 
 class ExportInputConflictError(ValueError):
@@ -4852,6 +4860,234 @@ def save_analysis_run_cas(
             return {"state": next_state, "revision": durable}
 
 
+# Single-module analysis reruns ------------------------------------------------
+
+
+def _committed_analysis_revision_locked(
+    project_id: str, analysis_run_id: str,
+) -> dict[str, Any] | None:
+    directory = _analysis_dir(project_id)
+    analysis_run_id = validate_resource_id(analysis_run_id, "analysis")
+    state = _read_json(directory / "state.json") or {}
+    entries = [item for item in state.get("history") or [] if item.get("analysis_run_id") == analysis_run_id]
+    if not entries:
+        return None  # A version file alone is not a published analysis.
+    revision = _read_json(directory / "versions" / f"{analysis_run_id}.json")
+    if (
+        len(entries) != 1 or revision is None
+        or revision.get("project_id") != project_id
+        or revision.get("analysis_run_id") != analysis_run_id
+        or _analysis_digest(revision) != revision.get("revision_payload_sha256")
+        or revision.get("revision_payload_sha256") != entries[0].get("revision_payload_sha256")
+        or revision.get("version_number") != entries[0].get("version_number")
+    ):
+        raise ValueError("committed analysis integrity check failed")
+    return {"project_id": project_id, "state": state, "revision": revision}
+
+
+def load_analysis_run(project_id: str, analysis_run_id: str) -> dict[str, Any] | None:
+    """Read a verified historical analysis without promoting it to current."""
+    with _STORE_LOCK:
+        with _mapping_process_lock(project_id):
+            return _committed_analysis_revision_locked(project_id, analysis_run_id)
+
+
+def _analysis_rerun_operation_path(owner_key: str, project_id: str, idempotency_key: str) -> Path:
+    digest = _canonical_payload_sha256([owner_key, idempotency_key])[:32]
+    return _analysis_dir(project_id) / "reruns" / f"{digest}.json"
+
+
+def _analysis_rerun_operation_digest(record: dict[str, Any]) -> str:
+    return _canonical_payload_sha256({
+        key: value for key, value in record.items()
+        if key not in {"operation_payload_sha256", "_claim_acquired"}
+    })
+
+
+def _validate_analysis_rerun_operation_locked(
+    record: dict[str, Any], *, owner_key: str, project_id: str, idempotency_key: str,
+) -> dict[str, Any]:
+    for field, prefix in (
+        ("project_id", "project"), ("rerun_id", "rerun"),
+        ("base_analysis_run_id", "analysis"), ("analysis_run_id", "analysis"),
+        ("module_id", "module"),
+    ):
+        validate_resource_id(str(record.get(field) or ""), prefix)
+    if (
+        record.get("operation_schema_version") != "interview-analysis-module-rerun-operation/1.0"
+        or record.get("project_id") != project_id
+        or record.get("owner_key_sha256") != hashlib.sha256(owner_key.encode("utf-8")).hexdigest()
+        or record.get("idempotency_key_sha256") != hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
+        or not _SHA256_RE.fullmatch(str(record.get("request_fingerprint") or ""))
+        or not _SHA256_RE.fullmatch(str(record.get("base_revision_payload_sha256") or ""))
+        or record.get("status") not in {"pending", "completed"}
+        or not str(record.get("created_at") or "").strip()
+        or record.get("operation_payload_sha256") != _analysis_rerun_operation_digest(record)
+    ):
+        raise ValueError("analysis rerun operation integrity check failed")
+    if record["status"] == "completed" and (
+        not str(record.get("completed_at") or "").strip()
+        or not _SHA256_RE.fullmatch(str(record.get("revision_payload_sha256") or ""))
+    ):
+        raise ValueError("completed analysis rerun operation is invalid")
+    return record
+
+
+def _recover_analysis_rerun_operation_locked(path: Path, record: dict[str, Any]) -> dict[str, Any]:
+    saved = _committed_analysis_revision_locked(record["project_id"], record["analysis_run_id"])
+    if saved is None:
+        if record["status"] == "completed":
+            raise ValueError("completed analysis rerun result is missing")
+        return record
+    revision = saved["revision"]
+    provenance = revision.get("rerun") or {}
+    if (
+        provenance.get("rerun_id") != record["rerun_id"]
+        or provenance.get("input_fingerprint") != record["request_fingerprint"]
+        or provenance.get("base_analysis_run_id") != record["base_analysis_run_id"]
+        or provenance.get("module_id") != record["module_id"]
+    ):
+        raise ValueError("analysis rerun result identity mismatch")
+    if record["status"] == "completed":
+        if record["revision_payload_sha256"] != revision["revision_payload_sha256"]:
+            raise ValueError("analysis rerun result digest mismatch")
+        return record
+    completed = {
+        **record, "status": "completed", "completed_at": revision["created_at"],
+        "revision_payload_sha256": revision["revision_payload_sha256"],
+    }
+    completed["operation_payload_sha256"] = _analysis_rerun_operation_digest(completed)
+    _atomic_write_json(path, completed)
+    return completed
+
+
+def claim_analysis_module_rerun(
+    *, owner_key: str, project_id: str, idempotency_key: str,
+    request_fingerprint: str, base_analysis_run_id: str,
+    base_revision_payload_sha256: str, module_id: str, created_at: str,
+) -> dict[str, Any]:
+    """Reserve one owner/project key across both stages of the shared endpoint."""
+    project_id = validate_resource_id(project_id, "project")
+    base_analysis_run_id = validate_resource_id(base_analysis_run_id, "analysis")
+    module_id = validate_resource_id(module_id, "module")
+    if not owner_key or not idempotency_key or not created_at:
+        raise ValueError("analysis rerun identity is missing")
+    if any(not _SHA256_RE.fullmatch(value) for value in (request_fingerprint, base_revision_payload_sha256)):
+        raise ValueError("analysis rerun fingerprint is invalid")
+    path = _analysis_rerun_operation_path(owner_key, project_id, idempotency_key)
+    with _STORE_LOCK:
+        with _mapping_process_lock(project_id):
+            if _read_json(_report_rerun_operation_path(owner_key, project_id, idempotency_key)) is not None:
+                raise AnalysisRerunIdempotencyConflictError()
+            existing = _read_json(path)
+            if existing is not None:
+                _validate_analysis_rerun_operation_locked(
+                    existing, owner_key=owner_key, project_id=project_id, idempotency_key=idempotency_key,
+                )
+                if existing["request_fingerprint"] != request_fingerprint:
+                    raise AnalysisRerunIdempotencyConflictError()
+                return {**_recover_analysis_rerun_operation_locked(path, existing), "_claim_acquired": False}
+            record = {
+                "operation_schema_version": "interview-analysis-module-rerun-operation/1.0",
+                "project_id": project_id,
+                "owner_key_sha256": hashlib.sha256(owner_key.encode("utf-8")).hexdigest(),
+                "idempotency_key_sha256": hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest(),
+                "request_fingerprint": request_fingerprint,
+                "base_analysis_run_id": base_analysis_run_id,
+                "base_revision_payload_sha256": base_revision_payload_sha256,
+                "module_id": module_id, "rerun_id": f"rerun_{uuid.uuid4().hex}",
+                "analysis_run_id": f"analysis_{uuid.uuid4().hex}",
+                "status": "pending", "created_at": created_at,
+            }
+            record["operation_payload_sha256"] = _analysis_rerun_operation_digest(record)
+            _atomic_write_json(path, record)
+            return {**record, "_claim_acquired": True}
+
+
+def save_analysis_module_rerun_cas(
+    *, owner_key: str, project_id: str, idempotency_key: str,
+    request_fingerprint: str, revision: dict[str, Any],
+) -> dict[str, Any]:
+    """Publish one replacement under the same lock as source/head/scope checks."""
+    path = _analysis_rerun_operation_path(owner_key, project_id, idempotency_key)
+    with _STORE_LOCK:
+        with _mapping_process_lock(project_id):
+            operation = _read_json(path)
+            if operation is None:
+                raise ValueError("analysis rerun operation is missing")
+            _validate_analysis_rerun_operation_locked(
+                operation, owner_key=owner_key, project_id=project_id, idempotency_key=idempotency_key,
+            )
+            if operation["request_fingerprint"] != request_fingerprint:
+                raise AnalysisRerunIdempotencyConflictError()
+            provenance = revision.get("rerun") or {}
+            if (
+                operation["status"] != "pending"
+                or revision.get("analysis_run_id") != operation["analysis_run_id"]
+                or revision.get("status") != "completed"
+                or provenance.get("rerun_id") != operation["rerun_id"]
+                or provenance.get("input_fingerprint") != request_fingerprint
+                or provenance.get("module_id") != operation["module_id"]
+                or provenance.get("base_analysis_run_id") != operation["base_analysis_run_id"]
+            ):
+                raise ValueError("analysis rerun result identity mismatch")
+            saved = _committed_analysis_revision_locked(project_id, operation["base_analysis_run_id"])
+            if saved is None or saved["state"].get("current_analysis_run_id") != operation["base_analysis_run_id"]:
+                raise ValueError("analysis version conflict")
+            base, state = saved["revision"], saved["state"]
+            if base["revision_payload_sha256"] != operation["base_revision_payload_sha256"]:
+                raise ValueError("analysis base digest changed")
+            _require_analysis_source_current_locked(project_id, base["source"])
+            validate_analysis_module_replacement(base, revision, operation["module_id"])
+            durable = deepcopy(revision)
+            durable["project_id"] = project_id
+            version_number = int(state["current_version_number"]) + 1
+            durable["version_number"] = version_number
+            durable["revision_payload_sha256"] = _analysis_digest(durable)
+            directory = _analysis_dir(project_id)
+            version_path = directory / "versions" / f"{operation['analysis_run_id']}.json"
+            if version_path.exists():
+                raise ValueError("analysis rerun revision already exists")
+            _atomic_write_json(version_path, durable)
+            next_state = {
+                **state, "current_analysis_run_id": durable["analysis_run_id"],
+                "current_version_number": version_number, "status": durable["status"],
+                "source": deepcopy(durable["source"]),
+                "history": [*state["history"], {
+                    "analysis_run_id": durable["analysis_run_id"], "version_number": version_number,
+                    "revision_payload_sha256": durable["revision_payload_sha256"],
+                    "created_at": durable["created_at"], "status": durable["status"],
+                }],
+            }
+            _atomic_write_json(directory / "state.json", next_state)
+            completed = _recover_analysis_rerun_operation_locked(path, operation)
+            return {"project_id": project_id, "state": next_state, "revision": durable, "operation": completed}
+
+
+def release_analysis_module_rerun(
+    *, owner_key: str, project_id: str, idempotency_key: str,
+    request_fingerprint: str, analysis_run_id: str,
+) -> bool:
+    """Release only a matching uncommitted reservation; never remove history."""
+    path = _analysis_rerun_operation_path(owner_key, project_id, idempotency_key)
+    with _STORE_LOCK:
+        with _mapping_process_lock(project_id):
+            record = _read_json(path)
+            if record is None:
+                return False
+            _validate_analysis_rerun_operation_locked(
+                record, owner_key=owner_key, project_id=project_id, idempotency_key=idempotency_key,
+            )
+            if (
+                record["status"] == "completed" or record["request_fingerprint"] != request_fingerprint
+                or record["analysis_run_id"] != analysis_run_id
+                or _committed_analysis_revision_locked(project_id, analysis_run_id) is not None
+            ):
+                return False
+            path.unlink(missing_ok=True)
+            return True
+
+
 # Evidence-bound report checkpoint --------------------------------------------
 
 def _report_dir(project_id: str) -> Path:
@@ -5025,6 +5261,8 @@ def claim_report_rerun_operation(
     path = _report_rerun_operation_path(owner_key, project_id, idempotency_key)
     with _STORE_LOCK:
         with _mapping_process_lock(project_id):
+            if _read_json(_analysis_rerun_operation_path(owner_key, project_id, idempotency_key)) is not None:
+                raise ReportRerunIdempotencyConflictError()
             existing = _read_json(path)
             if existing is not None:
                 existing = _validate_report_rerun_operation_locked(

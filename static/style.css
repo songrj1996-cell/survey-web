@@ -11410,21 +11410,31 @@ body {
 }
 
 .iv-v2-report-toolbar {
+  flex-wrap: wrap;
   margin-bottom: 16px;
+}
+
+.iv-v2-report-toolbar > * {
+  min-width: 0;
+  max-width: 100%;
 }
 
 .iv-v2-report-toolbar__meta {
   display: flex;
+  flex: 1 1 240px;
   flex-wrap: wrap;
+  min-width: 0;
   gap: 10px;
 }
 
 .iv-v2-report-chip {
   min-width: 0;
+  max-width: 100%;
   padding: 10px 12px;
   border: 1px solid var(--border);
   border-radius: 12px;
   background: var(--surface-2);
+  overflow-wrap: anywhere;
 }
 
 .iv-v2-report-chip strong,
@@ -11578,6 +11588,7 @@ body {
   }
 
   .iv-v2-report-toolbar__meta {
+    flex-basis: auto;
     flex-direction: column;
   }
 }
