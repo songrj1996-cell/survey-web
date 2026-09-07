@@ -1,10 +1,11 @@
+import asyncio
 import json
 import unittest
 from unittest.mock import AsyncMock, patch
 
 import survey_stats
 
-from app.services import report_engine
+from app.services import qualitative_viewpoints, report_engine
 from app.services.qualitative_viewpoints import (
     build_viewpoint_diagnostics,
     build_report_viewpoint_stats,
@@ -286,19 +287,57 @@ class QualitativeViewpointTests(unittest.TestCase):
 
 
 class CrossQuestionViewpointTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _fixture(question_count: int, themes_per_question: int):
+        clustered = {}
+        open_text = {}
+        columns = []
+        for column_index in range(1, question_count + 1):
+            columns.append({
+                "index": column_index,
+                "name": f"问题{column_index}",
+                "role": "open_text",
+            })
+            clustered[column_index] = {
+                "col_name": f"问题{column_index}",
+                "part_index": 1,
+                "all_themes": [
+                    {
+                        "id": f"t{theme_index + 1:02d}",
+                        "name": f"问题{column_index}观点{theme_index + 1}",
+                        "description": "具体玩家观点",
+                        "count": 1,
+                        "source_quotes": [f"引用-{column_index}-{theme_index + 1}"],
+                    }
+                    for theme_index in range(themes_per_question)
+                ],
+            }
+            open_text[column_index] = [{
+                "respondent_key": f"p{column_index}",
+                "text": f"回答-{column_index}",
+            }]
+        plan = {
+            "columns": columns,
+            "parts": [{
+                "name": "综合体验",
+                "column_indexes": [column["index"] for column in columns],
+            }],
+        }
+        return clustered, open_text, plan, columns
+
     async def test_cross_question_count_deduplicates_players_and_uses_relevant_sources(self):
         clustered = {
             1: {
                 "col_name": "界面反馈",
                 "all_themes": [{
-                    "id": "t01", "name": "按钮数量", "count": 2,
+                    "id": "t01", "name": "理解成本", "count": 2,
                     "source_quotes": ["按钮太多"],
                 }],
             },
             2: {
                 "col_name": "使用反馈",
                 "all_themes": [{
-                    "id": "t01", "name": "入口理解", "count": 2,
+                    "id": "t01", "name": "理解成本", "count": 2,
                     "source_quotes": ["入口难找"],
                 }],
             },
@@ -320,47 +359,40 @@ class CrossQuestionViewpointTests(unittest.IsolatedAsyncioTestCase):
             ],
             "parts": [{"name": "界面体验", "column_indexes": [1, 2]}],
         }
-        merged_themes = [
-            {"id": "t01", "name": "按钮数量", "description": "按钮多少"},
-            {"id": "t02", "name": "熟悉度与理解", "description": "熟悉度和理解难度"},
-        ]
+        selection = {
+            "status": "completed",
+            "viewpoints": [{
+                "id": "v01",
+                "name": "理解成本",
+                "description": "多处入口存在理解成本",
+                "source_candidate_ids": ["c0001", "c0002"],
+            }],
+            "excluded_candidate_ids": [],
+        }
         classified = {
             "classifications": [
-                {"response_id": "0", "assignments": [
-                    {"theme_id": "t01", "sentiment": "negative"},
-                    {"theme_id": "t02", "sentiment": "neutral"},
-                ]},
-                {"response_id": "1", "assignments": [
-                    {"theme_id": "t01", "sentiment": "positive"},
-                ]},
-                {"response_id": "2", "assignments": [
-                    {"theme_id": "t02", "sentiment": "negative"},
-                ]},
-                {"response_id": "3", "assignments": [
-                    {"theme_id": "t02", "sentiment": "positive"},
-                ]},
-            ]
+                {
+                    "response_id": str(index),
+                    "assignments": [{"theme_id": "v01", "sentiment": "neutral"}],
+                }
+                for index in range(4)
+            ],
+            "fallback_count": 0,
         }
 
         attempt_callback = object()
-        merge_call = AsyncMock(return_value={"data": {"themes": merged_themes}})
+        selection_call = AsyncMock(return_value={
+            "data": selection,
+            "model": "model-a",
+            "raw_len": 100,
+            "repaired": False,
+            "error": "",
+            "duration_seconds": 0.1,
+        })
         classify_call = AsyncMock(return_value=classified)
         with (
-            patch.object(
-                report_engine,
-                "_get_theme_merge_system_prompt_base",
-                return_value="merge-base",
-            ),
-            patch.object(
-                report_engine,
-                "_direct_json_call",
-                new=merge_call,
-            ),
-            patch.object(
-                report_engine,
-                "_classify_batch_direct",
-                new=classify_call,
-            ),
+            patch.object(report_engine, "_direct_json_call", new=selection_call),
+            patch.object(report_engine, "_classify_batch_direct", new=classify_call),
         ):
             events = [
                 item async for item in build_report_viewpoint_stats(
@@ -373,17 +405,18 @@ class CrossQuestionViewpointTests(unittest.IsolatedAsyncioTestCase):
             ]
 
         result = next(item[1] for item in events if item[0] == "result")
-        by_id = {item["id"]: item for item in result}
-        self.assertEqual(by_id["RVIEW:t01"]["count"], 2)
-        self.assertEqual(by_id["RVIEW:t01"]["denominator"], 2)
-        self.assertEqual(by_id["RVIEW:t02"]["count"], 2)
-        self.assertEqual(by_id["RVIEW:t02"]["denominator"], 3)
-        merge_system_prompt = merge_call.await_args.args[0]
-        merge_query = merge_call.await_args.args[1]
-        self.assertIn("最终主题不设置最少或最多数量", merge_system_prompt)
-        self.assertIn('"candidate_id": "c0001"', merge_query)
+        self.assertEqual(result[0]["id"], "RVIEW:v01")
+        self.assertEqual(result[0]["count"], 3)
+        self.assertEqual(result[0]["denominator"], 3)
+        self.assertEqual(result[0]["source_scope_keys"], ["1", "2"])
+        system_prompt = selection_call.await_args.args[0]
+        query = selection_call.await_args.args[1]
+        self.assertIn("筛选跨题共同观点", system_prompt)
+        self.assertNotIn("最终主题不设置最少或最多数量", system_prompt)
+        self.assertIn("<viewpoint_candidates_json>", query)
+        self.assertIn('"source_scope_key": "1"', query)
         self.assertIs(
-            merge_call.await_args.kwargs["on_attempt_event"],
+            selection_call.await_args.kwargs["on_attempt_event"],
             attempt_callback,
         )
         self.assertIs(
@@ -391,60 +424,75 @@ class CrossQuestionViewpointTests(unittest.IsolatedAsyncioTestCase):
             attempt_callback,
         )
 
-    async def test_large_candidate_catalog_is_hierarchically_merged_in_bounded_batches(self):
-        clustered = {}
-        open_text = {}
-        columns = []
-        for question_index in range(10):
-            column_index = question_index + 1
-            columns.append({
-                "index": column_index,
-                "name": f"问题{column_index}",
-                "role": "open_text",
-            })
-            clustered[column_index] = {
-                "col_name": f"问题{column_index}",
-                "part_index": 1,
-                "all_themes": [
-                    {
-                        "id": f"t{theme_index + 1:02d}",
-                        "name": f"问题{column_index}观点{theme_index + 1}",
-                        "description": "具体玩家观点",
-                        "count": 1,
-                        "source_quotes": [f"引用-{column_index}-{theme_index + 1}"],
-                    }
-                    for theme_index in range(17)
-                ],
-            }
-            open_text[column_index] = [{
-                "respondent_key": f"p{column_index}",
-                "text": f"回答-{column_index}",
-            }]
-        plan = {
-            "columns": columns,
-            "parts": [{
-                "name": "综合体验",
-                "column_indexes": [column["index"] for column in columns],
-            }],
-        }
-        observed_batch_sizes = []
+    def test_cross_question_validator_rejects_old_or_non_cross_contracts(self):
+        candidates = [
+            {"source_scope_key": "1"},
+            {"source_scope_key": "1"},
+            {"source_scope_key": "2"},
+        ]
+        old_error = qualitative_viewpoints._validate_cross_question_viewpoints(
+            {"themes": []},
+            candidates,
+        )
+        self.assertIn("旧协议字段 themes", old_error)
 
-        async def merge_call(_system, query, **_kwargs):
-            payload = query.split("<theme_candidates_json>\n", 1)[1].split(
-                "\n</theme_candidates_json>", 1
+        non_cross_error = qualitative_viewpoints._validate_cross_question_viewpoints(
+            {
+                "status": "completed",
+                "viewpoints": [{
+                    "id": "v01",
+                    "name": "单题观点",
+                    "description": "只来自一道题",
+                    "source_candidate_ids": ["c0001", "c0002"],
+                }],
+                "excluded_candidate_ids": ["c0003"],
+            },
+            candidates,
+        )
+        self.assertIn("没有跨越", non_cross_error)
+
+        valid = qualitative_viewpoints._validate_cross_question_viewpoints(
+            {
+                "status": "completed",
+                "viewpoints": [{
+                    "id": "v01",
+                    "name": "共同观点",
+                    "description": "两道题共同支持",
+                    "source_candidate_ids": ["c0001", "c0003"],
+                }],
+                "excluded_candidate_ids": ["c0002"],
+            },
+            candidates,
+        )
+        self.assertIsNone(valid)
+
+    async def test_real_scale_catalog_uses_one_selection_pass_and_records_reduction(self):
+        clustered, open_text, plan, columns = self._fixture(10, 17)
+        observed_candidate_counts = []
+
+        async def selection_call(_system, query, **_kwargs):
+            payload = query.split("<viewpoint_candidates_json>\n", 1)[1].split(
+                "\n</viewpoint_candidates_json>", 1
             )[0]
             candidates = json.loads(payload)
-            observed_batch_sizes.append(len(candidates))
-            candidate_ids = [item["candidate_id"] for item in candidates]
-            quote = candidates[0]["representative_quotes"][0]
+            observed_candidate_counts.append(len(candidates))
+            selected_ids = ["c0001", "c0018"]
+            excluded_ids = [
+                item["candidate_id"]
+                for item in candidates
+                if item["candidate_id"] not in selected_ids
+            ]
             return {
-                "data": {"themes": [{
-                    "id": "t01",
-                    "name": "跨题共同观点",
-                    "description": "跨题共同含义",
-                    "source_candidate_ids": candidate_ids,
-                    "representative_quotes": [quote],
-                }]},
+                "data": {
+                    "status": "completed",
+                    "viewpoints": [{
+                        "id": "v01",
+                        "name": "跨题共同观点",
+                        "description": "至少两道题共同出现",
+                        "source_candidate_ids": selected_ids,
+                    }],
+                    "excluded_candidate_ids": excluded_ids,
+                },
                 "model": "model-a",
                 "raw_len": 500,
                 "repaired": False,
@@ -452,13 +500,13 @@ class CrossQuestionViewpointTests(unittest.IsolatedAsyncioTestCase):
                 "duration_seconds": 0.1,
             }
 
-        async def classify_call(_question, _themes, batch, **_kwargs):
+        async def classify_call(_question, themes, batch, **_kwargs):
             return {
                 "classifications": [
                     {
                         "response_id": str(index),
                         "assignments": [{
-                            "theme_id": "t01",
+                            "theme_id": themes[0]["id"],
                             "sentiment": "neutral",
                         }],
                     }
@@ -468,7 +516,7 @@ class CrossQuestionViewpointTests(unittest.IsolatedAsyncioTestCase):
             }
 
         with (
-            patch.object(report_engine, "_direct_json_call", new=merge_call),
+            patch.object(report_engine, "_direct_json_call", new=selection_call),
             patch.object(report_engine, "_classify_batch_direct", new=classify_call),
         ):
             events = [
@@ -482,78 +530,41 @@ class CrossQuestionViewpointTests(unittest.IsolatedAsyncioTestCase):
 
         diagnostics = next(item[1] for item in events if item[0] == "diagnostics")
         result = next(item[1] for item in events if item[0] == "result")
+        self.assertEqual(observed_candidate_counts, [170])
         self.assertEqual(diagnostics["input_candidate_count"], 170)
-        self.assertEqual(diagnostics["reduction_levels"], 1)
-        self.assertEqual(diagnostics["final_input_candidate_count"], 5)
-        self.assertEqual(diagnostics["status"], "completed")
-        self.assertEqual(len(diagnostics["calls"]), 6)
-        self.assertEqual(observed_batch_sizes, [36, 36, 36, 36, 26, 5])
+        self.assertEqual(diagnostics["final_input_candidate_count"], 1)
+        self.assertEqual(diagnostics["selected_candidate_count"], 2)
+        self.assertEqual(diagnostics["excluded_candidate_count"], 168)
+        self.assertEqual(diagnostics["reduction_levels"], 0)
+        self.assertEqual(diagnostics["planned_logical_call_count"], 2)
+        self.assertEqual(diagnostics["completed_logical_call_count"], 2)
+        self.assertEqual(diagnostics["calls"][0]["retention_ratio"], round(1 / 170, 4))
+        self.assertEqual(diagnostics["final_viewpoint_count"], 1)
         self.assertEqual(len(result), 1)
         self.assertEqual(set(result[0]["source_scope_keys"]), {
             str(index) for index in range(1, 11)
         })
 
-    async def test_hierarchical_merge_never_sends_oversized_final_batch(self):
-        clustered = {}
-        open_text = {}
-        columns = []
-        for column_index in (1, 2):
-            columns.append({
-                "index": column_index,
-                "name": f"问题{column_index}",
-                "role": "open_text",
-            })
-            clustered[column_index] = {
-                "col_name": f"问题{column_index}",
-                "part_index": 1,
-                "all_themes": [
-                    {
-                        "id": f"t{theme_index + 1:02d}",
-                        "name": f"问题{column_index}观点{theme_index + 1}",
-                        "description": "具体玩家观点",
-                        "count": 1,
-                        "source_quotes": [f"引用-{column_index}-{theme_index + 1}"],
-                    }
-                    for theme_index in range(25)
-                ],
-            }
-            open_text[column_index] = [{
-                "respondent_key": f"p{column_index}",
-                "text": f"回答-{column_index}",
-            }]
-        plan = {
-            "columns": columns,
-            "parts": [{"name": "综合体验", "column_indexes": [1, 2]}],
-        }
-        observed_batch_sizes = []
+    async def test_old_nonreducing_output_stops_after_one_selection_call(self):
+        clustered, open_text, plan, columns = self._fixture(2, 25)
+        call_count = 0
 
-        async def nonreducing_merge(_system, query, **_kwargs):
-            payload = query.split("<theme_candidates_json>\n", 1)[1].split(
-                "\n</theme_candidates_json>", 1
-            )[0]
-            candidates = json.loads(payload)
-            observed_batch_sizes.append(len(candidates))
+        async def invalid_selection(_system, _query, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            data = {"themes": []}
             return {
-                "data": {"themes": [
-                    {
-                        "id": f"t{index:02d}",
-                        "name": candidate["name"],
-                        "description": candidate["description"],
-                        "source_candidate_ids": [candidate["candidate_id"]],
-                        "representative_quotes": candidate["representative_quotes"],
-                    }
-                    for index, candidate in enumerate(candidates, 1)
-                ]},
+                "data": None,
                 "model": "model-a",
-                "raw_len": 1000,
-                "repaired": False,
-                "error": "",
+                "raw_len": 100,
+                "repaired": True,
+                "error": kwargs["validator"](data),
                 "duration_seconds": 0.1,
             }
 
         classify_call = AsyncMock()
         with (
-            patch.object(report_engine, "_direct_json_call", new=nonreducing_merge),
+            patch.object(report_engine, "_direct_json_call", new=invalid_selection),
             patch.object(report_engine, "_classify_batch_direct", new=classify_call),
         ):
             events = [
@@ -561,19 +572,49 @@ class CrossQuestionViewpointTests(unittest.IsolatedAsyncioTestCase):
                     clustered,
                     open_text,
                     plan,
-                    ["玩家ID", "问题1", "问题2"],
+                    ["玩家ID", *(column["name"] for column in columns)],
                 )
             ]
 
         diagnostics = next(item[1] for item in events if item[0] == "diagnostics")
         result = next(item[1] for item in events if item[0] == "result")
+        self.assertEqual(call_count, 1)
         self.assertEqual(diagnostics["status"], "failed")
-        self.assertEqual(diagnostics["calls"][-1]["stage"], "reduction_guard")
-        self.assertEqual(observed_batch_sizes, [36, 14, 36, 14, 36, 14])
-        self.assertLessEqual(max(observed_batch_sizes), 36)
+        self.assertEqual(diagnostics["stop_reason"], "no_progress")
+        self.assertEqual(diagnostics["completed_logical_call_count"], 1)
         self.assertEqual(result, [])
         classify_call.assert_not_awaited()
 
+    async def test_stage_deadline_cancels_selection_without_repeating_candidates(self):
+        clustered, open_text, plan, columns = self._fixture(2, 2)
+        started = asyncio.Event()
+
+        async def blocked_selection(*_args, **_kwargs):
+            started.set()
+            await asyncio.Event().wait()
+
+        with (
+            patch.object(
+                qualitative_viewpoints,
+                "LLM_CROSS_QUESTION_STAGE_TIMEOUT_SECONDS",
+                0.01,
+            ),
+            patch.object(report_engine, "_direct_json_call", new=blocked_selection),
+        ):
+            events = [
+                item async for item in build_report_viewpoint_stats(
+                    clustered,
+                    open_text,
+                    plan,
+                    ["玩家ID", *(column["name"] for column in columns)],
+                )
+            ]
+
+        self.assertTrue(started.is_set())
+        diagnostics = next(item[1] for item in events if item[0] == "diagnostics")
+        self.assertEqual(diagnostics["stop_reason"], "stage_timeout")
+        self.assertLess(diagnostics["elapsed_seconds"], 0.5)
+        self.assertEqual(next(item[1] for item in events if item[0] == "result"), [])
 
 if __name__ == "__main__":
     unittest.main()

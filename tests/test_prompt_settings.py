@@ -28,6 +28,7 @@ EXPECTED_PROMPT_KEYS = {
     "report_qa_system",
     "theme_extract_system",
     "theme_merge_system",
+    "cross_question_viewpoint_system",
     "response_classify_system",
     "comment_relevance_system",
     "comment_extract_system",
@@ -62,11 +63,11 @@ def _sha256(path: str) -> str:
 
 
 class PromptCatalogTests(unittest.TestCase):
-    def test_catalog_has_26_current_non_dify_entries_in_six_groups(self):
+    def test_catalog_has_27_current_non_dify_entries_in_six_groups(self):
         catalog = prompt_storage.DEFAULT_PROMPTS
 
         self.assertEqual(set(catalog), EXPECTED_PROMPT_KEYS)
-        self.assertEqual(len(catalog), 26)
+        self.assertEqual(len(catalog), 27)
         self.assertNotIn("upload_guide", catalog)
         self.assertEqual(
             {entry["group"] for entry in catalog.values()},
@@ -213,6 +214,9 @@ class PromptCatalogTests(unittest.TestCase):
     def test_qualitative_prompts_use_semantic_boundaries_without_count_caps(self):
         extract_prompt = prompt_storage.DEFAULT_PROMPTS["theme_extract_system"]["current"]
         merge_prompt = prompt_storage.DEFAULT_PROMPTS["theme_merge_system"]["current"]
+        cross_prompt = prompt_storage.DEFAULT_PROMPTS[
+            "cross_question_viewpoint_system"
+        ]["current"]
         classify_prompt = prompt_storage.DEFAULT_PROMPTS["response_classify_system"]["current"]
 
         self.assertNotIn("5–15", extract_prompt)
@@ -221,6 +225,9 @@ class PromptCatalogTests(unittest.TestCase):
         self.assertIn("不设置候选主题数量目标", extract_prompt)
         self.assertIn("最终主题不设置最少或最多数量", merge_prompt)
         self.assertIn("source_candidate_ids", merge_prompt)
+        self.assertIn("筛选真正跨题重复出现", cross_prompt)
+        self.assertIn("excluded_candidate_ids", cross_prompt)
+        self.assertNotIn("最终主题不设置最少或最多数量", cross_prompt)
         self.assertIn("不设置上限", classify_prompt)
 
     def test_catalog_api_filters_unknown_and_legacy_entries(self):
