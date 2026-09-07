@@ -1558,6 +1558,8 @@ async function confirmPlan(text) {
 
     if (approved) {
       if (approvalWarning) showToast(approvalWarning, 'info', 8000);
+      $('plan-thinking').style.display = 'none';
+      $('plan-card').style.display = 'block';
       await runStats();
     }
   } catch (e) {
