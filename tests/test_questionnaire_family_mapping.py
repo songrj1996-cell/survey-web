@@ -43,6 +43,7 @@ def _question(
     question_type: CanonicalQuestionType,
     *,
     options: tuple[str, ...] = (),
+    other_indexes: tuple[int, ...] = (),
     rows: tuple[tuple[str, str], ...] = (),
 ) -> CanonicalQuestion:
     return CanonicalQuestion(
@@ -52,7 +53,11 @@ def _question(
         title=title,
         required=False,
         options=[
-            CanonicalOption(option_key=f"option-{index}", value=value)
+            CanonicalOption(
+                option_key=f"option-{index}",
+                value=value,
+                is_other=index in other_indexes,
+            )
             for index, value in enumerate(options)
         ],
         rows=[
@@ -76,6 +81,7 @@ def snapshot(
     omit_open: bool = False,
     choice_type: CanonicalQuestionType = CanonicalQuestionType.SINGLE_CHOICE,
     reorder: bool = False,
+    include_other: bool = False,
 ) -> QuestionnaireSnapshot:
     prefix = language
     questions = [
@@ -84,7 +90,16 @@ def snapshot(
             f"{prefix}-provider-choice",
             "Preferred mode" if language == "en" else "Mode favorit",
             choice_type,
-            options=(("Ranked", "Classic") if language == "en" else ("Peringkat", "Klasik")),
+            options=(
+                ("Ranked", "Classic", "Other / 其他")
+                if language == "en" and include_other
+                else ("Peringkat", "Klasik", "Other / 其他")
+                if include_other
+                else ("Ranked", "Classic")
+                if language == "en"
+                else ("Peringkat", "Klasik")
+            ),
+            other_indexes=((2,) if include_other else ()),
         ),
         _question(
             f"{prefix}-open",
@@ -154,7 +169,11 @@ def semantics(
                 CanonicalQuestionType.MATRIX_SINGLE: "功能评价",
             }[question.canonical_type]
             option_labels = (
-                ("排位", "经典")
+                (
+                    ("排位", "经典", "Other / 其他")
+                    if any(option.is_other for option in question.options)
+                    else ("排位", "经典")
+                )
                 if "choice" in question.question_id
                 else (("好", "差") if question.options else ())
             )
@@ -582,6 +601,68 @@ class QuestionnaireFamilyMappingTests(unittest.TestCase):
             hidden = storage.load_family("other-owner@example.test", family.family_id)
         self.assertEqual(loaded, family)
         self.assertIsNone(hidden)
+
+    def test_other_semantics_survive_translation_and_cross_language_reordering(self):
+        en = snapshot("FORM_EN", "en", include_other=True)
+        id_form = snapshot("FORM_ID", "id", include_other=True)
+        id_choice = id_form.canonical_questions[0]
+        id_other, id_ranked, id_classic = (
+            id_choice.options[2],
+            id_choice.options[0],
+            id_choice.options[1],
+        )
+        id_form = id_form.model_copy(update={
+            "canonical_questions": [
+                id_choice.model_copy(update={
+                    "options": [id_other, id_ranked, id_classic],
+                }),
+                *id_form.canonical_questions[1:],
+            ],
+        })
+        declared = [("en", "FORM_EN", en), ("id", "FORM_ID", id_form)]
+        translated = semantics(declared)
+        family_id = questionnaire_family_id(OWNER, TITLE, ["FORM_EN", "FORM_ID"])
+        en_variant = questionnaire_family_variant_id(family_id, "en", "FORM_EN")
+        id_variant = questionnaire_family_variant_id(family_id, "id", "FORM_ID")
+        translated[(en_variant, "en-choice")] = SemanticQuestionText(
+            title="偏好模式",
+            options=("排位", "经典", "错误的 Other 翻译"),
+        )
+        translated[(id_variant, "id-choice")] = SemanticQuestionText(
+            title="偏好模式",
+            options=("另一个错误翻译", "排位", "经典"),
+        )
+
+        family = build_questionnaire_family(
+            owner_ref=OWNER,
+            title=TITLE,
+            variants=[
+                FamilyVariantSnapshot(language=language, snapshot=source)
+                for language, _, source in declared
+            ],
+            semantic_questions=translated,
+            now=NOW,
+        )
+
+        self.assertEqual(family.status, QuestionnaireFamilyStatus.READY)
+        choice = next(
+            item
+            for item in family.canonical_questions
+            if item.canonical_type == CanonicalQuestionType.SINGLE_CHOICE
+        )
+        other = next(item for item in choice.options if item.is_other)
+        self.assertEqual(other.label, "Other / 其他")
+        self.assertEqual(
+            [
+                next(
+                    mapping.provider_value
+                    for mapping in variant.option_mappings
+                    if mapping.canonical_option_key == other.canonical_option_key
+                )
+                for variant in choice.variant_mappings
+            ],
+            ["Other / 其他", "Other / 其他"],
+        )
 
 
 if __name__ == "__main__":

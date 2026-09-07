@@ -90,6 +90,7 @@ class CanonicalOption(ContractModel):
     option_key: str = Field(min_length=1)
     value: str = Field(min_length=1)
     label: str | None = None
+    is_other: bool = False
     asset_reference_ids: list[str] = Field(default_factory=list)
     provider_option_id: str | None = None
 

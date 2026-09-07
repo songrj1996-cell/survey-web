@@ -595,11 +595,14 @@ function otherTextHTML(i, c) {
         `<span class="option-summary-chip" title="${esc(v)}">${esc(v)}</span>`
       ).join('')}</div>`
     : '';
+  const description = meta.provider_declared
+    ? `Google 表单结构允许 Other；当前回答接口不会逐条标记 Other。发现 ${count} 条不属于现有选项的候选内容，历史已删除选项也可能混入；确认后统计时计入「${esc(option)}」，并作为本题补充反馈。`
+    : `其他填空补充：检测到 ${count} 条；统计时计入「${esc(option)}」，报告中作为本题补充反馈`;
   return `<div class="option-editor" data-other-text="${i}">
     <div style="border:1px dashed var(--border);border-radius:8px;padding:10px 12px;background:rgba(255,255,255,.54);">
       <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:var(--text-2);">
         <input type="checkbox" data-other-text-enabled="${i}" ${meta.enabled !== false ? 'checked' : ''} />
-        <span>其他填空补充：检测到 ${count} 条；统计时计入「${esc(option)}」，报告中作为本题补充反馈</span>
+        <span>${description}</span>
       </label>
       ${exampleHTML}
     </div>

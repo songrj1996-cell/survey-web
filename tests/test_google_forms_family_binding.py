@@ -55,6 +55,46 @@ def _response(response_id: str, prefix: str, choice: str, open_text: str):
 
 
 class GoogleFormsFamilyBindingTests(unittest.TestCase):
+    def test_provider_declared_other_exposes_only_unmatched_response_candidates(self):
+        en = snapshot("FORM_EN", "en", include_other=True)
+        declared = [("en", "FORM_EN", en)]
+        family = build_questionnaire_family(
+            owner_ref=OWNER,
+            title=TITLE,
+            variants=[FamilyVariantSnapshot(language="en", snapshot=en)],
+            semantic_questions=semantics(declared),
+            now=NOW,
+        )
+        capture = GoogleFormResponsesCapture(
+            form_id="FORM_EN",
+            responses=(
+                _response("standard", "en", "Ranked", "Standard response"),
+                _response("custom-1", "en", "Custom mode", "First custom"),
+                _response("custom-2", "en", "Custom mode", "Second custom"),
+            ),
+            page_count=1,
+        )
+
+        binding = bind_google_forms_family_responses(family, [capture])
+
+        choice = next(
+            item
+            for item in binding.columns_detected
+            if item.role == "single_choice"
+        )
+        session_choice = choice.to_session_value()
+        self.assertEqual(session_choice["options"], ["排位", "经典", "Other / 其他"])
+        self.assertEqual(session_choice["other_text"], {
+            "enabled": True,
+            "option": "Other / 其他",
+            "provider_declared": True,
+            "count": 2,
+            "examples": ["Custom mode"],
+            "values": ["Custom mode"],
+        })
+        self.assertEqual(binding.rows[1][0], "排位")
+        self.assertEqual(binding.rows[2][0], "Custom mode")
+
     def test_multilingual_merge_only_guards_same_response_id_within_form(self):
         en = snapshot("FORM_EN", "en", include_discord=True)
         id_form = snapshot("FORM_ID", "id", reorder=True)
