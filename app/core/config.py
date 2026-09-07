@@ -74,7 +74,8 @@ USER_LLM_KEY_ENCRYPTION_KEY = os.getenv(
 ).strip()
 LLM_COLUMN_MODEL = os.getenv("LLM_COLUMN_MODEL", "gpt-5.6-terra").strip()
 LLM_COLUMN_FALLBACK_MODELS = (
-    _env_csv_list("LLM_COLUMN_FALLBACK_MODELS") or ("qwen3.7-plus",)
+    _env_csv_list("LLM_COLUMN_FALLBACK_MODELS")
+    or ("claude-sonnet-5", "gpt-5.6-sol")
 )
 LLM_COLUMN_REASONING = os.getenv("LLM_COLUMN_REASONING", "medium").strip()
 LLM_COLUMN_MAX_TOKENS = max(1024, _env_int("LLM_COLUMN_MAX_TOKENS", 16000))
