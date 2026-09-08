@@ -22,6 +22,9 @@ SURVEY_JAVASCRIPT = (
 STYLESHEET = (
     PROJECT_ROOT / "static" / "questionnaire-sources.css"
 ).read_text(encoding="utf-8")
+SETTINGS_JAVASCRIPT = (
+    PROJECT_ROOT / "static" / "js" / "features" / "settings.js"
+).read_text(encoding="utf-8")
 
 
 _BROWSER_SESSION_TEMP = tempfile.TemporaryDirectory(
@@ -210,6 +213,11 @@ class QuestionnaireSourceFrontendContractTests(unittest.TestCase):
         self.assertIn('.qsrc-variant', STYLESHEET)
         self.assertIn('.qsrc-project', STYLESHEET)
         self.assertIn('@media (max-width: 720px)', STYLESHEET)
+
+    def test_admin_settings_exposes_google_link_entry_toggle(self):
+        self.assertIn('setting-google-forms-entry', SETTINGS_JAVASCRIPT)
+        self.assertIn('google_forms_entry_enabled', SETTINGS_JAVASCRIPT)
+        self.assertIn('问卷分析·Google Link 入口', SETTINGS_JAVASCRIPT)
 
 
 if __name__ == '__main__':

@@ -6,6 +6,7 @@ from app.core.config import APP_SETTINGS_FILE
 
 DEFAULT_APP_SETTINGS = {
     "comment_duplicate_reminder_enabled": True,
+    "google_forms_entry_enabled": False,
 }
 
 

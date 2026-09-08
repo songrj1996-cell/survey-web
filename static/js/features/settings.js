@@ -1937,6 +1937,14 @@ async function loadSystemSettings() {
           <span>开启重复文件提醒</span>
         </label>
       </div>
+      <div class="uitext-card">
+        <div class="uitext-card__label">问卷分析·Google Link 入口</div>
+        <div class="prompt-card__desc">底层 Google Forms 连接可用时，开启后用户刷新页面即可看到入口；关闭后相关接口也会停止开放。</div>
+        <label class="setting-toggle">
+          <input type="checkbox" id="setting-google-forms-entry" ${data.google_forms_entry_enabled ? 'checked' : ''} />
+          <span>开放 Google Link 入口</span>
+        </label>
+      </div>
     `;
   } catch (e) {
     body.innerHTML = `<div class="hist-empty">加载平台设置失败：${esc(e.message)}</div>`;
@@ -1944,18 +1952,21 @@ async function loadSystemSettings() {
 }
 
 $('stab-content-system')?.addEventListener('change', async e => {
-  const input = e.target.closest('#setting-comment-duplicate');
+  const input = e.target.closest('#setting-comment-duplicate, #setting-google-forms-entry');
   if (!input) return;
+  const settingKey = input.id === 'setting-google-forms-entry'
+    ? 'google_forms_entry_enabled'
+    : 'comment_duplicate_reminder_enabled';
   input.disabled = true;
   try {
     const resp = await fetch('/api/app-settings', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ comment_duplicate_reminder_enabled: input.checked }),
+      body: JSON.stringify({ [settingKey]: input.checked }),
     });
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.detail || '保存失败');
-    input.checked = !!data.comment_duplicate_reminder_enabled;
+    input.checked = !!data[settingKey];
     showToast('平台设置已保存', 'success');
   } catch (err) {
     input.checked = !input.checked;
