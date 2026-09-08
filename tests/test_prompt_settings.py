@@ -141,7 +141,7 @@ class PromptCatalogTests(unittest.TestCase):
         self.assertEqual(migrated["column_detect_system"]["version"], 2)
         self.assertEqual(migrated["survey_planner_system"]["version"], 4)
         self.assertEqual(migrated["writer_requirements"]["version"], 14)
-        self.assertEqual(migrated["annotate_quality_system"]["version"], 3)
+        self.assertEqual(migrated["annotate_quality_system"]["version"], 4)
         self.assertEqual(migrated["theme_extract_system"]["version"], 3)
         self.assertEqual(migrated["theme_merge_system"]["version"], 2)
         self.assertEqual(migrated["response_classify_system"]["version"], 2)
@@ -161,7 +161,7 @@ class PromptCatalogTests(unittest.TestCase):
         for key, previous_version in (
             ("survey_planner_system", 3),
             ("writer_requirements", 11),
-            ("annotate_quality_system", 2),
+            ("annotate_quality_system", 3),
             ("theme_extract_system", 2),
             ("theme_merge_system", 1),
             ("response_classify_system", 1),

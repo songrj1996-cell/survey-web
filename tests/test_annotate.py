@@ -93,6 +93,25 @@ class AnnotateRuleTests(unittest.TestCase):
         self.assertIn("优秀 1、普通 1、无效 3", prompt)
         self.assertIn("Brody", prompt)
 
+    def test_quality_prompt_respects_conditional_no_issue_branch(self):
+        prompt = DEFAULT_ANNOTATE_QUALITY_SYSTEM_PROMPT
+        compact_prompt = "".join(prompt.split())
+
+        self.assertIn("按当前回答实际适用的分支判断", prompt)
+        self.assertIn("一般评价、偏好、比较、原因或建议题不适用", prompt)
+        self.assertIn("单元格为空时仍按 N/A 处理", prompt)
+        self.assertIn("即使没有额外原因、影响或场景，也应判为普通反馈", prompt)
+        self.assertIn('"It is very easy to understand"', prompt)
+        self.assertIn('"Clean design, easy to understand"', prompt)
+        self.assertIn("本条优先于下方", prompt)
+        self.assertIn("没有具体对象，应判为无效反馈", prompt)
+        self.assertIn("只报出元素名仍应判为无效反馈", compact_prompt)
+        self.assertIn("形成最小信息链但细节较少，可判普通反馈", compact_prompt)
+        self.assertIn("不会自动构成优秀反馈", prompt)
+        self.assertIn("题目在当前回答实际适用的分支中", compact_prompt)
+        self.assertIn("“若有，请说明为什么”只约束声称存在问题的回答", compact_prompt)
+        self.assertIn("只给结论或态度仍属于无效反馈", compact_prompt)
+
     def test_workflow_queries_only_contain_task_data(self):
         rows = [["P1", "answer one", "answer two"]]
         headers = ["ID", "Q1", "Q2"]
