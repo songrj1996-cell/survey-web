@@ -1286,7 +1286,7 @@
             <input type="checkbox" id="task-quality" />
             <span class="ann-task-label">
               <strong>回答质量打标</strong>
-              <span>为每道主观题打上 无效反馈 / 普通反馈 / 优秀反馈 标签，并生成整体质量评级</span>
+              <span>为每道已回答的主观题打上 无效反馈 / 有效反馈 / 优秀反馈 标签；未回答题记为 N/A</span>
             </span>
           </label>
         </div>
@@ -1529,19 +1529,51 @@
             <div class="ann-done-text" id="ann-done-text">标注完成</div>
           </div>
           <div class="ann-review-block" id="ann-quality-preview-block" hidden>
-            <div class="ann-review-toolbar">
-              <label for="ann-quality-filter">整体质量</label>
-              <select class="type-select" id="ann-quality-filter">
-                <option value="all">全部</option>
-                <option value="无效反馈">无效反馈</option>
-                <option value="普通反馈">普通反馈</option>
-                <option value="优秀反馈">优秀反馈</option>
-                <option value="N/A">N/A</option>
-              </select>
-              <span id="ann-quality-filter-count"></span>
+            <div class="ann-quality-review-header">
+              <div class="ann-quality-filter-toolbar">
+                <label>
+                  <span>整体质量</span>
+                  <select class="type-select" id="ann-quality-overall-filter">
+                    <option value="all">全部整体质量</option>
+                    <option value="无效反馈">无效反馈</option>
+                    <option value="有效反馈">有效反馈</option>
+                    <option value="优秀反馈">优秀反馈</option>
+                  </select>
+                </label>
+                <label>
+                  <span>逐题标签</span>
+                  <select class="type-select" id="ann-quality-question-filter">
+                    <option value="all">全部逐题标签</option>
+                    <option value="无效反馈">含无效反馈</option>
+                    <option value="有效反馈">含有效反馈</option>
+                    <option value="优秀反馈">含优秀反馈</option>
+                    <option value="N/A">含 N/A</option>
+                  </select>
+                </label>
+                <label>
+                  <span>人工修改状态</span>
+                  <select class="type-select" id="ann-quality-adjustment-filter">
+                    <option value="all">全部复核状态</option>
+                    <option value="adjusted">仅看人工改过</option>
+                    <option value="untouched">尚未修改</option>
+                  </select>
+                </label>
+                <span class="ann-quality-filter-count" id="ann-quality-filter-count"></span>
+              </div>
+              <div class="ann-ai-layout-switch" role="group" aria-label="质量结果审阅布局">
+                <button class="ann-ai-layout-btn ann-ai-layout-btn--active" id="ann-quality-layout-split" type="button">分栏档案</button>
+                <button class="ann-ai-layout-btn" id="ann-quality-layout-focus" type="button">专注审阅</button>
+              </div>
             </div>
-            <div class="ann-confirm-table-wrap ann-quality-preview-wrap">
-              <table class="ann-confirm-table" id="ann-quality-preview-table"></table>
+            <div class="ann-quality-summary-grid" id="ann-quality-summary-grid" aria-live="polite"></div>
+            <div class="ann-ai-confirm-workspace ann-quality-review-workspace" id="ann-quality-review-workspace">
+              <aside class="ann-ai-candidate-pane" aria-label="质量结果玩家列表">
+                <div class="ann-ai-pane-heading">
+                  <div><strong>玩家列表</strong><span>点击进入档案，筛选后只显示匹配玩家</span></div>
+                </div>
+                <div class="ann-ai-candidate-list" id="ann-quality-player-list"></div>
+              </aside>
+              <section class="ann-ai-profile-pane ann-quality-profile-pane" id="ann-quality-profile-pane" aria-label="玩家质量档案"></section>
             </div>
           </div>
           <div class="ann-result-actions">
@@ -2081,13 +2113,13 @@
   <script src="/static/js/features/questionnaire-sources.js?v=1"></script>
   <script src="/static/js/features/report.js?v=43"></script>
   <script src="/static/js/features/profile.js?v=2"></script>
-  <script src="/static/js/features/settings.js?v=34"></script>
+  <script src="/static/js/features/settings.js?v=35"></script>
   <script src="/static/js/features/history.js?v=36"></script>
   <script src="/static/js/features/interview.js?v=10"></script>
   <script src="/static/js/features/interview-v2.js?v=6"></script>
   <script src="/static/js/features/nav.js?v=37"></script>
   <script src="/static/js/features/comment.js?v=29"></script>
-<script src="/static/js/features/annotate.js?v=37"></script>
+<script src="/static/js/features/annotate.js?v=39"></script>
 </body>
 
 </html>

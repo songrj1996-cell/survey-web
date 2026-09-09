@@ -93,6 +93,7 @@ class FamilyVariantQuestionMapping(ContractModel):
 class FamilyCanonicalOption(ContractModel):
     canonical_option_key: str = Field(min_length=1, max_length=128)
     label: str = Field(min_length=1, max_length=100_000)
+    is_other: bool = False
 
 
 class FamilyCanonicalRow(ContractModel):

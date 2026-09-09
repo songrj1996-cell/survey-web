@@ -9,9 +9,11 @@
 import asyncio
 import inspect
 import json
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Literal
 
 import httpx
@@ -41,6 +43,7 @@ class _LLMRequestError(RuntimeError):
     status_code: int | None = None
     endpoint_incompatible: bool = False
     chat_usage_option_incompatible: bool = False
+    error_category: str = "llm_error"
 
     def __str__(self) -> str:
         return self.message
@@ -61,6 +64,48 @@ class _AttemptObservation:
     response_model: str | None = None
     usage: dict[str, int] | None = None
     usage_complete: bool = False
+    http_status: int | None = None
+    finish_reason: str | None = None
+
+
+def _attempt_error_category(error: BaseException | None) -> str | None:
+    """Diagnostic codes only; never copy exception messages or upstream bodies."""
+    if error is None:
+        return None
+    if isinstance(error, asyncio.CancelledError):
+        return "cancelled"
+    for error_class, category in (
+        (httpx.ConnectTimeout, "connect_timeout"),
+        (httpx.ReadTimeout, "read_timeout"),
+        (httpx.WriteTimeout, "write_timeout"),
+        (httpx.PoolTimeout, "pool_timeout"),
+        (httpx.TimeoutException, "timeout"),
+        (httpx.TransportError, "transport_error"),
+    ):
+        if isinstance(error, error_class):
+            return category
+    if isinstance(error, _LLMRequestError):
+        if error.endpoint_incompatible:
+            return "protocol_incompatible"
+        if error.chat_usage_option_incompatible:
+            return "usage_option_incompatible"
+        if error.status_code == 429:
+            return "rate_limited"
+        if error.status_code in {401, 403}:
+            return "authentication_error"
+        return error.error_category
+    return "unexpected_error"
+
+
+def _diagnostic_finish_reason(reason: str | None) -> str | None:
+    # A gateway may put arbitrary text into this field. Preserve known codes only.
+    if reason is None:
+        return None
+    return reason if reason in {
+        "stop", "length", "content_filter", "tool_calls", "function_call",
+        "end_turn", "max_tokens", "stop_sequence", "tool_use", "pause_turn",
+        "refusal", "completed", "incomplete", "max_output_tokens", "failed",
+    } else "unknown"
 
 
 def _configured_models(model_overrides=None) -> list[str]:
@@ -223,6 +268,7 @@ def _http_error(model: str, protocol: _Protocol, status: int, body: str) -> _LLM
         retryable=retryable,
         status_code=status,
         endpoint_incompatible=incompatible,
+        error_category="http_error",
     )
 
 
@@ -293,6 +339,7 @@ async def _request_chat(
         headers=headers,
         json=payload,
     ) as response:
+        observation.http_status = response.status_code
         if response.status_code >= 400:
             body = _safe_error_text(await response.aread(), api_key)
             if include_usage and _chat_usage_option_incompatible(
@@ -331,6 +378,7 @@ async def _request_chat(
                 raise _LLMRequestError(
                     f"LLM stream error model={model} protocol={protocol}: {error_text}",
                     retryable=True,
+                    error_category="upstream_stream_error",
                 )
             if isinstance(data.get("model"), str) and data["model"].strip():
                 observation.response_model = data["model"].strip()
@@ -351,6 +399,7 @@ async def _request_chat(
                 reason = choices[0].get("finish_reason")
                 if reason:
                     finish_reason = str(reason)
+                    observation.finish_reason = finish_reason
             text = _chat_chunk_text(data)
             if text:
                 chunks.append(text)
@@ -361,11 +410,13 @@ async def _request_chat(
             f"LLM stopped before completing output model={model} protocol={protocol}; "
             f"finish_reason={finish_reason}",
             status_code=400,
+            error_category=("output_truncated" if finish_reason == "length" else "content_filtered"),
         )
     if not answer:
         raise _LLMRequestError(
             f"LLM returned empty output model={model} protocol={protocol}",
             retryable=True,
+            error_category="empty_output",
         )
     return _LLMResult(
         answer=answer,
@@ -409,6 +460,7 @@ async def _request_messages(
     url = f"{LLM_API_BASE}/messages"
 
     async with client.stream("POST", url, headers=headers, json=payload) as response:
+        observation.http_status = response.status_code
         if response.status_code >= 400:
             body = _safe_error_text(await response.aread(), api_key)
             raise _http_error(model, protocol, response.status_code, body)
@@ -441,6 +493,7 @@ async def _request_messages(
                 raise _LLMRequestError(
                     f"LLM stream error model={model} protocol={protocol}: {error_text}",
                     retryable=True,
+                    error_category="upstream_stream_error",
                 )
             if event_type == "message_start":
                 message = (
@@ -474,6 +527,7 @@ async def _request_messages(
                 delta = data.get("delta") if isinstance(data.get("delta"), dict) else {}
                 if delta.get("stop_reason"):
                     stop_reason = str(delta["stop_reason"])
+                    observation.finish_reason = stop_reason
                 delta_usage = data.get("usage")
                 if isinstance(delta_usage, dict):
                     parsed_input = _token_count(delta_usage.get("input_tokens"))
@@ -496,6 +550,7 @@ async def _request_messages(
                     chunks.append(text)
                 if data.get("stop_reason"):
                     stop_reason = str(data["stop_reason"])
+                    observation.finish_reason = stop_reason
                 if isinstance(data.get("model"), str) and data["model"].strip():
                     observation.response_model = data["model"].strip()
                 raw_usage = data.get("usage")
@@ -520,11 +575,13 @@ async def _request_messages(
             f"LLM stopped before completing output model={model} protocol={protocol}; "
             f"stop_reason={stop_reason}",
             status_code=400,
+            error_category=("output_truncated" if stop_reason == "max_tokens" else "refusal"),
         )
     if not answer:
         raise _LLMRequestError(
             f"LLM returned empty output model={model} protocol={protocol}",
             retryable=True,
+            error_category="empty_output",
         )
     usage = _normalized_usage(
         {
@@ -569,6 +626,7 @@ async def _request_responses(
     url = f"{LLM_API_BASE}/responses"
 
     async with client.stream("POST", url, headers=headers, json=payload) as response:
+        observation.http_status = response.status_code
         if response.status_code >= 400:
             body = _safe_error_text(await response.aread(), api_key)
             raise _http_error(model, protocol, response.status_code, body)
@@ -626,8 +684,10 @@ async def _request_responses(
                 raise _LLMRequestError(
                     f"LLM stream error model={model} protocol={protocol}: {error_text}",
                     retryable=True,
+                    error_category="upstream_stream_error",
                 )
             elif event_type in {"response.completed", "response.incomplete"}:
+                observation.finish_reason = "completed"
                 completed = data.get("response") if isinstance(data.get("response"), dict) else {}
                 if not chunks:
                     final_text = _responses_text(completed)
@@ -637,13 +697,17 @@ async def _request_responses(
                         incomplete_reason = str(details.get("reason") or "incomplete")
                     else:
                         incomplete_reason = "incomplete"
+                    observation.finish_reason = incomplete_reason
             elif not event_type:
+                if data.get("status") == "completed":
+                    observation.finish_reason = "completed"
                 if data.get("status") == "incomplete":
                     details = data.get("incomplete_details")
                     if isinstance(details, dict):
                         incomplete_reason = str(details.get("reason") or "incomplete")
                     else:
                         incomplete_reason = "incomplete"
+                    observation.finish_reason = incomplete_reason
                 if not chunks:
                     final_text = _responses_text(data)
 
@@ -653,11 +717,17 @@ async def _request_responses(
             f"LLM stopped before completing output model={model} protocol={protocol}; "
             f"reason={incomplete_reason}",
             status_code=400,
+            error_category=(
+                "output_truncated" if incomplete_reason == "max_output_tokens"
+                else "content_filtered" if incomplete_reason == "content_filter"
+                else "incomplete_output"
+            ),
         )
     if not answer:
         raise _LLMRequestError(
             f"LLM returned empty output model={model} protocol={protocol}",
             retryable=True,
+            error_category="empty_output",
         )
     return _LLMResult(
         answer=answer,
@@ -746,12 +816,17 @@ async def collect_chat_completion(
     last_error: Exception | None = None
     requested_model = configured_models[0]
     attempt_number = 0
+    request_id = uuid.uuid4().hex
+    previous_attempt: dict[str, Any] = {}
 
     def _terminal_event(
         status: str,
         event_base: dict[str, Any],
         observation: _AttemptObservation,
         result: _LLMResult | None = None,
+        *,
+        started_clock: float,
+        error: BaseException | None = None,
     ) -> dict[str, Any]:
         event = {
             "status": status,
@@ -762,6 +837,12 @@ async def collect_chat_completion(
                 if result is not None
                 else observation.usage_complete
             ),
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "elapsed_seconds": round(time.perf_counter() - started_clock, 3),
+            "http_status": observation.http_status,
+            "finish_reason": _diagnostic_finish_reason(observation.finish_reason),
+            "error_type": type(error).__name__ if error is not None else None,
+            "error_category": _attempt_error_category(error),
         }
         response_model = (
             result.response_model if result is not None else observation.response_model
@@ -778,17 +859,34 @@ async def collect_chat_completion(
             *,
             chat_include_usage: bool = True,
         ) -> _LLMResult:
-            nonlocal attempt_number
+            nonlocal attempt_number, previous_attempt
             attempt_number += 1
+            attempt_kind = "initial"
+            if previous_attempt:
+                if previous_attempt["model"] != model:
+                    attempt_kind = "model_fallback"
+                elif previous_attempt["protocol"] != protocol:
+                    attempt_kind = "protocol_fallback"
+                elif previous_attempt["chat_include_usage"] != chat_include_usage:
+                    attempt_kind = "usage_compatibility"
+                else:
+                    attempt_kind = "retry"
             event_base = {
                 "call_id": uuid.uuid4().hex,
+                "request_id": request_id,
+                "previous_call_id": previous_attempt.get("call_id"),
+                "attempt_kind": attempt_kind,
                 "model": model,
                 "requested_model": requested_model,
                 "protocol": protocol,
                 "fallback": model_index > 0,
                 "attempt": attempt_number,
+                "max_output_tokens": request_max_tokens,
+                "started_at": datetime.now(timezone.utc).isoformat(),
             }
+            previous_attempt = {**event_base, "chat_include_usage": chat_include_usage}
             observation = _AttemptObservation()
+            started_clock = time.perf_counter()
             await _emit_attempt_events(
                 on_attempt_event,
                 {"status": "started", **event_base},
@@ -805,22 +903,31 @@ async def collect_chat_completion(
                     api_key=request_api_key,
                     chat_include_usage=chat_include_usage,
                 )
-            except asyncio.CancelledError:
+            except asyncio.CancelledError as exc:
                 await _emit_attempt_events(
                     on_attempt_event,
-                    _terminal_event("failed", event_base, observation),
+                    _terminal_event(
+                        "failed", event_base, observation,
+                        started_clock=started_clock, error=exc,
+                    ),
                 )
                 raise
-            except Exception:
+            except Exception as exc:
                 await _emit_attempt_events(
                     on_attempt_event,
-                    _terminal_event("failed", event_base, observation),
+                    _terminal_event(
+                        "failed", event_base, observation,
+                        started_clock=started_clock, error=exc,
+                    ),
                 )
                 raise
 
             await _emit_attempt_events(
                 on_attempt_event,
-                _terminal_event("completed", event_base, observation, result),
+                _terminal_event(
+                    "completed", event_base, observation, result,
+                    started_clock=started_clock,
+                ),
             )
             return result
 

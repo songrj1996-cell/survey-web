@@ -90,8 +90,17 @@ def get_app_settings() -> dict:
 def update_app_settings(patch: AppSettingsPatch) -> tuple[dict, str]:
     """更新系统设置，返回 (settings, audit_detail)。"""
     settings = _load_app_settings()
+    details = []
     if patch.comment_duplicate_reminder_enabled is not None:
         settings["comment_duplicate_reminder_enabled"] = bool(patch.comment_duplicate_reminder_enabled)
+        details.append(
+            f"评论重复文件提醒：{'开启' if settings['comment_duplicate_reminder_enabled'] else '关闭'}"
+        )
+    if patch.google_forms_entry_enabled is not None:
+        settings["google_forms_entry_enabled"] = bool(patch.google_forms_entry_enabled)
+        details.append(
+            f"Google Link 入口：{'开启' if settings['google_forms_entry_enabled'] else '关闭'}"
+        )
     _save_app_settings(settings)
-    detail = f"评论重复文件提醒：{'开启' if settings.get('comment_duplicate_reminder_enabled') else '关闭'}"
+    detail = "；".join(details) or "平台设置未变更"
     return settings, detail

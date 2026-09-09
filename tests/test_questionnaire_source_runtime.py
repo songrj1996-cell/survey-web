@@ -114,6 +114,10 @@ class QuestionnaireSourceRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 "app.routers.questionnaire_source_runtime._owner_key",
                 return_value=OWNER,
             ),
+            patch(
+                "app.routers.questionnaire_source_runtime.get_app_settings",
+                return_value={"google_forms_entry_enabled": True},
+            ),
         ):
             async with httpx.AsyncClient(
                 transport=transport,
@@ -128,6 +132,68 @@ class QuestionnaireSourceRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "google_forms_connection": True,
             "google_forms_unified_analysis": True,
         })
+
+    async def test_disabled_entry_hides_capabilities_and_blocks_family_routes(self):
+        app = FastAPI()
+        app.include_router(create_questionnaire_source_runtime_router(self.runtime))
+        transport = httpx.ASGITransport(app=app)
+        with (
+            patch(
+                "app.routers.questionnaire_source_runtime._require_feature",
+                new=AsyncMock(return_value=LOGIN),
+            ),
+            patch(
+                "app.routers.questionnaire_source_runtime._owner_key",
+                return_value=OWNER,
+            ),
+            patch(
+                "app.routers.questionnaire_source_runtime.get_app_settings",
+                return_value={"google_forms_entry_enabled": False},
+            ),
+        ):
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://test",
+            ) as client:
+                capabilities = await client.get(
+                    "/api/questionnaire-sources/capabilities"
+                )
+                families = await client.get(
+                    "/api/questionnaire-sources/google-forms/families"
+                )
+        self.assertEqual(capabilities.status_code, 200, capabilities.text)
+        self.assertEqual(capabilities.json(), {
+            "schema_version": 1,
+            "google_forms_connection": False,
+            "google_forms_unified_analysis": False,
+        })
+        self.assertEqual(families.status_code, 404, families.text)
+        self.assertEqual(families.json()["detail"]["code"], "google_forms_entry_disabled")
+
+    async def test_enabled_entry_allows_family_routes(self):
+        app = FastAPI()
+        app.include_router(create_questionnaire_source_runtime_router(self.runtime))
+        transport = httpx.ASGITransport(app=app)
+        with (
+            patch(
+                "app.routers.questionnaire_source_runtime.get_app_settings",
+                return_value={"google_forms_entry_enabled": True},
+            ),
+            patch(
+                "app.routers.google_forms_families._require_feature",
+                new=AsyncMock(return_value=LOGIN),
+            ),
+        ):
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://test",
+            ) as client:
+                response = await client.get(
+                    "/api/questionnaire-sources/google-forms/families"
+                )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["items"], [])
 
     async def test_capability_booleans_are_strict(self):
         with self.assertRaises(ValueError):

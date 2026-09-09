@@ -90,6 +90,7 @@ class UiTextUpdateRequest(BaseModel):
 
 class AppSettingsPatch(BaseModel):
     comment_duplicate_reminder_enabled: bool | None = None
+    google_forms_entry_enabled: bool | None = None
 
 
 class UserLlmKeyUpdateRequest(BaseModel):
@@ -136,3 +137,9 @@ class AnnotateConfirmRequest(BaseModel):
 
 class AnnotateConfirmAIRequest(BaseModel):
     confirmed_ai_ids: list[str]  # 用户确认为 AI 作答的 player ID 列表
+
+
+class AnnotateQualityReviewRequest(BaseModel):
+    player_id: str
+    column_index: int
+    label: str

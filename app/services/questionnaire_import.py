@@ -33,6 +33,7 @@ _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.IGNORECASE | re.DOTAL
 _CHINESE_RE = re.compile(r"[\u4e00-\u9fff]")
 _LATIN_RE = re.compile(r"[A-Za-z]")
 _LATIN_WORD_RE = re.compile(r"[A-Za-z]+")
+_OTHER_OPTION_LABEL = "Other / 其他"
 
 _BESTED_ROLE_MAP = {
     "描述题": "ignore",
@@ -839,6 +840,21 @@ def apply_questionnaire_translations(
         ]
         if original_options:
             options_zh = list(translated["options_zh"])
+            other_meta = question.get("other_text")
+            if (
+                isinstance(other_meta, dict)
+                and other_meta.get("provider_declared") is True
+            ):
+                provider_other_label = str(
+                    other_meta.get("option") or _OTHER_OPTION_LABEL
+                ).strip()
+                for index, original in enumerate(original_options):
+                    if _norm(original) == _norm(provider_other_label):
+                        options_zh[index] = _OTHER_OPTION_LABEL
+                updated["other_text"] = {
+                    **other_meta,
+                    "option": _OTHER_OPTION_LABEL,
+                }
             updated["options"] = options_zh
             updated["options_original"] = original_options
             aliases: dict[str, list[str]] = {}

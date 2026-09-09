@@ -3,6 +3,7 @@ import io
 import json
 import unittest
 from datetime import datetime
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import openpyxl
@@ -93,6 +94,25 @@ class AnnotateRuleTests(unittest.TestCase):
         self.assertIn("优秀 1、普通 1、无效 3", prompt)
         self.assertIn("Brody", prompt)
 
+    def test_quality_prompt_respects_conditional_no_issue_branch(self):
+        prompt = DEFAULT_ANNOTATE_QUALITY_SYSTEM_PROMPT
+        compact_prompt = "".join(prompt.split())
+
+        self.assertIn("按当前回答实际适用的分支判断", prompt)
+        self.assertIn("一般评价、偏好、比较、原因或建议题不适用", prompt)
+        self.assertIn("单元格为空时仍按 N/A 处理", prompt)
+        self.assertIn("即使没有额外原因、影响或场景，也应判为普通反馈", prompt)
+        self.assertIn('"It is very easy to understand"', prompt)
+        self.assertIn('"Clean design, easy to understand"', prompt)
+        self.assertIn("本条优先于下方", prompt)
+        self.assertIn("没有具体对象，应判为无效反馈", prompt)
+        self.assertIn("只报出元素名仍应判为无效反馈", compact_prompt)
+        self.assertIn("形成最小信息链但细节较少，可判普通反馈", compact_prompt)
+        self.assertIn("不会自动构成优秀反馈", prompt)
+        self.assertIn("题目在当前回答实际适用的分支中", compact_prompt)
+        self.assertIn("“若有，请说明为什么”只约束声称存在问题的回答", compact_prompt)
+        self.assertIn("只给结论或态度仍属于无效反馈", compact_prompt)
+
     def test_workflow_queries_only_contain_task_data(self):
         rows = [["P1", "answer one", "answer two"]]
         headers = ["ID", "Q1", "Q2"]
@@ -128,21 +148,47 @@ class AnnotateRuleTests(unittest.TestCase):
         self.assertEqual(results[0]["ai_prob"], 12)
         self.assertEqual(results[0]["polish_prob"], 91)
 
-    def test_all_na_has_no_assessable_overall_quality(self):
+    def test_all_na_is_overall_invalid_with_no_assessable_answers(self):
         overall, reason = annotate.calculate_overall_quality(
             {"col_1": "N/A", "col_2": "N/A"}, [1, 2]
         )
 
-        self.assertEqual(overall, "N/A")
+        self.assertEqual(overall, "无效反馈")
         self.assertIn("无可评估", reason)
 
-    def test_no_answer_placeholders_are_normalized_to_na(self):
+    def test_missing_answers_are_normalized_to_na(self):
+        for missing_answer in ("", "   ", None):
+            with self.subTest(missing_answer=missing_answer):
+                result = {
+                    "id": "P1",
+                    "q_labels": {"col_1": "无效反馈"},
+                    "q_reasons": {"col_1": "模型把空单元格当作回答"},
+                    "q_evidence": {"col_1": "错误证据"},
+                    "translations": {},
+                }
+                valid, missing, errors = annotate_workflow._validated_quality_results(
+                    [result], [["P1", missing_answer]], 0, [1], False
+                )
+                self.assertEqual(missing, set())
+                self.assertEqual(errors, [])
+                self.assertEqual(valid[0]["q_labels"]["col_1"], "N/A")
+                self.assertEqual(valid[0]["q_evidence"]["col_1"], "")
+                self.assertIn("未作答", valid[0]["q_reasons"]["col_1"])
+                self.assertEqual(valid[0]["overall"], "无效反馈")
+                self.assertEqual(
+                    annotate_workflow._quality_invalid_cols(
+                        valid[0], ["P1", missing_answer], [1]
+                    ),
+                    set(),
+                )
+
+    def test_textual_no_answer_placeholders_remain_assessable_answers(self):
         for placeholder in ("nil", "N/A", "none", "No", "no.", "Tidak", "暂无"):
             with self.subTest(placeholder=placeholder):
                 result = {
                     "id": "P1",
-                    "q_labels": {"col_1": "无效反馈"},
-                    "q_reasons": {"col_1": "模型把占位文本当作回答"},
+                    "q_labels": {"col_1": "普通反馈"},
+                    "q_reasons": {"col_1": "模型已判断该文本"},
                     "q_evidence": {"col_1": placeholder},
                     "translations": {},
                 }
@@ -151,14 +197,8 @@ class AnnotateRuleTests(unittest.TestCase):
                 )
                 self.assertEqual(missing, set())
                 self.assertEqual(errors, [])
-                self.assertEqual(valid[0]["q_labels"]["col_1"], "N/A")
-                self.assertEqual(valid[0]["q_evidence"]["col_1"], "")
-                self.assertEqual(
-                    annotate_workflow._quality_invalid_cols(
-                        valid[0], ["P1", placeholder], [1]
-                    ),
-                    set(),
-                )
+                self.assertEqual(valid[0]["q_labels"]["col_1"], "有效反馈")
+                self.assertEqual(valid[0]["q_evidence"]["col_1"], placeholder)
 
     def test_substantive_nonempty_answer_cannot_be_na(self):
         result = {
@@ -175,7 +215,7 @@ class AnnotateRuleTests(unittest.TestCase):
 
         self.assertEqual(valid, [])
         self.assertEqual(missing, {"P1"})
-        self.assertTrue(any("非空回答不能为 N/A" in error for error in errors))
+        self.assertTrue(any("有回答时不能标为 N/A" in error for error in errors))
 
     def test_na_is_excluded_from_overall_denominator(self):
         overall, reason = annotate.calculate_overall_quality(
@@ -185,12 +225,13 @@ class AnnotateRuleTests(unittest.TestCase):
 
         self.assertEqual(overall, "优秀反馈")
         self.assertIn("非N/A题目3道", reason)
+        self.assertIn("有效1", reason)
 
     def test_quality_v3_standard_case_one_keeps_invalid_majority_hard_gate(self):
         overall, reason = annotate.calculate_overall_quality(
             {
                 "col_1": "优秀反馈",
-                "col_2": "普通反馈",
+                "col_2": "有效反馈",
                 "col_3": "无效反馈",
                 "col_4": "无效反馈",
                 "col_5": "无效反馈",
@@ -199,7 +240,7 @@ class AnnotateRuleTests(unittest.TestCase):
         )
 
         self.assertEqual(overall, "无效反馈")
-        self.assertIn("无效3、普通1、优秀1", reason)
+        self.assertIn("无效3、有效1、优秀1", reason)
         self.assertIn("无效比例60.00%", reason)
         self.assertIn("加权总分3分、平均分0.60", reason)
         self.assertIn("整体硬门槛：已触发", reason)
@@ -209,26 +250,26 @@ class AnnotateRuleTests(unittest.TestCase):
         scenarios = (
             (
                 "below-invalid-threshold",
-                ["无效反馈", "无效反馈", "普通反馈", "普通反馈"],
+                ["无效反馈", "无效反馈", "有效反馈", "有效反馈"],
                 "无效反馈",
                 "平均分0.50",
             ),
             (
                 "exactly-invalid-threshold",
-                ["无效反馈", "无效反馈", "普通反馈", "普通反馈", "普通反馈"],
-                "普通反馈",
+                ["无效反馈", "无效反馈", "有效反馈", "有效反馈", "有效反馈"],
+                "有效反馈",
                 "平均分0.60",
             ),
             (
                 "excellent-at-threshold",
-                ["无效反馈", "普通反馈", "优秀反馈", "优秀反馈", "优秀反馈"],
+                ["无效反馈", "有效反馈", "优秀反馈", "优秀反馈", "优秀反馈"],
                 "优秀反馈",
                 "平均分1.40",
             ),
             (
                 "excellent-score-but-too-many-invalid",
                 ["无效反馈", "无效反馈", *(["优秀反馈"] * 5)],
-                "普通反馈",
+                "有效反馈",
                 "平均分1.43",
             ),
         )
@@ -300,7 +341,7 @@ class AnnotateRuleTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(valid[0]["overall"], "无效反馈")
         reason = valid[0]["overall_reason"]
-        self.assertIn("无效5、普通0、优秀0", reason)
+        self.assertIn("无效5、有效0、优秀0", reason)
         self.assertIn("无效比例100.00%", reason)
         self.assertIn("加权总分0分、平均分0.00", reason)
         self.assertIn("5个明确评分项全部为1", reason)
@@ -316,7 +357,7 @@ class AnnotateRuleTests(unittest.TestCase):
         ]
         row = ["P1", 1, 1, 1, 1, 1, *answers]
         open_text_cols = [6, 7, 8, 9, 10]
-        q_labels = {f"col_{col}": "普通反馈" for col in open_text_cols}
+        q_labels = {f"col_{col}": "有效反馈" for col in open_text_cols}
 
         low_effort = annotate.detect_low_effort_signals(
             row, headers, open_text_cols, 0, q_labels,
@@ -327,7 +368,7 @@ class AnnotateRuleTests(unittest.TestCase):
 
         self.assertFalse(low_effort["triggered"])
         self.assertEqual([signal["code"] for signal in low_effort["signals"]], ["uniform_scores"])
-        self.assertEqual(overall, "普通反馈")
+        self.assertEqual(overall, "有效反馈")
         self.assertIn("低投入组合信号：未触发（发现1项", reason)
 
     def test_missing_and_duplicate_ids_are_blocked_before_annotation(self):
@@ -510,6 +551,8 @@ class AnnotateRuleTests(unittest.TestCase):
         self.assertEqual(values[headers.index("Feedback")], "The skill delay is too long.")
         self.assertEqual(values[headers.index("[Feedback]中文翻译")], "技能延迟太长。")
         self.assertEqual(values[headers.index("AI作答标签")], "非高概率AI作答")
+        self.assertEqual(values[headers.index("整体反馈质量")], "有效反馈")
+        self.assertEqual(values[headers.index("[Feedback]质量标注")], "有效反馈")
 
     def test_incomplete_detail_tracks_translations_separately(self):
         detail = annotate_workflow._annotate_incomplete_detail({
@@ -565,12 +608,12 @@ class AnnotateRuleTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "无法解析 .xlsx"):
             _parse_file("responses.xlsx", b"not-an-xlsx")
 
-    def test_manual_quality_review_api_and_service_are_removed(self):
+    def test_manual_quality_review_api_and_service_are_available(self):
         from app.routers.annotate import router
 
         paths = {route.path for route in router.routes}
-        self.assertFalse(any("quality-review" in path for path in paths))
-        self.assertFalse(hasattr(annotate_workflow, "annotate_apply_quality_review"))
+        self.assertIn("/api/annotate/{sid}/quality-review", paths)
+        self.assertTrue(hasattr(annotate_workflow, "annotate_apply_quality_review"))
         self.assertTrue(all(
             any(
                 getattr(
@@ -581,11 +624,147 @@ class AnnotateRuleTests(unittest.TestCase):
             for route in router.routes
         ))
 
+    def test_quality_review_frontend_uses_card_filters_and_question_na_option(self):
+        root = Path(__file__).resolve().parents[1]
+        html = (root / "static" / "index.html").read_text(encoding="utf-8")
+        script = (root / "static" / "js" / "features" / "annotate.js").read_text(
+            encoding="utf-8"
+        )
+
+        for element_id in (
+            "ann-quality-overall-filter",
+            "ann-quality-question-filter",
+            "ann-quality-adjustment-filter",
+            "ann-quality-player-list",
+            "ann-quality-profile-pane",
+        ):
+            self.assertIn(f'id="{element_id}"', html)
+        question_filter = html.split('id="ann-quality-question-filter"', 1)[1].split(
+            "</select>", 1
+        )[0]
+        overall_filter = html.split('id="ann-quality-overall-filter"', 1)[1].split(
+            "</select>", 1
+        )[0]
+        self.assertIn('<option value="N/A">含 N/A</option>', question_filter)
+        self.assertNotIn('<option value="N/A">', overall_filter)
+        self.assertIn("'有效反馈'", script)
+        self.assertIn("当前标签固定为 N/A", script)
+        self.assertIn("/quality-review", script)
+        self.assertIn("human_reviews", script)
+        self.assertIn("annApplyQualityLabel", script)
+
 
 class AnnotateReviewTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def _decode_sse_event(raw: str) -> dict:
         return json.loads(raw.removeprefix("data: ").strip())
+
+    async def test_quality_review_updates_final_label_overall_and_excel_then_can_revert(self):
+        sid = "test-quality-human-review"
+        original_reason = "有观点但细节有限"
+        result = {
+            "id": "P1",
+            "q_labels": {"col_1": "普通反馈"},
+            "q_reasons": {"col_1": original_reason},
+            "q_evidence": {"col_1": "具体回答"},
+            "translations": {"col_1": "具体回答"},
+            "originals": {"col_1": "具体回答"},
+            "overall": "普通反馈",
+            "overall_reason": "原整体原因",
+        }
+        session = {
+            "rows": [["ID", "Q1"], ["P1", "具体回答"]],
+            "headers": ["ID", "Q1"],
+            "headers_zh": ["ID", "问题一"],
+            "id_col": 0,
+            "open_text_cols": [1],
+            "tasks": {"quality": True, "ai_detect": False},
+            "quality_status": "complete",
+            "quality_results": [result],
+            "filename": "responses.xlsx",
+        }
+        annotate_workflow.annotate_sessions[sid] = session
+        self.addCleanup(annotate_workflow.annotate_sessions.pop, sid, None)
+
+        with patch.object(
+            annotate_workflow,
+            "_save_annotate_result_history",
+            new=AsyncMock(),
+        ) as save_result:
+            changed = await annotate_workflow.annotate_apply_quality_review(
+                sid, "P1", 1, "优秀反馈", object()
+            )
+
+            self.assertTrue(changed["changed"])
+            self.assertEqual(changed["adjusted_count"], 1)
+            self.assertEqual(result["q_labels"]["col_1"], "优秀反馈")
+            self.assertEqual(result["overall"], "优秀反馈")
+            self.assertEqual(
+                result["quality_review_baseline"]["col_1"]["label"],
+                "有效反馈",
+            )
+            self.assertEqual(
+                result["human_reviews"]["col_1"]["to_label"],
+                "优秀反馈",
+            )
+            self.assertIn("有效反馈 → 优秀反馈", result["q_reasons"]["col_1"])
+            self.assertIn("人工复核调整1道题", result["overall_reason"])
+
+            excel_bytes, _ = annotate_workflow._build_annotate_excel_from_session(session)
+            workbook = openpyxl.load_workbook(io.BytesIO(excel_bytes))
+            sheet = workbook.active
+            headers = [cell.value for cell in sheet[1]]
+            label_col = headers.index("[Q1]质量标注") + 1
+            reason_col = headers.index("[Q1]质量原因") + 1
+            self.assertEqual(sheet.cell(2, label_col).value, "优秀反馈")
+            self.assertIn("人工复核调整", sheet.cell(2, reason_col).value)
+
+            reverted = await annotate_workflow.annotate_apply_quality_review(
+                sid, "P1", 1, "有效反馈", object()
+            )
+
+        self.assertTrue(reverted["changed"])
+        self.assertEqual(reverted["adjusted_count"], 0)
+        self.assertEqual(result["q_labels"]["col_1"], "有效反馈")
+        self.assertEqual(result["q_reasons"]["col_1"], original_reason)
+        self.assertNotIn("human_reviews", result)
+        self.assertEqual(save_result.await_count, 2)
+
+    async def test_quality_review_keeps_empty_answer_fixed_as_na(self):
+        sid = "test-quality-empty-human-review"
+        result = {
+            "id": "P1",
+            "q_labels": {"col_1": "N/A"},
+            "q_reasons": {"col_1": "该题未作答，按 N/A 处理"},
+            "q_evidence": {"col_1": ""},
+            "translations": {"col_1": ""},
+            "originals": {"col_1": ""},
+            "overall": "无效反馈",
+            "overall_reason": "无效反馈1道",
+        }
+        annotate_workflow.annotate_sessions[sid] = {
+            "rows": [["ID", "Q1"], ["P1", ""]],
+            "headers": ["ID", "Q1"],
+            "headers_zh": ["ID", "问题一"],
+            "id_col": 0,
+            "open_text_cols": [1],
+            "tasks": {"quality": True, "ai_detect": False},
+            "quality_status": "complete",
+            "quality_results": [result],
+        }
+        self.addCleanup(annotate_workflow.annotate_sessions.pop, sid, None)
+
+        with patch.object(
+            annotate_workflow,
+            "_save_annotate_result_history",
+            new=AsyncMock(),
+        ) as save_result:
+            with self.assertRaisesRegex(HTTPException, "固定标为 N/A"):
+                await annotate_workflow.annotate_apply_quality_review(
+                    sid, "P1", 1, "有效反馈", object()
+                )
+
+        save_result.assert_not_awaited()
 
     async def test_ai_detect_stream_sends_heartbeat_while_batch_is_waiting(self):
         sid = "test-ai-heartbeat"
@@ -1137,7 +1316,7 @@ class AnnotateReviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(missing, set())
         self.assertEqual(error, "")
         self.assertEqual(results[0]["q_labels"]["col_1"], "优秀反馈")
-        self.assertEqual(results[0]["q_labels"]["col_2"], "普通反馈")
+        self.assertEqual(results[0]["q_labels"]["col_2"], "有效反馈")
         self.assertEqual(
             [(label, fallback_first) for _, label, fallback_first in calls],
             [("1-initial", False), ("1-missing", True)],

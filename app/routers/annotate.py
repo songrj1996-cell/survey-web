@@ -9,9 +9,11 @@ from app.core.responses import _make_download_response
 from app.schemas.requests import (
     AnnotateConfirmAIRequest,
     AnnotateConfirmRequest,
+    AnnotateQualityReviewRequest,
 )
 from app.services.annotate_workflow import (
     ai_detect_stream,
+    annotate_apply_quality_review,
     annotate_set_column_config,
     annotate_set_confirmed_ai,
     build_and_save_annotate_download,
@@ -119,6 +121,40 @@ async def annotate_confirm_ai(sid: str, req: AnnotateConfirmAIRequest, request: 
         metadata={"session_id": sid, "confirmed_count": len(req.confirmed_ai_ids)},
     )
     return {"ok": True, "confirmed_count": len(req.confirmed_ai_ids)}
+
+
+@router.post("/api/annotate/{sid}/quality-review")
+async def annotate_quality_review(
+    sid: str,
+    req: AnnotateQualityReviewRequest,
+    request: Request,
+):
+    await require_session_request_access(
+        request,
+        sid,
+        login_resolver=_current_login,
+        loader=peek_annotate_session,
+    )
+    result = await annotate_apply_quality_review(
+        sid,
+        req.player_id,
+        req.column_index,
+        req.label,
+        request,
+    )
+    await audit_log(
+        request,
+        "annotate",
+        "人工调整回答质量标签",
+        f"会话：{sid}；玩家：{req.player_id}；列：{req.column_index}；标签：{req.label}",
+        metadata={
+            "session_id": sid,
+            "player_id": req.player_id,
+            "column_index": req.column_index,
+            "label": req.label,
+        },
+    )
+    return {"ok": True, **result}
 
 
 @router.get("/api/annotate/{sid}/run-quality")

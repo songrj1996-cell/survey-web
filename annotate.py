@@ -27,7 +27,17 @@ from app.core.config import (
     ANNOTATE_QUALITY_SHORT_TEXT_MAX_WORDS,
 )
 
-QUALITY_LABELS = {"无效反馈", "普通反馈", "优秀反馈", "N/A"}
+QUALITY_LABELS = {"无效反馈", "有效反馈", "优秀反馈", "N/A"}
+
+
+def canonical_quality_label(label: object, *, overall: bool = False) -> str:
+    """将旧标签转换为当前对外口径；整体结果不允许为 N/A。"""
+    normalized = str(label or "").strip()
+    if normalized == "普通反馈":
+        return "有效反馈"
+    if overall and normalized == "N/A":
+        return "无效反馈"
+    return normalized
 
 # 标注列样式
 _YELLOW_FILL  = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
@@ -363,7 +373,7 @@ def _strict_probability(val) -> int | None:
     return parsed if 0 <= parsed <= 100 else None
 
 
-_QUALITY_SCORE = {"无效反馈": 0, "普通反馈": 1, "优秀反馈": 2}
+_QUALITY_SCORE = {"无效反馈": 0, "有效反馈": 1, "优秀反馈": 2}
 _SCORE_HEADER_RE = re.compile(r"(?:\brate\b|\brating\b|\bscore\b|评分|打分|分数|量表)", re.IGNORECASE)
 _RANK_HEADER_RE = re.compile(r"(?:\brank(?:ing)?\b|\border\b|排序|排行|名次|优先级)", re.IGNORECASE)
 
@@ -545,13 +555,16 @@ def calculate_overall_quality(
     low_effort: dict | None = None,
 ) -> tuple[str, str]:
     """按非 N/A 题目加权计算整体质量，并返回可复核的计数与硬门槛说明。"""
-    labels = [str(q_labels.get(f"col_{col}", "N/A")) for col in open_text_cols]
+    labels = [
+        canonical_quality_label(q_labels.get(f"col_{col}", "N/A"))
+        for col in open_text_cols
+    ]
     assessed = [label for label in labels if label != "N/A"]
     if not assessed:
-        return "N/A", "非N/A题目0道：无效0、普通0、优秀0；无可评估回答，整体为N/A"
+        return "无效反馈", "非N/A题目0道：无效0、有效0、优秀0；无可评估回答，整体为无效反馈"
 
     invalid_count = assessed.count("无效反馈")
-    ordinary_count = assessed.count("普通反馈")
+    valid_count = assessed.count("有效反馈")
     excellent_count = assessed.count("优秀反馈")
     total = len(assessed)
     invalid_ratio = invalid_count / total
@@ -571,7 +584,7 @@ def calculate_overall_quality(
     ):
         overall = "优秀反馈"
     else:
-        overall = "普通反馈"
+        overall = "有效反馈"
 
     hard_reasons = []
     if majority_gate:
@@ -596,10 +609,10 @@ def calculate_overall_quality(
         low_effort_text = "未触发（未发现可审计的组合信号）"
 
     reason = (
-        f"非N/A题目{total}道：无效{invalid_count}、普通{ordinary_count}、"
+        f"非N/A题目{total}道：无效{invalid_count}、有效{valid_count}、"
         f"优秀{excellent_count}；无效比例{invalid_ratio:.2%}；"
         f"加权总分{weighted_total}分、平均分{average:.2f}"
-        f"（无效=0、普通=1、优秀=2）；整体硬门槛：{hard_text}；"
+        f"（无效=0、有效=1、优秀=2）；整体硬门槛：{hard_text}；"
         f"低投入组合信号：{low_effort_text}；整体判为{overall}"
     )
     return overall, reason
@@ -685,7 +698,9 @@ def generate_annotated_excel(
             ])
         if do_quality:
             output_row.extend([
-                "高概率AI作答" if is_ai else quality_info.get("overall", ""),
+                "高概率AI作答" if is_ai else canonical_quality_label(
+                    quality_info.get("overall", ""), overall=True,
+                ),
                 "已确认高概率AI作答，不进入质量打标" if is_ai else quality_info.get("overall_reason", ""),
             ])
 
@@ -694,7 +709,9 @@ def generate_annotated_excel(
             key = f"col_{col_idx}"
             spec_type = spec["type"]
             if spec_type == "quality_label":
-                value = "-" if is_ai else (quality_info.get("q_labels") or {}).get(key, "")
+                value = "-" if is_ai else canonical_quality_label(
+                    (quality_info.get("q_labels") or {}).get(key, "")
+                )
             elif spec_type == "quality_reason":
                 value = "-" if is_ai else (quality_info.get("q_reasons") or {}).get(key, "")
             elif spec_type == "quality_evidence":
