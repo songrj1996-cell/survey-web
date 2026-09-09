@@ -26,6 +26,7 @@
       || (typeof payload?.detail === 'string' ? payload.detail : '')
       || `请求失败（HTTP ${status}）`;
     const error = new Error(message);
+    error.status = status;
     error.code = typeof detail?.code === 'string' ? detail.code : '';
     return error;
   }
@@ -205,6 +206,7 @@
   }
 
   async function createFamily() {
+    if (state.busy || window.surveySessionIngress?.isLocked()) return;
     let payload;
     try {
       payload = validate();
@@ -213,6 +215,7 @@
       return;
     }
     state.busy = true;
+    window.surveySessionIngress?.setSourceBusy(true);
     renderVariants();
     renderSummary();
     setStatus('正在只读读取各语言 Form，并建立统一题目映射…', 'loading');
@@ -233,14 +236,16 @@
       setStatus(errorText(error), 'error');
     } finally {
       state.busy = false;
+      window.surveySessionIngress?.setSourceBusy(false);
       renderVariants();
       renderSummary();
     }
   }
 
   async function startAnalysis(familyId) {
-    if (!familyId || state.busy) return;
+    if (!familyId || state.busy || window.surveySessionIngress?.isLocked()) return;
     state.busy = true;
+    window.surveySessionIngress?.setSourceBusy(true);
     renderVariants();
     renderSummary();
     setStatus('正在分页读取回答，并创建统一分析会话…', 'loading');
@@ -251,22 +256,24 @@
       );
       const ingress = window.surveySessionIngress;
       if (!ingress || typeof ingress.acceptGoogleFormsFamilySession !== 'function') {
-        throw new Error('现有定性分析入口尚未就绪');
+        throw new Error('问卷分析入口尚未就绪');
       }
-      ingress.acceptGoogleFormsFamilySession(session);
+      await ingress.acceptGoogleFormsFamilySession(session);
       setStatus('统一分析会话已创建。', 'success');
     } catch (error) {
       setStatus(errorText(error), 'error');
     } finally {
       state.busy = false;
+      window.surveySessionIngress?.setSourceBusy(false);
       renderVariants();
       renderSummary();
     }
   }
 
   async function refreshFamily(familyId) {
-    if (!familyId || state.catalogBusy) return;
+    if (!familyId || state.catalogBusy || state.busy || window.surveySessionIngress?.isLocked()) return;
     state.catalogBusy = true;
+    window.surveySessionIngress?.setSourceBusy(true);
     setStatus('正在刷新已保存项目的问卷结构…', 'loading');
     try {
       state.summary = await requestJson(
@@ -280,6 +287,7 @@
       setStatus(errorText(error), 'error');
     } finally {
       state.catalogBusy = false;
+      window.surveySessionIngress?.setSourceBusy(false);
     }
   }
 
@@ -332,8 +340,7 @@
 
   function buildPanel() {
     const mount = document.getElementById('survey-google-upload');
-    const upload = document.getElementById('upload-zone');
-    if (!mount || !upload) return null;
+    if (!mount) return null;
 
     const panel = el('section', 'qsrc-panel');
     panel.id = 'qsrc-google-family';
@@ -349,7 +356,7 @@
       el(
         'p',
         'qsrc-heading__desc',
-        '支持 1–10 个语言版本，只读读取问卷和回答，统一进入现有定性分析。',
+        '支持 1–10 个语言版本；服务账号需获得每份问卷的编辑权限。读取回答后进入数据确认，再选择报告重心。',
       ),
     );
     heading.appendChild(headingText);
@@ -391,14 +398,14 @@
     summary.hidden = true;
 
     const catalog = el('details', 'qsrc-catalog');
-    catalog.open = true;
+    catalog.open = false;
     catalog.append(
       el('summary', 'qsrc-catalog__title', '已保存调研项目'),
       Object.assign(el('div', 'qsrc-catalog__list'), { id: 'qsrc-catalog-list' }),
     );
 
     panel.append(heading, titleLabel, variants, controls, status, summary, catalog);
-    mount.insertBefore(panel, upload);
+    mount.appendChild(panel);
     renderVariants();
     return panel;
   }
@@ -412,12 +419,18 @@
         capabilities?.google_forms_connection !== true
         || capabilities?.google_forms_unified_analysis !== true
       ) {
+        document.getElementById('qe-link-status').textContent = 'Google Form Link 仍在适配中，当前环境未开放连接。请使用上传本地文件。';
         return;
       }
       panel.hidden = false;
+      document.getElementById('qe-link-badge').textContent = '可连接';
+      document.getElementById('qe-link-status').textContent = '连接已开放。请确认上方服务账号拥有问卷编辑权限；系统会检查问卷和回答读取权限，读取失败时可改用上传本地文件。';
       await loadCatalog();
-    } catch (_) {
+    } catch (error) {
       panel.hidden = true;
+      document.getElementById('qe-link-status').textContent = error.status === 404
+        ? 'Google Form Link 仍在适配中，当前环境未开放连接。请使用上传本地文件。'
+        : '暂时无法检查连接权限：' + errorText(error) + '。请先登录并确认权限，或改用上传本地文件。';
     }
   }
 
