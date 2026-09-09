@@ -26,6 +26,10 @@ const annState = {
   qualityResults: [],
   qualityCount: 0,
   qualityDurationSeconds: null,
+  qualityReviewPlayerId: null,
+  qualityQuestionIndex: 0,
+  qualityReviewLayout: 'split',
+  qualityReviewSaving: false,
   missingAiIds: [],
   missingQualityIds: [],
   missingTranslationIds: [],
@@ -691,6 +695,10 @@ async function annRunQuality() {
         annState.qualityCount = ev.count;
         annState.qualityResults = ev.results || [];
         annState.qualityDurationSeconds = ev.quality_duration_seconds ?? null;
+        annState.qualityReviewPlayerId = null;
+        annState.qualityQuestionIndex = 0;
+        annState.qualityReviewLayout = 'split';
+        annState.qualityReviewSaving = false;
         annState.missingQualityIds = missingQIds;
         annState.missingTranslationIds = missingTranslationIds;
         if (missingQIds.length > 0) {
@@ -734,12 +742,13 @@ function annBuildDoneSummary() {
     );
   }
   if (annState.tasks.quality) {
-    const counts = { '优秀反馈': 0, '普通反馈': 0, '无效反馈': 0 };
+    const counts = { '优秀反馈': 0, '有效反馈': 0, '无效反馈': 0 };
     annState.qualityResults.forEach(result => {
-      if (Object.hasOwn(counts, result.overall)) counts[result.overall] += 1;
+      const overall = annCanonicalQualityLabel(result.overall, true);
+      if (Object.hasOwn(counts, overall)) counts[overall] += 1;
     });
     lines.push(
-      `<div class="ann-summary-line">质量打标结果：优秀反馈 ${counts['优秀反馈']} 条，普通反馈 ${counts['普通反馈']} 条，无效反馈 ${counts['无效反馈']} 条</div>`
+      `<div class="ann-summary-line">质量打标结果：优秀反馈 ${counts['优秀反馈']} 条，有效反馈 ${counts['有效反馈']} 条，无效反馈 ${counts['无效反馈']} 条</div>`
     );
     const duration = formatReportDuration(annState.qualityDurationSeconds);
     if (duration) {
@@ -772,44 +781,357 @@ function annShowDone() {
   }
 }
 
+const ANN_EDITABLE_QUALITY_LABELS = ['无效反馈', '有效反馈', '优秀反馈'];
+
+function annIsEffectivelyEmptyAnswer(value) {
+  return !String(value || '').trim();
+}
+
+function annCanonicalQualityLabel(label, overall = false) {
+  const normalized = String(label || '').trim();
+  if (normalized === '普通反馈') return '有效反馈';
+  if (overall && normalized === 'N/A') return '无效反馈';
+  return normalized;
+}
+
+function annQualityQuestionLabel(result, key) {
+  if (annIsEffectivelyEmptyAnswer((result?.originals || {})[key])) return 'N/A';
+  return annCanonicalQualityLabel((result?.q_labels || {})[key]) || '无效反馈';
+}
+
+function annQualityLabelClass(label) {
+  return {
+    '无效反馈': 'ann-quality-badge--invalid',
+    '有效反馈': 'ann-quality-badge--valid',
+    '优秀反馈': 'ann-quality-badge--excellent',
+    'N/A': 'ann-quality-badge--na',
+  }[label] || 'ann-quality-badge--invalid';
+}
+
+function annQualityHumanReviews(result) {
+  return result?.human_reviews || {};
+}
+
+function annQualityBaseline(result, key, emptyAnswer = false) {
+  const baseline = (result?.quality_review_baseline || {})[key] || {};
+  return {
+    label: emptyAnswer
+      ? 'N/A'
+      : annCanonicalQualityLabel(baseline.label || (result?.q_labels || {})[key]) || '无效反馈',
+    reason: baseline.reason || (result?.q_reasons || {})[key] || '',
+  };
+}
+
+function annQualityMatchesQuestionFilters(result, questionFilter, adjustmentFilter) {
+  const reviews = annQualityHumanReviews(result);
+  const keys = annState.openTextCols.map(col => `col_${col}`);
+  if (questionFilter !== 'all' && adjustmentFilter === 'adjusted') {
+    return keys.some(key => annQualityQuestionLabel(result, key) === questionFilter && reviews[key]);
+  }
+  if (questionFilter !== 'all' && !keys.some(key => annQualityQuestionLabel(result, key) === questionFilter)) {
+    return false;
+  }
+  const hasAdjustment = Object.keys(reviews).length > 0;
+  if (adjustmentFilter === 'adjusted') return hasAdjustment;
+  if (adjustmentFilter === 'untouched') return !hasAdjustment;
+  return true;
+}
+
+function annFilteredQualityResults() {
+  const overallFilter = $('ann-quality-overall-filter').value;
+  const questionFilter = $('ann-quality-question-filter').value;
+  const adjustmentFilter = $('ann-quality-adjustment-filter').value;
+  return annState.qualityResults.filter(result => (
+    (overallFilter === 'all' || annCanonicalQualityLabel(result.overall, true) === overallFilter)
+    && annQualityMatchesQuestionFilters(result, questionFilter, adjustmentFilter)
+  ));
+}
+
+function annPreferredQualityQuestionIndex(result) {
+  const questionFilter = $('ann-quality-question-filter').value;
+  const adjustmentFilter = $('ann-quality-adjustment-filter').value;
+  const reviews = annQualityHumanReviews(result);
+  let index = -1;
+  if (questionFilter !== 'all' && adjustmentFilter === 'adjusted') {
+    index = annState.openTextCols.findIndex(col => {
+      const key = `col_${col}`;
+      return annQualityQuestionLabel(result, key) === questionFilter && reviews[key];
+    });
+  }
+  if (index < 0 && questionFilter !== 'all') {
+    index = annState.openTextCols.findIndex(
+      col => annQualityQuestionLabel(result, `col_${col}`) === questionFilter
+    );
+  }
+  if (index < 0 && adjustmentFilter === 'adjusted') {
+    index = annState.openTextCols.findIndex(col => reviews[`col_${col}`]);
+  }
+  return index >= 0 ? index : 0;
+}
+
+function annRenderQualitySummary() {
+  const counts = { '无效反馈': 0, '有效反馈': 0, '优秀反馈': 0 };
+  annState.qualityResults.forEach(result => {
+    const overall = annCanonicalQualityLabel(result.overall, true);
+    if (Object.hasOwn(counts, overall)) counts[overall] += 1;
+  });
+  $('ann-quality-summary-grid').innerHTML = [
+    ['全部玩家', annState.qualityResults.length],
+    ['无效反馈', counts['无效反馈']],
+    ['有效反馈', counts['有效反馈']],
+    ['优秀反馈', counts['优秀反馈']],
+  ].map(([label, count]) => `
+    <div class="ann-quality-summary-item">
+      <span>${label}</span><strong>${count} 位</strong>
+    </div>`).join('');
+}
+
+function annCurrentQualityResult(results = annFilteredQualityResults()) {
+  if (!results.length) return null;
+  let current = results.find(result => String(result.id) === String(annState.qualityReviewPlayerId));
+  if (!current) {
+    current = results[0];
+    annState.qualityReviewPlayerId = String(current.id);
+    annState.qualityQuestionIndex = annPreferredQualityQuestionIndex(current);
+  }
+  return current;
+}
+
+function annRenderQualityPlayerList(results) {
+  const list = $('ann-quality-player-list');
+  if (!results.length) {
+    list.innerHTML = '<div class="ann-quality-empty">当前筛选没有匹配玩家</div>';
+    return;
+  }
+  list.innerHTML = results.map(result => {
+    const adjustedCount = Object.keys(annQualityHumanReviews(result)).length;
+    const active = String(result.id) === String(annState.qualityReviewPlayerId);
+    const overall = annCanonicalQualityLabel(result.overall, true) || '无效反馈';
+    return `<button class="ann-ai-candidate-card ann-quality-player-card${active ? ' ann-ai-candidate-card--active' : ''}"
+      type="button" data-ann-quality-player-id="${esc(result.id)}">
+      <span class="ann-ai-candidate-id">${esc(result.id)}</span>
+      <span class="ann-quality-badge ${annQualityLabelClass(overall)}">${esc(overall)}</span>
+      <span class="ann-ai-candidate-reason">${esc(
+        adjustedCount ? `已人工调整 ${adjustedCount} 道题` : (result.overall_reason || '暂无整体判断依据')
+      )}</span>
+      <em class="ann-quality-review-status${adjustedCount ? ' ann-quality-review-status--adjusted' : ''}">
+        ${adjustedCount ? '已人工复核' : '尚未修改'}
+      </em>
+    </button>`;
+  }).join('');
+}
+
+function annRenderQualityProfile(results) {
+  const pane = $('ann-quality-profile-pane');
+  const result = annCurrentQualityResult(results);
+  if (!result) {
+    pane.innerHTML = '<div class="ann-quality-empty">请调整筛选条件后继续查看</div>';
+    return;
+  }
+  const playerIndex = results.indexOf(result);
+  const totalQuestions = annState.openTextCols.length;
+  annState.qualityQuestionIndex = Math.max(0, Math.min(annState.qualityQuestionIndex, totalQuestions - 1));
+  const col = annState.openTextCols[annState.qualityQuestionIndex];
+  const key = `col_${col}`;
+  const title = annState.headersZh[col] || annState.headers[col] || `列 ${col}`;
+  const original = (result.originals || {})[key] || '';
+  const translated = (result.translations || {})[key] || '';
+  const evidence = (result.q_evidence || {})[key] || '';
+  const emptyAnswer = annIsEffectivelyEmptyAnswer(original);
+  const label = annQualityQuestionLabel(result, key);
+  const baseline = annQualityBaseline(result, key, emptyAnswer);
+  const review = annQualityHumanReviews(result)[key];
+  const adjustedCount = Object.keys(annQualityHumanReviews(result)).length;
+  const disabled = emptyAnswer || annState.qualityReviewSaving;
+  const questionDots = annState.openTextCols.map((questionCol, index) => {
+    const questionKey = `col_${questionCol}`;
+    const questionLabel = annQualityQuestionLabel(result, questionKey);
+    const adjusted = Boolean(annQualityHumanReviews(result)[questionKey]);
+    return `<button type="button" data-ann-quality-question-index="${index}"
+      class="ann-quality-question-dot ${annQualityLabelClass(questionLabel)}${index === annState.qualityQuestionIndex ? ' ann-quality-question-dot--active' : ''}${adjusted ? ' ann-quality-question-dot--adjusted' : ''}"
+      aria-label="查看第 ${index + 1} 题，${esc(questionLabel)}${adjusted ? '，已人工修改' : ''}">${index + 1}</button>`;
+  }).join('');
+  const labelButtons = ANN_EDITABLE_QUALITY_LABELS.map(option => `
+    <button type="button" class="ann-quality-label-btn ${annQualityLabelClass(option)}"
+      data-ann-quality-label="${option}" aria-pressed="${label === option}"${disabled ? ' disabled' : ''}>${option}</button>`).join('');
+
+  pane.innerHTML = `
+    <div class="ann-quality-profile-header">
+      <div class="ann-ai-player-identity">
+        <span>玩家档案</span>
+        <h2>${esc(result.id)}</h2>
+        <em class="ann-quality-review-status${adjustedCount ? ' ann-quality-review-status--adjusted' : ''}">${adjustedCount ? '已人工复核' : '尚未修改'}</em>
+      </div>
+      <div class="ann-quality-overall-card">
+        <span>当前整体质量</span>
+        <strong class="ann-quality-badge ${annQualityLabelClass(annCanonicalQualityLabel(result.overall, true))}">${esc(annCanonicalQualityLabel(result.overall, true) || '无效反馈')}</strong>
+        <p>${esc(result.overall_reason || '')}</p>
+      </div>
+    </div>
+    <div class="ann-ai-player-nav">
+      <button type="button" data-ann-quality-player-nav="prev" aria-label="上一位玩家"${playerIndex === 0 ? ' disabled' : ''}>‹</button>
+      <span>玩家 ${playerIndex + 1} / ${results.length}</span>
+      <button type="button" data-ann-quality-player-nav="next" aria-label="下一位玩家"${playerIndex === results.length - 1 ? ' disabled' : ''}>›</button>
+    </div>
+    <div class="ann-ai-question-panel ann-quality-question-panel">
+      <div class="ann-ai-question-heading">
+        <div><span>第 ${annState.qualityQuestionIndex + 1} / ${totalQuestions} 题</span><strong>${esc(title)}</strong></div>
+        <div class="ann-ai-question-nav">
+          <button type="button" data-ann-quality-question-nav="prev"${annState.qualityQuestionIndex === 0 ? ' disabled' : ''}>上一题</button>
+          <button type="button" data-ann-quality-question-nav="next"${annState.qualityQuestionIndex === totalQuestions - 1 ? ' disabled' : ''}>下一题</button>
+        </div>
+      </div>
+      <div class="ann-ai-question-dots ann-quality-question-dots">${questionDots}</div>
+      <div class="ann-quality-answer-grid">
+        <div class="ann-ai-answer-block"><span>玩家原文</span><p>${esc(original || '（未作答）')}</p></div>
+        <div class="ann-ai-answer-block ann-ai-answer-block--translation"><span>中文翻译</span><p>${esc(translated || '（无内容）')}</p></div>
+      </div>
+      <div class="ann-quality-evidence-grid">
+        <div class="ann-quality-evidence-card">
+          <span>AI 原始标签与判断依据</span>
+          <strong class="ann-quality-badge ${annQualityLabelClass(baseline.label)}">${esc(baseline.label)}</strong>
+          <p>${esc(baseline.reason || '未提供判断依据')}</p>
+        </div>
+        <div class="ann-quality-evidence-card">
+          <span>原文证据</span>
+          <p>${esc(evidence || '无原文证据')}</p>
+        </div>
+      </div>
+      <div class="ann-quality-edit-panel">
+        <div class="ann-quality-edit-head">
+          <div><strong>人工最终标注</strong>${emptyAnswer ? '<span>该题未作答，固定标为 N/A，不开放修改</span>' : ''}</div>
+          <div class="ann-quality-label-actions" role="group" aria-label="调整这道题的最终标签">${labelButtons}</div>
+        </div>
+        <div class="ann-quality-save-state" aria-live="polite">
+          ${annState.qualityReviewSaving
+            ? '正在保存人工调整…'
+            : review
+              ? `人工调整记录：${esc(annCanonicalQualityLabel(review.from_label))} → ${esc(annCanonicalQualityLabel(review.to_label))}；下载时以当前标签为准`
+              : emptyAnswer
+                ? '当前标签固定为 N/A；不参与整体质量计算'
+                : '尚未修改，当前采用 AI 原始标签'}
+        </div>
+      </div>
+    </div>`;
+}
+
+function annSetQualityReviewLayout(layout) {
+  annState.qualityReviewLayout = layout === 'focus' ? 'focus' : 'split';
+  $('ann-quality-review-workspace').classList.toggle(
+    'ann-ai-confirm-workspace--focus',
+    annState.qualityReviewLayout === 'focus'
+  );
+  $('ann-quality-layout-split').classList.toggle('ann-ai-layout-btn--active', annState.qualityReviewLayout === 'split');
+  $('ann-quality-layout-split').setAttribute('aria-pressed', String(annState.qualityReviewLayout === 'split'));
+  $('ann-quality-layout-focus').classList.toggle('ann-ai-layout-btn--active', annState.qualityReviewLayout === 'focus');
+  $('ann-quality-layout-focus').setAttribute('aria-pressed', String(annState.qualityReviewLayout === 'focus'));
+}
+
 function annRenderQualityPreview() {
   const block = $('ann-quality-preview-block');
-  const table = $('ann-quality-preview-table');
   if (!annState.tasks.quality || annState.qualityResults.length === 0) {
     block.hidden = true;
     return;
   }
   block.hidden = false;
-  const filter = $('ann-quality-filter').value;
-  const results = annState.qualityResults.filter(result => filter === 'all' || result.overall === filter);
-  $('ann-quality-filter-count').textContent = `${results.length} 位玩家`;
-
-  let headers = '<th class="ann-th-id">玩家 ID</th><th class="ann-col-overall">整体质量</th><th class="ann-col-reason">整体原因</th>';
-  for (const col of annState.openTextCols) {
-    const title = annState.headersZh[col] || annState.headers[col] || `列${col}`;
-    headers += `<th class="ann-col-label">${esc(title)} · 标签</th><th class="ann-col-reason">判断依据</th><th class="ann-col-response">回答原文 / 中文</th>`;
-  }
-  const rows = results.map(result => {
-    let cells = `<td class="ann-cell-id">${esc(result.id)}</td><td class="ann-quality-overall ann-col-overall">${esc(result.overall || '')}</td><td class="ann-col-reason">${esc(result.overall_reason || '')}</td>`;
-    for (const col of annState.openTextCols) {
-      const key = `col_${col}`;
-      const label = (result.q_labels || {})[key] || 'N/A';
-      const reason = (result.q_reasons || {})[key] || '';
-      const evidence = (result.q_evidence || {})[key] || '';
-      const original = (result.originals || {})[key] || '';
-      const translated = (result.translations || {})[key] || '';
-      cells += `<td class="ann-col-label"><span class="ann-quality-label-readonly">${esc(label)}</span></td>
-        <td class="ann-col-reason"><div class="ann-reason-text">${esc(reason)}</div>${evidence ? `<div class="ann-review-evidence"><span>证据</span>${esc(evidence)}</div>` : ''}</td>
-        <td class="ann-col-response"><div class="ann-response-original">${esc(original)}</div>${translated && translated !== original ? `<div class="ann-cell-trans"><span>中文</span>${esc(translated)}</div>` : ''}</td>`;
-    }
-    return `<tr data-id="${esc(result.id)}">${cells}</tr>`;
-  }).join('');
-  table.innerHTML = `<thead><tr>${headers}</tr></thead><tbody>${rows || '<tr><td>当前筛选没有结果</td></tr>'}</tbody>`;
+  const results = annFilteredQualityResults();
+  annCurrentQualityResult(results);
+  $('ann-quality-filter-count').textContent = `当前显示 ${results.length} / ${annState.qualityResults.length} 位玩家`;
+  annRenderQualitySummary();
+  annRenderQualityPlayerList(results);
+  annRenderQualityProfile(results);
+  annSetQualityReviewLayout(annState.qualityReviewLayout);
 }
 
-$('ann-quality-filter').addEventListener('change', () => {
+function annGoToQualityPlayer(playerId) {
+  const result = annState.qualityResults.find(item => String(item.id) === String(playerId));
+  if (!result) return;
+  annState.qualityReviewPlayerId = String(result.id);
+  annState.qualityQuestionIndex = annPreferredQualityQuestionIndex(result);
   annRenderQualityPreview();
+}
+
+async function annApplyQualityLabel(label) {
+  if (annState.qualityReviewSaving) return;
+  const results = annFilteredQualityResults();
+  const result = annCurrentQualityResult(results);
+  const col = annState.openTextCols[annState.qualityQuestionIndex];
+  const key = `col_${col}`;
+  if (!result || !ANN_EDITABLE_QUALITY_LABELS.includes(label)) return;
+  if (annQualityQuestionLabel(result, key) === label) return;
+
+  annState.qualityReviewSaving = true;
+  annRenderQualityProfile(results);
+  try {
+    const resp = await fetch(`/api/annotate/${annState.sessionId}/quality-review`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        player_id: String(result.id),
+        column_index: col,
+        label,
+      }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || '保存人工调整失败');
+    const index = annState.qualityResults.findIndex(item => String(item.id) === String(result.id));
+    if (index >= 0 && data.result) annState.qualityResults[index] = data.result;
+    annState.qualityReviewSaving = false;
+    $('ann-done-text').innerHTML = annBuildDoneSummary();
+    annRenderQualityPreview();
+    showToast(data.changed ? '人工标签已保存，整体质量已重新计算' : '当前标签无需修改', 'success');
+  } catch (e) {
+    annState.qualityReviewSaving = false;
+    annRenderQualityPreview();
+    showToast(`保存失败：${e.message}`, 'error');
+  }
+}
+
+$('ann-quality-player-list').addEventListener('click', event => {
+  const card = event.target.closest('[data-ann-quality-player-id]');
+  if (card) annGoToQualityPlayer(card.dataset.annQualityPlayerId);
 });
+
+$('ann-quality-profile-pane').addEventListener('click', event => {
+  const results = annFilteredQualityResults();
+  const current = annCurrentQualityResult(results);
+  if (!current) return;
+  const playerNav = event.target.closest('[data-ann-quality-player-nav]');
+  if (playerNav) {
+    const index = results.indexOf(current) + (playerNav.dataset.annQualityPlayerNav === 'prev' ? -1 : 1);
+    if (results[index]) annGoToQualityPlayer(results[index].id);
+    return;
+  }
+  const questionNav = event.target.closest('[data-ann-quality-question-nav]');
+  if (questionNav) {
+    annState.qualityQuestionIndex += questionNav.dataset.annQualityQuestionNav === 'prev' ? -1 : 1;
+    annRenderQualityProfile(results);
+    return;
+  }
+  const dot = event.target.closest('[data-ann-quality-question-index]');
+  if (dot) {
+    annState.qualityQuestionIndex = Number(dot.dataset.annQualityQuestionIndex);
+    annRenderQualityProfile(results);
+    return;
+  }
+  const labelButton = event.target.closest('[data-ann-quality-label]');
+  if (labelButton) annApplyQualityLabel(labelButton.dataset.annQualityLabel);
+});
+
+for (const filterId of [
+  'ann-quality-overall-filter',
+  'ann-quality-question-filter',
+  'ann-quality-adjustment-filter',
+]) {
+  $(filterId).addEventListener('change', () => {
+    annState.qualityReviewPlayerId = null;
+    annState.qualityQuestionIndex = 0;
+    annRenderQualityPreview();
+  });
+}
+
+$('ann-quality-layout-split').addEventListener('click', () => annSetQualityReviewLayout('split'));
+$('ann-quality-layout-focus').addEventListener('click', () => annSetQualityReviewLayout('focus'));
 
 $('ann-btn-download').addEventListener('click', () => {
   window.location.href = `/api/annotate/${annState.sessionId}/download`;
@@ -835,12 +1157,19 @@ $('ann-btn-restart').addEventListener('click', () => {
   annState.qualityResults = [];
   annState.qualityCount = 0;
   annState.qualityDurationSeconds = null;
+  annState.qualityReviewPlayerId = null;
+  annState.qualityQuestionIndex = 0;
+  annState.qualityReviewLayout = 'split';
+  annState.qualityReviewSaving = false;
   annState.missingAiIds = [];
   annState.missingQualityIds = [];
   annState.missingTranslationIds = [];
   $('ann-btn-download').disabled = true;
   $('task-ai-detect').checked = false;
   $('task-quality').checked = false;
+  $('ann-quality-overall-filter').value = 'all';
+  $('ann-quality-question-filter').value = 'all';
+  $('ann-quality-adjustment-filter').value = 'all';
   $('ann-background').value = '';
   $('ann-background-block').style.display = 'none';
   annSyncTaskCards();

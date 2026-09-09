@@ -668,17 +668,9 @@ def annotate_set_column_config(
 # ── AI 检测 SSE ─────────────────────────────────────────────────
 
 
-_EMPTY_ANSWER_RE = re.compile(
-    r"^(?:n/?a|none|null|nil|no\.?|nothing|no\s+(?:feedback|comment)|"
-    r"not\s+applicable|tidak|无|没有|暂无|无意见|没了|なし|없음)[.!。！]?$",
-    re.IGNORECASE,
-)
-
-
 def _is_effectively_empty_answer(value: object) -> bool:
-    """Treat explicit no-answer placeholders as empty while preserving source text."""
-    text = re.sub(r"\s+", " ", str(value or "")).strip()
-    return not text or bool(_EMPTY_ANSWER_RE.fullmatch(text))
+    """只有真正缺失或纯空白的单元格才视为未作答。"""
+    return not str(value or "").strip()
 
 
 def _has_open_text(row: list, open_text_cols: list[int]) -> bool:
@@ -950,7 +942,7 @@ def _validated_ai_results(
 
 def _empty_quality_result(row: list, id_col: int, open_text_cols: list[int]) -> dict:
     q_labels = {f"col_{col}": "N/A" for col in open_text_cols}
-    q_reasons = {f"col_{col}": "回答为空，按 N/A 处理" for col in open_text_cols}
+    q_reasons = {f"col_{col}": "该题未作答，按 N/A 处理" for col in open_text_cols}
     q_evidence = {f"col_{col}": "" for col in open_text_cols}
     overall, overall_reason = annotate.calculate_overall_quality(q_labels, open_text_cols)
     return {
@@ -995,21 +987,21 @@ def _validated_quality_results(
         row_errors: list[str] = []
         for col in open_text_cols:
             key = f"col_{col}"
-            original = str(row[col]).strip() if col < len(row) else ""
-            label = str(labels.get(key, ""))
+            original_value = row[col] if col < len(row) else ""
+            original = str(original_value or "").strip()
+            label = annotate.canonical_quality_label(labels.get(key, ""))
             reason = str(reasons.get(key, "")).strip()
             evidence = str(evidence_map.get(key, "")).strip()
-            if _is_effectively_empty_answer(original):
+            if _is_effectively_empty_answer(original_value):
                 labels[key] = "N/A"
-                reasons[key] = "回答为无内容占位表达，按 N/A 处理"
+                reasons[key] = "该题未作答，按 N/A 处理"
                 evidence_map[key] = ""
                 continue
+            labels[key] = label
             if label not in annotate.QUALITY_LABELS:
                 row_errors.append(f"{key} 标签非法")
-            elif not original and label != "N/A":
-                row_errors.append(f"{key} 空回答必须为 N/A")
-            elif original and label == "N/A":
-                row_errors.append(f"{key} 非空回答不能为 N/A")
+            elif label == "N/A":
+                row_errors.append(f"{key} 有回答时不能标为 N/A")
             if not reason:
                 row_errors.append(f"{key} 缺少原因")
             if label != "N/A" and (not evidence or evidence not in original):
@@ -1051,10 +1043,11 @@ def _quality_invalid_cols(
     invalid: set[int] = set()
     for col in open_text_cols:
         key = f"col_{col}"
-        original = str(row[col]).strip() if col < len(row) else ""
-        if _is_effectively_empty_answer(original):
+        original_value = row[col] if col < len(row) else ""
+        original = str(original_value or "").strip()
+        if _is_effectively_empty_answer(original_value):
             continue
-        label = str(labels.get(key, ""))
+        label = annotate.canonical_quality_label(labels.get(key, ""))
         reason = str(reasons.get(key, "")).strip()
         if (
             label not in annotate.QUALITY_LABELS
@@ -1280,6 +1273,119 @@ async def annotate_set_confirmed_ai(sid: str, confirmed_ai_ids: list[str], reque
     sess["ai_confirmation_complete"] = True
     if not (sess.get("tasks") or {}).get("quality"):
         await _save_annotate_result_history(sid, sess, request)
+
+
+async def annotate_apply_quality_review(
+    sid: str,
+    player_id: str,
+    column_index: int,
+    label: str,
+    request: Request,
+) -> dict:
+    """保存单玩家单题的人工质量改标，并同步重算整体质量与结果 Excel。"""
+    sess = get_annotate_session(sid)
+    if not (sess.get("tasks") or {}).get("quality"):
+        raise HTTPException(status_code=400, detail="当前任务未启用质量打标")
+    incomplete = _annotate_incomplete_detail(sess)
+    if incomplete:
+        raise HTTPException(status_code=409, detail=f"结果尚未完整，不能人工改标：{incomplete}")
+
+    normalized_id = str(player_id or "").strip()
+    normalized_label = str(label or "").strip()
+    normalized_label = annotate.canonical_quality_label(normalized_label)
+    editable_labels = {"无效反馈", "有效反馈", "优秀反馈"}
+    if normalized_label not in editable_labels:
+        raise HTTPException(status_code=400, detail="人工标签只能是无效反馈、有效反馈或优秀反馈")
+
+    open_text_cols = list(sess.get("open_text_cols") or [])
+    if column_index not in open_text_cols:
+        raise HTTPException(status_code=400, detail="只能修改当前任务中的主观题标签")
+    if normalized_id in set(sess.get("confirmed_ai_ids") or []):
+        raise HTTPException(status_code=400, detail="已确认 AI 作答的玩家不进入质量改标")
+
+    id_col = int(sess.get("id_col", 1))
+    row_matches = [
+        row for row in (sess.get("rows") or [])[1:]
+        if _row_id(row, id_col) == normalized_id
+    ]
+    result_matches = [
+        result for result in (sess.get("quality_results") or [])
+        if str(result.get("id", "")).strip() == normalized_id
+    ]
+    if len(row_matches) != 1 or len(result_matches) != 1:
+        raise HTTPException(status_code=404, detail="没有找到可唯一复核的玩家质量结果")
+
+    row = row_matches[0]
+    result = result_matches[0]
+    key = f"col_{column_index}"
+    original_value = row[column_index] if column_index < len(row) else ""
+    if _is_effectively_empty_answer(original_value):
+        raise HTTPException(status_code=400, detail="未作答题固定标为 N/A，不开放人工修改")
+
+    labels = result.setdefault("q_labels", {})
+    reasons = result.setdefault("q_reasons", {})
+    current_label = annotate.canonical_quality_label(labels.get(key, ""))
+    if current_label not in annotate.QUALITY_LABELS:
+        raise HTTPException(status_code=409, detail="当前题标签不完整，请重新运行质量打标")
+    if current_label == normalized_label:
+        return {
+            "result": result,
+            "changed": False,
+            "adjusted_count": len(result.get("human_reviews") or {}),
+        }
+
+    baseline = result.setdefault("quality_review_baseline", {})
+    if key not in baseline:
+        baseline[key] = {
+            "label": current_label,
+            "reason": str(reasons.get(key, "")).strip(),
+        }
+    baseline_label = annotate.canonical_quality_label(
+        (baseline.get(key) or {}).get("label", current_label)
+    )
+    baseline_reason = str((baseline.get(key) or {}).get("reason", "")).strip()
+    human_reviews = result.setdefault("human_reviews", {})
+    labels[key] = normalized_label
+    if normalized_label == baseline_label:
+        reasons[key] = baseline_reason
+        human_reviews.pop(key, None)
+    else:
+        reasons[key] = (
+            f"人工复核调整：{baseline_label} → {normalized_label}；"
+            f"AI 原判断：{baseline_reason or '未提供判断依据'}"
+        )
+        human_reviews[key] = {
+            "from_label": baseline_label,
+            "to_label": normalized_label,
+            "reviewed_at": _quality_now().isoformat(timespec="seconds"),
+        }
+    if not human_reviews:
+        result.pop("human_reviews", None)
+
+    low_effort = annotate.detect_low_effort_signals(
+        row,
+        sess.get("headers") or [],
+        open_text_cols,
+        id_col,
+        labels,
+        headers_zh=sess.get("headers_zh") or [],
+    )
+    overall, overall_reason = annotate.calculate_overall_quality(
+        labels,
+        open_text_cols,
+        low_effort=low_effort,
+    )
+    adjusted_count = len(result.get("human_reviews") or {})
+    result["overall"] = overall
+    result["overall_reason"] = overall_reason + (
+        f"；人工复核调整{adjusted_count}道题" if adjusted_count else ""
+    )
+    await _save_annotate_result_history(sid, sess, request)
+    return {
+        "result": result,
+        "changed": True,
+        "adjusted_count": adjusted_count,
+    }
 
 
 # ── 质量打标 SSE ────────────────────────────────────────────────
