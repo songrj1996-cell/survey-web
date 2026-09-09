@@ -408,6 +408,9 @@ class ReportWriterStructureTests(unittest.TestCase):
                 self.assertIn("这一边界适用于整个核心结论", prompt)
                 self.assertIn("不能只改首句", prompt)
                 self.assertIn("只有来源直接支持这些关系时才能这样表述", prompt)
+                self.assertIn("认可理由不等于选择理由", prompt)
+                self.assertIn("没有逐人对应或交叉统计时，不能把评价者认作选择者", prompt)
+                self.assertIn("人数相同也不能证明是同一批玩家", prompt)
                 for forced_opening in (
                     "第一句话就用", "必须先写跨题洞察、判断标准或取舍逻辑",
                     "概括玩家依据哪些真实标准做选择", "第一句就必须先概括真实的判断标准",
