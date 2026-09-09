@@ -196,6 +196,8 @@ def partial_rerun_capability(entry: dict, snapshot: dict) -> dict:
         "parts": [],
         "questions": [],
     }
+    if snapshot.get("report_style") == "quick":
+        return {**unavailable, "reason": "快速报告暂不支持按 Part 局部重做，请重新上传并生成新版本。"}
     if (entry.get("mode") or "") in {"comment", "interview", "annotate", "crosstab"}:
         return {**unavailable, "reason": "当前报告类型暂不支持局部重做。"}
     plan = entry.get("plan")

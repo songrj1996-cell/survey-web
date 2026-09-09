@@ -29,6 +29,7 @@ from app.core.config import (
     DEFAULT_QUESTIONNAIRE_TRANSLATION_SYSTEM_PROMPT,
     DEFAULT_REPORT_QA_SYSTEM_PROMPT,
     DEFAULT_REPORT_WRITER_SYSTEM_PROMPT,
+    DEFAULT_QUICK_WRITER_REQUIREMENTS,
     DEFAULT_RESPONSE_CLASSIFY_SYSTEM_PROMPT,
     DEFAULT_SURVEY_PLANNER_SYSTEM_PROMPT,
     DEFAULT_THEME_EXTRACT_SYSTEM_PROMPT,
@@ -162,6 +163,13 @@ DEFAULT_PROMPTS: dict = {
         order=30,
         kind="instruction",
         current=DEFAULT_LARGE_SAMPLE_WRITER_REQUIREMENTS,
+    ),
+    "quick_writer_requirements": _prompt(
+        "quick_writer_requirements",
+        "快速报告写作要求",
+        "全量分析后的重点写作规则；三层结构、证据编号和完整目录由代码校验。",
+        group="报告生成与追问", group_order=20, order=35,
+        kind="instruction", current=DEFAULT_QUICK_WRITER_REQUIREMENTS,
     ),
     "report_qa_system": _prompt(
         "report_qa_system",

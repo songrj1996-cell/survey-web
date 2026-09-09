@@ -35,6 +35,8 @@ _SELECTED_VERSION_FIELDS = (
     "analyst_app",
     "comparison_validation",
     "report_llm_usage",
+    "report_style",
+    "quick_report_diagnostics",
 )
 
 
