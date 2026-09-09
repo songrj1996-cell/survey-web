@@ -1,5 +1,6 @@
 import json
 import unittest
+from copy import deepcopy
 
 from app.core.config import DEFAULT_WRITER_REQUIREMENTS
 from app.services.report_engine import (
@@ -19,6 +20,7 @@ from app.services.report_engine import (
     _normalize_action_section,
     _parse_comparison_repairs,
 )
+from app.storage.prompts import DEFAULT_PROMPTS, _sync_entry
 
 
 def _analysis_focus() -> dict:
@@ -86,7 +88,7 @@ class ReportWriterStructureTests(unittest.TestCase):
         self.assertIn("未参与调研立项、未看过问卷提纲的读者也能独立理解", requirements)
         self.assertIn("分别回车成短段，不强制编号", requirements)
         self.assertIn("不同范围的观点与风险不得混写", requirements)
-        self.assertIn("第一句话就用", requirements)
+        self.assertIn("不限定首句句式", requirements)
         self.assertIn("禁止使用「针对……这一核心问题」", requirements)
         self.assertIn("不得写成已经证明因果的「A 导致 B」", requirements)
         self.assertIn("精确人数和百分比", requirements)
@@ -221,7 +223,7 @@ class ReportWriterStructureTests(unittest.TestCase):
         self.assertIn("不同范围不得混写", query)
         self.assertIn("不得机械套用标签或补造研究阶段", query)
         self.assertIn("不要复述、转述或重新提出业务问题或调研需求", query)
-        self.assertIn("第一句话就用", query)
+        self.assertIn("不限定首句句式", query)
         self.assertIn("证据显示相关", query)
         self.assertIn("从本次调研看，A 与 B 有关", query)
         self.assertIn("不得写成已经证明因果的「A 导致 B」", query)
@@ -232,12 +234,10 @@ class ReportWriterStructureTests(unittest.TestCase):
         self.assertNotIn("核心结论里不使用百分比、不使用精确人数", query)
         self.assertIn("### 少数但值得关注的反馈", query)
         self.assertNotIn("高信号少数观点与风险", query)
-        self.assertIn("有必要、重要且必须优先展示的跨题判断", query)
+        self.assertIn("有必要、重要且必须优先展示的发现、分歧或决策信息", query)
         self.assertIn("第一句实质判断", query)
-        self.assertIn("全报告最高优先级的信息", query)
-        self.assertIn("必须先写跨题洞察、判断标准或取舍逻辑", query)
-        self.assertIn("不得以“方案X排名第一/获得最多第一名/满意度最高”", query)
-        self.assertIn("使用 `**加粗**` 标出这些关键标准", query)
+        self.assertIn("证据支持最充分的重要发现", query)
+        self.assertIn("允许用关键数字支撑开头", query)
         self.assertIn("不设置段数和字数硬限制", query)
         self.assertIn("不要写成后续业务小节的目录式预告", query)
         self.assertIn("不要机械汇总各 Part", query)
@@ -354,12 +354,65 @@ class ReportWriterStructureTests(unittest.TestCase):
         self.assertIn("不得输出完整 CORE 替换稿", query)
         self.assertIn("人数与占比只能支撑判断", query)
         self.assertIn("分析推断不是错误", query)
-        self.assertIn("首句优先级必须单独复核", query)
-        self.assertIn("即使这些判断标准已在第二段或后文出现", query)
-        self.assertIn("也必须判定为不合格", query)
-        self.assertIn("局部修补将判断标准上提", query)
+        self.assertIn("首句应按证据与研究问题复核", query)
+        self.assertIn("不得仅因首句没有判断标准", query)
+        self.assertIn("不得仅为把框架移到首句而修补", query)
+        self.assertIn("这种如实说明不属于交付遗漏", query)
         self.assertIn("事实句和数字不得单独使用 `<u>下划线</u>`", query)
         self.assertIn("只修补对应句段，不得改动无关内容", query)
+
+    def test_default_generation_and_review_allow_evidence_led_openings(self):
+        prompts = {"default": DEFAULT_WRITER_REQUIREMENTS}
+        for name, focus in (("without_focus", None), ("with_focus", _analysis_focus())):
+            prompts[f"core_{name}"] = _build_writer_core_query(
+                [{"i": 1, "name": "方案评价"}], has_bug=False, analysis_focus=focus,
+            )
+            prompts[f"review_{name}"] = _build_writer_core_review_query(focus, has_bug=False)
+
+        for name, prompt in prompts.items():
+            with self.subTest(prompt=name):
+                for permitted_opening in ("明确偏好", "方案优劣", "意见分歧", "突出问题", "尚无法判断"):
+                    self.assertIn(permitted_opening, prompt)
+                self.assertIn("不限定首句句式", prompt)
+                self.assertIn("允许用关键数字支撑开头", prompt)
+                self.assertIn("证据充分的跨题洞察仍应保留", prompt)
+                self.assertIn("不要求每份报告都形成统一标准", prompt)
+                self.assertIn("不同玩家分别提到不同因素，不等于他们共同遵循同一套标准", prompt)
+                self.assertIn("所声明范围内的一致程度", prompt)
+                self.assertIn("分歧或反例", prompt)
+                self.assertIn("不必每句话都加", prompt)
+                self.assertIn("不得冒充玩家原意", prompt)
+                self.assertIn("这一边界适用于整个核心结论", prompt)
+                self.assertIn("不能只改首句", prompt)
+                self.assertIn("只有来源直接支持这些关系时才能这样表述", prompt)
+                for forced_opening in (
+                    "第一句话就用", "必须先写跨题洞察、判断标准或取舍逻辑",
+                    "概括玩家依据哪些真实标准做选择", "第一句就必须先概括真实的判断标准",
+                    "局部修补将判断标准上提", "任何纯数字陈述开头",
+                ):
+                    self.assertNotIn(forced_opening, prompt)
+
+        for name in ("default", "core_with_focus", "review_with_focus", "review_without_focus"):
+            with self.subTest(deliverable_boundary=name):
+                self.assertIn("交付要求不能越过证据边界", prompts[name])
+                self.assertIn("暂不能形成可靠框架", prompts[name])
+                self.assertIn("待验证候选及其缺口", prompts[name])
+
+    def test_writer_v15_migration_refreshes_defaults_and_preserves_custom_history(self):
+        default = DEFAULT_PROMPTS["writer_requirements"]
+        self.assertEqual(default["version"], 15)
+        for customized in (False, True):
+            with self.subTest(customized=customized):
+                entry = deepcopy(default)
+                entry.update(version=14, current="旧版写作要求")
+                entry["history"] = [{"content": "个人写作规则", "note": "custom"}] if customized else []
+                previous_history = deepcopy(entry["history"])
+
+                self.assertTrue(_sync_entry(entry, default))
+                self.assertEqual(entry["version"], 15)
+                self.assertEqual(entry["history"], previous_history)
+                self.assertEqual(entry["current"], "旧版写作要求" if customized else DEFAULT_WRITER_REQUIREMENTS)
+                self.assertFalse(_sync_entry(entry, default))
 
     def test_quantitative_part_query_prioritizes_objective_statistics(self):
         query = _build_writer_part_query({
