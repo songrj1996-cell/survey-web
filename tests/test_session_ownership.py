@@ -508,6 +508,12 @@ class SessionRouteBarrierTests(unittest.IsolatedAsyncioTestCase):
                 ["peek_annotate_session", "annotate_set_confirmed_ai", "audit_log"],
             ),
             (
+                lambda: annotate_router.annotate_quality_review(
+                    "sid", SimpleNamespace(), request,
+                ),
+                ["peek_annotate_session", "annotate_apply_quality_review", "audit_log"],
+            ),
+            (
                 lambda: annotate_router.annotate_run_quality("sid", request),
                 ["peek_annotate_session", "validate_annotate_session_for_quality"],
             ),
