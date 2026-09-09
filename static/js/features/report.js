@@ -608,6 +608,7 @@ function normalizeReportVersions(versions) {
           kind,
           base_version: toFiniteVersion(item.base_version),
           title: item.title || '',
+          report_style: item.report_style === 'quick' ? 'quick' : 'full',
           plan_approved_at: item.plan_approved_at || '',
           report_completed_at: item.report_completed_at || '',
           report_duration_seconds: item.report_duration_seconds,
@@ -660,7 +661,11 @@ function updateReportActionAvailability() {
   const exportDropdown = $('btn-export-dropdown');
   if (exportDropdown) exportDropdown.disabled = busy;
   const partialRerunBtn = $('btn-report-partial-rerun');
-  if (partialRerunBtn) partialRerunBtn.disabled = !activeReportId() || busy;
+  if (partialRerunBtn) {
+    const quick = activeReportCtx()?.reportStyle === 'quick';
+    partialRerunBtn.disabled = !activeReportId() || busy || quick;
+    partialRerunBtn.title = quick ? '快速报告暂不支持按 Part 局部重做' : '';
+  }
   const validationBtn = $('btn-comparison-validation');
   if (validationBtn) validationBtn.disabled = !activeReportId() || busy;
   const hasSession = !!(
@@ -701,6 +706,7 @@ function syncReportVersionMeta(target, meta = {}) {
   if (selectedVersion != null) target.selectedVersion = selectedVersion;
   if (!target.selectedVersion) target.selectedVersion = target.version || target.activeVersion || normalized.at(-1)?.version || null;
   const selectedSummary = normalized.find(item => item.version === target.selectedVersion);
+  target.reportStyle = (meta.report_style ?? selectedSummary?.report_style) === 'quick' ? 'quick' : 'full';
   const hasDuration = Object.prototype.hasOwnProperty.call(meta, 'report_duration_seconds')
     || Object.prototype.hasOwnProperty.call(selectedSummary || {}, 'report_duration_seconds');
   if (hasDuration) {
@@ -1354,6 +1360,7 @@ function buildTOC() {
   const filtered = headings.filter((h, idx) => {
     if (h.tagName === 'H1' && idx === 0) return false;
     if (h.closest('.core-summary-box') && h.tagName !== 'H2') return false;
+    if (h.closest('.quick-evidence')) return false;
     return true;
   });
   const reportBody = document.querySelector('#panel-5 .report-document .report-body');
@@ -1376,6 +1383,7 @@ function buildTOC() {
     a.classList.add(`report-toc__link--${h.tagName.toLowerCase()}`);
     a.addEventListener('click', e => {
       e.preventDefault();
+      revealQuickTarget(h);
       if (reportBody) {
         const top = h.getBoundingClientRect().top - reportBody.getBoundingClientRect().top + reportBody.scrollTop - 24;
         reportBody.scrollTo({ top, behavior: 'smooth' });
@@ -1822,6 +1830,7 @@ function renderReportWorkspace(md, { preserveQa = true } = {}) {
   applyCoreHighlight();
   removeLegacyStatsChartPayloads();
   enhanceReportTables();
+  renderQuickReportNavigation(md, ctx);
   buildTOC();
   switchReportTab('report');
   renderReportBreadcrumb();

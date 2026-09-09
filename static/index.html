@@ -13,6 +13,7 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Roboto+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/static/style.css?v=53" />
   <link rel="stylesheet" href="/static/questionnaire-sources.css?v=1" />
+  <link rel="stylesheet" href="/static/report-quick.css?v=1" />
 </head>
 
 <body>
@@ -462,6 +463,18 @@
         <div class="plan-card" id="plan-card" style="display:none">
           <div class="plan-card__sections" id="plan-card-content"></div>
           <div class="plan-actions">
+            <fieldset class="report-style-picker" id="report-style-picker" hidden>
+              <legend>报告模式</legend>
+              <div class="report-style-picker__options">
+                <label><input type="radio" name="report-style" value="full" checked />
+                  <span><strong>完整模式</strong><small>逐章展开分析，适合深入研究与完整归档</small></span>
+                </label>
+                <label><input type="radio" name="report-style" value="quick" />
+                  <span><strong>快速模式 <em>试用</em></strong><small>重点精写，全部已识别主题与证据按需查看</small></span>
+                </label>
+              </div>
+              <p>确认方案后开始生成。快速模式保留全量分析，主要减少写作和阅读负担；实际耗时取决于回答量。</p>
+            </fieldset>
             <div class="plan-actions__hint">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <circle cx="12" cy="12" r="10" />
@@ -1878,13 +1891,14 @@
 
   <script src="https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js"></script>
   <!-- app.js 已按业务线拆分;顺序固定:core 最先,各 feature 居中(均含原顺序的初始化代码) -->
-  <script src="/static/js/core/core.js?v=32"></script>
-  <script src="/static/js/features/survey.js?v=38"></script>
+  <script src="/static/js/core/core.js?v=33"></script>
+  <script src="/static/js/features/report-quick.js?v=1"></script>
+  <script src="/static/js/features/survey.js?v=39"></script>
   <script src="/static/js/features/questionnaire-sources.js?v=1"></script>
-  <script src="/static/js/features/report.js?v=43"></script>
+  <script src="/static/js/features/report.js?v=44"></script>
   <script src="/static/js/features/profile.js?v=2"></script>
   <script src="/static/js/features/settings.js?v=35"></script>
-  <script src="/static/js/features/history.js?v=36"></script>
+  <script src="/static/js/features/history.js?v=37"></script>
   <script src="/static/js/features/interview.js?v=9"></script>
   <script src="/static/js/features/nav.js?v=37"></script>
   <script src="/static/js/features/comment.js?v=29"></script>

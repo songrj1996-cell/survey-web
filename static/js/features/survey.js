@@ -1147,6 +1147,7 @@ async function startPlan() {
 // ============================================================
 
 function showPlanCard(plan, headers) {
+  loadReportStyleOptions();
   $('plan-thinking').style.display = 'none';
   $('plan-card').style.display = 'block';
   $('plan-card-content').innerHTML = buildPlanHTML(plan, headers);
@@ -1470,6 +1471,8 @@ $('plan-input').addEventListener('keydown', e => {
 });
 
 async function confirmPlan(text) {
+  const reportStyle = selectedReportStyle();
+  lockReportStyleSelection(true);
   $('plan-input').disabled = true;
   $('btn-plan-ok').disabled = true;
   $('btn-plan-revise').disabled = true;
@@ -1489,6 +1492,7 @@ async function confirmPlan(text) {
       await consumeSSEPost('/api/plan/confirm', {
         session_id: state.sessionId,
         user_text: text,
+        report_style: reportStyle,
       }, ev => {
         if (ev.type === 'progress') {
           const el = $('plan-stream-text');
@@ -1564,6 +1568,7 @@ async function confirmPlan(text) {
     }
   } catch (e) {
     showBlockingFlowError('方案修订失败', e.message);
+    lockReportStyleSelection(false);
     // 修订失败时恢复方案卡片（隐藏 thinking 区，避免用户看到空白）
     if (state.planData) {
       $('plan-thinking').style.display = 'none';

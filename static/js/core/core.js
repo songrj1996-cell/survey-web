@@ -25,7 +25,9 @@ const state = {
   reportGenerationSerial: 0,
   viewMode: 'session', // 'session' | 'history'
   historyId: null,     // 当前查看/续聊的历史 id
+  reportStyleSelection: { sessionId: null, value: 'full', enabled: false, locked: false },
   sessionReport: {
+    reportStyle: 'full',
     id: null,
     reportMd: null,
     title: '',
@@ -49,6 +51,7 @@ const state = {
     comparisonValidation: {},
   },
   historyReport: {
+    reportStyle: 'full',
     id: null,
     reportMd: null,
     title: '',
