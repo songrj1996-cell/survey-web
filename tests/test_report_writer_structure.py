@@ -13,6 +13,7 @@ from app.services.report_engine import (
     _build_writer_action_repair_query,
     _build_comparison_repair_query,
     _build_writer_context,
+    _build_writer_core_context_query,
     _build_writer_core_review_query,
     _build_writer_core_query,
     _build_writer_first_query,
@@ -35,6 +36,28 @@ def _analysis_focus() -> dict:
 
 
 class ReportWriterStructureTests(unittest.TestCase):
+    def test_independent_core_round_keeps_sample_note_out_of_heading(self):
+        for focus in (None, _analysis_focus()):
+            with self.subTest(with_analysis_focus=bool(focus)):
+                query = _build_writer_core_context_query(
+                    [{"i": 1, "name": "图标评价", "col_desc": "评价(open_text)"}],
+                    ["## Part 1 图标评价\n\n设计取舍依据。"],
+                    stats_md="<metadata>有效样本: 60</metadata>",
+                    viewpoint_stats_md="<subjective_viewpoint_stats>有效回答玩家: 57</subjective_viewpoint_stats>",
+                    bug_section="",
+                    analysis_focus=focus,
+                )
+                self.assertIn("标题必须独占一行且严格为 `## 核心结论`", query)
+                self.assertIn("不得在标题中追加样本数、分母或括号说明", query)
+                self.assertIn("`*本次调研共收集 N 份有效回复。*`", query)
+                self.assertIn("不要使用 `>` 引用框", query)
+                self.assertIn("有效回答数、分母和适用范围，也写在该附注中", query)
+                self.assertIn("附注后空一行", query)
+                self.assertIn("有效样本: 60", query)
+                self.assertIn("有效回答玩家: 57", query)
+                self.assertNotIn("首行写明样本总数", query)
+                self.assertNotIn("严格按 <report_spec>", query)
+
     def test_comparison_repair_query_is_sentence_scoped_and_contains_audit_ids(self):
         query = _build_comparison_repair_query([{
             "claim_id": "C001",
