@@ -13,6 +13,7 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Roboto+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/static/style.css?v=54" />
   <link rel="stylesheet" href="/static/questionnaire-sources.css?v=1" />
+  <link rel="stylesheet" href="/static/survey-entry.css?v=2" />
 </head>
 
 <body>
@@ -169,194 +170,52 @@
               class="step-bar__label">报告 &amp; 追问</span></button>
         </div>
         <div class="panel__header">
-          <h1 class="panel__title">选择分析入口</h1>
-          <p class="panel__desc">按数据来源选择流程。定量入口用于倍市得数据：跑数表已上传时直接进入方案确认，未上传时先确认题型并由 Python 自动统计。</p>
+          <h1 class="panel__title">选择数据导入方式</h1>
+          <p class="panel__desc">两种方式都会进入同一套数据确认、报告重心选择和报告生成流程。</p>
         </div>
-
-        <!-- 分析类型选择 -->
-        <div class="analysis-type-picker" id="analysis-type-picker">
-          <div class="analysis-type-card" id="btn-qual-enter">
-            <div class="analysis-type-card__icon">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-                <polyline points="14 2 14 8 20 8" />
-                <line x1="9" y1="13" x2="15" y2="13" />
-                <line x1="9" y1="17" x2="13" y2="17" />
-              </svg>
-            </div>
-            <div class="analysis-type-card__body">
-              <div class="analysis-type-card__title">定性问卷分析</div>
-              <div class="analysis-type-card__desc">上传原始问卷数据，确认题型与分析方案后生成完整报告。</div>
-              <div class="analysis-type-card__enter">选择入口 →</div>
-            </div>
-          </div>
-          <div class="analysis-type-card" id="btn-quant-enter">
-            <div class="analysis-type-card__icon">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-                <rect x="3" y="3" width="18" height="18" rx="2" />
-                <path d="M9 9h6M9 12h6M9 15h4" />
-              </svg>
-            </div>
-            <div class="analysis-type-card__body">
-              <div class="analysis-type-card__title">定量分析（倍市得）</div>
-              <div class="analysis-type-card__desc">以客观题统计为主、开放题分析为辅。跑数表选填，未上传时由平台自动计算。</div>
-              <div class="analysis-type-card__enter">选择入口 →</div>
-            </div>
-          </div>
+        <div class="qe-tabs" role="tablist" aria-label="数据导入方式">
+          <button class="qe-tab is-selected" type="button" id="qe-local-tab" role="tab" aria-selected="true" aria-controls="qe-local-panel" data-entry-method="local">
+            <span class="qe-icon" aria-hidden="true">↑</span><span><strong>上传本地文件</strong><small>上传问卷回答数据及可选辅助资料</small></span><span class="qe-badge">默认入口</span>
+          </button>
+          <button class="qe-tab" type="button" id="qe-link-tab" role="tab" aria-selected="false" aria-controls="qe-link-panel" data-entry-method="link">
+            <span class="qe-icon" aria-hidden="true">↗</span><span><strong>粘贴 Google Form Link</strong><small>需要为谷歌服务账号添加问卷编辑权限</small></span><span class="qe-badge" id="qe-link-badge">适配中</span>
+          </button>
         </div>
-
-        <!-- 跑数表模式上传区（点定量分析后显示） -->
-        <div id="crosstab-upload-area" style="display:none">
-          <div class="crosstab-uploader">
-            <div class="crosstab-uploader__header">
-              <div>
-                <h2 class="crosstab-uploader__title">上传倍市得定量文件</h2>
-                <p class="crosstab-uploader__desc">调研问卷和回答明细必填；专业跑数表选填。未上传跑数表时，平台将确认题型并由 Python 自动统计。</p>
+        <section class="qe-surface" id="qe-local-panel" role="tabpanel" aria-labelledby="qe-local-tab">
+          <div class="qe-file-heading"><div><h2>必填文件</h2><p>上传包含每位受访者逐题回答的数据表。</p></div>
+            <label class="qe-platform" for="qe-platform">调研平台<select id="qe-platform"><option value="auto">自动识别</option><option value="google">Google Forms</option><option value="bested">倍市得</option></select></label>
+          </div>
+          <div class="qe-file" data-entry-drop="responses">
+            <input id="qe-responses" type="file" accept=".csv,.xlsx" hidden>
+            <button class="qe-file-pick" type="button" data-entry-pick="responses"><span class="qe-icon" aria-hidden="true">▤</span><span><strong>问卷回答数据</strong><small>CSV / XLSX · 每份文件最大 50MB</small><span class="qe-filename" data-entry-name="responses">未选择文件</span></span><span class="qe-file-action">选择文件</span></button>
+            <button class="qe-remove" type="button" data-entry-remove="responses" hidden aria-label="移除问卷回答数据">移除</button>
+          </div>
+          <div class="qe-optional">
+            <h2>可选文件</h2><p>有则上传，可提高结构识别准确度或复用已有统计口径。</p>
+            <div class="qe-file-grid">
+              <div class="qe-file" data-entry-drop="questionnaire">
+                <input id="qe-questionnaire" type="file" accept=".xls,.xlsx" hidden>
+                <button class="qe-file-pick" type="button" data-entry-pick="questionnaire"><span class="qe-icon" aria-hidden="true">▥</span><span><strong>调研问卷源文件</strong><small>仅支持倍市得导出的 XLS / XLSX；用于读取题型、选项和矩阵结构</small><span class="qe-filename" data-entry-name="questionnaire">未选择文件</span></span><span class="qe-file-action">选择文件</span></button>
+                <button class="qe-remove" type="button" data-entry-remove="questionnaire" hidden aria-label="移除调研问卷源文件">移除</button>
               </div>
-              <span class="analysis-type-card__badge">CSV / Excel · 最大 50MB</span>
-            </div>
-
-            <div class="crosstab-file-grid">
-              <label class="crosstab-file-card" for="ct-survey" data-ct-slot="survey">
-                <input type="file" id="ct-survey" accept=".xls,.xlsx" hidden />
-                <span class="crosstab-file-card__icon">
-                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-                    <path d="M14 2H7a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7z" />
-                    <path d="M14 2v5h5" />
-                    <path d="M8 13h8M8 17h5" />
-                  </svg>
-                </span>
-                <span class="crosstab-file-card__body">
-                  <span class="crosstab-file-card__title">调研问卷 <em>必填</em></span>
-                  <span class="crosstab-file-card__desc">用于准确读取题型、选项、矩阵结构和问卷原文。</span>
-                  <span class="crosstab-file-card__filename" data-ct-file-name="survey">未选择文件</span>
-                </span>
-                <span class="crosstab-file-card__action">选择文件</span>
-              </label>
-
-              <label class="crosstab-file-card" for="ct-data" data-ct-slot="data">
-                <input type="file" id="ct-data" accept=".csv,.xlsx" hidden />
-                <span class="crosstab-file-card__icon">
-                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-                    <path d="M4 5h16M4 12h16M4 19h16" />
-                    <path d="M8 5v14M16 5v14" />
-                  </svg>
-                </span>
-                <span class="crosstab-file-card__body">
-                  <span class="crosstab-file-card__title">回答明细 <em>必填</em></span>
-                  <span class="crosstab-file-card__desc">逐份回答数据，用于统计计算、主观题分析和样本定位。</span>
-                  <span class="crosstab-file-card__filename" data-ct-file-name="data">未选择文件</span>
-                </span>
-                <span class="crosstab-file-card__action">选择文件</span>
-              </label>
-
-              <label class="crosstab-file-card" for="ct-crosstab" data-ct-slot="crosstab">
-                <input type="file" id="ct-crosstab" accept=".csv,.xlsx" hidden />
-                <span class="crosstab-file-card__icon">
-                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-                    <rect x="3" y="4" width="18" height="16" rx="2" />
-                    <path d="M7 9h10M7 13h10M7 17h6" />
-                  </svg>
-                </span>
-                <span class="crosstab-file-card__body">
-                  <span class="crosstab-file-card__title">专业跑数表 <em class="is-optional">选填</em></span>
-                  <span class="crosstab-file-card__desc">上传后以跑数表为正式口径；不上传则由 Python 自动计算。</span>
-                  <span class="crosstab-file-card__filename" data-ct-file-name="crosstab">未选择文件</span>
-                </span>
-                <span class="crosstab-file-card__action">选择文件</span>
-              </label>
-            </div>
-
-            <div class="context-form-wrap crosstab-context-form" id="crosstab-context-form-wrap">
-              <details class="context-form__details" open>
-                <summary class="context-form__summary">
-                  <span class="context-form__summary-title">建议填写：补充调研背景</span>
-                  <span class="context-form__summary-hint">用于确定统计解读重点和行动建议，不填不影响生成</span>
-                </summary>
-                <div class="context-form__body">
-                  <div class="context-form__field">
-                    <label for="ct-ctx-problem">业务问题/业务痛点/业务规划是什么？</label>
-                    <textarea id="ct-ctx-problem" rows="2"></textarea>
-                  </div>
-                  <div class="context-form__field">
-                    <label for="ct-ctx-key-concerns">本次调研最关心的问题是什么？</label>
-                    <textarea id="ct-ctx-key-concerns" rows="2"></textarea>
-                  </div>
-                  <div class="context-form__field">
-                    <label for="ct-ctx-target-users">产品/功能的目标用户是谁？</label>
-                    <textarea id="ct-ctx-target-users" rows="2"></textarea>
-                  </div>
-                </div>
-              </details>
-            </div>
-
-            <div class="crosstab-actions">
-              <button class="btn btn--ghost" id="btn-ct-back" type="button">返回入口选择</button>
-              <button class="btn btn--primary" id="btn-ct-upload" type="button" disabled>上传并开始分析</button>
-            </div>
-          </div>
-        </div>
-
-        <!-- 上传区（点定性分析后显示） -->
-        <div id="upload-area" style="display:none">
-          <div class="upload-guide" id="upload-guide"></div>
-          <div class="survey-source-picker" aria-label="选择问卷数据来源">
-            <button class="survey-source-card survey-source-card--active" data-survey-source="google" type="button">
-              <span class="survey-source-card__title">Google 表单 / 通用表格</span>
-              <span class="survey-source-card__desc">上传回答数据，由 AI 识别题型并在下一步确认。</span>
-            </button>
-            <button class="survey-source-card" data-survey-source="bested" type="button">
-              <span class="survey-source-card__title">倍市得</span>
-              <span class="survey-source-card__desc">支持拆列多选与矩阵单选，推荐同时上传调研问卷。</span>
-            </button>
-          </div>
-
-          <div id="survey-google-upload">
-            <div class="upload-zone" id="upload-zone">
-              <input type="file" id="file-input" accept=".csv,.xlsx" hidden />
-              <div class="upload-zone__icon">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-                  <polyline points="17 8 12 3 7 8" />
-                  <line x1="12" y1="3" x2="12" y2="15" />
-                </svg>
-              </div>
-              <div class="upload-zone__text">
-                <span class="upload-zone__primary">拖放回答数据到这里，或点击选择</span>
-                <span class="upload-zone__secondary">支持 CSV / Excel（最大 50MB）</span>
+              <div class="qe-file" data-entry-drop="statistics">
+                <input id="qe-statistics" type="file" accept=".xlsx" hidden>
+                <button class="qe-file-pick" type="button" data-entry-pick="statistics"><span class="qe-icon" aria-hidden="true">▦</span><span><strong>统计结果表</strong><small>仅适配倍市得专业统计表 XLSX，需配套问卷源文件；上传后固定采用“统计解读优先”</small><span class="qe-filename" data-entry-name="statistics">未选择文件</span></span><span class="qe-file-action">选择文件</span></button>
+                <button class="qe-remove" type="button" data-entry-remove="statistics" hidden aria-label="移除统计结果表">移除</button>
               </div>
             </div>
           </div>
-
-          <div id="survey-bested-upload" style="display:none">
-            <div class="survey-file-grid">
-              <label class="survey-file-card" for="bested-result-file" data-survey-file-card="result">
-                <input type="file" id="bested-result-file" accept=".csv,.xlsx" hidden />
-                <span class="survey-file-card__body">
-                  <span class="survey-file-card__title">问卷结果 <em>必填</em></span>
-                  <span class="survey-file-card__desc">倍市得导出的可读回答数据。</span>
-                  <span class="survey-file-card__filename" data-survey-file-name="result">未选择文件</span>
-                </span>
-                <span class="survey-file-card__action">选择文件</span>
-              </label>
-              <label class="survey-file-card" for="bested-questionnaire-file" data-survey-file-card="questionnaire">
-                <input type="file" id="bested-questionnaire-file" accept=".xls,.xlsx" hidden />
-                <span class="survey-file-card__body">
-                  <span class="survey-file-card__title">调研问卷 <em class="is-recommended">推荐</em></span>
-                  <span class="survey-file-card__desc">上传后直接读取题型、选项和矩阵结构，不让 AI 猜测。</span>
-                  <span class="survey-file-card__filename" data-survey-file-name="questionnaire">未选择文件</span>
-                </span>
-                <span class="survey-file-card__action">选择文件</span>
-              </label>
-            </div>
-            <div class="survey-questionnaire-hint" id="survey-questionnaire-hint">
-              未上传调研问卷，将使用 AI 识别题型，请在下一步仔细核对。
-            </div>
-            <div class="survey-upload-actions">
-              <button class="btn btn--primary" id="btn-bested-upload" type="button" disabled>上传并解析</button>
-            </div>
-          </div>
-        </div>
+          <p class="qe-hint" id="qe-platform-hint">自动识别会参考配套问卷；仅有回答表时按通用表格读取，请在下一步核对题型。</p>
+          <div class="qe-notice" id="qe-upload-rule" hidden role="status"></div>
+          <div class="qe-actions"><button class="btn btn--primary" type="button" id="qe-upload" disabled>上传文件并继续</button></div>
+        </section>
+        <section class="qe-surface" id="qe-link-panel" role="tabpanel" aria-labelledby="qe-link-tab" hidden>
+          <p class="qe-hint">请先将谷歌服务账号添加为问卷编辑者，再粘贴编辑链接；公开填写链接不会授予服务账号读取权限。</p>
+          <div class="qe-account"><strong>谷歌服务账号</strong><code id="qe-service-account">nancysong@research-and-analysis-platform.iam.gserviceaccount.com</code><button type="button" class="btn btn--ghost" id="qe-copy-account">复制账号</button></div>
+          <div class="qe-notice" id="qe-link-status" role="status">正在检查 Google Forms 入口是否可用…</div>
+          <div id="survey-google-upload"></div>
+        </section>
+        <p class="qe-status" id="qe-upload-status" role="status" aria-live="polite"></p>
       </section>
 
       <!-- STEP 2: Data confirm (column types) -->
@@ -378,11 +237,41 @@
           <p class="panel__desc" id="preview-meta">已读取文件</p>
         </div>
 
+        <div id="qe-data-confirm">
+        <section class="qe-confirm-section" id="qe-focus-panel" aria-label="选择报告重心">
+          <div><h2 class="qe-section-title"><span class="qe-section-number" aria-hidden="true">1</span>选择报告重心</h2><p class="panel__desc">两种方式使用同一份回答数据；区别是正文优先回答什么，以及开放题分析到什么粒度。</p></div>
+          <div class="qe-notice" id="qe-focus-lock" hidden role="status"><strong>已上传专业统计表，报告重心已固定</strong><p>将以该表为正式统计口径，自动采用“统计解读优先”。如需观点洞察，请返回上传页移除统计表，其他文件会保留。</p><button class="btn btn--ghost" type="button" id="qe-return-upload">返回上传页移除统计表</button></div>
+            <div class="qe-focus-options" role="radiogroup" aria-label="报告重心">
+              <button class="qe-focus-choice" type="button" role="radio" aria-checked="true" data-entry-focus="insight" aria-describedby="qe-insight-disabled">
+                <span class="qe-choice-title"><strong>观点洞察优先</strong><span class="qe-badge" data-entry-focus-badge="insight">当前选择</span></span>
+                <p>回答玩家有哪些不同想法、为什么、发生在什么情境，以及有哪些少数但重要的声音。</p>
+                <span id="qe-insight-disabled" hidden>当前不可选：请先移除已上传的统计结果表。</span>
+              </button>
+              <button class="qe-focus-choice" type="button" role="radio" aria-checked="false" data-entry-focus="statistics">
+                <span class="qe-choice-title"><strong>统计解读优先</strong><span class="qe-badge" data-entry-focus-badge="statistics">可选择</span></span>
+                <p>回答总体结果怎样、不同人群有何差异、哪些指标值得关注，以及开放题如何解释数字。</p>
+              </button>
+            </div>
+          <p class="qe-hint" id="qe-focus-stats"></p>
+          <details class="qe-focus-preview" id="qe-focus-preview">
+            <summary>查看报告结构示例</summary>
+            <p class="qe-hint">仅用于说明两种重心的差异，实际分析思路和章节将在下一步生成。</p>
+            <div id="qe-focus-outline"></div>
+          </details>
+        </section>
+        <section class="qe-confirm-section" id="qe-columns-panel" aria-labelledby="qe-confirm-title">
+          <div class="col-confirm-header">
+            <h2 class="qe-section-title"><span class="qe-section-number" aria-hidden="true">2</span><span id="qe-confirm-title">确认题型</span></h2>
+            <span class="col-confirm-count" id="col-confirm-count"></span>
+          </div>
+          <p class="panel__desc" id="qe-confirm-description">请逐一核对题型与中文题名。题型直接影响后续统计口径。</p>
+          <div class="col-list" id="col-list"></div>
+        </section>
         <div class="context-form-wrap" id="context-form-wrap">
-          <details class="context-form__details" id="context-form-details" open>
+          <details class="context-form__details" id="context-form-details">
             <summary class="context-form__summary">
-              <span class="context-form__summary-title">建议填写：补充调研背景</span>
-              <span class="context-form__summary-hint">填写后报告会更贴近你的产品决策，不填不影响生成</span>
+              <span class="context-form__summary-title"><span class="qe-section-number" aria-hidden="true">3</span>补充调研背景（选填）</span>
+              <span class="context-form__summary-hint">补充业务问题和目标用户，让报告更贴近产品决策；不填也可继续</span>
             </summary>
             <div class="context-form__body">
               <div class="context-form__field">
@@ -405,28 +294,10 @@
             </div>
           </details>
         </div>
-
-        <div class="col-confirm-header">
-          <div class="plan-section__title">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M9 11l3 3L22 4" />
-              <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" />
-            </svg>
-            题型确认
-          </div>
-          <span class="col-confirm-count" id="col-confirm-count"></span>
+        <p class="qe-status" id="qe-focus-status" role="status"></p>
+        <div class="qe-actions">
+          <button class="btn btn--primary" type="button" id="btn-start-plan" disabled><span id="qe-confirm-action">确认并生成分析方案</span></button>
         </div>
-        <p class="panel__desc" data-uitext="panel_col_desc">AI 已识别每道题的题型与中文题名，请逐一核对并修正。题型直接影响后续统计口径。</p>
-
-        <div class="col-list" id="col-list"></div>
-
-        <div class="col-confirm-actions">
-          <button class="btn btn--primary" id="btn-start-plan">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <polygon points="5 3 19 12 5 21 5 3" />
-            </svg>
-            确认题型，开始 AI 分析
-          </button>
         </div>
       </section>
 
@@ -459,7 +330,15 @@
           </div>
         </div>
 
+        <div class="qe-notice" id="qe-plan-recovery" hidden><strong>方案尚未生成完成</strong><p>已上传的文件、题型与调研背景仍保留，可以返回数据确认检查设置后重试。</p><button type="button" class="btn btn--ghost" id="qe-retry-plan">返回数据确认并重试</button></div>
         <div class="plan-card" id="plan-card" style="display:none">
+          <section class="qe-plan-meta" id="qe-plan-settings" hidden aria-label="本次分析设置">
+            <details id="qe-plan-details">
+              <summary><strong>本次分析设置</strong><span id="qe-plan-summary"></span><span class="qe-details-hint">查看详情</span></summary>
+              <dl class="qe-settings" id="qe-plan-settings-content"></dl>
+            </details>
+            <button type="button" class="btn btn--ghost" id="qe-edit-focus">修改设置</button>
+          </section>
           <div class="plan-card__sections" id="plan-card-content"></div>
           <div class="plan-actions">
             <div class="plan-actions__hint">
@@ -1878,15 +1757,16 @@
 
   <script src="https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js"></script>
   <!-- app.js 已按业务线拆分;顺序固定:core 最先,各 feature 居中(均含原顺序的初始化代码) -->
-  <script src="/static/js/core/core.js?v=32"></script>
-  <script src="/static/js/features/survey.js?v=38"></script>
-  <script src="/static/js/features/questionnaire-sources.js?v=1"></script>
+  <script src="/static/js/core/core.js?v=33"></script>
+  <script src="/static/js/features/survey.js?v=40"></script>
+  <script src="/static/js/features/survey-entry.js?v=2"></script>
+  <script src="/static/js/features/questionnaire-sources.js?v=2"></script>
   <script src="/static/js/features/report.js?v=43"></script>
   <script src="/static/js/features/profile.js?v=2"></script>
   <script src="/static/js/features/settings.js?v=35"></script>
   <script src="/static/js/features/history.js?v=36"></script>
   <script src="/static/js/features/interview.js?v=9"></script>
-  <script src="/static/js/features/nav.js?v=37"></script>
+  <script src="/static/js/features/nav.js?v=38"></script>
   <script src="/static/js/features/comment.js?v=29"></script>
 <script src="/static/js/features/annotate.js?v=40"></script>
 </body>
