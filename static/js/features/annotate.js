@@ -661,16 +661,26 @@ async function annRunQuality() {
   const bar = $('ann-quality-progress-bar');
   const msg = $('ann-quality-progress-msg');
   const warnLog = $('ann-quality-warn-log');
-  let retryBtn = $('ann-btn-quality-retry');
-  if (!retryBtn) {
-    retryBtn = document.createElement('button');
+  let retryActions = $('ann-quality-retry');
+  if (!retryActions) {
+    retryActions = document.createElement('div');
+    retryActions.id = 'ann-quality-retry';
+    retryActions.className = 'ann-quality-retry';
+    const retryBtn = document.createElement('button');
     retryBtn.id = 'ann-btn-quality-retry';
-    retryBtn.className = 'btn btn--ghost';
-    retryBtn.textContent = '重试质量打标';
+    retryBtn.type = 'button';
+    retryBtn.className = 'btn btn--primary';
+    retryBtn.setAttribute('aria-describedby', 'ann-quality-retry-hint');
     retryBtn.onclick = () => annRunQuality();
-    warnLog.insertAdjacentElement('afterend', retryBtn);
+    const retryHint = document.createElement('p');
+    retryHint.id = 'ann-quality-retry-hint';
+    retryHint.className = 'ann-quality-retry__hint';
+    retryActions.append(retryBtn, retryHint);
+    warnLog.insertAdjacentElement('afterend', retryActions);
   }
-  retryBtn.style.display = 'none';
+  const retryBtn = $('ann-btn-quality-retry');
+  const retryHint = $('ann-quality-retry-hint');
+  retryActions.style.display = 'none';
   bar.style.width = '0%';
   msg.textContent = '正在连接…';
   warnLog.innerHTML = '';
@@ -711,7 +721,20 @@ async function annRunQuality() {
       }
     });
     if (annState.missingQualityIds.length > 0 || annState.missingTranslationIds.length > 0) {
-      retryBtn.style.display = '';
+      const missingQualityCount = annState.missingQualityIds.length;
+      const missingTranslationCount = annState.missingTranslationIds.length;
+      const retainedSummary = `已完成 ${annState.qualityCount} 行质量打标，结果会保留。`;
+      if (missingQualityCount > 0 && missingTranslationCount > 0) {
+        retryBtn.textContent = '重试失败行并补译';
+        retryHint.textContent = `质量打标失败 ${missingQualityCount} 行，中文翻译待补 ${missingTranslationCount} 行。${retainedSummary}仅重新判断失败行的主观题，并补齐缺失译文。`;
+      } else if (missingQualityCount > 0) {
+        retryBtn.textContent = `重试失败的 ${missingQualityCount} 行`;
+        retryHint.textContent = `${retainedSummary}仅重新判断失败行的主观题。`;
+      } else {
+        retryBtn.textContent = `补齐 ${missingTranslationCount} 行中文翻译`;
+        retryHint.textContent = '质量打标已完成，本次仅补齐缺失译文，保留已有质量结果。';
+      }
+      retryActions.style.display = '';
       showToast(
         annState.missingQualityIds.length > 0
           ? '质量打标结果不完整，已停留在当前步骤'

@@ -18,6 +18,8 @@ JAVASCRIPT = (
 ).read_text(encoding="utf-8")
 SURVEY_JAVASCRIPT = (
     PROJECT_ROOT / "static" / "js" / "features" / "survey.js"
+).read_text(encoding="utf-8") + (
+    PROJECT_ROOT / "static" / "js" / "features" / "survey-entry.js"
 ).read_text(encoding="utf-8")
 STYLESHEET = (
     PROJECT_ROOT / "static" / "questionnaire-sources.css"
@@ -135,12 +137,12 @@ class QuestionnaireSourceFrontendContractTests(unittest.TestCase):
             1,
         )
         self.assertEqual(
-            INDEX.count('/static/js/features/questionnaire-sources.js?v=1'),
+            INDEX.count('/static/js/features/questionnaire-sources.js?'),
             1,
         )
         self.assertLess(
-            INDEX.index('/static/js/features/survey.js?v=38'),
-            INDEX.index('/static/js/features/questionnaire-sources.js?v=1'),
+            INDEX.index('/static/js/features/survey-entry.js?'),
+            INDEX.index('/static/js/features/questionnaire-sources.js?'),
         )
 
     def test_only_google_capability_and_family_endpoints_are_present(self):

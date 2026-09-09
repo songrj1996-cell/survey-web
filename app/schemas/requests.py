@@ -8,6 +8,10 @@ class ColumnConfirmRequest(BaseModel):
     columns: list[dict]
 
 
+class SurveyAnalysisSettingsRequest(BaseModel):
+    report_focus: Literal["insight", "statistics"]
+
+
 class PlanConfirmRequest(BaseModel):
     session_id: str
     user_text: str
