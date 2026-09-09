@@ -1195,12 +1195,41 @@ function applyCoreHighlight() {
     cleanItems.forEach(item => wrapper.appendChild(item));
   };
 
-  // 找「核心结论」h2
+  // 兼容历史报告把样本口径写进标题的情况；只调整 DOM，不改写报告原文。
+  const sampleCountPattern = /^(?:(?:基于|本次调研(?:共收集)?)\s*)?(?:\d+\s*(?:份|名|位|条|个)\s*(?:有效)?(?:样本|回复|回答|玩家|受访者)|(?:有效|总)?样本(?:数|量|总数)?\s*[:：=为]?\s*\d+|[nN]\s*=\s*\d+)/;
   let coreH2 = null;
   for (const h of content.querySelectorAll('h2')) {
-    if (h.textContent.trim() === '核心结论') { coreH2 = h; break; }
+    const title = h.textContent.trim();
+    if (title === '核心结论') { coreH2 = h; break; }
+    const match = title.match(/^核心结论\s*(?:（(.+)）|\((.+)\))$/);
+    const sampleNote = (match?.[1] || match?.[2] || '').trim();
+    // 必须以明确的样本数量开头，避免移动业务限定标题中的普通文字。
+    if (!sampleCountPattern.test(sampleNote)) continue;
+    h.textContent = '核心结论';
+    const next = h.nextElementSibling;
+    if (!['P', 'BLOCKQUOTE'].includes(next?.tagName) || next.textContent.trim() !== sampleNote) {
+      const note = document.createElement('p');
+      note.textContent = sampleNote;
+      h.parentNode.insertBefore(note, next);
+    }
+    coreH2 = h;
+    break;
   }
   if (coreH2) {
+    let note = coreH2.nextElementSibling;
+    if (note && ['P', 'BLOCKQUOTE'].includes(note.tagName) && sampleCountPattern.test(note.textContent.trim())) {
+      // 旧引用格式只拆除单段样本附注的外框，保留段落中的链接等原有节点。
+      if (note.tagName === 'BLOCKQUOTE' && note.children.length === 1 && note.children[0].tagName === 'P') {
+        const paragraph = note.children[0];
+        note.parentNode.insertBefore(paragraph, note);
+        note.remove();
+        note = paragraph;
+      }
+      if (note.tagName === 'P') {
+        note.classList.add('core-sample-note');
+        note.style.fontStyle = 'italic';
+      }
+    }
     const toWrap = [coreH2];
     let el = coreH2.nextElementSibling;
     while (el && el.tagName !== 'H1' && el.tagName !== 'H2') {
