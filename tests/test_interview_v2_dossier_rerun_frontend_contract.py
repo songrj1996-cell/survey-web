@@ -49,7 +49,7 @@ class DossierRerunFrontendTests(unittest.TestCase):
         self.assertIn("from_stage: 'participant_dossier'", JS)
         self.assertIn('/api/v1/interview-projects/${ivV2State.projectId}/reruns', JS)
         self.assertIn("'Idempotency-Key': idempotencyKey", JS)
-        self.assertIn('/static/js/features/interview-v2.js?v=6', (ROOT / "static/index.html").read_text(encoding="utf-8"))
+        self.assertIn('/static/js/features/interview-v2.js?v=7', (ROOT / "static/index.html").read_text(encoding="utf-8"))
         self.run_js("""
           const payload = ivV2DossierRerunPayload();
           assert.deepEqual(payload, {from_stage: 'participant_dossier', participant_id: participant, base_dossier_version_id: base, preserve_manual_report_edits: true, reuse_unchanged_artifacts: true, force: false});

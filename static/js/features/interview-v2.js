@@ -5,6 +5,7 @@ const IV_V2_POLL_INTERVAL_MS = 1800;
 const IV_V2_SOURCE_SCOPE_TYPES = ['interview_body', 'participant_background', 'excluded'];
 const IV_V2_LABEL_SCOPE_MODES = ['disabled', 'all_analysis', 'selected_modules', 'selected_evaluation_objects'];
 const IV_V2_BOUNDARY_TABS = ['review', 'evaluation_objects', 'analysis_scope', 'coverage'];
+let ivV2Enabled = false;
 
 const ivV2State = {
   currentStep: 1,
@@ -705,18 +706,34 @@ function ivV2SyncTrackToggle() {
   );
   const locked = ivV2OperationBusy() || (track === 'v2' ? ivV2PrecheckActive() : v1Busy);
   ivV2AllTrackButtons().forEach(button => {
+    const unavailable = button.dataset.ivTrack === 'v2' && !ivV2Enabled;
     const active = button.dataset.ivTrack === track;
     button.classList.toggle('iv-track-switch__btn--active', active);
     button.setAttribute('aria-pressed', active ? 'true' : 'false');
-    button.disabled = locked;
+    button.hidden = unavailable;
+    button.disabled = locked || unavailable;
   });
   document.querySelectorAll('[data-iv-track-content]').forEach(section => {
     section.hidden = section.dataset.ivTrackContent !== track;
   });
 }
 
+async function ivV2LoadCapabilities() {
+  try {
+    const response = await fetch('/api/interview/capabilities', {
+      cache: 'no-store',
+      signal: AbortSignal.timeout(8000),
+    });
+    ivV2Enabled = response.ok && (await response.json()).interview_v2_enabled === true;
+  } catch (_) {
+    ivV2Enabled = false;
+  }
+  ivV2SyncTrackToggle();
+}
+
 function ivV2SetTrack(track) {
   if (!window.ivState) return;
+  if (track === 'v2' && !ivV2Enabled) return;
   const currentTrack = window.ivState.track || 'v1';
   if (track === currentTrack) return;
   if (ivV2OperationBusy()) {
@@ -6309,6 +6326,7 @@ function ivV2StartOver() {
 }
 
 function ivV2Mount() {
+  ivV2LoadCapabilities();
   if (typeof window.addEventListener === 'function') {
     window.addEventListener('beforeunload', event => {
       if (!ivV2HasUnsavedWork()) return;

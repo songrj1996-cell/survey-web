@@ -2,6 +2,7 @@
 from fastapi import APIRouter, File, Form, Request, UploadFile
 from fastapi.responses import StreamingResponse
 
+from app.core.config import INTERVIEW_V2_ENABLED
 from app.schemas.requests import InterviewBatchReviewRequest
 from app.services.audit import audit_log
 from app.services.auth import _require_feature
@@ -20,6 +21,12 @@ from app.services.interview_service import (
 from app.services.report_history import confirm_interview_audit_issue
 
 router = APIRouter()
+
+
+@router.get("/api/interview/capabilities")
+async def interview_capabilities(request: Request):
+    await _require_feature(request, "interview")
+    return {"interview_v2_enabled": INTERVIEW_V2_ENABLED}
 
 
 @router.post("/api/interview/upload")
