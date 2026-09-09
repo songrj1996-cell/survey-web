@@ -396,6 +396,7 @@ async function openHistoryEntry(id) {
       report_duration_seconds: entry.report_duration_seconds,
       report_completed_at: entry.report_completed_at,
       report_llm_usage: entry.report_llm_usage,
+      report_style: entry.report_style,
     });
     state.historyReport.qaMessages = normalizeQAMessages(entry.qa_messages);
     state.historyReport.qaHtml = '';

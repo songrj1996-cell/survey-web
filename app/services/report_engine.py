@@ -38,6 +38,7 @@ from app.services.glossary_service import (
     prepare_glossary_messages,
 )
 from app.services.question_detect import ROLE_LABEL_MAP
+from app.services.report_quick_mode import build_evidence_catalog
 from app.storage.prompts import (
     _get_large_sample_writer_requirements as _get_large_sample_writer_requirements_base,
     _get_planner_extra,
@@ -2480,6 +2481,15 @@ def _writer_parts_meta(plan: dict, headers: list[str]) -> list[dict]:
             "filter_desc": _part_filter_desc(p, plan),
         })
     return meta
+
+
+def _build_quick_evidence_catalog(stats_md, open_text, plan, clustered_themes, report_viewpoints, diagnostics):
+    """Reuse source scopes and deterministic stats without full-writer requirements."""
+    # Keep the full deterministic result, including sample/filter notes and cross-tabs.
+    stats = {"问卷统计与样本口径": stats_md} if str(stats_md or "").strip() else {}
+    return build_evidence_catalog(
+        clustered_themes, report_viewpoints, list(_open_text_scopes(open_text, plan)), stats, diagnostics,
+    )
 
 
 def _build_writer_context(
