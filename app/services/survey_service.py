@@ -1042,6 +1042,40 @@ async def columns_stream(session_id: str, request: Request):
 # ── 列确认 ──────────────────────────────────────────────────────
 
 
+def set_survey_analysis_settings(session_id: str, report_focus: str) -> dict:
+    """Persist the report focus without changing the authority of statistics."""
+    if report_focus not in {"insight", "statistics"}:
+        raise HTTPException(status_code=422, detail="不支持的报告重心")
+    sess = get_session(session_id)
+    if sess.get("mode") not in {None, "", "qualitative", "standard", "survey", "quantitative", "crosstab"}:
+        raise HTTPException(status_code=400, detail="只有问卷分析任务可以选择报告重心")
+    if not sess.get("rows"):
+        raise HTTPException(status_code=400, detail="请先上传回答数据")
+    external = sess.get("stats_source") == "external_crosstab" or sess.get("mode") == "crosstab"
+    if external and report_focus != "statistics":
+        raise HTTPException(status_code=409, detail="已上传专业统计表，报告重心固定为统计解读优先；请返回上传页移除统计表")
+    previous = sess.get("report_focus") or (
+        "statistics" if external or sess.get("mode") == "quantitative" or sess.get("analysis_mode") == "quantitative" else "insight"
+    )
+    if previous != report_focus and (
+        sess.get("plan_approved_at") or sess.get("report_md") or sess.get("stats_md")
+        or sess.get("report_versions") or _report_generation_lock(session_id).locked()
+    ):
+        raise HTTPException(status_code=409, detail="方案已确认或报告已经开始，请重新开始分析后选择报告重心")
+    if previous != report_focus:
+        # An unapproved draft belongs to its original focus and must be regenerated.
+        for key in ("plan", "plan_revision_texts", "current_plan_revision_texts",
+                    "preset_plan_revision_texts", "preset_analysis_focus",
+                    "applied_analysis_preset_id", "applied_analysis_preset_fingerprint"):
+            sess.pop(key, None)
+    sess["report_focus"] = report_focus
+    sess["analysis_mode"] = "quantitative" if report_focus == "statistics" else "qualitative"
+    sess["mode"] = "crosstab" if external else ("quantitative" if report_focus == "statistics" else "standard")
+    sess["stats_source"] = "external_crosstab" if external else "python"
+    save_session(session_id, sess)
+    return {key: sess[key] for key in ("report_focus", "analysis_mode", "mode", "stats_source")}
+
+
 def set_survey_columns(session_id: str, columns: list) -> None:
     """存储用户确认后的列题型配置。"""
     sess = get_session(session_id)

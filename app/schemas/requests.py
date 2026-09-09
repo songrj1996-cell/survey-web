@@ -1,10 +1,15 @@
 """所有 FastAPI 请求体模型(Pydantic)。由各 router 共用,只定义数据结构,不含业务逻辑。"""
 from pydantic import BaseModel, Field
+from typing import Literal
 
 
 # ── 问卷主流程 ──────────────────────────────────────────────
 class ColumnConfirmRequest(BaseModel):
     columns: list[dict]
+
+
+class SurveyAnalysisSettingsRequest(BaseModel):
+    report_focus: Literal["insight", "statistics"]
 
 
 class PlanConfirmRequest(BaseModel):
