@@ -21,12 +21,14 @@ _MIRROR_FIELDS = (
     "analyst_app",
     "comparison_validation",
     "report_llm_usage",
+    "report_style",
+    "quick_report_diagnostics",
 )
 _TEXT_SNAPSHOT_FIELDS = tuple(
     field for field in _MIRROR_FIELDS
-    if field not in {"qa_messages", "comparison_validation", "report_llm_usage"}
+    if field not in {"qa_messages", "comparison_validation", "report_llm_usage", "report_style", "quick_report_diagnostics"}
 )
-_OPTIONAL_OBJECT_SNAPSHOT_FIELDS = ("report_llm_usage",)
+_OPTIONAL_OBJECT_SNAPSHOT_FIELDS = ("report_llm_usage", "quick_report_diagnostics")
 _SUMMARY_FIELDS = (
     "version",
     "kind",
@@ -35,6 +37,7 @@ _SUMMARY_FIELDS = (
     "created_at",
     "title",
     "rerun_details",
+    "report_style",
 )
 _IMMUTABLE_UPDATE_FIELDS = {
     "version",
@@ -162,6 +165,10 @@ def _snapshot_from(
             raise ValueError(f"{field} 必须是对象")
         result[field] = deepcopy(value)
 
+    result["report_style"] = "quick" if snapshot.get("report_style", fallback.get("report_style")) == "quick" else "full"
+    if result["report_style"] != "quick":
+        result.pop("quick_report_diagnostics", None)
+
     if not result["title"]:
         result["title"] = _report_title(result["report_md"])
     return result
@@ -258,7 +265,7 @@ def report_version_summaries(source: dict) -> list[dict]:
         {
             field: deepcopy(snapshot[field])
             for field in _SUMMARY_FIELDS
-            if field in snapshot
+            if field in snapshot and (field != "report_style" or snapshot[field] == "quick")
         }
         for snapshot in normalize_report_versions(source)
     ]
@@ -360,11 +367,11 @@ def append_report_version(
         or datetime.now().isoformat(timespec="seconds")
     )
     snapshot_fallback = source
-    if versions and "report_llm_usage" in source:
+    if versions:
         snapshot_fallback = {
             key: value
             for key, value in source.items()
-            if key != "report_llm_usage"
+            if key not in {"report_llm_usage", "quick_report_diagnostics", "report_style"}
         }
     new_snapshot = _snapshot_from(
         snapshot,

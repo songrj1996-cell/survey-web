@@ -25,7 +25,9 @@ const state = {
   reportGenerationSerial: 0,
   viewMode: 'session', // 'session' | 'history'
   historyId: null,     // 当前查看/续聊的历史 id
+  reportStyleSelection: { sessionId: null, value: 'full', enabled: false, locked: false },
   sessionReport: {
+    reportStyle: 'full',
     id: null,
     reportMd: null,
     title: '',
@@ -49,6 +51,7 @@ const state = {
     comparisonValidation: {},
   },
   historyReport: {
+    reportStyle: 'full',
     id: null,
     reportMd: null,
     title: '',
@@ -145,19 +148,18 @@ function renderStepBars() {
   applyStepBarForMode();
 }
 
-// 跑数表(crosstab)模式:隐藏「数据确认」(step2),可见步骤重新编号 1..4
+// All questionnaire imports share five steps, including external statistics.
 function applyStepBarForMode() {
-  const crosstab = state.mode === 'crosstab';
   document.querySelectorAll('[data-survey-step="2"]').forEach(b => {
-    b.style.display = crosstab ? 'none' : '';
+    b.style.display = '';
   });
-  const seq = crosstab ? [1, 3, 4, 5] : [1, 2, 3, 4, 5];
+  const seq = [1, 2, 3, 4, 5];
   document.querySelectorAll('.step-bar').forEach(bar => {
     seq.forEach((step, i) => {
       const btn = bar.querySelector(`[data-survey-step="${step}"]`);
       if (!btn) return;
       const num = btn.querySelector('.step-bar__num');
-      if (num) num.textContent = crosstab ? (i + 1) : step;
+      if (num) num.textContent = step;
     });
   });
 }

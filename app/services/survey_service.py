@@ -42,6 +42,8 @@ from app.core.config import (
     LLM_REPORT_MODEL,
     LLM_STREAM_HEARTBEAT_SECONDS,
     MAX_REPORT_VERSIONS,
+    REPORT_QUICK_MODE_ENABLED,
+    LLM_QUICK_REPORT_STAGE_TIMEOUT_SECONDS,
 )
 from app.core.parsing import _parse_file
 from app.core.llm_context import current_llm_api_key
@@ -91,6 +93,7 @@ from app.services.qualitative_viewpoints import (
 )
 from app.services.report_engine import (
     _batch_qualitative_analysis,
+    _build_quick_evidence_catalog,
     _build_analysis_approach_block,
     _build_analysis_focus_block,
     _build_analysis_focus_mode_block,
@@ -158,6 +161,10 @@ from app.services.report_versions import (
     update_report_version,
 )
 from app.services.session_access import require_session_access
+from app.services.report_quick_mode import (
+    supports_quick_report, normalize_report_style, build_quick_query,
+    parse_quick_draft, render_quick_report,
+)
 from app.services.report_render import _inject_disclaimer, _inject_research_background
 from app.services.stats_presentation import (
     inject_qualitative_stats,
@@ -173,6 +180,7 @@ from app.storage.prompts import (
     _get_questionnaire_translation_system_prompt,
     _get_report_qa_system_prompt,
     _get_report_writer_system_prompt,
+    _get_prompt_text,
     _get_survey_planner_system_prompt,
 )
 from app.storage.sessions import get_session, new_session, save_session
@@ -1042,6 +1050,40 @@ async def columns_stream(session_id: str, request: Request):
 # ── 列确认 ──────────────────────────────────────────────────────
 
 
+def set_survey_analysis_settings(session_id: str, report_focus: str) -> dict:
+    """Persist the report focus without changing the authority of statistics."""
+    if report_focus not in {"insight", "statistics"}:
+        raise HTTPException(status_code=422, detail="不支持的报告重心")
+    sess = get_session(session_id)
+    if sess.get("mode") not in {None, "", "qualitative", "standard", "survey", "quantitative", "crosstab"}:
+        raise HTTPException(status_code=400, detail="只有问卷分析任务可以选择报告重心")
+    if not sess.get("rows"):
+        raise HTTPException(status_code=400, detail="请先上传回答数据")
+    external = sess.get("stats_source") == "external_crosstab" or sess.get("mode") == "crosstab"
+    if external and report_focus != "statistics":
+        raise HTTPException(status_code=409, detail="已上传专业统计表，报告重心固定为统计解读优先；请返回上传页移除统计表")
+    previous = sess.get("report_focus") or (
+        "statistics" if external or sess.get("mode") == "quantitative" or sess.get("analysis_mode") == "quantitative" else "insight"
+    )
+    if previous != report_focus and (
+        sess.get("plan_approved_at") or sess.get("report_md") or sess.get("stats_md")
+        or sess.get("report_versions") or _report_generation_lock(session_id).locked()
+    ):
+        raise HTTPException(status_code=409, detail="方案已确认或报告已经开始，请重新开始分析后选择报告重心")
+    if previous != report_focus:
+        # An unapproved draft belongs to its original focus and must be regenerated.
+        for key in ("plan", "plan_revision_texts", "current_plan_revision_texts",
+                    "preset_plan_revision_texts", "preset_analysis_focus",
+                    "applied_analysis_preset_id", "applied_analysis_preset_fingerprint"):
+            sess.pop(key, None)
+    sess["report_focus"] = report_focus
+    sess["analysis_mode"] = "quantitative" if report_focus == "statistics" else "qualitative"
+    sess["mode"] = "crosstab" if external else ("quantitative" if report_focus == "statistics" else "standard")
+    sess["stats_source"] = "external_crosstab" if external else "python"
+    save_session(session_id, sess)
+    return {key: sess[key] for key in ("report_focus", "analysis_mode", "mode", "stats_source")}
+
+
 def set_survey_columns(session_id: str, columns: list) -> None:
     """存储用户确认后的列题型配置。"""
     sess = get_session(session_id)
@@ -1190,12 +1232,32 @@ def apply_analysis_preset_to_session(
     return preset
 
 
+def report_style_options(session_id: str) -> dict:
+    sess = get_session(session_id)
+    allowed = bool(REPORT_QUICK_MODE_ENABLED and supports_quick_report(sess))
+    return {"quick_enabled": allowed, "report_style": sess.get("pending_report_style", "full") if allowed else "full"}
+
+
+def _validate_report_style(sess: dict, value) -> str:
+    try:
+        style = normalize_report_style(value)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if style == "quick" and not (REPORT_QUICK_MODE_ENABLED and supports_quick_report(sess)):
+        raise HTTPException(status_code=400, detail="当前报告类型或运行配置不支持快速模式")
+    return style
+
+
 def confirm_survey_plan(
     session_id: str,
     login: dict | None,
+    *, report_style: str = "full",
 ) -> dict:
     """确认当前方案，并在适用时保存同问卷可复用分析预设。"""
     sess = require_session_access(session_id, login, loader=get_session)
+    if _report_generation_lock(session_id).locked():
+        raise HTTPException(status_code=409, detail="报告正在生成，不能修改报告模式")
+    sess["pending_report_style"] = _validate_report_style(sess, report_style)
     sess["plan_approved_at"] = datetime.now().isoformat(timespec="milliseconds")
     save_session(session_id, sess)
     try:
@@ -1952,6 +2014,8 @@ async def report_stream(
             sess.get("analysis_mode") == "quantitative" or is_crosstab
         )
         qualitative_context = sess.get("qualitative_context")
+        report_style = _validate_report_style(sess, sess.get("pending_report_style", "full"))
+        quick_diagnostics = None
         use_large_mode = is_crosstab or any(
             len(value) > LARGE_SAMPLE_THRESHOLD for value in open_text.values()
         )
@@ -2166,6 +2230,63 @@ async def report_stream(
             diagnostic_session["report_viewpoint_diagnostics"] = viewpoint_diagnostics
             save_session(session_id, diagnostic_session)
 
+        async def _quick_write():
+            nonlocal quick_diagnostics, writer_context_included
+            started = time.monotonic()
+            catalog = _build_quick_evidence_catalog(
+                stats_md, open_text, plan, clustered_themes, report_viewpoints, cluster_diagnostics,
+            )
+            writer_context_included = bool(viewpoint_stats_md)
+            quick_diagnostics = {
+                "schema_version": 1, "status": "running", "catalog_count": len(catalog),
+                "stage_budget_seconds": LLM_QUICK_REPORT_STAGE_TIMEOUT_SECONDS,
+                "logical_calls": 0, "planned_logical_calls": 1, "max_logical_calls": 2,
+                "input_char_count": 0, "output_char_count": 0, "stop_reason": "",
+            }
+            messages = [{"role": "system", "content": _get_prompt_text("quick_writer_requirements")}]
+            query = build_quick_query(catalog, context=qualitative_context,
+                                      focus=plan.get("analysis_focus"), instruction=prompt_instruction)
+            quick_diagnostics["input_char_count"] = len(query)
+            try:
+                async with asyncio.timeout(LLM_QUICK_REPORT_STAGE_TIMEOUT_SECONDS):
+                    for attempt in range(2):
+                        quick_diagnostics["logical_calls"] += 1
+                        async for event in _writer_call(query, messages=messages, step="quick_report" if not attempt else "quick_repair"):
+                            yield event
+                        answer, model = _writer_call.out
+                        writer_models_used.append(model)
+                        quick_diagnostics["output_char_count"] = len(answer)
+                        try:
+                            draft = parse_quick_draft(answer, catalog)
+                        except ValueError as exc:
+                            if attempt:
+                                raise
+                            quick_diagnostics["repair_reason"] = str(exc)
+                            yield sse_event({"type": "progress", "message": "快速报告结构或证据引用未通过检查，正在执行一次修复…"})
+                            query = f"上轮未通过校验：{exc}。请按原契约重新返回完整JSON，不能省略已要求的字段。"
+                            continue
+                        markdown, metrics = render_quick_report(draft, catalog)
+                        quick_diagnostics.update(metrics)
+                        quick_diagnostics.update(status="completed", stop_reason="validated", report_char_count=len(markdown))
+                        _quick_write.out = markdown
+                        for event in _content_events(markdown):
+                            yield event
+                        return
+            except BaseException as exc:
+                quick_diagnostics.update(status="failed", stop_reason="timeout" if isinstance(exc, TimeoutError) else "cancelled" if isinstance(exc, asyncio.CancelledError) else "validation_or_upstream_failure")
+                if isinstance(exc, TimeoutError):
+                    raise ValueError("快速报告写作超过阶段预算，本次未保存为成功报告") from exc
+                raise
+            finally:
+                quick_diagnostics["elapsed_seconds"] = round(time.monotonic() - started, 3)
+                if quick_diagnostics["status"] == "failed":
+                    diagnostic_session = deepcopy(sess)
+                    diagnostic_session["last_quick_report_failure"] = {
+                        **deepcopy(quick_diagnostics),
+                        "report_llm_usage": report_llm_usage.snapshot(),
+                    }
+                    save_session(session_id, diagnostic_session)
+
         yield _report_llm_status_event()
 
         if use_large_mode:
@@ -2298,52 +2419,59 @@ async def report_stream(
             )
             _persist_synthesis_failure_diagnostics()
 
-            yield _analysis_progress(
-                "writing",
-                "active",
-                "主题材料已准备完成，正在撰写报告正文",
-                next_steps=["校验并保存"],
-            )
-            writer_query = _build_large_sample_writer_query(
-                stats_md, clustered_themes, plan, rows[0], open_text,
-                qualitative_context=qualitative_context,
-                quantitative_first=quantitative_first,
-                viewpoint_stats_md=viewpoint_stats_md,
-            )
-            writer_query = (
-                _build_report_generation_instruction_block(prompt_instruction)
-                + writer_query
-            )
-            if quantitative_first:
+            if report_style == "quick":
+                yield _analysis_progress("writing", "active", "正在精写核心判断与关键发现，完整证据将保留在附录", next_steps=["校验并保存"])
+                async for event in _quick_write():
+                    yield event
+                full_report = _quick_write.out
+                yield _analysis_progress("writing", "completed", "快速报告正文与证据附录已生成")
+            else:
+                yield _analysis_progress(
+                    "writing",
+                    "active",
+                    "主题材料已准备完成，正在撰写报告正文",
+                    next_steps=["校验并保存"],
+                )
+                writer_query = _build_large_sample_writer_query(
+                    stats_md, clustered_themes, plan, rows[0], open_text,
+                    qualitative_context=qualitative_context,
+                    quantitative_first=quantitative_first,
+                    viewpoint_stats_md=viewpoint_stats_md,
+                )
                 writer_query = (
-                    "<quantitative_report_rule>本报告以客观题统计为主、开放题分析为辅。"
-                    "正文必须优先解释关键分布和显著差异；完整逐题统计表将由系统确定性追加，"
-                    "不要自行重算或改写表内数字。</quantitative_report_rule>\n\n"
+                    _build_report_generation_instruction_block(prompt_instruction)
                     + writer_query
                 )
-            if is_crosstab:
-                q_text = (sess.get("questionnaire_text") or "").strip()
-                if q_text:
-                    if len(q_text) > 8000:
-                        q_text = q_text[:8000] + "\n…（问卷过长，已截断）"
+                if quantitative_first:
                     writer_query = (
-                        f"<questionnaire>\n以下是问卷原文（仅供理解题目意图与背景，"
-                        f"不要直接搬运）：\n{q_text}\n</questionnaire>\n\n" + writer_query
+                        "<quantitative_report_rule>本报告以客观题统计为主、开放题分析为辅。"
+                        "正文必须优先解释关键分布和显著差异；完整逐题统计表将由系统确定性追加，"
+                        "不要自行重算或改写表内数字。</quantitative_report_rule>\n\n"
+                        + writer_query
                     )
-            writer_context_included = bool(
-                viewpoint_stats_md and viewpoint_stats_md in writer_query
-            )
-            async for heartbeat in _writer_call(writer_query, step="large_sample_report"):
-                yield heartbeat
-            full_report, model_used = _writer_call.out
-            writer_models_used.append(model_used)
-            yield _analysis_progress(
-                "writing",
-                "completed",
-                "报告正文已生成，准备校验并保存",
-            )
-            for event in _content_events(full_report):
-                yield event
+                if is_crosstab:
+                    q_text = (sess.get("questionnaire_text") or "").strip()
+                    if q_text:
+                        if len(q_text) > 8000:
+                            q_text = q_text[:8000] + "\n…（问卷过长，已截断）"
+                        writer_query = (
+                            f"<questionnaire>\n以下是问卷原文（仅供理解题目意图与背景，"
+                            f"不要直接搬运）：\n{q_text}\n</questionnaire>\n\n" + writer_query
+                        )
+                writer_context_included = bool(
+                    viewpoint_stats_md and viewpoint_stats_md in writer_query
+                )
+                async for heartbeat in _writer_call(writer_query, step="large_sample_report"):
+                    yield heartbeat
+                full_report, model_used = _writer_call.out
+                writer_models_used.append(model_used)
+                yield _analysis_progress(
+                    "writing",
+                    "completed",
+                    "报告正文已生成，准备校验并保存",
+                )
+                for event in _content_events(full_report):
+                    yield event
         else:
             clustered_themes: dict = {}
             cluster_diagnostics: dict = {}
@@ -2465,218 +2593,225 @@ async def report_stream(
             )
             _persist_synthesis_failure_diagnostics()
 
-            yield _analysis_progress(
-                "writing",
-                "active",
-                "分析材料已准备完成，开始分章撰写报告",
-                next_steps=["校验并保存"],
-            )
-            parts_meta = _writer_parts_meta(plan, rows[0])
-            writer_instruction_block = _build_report_generation_instruction_block(
-                prompt_instruction
-            )
-            part_stats_by_title = render_qualitative_stats_by_part(stats_md, plan)
-            summary_stats_blocks = [
-                _writer_stats_metadata(stats_md),
-                *part_stats_by_title.values(),
-            ]
-            summary_stats_md = "\n\n".join(
-                block for block in summary_stats_blocks if str(block or "").strip()
-            ) or str(stats_md or "")
-
-            async def _round(
-                query: str, messages: list[dict], *, step: str, part_index: int | None = None,
-            ):
-                async for heartbeat in _writer_call(
-                    query, messages=messages, step=step, part_index=part_index,
-                ):
-                    yield heartbeat
-                text, model = _writer_call.out
-                writer_models_used.append(model)
-                for event in _content_events(text):
+            if report_style == "quick":
+                yield _analysis_progress("writing", "active", "正在精写核心判断与关键发现，完整证据将保留在附录", next_steps=["校验并保存"])
+                async for event in _quick_write():
                     yield event
-                _round.out = text
-
-            total_rounds = len(parts_meta) + 4
-            yield sse_event({"type": "progress",
-                             "message": f"分章生成 1/{total_rounds}：准备数据并生成标题…"})
-            first_q = _build_writer_first_query(
-                stats_md,
-                open_text,
-                plan,
-                rows[0],
-                qualitative_context=qualitative_context,
-                analysis_focus=analysis_focus,
-                viewpoint_stats_md=viewpoint_stats_md,
-            )
-            first_q = writer_instruction_block + first_q
-            async for ev in _round(first_q, _new_writer_messages(), step="title"):
-                yield ev
-            title_text = _round.out
-            title_lines = []
-            for ln in title_text.split("\n"):
-                if ln.lstrip().startswith("## "):
-                    break
-                title_lines.append(ln)
-            title_block = "\n".join(title_lines).strip() or title_text.strip()
-
-            part_sections: list[str] = []
-            for m in parts_meta:
-                rnd = m["i"] + 1
-                yield sse_event({"type": "progress",
-                                 "message": f"分章生成 {rnd}/{total_rounds}：Part {m['i']} {m['name']}…"})
-                yield sse_event({"type": "chunk", "content": "\n\n"})
-                part_title = f"Part {m['i']} {m['name']}"
-                part_viewpoint_stats_md = render_viewpoint_stats(
-                    clustered_themes,
-                    report_viewpoints,
-                    part_index=m["i"],
+                full_report = _quick_write.out
+                yield _analysis_progress("writing", "completed", "快速报告正文与证据附录已生成")
+            else:
+                yield _analysis_progress(
+                    "writing",
+                    "active",
+                    "分析材料已准备完成，开始分章撰写报告",
+                    next_steps=["校验并保存"],
                 )
-                part_query = writer_instruction_block + _build_writer_part_context_query(
-                    m,
-                    part_stats_md=part_stats_by_title.get(part_title, ""),
-                    open_text=open_text,
-                    plan=plan,
-                    headers=rows[0],
+                parts_meta = _writer_parts_meta(plan, rows[0])
+                writer_instruction_block = _build_report_generation_instruction_block(
+                    prompt_instruction
+                )
+                part_stats_by_title = render_qualitative_stats_by_part(stats_md, plan)
+                summary_stats_blocks = [
+                    _writer_stats_metadata(stats_md),
+                    *part_stats_by_title.values(),
+                ]
+                summary_stats_md = "\n\n".join(
+                    block for block in summary_stats_blocks if str(block or "").strip()
+                ) or str(stats_md or "")
+
+                async def _round(
+                    query: str, messages: list[dict], *, step: str, part_index: int | None = None,
+                ):
+                    async for heartbeat in _writer_call(
+                        query, messages=messages, step=step, part_index=part_index,
+                    ):
+                        yield heartbeat
+                    text, model = _writer_call.out
+                    writer_models_used.append(model)
+                    for event in _content_events(text):
+                        yield event
+                    _round.out = text
+
+                total_rounds = len(parts_meta) + 4
+                yield sse_event({"type": "progress",
+                                 "message": f"分章生成 1/{total_rounds}：准备数据并生成标题…"})
+                first_q = _build_writer_first_query(
+                    stats_md,
+                    open_text,
+                    plan,
+                    rows[0],
                     qualitative_context=qualitative_context,
                     analysis_focus=analysis_focus,
-                    viewpoint_stats_md=part_viewpoint_stats_md,
-                    quantitative_first=quantitative_first,
+                    viewpoint_stats_md=viewpoint_stats_md,
                 )
-                if viewpoint_stats_md and "<subjective_viewpoint_stats>" in part_viewpoint_stats_md:
-                    writer_context_included = True
-                async for ev in _round(
-                    part_query, _new_writer_messages(), step="part", part_index=m["i"],
-                ):
+                first_q = writer_instruction_block + first_q
+                async for ev in _round(first_q, _new_writer_messages(), step="title"):
                     yield ev
-                sec = _round.out
-                part_sections.append(sec.strip())
+                title_text = _round.out
+                title_lines = []
+                for ln in title_text.split("\n"):
+                    if ln.lstrip().startswith("## "):
+                        break
+                    title_lines.append(ln)
+                title_block = "\n".join(title_lines).strip() or title_text.strip()
 
-            yield sse_event({"type": "progress",
-                             "message": f"分章生成 {total_rounds - 2}/{total_rounds}：核查待确认问题…"})
-            bug_query = writer_instruction_block + _build_writer_bug_context_query(
-                open_text,
-                plan,
-                rows[0],
-                qualitative_context,
-            )
-            async for ev in _round(bug_query, _new_writer_messages(), step="bug_check"):
-                yield ev
-            bug_text = _round.out
-            bug_clean = bug_text.strip()
-            has_bug = bool(bug_clean) and bug_clean.upper().strip(" .。`*") != "NONE" and "## Bug" in bug_clean
-            bug_section = bug_clean if has_bug else ""
+                part_sections: list[str] = []
+                for m in parts_meta:
+                    rnd = m["i"] + 1
+                    yield sse_event({"type": "progress",
+                                     "message": f"分章生成 {rnd}/{total_rounds}：Part {m['i']} {m['name']}…"})
+                    yield sse_event({"type": "chunk", "content": "\n\n"})
+                    part_title = f"Part {m['i']} {m['name']}"
+                    part_viewpoint_stats_md = render_viewpoint_stats(
+                        clustered_themes,
+                        report_viewpoints,
+                        part_index=m["i"],
+                    )
+                    part_query = writer_instruction_block + _build_writer_part_context_query(
+                        m,
+                        part_stats_md=part_stats_by_title.get(part_title, ""),
+                        open_text=open_text,
+                        plan=plan,
+                        headers=rows[0],
+                        qualitative_context=qualitative_context,
+                        analysis_focus=analysis_focus,
+                        viewpoint_stats_md=part_viewpoint_stats_md,
+                        quantitative_first=quantitative_first,
+                    )
+                    if viewpoint_stats_md and "<subjective_viewpoint_stats>" in part_viewpoint_stats_md:
+                        writer_context_included = True
+                    async for ev in _round(
+                        part_query, _new_writer_messages(), step="part", part_index=m["i"],
+                    ):
+                        yield ev
+                    sec = _round.out
+                    part_sections.append(sec.strip())
 
-            yield sse_event({"type": "progress",
-                             "message": f"分章生成 {total_rounds - 1}/{total_rounds}：汇总核心结论…"})
-            yield sse_event({"type": "chunk", "content": "\n\n"})
-            core_query = writer_instruction_block + _build_writer_core_context_query(
-                parts_meta,
-                part_sections,
-                stats_md=summary_stats_md,
-                viewpoint_stats_md=viewpoint_stats_md,
-                bug_section=bug_section,
-                qualitative_context=qualitative_context,
-                analysis_focus=analysis_focus,
-            )
-            core_messages = _new_writer_messages()
-            async for heartbeat in _writer_call(core_query, messages=core_messages, step="core"):
-                yield heartbeat
-            core_text, core_model = _writer_call.out
-            writer_models_used.append(core_model)
-            core_block = core_text.strip()
-
-            yield sse_event({
-                "type": "progress",
-                "message": "正在局部复核核心结论的证据边界、原因场景与分析交付覆盖…",
-            })
-            selected_core = core_block
-            try:
-                async for heartbeat in _writer_call(
-                    _build_writer_core_review_query(analysis_focus, has_bug),
-                    messages=core_messages,
-                    step="core_review",
-                ):
-                    yield heartbeat
-                review_text, review_model = _writer_call.out
-                writer_models_used.append(review_model)
-                selected_core = _resolve_core_coverage_review(core_block, review_text)
-            except Exception as review_error:
-                print(
-                    "[report] WARN optional core evidence review skipped: "
-                    f"{type(review_error).__name__}"
+                yield sse_event({"type": "progress",
+                                 "message": f"分章生成 {total_rounds - 2}/{total_rounds}：核查待确认问题…"})
+                bug_query = writer_instruction_block + _build_writer_bug_context_query(
+                    open_text,
+                    plan,
+                    rows[0],
+                    qualitative_context,
                 )
+                async for ev in _round(bug_query, _new_writer_messages(), step="bug_check"):
+                    yield ev
+                bug_text = _round.out
+                bug_clean = bug_text.strip()
+                has_bug = bool(bug_clean) and bug_clean.upper().strip(" .。`*") != "NONE" and "## Bug" in bug_clean
+                bug_section = bug_clean if has_bug else ""
+
+                yield sse_event({"type": "progress",
+                                 "message": f"分章生成 {total_rounds - 1}/{total_rounds}：汇总核心结论…"})
+                yield sse_event({"type": "chunk", "content": "\n\n"})
+                core_query = writer_instruction_block + _build_writer_core_context_query(
+                    parts_meta,
+                    part_sections,
+                    stats_md=summary_stats_md,
+                    viewpoint_stats_md=viewpoint_stats_md,
+                    bug_section=bug_section,
+                    qualitative_context=qualitative_context,
+                    analysis_focus=analysis_focus,
+                )
+                core_messages = _new_writer_messages()
+                async for heartbeat in _writer_call(core_query, messages=core_messages, step="core"):
+                    yield heartbeat
+                core_text, core_model = _writer_call.out
+                writer_models_used.append(core_model)
+                core_block = core_text.strip()
+
                 yield sse_event({
                     "type": "progress",
-                    "message": "核心结论证据复核未完成，已沿用原核心结论继续生成报告。",
+                    "message": "正在局部复核核心结论的证据边界、原因场景与分析交付覆盖…",
                 })
-            finally:
-                # 复核轮只用于选择核心结论；独立会话不会进入后续行动建议。
-                pass
-            if selected_core != core_block:
-                core_block = selected_core
+                selected_core = core_block
+                try:
+                    async for heartbeat in _writer_call(
+                        _build_writer_core_review_query(analysis_focus, has_bug),
+                        messages=core_messages,
+                        step="core_review",
+                    ):
+                        yield heartbeat
+                    review_text, review_model = _writer_call.out
+                    writer_models_used.append(review_model)
+                    selected_core = _resolve_core_coverage_review(core_block, review_text)
+                except Exception as review_error:
+                    print(
+                        "[report] WARN optional core evidence review skipped: "
+                        f"{type(review_error).__name__}"
+                    )
+                    yield sse_event({
+                        "type": "progress",
+                        "message": "核心结论证据复核未完成，已沿用原核心结论继续生成报告。",
+                    })
+                finally:
+                    # 复核轮只用于选择核心结论；独立会话不会进入后续行动建议。
+                    pass
+                if selected_core != core_block:
+                    core_block = selected_core
 
-            for event in _content_events(core_block):
-                yield event
+                for event in _content_events(core_block):
+                    yield event
 
-            yield sse_event({"type": "progress",
-                             "message": f"分章生成 {total_rounds}/{total_rounds}：生成行动建议…"})
-            yield sse_event({"type": "chunk", "content": "\n\n"})
-            action_query = writer_instruction_block + _build_writer_action_context_query(
-                parts_meta,
-                part_sections,
-                stats_md=summary_stats_md,
-                viewpoint_stats_md=viewpoint_stats_md,
-                bug_section=bug_section,
-                qualitative_context=qualitative_context,
-                analysis_focus=analysis_focus,
-                selected_core=core_block,
-            )
-            action_messages = _new_writer_messages()
-            async for heartbeat in _writer_call(
-                action_query,
-                messages=action_messages,
-                step="action",
-            ):
-                yield heartbeat
-            action_text, action_model = _writer_call.out
-            writer_models_used.append(action_model)
-            action_section = _normalize_action_section(action_text)
-            if not action_section:
-                yield sse_event({
-                    "type": "progress",
-                    "message": "行动建议格式校验中，正在修正 Markdown 结构…",
-                })
+                yield sse_event({"type": "progress",
+                                 "message": f"分章生成 {total_rounds}/{total_rounds}：生成行动建议…"})
+                yield sse_event({"type": "chunk", "content": "\n\n"})
+                action_query = writer_instruction_block + _build_writer_action_context_query(
+                    parts_meta,
+                    part_sections,
+                    stats_md=summary_stats_md,
+                    viewpoint_stats_md=viewpoint_stats_md,
+                    bug_section=bug_section,
+                    qualitative_context=qualitative_context,
+                    analysis_focus=analysis_focus,
+                    selected_core=core_block,
+                )
+                action_messages = _new_writer_messages()
                 async for heartbeat in _writer_call(
-                    _build_writer_action_repair_query(),
+                    action_query,
                     messages=action_messages,
-                    step="action_repair",
+                    step="action",
                 ):
                     yield heartbeat
-                repaired_text, repaired_model = _writer_call.out
-                writer_models_used.append(repaired_model)
-                action_section = _normalize_action_section(repaired_text)
+                action_text, action_model = _writer_call.out
+                writer_models_used.append(action_model)
+                action_section = _normalize_action_section(action_text)
                 if not action_section:
-                    fallback_body = repaired_text.strip() or action_text.strip()
-                    if not fallback_body:
-                        raise RuntimeError("行动建议生成结果为空")
-                    # 内容已经由行动建议专用轮生成；这里只补齐固定标题，不改任何分析内容。
-                    action_section = f"## 行动建议\n\n{fallback_body}"
-            for event in _content_events(action_section):
-                yield event
+                    yield sse_event({
+                        "type": "progress",
+                        "message": "行动建议格式校验中，正在修正 Markdown 结构…",
+                    })
+                    async for heartbeat in _writer_call(
+                        _build_writer_action_repair_query(),
+                        messages=action_messages,
+                        step="action_repair",
+                    ):
+                        yield heartbeat
+                    repaired_text, repaired_model = _writer_call.out
+                    writer_models_used.append(repaired_model)
+                    action_section = _normalize_action_section(repaired_text)
+                    if not action_section:
+                        fallback_body = repaired_text.strip() or action_text.strip()
+                        if not fallback_body:
+                            raise RuntimeError("行动建议生成结果为空")
+                        # 内容已经由行动建议专用轮生成；这里只补齐固定标题，不改任何分析内容。
+                        action_section = f"## 行动建议\n\n{fallback_body}"
+                for event in _content_events(action_section):
+                    yield event
 
-            yield _analysis_progress(
-                "writing",
-                "completed",
-                f"报告正文 {total_rounds}/{total_rounds} 个生成步骤已完成",
-            )
+                yield _analysis_progress(
+                    "writing",
+                    "completed",
+                    f"报告正文 {total_rounds}/{total_rounds} 个生成步骤已完成",
+                )
 
-            details_divider = "---------------- 以下为详细信息，各位可以按需查看 ----------------"
-            assembled = [title_block, core_block, details_divider, *part_sections]
-            if bug_section:
-                assembled.append(bug_section)
-            assembled.append(action_section)
-            full_report = "\n\n".join(b for b in assembled if b)
+                details_divider = "---------------- 以下为详细信息，各位可以按需查看 ----------------"
+                assembled = [title_block, core_block, details_divider, *part_sections]
+                if bug_section:
+                    assembled.append(bug_section)
+                assembled.append(action_section)
+                full_report = "\n\n".join(b for b in assembled if b)
 
         yield _analysis_progress(
             "finalize",
@@ -2684,7 +2819,9 @@ async def report_stream(
             "正在核对统计引用、整理格式并保存报告",
         )
 
-        if quantitative_first:
+        if report_style == "quick":
+            pass  # Complete deterministic statistics already live in the evidence appendix.
+        elif quantitative_first:
             appendix = render_stats_appendix(
                 sess.get("stats_blocks") or [],
                 sess.get("stats_source") or "python",
@@ -2693,6 +2830,11 @@ async def report_stream(
                 full_report = "\n\n".join((full_report.rstrip(), appendix))
         else:
             full_report = inject_qualitative_stats(full_report, stats_md, plan)
+
+        quick_appendix = ""
+        if report_style == "quick":
+            full_report, separator, appendix_body = full_report.partition("\n\n## 发现与证据附录\n\n")
+            quick_appendix = separator + appendix_body
 
         numeric_sources = "\n".join(
             source for source in (stats_md, viewpoint_stats_md) if source
@@ -2788,11 +2930,18 @@ async def report_stream(
         full_report = _inject_disclaimer(full_report, mode=sess.get("mode") or "")
         full_report = _inject_research_background(full_report, qualitative_context)
         full_report = normalize_glossary_terms(full_report)
+        full_report += quick_appendix
         viewpoint_diagnostics = finalize_viewpoint_diagnostics(
             viewpoint_diagnostics,
             full_report,
             writer_context_included=writer_context_included,
         )
+        if report_style == "quick":
+            viewpoint_diagnostics["writer_output"].update(
+                status="quick_contract_validated",
+                format="quick_v1",
+                quick_report_diagnostics=deepcopy(quick_diagnostics),
+            )
         viewpoint_catalog = viewpoint_diagnostics["catalog"]
         viewpoint_output = viewpoint_diagnostics["writer_output"]
         print(
@@ -2814,8 +2963,14 @@ async def report_stream(
         completion_timing = _report_completion_timing(sess)
         sess.update(completion_timing)
         report_llm_usage.finalize_open_attempts()
+        if quick_diagnostics is not None:
+            quick_diagnostics["writing_upstream_attempts"] = (
+                report_llm_usage.snapshot().get("phases", {}).get("writing", {}).get("call_count", 0)
+            )
         partial_rerun_source = build_partial_rerun_source(sess)
         snapshot = {
+            "report_style": report_style,
+            **({"quick_report_diagnostics": deepcopy(quick_diagnostics)} if quick_diagnostics else {}),
             "report_md": full_report,
             "title": "",
             "qa_context_md": qa_context_md,
@@ -3453,6 +3608,7 @@ def _session_report_version_payload(sess: dict) -> dict:
         next_version = highest_version + 1
     next_version = max(next_version, highest_version + 1)
     return {
+        "report_style": resolve_report_version(sess).get("report_style", "full") if versions else "full",
         "versions": report_version_summaries(sess),
         "active_version": active_version,
         "next_version": next_version,
@@ -3487,6 +3643,7 @@ def get_session_report_version(session_id: str, version: int) -> dict:
         "version": snapshot["version"],
         "selected_version": snapshot["version"],
         **_session_report_version_payload(sess),
+        "report_style": snapshot.get("report_style", "full"),
     }
 
 

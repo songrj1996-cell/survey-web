@@ -19,6 +19,7 @@ from app.schemas.requests import (
     QARequest,
     QualitativeContextRequest,
     ReportVersionRequest,
+    SurveyAnalysisSettingsRequest,
 )
 from app.services.audit import audit_log
 from app.services.auth import _current_login
@@ -46,8 +47,10 @@ from app.services.survey_service import (
     prepare_history_qa_context,
     qa_stream,
     report_stream,
+    report_style_options,
     save_qualitative_context,
     set_survey_columns,
+    set_survey_analysis_settings,
     validate_columns_ready,
     validate_plan_confirm_ready,
     validate_plan_ready,
@@ -56,6 +59,16 @@ from app.services.survey_service import (
 )
 
 router = APIRouter()
+
+
+@router.post("/api/analysis-settings/{session_id}")
+async def update_analysis_settings(
+    session_id: str, req: SurveyAnalysisSettingsRequest, request: Request,
+):
+    await require_session_request_access(
+        request, session_id, login_resolver=_current_login,
+    )
+    return set_survey_analysis_settings(session_id, req.report_focus)
 
 
 @router.post("/api/upload")
@@ -201,7 +214,7 @@ async def confirm_plan(req: PlanConfirmRequest, request: Request):
     if is_survey_plan_approval(req.user_text):
         if login is None:
             login = await _current_login(request)
-        result = confirm_survey_plan(req.session_id, login)
+        result = confirm_survey_plan(req.session_id, login, report_style=req.report_style)
         await audit_log(
             request, "survey", "确认分析方案",
             f"会话：{req.session_id}", metadata={"session_id": req.session_id},
@@ -261,6 +274,14 @@ async def prepare_report_rerun(
         },
     )
     return result
+
+
+@router.get("/api/report/{session_id}/options")
+async def get_report_options(session_id: str, request: Request):
+    await require_session_request_access(
+        request, session_id, login_resolver=_current_login,
+    )
+    return report_style_options(session_id)
 
 
 @router.get("/api/report/{session_id}")

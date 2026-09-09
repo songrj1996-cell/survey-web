@@ -1,0 +1,40 @@
+/* Shared platform tokens keep quick reports consistent in both themes. */
+.report-style-picker { margin: 0 0 20px; padding: 0; border: 0; min-width: 0; }
+.report-style-picker[hidden] { display: none; }
+.report-style-picker legend { font-size: 13px; font-weight: 600; color: var(--text); margin-bottom: 10px; }
+.report-style-picker__options { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.report-style-picker__options label { display: flex; gap: 10px; padding: 14px 16px; border: 1px solid var(--border); border-radius: 10px; cursor: pointer; background: var(--surface); }
+.report-style-picker__options label:has(input:checked) { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, var(--surface)); }
+.report-style-picker input { accent-color: var(--accent); align-self: flex-start; margin-top: 4px; }
+.report-style-picker strong { display: block; font-size: 13px; font-weight: 600; color: var(--text); }
+.report-style-picker small { display: block; font-size: 12px; color: var(--text-2); margin-top: 5px; line-height: 1.6; }
+.report-style-picker em { font-style: normal; font-size: 10px; color: var(--accent); margin-left: 6px; }
+.report-style-picker p { color: var(--text-3); font-size: 12px; line-height: 1.6; margin: 10px 0 0; }
+.report-style-picker:disabled label { opacity: .65; cursor: default; }
+.quick-report-nav { border: 1px solid var(--border); border-radius: 12px; background: var(--surface); padding: 16px; margin-bottom: 28px; }
+.quick-report-nav__intro { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; color: var(--text-2); font-size: 12px; }
+.quick-report-badge { display: inline-block; padding: 3px 9px; border-radius: 6px; background: color-mix(in srgb, var(--accent) 12%, var(--surface)); color: var(--accent); font-size: 12px; font-weight: 600; }
+.quick-report-nav__links { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.quick-report-nav button, .quick-return { font: inherit; font-size: 12px; color: var(--text-2); border: 1px solid var(--border); background: var(--surface-2); border-radius: 7px; padding: 8px 12px; cursor: pointer; }
+.quick-report-nav button:hover, .quick-return:hover { color: var(--accent); border-color: var(--accent); }
+.quick-reference { display: inline; border: 0; border-radius: 4px; padding: 1px 4px; color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, var(--surface)); font: inherit; font-size: .85em; cursor: pointer; vertical-align: baseline; }
+.quick-reference:hover { text-decoration: underline; }
+.quick-appendix { border: 1px solid var(--border); border-radius: 12px; padding: 18px; margin-top: 28px; }
+.quick-appendix > summary, .quick-evidence > summary { cursor: pointer; color: var(--text); }
+.quick-appendix > summary h2, .quick-evidence > summary h3 { display: inline; border: 0; margin: 0; padding: 0; }
+.quick-appendix > summary h2 { font-size: 17px; }
+.quick-appendix > summary span { display: block; font-size: 12px; color: var(--text-3); margin: 6px 0 0 18px; }
+.quick-appendix[open] > summary { margin-bottom: 24px; }
+.quick-evidence { border-top: 1px solid var(--border); padding: 16px 0; }
+.quick-evidence > summary h3 { font-size: 14px; }
+.quick-evidence[open] > summary { margin-bottom: 16px; }
+.quick-return { margin: 0 0 12px; }
+.quick-report :focus-visible, .report-style-picker label:has(:focus-visible) { outline: 2px solid var(--accent); outline-offset: 4px; }
+@media (max-width: 680px) {
+  .report-style-picker__options { grid-template-columns: 1fr; }
+  .quick-report-nav, .quick-appendix { padding: 12px; }
+  .quick-report-nav__links button { flex: 1 1 auto; }
+}
+@media print {
+  .quick-report-nav, .quick-return { display: none; }
+}

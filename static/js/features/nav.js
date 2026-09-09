@@ -3,6 +3,10 @@
 // ============================================================
 
 $('btn-restart').addEventListener('click', () => {
+  if (typeof surveyEntryBusy === 'function' && surveyEntryBusy()) {
+    showToast('当前上传或分析设置正在处理，请稍候', 'info');
+    return;
+  }
   if (reportInteractionBusy()) {
     showToast('当前报告操作尚未完成，请稍候再重新开始', 'info', 5000);
     return;
@@ -68,236 +72,16 @@ $('btn-restart').addEventListener('click', () => {
     planData: null,
   };
   resetUploadZone();
-  fileInput.value = '';
-  resetCrosstabUploader();
   clearPlanInput();
   $('qa-input').disabled = false;
   $('btn-qa-send').disabled = false;
-  // 回到分析类型选择层
+  // 回到统一上传入口
   state.mode = null;
-  $('analysis-type-picker').style.display = '';
-  $('upload-area').style.display = 'none';
-  const ctArea = $('crosstab-upload-area');
-  if (ctArea) ctArea.style.display = 'none';
   goStep(1);
   showToast('已重置，请重新上传文件', 'info');
 });
 
-// ── 分析类型选择器 ──
-$('btn-qual-enter').addEventListener('click', () => {
-  state.mode = null;
-  $('analysis-type-picker').style.display = 'none';
-  $('upload-area').style.display = '';
-  // 每次进入上传区都（重新）加载说明文案，确保显示
-  fetch('/api/upload-guide')
-    .then(r => r.json())
-    .then(({ content }) => {
-      const el = $('upload-guide');
-      if (el && content) el.innerHTML = marked.parse(content);
-    })
-    .catch(() => { });
-});
-
-// ── 定量分析：问卷 + 回答必填，专业跑数表选填 ──
-const CT_FILE_SLOTS = [
-  { key: 'survey', inputId: 'ct-survey', label: '问卷文件' },
-  { key: 'data', inputId: 'ct-data', label: '回答数据' },
-  { key: 'crosstab', inputId: 'ct-crosstab', label: '跑数表' },
-];
-const CT_CONTEXT_FIELD_IDS = {
-  problem: 'ct-ctx-problem',
-  key_concerns: 'ct-ctx-key-concerns',
-  target_users: 'ct-ctx-target-users',
-};
-
-function readCrosstabContextForm() {
-  return Object.fromEntries(
-    Object.entries(CT_CONTEXT_FIELD_IDS).map(([key, id]) => [key, ($(id)?.value || '').trim()]),
-  );
-}
-
-async function saveCrosstabContext(sessionId, context) {
-  const resp = await fetch(`/api/survey-context/${sessionId}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(context),
-  });
-  if (!resp.ok) {
-    const data = await resp.json().catch(() => ({}));
-    throw new Error(data.detail || '保存调研背景失败');
-  }
-}
-
-function getCrosstabFile(slot) {
-  const input = $(slot.inputId);
-  return input ? input.files[0] : null;
-}
-
-function isSupportedCrosstabFile(file) {
-  return /\.(csv|xlsx|xls)$/i.test(file.name || '');
-}
-
-function updateCrosstabFileCard(slot) {
-  const file = getCrosstabFile(slot);
-  const card = document.querySelector(`[data-ct-slot="${slot.key}"]`);
-  const nameEl = document.querySelector(`[data-ct-file-name="${slot.key}"]`);
-  if (!card || !nameEl) return;
-  card.classList.toggle('crosstab-file-card--selected', !!file);
-  nameEl.textContent = file ? file.name : '未选择文件';
-}
-
-function updateCrosstabUploadState() {
-  CT_FILE_SLOTS.forEach(updateCrosstabFileCard);
-  const btn = $('btn-ct-upload');
-  if (!btn) return;
-  const ready = ['survey', 'data'].every(key => {
-    const slot = CT_FILE_SLOTS.find(item => item.key === key);
-    return !!getCrosstabFile(slot);
-  });
-  if (!btn.dataset.loading) btn.disabled = !ready;
-}
-
-function resetCrosstabUploader() {
-  CT_FILE_SLOTS.forEach(slot => {
-    const input = $(slot.inputId);
-    if (input) input.value = '';
-  });
-  const uploader = document.querySelector('.crosstab-uploader');
-  if (uploader) uploader.classList.remove('crosstab-uploader--loading');
-  const btn = $('btn-ct-upload');
-  if (btn) {
-    btn.disabled = true;
-    btn.textContent = '上传并开始分析';
-    delete btn.dataset.loading;
-  }
-  updateCrosstabUploadState();
-}
-
-function setCrosstabUploadLoading(loading) {
-  const btn = $('btn-ct-upload');
-  const uploader = document.querySelector('.crosstab-uploader');
-  if (uploader) uploader.classList.toggle('crosstab-uploader--loading', loading);
-  if (!btn) return;
-  if (loading) {
-    btn.dataset.loading = '1';
-    btn.disabled = true;
-    btn.textContent = '正在上传与解析...';
-  } else {
-    delete btn.dataset.loading;
-    btn.textContent = '上传并开始分析';
-    updateCrosstabUploadState();
-  }
-}
-
-function assignCrosstabFile(slot, file) {
-  if (!file) return;
-  if (!isSupportedCrosstabFile(file)) {
-    showToast(`${slot.label}仅支持 CSV / Excel 文件`, 'error');
-    return;
-  }
-  const input = $(slot.inputId);
-  if (!input) return;
-  const transfer = new DataTransfer();
-  transfer.items.add(file);
-  input.files = transfer.files;
-  updateCrosstabUploadState();
-}
-
-CT_FILE_SLOTS.forEach(slot => {
-  const input = $(slot.inputId);
-  const card = document.querySelector(`[data-ct-slot="${slot.key}"]`);
-  if (!input || !card) return;
-  input.addEventListener('change', () => {
-    const file = getCrosstabFile(slot);
-    if (file && !isSupportedCrosstabFile(file)) {
-      input.value = '';
-      showToast(`${slot.label}仅支持 CSV / Excel 文件`, 'error');
-    }
-    updateCrosstabUploadState();
-  });
-  card.addEventListener('dragover', e => {
-    e.preventDefault();
-    card.classList.add('crosstab-file-card--drag');
-  });
-  card.addEventListener('dragleave', () => card.classList.remove('crosstab-file-card--drag'));
-  card.addEventListener('drop', e => {
-    e.preventDefault();
-    card.classList.remove('crosstab-file-card--drag');
-    assignCrosstabFile(slot, e.dataTransfer.files[0]);
-  });
-});
-
-$('btn-ct-back').addEventListener('click', () => {
-  state.mode = null;
-  resetCrosstabUploader();
-  $('crosstab-upload-area').style.display = 'none';
-  $('analysis-type-picker').style.display = '';
-});
-
-$('btn-quant-enter').addEventListener('click', () => {
-  state.mode = 'crosstab';
-  $('analysis-type-picker').style.display = 'none';
-  $('crosstab-upload-area').style.display = '';
-  updateCrosstabUploadState();
-});
-
-$('btn-ct-upload').addEventListener('click', async () => {
-  const sf = $('ct-survey').files[0];
-  const df = $('ct-data').files[0];
-  const cf = $('ct-crosstab').files[0];
-  if (!sf || !df) { showToast('请上传调研问卷和回答明细', 'error'); return; }
-  if (!cf && !df.name.toLowerCase().endsWith('.xlsx')) {
-    showToast('未上传跑数表时，回答明细请选择倍市得导出的 .xlsx 文件', 'error');
-    return;
-  }
-  const MAX = 50 * 1024 * 1024;
-  for (const f of [sf, df, cf].filter(Boolean)) {
-    if (f.size > MAX) { showToast(`文件 ${f.name} 超过 50MB 上限`, 'error'); return; }
-  }
-  setCrosstabUploadLoading(true);
-  const fd = new FormData();
-  fd.append('survey_file', sf);
-  fd.append('data_file', df);
-  if (cf) fd.append('crosstab_file', cf);
-  try {
-    const quantitativeContext = readCrosstabContextForm();
-    const resp = await fetch('/api/upload/crosstab', { method: 'POST', body: fd });
-    const data = await resp.json();
-    if (!resp.ok) throw new Error(data.detail || '上传失败');
-    state.sessionId = data.session_id;
-    state.mode = data.mode || (cf ? 'crosstab' : 'quantitative');
-    state.surveySource = 'bested';
-    state.questionnaireUsed = !!data.requires_column_confirmation;
-    state.viewMode = 'session';
-    state.historyId = null;
-    state.contextForm = quantitativeContext;
-    await saveCrosstabContext(state.sessionId, quantitativeContext);
-    clearPlanInput();
-    state.sessionReport = {
-      id: null,
-      reportMd: null, title: '', reportNo: '', qaHtml: '',
-      version: null, versions: [], activeVersion: null, selectedVersion: null,
-      nextVersion: null, maxVersions: 5, canGenerateVersion: true, versionInstructions: {},
-      qaMessages: [], feishuLinkHtml: '', running: false, stream: '',
-      pendingVersionRequest: null, generatingVersion: null, lastVersionInstruction: '',
-    };
-    renderPreview(data);
-    if (data.stats_source === 'external_crosstab') {
-      const segInfo = (data.crosstab_segments || []).join('、');
-      showToast(`跑数表解析成功：${data.crosstab_questions} 道题、分段[${segInfo}]；回答 ${data.total_rows} 行`, 'success');
-      // 外部跑数表已提供统计结构，跳过题型确认。
-      startPlan();
-    } else {
-      showToast(`已读取 ${data.total_rows} 份回答，将由 Python 自动计算统计`, 'success');
-      refreshContextFormVisibility();
-      goStep(2);
-      loadColumns();
-    }
-  } catch (e) {
-    showToast(`上传失败：${e.message}`, 'error');
-    setCrosstabUploadLoading(false);
-  }
-});
+// Questionnaire imports are managed by survey-entry.js.
 
 // ── UI 文案初始化 ──
 async function initUiTexts() {

@@ -33,6 +33,7 @@ EXPECTED_PROMPT_KEYS = {
     "report_writer_system",
     "writer_requirements",
     "large_sample_writer_requirements",
+    "quick_writer_requirements",
     "report_qa_system",
     "theme_extract_system",
     "theme_merge_system",
@@ -78,11 +79,11 @@ def _sha256(path: str) -> str:
 
 
 class PromptCatalogTests(unittest.TestCase):
-    def test_catalog_has_34_current_non_dify_entries_in_six_groups(self):
+    def test_catalog_has_35_current_non_dify_entries_in_six_groups(self):
         catalog = prompt_storage.DEFAULT_PROMPTS
 
         self.assertEqual(set(catalog), EXPECTED_PROMPT_KEYS)
-        self.assertEqual(len(catalog), 34)
+        self.assertEqual(len(catalog), 35)
         self.assertNotIn("upload_guide", catalog)
         self.assertEqual(
             {entry["group"] for entry in catalog.values()},
