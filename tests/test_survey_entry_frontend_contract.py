@@ -87,7 +87,7 @@ class SurveyEntryFrontendContractTests(unittest.TestCase):
         self.assertIn("surveyEntryBusy() || !state.sessionId || state.currentStep > 2", submit)
         self.assertIn("finally { entrySetBusy(false);", submit)
         self.assertIn("readContextForm()", submit)
-        back = ENTRY.split("function returnToSurveyFocus()", 1)[1].split("$('qe-edit-focus')", 1)[0]
+        back = ENTRY.split("function returnToSurveyFocus()", 1)[1].split("$('qe-retry-plan')", 1)[0]
         self.assertIn("goStep(2)", back)
         self.assertNotIn("renderColumns", back)
         self.assertNotIn("clearContext", back)
