@@ -1930,12 +1930,18 @@ async function loadSystemSettings() {
     if (!resp.ok) throw new Error(data.detail || '加载失败');
     body.innerHTML = `
       <div class="uitext-card">
-        <div class="uitext-card__label">评论分析·重复文件提醒</div>
-        <div class="prompt-card__desc">开启后，用户上传已生成过历史报告的同一文件时，会先提示可查看历史报告或继续重新分析。</div>
-        <label class="setting-toggle">
-          <input type="checkbox" id="setting-comment-duplicate" ${data.comment_duplicate_reminder_enabled ? 'checked' : ''} />
-          <span>开启重复文件提醒</span>
-        </label>
+        <div class="uitext-card__label" id="duplicate-reminder-settings-title">重复文件提醒</div>
+        <div class="prompt-card__desc">各功能独立控制。开启后，发现匹配的历史报告时，会提示查看已有报告或重新分析；关闭后按正常流程继续。保存后对下一次操作生效。</div>
+        <div role="group" aria-labelledby="duplicate-reminder-settings-title" style="display:flex;flex-wrap:wrap;column-gap:32px;">
+          <label class="setting-toggle">
+            <input type="checkbox" id="setting-survey-duplicate" ${data.survey_duplicate_reminder_enabled ? 'checked' : ''} />
+            <span>问卷分析</span>
+          </label>
+          <label class="setting-toggle">
+            <input type="checkbox" id="setting-comment-duplicate" ${data.comment_duplicate_reminder_enabled ? 'checked' : ''} />
+            <span>评论分析</span>
+          </label>
+        </div>
       </div>
       <div class="uitext-card">
         <div class="uitext-card__label">问卷分析·Google Link 入口</div>
@@ -1960,10 +1966,11 @@ async function loadSystemSettings() {
 }
 
 $('stab-content-system')?.addEventListener('change', async e => {
-  const input = e.target.closest('#setting-comment-duplicate, #setting-google-forms-entry, #setting-report-quick-mode');
+  const input = e.target.closest('#setting-comment-duplicate, #setting-survey-duplicate, #setting-google-forms-entry, #setting-report-quick-mode');
   if (!input) return;
   const settingKey = {
     'setting-comment-duplicate': 'comment_duplicate_reminder_enabled',
+    'setting-survey-duplicate': 'survey_duplicate_reminder_enabled',
     'setting-google-forms-entry': 'google_forms_entry_enabled',
     'setting-report-quick-mode': 'report_quick_mode_enabled',
   }[input.id];

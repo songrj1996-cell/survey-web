@@ -160,7 +160,7 @@ from app.services.report_versions import (
     update_report_version,
 )
 from app.services.session_access import require_session_access
-from app.services.settings_service import is_quick_report_enabled
+from app.services.settings_service import get_app_settings, is_quick_report_enabled
 from app.services.report_quick_mode import (
     supports_quick_report, normalize_report_style, build_quick_query,
     parse_quick_draft, render_quick_report,
@@ -1312,7 +1312,7 @@ def save_qualitative_context(
     ctx: QualitativeContextRequest,
     login: dict | None = None,
 ) -> dict | None:
-    """存储数据确认上下文，并查找严格匹配的成功历史报告。"""
+    """存储数据确认上下文，并在问卷提醒开启时查找匹配的成功历史报告。"""
     sess = require_session_access(session_id, login, loader=get_session)
     _assign_session_owner(sess, login)
     if hasattr(ctx, "model_dump"):
@@ -1326,6 +1326,8 @@ def save_qualitative_context(
         merged.setdefault(field, "")
     sess["qualitative_context"] = merged
     save_session(session_id, sess)
+    if not get_app_settings().get("survey_duplicate_reminder_enabled", True):
+        return None
     return find_exact_survey_duplicate_report(sess, login)
 
 

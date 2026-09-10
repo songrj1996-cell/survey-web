@@ -101,6 +101,11 @@ def update_app_settings(patch: AppSettingsPatch) -> tuple[dict, str]:
         details.append(
             f"评论重复文件提醒：{'开启' if settings['comment_duplicate_reminder_enabled'] else '关闭'}"
         )
+    if patch.survey_duplicate_reminder_enabled is not None:
+        settings["survey_duplicate_reminder_enabled"] = bool(patch.survey_duplicate_reminder_enabled)
+        details.append(
+            f"问卷重复文件提醒：{'开启' if settings['survey_duplicate_reminder_enabled'] else '关闭'}"
+        )
     if patch.google_forms_entry_enabled is not None:
         settings["google_forms_entry_enabled"] = bool(patch.google_forms_entry_enabled)
         details.append(
