@@ -97,6 +97,7 @@ class UiTextUpdateRequest(BaseModel):
 class AppSettingsPatch(BaseModel):
     comment_duplicate_reminder_enabled: bool | None = None
     google_forms_entry_enabled: bool | None = None
+    report_quick_mode_enabled: bool | None = None
 
 
 class UserLlmKeyUpdateRequest(BaseModel):

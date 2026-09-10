@@ -87,6 +87,11 @@ def get_app_settings() -> dict:
     return _load_app_settings()
 
 
+def is_quick_report_enabled() -> bool:
+    """每次读取管理员开关；不依赖进程启动时的环境变量或缓存。"""
+    return get_app_settings().get("report_quick_mode_enabled") is True
+
+
 def update_app_settings(patch: AppSettingsPatch) -> tuple[dict, str]:
     """更新系统设置，返回 (settings, audit_detail)。"""
     settings = _load_app_settings()
@@ -100,6 +105,11 @@ def update_app_settings(patch: AppSettingsPatch) -> tuple[dict, str]:
         settings["google_forms_entry_enabled"] = bool(patch.google_forms_entry_enabled)
         details.append(
             f"Google Link 入口：{'开启' if settings['google_forms_entry_enabled'] else '关闭'}"
+        )
+    if patch.report_quick_mode_enabled is not None:
+        settings["report_quick_mode_enabled"] = bool(patch.report_quick_mode_enabled)
+        details.append(
+            f"快速报告模式：{'开启' if settings['report_quick_mode_enabled'] else '关闭'}"
         )
     _save_app_settings(settings)
     detail = "；".join(details) or "平台设置未变更"

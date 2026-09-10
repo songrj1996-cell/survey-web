@@ -42,7 +42,6 @@ from app.core.config import (
     LLM_REPORT_MODEL,
     LLM_STREAM_HEARTBEAT_SECONDS,
     MAX_REPORT_VERSIONS,
-    REPORT_QUICK_MODE_ENABLED,
     LLM_QUICK_REPORT_STAGE_TIMEOUT_SECONDS,
 )
 from app.core.parsing import _parse_file
@@ -161,6 +160,7 @@ from app.services.report_versions import (
     update_report_version,
 )
 from app.services.session_access import require_session_access
+from app.services.settings_service import is_quick_report_enabled
 from app.services.report_quick_mode import (
     supports_quick_report, normalize_report_style, build_quick_query,
     parse_quick_draft, render_quick_report,
@@ -1234,7 +1234,7 @@ def apply_analysis_preset_to_session(
 
 def report_style_options(session_id: str) -> dict:
     sess = get_session(session_id)
-    allowed = bool(REPORT_QUICK_MODE_ENABLED and supports_quick_report(sess))
+    allowed = supports_quick_report(sess) and is_quick_report_enabled()
     return {"quick_enabled": allowed, "report_style": sess.get("pending_report_style", "full") if allowed else "full"}
 
 
@@ -1243,8 +1243,8 @@ def _validate_report_style(sess: dict, value) -> str:
         style = normalize_report_style(value)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if style == "quick" and not (REPORT_QUICK_MODE_ENABLED and supports_quick_report(sess)):
-        raise HTTPException(status_code=400, detail="当前报告类型或运行配置不支持快速模式")
+    if style == "quick" and not (supports_quick_report(sess) and is_quick_report_enabled()):
+        raise HTTPException(status_code=400, detail="当前报告类型不支持快速模式，或管理员已关闭快速报告模式")
     return style
 
 
