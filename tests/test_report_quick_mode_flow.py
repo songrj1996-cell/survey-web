@@ -39,7 +39,7 @@ class QuickReportFlowTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(10)
             writer.side_effect=delayed
         with _isolated_report_runtime(sess,writer) as runtime, ExitStack() as stack:
-            stack.enter_context(patch.object(survey_service,'REPORT_QUICK_MODE_ENABLED',True))
+            stack.enter_context(patch.object(survey_service,'is_quick_report_enabled',return_value=True))
             stack.enter_context(patch.object(survey_service,'_get_prompt_text',return_value=DEFAULT_QUICK_WRITER_REQUIREMENTS))
             stack.enter_context(patch.object(survey_service,'_batch_qualitative_analysis',new=themes))
             stack.enter_context(patch.object(survey_service,'build_report_viewpoint_stats',new=synthesis))
@@ -84,7 +84,7 @@ class QuickReportFlowTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_flag_disabled_and_full_mode_compatibility(self):
         sess=_base_session()
-        with patch.object(survey_service,'REPORT_QUICK_MODE_ENABLED',False):
+        with patch.object(survey_service,'is_quick_report_enabled',return_value=False):
             with self.assertRaises(HTTPException): survey_service._validate_report_style(sess,'quick')
             self.assertEqual(survey_service._validate_report_style(sess,'full'),'full')
         with _isolated_report_runtime(sess,_writer('完整报告')) as runtime:

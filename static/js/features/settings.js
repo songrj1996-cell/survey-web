@@ -1930,12 +1930,18 @@ async function loadSystemSettings() {
     if (!resp.ok) throw new Error(data.detail || '加载失败');
     body.innerHTML = `
       <div class="uitext-card">
-        <div class="uitext-card__label">评论分析·重复文件提醒</div>
-        <div class="prompt-card__desc">开启后，用户上传已生成过历史报告的同一文件时，会先提示可查看历史报告或继续重新分析。</div>
-        <label class="setting-toggle">
-          <input type="checkbox" id="setting-comment-duplicate" ${data.comment_duplicate_reminder_enabled ? 'checked' : ''} />
-          <span>开启重复文件提醒</span>
-        </label>
+        <div class="uitext-card__label" id="duplicate-reminder-settings-title">重复文件提醒</div>
+        <div class="prompt-card__desc">各功能独立控制。开启后，发现匹配的历史报告时，会提示查看已有报告或重新分析；关闭后按正常流程继续。保存后对下一次操作生效。</div>
+        <div role="group" aria-labelledby="duplicate-reminder-settings-title" style="display:flex;flex-wrap:wrap;column-gap:32px;">
+          <label class="setting-toggle">
+            <input type="checkbox" id="setting-survey-duplicate" ${data.survey_duplicate_reminder_enabled ? 'checked' : ''} />
+            <span>问卷分析</span>
+          </label>
+          <label class="setting-toggle">
+            <input type="checkbox" id="setting-comment-duplicate" ${data.comment_duplicate_reminder_enabled ? 'checked' : ''} />
+            <span>评论分析</span>
+          </label>
+        </div>
       </div>
       <div class="uitext-card">
         <div class="uitext-card__label">问卷分析·Google Link 入口</div>
@@ -1945,6 +1951,14 @@ async function loadSystemSettings() {
           <span>开放 Google Link 入口</span>
         </label>
       </div>
+      <div class="uitext-card">
+        <div class="uitext-card__label">问卷分析·快速报告模式</div>
+        <div class="prompt-card__desc">开启后，定性问卷的方案确认页可手动选择快速模式。保存后生效，无需重启服务；关闭不影响正在生成的报告及已有报告的查看、追问和导出。</div>
+        <label class="setting-toggle">
+          <input type="checkbox" id="setting-report-quick-mode" ${data.report_quick_mode_enabled ? 'checked' : ''} />
+          <span>开放快速报告模式</span>
+        </label>
+      </div>
     `;
   } catch (e) {
     body.innerHTML = `<div class="hist-empty">加载平台设置失败：${esc(e.message)}</div>`;
@@ -1952,11 +1966,14 @@ async function loadSystemSettings() {
 }
 
 $('stab-content-system')?.addEventListener('change', async e => {
-  const input = e.target.closest('#setting-comment-duplicate, #setting-google-forms-entry');
+  const input = e.target.closest('#setting-comment-duplicate, #setting-survey-duplicate, #setting-google-forms-entry, #setting-report-quick-mode');
   if (!input) return;
-  const settingKey = input.id === 'setting-google-forms-entry'
-    ? 'google_forms_entry_enabled'
-    : 'comment_duplicate_reminder_enabled';
+  const settingKey = {
+    'setting-comment-duplicate': 'comment_duplicate_reminder_enabled',
+    'setting-survey-duplicate': 'survey_duplicate_reminder_enabled',
+    'setting-google-forms-entry': 'google_forms_entry_enabled',
+    'setting-report-quick-mode': 'report_quick_mode_enabled',
+  }[input.id];
   input.disabled = true;
   try {
     const resp = await fetch('/api/app-settings', {
@@ -1968,6 +1985,12 @@ $('stab-content-system')?.addEventListener('change', async e => {
     if (!resp.ok) throw new Error(data.detail || '保存失败');
     input.checked = !!data[settingKey];
     showToast('平台设置已保存', 'success');
+    if (settingKey === 'report_quick_mode_enabled'
+        && state.currentStep === 3 && state.sessionId
+        && !state.reportStyleSelection?.locked
+        && typeof loadReportStyleOptions === 'function') {
+      await loadReportStyleOptions();
+    }
   } catch (err) {
     input.checked = !input.checked;
     showToast(`保存失败：${err.message}`, 'error');

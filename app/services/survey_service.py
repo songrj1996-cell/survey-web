@@ -42,7 +42,6 @@ from app.core.config import (
     LLM_REPORT_MODEL,
     LLM_STREAM_HEARTBEAT_SECONDS,
     MAX_REPORT_VERSIONS,
-    REPORT_QUICK_MODE_ENABLED,
     LLM_QUICK_REPORT_STAGE_TIMEOUT_SECONDS,
 )
 from app.core.parsing import _parse_file
@@ -161,6 +160,7 @@ from app.services.report_versions import (
     update_report_version,
 )
 from app.services.session_access import require_session_access
+from app.services.settings_service import get_app_settings, is_quick_report_enabled
 from app.services.report_quick_mode import (
     supports_quick_report, normalize_report_style, build_quick_query,
     parse_quick_draft, render_quick_report,
@@ -1234,7 +1234,7 @@ def apply_analysis_preset_to_session(
 
 def report_style_options(session_id: str) -> dict:
     sess = get_session(session_id)
-    allowed = bool(REPORT_QUICK_MODE_ENABLED and supports_quick_report(sess))
+    allowed = supports_quick_report(sess) and is_quick_report_enabled()
     return {"quick_enabled": allowed, "report_style": sess.get("pending_report_style", "full") if allowed else "full"}
 
 
@@ -1243,8 +1243,8 @@ def _validate_report_style(sess: dict, value) -> str:
         style = normalize_report_style(value)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if style == "quick" and not (REPORT_QUICK_MODE_ENABLED and supports_quick_report(sess)):
-        raise HTTPException(status_code=400, detail="当前报告类型或运行配置不支持快速模式")
+    if style == "quick" and not (supports_quick_report(sess) and is_quick_report_enabled()):
+        raise HTTPException(status_code=400, detail="当前报告类型不支持快速模式，或管理员已关闭快速报告模式")
     return style
 
 
@@ -1312,7 +1312,7 @@ def save_qualitative_context(
     ctx: QualitativeContextRequest,
     login: dict | None = None,
 ) -> dict | None:
-    """存储数据确认上下文，并查找严格匹配的成功历史报告。"""
+    """存储数据确认上下文，并在问卷提醒开启时查找匹配的成功历史报告。"""
     sess = require_session_access(session_id, login, loader=get_session)
     _assign_session_owner(sess, login)
     if hasattr(ctx, "model_dump"):
@@ -1326,6 +1326,8 @@ def save_qualitative_context(
         merged.setdefault(field, "")
     sess["qualitative_context"] = merged
     save_session(session_id, sess)
+    if not get_app_settings().get("survey_duplicate_reminder_enabled", True):
+        return None
     return find_exact_survey_duplicate_report(sess, login)
 
 
@@ -1377,14 +1379,12 @@ def prepare_duplicate_report_rerun(
                 status_code=409,
                 detail=f"报告版本已达上限（{MAX_REPORT_VERSIONS} 个），请先删除一个旧版本。",
             )
-        resolved_base = (
-            resolve_report_version(entry)["version"]
-            if base_version is None
-            else resolve_report_version(entry, base_version)["version"]
-        )
+        base_snapshot = resolve_report_version(entry, base_version)
+        resolved_base = base_snapshot["version"]
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    report_style = _validate_report_style(sess, base_snapshot.get("report_style", "full"))
     supplement = str(instruction or "").strip()
     version_instruction = supplement or DEFAULT_RERUN_VERSION_INSTRUCTION
     target_version = _next_history_version_number(entry, versions)
@@ -1392,6 +1392,7 @@ def prepare_duplicate_report_rerun(
     if isinstance(plan.get("branch_rules"), list):
         sess["branch_rules"] = deepcopy(plan["branch_rules"])
     sess.update({
+        "pending_report_style": report_style,
         "rerun_target_history_id": target_id,
         "rerun_base_version": resolved_base,
         "rerun_supplement": supplement,
@@ -2014,7 +2015,7 @@ async def report_stream(
             sess.get("analysis_mode") == "quantitative" or is_crosstab
         )
         qualitative_context = sess.get("qualitative_context")
-        report_style = _validate_report_style(sess, sess.get("pending_report_style", "full"))
+        requested_report_style = sess.get("pending_report_style", "full")
         quick_diagnostics = None
         use_large_mode = is_crosstab or any(
             len(value) > LARGE_SAMPLE_THRESHOLD for value in open_text.values()
@@ -2057,7 +2058,8 @@ async def report_stream(
                 resolved_base_version = int(sess.get("rerun_base_version"))
             except (TypeError, ValueError) as exc:
                 raise ValueError("历史重跑缺少基础版本") from exc
-            resolve_report_version(rerun_entry, resolved_base_version)
+            base_snapshot = resolve_report_version(rerun_entry, resolved_base_version)
+            requested_report_style = base_snapshot.get("report_style", "full")
             prompt_instruction = str(sess.get("rerun_supplement") or "").strip()
             version_instruction = (
                 str(sess.get("rerun_instruction") or "").strip()
@@ -2079,7 +2081,11 @@ async def report_stream(
                 active_version = resolve_report_version(sess)["version"]
                 if resolved_base_version is None:
                     resolved_base_version = active_version
-                resolve_report_version(sess, resolved_base_version)
+                base_snapshot = resolve_report_version(sess, resolved_base_version)
+                requested_report_style = base_snapshot.get("report_style", "full")
+
+        # 重生成沿用基础版本的模式，不能被新会话默认值或旧选择覆盖。
+        report_style = _validate_report_style(sess, requested_report_style)
 
         if len(existing_versions) >= MAX_REPORT_VERSIONS:
             raise ValueError(

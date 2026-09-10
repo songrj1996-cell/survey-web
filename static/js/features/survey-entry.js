@@ -369,7 +369,6 @@ function returnToSurveyFocus() {
   document.querySelector('[data-entry-focus="' + surveyEntry.focus + '"]').focus();
   document.querySelector('.main').scrollTo({ top: 0, behavior: 'auto' });
 }
-$('qe-edit-focus').addEventListener('click', returnToSurveyFocus);
 $('qe-retry-plan').addEventListener('click', returnToSurveyFocus);
 
 function resetUploadZone() {

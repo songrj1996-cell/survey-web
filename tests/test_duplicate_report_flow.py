@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import ExitStack
 from copy import deepcopy
 import hashlib
 import json
@@ -9,13 +10,15 @@ import unittest
 import uuid
 from unittest.mock import AsyncMock, patch
 
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
 
-from app.routers import survey as survey_router
-from app.schemas.requests import QualitativeContextRequest, ReportVersionRequest
-from app.services import report_history, report_versions, survey_service
+from app.routers import settings_api, survey as survey_router
+from app.schemas.requests import AppSettingsPatch, QualitativeContextRequest, ReportVersionRequest
+from app.services import comment_upload, report_history, report_versions, settings_service, survey_service
 from app.storage import history as history_storage
 from app.storage import sessions as session_storage
+from app.storage import settings as settings_storage
 
 
 LOGIN = {"email": "owner@example.com", "name": "Owner"}
@@ -109,6 +112,10 @@ class TemporaryDuplicateRuntimeMixin:
         root = Path(self._temp.name)
         self.history_file = root / "history.json"
         self.session_dir = root / "sessions"
+        self.settings_file = root / "app_settings.json"
+        self._settings_patch = patch.object(
+            settings_storage, "APP_SETTINGS_FILE", str(self.settings_file)
+        )
         self._history_patch = patch.object(
             history_storage,
             "HISTORY_FILE",
@@ -121,6 +128,7 @@ class TemporaryDuplicateRuntimeMixin:
         )
         self._history_patch.start()
         self._session_patch.start()
+        self._settings_patch.start()
         survey_service._REPORT_GENERATION_LOCKS.clear()
         survey_service._REPORT_RERUN_TARGET_LOCKS.clear()
 
@@ -129,6 +137,7 @@ class TemporaryDuplicateRuntimeMixin:
         survey_service._REPORT_RERUN_TARGET_LOCKS.clear()
         self._session_patch.stop()
         self._history_patch.stop()
+        self._settings_patch.stop()
         self._temp.cleanup()
         real_after = (
             hashlib.sha256(self._real_history_path.read_bytes()).hexdigest()
@@ -154,6 +163,145 @@ class TemporaryDuplicateRuntimeMixin:
         )
         saved = report_history.save_to_history(history_id, sess)
         return history_id, saved
+
+
+class DuplicateReminderSettingTests(
+    TemporaryDuplicateRuntimeMixin,
+    unittest.IsolatedAsyncioTestCase,
+):
+    def test_new_survey_default_preserves_saved_comment_and_other_settings(self):
+        existing = {
+            "comment_duplicate_reminder_enabled": False,
+            "google_forms_entry_enabled": True,
+            "report_quick_mode_enabled": True,
+        }
+        self.settings_file.write_text(json.dumps(existing), encoding="utf-8")
+
+        loaded = settings_service.get_app_settings()
+
+        self.assertIs(loaded["survey_duplicate_reminder_enabled"], True)
+        self.assertEqual({key: loaded[key] for key in existing}, existing)
+        self.assertEqual(json.loads(self.settings_file.read_text(encoding="utf-8")), loaded)
+
+    def test_saved_survey_false_is_preserved_on_reload(self):
+        settings_service.update_app_settings(
+            AppSettingsPatch(survey_duplicate_reminder_enabled=False)
+        )
+        self.assertIs(
+            settings_service.get_app_settings()["survey_duplicate_reminder_enabled"],
+            False,
+        )
+
+    async def test_admin_switches_control_each_flow_independently_without_restart(self):
+        history_id, _ = self._archive_v1()
+        comment_id = str(uuid.uuid4())
+        history_storage._save_history([
+            *history_storage._load_history(),
+            {
+                "id": comment_id,
+                "mode": "comment",
+                "comment_file_hash": FILE_SHA256,
+                "title": "评论报告",
+                "report_md": "评论报告正文",
+                "created_at": "2026-08-01T10:00:00",
+                **OWNER,
+            },
+        ])
+        session_id = self._new_session(_fingerprint_session())
+        app = FastAPI()
+        app.include_router(settings_api.router)
+        app.include_router(survey_router.router)
+        expected = {
+            "survey_duplicate_reminder_enabled": True,
+            "comment_duplicate_reminder_enabled": True,
+        }
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(settings_api, "_require_admin", new=AsyncMock()))
+            audit = stack.enter_context(patch.object(settings_api, "audit_log", new=AsyncMock()))
+            stack.enter_context(patch.object(survey_router, "audit_log", new=AsyncMock()))
+            stack.enter_context(patch.object(
+                survey_router, "require_session_request_access", new=AsyncMock(return_value=LOGIN)
+            ))
+            stack.enter_context(patch.object(
+                comment_upload, "_COMMENT_UPLOAD_DIR", Path(self._temp.name) / "comment_uploads"
+            ))
+            client = stack.enter_context(TestClient(app))
+            for key, enabled, label in (
+                ("survey_duplicate_reminder_enabled", False, "问卷"),
+                ("comment_duplicate_reminder_enabled", False, "评论"),
+                ("survey_duplicate_reminder_enabled", True, "问卷"),
+                ("comment_duplicate_reminder_enabled", True, "评论"),
+            ):
+                with self.subTest(key=key, enabled=enabled):
+                    expected[key] = enabled
+                    response = client.patch("/api/app-settings", json={key: enabled})
+                    self.assertEqual(response.status_code, 200)
+                    loaded = client.get("/api/app-settings").json()
+                    for setting, value in expected.items():
+                        self.assertIs(response.json()[setting], value)
+                        self.assertIs(loaded[setting], value)
+                    self.assertEqual(
+                        audit.await_args.args[3],
+                        f"{label}重复文件提醒：{'开启' if enabled else '关闭'}",
+                    )
+
+                    response = client.post(f"/api/survey-context/{session_id}", json=CONTEXT)
+                    self.assertEqual(response.status_code, 200)
+                    survey_duplicate = response.json()["duplicate_report"]
+                    if expected["survey_duplicate_reminder_enabled"]:
+                        self.assertEqual(survey_duplicate["id"], history_id)
+                    else:
+                        self.assertIsNone(survey_duplicate)
+                    uploaded = await comment_upload.handle_comment_upload(
+                        "comments.csv", FILE_BYTES, "帖子标题", "帖子内容", LOGIN
+                    )
+                    if expected["comment_duplicate_reminder_enabled"]:
+                        self.assertEqual(uploaded["duplicate_report"]["id"], comment_id)
+                    else:
+                        self.assertIsNone(uploaded["duplicate_report"])
+            self.assertEqual(audit.await_count, 4)
+
+    def test_disabled_survey_saves_context_without_history_lookup_or_rerun_binding(self):
+        settings_service.update_app_settings(
+            AppSettingsPatch(survey_duplicate_reminder_enabled=False)
+        )
+        fresh = _fingerprint_session()
+        fresh.pop("qualitative_context")
+        session_id = self._new_session(fresh)
+        with patch.object(survey_service, "find_exact_survey_duplicate_report") as lookup:
+            duplicate = survey_service.save_qualitative_context(
+                session_id, QualitativeContextRequest(**CONTEXT), LOGIN
+            )
+        self.assertIsNone(duplicate)
+        lookup.assert_not_called()
+        saved = session_storage.get_session(session_id)
+        self.assertEqual(saved["qualitative_context"], CONTEXT)
+        self.assertEqual(saved["rows"], fresh["rows"])
+        self.assertNotIn("rerun_target_history_id", saved)
+
+    def test_disabled_reminder_does_not_block_explicit_rerun(self):
+        history_id, _ = self._archive_v1()
+        session_id = self._new_session(_fingerprint_session())
+        settings_service.update_app_settings(
+            AppSettingsPatch(survey_duplicate_reminder_enabled=False)
+        )
+        prepared = survey_service.prepare_duplicate_report_rerun(
+            session_id, LOGIN, history_id=history_id, instruction="", base_version=1
+        )
+        self.assertEqual(prepared["base_version"], 1)
+        self.assertEqual(prepared["target_version"], 2)
+
+    def test_non_admin_cannot_change_either_reminder(self):
+        settings_service.get_app_settings()
+        before = self.settings_file.read_bytes()
+        app = FastAPI()
+        app.include_router(settings_api.router)
+        denied = AsyncMock(side_effect=HTTPException(status_code=403, detail="需要管理员权限"))
+        with patch.object(settings_api, "_require_admin", new=denied), TestClient(app) as client:
+            for key in ("survey_duplicate_reminder_enabled", "comment_duplicate_reminder_enabled"):
+                response = client.patch("/api/app-settings", json={key: False})
+                self.assertEqual(response.status_code, 403)
+        self.assertEqual(self.settings_file.read_bytes(), before)
 
 
 class DuplicateUploadAndMatchTests(

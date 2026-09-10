@@ -25,10 +25,22 @@ const input = JSON.parse(fs.readFileSync(0, 'utf8'));
     const errors = [];
     page.on('pageerror', e => errors.push(e.message));
     let slowOptions = null;
+    let quickEnabled = false;
+    let failSettingSave = false;
+    const settingWrites = [];
     await page.route('**/api/**', async route => {
+      if (route.request().url().endsWith('/app-settings')) {
+        if (route.request().method() === 'PATCH') {
+          if (failSettingSave) return route.fulfill({status:503,json:{detail:'设置保存失败'}});
+          const body = route.request().postDataJSON();
+          settingWrites.push(body);
+          quickEnabled = body.report_quick_mode_enabled;
+        }
+        return route.fulfill({json:{comment_duplicate_reminder_enabled:true,google_forms_entry_enabled:false,report_quick_mode_enabled:quickEnabled}});
+      }
       if (route.request().url().endsWith('/options')) {
         if (route.request().url().includes('/late/')) { slowOptions = route; return; }
-        return route.fulfill({json:{quick_enabled: !route.request().url().includes('/quant/'), report_style:'full'}});
+        return route.fulfill({json:{quick_enabled: quickEnabled && !route.request().url().includes('/quant/'), report_style:'full'}});
       }
       return route.fulfill({json:{logged_in:true,authenticated:true,login_required:false,enabled:false,items:[],entries:[],texts:{},users:[],settings:{}}});
     });
@@ -37,6 +49,27 @@ const input = JSON.parse(fs.readFileSync(0, 'utf8'));
     await page.goto(input.url, {waitUntil:'networkidle'});
     await page.evaluate(() => { state.sessionId='first'; state.currentStep=3; goStep(3); $('plan-card').style.display='block'; });
     await page.evaluate(() => loadReportStyleOptions());
+    assert.equal(await page.locator('#report-style-picker').isVisible(),false);
+    await page.evaluate(() => { openDrawer('settings-drawer'); switchSettingsTab('system'); });
+    const toggle = page.locator('#setting-report-quick-mode');
+    await toggle.waitFor({state:'visible'});
+    assert.equal(await toggle.isChecked(),false);
+    await toggle.check();
+    await page.waitForFunction(() => !$('setting-report-quick-mode').disabled && !$('report-style-picker').hidden);
+    assert.deepEqual(settingWrites,[{report_quick_mode_enabled:true}]);
+    await page.evaluate(() => loadSystemSettings());
+    assert.equal(await toggle.isChecked(),true,'saved toggle survives reopening settings');
+    if (input.output) await page.screenshot({path:input.output+'/platform-quick-toggle.png'});
+    failSettingSave = true;
+    await toggle.uncheck();
+    await page.waitForFunction(() => !$('setting-report-quick-mode').disabled && $('setting-report-quick-mode').checked);
+    assert.equal(await page.locator('#report-style-picker').evaluate(el => el.hidden),false,'failed save must preserve available mode');
+    failSettingSave = false;
+    await toggle.uncheck();
+    await page.waitForFunction(() => !$('setting-report-quick-mode').disabled && $('report-style-picker').hidden);
+    await toggle.check();
+    await page.waitForFunction(() => !$('setting-report-quick-mode').disabled && !$('report-style-picker').hidden);
+    await page.evaluate(() => closeDrawer('settings-drawer'));
     await page.locator('#report-style-picker').waitFor({state:'visible'});
     await page.check('input[name="report-style"][value="quick"]');
     assert.equal(await page.evaluate(() => selectedReportStyle()),'quick');
@@ -96,7 +129,7 @@ const input = JSON.parse(fs.readFileSync(0, 'utf8'));
     assert.equal(await page.locator('.quick-appendix').count(),0);
     assert.equal(await page.locator('#btn-report-partial-rerun').isDisabled(),false);
     assert.deepEqual(errors,[]);
-    process.stdout.write(JSON.stringify({passed:true,checks:['selection','feature flag','stale response','evidence jump','return','appendix','TOC','version isolation','unchanged export/QA source','light/dark/narrow'],pageErrors:errors}));
+    process.stdout.write(JSON.stringify({passed:true,checks:['admin toggle persistence','save failure rollback','live selector update','selection','feature flag','stale response','evidence jump','return','appendix','TOC','version isolation','unchanged export/QA source','light/dark/narrow'],pageErrors:errors}));
   } finally { await browser.close(); }
 })().catch(error => { console.error(error); process.exitCode=1; });
 '''

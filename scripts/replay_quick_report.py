@@ -91,7 +91,6 @@ def main():
     os.chdir(output)
     os.environ['DATA_DIR']=str(output/'data')
     os.environ['RESEARCH_ASSET_STORAGE_DIR']=str(output/'assets')
-    os.environ['REPORT_QUICK_MODE_ENABLED']='true'
     os.environ['FEISHU_LOGIN_REQUIRED']='false'
     os.environ['GOOGLE_FORMS_QUALITATIVE_ENABLED']='false'
     if args.real and env_file:
@@ -108,8 +107,12 @@ def main():
         return 1
     print(json.dumps({key:diagnostics[key] for key in ('status','real_model','logical_calls','elapsed_seconds','body_char_count','report_char_count','catalog_count','critical_evidence_referenced','segment_evidence_referenced')},ensure_ascii=False),flush=True)
     if args.serve:
+        from app.schemas.requests import AppSettingsPatch
+        from app.services.settings_service import update_app_settings
         from app.services.report_versions import append_report_version
         from app.storage.history import mutate_history
+        # 只开启上方 output/data 中的隔离预览设置，不操作真实平台设置。
+        update_app_settings(AppSettingsPatch(report_quick_mode_enabled=True))
         entry={'id':str(uuid.uuid4()),'filename':'快速模式验收示例（合成材料）.xlsx','created_at':datetime.now().isoformat(timespec='seconds'),'mode':'','row_count':fixture['respondent_count'],'plan':{'columns':[],'parts':[]}}
         append_report_version(entry,{'report_md':markdown,'report_style':'quick','quick_report_diagnostics':diagnostics,'qa_context_md':markdown,'qa_messages':[]})
         mutate_history(lambda history: history.insert(0,entry))

@@ -52,7 +52,7 @@
 .qe-settings { display:grid; grid-template-columns:130px minmax(0,1fr); gap:12px; margin-top:16px; }
 .qe-settings dt { color:var(--text-2); }
 .qe-settings dd { margin:0; overflow-wrap:anywhere; }
-.qe-plan-meta { display:flex; align-items:flex-start; gap:16px; background:var(--surface-2); border:1px solid var(--border); border-radius:12px; padding:12px 16px; margin-bottom:20px; }
+.qe-plan-meta { display:flex; align-items:flex-start; gap:16px; background:var(--surface-2); border:1px solid var(--border); border-radius:12px; padding:12px 16px; margin:22px 22px 0; }
 .qe-plan-meta > details { flex:1; min-width:0; }
 .qe-plan-meta summary { display:flex; flex-wrap:wrap; align-items:center; gap:10px; padding:8px 0; cursor:pointer; }
 #qe-plan-summary { color:var(--text-2); font-size:13px; overflow-wrap:anywhere; }
@@ -65,6 +65,9 @@
   .qe-tabs { grid-template-columns:1fr; }
   .qe-file-pick { grid-template-columns:auto minmax(0,1fr); }
   .qe-file-action { grid-column:2; }
+}
+@media (max-width:760px) {
+  .qe-plan-meta { margin:16px 16px 0; }
 }
 @media (max-width:640px) {
   .qe-file-grid, .qe-focus-options, #qe-focus-outline { grid-template-columns:1fr; }
