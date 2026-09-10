@@ -41,7 +41,7 @@ async def _export_to_feishu(report_md: str, login: dict, mode: str = "", title: 
         **({"block_navigation": navigation} if navigation else {}),
     )
     if navigation and doc_type == "docx":
-        await register_exported_navigation(doc_token, url)
+        await register_exported_navigation(doc_token, url, recipient_open_id=open_id or "", title=title)
     print(f"[feishu-export] created doc title={title!r} url={url}")
     if open_id:
         await feishu_export.send_message_to_user(

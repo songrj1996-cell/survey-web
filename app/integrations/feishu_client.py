@@ -874,6 +874,24 @@ async def _navigation_request(client, method: str, path: str, *, headers: dict, 
     return data
 
 
+async def send_navigation_notification(open_id: str, text: str, message_uuid: str, *, timeout: float) -> str:
+    """One checked private-message attempt with a persisted, stable deduplication UUID."""
+    if not re.fullmatch(r"ou_[A-Za-z0-9_-]{1,125}", open_id) or not re.fullmatch(r"[a-f0-9]{32}", message_uuid):
+        raise ValueError("invalid notification recipient or id")
+    async with asyncio.timeout(timeout):
+        headers = {"Authorization": f"Bearer {await _app_access_token()}"}
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            data = await _navigation_request(
+                client, "POST", "/im/v1/messages", headers=headers,
+                params={"receive_id_type": "open_id"},
+                payload={"receive_id": open_id, "msg_type": "text", "uuid": message_uuid,
+                         "content": json.dumps({"text": text}, ensure_ascii=False)},
+            )
+            if not isinstance(data.get("message_id"), str) or not data["message_id"]:
+                raise FeishuNavigationAPIError("notification", "missing_message_id")
+            return data["message_id"]
+
+
 async def subscribe_navigation_events(doc_token: str) -> None:
     headers = {"Authorization": f"Bearer {await _app_access_token()}"}
     async with httpx.AsyncClient(timeout=15) as client:

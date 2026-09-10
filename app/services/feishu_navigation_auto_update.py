@@ -29,7 +29,7 @@ def verification_ready() -> bool:
     )
 
 
-async def register_exported_navigation(doc_token: str, doc_url: str) -> bool:
+async def register_exported_navigation(doc_token: str, doc_url: str, *, recipient_open_id: str = "", title: str = "") -> bool:
     """Registration adds local metadata only; subscription runs off the export path."""
     if not config.FEISHU_WIKI_AUTO_UPDATE_ENABLED:
         return False
@@ -39,7 +39,11 @@ async def register_exported_navigation(doc_token: str, doc_url: str) -> bool:
         parsed_token, canonical = navigation_document_identity(doc_url)
         if parsed_token != doc_token:
             raise ValueError("exported document identity mismatch")
-        return await asyncio.to_thread(storage.register_document, doc_token, canonical)
+        return await asyncio.to_thread(
+            storage.register_document, doc_token, canonical,
+            recipient_open_id=recipient_open_id if config.FEISHU_NAVIGATION_NOTIFICATIONS_ENABLED else "",
+            title=title,
+        )
     except Exception as exc:
         logger.error("Feishu navigation registration failed: %s", type(exc).__name__)
         return False
@@ -91,6 +95,10 @@ async def process_navigation_job(job: dict) -> None:
             if wiki_url is None:
                 result = {"status": "watching", "last_error": ""}
             else:
+                await asyncio.to_thread(
+                    storage.mark_navigation_started, token, job["claim_id"], wiki_url,
+                    notify=config.FEISHU_NAVIGATION_NOTIFICATIONS_ENABLED,
+                )
                 snapshot = await feishu_client.get_navigation_snapshot(token)
                 prepared = prepare_wiki_navigation_updates(
                     snapshot["blocks"], token, job["doc_url"], wiki_url,
@@ -136,7 +144,69 @@ async def process_navigation_job(job: dict) -> None:
     await asyncio.to_thread(
         storage.finish_job, token, job["claim_id"], result,
         followup_delay=config.FEISHU_NAVIGATION_COOLDOWN_SECONDS,
+        notify=config.FEISHU_NAVIGATION_NOTIFICATIONS_ENABLED,
     )
+
+
+def _notification_text(job: dict) -> str:
+    title = job.get("title") or "调研报告"
+    stage = job["stage"]
+    if stage == "started":
+        text = f"正在检查并更新《{title}》的知识库证据链接。"
+    elif stage == "completed":
+        text = f"《{title}》的证据和返回链接已更新，可在知识库文档内跳转。"
+    elif stage == "completed_with_skips":
+        text = f"《{title}》的链接更新部分完成：已处理能确认的链接，还有 {job.get('skipped_links', 0)} 处未处理，请检查文档中的相关链接。"
+    elif stage == "failed":
+        text = f"《{title}》的证据链接自动更新暂时失败，本轮自动重试已结束。部分链接可能仍是原地址；请检查机器人文档权限，或联系平台维护者查看处理状态。"
+    else:
+        raise ValueError("invalid notification stage")
+    return f"{text}\n文档：{job['url']}"
+
+
+async def process_navigation_notification(job: dict) -> None:
+    sent, retryable, error, retry_after = False, True, "", 0
+    try:
+        await feishu_client.send_navigation_notification(
+            job["recipient_open_id"], _notification_text(job), job["id"],
+            timeout=config.FEISHU_NAVIGATION_NOTIFICATION_TIMEOUT_SECONDS,
+        )
+        sent = True
+    except Exception as exc:
+        error = type(exc).__name__
+        if isinstance(exc, feishu_client.FeishuNavigationAPIError):
+            retryable, retry_after = exc.retryable, exc.retry_after
+            error = f"{exc.operation}:{exc.code}"
+        elif isinstance(exc, ValueError):
+            retryable = False
+        logger.warning("Feishu navigation notification failed: %s", error)
+    await asyncio.to_thread(
+        storage.finish_notification, job, sent=sent, retryable=retryable,
+        max_attempts=config.FEISHU_NAVIGATION_NOTIFICATION_MAX_ATTEMPTS,
+        delay=max(retry_after, config.FEISHU_NAVIGATION_NOTIFICATION_RETRY_SECONDS * job["attempts"]),
+        error=error,
+    )
+
+
+async def _notification_worker(stop: asyncio.Event) -> None:
+    # Independent from document processing: a slow/failing message never blocks a repair.
+    while not stop.is_set():
+        try:
+            job = await asyncio.to_thread(
+                storage.claim_notification,
+                lease_seconds=config.FEISHU_NAVIGATION_NOTIFICATION_TIMEOUT_SECONDS + 10,
+                max_attempts=config.FEISHU_NAVIGATION_NOTIFICATION_MAX_ATTEMPTS,
+                ttl_seconds=config.FEISHU_NAVIGATION_NOTIFICATION_TTL_SECONDS,
+            )
+            if job:
+                await process_navigation_notification(job)
+                continue
+        except Exception as exc:
+            logger.warning("Feishu navigation notification worker: %s", type(exc).__name__)
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=config.FEISHU_NAVIGATION_WORKER_INTERVAL_SECONDS)
+        except TimeoutError:
+            pass
 
 
 async def _worker(stop: asyncio.Event) -> None:
@@ -151,6 +221,7 @@ async def _worker(stop: asyncio.Event) -> None:
                 storage.claim_job,
                 lease_seconds=config.FEISHU_NAVIGATION_JOB_TIMEOUT_SECONDS + 15,
                 max_attempts=config.FEISHU_NAVIGATION_MAX_ATTEMPTS,
+                notify=config.FEISHU_NAVIGATION_NOTIFICATIONS_ENABLED,
             )
             if job:
                 await process_navigation_job(job)
@@ -175,10 +246,15 @@ async def navigation_lifespan(app):
         return
     stop = asyncio.Event()
     task = asyncio.create_task(_worker(stop), name="feishu-navigation")
+    notifications = (asyncio.create_task(_notification_worker(stop), name="feishu-navigation-notifications")
+                     if config.FEISHU_NAVIGATION_NOTIFICATIONS_ENABLED else None)
     try:
         yield
     finally:
         stop.set()
-        task.cancel()
-        with suppress(asyncio.CancelledError):
-            await task
+        tasks = [task] + ([notifications] if notifications is not None else [])
+        for running in tasks:
+            running.cancel()
+        for running in tasks:
+            with suppress(asyncio.CancelledError):
+                await running

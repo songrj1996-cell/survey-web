@@ -21,6 +21,40 @@
 
 ## 部署配置
 
+### 已有机器人使用长连接时（当前项目）
+
+保留飞书后台的「使用长连接接收事件」和「接收消息」订阅，不切换为 HTTP，不修改原「回调配置」。部署配套 feishu-bot 的文档事件转交功能：在现有长连接分发器上添加三类文档事件，将经过 SDK 接收的最小事件重新签名后发到本平台 `/api/feishu/events`。平台现有的验签、去重、登记限制、修复及版本检查继续生效。转交签名认证的是受信任机器人，不能视为飞书原始 HTTP 来源证明。
+
+机器人 `.env` 配置：
+
+```dotenv
+FEISHU_NAVIGATION_BRIDGE_ENABLED=true
+FEISHU_NAVIGATION_BRIDGE_URL=http://127.0.0.1:8000/api/feishu/events
+FEISHU_EVENT_VERIFICATION_TOKEN=<与平台相同>
+FEISHU_EVENT_ENCRYPT_KEY=<与平台相同>
+```
+
+平台 `.env` 配置：
+
+```dotenv
+FEISHU_WIKI_AUTO_UPDATE_ENABLED=true
+FEISHU_EVENT_VERIFICATION_TOKEN=<实际值>
+FEISHU_EVENT_ENCRYPT_KEY=<实际值>
+FEISHU_NAVIGATION_SEED_DOC_URLS=
+```
+
+两端 App ID 必须一致。上面的 HTTP 地址仅适用于机器人和平台在同一机器上运行；机器人若在公司服务器上，需要填写从该服务器可访问的平台 HTTPS 地址。长连接方式无需飞书回调进入本地，因此同机测试无需公网域名、ngrok 或 HTTP challenge。
+
+更新并重启**正在处理聊天的机器人进程**和平台，再添加/发布 `drive.file.read_v1`、`drive.file.edit_v1`、`drive.file.title_updated_v1` 三类应用身份事件及相应权限。不要只重启平台，也不要额外启动一个同应用的旧/新客户端混合接收事件：多客户端会分摊事件，旧客户端不具备新处理器时可能漏处理；应统一升级现有实例，并指向同一平台。
+
+正常用户测试不填种子地址：平台重新导出快速报告后自动登记，移入知识库并打开或改名，等待修复后检查证据和返回链接。旧导出且没有登记的文档才需要下文的一次性登记。
+
+转交默认关闭。开启后，机器人自己的 `.runtime/navigation_bridge/`（可配置）会新增 SQLite 待办和事务文件；仅保存事件、应用及文档标识和处理状态，不保存正文或密钥。平台登记数据仍位于本平台 DATA_DIR 下。通知/聊天与文档更新是不同处理流程，聊天能回复不代表文档转交已配置成功。细节及限额见配套 feishu-bot README 的“平台快速报告的 Wiki 证据链接自动更新”。
+
+### 独立使用 HTTP 接收事件时
+
+以下方式适用于没有既有长连接接收功能、明确采用 HTTP 的部署。已有长连接的应用使用上一节方案，不直接切换订阅方式。
+
 默认关闭。代码部署、应用配置及真实文档订阅和更新，应分别按项目规则取得批准。
 
 在已有部署环境中设置：
@@ -48,6 +82,33 @@
 
 参考：[官方事件处理和验签](https://github.com/larksuite/oapi-sdk-python/blob/v2_main/lark_oapi/event/dispatcher_handler.py)、[文档阅读事件](https://github.com/larksuite/oapi-sdk-python/blob/v2_main/lark_oapi/api/drive/v1/model/p2_drive_file_read_v1.py)、[文档事件订阅](https://github.com/larksuite/oapi-sdk-python/blob/v2_main/lark_oapi/api/drive/v1/model/subscribe_file_request.py)。
 
+## 进度私聊通知
+
+自动更新开启后，通知默认随之启用；无需再向机器人发送指令。通知发给平台登录后**导出这份报告的人**，使用与导出通知相同的机器人私聊，消息附对应文档链接。不会发到群里，也不会通知后来阅读或改名的其他人。
+
+- 确认文档已进入知识库后，安排“正在检查并更新”通知。
+- 更新及回读验证完成后，发送“已更新”或“部分完成”；部分完成说明仍有多少处链接未处理。
+- 修复不可继续或本轮重试耗尽时，发送“暂时失败”，不误报全部完成。
+- 很快完成时，尚未发送的开始通知会合并为结果通知。重复事件和自身编辑事件不会重复刷进度。
+
+通知使用独立后台任务，不等待消息送达才修复文档。单次消息尝试默认最多 5 秒，最多 3 次，重试间隔默认 30、60 秒，并遵守 Retry-After；相同通知始终使用同一个消息 UUID。状态持久化后可恢复，默认超过 24 小时不再补发过期进度，避免跨越去重窗口后重复提示。发送失败不会撤销已完成的链接更新，通知状态与修复状态分别记录。多个通知在同一文档内按序发送；真实客户端显示顺序及飞书端去重行为仍需联调。
+
+可选配置：
+
+```dotenv
+FEISHU_NAVIGATION_NOTIFICATIONS_ENABLED=true
+FEISHU_NAVIGATION_NOTIFICATION_TIMEOUT_SECONDS=5
+FEISHU_NAVIGATION_NOTIFICATION_MAX_ATTEMPTS=3
+FEISHU_NAVIGATION_NOTIFICATION_RETRY_SECONDS=30
+FEISHU_NAVIGATION_NOTIFICATION_TTL_SECONDS=86400
+```
+
+设置通知开关为 false 并重启可停止后续通知，链接修复仍按自动更新开关运行。总开关关闭时两个后台任务都不运行。
+
+登记记录新增导出人的 open_id、导出时标题和通知状态/UUID，不保存消息凭据或报告正文。文档后来改名时通知标题可能仍使用导出时标题，以消息中的文档链接为准。已有旧记录或手工种子登记没有可靠导出人时不发送通知，也不根据事件操作者或当前文档所有者补猜接收人；本版重新导出的报告会自动登记接收人。
+
+这会增加消息接口请求和少量存储 I/O，不增加模型调用。通知任务与修复任务独立；生产资源争用、事件到达和私聊投递延迟未做真实负载验证。
+
 ## 旧文档一次性登记
 
 旧导出文档不会被自动发现或扫描。将明确指定的**原始 docx 地址**加入 FEISHU_NAVIGATION_SEED_DOC_URLS，多个地址用逗号分隔；不要把 docx token 直接替换成 wiki token。
@@ -58,7 +119,7 @@
 
 ## 状态、重试与数据
 
-状态保存在 DATA_DIR/feishu_navigation/registry.json，进程锁为同目录 registry.lock，原子写入的临时文件也只在该目录生成。记录包含文档 ID、URL、最近事件 ID、状态、尝试次数和错误代码，不保存报告正文或凭据。
+状态保存在 DATA_DIR/feishu_navigation/registry.json，进程锁为同目录 registry.lock，原子写入的临时文件也只在该目录生成。记录包含文档 ID、URL、最近事件 ID、状态、尝试次数和错误代码；新导出记录还可包含导出人 open_id、导出时标题及通知状态。不保存报告正文或凭据。
 
 启用后会新增或更新此目录。当前开发验证仅使用工作树 .test-tmp/ 下的隔离目录，**不写真实 DATA_DIR**。线上启用前应明确实际 DATA_DIR，并批准相应目录的数据写入。
 
@@ -102,6 +163,20 @@
 无需重新生成报告。若需修改现有记录、反向改写文档或删除目录，应另行批准并准备恢复方案，不要清空运行时目录。
 
 ## 本地交付记录（2026-09-10）
+
+### 长连接兼容与进度通知补充
+
+- 隔离基线：survey-web `b46c101`，feishu-bot `02404db`；分别使用 `codex/bugfix-feishu-navigation-bridge` 分支。
+- 平台 84 项测试通过（原 69 项回归和新增 15 项通知验收）；机器人 48 项测试通过（原 32 项统计测试和新增 16 项转交验收）。
+- 跨项目测试使用真实 SDK 分发器、平台 HTTP 路由和修复流程，模拟外部接口；验证了签名转交、Wiki 迁移后双向链接、正文/样式/评论标识保持，以及原 `/help`、`/ping` 和无上下文回复。
+- 通知测试覆盖导出人隔离、快速完成合并、开始/结果顺序、部分完成、重试耗尽、通知失败不阻断修复、稳定消息 UUID 和重启恢复。两端未发送真实消息或修改真实文档。
+- 测试日志分别位于两个任务工作树 `.test-tmp/platform-tests.log`、`.test-tmp/bot-tests-final.log`；缓存及运行数据均隔离。
+- 未配置真实 `.env`，未重启正在运行的机器人，未订阅真实事件、提交、合并或部署。当前机器人的实际运行位置及与本地 8000 的连通性需在部署时确认。
+- 默认关闭的转交代码可进入合并审核。真实联调前必须更新现有机器人实例、确保目标平台可达，并配置/发布所需文档事件和权限；不可仅重启本地 8000 后宣称完整流程可用。
+- 暂未发现对报告生成质量和模型调用数量的直接影响；模拟验证保持正文和跳转目标。新增持久存储、事件转交及消息接口必然增加后台 I/O 和请求，繁忙时可能争用资源，真实耗时及投递效果仍未验证。
+- 回退可关闭机器人转交开关，以及平台自动更新/通知开关；已经更新的链接保留，运行数据不自动清理。主干合并仍需明确授权。
+
+### 原 HTTP 接入交付
 
 - 基线：64e232d；工作分支：codex/bugfix-feishu-wiki-navigation。
 - 69 项定向 unittest 通过，覆盖证据导航、自动任务、既有飞书格式、快速报告和历史版本导出。
