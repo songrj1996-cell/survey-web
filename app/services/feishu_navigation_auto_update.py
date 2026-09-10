@@ -1,0 +1,184 @@
+"""Event-driven repair of registered quick-report navigation after Wiki moves."""
+from __future__ import annotations
+
+import asyncio
+from contextlib import asynccontextmanager, suppress
+import logging
+import time
+
+from app.core import config
+from app.integrations import feishu_client
+from app.services.feishu_evidence_navigation import (
+    navigation_document_identity,
+    prepare_wiki_navigation_updates,
+)
+from app.storage import feishu_navigation as storage
+
+logger = logging.getLogger(__name__)
+_EVENTS = {"drive.file.read_v1", "drive.file.edit_v1", "drive.file.title_updated_v1"}
+
+
+class NavigationEventUnavailable(RuntimeError):
+    pass
+
+
+def verification_ready() -> bool:
+    return bool(
+        config.FEISHU_EVENT_VERIFICATION_TOKEN and config.FEISHU_EVENT_ENCRYPT_KEY
+        and feishu_client.FEISHU_APP_ID and feishu_client.FEISHU_APP_SECRET
+    )
+
+
+async def register_exported_navigation(doc_token: str, doc_url: str) -> bool:
+    """Registration adds local metadata only; subscription runs off the export path."""
+    if not config.FEISHU_WIKI_AUTO_UPDATE_ENABLED:
+        return False
+    try:
+        if not verification_ready():
+            raise NavigationEventUnavailable("event_verification_not_configured")
+        parsed_token, canonical = navigation_document_identity(doc_url)
+        if parsed_token != doc_token:
+            raise ValueError("exported document identity mismatch")
+        return await asyncio.to_thread(storage.register_document, doc_token, canonical)
+    except Exception as exc:
+        logger.error("Feishu navigation registration failed: %s", type(exc).__name__)
+        return False
+
+
+async def register_existing_document(doc_url: str) -> bool:
+    """Explicit admin bootstrap; never discovers/scans the user's other documents."""
+    token, canonical = navigation_document_identity(doc_url)
+    if not config.FEISHU_WIKI_AUTO_UPDATE_ENABLED or not verification_ready():
+        raise NavigationEventUnavailable("automatic_navigation_not_configured")
+    return await asyncio.to_thread(storage.register_document, token, canonical)
+
+
+async def accept_navigation_event(body: bytes, headers: dict) -> dict:
+    if not verification_ready():
+        raise NavigationEventUnavailable("event_verification_not_configured")
+    payload = feishu_client.decode_navigation_event(
+        body, headers, verification_token=config.FEISHU_EVENT_VERIFICATION_TOKEN,
+        encrypt_key=config.FEISHU_EVENT_ENCRYPT_KEY, app_id=feishu_client.FEISHU_APP_ID,
+        max_age_seconds=config.FEISHU_EVENT_MAX_AGE_SECONDS,
+    )
+    if payload.get("type") == "url_verification":
+        return {"challenge": payload["challenge"]}
+    if not config.FEISHU_WIKI_AUTO_UPDATE_ENABLED:
+        return {"code": 0}
+    header, event = payload["header"], payload.get("event", {})
+    if not isinstance(event, dict):
+        raise ValueError("invalid event data")
+    if header.get("event_type") not in _EVENTS or event.get("file_type") != "docx":
+        return {"code": 0}
+    # Persist the event before acknowledging it; unknown documents do no API work.
+    await asyncio.to_thread(
+        storage.enqueue_event, event.get("file_token"), header.get("event_id"),
+        cooldown=config.FEISHU_NAVIGATION_COOLDOWN_SECONDS,
+    )
+    return {"code": 0}
+
+
+async def process_navigation_job(job: dict) -> None:
+    token = job["doc_token"]
+    subscribed, changed = job["subscribed"], 0
+    result = {}
+    try:
+        async with asyncio.timeout(config.FEISHU_NAVIGATION_JOB_TIMEOUT_SECONDS):
+            if not subscribed:
+                await feishu_client.subscribe_navigation_events(token)
+                subscribed = True
+            wiki_url = await feishu_client.resolve_navigation_wiki_url(token, job["doc_url"])
+            if wiki_url is None:
+                result = {"status": "watching", "last_error": ""}
+            else:
+                snapshot = await feishu_client.get_navigation_snapshot(token)
+                prepared = prepare_wiki_navigation_updates(
+                    snapshot["blocks"], token, job["doc_url"], wiki_url,
+                )
+                if prepared["updates"]:
+                    changed = await feishu_client.update_navigation_blocks(
+                        token, snapshot["revision_id"], prepared["updates"],
+                    )
+                    # Read back real block IDs and link targets before reporting completion.
+                    verified = await feishu_client.get_navigation_snapshot(token)
+                    remaining = prepare_wiki_navigation_updates(
+                        verified["blocks"], token, job["doc_url"], wiki_url,
+                    )
+                    if remaining["updates"]:
+                        raise feishu_client.FeishuNavigationAPIError("verification", "links_remaining")
+                    prepared = remaining
+                skipped = prepared["skipped_links"]
+                result = {
+                    "status": "completed_with_skips" if skipped else "completed",
+                    "wiki_url": wiki_url, "last_error": "",
+                    "skipped_links": skipped,
+                }
+    except Exception as exc:
+        retryable = not isinstance(exc, ValueError)
+        retry_after = 0
+        if isinstance(exc, feishu_client.FeishuNavigationAPIError):
+            changed += exc.updated_blocks
+            retryable = exc.retryable
+            reason = f"{exc.operation}:{exc.code}"
+            retry_after = exc.retry_after
+        else:
+            reason = type(exc).__name__
+        retry = retryable and job["attempts"] < config.FEISHU_NAVIGATION_MAX_ATTEMPTS
+        result = {
+            "status": "pending" if retry else "failed",
+            "next_at": time.time() + max(
+                retry_after, config.FEISHU_NAVIGATION_COOLDOWN_SECONDS * job["attempts"],
+            ),
+            "last_error": reason,
+        }
+        logger.warning("Feishu navigation job %s: %s", result["status"], reason)
+    result.update(subscribed=subscribed, updated_blocks=job["updated_blocks"] + changed)
+    await asyncio.to_thread(
+        storage.finish_job, token, job["claim_id"], result,
+        followup_delay=config.FEISHU_NAVIGATION_COOLDOWN_SECONDS,
+    )
+
+
+async def _worker(stop: asyncio.Event) -> None:
+    for url in config.FEISHU_NAVIGATION_SEED_DOC_URLS:
+        try:
+            await register_existing_document(url)
+        except Exception as exc:
+            logger.error("Feishu navigation seed registration failed: %s", type(exc).__name__)
+    while not stop.is_set():
+        try:
+            job = await asyncio.to_thread(
+                storage.claim_job,
+                lease_seconds=config.FEISHU_NAVIGATION_JOB_TIMEOUT_SECONDS + 15,
+                max_attempts=config.FEISHU_NAVIGATION_MAX_ATTEMPTS,
+            )
+            if job:
+                await process_navigation_job(job)
+                continue
+        except Exception as exc:
+            logger.error("Feishu navigation worker failed: %s", type(exc).__name__)
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=config.FEISHU_NAVIGATION_WORKER_INTERVAL_SECONDS)
+        except TimeoutError:
+            pass
+
+
+@asynccontextmanager
+async def navigation_lifespan(app):
+    """A disabled installation performs no registry or network operations."""
+    if not config.FEISHU_WIKI_AUTO_UPDATE_ENABLED:
+        yield
+        return
+    if not verification_ready():
+        logger.error("Feishu automatic navigation disabled: event verification is not configured")
+        yield
+        return
+    stop = asyncio.Event()
+    task = asyncio.create_task(_worker(stop), name="feishu-navigation")
+    try:
+        yield
+    finally:
+        stop.set()
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task

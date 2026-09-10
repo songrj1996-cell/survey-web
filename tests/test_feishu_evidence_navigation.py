@@ -13,7 +13,7 @@ import markdown
 
 from app.integrations import feishu_client as feishu
 from app.services.export_service import _export_to_feishu
-from app.services.feishu_evidence_navigation import prepare_evidence_navigation
+from app.services.feishu_evidence_navigation import prepare_evidence_navigation, prepare_wiki_navigation_updates
 from app.services.report_quick_mode import render_quick_report
 from app.services.report_render import _prep_feishu_export_md
 
@@ -362,6 +362,101 @@ class NavigationApiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("### [E", create.call_args.args[1])
             else:
                 self.assertIn("### [E1] 普通标题", create.call_args.args[1])
+
+
+def apply_block_updates(blocks, updates):
+    by_id = {block["block_id"]: block for block in blocks}
+    for update in updates:
+        block = by_id[update["block_id"]]
+        kind = next(key for key in ("text", "bullet", "ordered") if key in block)
+        block[kind]["elements"] = deepcopy(update["update_text_elements"]["elements"])
+
+
+def wiki_fixture():
+    body, plan = prepare_evidence_navigation(_prep_feishu_export_md(sample_report()))
+    blocks = imported_blocks(body)
+    apply_block_updates(blocks, feishu._block_navigation_updates(blocks, DOC, URL, plan))
+    return blocks
+
+
+class WikiRetargetingTests(unittest.TestCase):
+    wiki_url = "https://example.invalid/wiki/wiki-test"
+
+    def test_all_references_and_returns_keep_targets_and_every_other_field(self):
+        blocks = wiki_fixture()
+        original = deepcopy(blocks)
+        result = prepare_wiki_navigation_updates(blocks, DOC, URL, self.wiki_url)
+        self.assertGreater(len(result["updates"]), 5)
+        self.assertEqual(result["skipped_links"], 0)
+        self.assertEqual(blocks, original)
+        apply_block_updates(blocks, result["updates"])
+        for before, after in zip(original, blocks):
+            for kind in ("text", "bullet", "ordered"):
+                if kind not in after:
+                    continue
+                for old, new in zip(before[kind]["elements"], after[kind]["elements"]):
+                    old_link = old["text_run"].get("text_element_style", {}).get("link")
+                    new_link = new["text_run"].get("text_element_style", {}).get("link")
+                    if old_link and new_link and old_link != new_link:
+                        self.assertEqual(unquote(old_link["url"]).split("#")[1],
+                                         unquote(new_link["url"]).split("#")[1])
+                        self.assertTrue(unquote(new_link["url"]).startswith(self.wiki_url + "#"))
+                        new_link["url"] = old_link["url"]
+            self.assertEqual(before, after)
+
+    def test_manual_partial_repair_and_repeat_do_not_rewrite_correct_links(self):
+        blocks = wiki_fixture()
+        updates = prepare_wiki_navigation_updates(blocks, DOC, URL, self.wiki_url)["updates"]
+        apply_block_updates(blocks, updates[:1])
+        remaining = prepare_wiki_navigation_updates(blocks, DOC, URL, self.wiki_url)
+        self.assertEqual(len(remaining["updates"]), len(updates) - 1)
+        apply_block_updates(blocks, remaining["updates"])
+        self.assertEqual(prepare_wiki_navigation_updates(blocks, DOC, URL, self.wiki_url)["updates"], [])
+
+    def test_wrong_target_and_external_document_are_not_retargeted(self):
+        blocks = wiki_fixture()
+        source = next(b for b in blocks if "ordered" in b)
+        runs = source["ordered"]["elements"]
+        linked = [e["text_run"] for e in runs if e["text_run"].get("text_element_style", {}).get("link")]
+        linked[0]["text_element_style"]["link"]["url"] = URL.split("?")[0] + "#missing-block"
+        linked[1]["text_element_style"]["link"]["url"] = "https://example.invalid/docx/another#external"
+        original = deepcopy(source)
+        result = prepare_wiki_navigation_updates(blocks, DOC, URL, self.wiki_url)
+        self.assertGreater(result["skipped_links"], 0)
+        apply_block_updates(blocks, result["updates"])
+        self.assertEqual(source, original)
+
+    def test_rich_reference_fragments_and_comments_survive(self):
+        blocks = wiki_fixture()
+        source = next(b for b in blocks if "ordered" in b)
+        elements = source["ordered"]["elements"]
+        index = next(i for i, e in enumerate(elements) if e["text_run"]["content"] == "[E1]")
+        first = deepcopy(elements[index])
+        second = deepcopy(first)
+        first["text_run"]["content"] = "[E"
+        second["text_run"]["content"] = "1]"
+        second["text_run"]["text_element_style"].update(bold=True, comment_ids=["comment-test"])
+        elements[index:index + 1] = [first, second]
+        result = prepare_wiki_navigation_updates(blocks, DOC, URL, self.wiki_url)
+        apply_block_updates(blocks, result["updates"])
+        second = source["ordered"]["elements"][index + 1]["text_run"]
+        self.assertEqual(second["text_element_style"]["comment_ids"], ["comment-test"])
+        self.assertTrue(second["text_element_style"]["bold"])
+        self.assertTrue(unquote(second["text_element_style"]["link"]["url"]).startswith(self.wiki_url))
+
+    def test_foreign_wiki_missing_roots_and_full_reports_fail_closed(self):
+        blocks = wiki_fixture()
+        for changed, wiki in (
+            (blocks, "https://other.invalid/wiki/wiki-test"),
+            (blocks[1:], self.wiki_url),
+            (imported_blocks(FULL), self.wiki_url),
+        ):
+            with self.assertRaises(ValueError):
+                prepare_wiki_navigation_updates(changed, DOC, URL, wiki)
+        broken = deepcopy(blocks)
+        broken.pop(1)
+        with self.assertRaises(ValueError):
+            prepare_wiki_navigation_updates(broken, DOC, URL, self.wiki_url)
 
 
 if __name__ == "__main__":

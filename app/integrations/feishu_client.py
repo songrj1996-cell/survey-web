@@ -12,11 +12,16 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from copy import deepcopy
+import hashlib
+import hmac
+import json
 import os
 import re
 import time
 from urllib.parse import quote, unquote, urldefrag, urlencode, urlsplit
+import uuid
 
 import httpx
 from dotenv import load_dotenv
@@ -769,6 +774,199 @@ async def apply_block_navigation(
         # Do not log source text, API response bodies, URLs or credentials.
         print(f"[feishu] block navigation skipped: {type(exc).__name__}")
         return False
+
+
+class FeishuEventValidationError(ValueError):
+    """An event failed authentication or structural validation."""
+
+
+def decode_navigation_event(
+    body: bytes, headers: dict, *, verification_token: str, encrypt_key: str,
+    app_id: str, max_age_seconds: int, now: float | None = None,
+) -> dict:
+    """Validate Feishu's signed event envelope, without logging credentials.
+
+    URL verification uses its secret token (and decryption when configured).
+    Regular events additionally require signature, timestamp and application ID.
+    """
+    from cryptography.hazmat.primitives import padding
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+    try:
+        if not verification_token or not encrypt_key or not app_id:
+            raise ValueError("event verification not configured")
+        payload = json.loads(body)
+        if "encrypt" in payload:
+            encrypted = base64.b64decode(payload["encrypt"], validate=True)
+            if len(encrypted) < 32 or len(encrypted) % 16:
+                raise ValueError("invalid encrypted event")
+            decryptor = Cipher(
+                algorithms.AES(hashlib.sha256(encrypt_key.encode()).digest()),
+                modes.CBC(encrypted[:16]),
+            ).decryptor()
+            plaintext = decryptor.update(encrypted[16:]) + decryptor.finalize()
+            unpadder = padding.PKCS7(128).unpadder()
+            payload = json.loads(unpadder.update(plaintext) + unpadder.finalize())
+        if not isinstance(payload, dict):
+            raise ValueError("invalid event envelope")
+        challenge = payload.get("type") == "url_verification"
+        event_header = payload.get("header") or {}
+        token = payload.get("token") if challenge else event_header.get("token")
+        if not isinstance(token, str) or not hmac.compare_digest(token, verification_token):
+            raise ValueError("invalid event token")
+        if challenge:
+            if not isinstance(payload.get("challenge"), str) or len(payload["challenge"]) > 1024:
+                raise ValueError("invalid challenge")
+            return payload
+        supplied = {key.lower(): value for key, value in headers.items()}
+        timestamp = supplied.get("x-lark-request-timestamp", "")
+        nonce = supplied.get("x-lark-request-nonce", "")
+        signature = supplied.get("x-lark-signature", "")
+        current = time.time() if now is None else now
+        if (not timestamp.isdecimal() or abs(current - int(timestamp)) > max_age_seconds
+                or not nonce or len(nonce) > 256):
+            raise ValueError("invalid event timestamp")
+        digest = hashlib.sha256((timestamp + nonce + encrypt_key).encode() + body).hexdigest()
+        if not hmac.compare_digest(digest, signature):
+            raise ValueError("invalid event signature")
+        if payload.get("schema") != "2.0" or event_header.get("app_id") != app_id:
+            raise ValueError("invalid event application")
+        return payload
+    except Exception as exc:
+        raise FeishuEventValidationError("invalid Feishu event") from None
+
+
+class FeishuNavigationAPIError(RuntimeError):
+    def __init__(self, operation: str, code: int | str, *, retryable: bool = True, retry_after: float = 0):
+        super().__init__(f"{operation}:{code}")
+        self.operation = operation
+        self.code = code
+        self.retryable = retryable
+        self.updated_blocks = 0
+        self.retry_after = retry_after
+
+
+async def _navigation_request(client, method: str, path: str, *, headers: dict, params=None, payload=None) -> dict:
+    """One attempt; the durable job controls the entire retry budget."""
+    response = await client.request(
+        method, f"{FEISHU_BASE}{path}", headers=headers, params=params, json=payload,
+    )
+    try:
+        result = response.json()
+    except ValueError:
+        raise FeishuNavigationAPIError("response", response.status_code) from None
+    if not isinstance(result, dict) or response.status_code >= 400 or result.get("code") != 0:
+        code = result.get("code", response.status_code) if isinstance(result, dict) else response.status_code
+        if type(code) is not int:
+            code = "invalid_error_code"
+        try:
+            retry_after = max(0, float(response.headers.get("Retry-After", "0")))
+        except ValueError:
+            retry_after = 0
+        raise FeishuNavigationAPIError(
+            "request", code,
+            retryable=response.status_code not in (401, 403) and code not in (99991663, 99991672, 99991679),
+            retry_after=retry_after,
+        )
+    data = result.get("data", {})
+    if not isinstance(data, dict):
+        raise FeishuNavigationAPIError("response", "invalid_data", retryable=False)
+    return data
+
+
+async def subscribe_navigation_events(doc_token: str) -> None:
+    headers = {"Authorization": f"Bearer {await _app_access_token()}"}
+    async with httpx.AsyncClient(timeout=15) as client:
+        state = await _navigation_request(
+            client, "GET", f"/drive/v1/files/{quote(doc_token, safe='')}/get_subscribe",
+            headers=headers, params={"file_type": "docx"},
+        )
+        if state.get("is_subscribe") is True:
+            return
+        if state.get("is_subscribe") is not False:
+            raise FeishuNavigationAPIError("subscription", "unknown_state", retryable=False)
+        await _navigation_request(
+            client, "POST", f"/drive/v1/files/{quote(doc_token, safe='')}/subscribe",
+            headers=headers, params={"file_type": "docx"},
+        )
+
+
+async def resolve_navigation_wiki_url(doc_token: str, original_url: str) -> str | None:
+    headers = {"Authorization": f"Bearer {await _app_access_token()}"}
+    async with httpx.AsyncClient(timeout=15) as client:
+        try:
+            data = await _navigation_request(
+                client, "GET", "/wiki/v2/spaces/get_node", headers=headers,
+                params={"token": doc_token, "obj_type": "docx"},
+            )
+        except FeishuNavigationAPIError as exc:
+            if exc.code == 131014:  # The document is not mounted in Wiki.
+                return None
+            raise
+    node = data.get("node", {})
+    node_token = node.get("node_token", "")
+    if (node.get("obj_type") != "docx" or node.get("obj_token") != doc_token
+            or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", node_token)):
+        raise FeishuNavigationAPIError("wiki_identity", "mismatch", retryable=False)
+    origin = urlsplit(original_url)
+    return f"{origin.scheme}://{origin.netloc}/wiki/{node_token}"
+
+
+async def get_navigation_snapshot(doc_token: str) -> dict:
+    from app.core.config import FEISHU_NAVIGATION_MAX_BLOCKS
+
+    headers = {"Authorization": f"Bearer {await _app_access_token()}"}
+    path = f"/docx/v1/documents/{quote(doc_token, safe='')}"
+    async with httpx.AsyncClient(timeout=15) as client:
+        data = await _navigation_request(client, "GET", path, headers=headers)
+        document = data.get("document", {})
+        revision = document.get("revision_id")
+        if document.get("document_id") != doc_token or type(revision) is not int or revision < 0:
+            raise FeishuNavigationAPIError("document_identity", "mismatch", retryable=False)
+        blocks, seen, page = [], set(), ""
+        while True:
+            params = {"page_size": 500, "document_revision_id": revision}
+            if page:
+                params["page_token"] = page
+            data = await _navigation_request(client, "GET", f"{path}/blocks", headers=headers, params=params)
+            items = data.get("items")
+            if not isinstance(items, list):
+                raise FeishuNavigationAPIError("blocks", "missing_items", retryable=False)
+            blocks.extend(items)
+            if len(blocks) > FEISHU_NAVIGATION_MAX_BLOCKS:
+                raise FeishuNavigationAPIError("blocks", "limit", retryable=False)
+            if not data.get("has_more"):
+                return {"revision_id": revision, "blocks": blocks}
+            page = data.get("page_token")
+            if not isinstance(page, str) or not page or page in seen or not items:
+                raise FeishuNavigationAPIError("blocks", "invalid_pagination", retryable=False)
+            seen.add(page)
+
+
+async def update_navigation_blocks(doc_token: str, revision: int, updates: list[dict]) -> int:
+    """Update against the fetched version; never fall back to revision -1."""
+    if type(revision) is not int or revision < 0:
+        raise ValueError("missing navigation revision")
+    headers = {"Authorization": f"Bearer {await _app_access_token()}"}
+    count = 0
+    async with httpx.AsyncClient(timeout=15) as client:
+        for offset in range(0, len(updates), 100):
+            batch = updates[offset:offset + 100]
+            try:
+                data = await _navigation_request(
+                    client, "PATCH", f"/docx/v1/documents/{quote(doc_token, safe='')}/blocks/batch_update",
+                    headers=headers, params={"document_revision_id": revision, "client_token": uuid.uuid4().hex},
+                    payload={"requests": batch},
+                )
+                count += len(batch)
+                next_revision = data.get("document_revision_id")
+                if type(next_revision) is not int or next_revision <= revision:
+                    raise FeishuNavigationAPIError("revision", "missing_next_revision")
+                revision = next_revision
+            except FeishuNavigationAPIError as exc:
+                exc.updated_blocks = count
+                raise
+    return count
 
 
 async def _replace_section_with_callout(

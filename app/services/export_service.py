@@ -8,6 +8,7 @@ from fastapi import HTTPException
 
 from app.integrations import feishu_client as feishu_export
 from app.services.feishu_evidence_navigation import prepare_evidence_navigation
+from app.services.feishu_navigation_auto_update import register_exported_navigation
 from app.services.report_render import (
     _extract_feishu_callout_sections,
     _prep_export_md,
@@ -31,7 +32,7 @@ async def _export_to_feishu(report_md: str, login: dict, mode: str = "", title: 
     body, navigation = prepare_evidence_navigation(body)
     callout_sections = _extract_feishu_callout_sections(report_md)
     open_id = login.get("open_id", "") or None
-    url, _, _ = await feishu_export.create_doc_via_bot(
+    url, doc_token, doc_type = await feishu_export.create_doc_via_bot(
         title,
         body,
         open_id,
@@ -39,6 +40,8 @@ async def _export_to_feishu(report_md: str, login: dict, mode: str = "", title: 
         apply_report_format=True,
         **({"block_navigation": navigation} if navigation else {}),
     )
+    if navigation and doc_type == "docx":
+        await register_exported_navigation(doc_token, url)
     print(f"[feishu-export] created doc title={title!r} url={url}")
     if open_id:
         await feishu_export.send_message_to_user(

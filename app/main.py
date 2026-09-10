@@ -23,9 +23,10 @@ from app.core.config import (
 )
 from app.core.security import _forbidden_response, _is_public_path, _safe_next_path, _unauthorized_response
 from app.services.auth import _current_login, _login_allowed
+from app.services.feishu_navigation_auto_update import navigation_lifespan
 from app.storage.sessions import _sweep_old_sessions
 
-app = FastAPI(title="调研分析平台")
+app = FastAPI(title="调研分析平台", lifespan=navigation_lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 _sweep_old_sessions()  # 启动时清理过期 session 文件
 

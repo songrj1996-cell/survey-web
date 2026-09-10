@@ -6,8 +6,10 @@ integration resolves those IDs only after import and all structural formatting.
 from __future__ import annotations
 
 from collections import defaultdict
+from copy import deepcopy
 from html.parser import HTMLParser
 import re
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 import markdown
 
@@ -178,3 +180,147 @@ def prepare_evidence_navigation(md: str) -> tuple[str, dict | None]:
             add_node(f"backlinks:{ref}", index, text, links)
             output.extend(["", text, ""])
     return "\n".join(output), plan
+
+
+def navigation_document_identity(url: str) -> tuple[str, str]:
+    """Validate a document locator, without requesting the user-supplied URL."""
+    parsed = urlsplit(url.strip())
+    match = re.fullmatch(r"/docx/([A-Za-z0-9_-]{1,128})", parsed.path)
+    host = parsed.hostname or ""
+    if (parsed.scheme != "https" or parsed.username or parsed.password
+            or parsed.port not in (None, 443) or not match
+            or not (host.endswith(".feishu.cn") or host.endswith(".larksuite.com"))):
+        raise ValueError("expected canonical Feishu docx URL")
+    return match[1], urlunsplit(("https", parsed.netloc.lower(), parsed.path, "", ""))
+
+
+def _rich_block(block: dict) -> tuple[str, list[dict], str]:
+    for kind in ("text", "bullet", "ordered", *(f"heading{i}" for i in range(1, 10))):
+        if kind in block:
+            elements = block[kind].get("elements", [])
+            if any(set(element) != {"text_run"} for element in elements):
+                return kind, [], ""
+            return kind, elements, "".join(element["text_run"].get("content", "") for element in elements)
+    return "", [], ""
+
+
+def _link_groups(elements: list[dict]) -> list[tuple[int, int, str, str]]:
+    groups = []
+    for index, element in enumerate(elements):
+        run = element["text_run"]
+        url = run.get("text_element_style", {}).get("link", {}).get("url", "")
+        if not url:
+            continue
+        # Feishu returns both encoded and normalized URL representations.
+        normalized = url if url.startswith("https://") else unquote(url)
+        if groups and groups[-1][1] == index and groups[-1][2] == normalized:
+            start, _, previous, text = groups.pop()
+            groups.append((start, index + 1, previous, text + run.get("content", "")))
+        else:
+            groups.append((index, index + 1, normalized, run.get("content", "")))
+    return groups
+
+
+def prepare_wiki_navigation_updates(
+    blocks: list[dict], doc_token: str, doc_url: str, wiki_url: str,
+) -> dict:
+    """Retarget existing, verifiable evidence links; never reconstruct text.
+
+    The original exported block ID stays the destination. A missing/ambiguous
+    destination or a manually repurposed link is skipped, never guessed.
+    """
+    old, new = urlsplit(doc_url), urlsplit(wiki_url)
+    if (old.scheme != "https" or new.scheme != "https" or old.netloc != new.netloc
+            or old.path != f"/docx/{doc_token}"
+            or not re.fullmatch(r"/wiki/[A-Za-z0-9_-]{1,128}", new.path)
+            or new.query or new.fragment or old.username or new.username):
+        raise ValueError("wiki navigation identity mismatch")
+    by_id = {block.get("block_id"): block for block in blocks}
+    if len(by_id) != len(blocks) or None in by_id:
+        raise ValueError("ambiguous document block IDs")
+    root = [block for block in blocks if block.get("parent_id") == doc_token]
+    children = by_id.get(doc_token, {}).get("children")
+    if not isinstance(children, list):
+        raise ValueError("missing root document block")
+    if len(children) != len(set(children)) or set(children) != {b["block_id"] for b in root}:
+        raise ValueError("incomplete root document blocks")
+    root = [by_id[block_id] for block_id in children]
+    rich = [_rich_block(block) for block in root]
+    positions = []
+    for kind, title in (("heading2", "核心判断"), ("heading2", "关键发现"),
+                        ("heading2", "发现与证据附录"), ("heading3", "完整发现目录")):
+        matches = [i for i, item in enumerate(rich) if item[0] == kind and item[2].strip() == title]
+        if len(matches) != 1:
+            raise ValueError("not an exported quick-report document")
+        positions.append(matches[0])
+    core, findings, appendix, inventory = positions
+    if positions != sorted(set(positions)):
+        raise ValueError("invalid quick-report section order")
+    evidence: dict[str, list[str]] = defaultdict(list)
+    for index in range(inventory + 1, len(root)):
+        kind, elements, text = rich[index]
+        match = re.match(r"^\[(E[1-9]\d*)\]\s+\S", text.strip())
+        first = next((element["text_run"] for element in elements
+                      if element["text_run"].get("content", "").strip()), {})
+        if (kind == "text" and match
+                and first.get("text_element_style", {}).get("bold")):
+            evidence[match[1]].append(root[index]["block_id"])
+    evidence = {ref: ids[0] for ref, ids in evidence.items() if len(ids) == 1}
+    if not evidence:
+        raise ValueError("missing unambiguous evidence blocks")
+    indexes = {block["block_id"]: i for i, block in enumerate(root)}
+
+    def destination(url: str) -> str | None:
+        parsed = urlsplit(url)
+        if (parsed.scheme == "https" and parsed.netloc == old.netloc
+                and parsed.path in (old.path, new.path)):
+            return unquote(parsed.fragment)
+        return None
+
+    def cites(block_id: str, ref: str) -> bool:
+        index = indexes.get(block_id, -1)
+        if index < 0:
+            return False
+        kind, elements, text = rich[index]
+        eligible = (core < index < appendix and kind in {"text", "bullet", "ordered"})
+        eligible |= index > inventory and kind == "bullet" and text.strip().startswith(f"[{ref}] ")
+        return eligible and any(
+            label == f"[{ref}]" and destination(url) == evidence.get(ref)
+            for _, _, url, label in _link_groups(elements)
+        )
+
+    updates, skipped, already, eligible = [], 0, 0, 0
+    for index, block in enumerate(root):
+        kind, elements, text = rich[index]
+        if kind not in {"text", "ordered", "bullet"} or index <= core:
+            continue
+        backlink = re.match(r"^返回引用（(E[1-9]\d*)）：", text.strip()) if index > inventory else None
+        is_source = (index < appendix or (index > inventory and kind == "bullet"))
+        if not (backlink or is_source):
+            continue
+        replacement = deepcopy(elements)
+        changed = False
+        for start, end, url, label in _link_groups(elements):
+            target = destination(url)
+            if target is None:  # Other documents and external sources are untouched.
+                continue
+            eligible += 1
+            reference = re.fullmatch(r"\[(E[1-9]\d*)\]", label)
+            valid = bool(reference and is_source and evidence.get(reference[1]) == target)
+            if backlink:
+                valid = backlink[1] in evidence and cites(target, backlink[1])
+            if not valid or target not in by_id:
+                skipped += 1
+                continue
+            desired = f"{wiki_url}#{quote(target, safe='')}"
+            if url == desired:
+                already += 1
+                continue
+            for offset in range(start, end):
+                replacement[offset]["text_run"]["text_element_style"]["link"]["url"] = quote(desired, safe="")
+            changed = True
+        if changed:
+            updates.append({"block_id": block["block_id"], "update_text_elements": {"elements": replacement}})
+    if not eligible:
+        raise ValueError("missing exported evidence links")
+    return {"updates": updates, "skipped_links": skipped, "already_current": already}

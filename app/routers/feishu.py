@@ -5,7 +5,7 @@ OAuth state 管理、code 兑换、web_logins 读写全部在 services/feishu_au
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 
-from app.core.config import COOKIE_NAME, FEISHU_LOGIN_REQUIRED, FEISHU_SESSION_SECONDS
+from app.core.config import COOKIE_NAME, FEISHU_LOGIN_REQUIRED, FEISHU_SESSION_SECONDS, FEISHU_EVENT_MAX_BYTES
 from app.core.security import _is_admin, _login_denied_reason, _login_url, _safe_next_path
 from app.services.audit import _audit_log_from_login
 from app.services.auth import _current_login, _get_user_perms, _login_allowed
@@ -16,8 +16,28 @@ from app.services.feishu_auth import (
     process_oauth_callback,
     require_feishu_configured,
 )
+from app.services.feishu_navigation_auto_update import (
+    NavigationEventUnavailable,
+    accept_navigation_event,
+)
 
 router = APIRouter()
+
+
+@router.post("/api/feishu/events")
+async def feishu_events(request: Request):
+    # This route uses Feishu event verification, independently of browser login.
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > FEISHU_EVENT_MAX_BYTES:
+            return JSONResponse({"detail": "event too large"}, status_code=413)
+        body.extend(chunk)
+    try:
+        return await accept_navigation_event(bytes(body), dict(request.headers))
+    except NavigationEventUnavailable:
+        return JSONResponse({"detail": "event verification is not configured"}, status_code=503)
+    except ValueError:
+        return JSONResponse({"detail": "invalid Feishu event"}, status_code=403)
 
 
 @router.get("/api/feishu/login")
