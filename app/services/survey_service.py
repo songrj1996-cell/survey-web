@@ -1377,14 +1377,12 @@ def prepare_duplicate_report_rerun(
                 status_code=409,
                 detail=f"报告版本已达上限（{MAX_REPORT_VERSIONS} 个），请先删除一个旧版本。",
             )
-        resolved_base = (
-            resolve_report_version(entry)["version"]
-            if base_version is None
-            else resolve_report_version(entry, base_version)["version"]
-        )
+        base_snapshot = resolve_report_version(entry, base_version)
+        resolved_base = base_snapshot["version"]
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    report_style = _validate_report_style(sess, base_snapshot.get("report_style", "full"))
     supplement = str(instruction or "").strip()
     version_instruction = supplement or DEFAULT_RERUN_VERSION_INSTRUCTION
     target_version = _next_history_version_number(entry, versions)
@@ -1392,6 +1390,7 @@ def prepare_duplicate_report_rerun(
     if isinstance(plan.get("branch_rules"), list):
         sess["branch_rules"] = deepcopy(plan["branch_rules"])
     sess.update({
+        "pending_report_style": report_style,
         "rerun_target_history_id": target_id,
         "rerun_base_version": resolved_base,
         "rerun_supplement": supplement,
@@ -2014,7 +2013,7 @@ async def report_stream(
             sess.get("analysis_mode") == "quantitative" or is_crosstab
         )
         qualitative_context = sess.get("qualitative_context")
-        report_style = _validate_report_style(sess, sess.get("pending_report_style", "full"))
+        requested_report_style = sess.get("pending_report_style", "full")
         quick_diagnostics = None
         use_large_mode = is_crosstab or any(
             len(value) > LARGE_SAMPLE_THRESHOLD for value in open_text.values()
@@ -2057,7 +2056,8 @@ async def report_stream(
                 resolved_base_version = int(sess.get("rerun_base_version"))
             except (TypeError, ValueError) as exc:
                 raise ValueError("历史重跑缺少基础版本") from exc
-            resolve_report_version(rerun_entry, resolved_base_version)
+            base_snapshot = resolve_report_version(rerun_entry, resolved_base_version)
+            requested_report_style = base_snapshot.get("report_style", "full")
             prompt_instruction = str(sess.get("rerun_supplement") or "").strip()
             version_instruction = (
                 str(sess.get("rerun_instruction") or "").strip()
@@ -2079,7 +2079,11 @@ async def report_stream(
                 active_version = resolve_report_version(sess)["version"]
                 if resolved_base_version is None:
                     resolved_base_version = active_version
-                resolve_report_version(sess, resolved_base_version)
+                base_snapshot = resolve_report_version(sess, resolved_base_version)
+                requested_report_style = base_snapshot.get("report_style", "full")
+
+        # 重生成沿用基础版本的模式，不能被新会话默认值或旧选择覆盖。
+        report_style = _validate_report_style(sess, requested_report_style)
 
         if len(existing_versions) >= MAX_REPORT_VERSIONS:
             raise ValueError(
