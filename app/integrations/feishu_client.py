@@ -12,10 +12,11 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 import os
 import re
 import time
-from urllib.parse import urlencode
+from urllib.parse import quote, unquote, urldefrag, urlencode, urlsplit
 
 import httpx
 from dotenv import load_dotenv
@@ -168,6 +169,7 @@ async def create_doc_via_bot(
     open_id: str | None = None,
     callout_sections: list[dict] | None = None,
     apply_report_format: bool = False,
+    block_navigation: dict | None = None,
 ) -> tuple[str, str, str]:
     """用 tenant_access_token 创建文档，返回 (URL, doc_token, doc_type)。
     若提供 open_id，文档创建后转移所有权给该用户（文档移入用户我的空间）。
@@ -233,6 +235,10 @@ async def create_doc_via_bot(
         await apply_callout_sections(doc_token, callout_sections)
     if apply_report_format:
         await apply_report_styles(doc_token)
+    if block_navigation:
+        # Resolve final block IDs after structural formatting and before handing
+        # ownership to the user, while the bot still has edit permission.
+        await apply_block_navigation(doc_token, doc_url, block_navigation)
 
     # 5. 转移所有权给用户（best-effort）
     if open_id:
@@ -620,6 +626,149 @@ async def _doc_edit(
             return last
         await asyncio.sleep(0.5 * (2 ** attempt))
     return last
+
+
+def _link_text_elements(elements: list[dict], links: list[dict], targets: dict[str, str]) -> list[dict]:
+    """Split only linked spans, preserving every character and existing style.
+
+    Offsets are Python string offsets in the complete text, not API UTF-16
+    indices: the API receives the resulting whole elements array.
+    """
+    if any(set(element) != {"text_run"} for element in elements):
+        raise ValueError("navigation requires plain text runs")
+    content = "".join(element["text_run"]["content"] for element in elements)
+    spans = sorted(links, key=lambda link: link["start"])
+    previous_end = 0
+    for span in spans:
+        if not 0 <= previous_end <= span["start"] < span["end"] <= len(content):
+            raise ValueError("invalid or overlapping navigation span")
+        if span["target"] not in targets:
+            raise ValueError("missing navigation target")
+        previous_end = span["end"]
+    result = []
+    offset = 0
+    for element in elements:
+        text = element["text_run"]["content"]
+        end = offset + len(text)
+        cuts = sorted({offset, end, *(pos for span in spans for pos in (span["start"], span["end"]) if offset < pos < end)})
+        if not text:
+            result.append(deepcopy(element))
+        for start, stop in zip(cuts, cuts[1:]):
+            piece = deepcopy(element)
+            run = piece["text_run"]
+            run["content"] = text[start - offset:stop - offset]
+            for span in spans:
+                if span["start"] <= start and stop <= span["end"]:
+                    style = run.setdefault("text_element_style", {})
+                    url = targets[span["target"]]
+                    if style.get("link"):
+                        if unquote(style["link"].get("url", "")) != unquote(url):
+                            raise ValueError("navigation overlaps an existing link")
+                    else:
+                        style["link"] = {"url": url}
+                    break
+            result.append(piece)
+        offset = end
+    return result
+
+
+def _block_navigation_updates(blocks: list[dict], doc_token: str, doc_url: str, plan: dict) -> list[dict]:
+    """Resolve an entire ordered heading/text plan before preparing any edits.
+
+    Exact section, block kind and complete text must identify a unique root
+    block. Never guess by substring, global occurrence, or a fabricated ID.
+    """
+    base_url = urldefrag(doc_url)[0]
+    parsed = urlsplit(base_url)
+    if parsed.scheme not in {"https", "http"} or not parsed.netloc:
+        raise ValueError("invalid document URL")
+    root = [block for block in blocks if block.get("parent_id") == doc_token]
+    document = next((block for block in blocks if block.get("block_id") == doc_token), {})
+    if document.get("children"):
+        by_id = {block["block_id"]: block for block in root}
+        if set(document["children"]) != set(by_id):
+            raise ValueError("incomplete document blocks")
+        root = [by_id[block_id] for block_id in document["children"]]
+    if not root:
+        raise ValueError("missing document blocks")
+    headings = []
+    section = -1
+    candidates: dict[tuple, list[dict]] = {}
+    for block in root:
+        level = _heading_level(block)
+        if level:
+            headings.append({"kind": f"heading{level}", "text": _block_text(block).strip()})
+            section += 1
+        for kind in ("text", "bullet", "ordered"):
+            if kind in block:
+                key = (section, kind, _block_text(block).strip())
+                candidates.setdefault(key, []).append(block)
+    if headings != plan["headings"]:
+        raise ValueError("document headings do not match navigation plan")
+    resolved = {}
+    used_ids = set()
+    for node in plan["nodes"]:
+        matches = candidates.get((node["section"], node["kind"], node["text"]), [])
+        if len(matches) != 1 or not matches[0].get("block_id"):
+            raise ValueError("missing or ambiguous navigation block")
+        block = matches[0]
+        if node["key"] in resolved or block["block_id"] in used_ids:
+            raise ValueError("duplicate navigation block")
+        elements = block[node["kind"]].get("elements", [])
+        if any(set(element) != {"text_run"} for element in elements):
+            raise ValueError("unsupported navigation text elements")
+        used_ids.add(block["block_id"])
+        resolved[node["key"]] = block
+    targets = {
+        key: quote(f"{base_url}#{quote(block['block_id'], safe='')}", safe="")
+        for key, block in resolved.items()
+    }
+    updates = []
+    for node in plan["nodes"]:
+        if node["links"]:
+            block = resolved[node["key"]]
+            elements = block[node["kind"]]["elements"]
+            # Imports may add surrounding whitespace to list paragraphs. Shift
+            # spans without removing any of those characters or relaxing the
+            # complete-text match inside the whitespace.
+            text = _block_text(block)
+            leading = len(text) - len(text.lstrip())
+            links = [dict(link, start=link["start"] + leading, end=link["end"] + leading) for link in node["links"]]
+            linked = _link_text_elements(elements, links, targets)
+            if linked != elements:
+                updates.append({"block_id": block["block_id"], "update_text_elements": {"elements": linked}})
+    return updates
+
+
+async def apply_block_navigation(
+    doc_token: str, doc_url: str, plan: dict, *, timeout_seconds: float = 45.0,
+) -> bool:
+    """Best-effort in-document links with a total budget, including rate limits.
+
+    A failed/partial batch never removes text or blocks. A second invocation
+    safely skips already linked elements and fills any remaining links.
+    """
+    try:
+        async with asyncio.timeout(timeout_seconds):
+            app_token = await _app_access_token()
+            headers = {"Authorization": f"Bearer {app_token}", "Content-Type": "application/json; charset=utf-8"}
+            async with httpx.AsyncClient(timeout=15) as client:
+                blocks = await _list_doc_blocks(client, headers, doc_token)
+                updates = _block_navigation_updates(blocks, doc_token, doc_url, plan)
+                for offset in range(0, len(updates), 100):
+                    result = await _doc_edit(
+                        client, "PATCH",
+                        f"{FEISHU_BASE}/docx/v1/documents/{doc_token}/blocks/batch_update",
+                        headers, {"requests": updates[offset:offset + 100]},
+                    )
+                    if result.get("code") != 0:
+                        print(f"[feishu] block navigation incomplete: code={result.get('code')}")
+                        return False
+        return True
+    except Exception as exc:
+        # Do not log source text, API response bodies, URLs or credentials.
+        print(f"[feishu] block navigation skipped: {type(exc).__name__}")
+        return False
 
 
 async def _replace_section_with_callout(
