@@ -43,11 +43,11 @@
 .qe-focus-choice p { margin:8px 0 0; color:var(--text-2); }
 .qe-focus-choice:disabled { cursor:not-allowed; background:var(--surface-2); color:var(--text-2); }
 .qe-focus-choice #qe-insight-disabled { display:block; margin-top:12px; }
-.qe-focus-preview { font-size:13px; }
+.qe-focus-preview { font-size:13px; padding:18px 20px; border-radius:12px; background:color-mix(in srgb,var(--accent-soft) 50%,transparent); }
 .qe-focus-preview > summary { cursor:pointer; color:var(--accent); }
 #qe-focus-outline { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:0 24px; }
 .context-form__summary-title { display:flex; align-items:center; gap:10px; }
-.qe-outline-row { border-bottom:1px solid var(--border); padding:14px 0; }
+.qe-outline-row { padding:14px 0; }
 .qe-outline-row strong { display:block; margin-bottom:6px; }
 .qe-settings { display:grid; grid-template-columns:130px minmax(0,1fr); gap:12px; margin-top:16px; }
 .qe-settings dt { color:var(--text-2); }

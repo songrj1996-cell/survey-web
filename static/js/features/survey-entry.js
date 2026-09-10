@@ -3,7 +3,7 @@
 
 const surveyEntry = {
   method: 'local', files: { responses: null, questionnaire: null, statistics: null },
-  busy: false, sourceBusy: false, preferredFocus: 'insight', focus: 'insight',
+  busy: false, sourceBusy: false, columnsLoading: false, preferredFocus: 'insight', focus: 'insight',
   statsSource: 'python', importSignature: '', familyId: '', platform: 'auto',
 };
 const ENTRY_FILE_RULES = {
@@ -22,7 +22,10 @@ const ENTRY_FOCUS = {
   },
 };
 
-function surveyEntryBusy() { return surveyEntry.busy || surveyEntry.sourceBusy; }
+function surveyEntryBusy() { return surveyEntry.busy || surveyEntry.sourceBusy || surveyEntry.columnsLoading; }
+function surveyConfirmationIsLocked() {
+  return state.currentStep > 2 || (surveyEntryBusy() && !surveyEntry.columnsLoading);
+}
 function surveyUploadIsLocked() { return surveyEntryBusy() || (!!state.sessionId && state.currentStep > 1); }
 function entryHasStatistics() { return surveyEntry.method === 'local' && !!surveyEntry.files.statistics; }
 function entryStatus(message, error = false) {
@@ -160,7 +163,7 @@ function entryInitializeSession(data) {
   surveyEntry.statsSource = data.stats_source || 'python';
   state.uploadedFilename = data.filename;
   $('qe-focus-preview').open = false;
-  $('context-form-details').open = false;
+  $('context-form-details').open = true;
   $('qe-plan-details').open = false;
   $('qe-focus-status').textContent = '';
   $('qe-plan-settings').hidden = true;
@@ -217,7 +220,7 @@ async function uploadSurveyEntry() {
       $('col-confirm-count').textContent = '统计结构已确认';
       $('btn-start-plan').disabled = false;
     } else {
-      await loadColumns();
+      await entryLoadColumns();
     }
   } catch (error) {
     entryStatus(error.message, true);
@@ -239,7 +242,17 @@ async function acceptGoogleFormsFamilySession(data) {
   entryStatus('已连接多语言 Google Forms 回答');
   const count = Number(data.file_upload_answer_count) || 0;
   if (count) showToast(count + ' 个文件上传回答仅保留 Drive 元数据，文件内容未进入分析', 'info', 8000);
-  await loadColumns();
+  await entryLoadColumns();
+}
+async function entryLoadColumns() {
+  surveyEntry.columnsLoading = true;
+  renderSurveyFocus();
+  try {
+    await loadColumns();
+  } finally {
+    surveyEntry.columnsLoading = false;
+    renderSurveyFocus();
+  }
 }
 Object.defineProperty(window, 'surveySessionIngress', {
   value: Object.freeze({
@@ -254,13 +267,15 @@ function renderSurveyFocus() {
   const locked = entryHasStatistics();
   const busy = surveyEntryBusy();
   const readonly = state.currentStep > 2;
-  $('qe-data-confirm').toggleAttribute('inert', busy || readonly);
+  const inputLocked = surveyConfirmationIsLocked();
+  $('qe-data-confirm').toggleAttribute('inert', inputLocked);
+  $('qe-columns-status').hidden = !surveyEntry.columnsLoading;
   $('qe-focus-lock').hidden = !locked;
   $('qe-insight-disabled').hidden = !locked;
   document.querySelectorAll('[data-entry-focus]').forEach(button => {
     const key = button.dataset.entryFocus;
     const active = key === surveyEntry.focus;
-    button.disabled = busy || readonly || (locked && key === 'insight');
+    button.disabled = inputLocked || (locked && key === 'insight');
     button.classList.toggle('is-selected', active);
     button.setAttribute('aria-checked', String(active));
     document.querySelector('[data-entry-focus-badge="' + key + '"]').textContent =
@@ -271,11 +286,14 @@ function renderSurveyFocus() {
     .map(([title, text]) => '<div class="qe-outline-row"><strong>' + esc(title) + '</strong><p>' + esc(text) + '</p></div>').join('');
   $('qe-return-upload').disabled = busy || readonly;
   $('btn-start-plan').disabled = busy || readonly || !state.sessionId || (state.mode !== 'crosstab' && !state.columns);
-  $('qe-confirm-action').textContent = busy ? '正在处理…' : '确认并生成分析方案';
+  $('qe-confirm-action').textContent = surveyEntry.columnsLoading
+    ? (state.questionnaireUsed ? '题型读取中，完成后可继续' : '题型识别中，完成后可继续')
+    : (busy ? '正在处理…' : (state.sessionId && state.mode !== 'crosstab' && !state.columns
+      ? '请先完成题型识别' : '确认并生成分析方案'));
 }
 document.querySelectorAll('[data-entry-focus]').forEach(button => {
   button.addEventListener('click', () => {
-    if (surveyEntryBusy() || entryHasStatistics() || state.currentStep > 2) return;
+    if (surveyConfirmationIsLocked() || entryHasStatistics()) return;
     surveyEntry.preferredFocus = button.dataset.entryFocus;
     renderSurveyFocus();
   });
@@ -367,7 +385,7 @@ function resetUploadZone() {
   state.questionnaireUsed = false;
   Object.keys(ENTRY_FILE_RULES).forEach(key => { $('qe-' + key).value = ''; });
   $('qe-focus-preview').open = false;
-  $('context-form-details').open = false;
+  $('context-form-details').open = true;
   $('qe-plan-details').open = false;
   $('qe-focus-status').textContent = '';
   $('qe-plan-settings').hidden = true;

@@ -1,7 +1,9 @@
-"""Static DOM contracts; browser interactions are verified separately."""
+"""DOM contracts and the context draft race; browser flows are verified separately."""
 from html.parser import HTMLParser
 from pathlib import Path
 import re
+import shutil
+import subprocess
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1] / "static"
@@ -64,14 +66,17 @@ class SurveyEntryFrontendContractTests(unittest.TestCase):
         self.assertIn("确认并生成分析方案", HTML)
         self.assertEqual(SURVEY.count("addEventListener('click', () => submitSurveyEntry())"), 1)
 
-    def test_optional_background_preview_and_settings_default_collapsed(self):
+    def test_background_defaults_open_while_preview_and_settings_stay_collapsed(self):
         nodes = Elements().nodes
-        for node_id in ("context-form-details", "qe-focus-preview", "qe-plan-details"):
+        self.assertEqual(nodes["context-form-details"][0], "details")
+        self.assertIn("open", nodes["context-form-details"][1])
+        for node_id in ("qe-focus-preview", "qe-plan-details"):
             self.assertEqual(nodes[node_id][0], "details")
             self.assertNotIn("open", nodes[node_id][1])
         for node_id in ("ctx-problem", "ctx-key-concerns", "ctx-target-users", "ctx-analysis-approach"):
             self.assertEqual(nodes[node_id][0], "textarea")
         self.assertIn("补充调研背景（选填）", HTML)
+        self.assertIn('for="ctx-analysis-approach">期望的分析思路</label>', HTML)
 
     def test_compact_settings_do_not_replace_analysis_thinking(self):
         self.assertLess(HTML.index('id="qe-plan-settings"'), HTML.index('id="plan-card-content"'))
@@ -81,7 +86,7 @@ class SurveyEntryFrontendContractTests(unittest.TestCase):
         self.assertIn("本次分析重点", SURVEY)
 
     def test_single_submit_freezes_input_and_keeps_existing_persistence(self):
-        self.assertIn("toggleAttribute('inert', busy || readonly)", ENTRY)
+        self.assertIn("toggleAttribute('inert', inputLocked)", ENTRY)
         submit = ENTRY.split("async function submitSurveyEntry()", 1)[1].split("function returnToSurveyFocus()", 1)[0]
         self.assertLess(submit.index("entrySetBusy(true)"), submit.index("await fetch("))
         self.assertIn("surveyEntryBusy() || !state.sessionId || state.currentStep > 2", submit)
@@ -91,6 +96,52 @@ class SurveyEntryFrontendContractTests(unittest.TestCase):
         self.assertIn("goStep(2)", back)
         self.assertNotIn("renderColumns", back)
         self.assertNotIn("clearContext", back)
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required for the draft timing regression")
+    def test_column_readiness_preserves_unsaved_input_and_intentionally_cleared_fields(self):
+        script = r"""
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
+const source = fs.readFileSync(process.argv[1], 'utf8');
+const contextCode = source.slice(source.indexOf('const CONTEXT_DRAFT_KEY'),
+  source.indexOf('let duplicateReportResolve'));
+const ids = ['ctx-problem', 'ctx-key-concerns', 'ctx-target-users', 'ctx-analysis-approach'];
+const keys = ['problem', 'key_concerns', 'target_users', 'analysis_approach'];
+const fields = Object.fromEntries(keys.map(key => [key, '旧草稿']));
+for (const text of ['用户刚输入的新内容', '']) {
+  let saved = JSON.stringify({ fileSignature: 'sample', fields });
+  let pending;
+  const elements = { 'context-form-wrap': { style: {} } };
+  for (const id of ids) elements[id] = {
+    value: '旧草稿',
+    addEventListener(name, callback) { this[name] = callback; },
+  };
+  const sandbox = {
+    $: id => elements[id],
+    localStorage: { getItem: () => saved, setItem: (_, value) => { saved = value; } },
+    setTimeout: callback => { pending = callback; return 1; },
+    clearTimeout() {},
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(contextCode, sandbox);
+  vm.runInContext("currentContextFileSignature = 'sample';", sandbox);
+  for (const id of ids) {
+    elements[id].value = text;
+    elements[id].input();
+  }
+  // The SSE callback runs before the 400ms draft save, including while editing.
+  vm.runInContext('refreshContextFormVisibility();', sandbox);
+  for (const id of ids) assert.equal(elements[id].value, text, id);
+  pending();
+  for (const key of keys) assert.equal(JSON.parse(saved).fields[key], text, key);
+}
+"""
+        result = subprocess.run(
+            [shutil.which("node"), "-e", script, str(ROOT / "js/features/survey.js")],
+            capture_output=True, text=True, encoding="utf-8", timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

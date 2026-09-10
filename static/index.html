@@ -14,7 +14,7 @@
   <link rel="stylesheet" href="/static/style.css?v=54" />
   <link rel="stylesheet" href="/static/questionnaire-sources.css?v=1" />
   <link rel="stylesheet" href="/static/report-quick.css?v=1" />
-  <link rel="stylesheet" href="/static/survey-entry.css?v=2" />
+  <link rel="stylesheet" href="/static/survey-entry.css?v=3" />
 </head>
 
 <body>
@@ -266,10 +266,11 @@
             <span class="col-confirm-count" id="col-confirm-count"></span>
           </div>
           <p class="panel__desc" id="qe-confirm-description">请逐一核对题型与中文题名。题型直接影响后续统计口径。</p>
+          <p class="qe-hint" id="qe-columns-status" role="status" hidden>正在准备题型，可先选择报告重心、补充调研背景。</p>
           <div class="col-list" id="col-list"></div>
         </section>
         <div class="context-form-wrap" id="context-form-wrap">
-          <details class="context-form__details" id="context-form-details">
+          <details class="context-form__details" id="context-form-details" open>
             <summary class="context-form__summary">
               <span class="context-form__summary-title"><span class="qe-section-number" aria-hidden="true">3</span>补充调研背景（选填）</span>
               <span class="context-form__summary-hint">补充业务问题和目标用户，让报告更贴近产品决策；不填也可继续</span>
@@ -288,7 +289,7 @@
                 <textarea id="ctx-target-users" rows="2"></textarea>
               </div>
               <div class="context-form__field">
-                <label for="ctx-analysis-approach">期望的分析思路（选填）</label>
+                <label for="ctx-analysis-approach">期望的分析思路</label>
                 <textarea id="ctx-analysis-approach" rows="3"
                   placeholder="例如：围绕玩家决策链路组织结论，并说明问题成因与改进优先级"></textarea>
               </div>
@@ -2002,8 +2003,8 @@
   <!-- app.js 已按业务线拆分;顺序固定:core 最先,各 feature 居中(均含原顺序的初始化代码) -->
   <script src="/static/js/core/core.js?v=34"></script>
   <script src="/static/js/features/report-quick.js?v=1"></script>
-  <script src="/static/js/features/survey.js?v=41"></script>
-  <script src="/static/js/features/survey-entry.js?v=2"></script>
+  <script src="/static/js/features/survey.js?v=42"></script>
+  <script src="/static/js/features/survey-entry.js?v=3"></script>
   <script src="/static/js/features/questionnaire-sources.js?v=2"></script>
   <script src="/static/js/features/report.js?v=45"></script>
   <script src="/static/js/features/profile.js?v=2"></script>

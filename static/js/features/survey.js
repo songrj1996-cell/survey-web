@@ -167,8 +167,8 @@ function refreshContextFormVisibility() {
   const wrap = $('context-form-wrap');
   if (!wrap) return;
   wrap.style.display = '';
-  const draft = loadContextDraftForCurrentFile();
-  if (draft) writeContextForm(draft);
+  // Restore drafts only when initializing an upload. Column readiness must not
+  // overwrite live input with a draft that is still waiting for its save timer.
 }
 
 let duplicateReportResolve = null;
