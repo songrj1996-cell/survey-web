@@ -5,10 +5,12 @@ from datetime import datetime
 import re
 
 from app.core.config import MAX_REPORT_VERSIONS
+from app.services.report_modes import MODE_SNAPSHOT_FIELDS, MODE_OBJECT_FIELDS, resolve_report_mode
 
 
 _VERSION_KINDS = {"initial", "regenerate"}
 _MIRROR_FIELDS = (
+    *MODE_SNAPSHOT_FIELDS,
     "report_md",
     "title",
     "qa_context_md",
@@ -26,10 +28,12 @@ _MIRROR_FIELDS = (
 )
 _TEXT_SNAPSHOT_FIELDS = tuple(
     field for field in _MIRROR_FIELDS
-    if field not in {"qa_messages", "comparison_validation", "report_llm_usage", "report_style", "quick_report_diagnostics"}
+    if field not in {"qa_messages", "comparison_validation", "report_llm_usage", "report_style", "quick_report_diagnostics", *MODE_SNAPSHOT_FIELDS}
 )
-_OPTIONAL_OBJECT_SNAPSHOT_FIELDS = ("report_llm_usage", "quick_report_diagnostics")
+_OPTIONAL_OBJECT_SNAPSHOT_FIELDS = ("report_llm_usage", "quick_report_diagnostics", *MODE_OBJECT_FIELDS)
 _SUMMARY_FIELDS = (
+    "quick_completion_revision",
+    "report_mode", "report_status",
     "version",
     "kind",
     "base_version",
@@ -166,6 +170,11 @@ def _snapshot_from(
         result[field] = deepcopy(value)
 
     result["report_style"] = "quick" if snapshot.get("report_style", fallback.get("report_style")) == "quick" else "full"
+    result["report_mode"] = snapshot.get("report_mode") or (
+        "quick" if result["report_style"] == "quick" else
+        "statistics" if fallback.get("report_mode") == "statistics" or fallback.get("mode") in {"crosstab", "quantitative"} else "insight"
+    )
+    result["report_status"] = "partial" if snapshot.get("report_status", fallback.get("report_status")) == "partial" else "complete"
     if result["report_style"] != "quick":
         result.pop("quick_report_diagnostics", None)
 
@@ -201,7 +210,7 @@ def normalize_report_versions(source: dict) -> list[dict]:
         raise ValueError("report_versions 必须是列表")
 
     versions = [
-        _snapshot_from(item, fallback={"created_at": source.get("created_at", "")})
+        _snapshot_from(item, fallback={"created_at": source.get("created_at", ""), "mode": source.get("mode")})
         for item in raw_versions
     ]
     versions.sort(key=lambda item: item["version"])
@@ -266,6 +275,7 @@ def report_version_summaries(source: dict) -> list[dict]:
             field: deepcopy(snapshot[field])
             for field in _SUMMARY_FIELDS
             if field in snapshot and (field != "report_style" or snapshot[field] == "quick")
+            and (field not in {"report_mode", "report_status"} or "input_snapshot" in snapshot or "quick_summary" in snapshot)
         }
         for snapshot in normalize_report_versions(source)
     ]
@@ -371,7 +381,7 @@ def append_report_version(
         snapshot_fallback = {
             key: value
             for key, value in source.items()
-            if key not in {"report_llm_usage", "quick_report_diagnostics", "report_style"}
+            if key not in {"report_llm_usage", "quick_report_diagnostics", "report_style", *MODE_SNAPSHOT_FIELDS}
         }
     new_snapshot = _snapshot_from(
         snapshot,
@@ -396,6 +406,100 @@ def append_report_version(
     )
     _commit_state(source, state)
     return committed_snapshot
+
+
+def validate_quick_completion_base(base: dict) -> None:
+    """Require every successful question and frozen answer/profile before retry."""
+    frozen = base.get("input_snapshot") or {}
+    questions = (base.get("quick_summary") or {}).get("questions") or []
+    originals = frozen.get("source_questions") or []
+    if resolve_report_mode(base) != "quick" or base.get("report_status") != "partial" or not questions:
+        raise ValueError("所选版本没有可补全的失败题目")
+    if [q.get("question_key") for q in questions] != [q.get("question_key") for q in originals]:
+        raise ValueError("原版本题目资料不完整，无法安全补全")
+    successful = {q["question_key"]: q for q in questions if q.get("status") == "complete"}
+    cached = (base.get("quick_checkpoint") or {}).get("questions") or []
+    if len(cached) != len(successful) or {q.get("question_key"): q for q in cached} != successful:
+        raise ValueError("原版本成功题目缓存不完整，已停止补全，不会重跑成功题目")
+    for question, original in zip(questions, originals):
+        if question.get("sources") != original.get("sources"):
+            raise ValueError("原版本回答与画像不匹配，无法安全补全")
+        if any(not isinstance(row.get("profile"), dict) for row in original.get("sources", [])):
+            raise ValueError("原版本缺少完整画像资料，已停止补全")
+
+
+def _merge_completion_usage(previous: dict, current: dict) -> dict:
+    result = deepcopy(current or previous or {})
+    counts = ("input_tokens", "output_tokens", "total_tokens", "call_count",
+              "usage_reported_call_count", "usage_missing_call_count")
+    def merge(left, right):
+        value = deepcopy(right)
+        for key in counts:
+            value[key] = int(left.get(key) or 0) + int(right.get(key) or 0)
+        for key in ("models_used", "fallback_models_used"):
+            value[key] = list(dict.fromkeys([*(left.get(key) or []), *(right.get(key) or [])]))
+        value.update(active_calls=0, active_models={})
+        return value
+    if previous and current:
+        result["totals"] = merge(previous.get("totals", {}), current.get("totals", {}))
+        left, right = previous.get("phases", {}), current.get("phases", {})
+        result["phases"] = {key: merge(left.get(key, {}), right.get(key, {})) for key in left.keys() | right.keys()}
+    return result
+
+
+def complete_quick_report_version(source: dict, snapshot: dict, *, expected_base: dict) -> dict:
+    """Patch only unfinished questions; reject stale results before mutating source."""
+    from app.services.report_quick_mode import render_quick_report, fill_question_evidence
+    from app.services.report_modes import quick_qa_context
+
+    current = resolve_report_version(source, expected_base["version"])
+    validate_quick_completion_base(current)
+    for field in ("input_snapshot", "quick_summary", "quick_checkpoint", "report_md", "quick_completion_revision"):
+        if current.get(field) != expected_base.get(field):
+            raise ValueError("该版本已更新，本次补全结果未覆盖新进度，请刷新报告")
+    result = deepcopy(snapshot.get("quick_summary") or {})
+    old_questions = current["quick_summary"]["questions"]
+    new_questions = result.get("questions") or []
+    if snapshot.get("input_snapshot") != current["input_snapshot"]:
+        raise ValueError("补全结果的原始回答或画像发生变化，未保存")
+    if [q.get("question_key") for q in new_questions] != [q.get("question_key") for q in old_questions]:
+        raise ValueError("补全结果的题目范围发生变化，未保存")
+    for old, new in zip(old_questions, new_questions):
+        if old.get("status") == "complete" and old != new:
+            raise ValueError("补全结果改动了成功题目，未保存")
+        for field in ("question", "source_order", "sources"):
+            if old.get(field) != new.get(field):
+                raise ValueError("补全结果的回答或画像对应关系发生变化，未保存")
+        for finding in new.get("findings") or []:
+            try:
+                expected = fill_question_evidence([finding], new["sources"])[0]["evidence"]
+            except (KeyError, TypeError):
+                raise ValueError("补全结果的引用不属于原题回答，未保存") from None
+            if finding.get("evidence") != expected:
+                raise ValueError("补全结果的引用原文或画像发生变化，未保存")
+    if result.get("objective_stats") != current["quick_summary"].get("objective_stats"):
+        raise ValueError("补全结果改动了原客观统计，未保存")
+    cached = (snapshot.get("quick_checkpoint") or {}).get("questions") or []
+    successful = {q["question_key"]: q for q in new_questions if q.get("status") == "complete"}
+    if len(cached) != len(successful) or {q.get("question_key"): q for q in cached} != successful:
+        raise ValueError("补全结果的成功题目缓存不完整，未保存")
+    status = "complete" if all(q.get("status") == "complete" for q in new_questions) else "partial"
+    markdown = render_quick_report(result, title=current["title"])
+    if snapshot.get("report_md") != markdown or snapshot.get("report_status") != status:
+        raise ValueError("补全正文或状态与题目结果不一致，未保存")
+    attempts = deepcopy((current.get("quick_report_diagnostics") or {}).get("completion_attempts") or [])
+    attempts.append({"completed_at": snapshot.get("report_completed_at"),
+                     "duration_seconds": snapshot.get("report_duration_seconds"),
+                     "report_status": status, "usage": deepcopy(snapshot.get("report_llm_usage") or {}),
+                     "diagnostics": deepcopy(snapshot.get("quick_report_diagnostics") or {})})
+    fields = {key: deepcopy(snapshot[key]) for key in ("quick_summary", "quick_checkpoint", "report_completed_at") if key in snapshot}
+    fields.update(report_md=markdown, report_status=status,
+                  qa_context_md=quick_qa_context(markdown, current["input_snapshot"]),
+                  quick_completion_revision=int(current.get("quick_completion_revision") or 0) + 1,
+                  report_duration_seconds=float(current.get("report_duration_seconds") or 0) + float(snapshot.get("report_duration_seconds") or 0),
+                  report_llm_usage=_merge_completion_usage(current.get("report_llm_usage"), snapshot.get("report_llm_usage")),
+                  quick_report_diagnostics={**deepcopy(snapshot.get("quick_report_diagnostics") or {}), "completion_attempts": attempts})
+    return update_report_version(source, current["version"], **fields)
 
 
 def update_report_version(source: dict, version, **fields) -> dict:

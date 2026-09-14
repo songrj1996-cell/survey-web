@@ -197,11 +197,12 @@ def partial_rerun_capability(entry: dict, snapshot: dict) -> dict:
         "questions": [],
     }
     if snapshot.get("report_style") == "quick":
-        return {**unavailable, "reason": "快速报告暂不支持按 Part 局部重做，请重新上传并生成新版本。"}
+        return {**unavailable, "reason": "快速总结可使用失败题目重试或整份重新生成。"}
     if (entry.get("mode") or "") in {"comment", "interview", "annotate", "crosstab"}:
         return {**unavailable, "reason": "当前报告类型暂不支持局部重做。"}
-    plan = entry.get("plan")
-    source = entry.get("partial_rerun_source")
+    frozen = snapshot.get("input_snapshot") or {}
+    plan = frozen.get("plan", entry.get("plan"))
+    source = frozen.get("partial_rerun_source", entry.get("partial_rerun_source"))
     artifacts = snapshot.get("analysis_artifacts")
     if not isinstance(plan, dict) or not isinstance(source, dict) or not isinstance(artifacts, dict):
         return unavailable
@@ -349,7 +350,7 @@ def replace_core_block(report_md: str, replacement: str) -> str:
         or not text.endswith("<!--CORE_END-->")
         or text.count("<!--CORE_START-->") != 1
         or text.count("<!--CORE_END-->") != 1
-        or len(re.findall(r"(?m)^## 核心结论[ \t]*$", text)) != 1
+        or len(re.findall(r"(?m)^## (?:核心结论|总体判断)[ \t]*$", text)) != 1
     ):
         raise ValueError("新核心结论未通过严格结构校验")
     pattern = re.compile(

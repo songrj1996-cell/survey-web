@@ -226,12 +226,12 @@ def compute(
     return "\n".join(md_parts).rstrip() + "\n", open_text
 
 
-def collect_open_text(rows: list[list], plan: dict) -> dict[int, list[dict]]:
+def collect_open_text(rows: list[list], plan: dict, *, include_choice_other: bool = False) -> dict[int, list[dict]]:
     """只收集开放题原文池（不做任何数值统计）。
 
     用于「跑数表模式」：数字来自外部跑数表，平台不再自算统计，
     只需把开放题原文按列收集好（结构与 compute() 返回的 open_text 完全一致），
-    交给大样本聚类引擎处理。这样既复用已有收集逻辑，又避开易报错的数值计算。
+    交给大样本聚类引擎处理。快速总结可显式包含已启用的选择题 Other 原文；默认保持原行为。
     """
     if not rows:
         return {}
@@ -252,6 +252,12 @@ def collect_open_text(rows: list[list], plan: dict) -> dict[int, list[dict]]:
             open_text[c["index"]] = _collect_open_text(
                 c["index"], body, headers, mlbb_id_cols + id_cols, profile_cols, segment_cols
             )
+        elif include_choice_other and c["role"] in ("single_choice", "multi_choice"):
+            entries = _collect_choice_other_text(
+                c, body, headers, mlbb_id_cols + id_cols, profile_cols, segment_cols
+            )
+            if entries:
+                open_text[c["index"]] = entries
     return open_text
 
 

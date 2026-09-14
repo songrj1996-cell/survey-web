@@ -18,6 +18,101 @@ from app.services.report_versions import (
 from app.storage import history as history_storage
 
 
+def quick_completion_fixture():
+    from app.services.report_quick_mode import render_quick_report, fill_question_evidence
+    from app.services.report_modes import quick_qa_context
+    from app.services.report_versions import resolve_report_version
+    rows = [{"response_id": "r1", "text": "合成完整回答一", "profile": {"段位": "Gold", "局数": 0}},
+            {"response_id": "r2", "text": "合成完整回答二", "profile": {"段位": "Silver", "新玩家": False}}]
+    originals = [{"question_key": str(i), "question": f"合成题{i}", "source_order": i, "sources": deepcopy(rows)} for i in (1, 2)]
+    finding = {"text": "合成观点", "frequency": "部分提及", "risk": False, "evidence_ids": ["r1", "r2"]}
+    questions = [{**deepcopy(q), "status": "complete" if q["question_key"] == "1" else "failed",
+                  "findings": fill_question_evidence([finding], rows) if q["question_key"] == "1" else []} for q in originals]
+    frozen = {"source_questions": originals, "objective_stats": {"sections": []}}
+    summary = {"questions": questions, "objective_stats": {"sections": []}}
+    def usage(count):
+        values = {"input_tokens": count, "output_tokens": 0, "total_tokens": count, "call_count": 1,
+                  "usage_reported_call_count": 1, "usage_missing_call_count": 0, "models_used": ["synthetic"]}
+        return {"schema_version": 1, "phases": {"themes": deepcopy(values)}, "totals": values}
+    initial = {"report_mode": "quick", "report_style": "quick", "report_status": "partial", "title": "合成报告",
+               "input_snapshot": frozen, "quick_summary": summary, "quick_checkpoint": {"questions": [deepcopy(questions[0])]},
+               "report_duration_seconds": 2, "qa_messages": [{"role": "user", "content": "原有追问"}],
+               "report_llm_usage": usage(7), "quick_report_diagnostics": {"initial": True}}
+    initial["report_md"] = render_quick_report(summary, title=initial["title"])
+    initial["qa_context_md"] = quick_qa_context(initial["report_md"], frozen)
+    entry = {"id": "completion-history", "owner_key": "email:owner@example.com", "mode": "standard", "filename": "synthetic.csv"}
+    append_report_version(entry, initial)
+    base = resolve_report_version(entry, 1)
+    result = deepcopy(initial)
+    result["quick_summary"]["questions"][1].update(status="complete", findings=fill_question_evidence([finding], rows))
+    result.update(report_status="complete", report_duration_seconds=3, report_llm_usage=usage(11), qa_messages=[])
+    result["quick_checkpoint"]["questions"] = deepcopy(result["quick_summary"]["questions"])
+    result["report_md"] = render_quick_report(result["quick_summary"], title=result["title"])
+    for _ in range(4):
+        append_report_version(entry, result, base_version=1)
+    return entry, base, result
+
+
+class QuickCompletionProtectionTests(unittest.TestCase):
+    def test_only_failed_question_changes_and_metadata_is_preserved_at_limit(self):
+        from app.services.report_versions import complete_quick_report_version, resolve_report_version
+        entry, base, result = quick_completion_fixture()
+        other = deepcopy(entry["report_versions"][1:])
+        entry["report_versions"][0]["qa_messages"].append({"role": "assistant", "content": "更新期间已有追问"})
+        saved = complete_quick_report_version(entry, result, expected_base=base)
+        self.assertEqual(saved["version"], 1)
+        self.assertEqual(len(entry["report_versions"]), 5)
+        self.assertEqual(entry["report_versions"][1:], other)
+        self.assertEqual(entry["active_report_version"], 5)
+        self.assertEqual(entry["next_report_version"], 6)
+        self.assertEqual(saved["quick_summary"]["questions"][0], base["quick_summary"]["questions"][0])
+        self.assertEqual(saved["input_snapshot"], base["input_snapshot"])
+        self.assertEqual(len(saved["qa_messages"]), 2)
+        self.assertEqual(saved["report_llm_usage"]["totals"]["total_tokens"], 18)
+        self.assertEqual(saved["report_duration_seconds"], 5)
+        self.assertEqual(saved["created_at"], base["created_at"])
+        self.assertEqual(saved["quick_completion_revision"], 1)
+        self.assertEqual(resolve_report_version(entry, 1), saved)
+
+    def test_rejects_corruption_without_any_mutation(self):
+        from app.services.report_versions import complete_quick_report_version
+        changes = [
+            lambda r: r["quick_summary"]["questions"][0].update(findings=[]),
+            lambda r: r["input_snapshot"]["source_questions"][1]["sources"][0]["profile"].update(段位="Changed"),
+            lambda r: r["quick_summary"]["questions"][1]["sources"][0].update(text="错配原文"),
+            lambda r: r["quick_summary"]["questions"][1]["findings"][0]["evidence"][0].update(text="错配引用"),
+            lambda r: r["quick_summary"]["questions"].pop(),
+            lambda r: r.update(report_md="错误正文"),
+            lambda r: r["quick_summary"].update(objective_stats={"changed": True}),
+            lambda r: r["quick_checkpoint"].update(questions=[]),
+        ]
+        for change in changes:
+            entry, base, result = quick_completion_fixture()
+            before = deepcopy(entry)
+            change(result)
+            with self.assertRaises(ValueError):
+                complete_quick_report_version(entry, result, expected_base=base)
+            self.assertEqual(entry, before)
+
+    def test_stale_result_and_missing_success_or_profile_are_rejected(self):
+        from app.services.report_versions import complete_quick_report_version, validate_quick_completion_base
+        entry, base, result = quick_completion_fixture()
+        entry["report_versions"][0]["quick_completion_revision"] = 1
+        before = deepcopy(entry)
+        with self.assertRaisesRegex(ValueError, "已更新"):
+            complete_quick_report_version(entry, result, expected_base=base)
+        self.assertEqual(entry, before)
+        broken = deepcopy(base)
+        broken["quick_checkpoint"]["questions"] = []
+        with self.assertRaisesRegex(ValueError, "成功题目缓存"):
+            validate_quick_completion_base(broken)
+        broken = deepcopy(base)
+        for collection in (broken["input_snapshot"]["source_questions"], broken["quick_summary"]["questions"]):
+            collection[1]["sources"][0].pop("profile")
+        with self.assertRaisesRegex(ValueError, "画像"):
+            validate_quick_completion_base(broken)
+
+
 def _snapshot(title: str, created_at: str) -> dict:
     return {
         "report_md": f"# {title}\n\n{title}正文",
@@ -58,6 +153,43 @@ def _versioned_session(session_id: str = "version-history-id") -> dict:
     )
     source["next_report_version"] = 6
     return source
+
+
+class QuickCompletionPersistenceTests(unittest.TestCase):
+    def test_atomic_history_failure_concurrency_and_stale_session(self):
+        from pathlib import Path
+        from app.services.report_versions import resolve_report_version
+        from app.services import survey_service
+        entry, base, result = quick_completion_fixture()
+        login = {"email": "owner@example.com"}
+        with tempfile.TemporaryDirectory(prefix="quick-completion-") as folder, patch.object(history_storage, "HISTORY_FILE", os.path.join(folder, "history.json")):
+            history_storage._save_history([entry])
+            original = Path(history_storage.HISTORY_FILE).read_bytes()
+            with patch.object(history_storage.os, "replace", side_effect=OSError("synthetic disk failure")):
+                with self.assertRaises(OSError):
+                    report_history.complete_quick_report_in_history(entry["id"], result, expected_base=base, login=login)
+            self.assertEqual(Path(history_storage.HISTORY_FILE).read_bytes(), original)
+            def complete():
+                try:
+                    report_history.complete_quick_report_in_history(entry["id"], result, expected_base=base, login=login)
+                    return True
+                except ValueError:
+                    return False
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                self.assertEqual(sorted(pool.map(lambda _: complete(), range(2))), [False, True])
+            saved = history_storage._load_history()[0]
+            self.assertEqual(len(saved["report_versions"]), 5)
+            self.assertEqual(resolve_report_version(saved, 1)["quick_completion_revision"], 1)
+            # A stale live reader must not undo the completed version during a later history save.
+            merged = report_history._history_version_source(entry, saved, title=entry["title"], created_at=entry.get("created_at", ""))
+            self.assertEqual(resolve_report_version(merged, 1), resolve_report_version(saved, 1))
+            # Version viewing recovers from authoritative history after a failed session-copy save.
+            with patch.object(survey_service, "get_session", return_value=entry):
+                view = survey_service.get_session_report_version(entry["id"], 1)
+            self.assertEqual(view["report_status"], "complete")
+            from app.services.report_modes import prepare_report_markdown
+            exported = export_history.get_history_export_entry(entry["id"], login, 1)
+            self.assertEqual(exported["report_md"], prepare_report_markdown(resolve_report_version(saved, 1)))
 
 
 class TemporaryHistoryMixin:
@@ -280,6 +412,106 @@ class HistoryVersionIntegrationTests(TemporaryHistoryMixin, unittest.TestCase):
 
 
 class VersionExportTests(TemporaryHistoryMixin, unittest.IsolatedAsyncioTestCase):
+    async def test_outline_uses_selected_version_across_history_and_all_export_formats(self):
+        from pathlib import Path
+        from tests.test_report_quick_outline import outline_fixture
+        from app.services.report_modes import prepare_report_markdown
+        from app.services.report_quick_outline import build_quick_outline
+        snapshot = outline_fixture()
+        entry = {'id': 'outline-history', 'report_no': 'R-001', 'owner_key': 'email:owner@example.com', 'mode': 'standard', 'filename': 'synthetic.csv'}
+        append_report_version(entry, snapshot)
+        newer = deepcopy(snapshot)
+        newer['input_snapshot']['branch_rules'][0]['allowed_options'] = ['另一个版本的人群']
+        append_report_version(entry, newer)
+        history_storage._save_history([entry])
+        before = Path(self.history_file).read_bytes()
+        for version, expected_snapshot in ((1, snapshot), (2, newer)):
+            selected = history_service.get_history_entry(entry['id'], {'email': 'owner@example.com'}, version)
+            self.assertEqual(selected['quick_outline'], build_quick_outline(expected_snapshot))
+            self.assertEqual(selected['report_md'], expected_snapshot['report_md'])
+            with (
+                patch.object(export_download, 'get_session', return_value=entry),
+                patch.object(export_download, 'markdown_to_docx', side_effect=lambda md: md.encode()),
+                patch.object(export_download, 'report_markdown_to_pdf', side_effect=lambda md, mode: md.encode()),
+                patch.object(export_history, 'markdown_to_docx', side_effect=lambda md: md.encode()),
+                patch.object(export_history, 'report_markdown_to_pdf', side_effect=lambda md, mode: md.encode()),
+            ):
+                for scope in ('body', 'evidence'):
+                    expected = prepare_report_markdown(expected_snapshot, scope)
+                    prepared = export_download._prep_export_md(expected, mode='standard')
+                    self.assertEqual((await export_download.prepare_word_download(entry['id'], version, scope))[0], prepared.encode())
+                    self.assertEqual((await export_download.prepare_markdown_download(entry['id'], version, scope))[0], prepared.encode())
+                    self.assertEqual((await export_download.prepare_pdf_download(entry['id'], version, scope))[0], expected.encode())
+                    self.assertEqual(export_download.get_session_export_data(entry['id'], version, scope)[0], expected)
+                    exported = export_history.get_history_export_entry(entry['id'], {'email': 'owner@example.com'}, version, scope)
+                    self.assertEqual(exported['report_md'], expected)
+                    self.assertEqual((await export_history.prepare_word_history_download(entry['id'], {'email': 'owner@example.com'}, version, scope))[0], prepared.encode())
+                    self.assertEqual((await export_history.prepare_markdown_history_download(entry['id'], {'email': 'owner@example.com'}, version, scope))[0], prepared.encode())
+                    self.assertEqual((await export_history.prepare_pdf_history_download(entry['id'], {'email': 'owner@example.com'}, version, scope))[0], expected.encode())
+        self.assertEqual(Path(self.history_file).read_bytes(), before)
+
+    async def test_quick_exports_recover_completed_selected_version_without_writing(self):
+        from pathlib import Path
+        from app.services.report_modes import prepare_report_markdown
+        from app.services.report_versions import resolve_report_version, update_report_version
+        sess, base, result = quick_completion_fixture()
+        update_report_version(sess, 5, title='另一个版本', report_md='# 另一个版本\n\n版本五专有正文')
+        history_storage._save_history([sess])
+        _, completed = report_history.complete_quick_report_in_history(
+            sess['id'], result, expected_base=base, login={'email': 'owner@example.com'})
+        before = deepcopy(sess)
+        history_bytes = Path(self.history_file).read_bytes()
+        # The session still has partial V1; the archive has completed V1 and active V5.
+        self.assertEqual(resolve_report_version(sess, 1)['report_status'], 'partial')
+        self.assertEqual(completed['report_status'], 'complete')
+        with (
+            patch.object(export_download, 'get_session', return_value=sess),
+            patch.object(export_download, 'markdown_to_docx', side_effect=lambda md: ('docx:' + md).encode('utf-8')),
+            patch.object(export_download, 'report_markdown_to_pdf', side_effect=lambda md, mode: ('pdf:' + md).encode('utf-8')),
+        ):
+            for scope in ('body', 'evidence'):
+                with self.subTest(scope=scope):
+                    expected = prepare_report_markdown(completed, scope)
+                    prepared = export_download._prep_export_md(expected, mode=sess['mode'])
+                    word = await export_download.prepare_word_download(sess['id'], '1', scope)
+                    markdown = await export_download.prepare_markdown_download(sess['id'], 1, scope)
+                    pdf = await export_download.prepare_pdf_download(sess['id'], 1, scope)
+                    feishu_md, _ = export_download.get_session_export_data(sess['id'], 1, scope)
+                    self.assertEqual(word[0], ('docx:' + prepared).encode('utf-8'))
+                    self.assertEqual(markdown[0], prepared.encode('utf-8'))
+                    self.assertEqual(pdf[0], ('pdf:' + expected).encode('utf-8'))
+                    self.assertEqual(feishu_md, expected)
+                    self.assertEqual([item[2] for item in (word, markdown, pdf)], ['合成报告'] * 3)
+            selected = export_download._get_session_report_source(sess['id'], 1)
+            self.assertEqual(selected['quick_completion_revision'], 1)
+            self.assertEqual(selected['input_snapshot'], base['input_snapshot'])
+            self.assertEqual(selected['qa_messages'], base['qa_messages'])
+            self.assertEqual(export_download._get_session_report_source(sess['id'])['version'], 5)
+            self.assertIn('版本五专有正文', export_download.get_session_export_data(sess['id'], 5)[0])
+        # A restored job resolves the original history ID, not its temporary session ID.
+        restored = {**deepcopy(sess), 'rerun_target_history_id': sess['id']}
+        with patch.object(export_download, 'get_session', return_value=restored):
+            self.assertEqual(export_download._get_session_report_source('restored-job', 1)['report_md'], completed['report_md'])
+        self.assertEqual(sess, before)
+        self.assertEqual(Path(self.history_file).read_bytes(), history_bytes)
+        self.assertEqual(len(history_storage._load_history()[0]['report_versions']), 5)
+
+    async def test_quick_export_recovery_preserves_owner_and_legacy_boundaries(self):
+        sess, base, _ = quick_completion_fixture()
+        foreign = deepcopy(sess)
+        foreign['owner_key'] = 'email:someone-else@example.com'
+        for archive in ([], [foreign]):
+            with self.subTest(archive=bool(archive)), patch.object(export_download, 'get_session', return_value=sess), patch.object(report_history, '_load_history', return_value=archive):
+                selected = export_download._get_session_report_source(sess['id'], 1)
+                self.assertEqual(selected['report_md'], base['report_md'])
+                self.assertEqual(selected['report_status'], 'partial')
+        with patch.object(export_download, 'get_session', return_value=sess), patch.object(report_history, '_load_history', side_effect=OSError('synthetic unreadable history')):
+            with self.assertRaisesRegex(OSError, 'unreadable history'):
+                export_download.get_session_export_data(sess['id'], 1)
+        legacy = _versioned_session()
+        with patch.object(export_download, 'get_session', return_value=legacy), patch.object(report_history, '_load_history', side_effect=AssertionError('ordinary export must not load history')):
+            self.assertEqual(export_download._get_session_report_source(legacy['id'], 1)['title'], '第一版')
+
     async def test_session_word_pdf_markdown_and_feishu_data_select_version(self):
         sess = _versioned_session()
         identity = lambda report_md, mode: report_md
@@ -413,8 +645,8 @@ class VersionExportTests(TemporaryHistoryMixin, unittest.IsolatedAsyncioTestCase
 
         self.assertEqual(session_result["url"], "https://doc/1")
         self.assertEqual(history_result["url"], "https://doc/2")
-        session_data.assert_called_once_with("session-id", "1")
-        history_data.assert_called_once_with("history-id", login, "2")
+        session_data.assert_called_once_with("session-id", "1", scope="body")
+        history_data.assert_called_once_with("history-id", login, "2", scope="body")
         self.assertEqual(export_to_feishu.await_args_list[0].args[0], "# 第一版")
         self.assertEqual(export_to_feishu.await_args_list[1].args[0], "# 历史第一版")
 
@@ -458,8 +690,8 @@ class VersionExportTests(TemporaryHistoryMixin, unittest.IsolatedAsyncioTestCase
                 "2",
             )
 
-        session_markdown.assert_awaited_once_with("session-id", "1")
-        history_markdown.assert_awaited_once_with("history-id", None, "2")
+        session_markdown.assert_awaited_once_with("session-id", "1", scope="body")
+        history_markdown.assert_awaited_once_with("history-id", None, "2", scope="body")
         self.assertEqual(session_result["filename"], "session.md")
         self.assertEqual(history_result["filename"], "history.md")
 

@@ -6,16 +6,19 @@ from typing import Literal
 # ── 问卷主流程 ──────────────────────────────────────────────
 class ColumnConfirmRequest(BaseModel):
     columns: list[dict]
+    selected_question_keys: list[str] | None = None
 
 
 class SurveyAnalysisSettingsRequest(BaseModel):
-    report_focus: Literal["insight", "statistics"]
+    report_focus: Literal["insight", "statistics"] | None = None
+    report_mode: Literal["quick", "insight", "statistics"] | None = None
 
 
 class PlanConfirmRequest(BaseModel):
     session_id: str
     user_text: str
     report_style: Literal["full", "quick"] = "full"
+    plan: dict | None = None
 
 
 class AnalysisPresetApplyRequest(BaseModel):
@@ -25,6 +28,13 @@ class AnalysisPresetApplyRequest(BaseModel):
 class ReportVersionRequest(BaseModel):
     instruction: str = Field(default="", max_length=4000)
     base_version: int | None = Field(default=None, ge=1)
+    history_id: str | None = Field(default=None, max_length=128)
+
+
+class ReportSourceTranslationRequest(BaseModel):
+    version: int = Field(ge=1)
+    history_id: str | None = Field(default=None, max_length=128)
+    response_ids: list[str] = Field(min_length=1, max_length=50)
 
 
 class PrepareReportRerunRequest(BaseModel):

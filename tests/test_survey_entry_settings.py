@@ -30,6 +30,7 @@ class SurveyEntrySettingsTests(unittest.TestCase):
         before = deepcopy(self.session)
         result = survey_service.set_survey_analysis_settings("entry", "statistics")
         self.assertEqual(result, {
+            "report_mode": "statistics", "pending_report_style": "full",
             "report_focus": "statistics", "analysis_mode": "quantitative",
             "mode": "quantitative", "stats_source": "python",
         })
@@ -126,7 +127,7 @@ class SurveyEntryRouteTests(unittest.IsolatedAsyncioTestCase):
             patch.object(survey, "set_survey_analysis_settings", return_value={"mode": "quantitative"}) as save,
         ):
             result = await survey.update_analysis_settings("owned", SurveyAnalysisSettingsRequest(report_focus="statistics"), object())
-            save.assert_called_once_with("owned", "statistics")
+            save.assert_called_once_with("owned", "statistics", report_mode=None)
             self.assertEqual(result["mode"], "quantitative")
 
 

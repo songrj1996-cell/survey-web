@@ -10,12 +10,11 @@ from unittest.mock import AsyncMock, patch
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
-from app.core.config import DEFAULT_QUICK_WRITER_REQUIREMENTS
 from app.routers import settings_api, survey as survey_router
 from app.schemas.requests import AppSettingsPatch
-from app.services import settings_service, survey_service
+from app.services import report_quick_pipeline, settings_service, survey_service
 from app.storage import settings as settings_storage
-from tests.test_report_quick_mode_flow import _draft
+from tests.test_report_quick_mode_flow import _draft, _quick_runtime, _quick_session
 from tests.test_survey_report_versions import _base_session, _event_payloads, _isolated_report_runtime
 
 
@@ -64,9 +63,22 @@ class QuickReportSettingTests(_IsolatedSettings, unittest.TestCase):
                         self.assertEqual(caught.exception.status_code, 400)
                     self.assertEqual(survey_service._validate_report_style(sess, "full"), "full")
 
-    def test_enabled_does_not_expand_supported_report_types(self):
+    def test_entry_allows_survey_mode_switch_but_rejects_other_report_types(self):
         self.set_enabled(True)
-        for fields in ({"analysis_mode": "quantitative"}, {"mode": "crosstab"},
+        sess = {**_quick_session(), "report_mode": "statistics", "mode": "quantitative",
+                "analysis_mode": "quantitative", "pending_report_style": "full"}
+        with patch.object(survey_service, "get_session", return_value=sess), patch.object(
+            survey_service, "save_session"
+        ) as save:
+            self.assertTrue(survey_service.report_style_options("session")["quick_enabled"])
+            result = survey_service.set_survey_analysis_settings("session", report_mode="quick")
+            self.assertEqual(result["report_mode"], "quick")
+            self.assertEqual(result["analysis_mode"], "qualitative")
+            self.assertEqual(result["pending_report_style"], "quick")
+            self.assertEqual(survey_service._validate_report_style(sess, "quick"), "quick")
+            save.assert_called_once()
+
+        for fields in ({"mode": "crosstab"},
                        {"mode": "comment"}, {"mode": "interview"}, {"mode": "annotate"}):
             sess = {**_base_session(), **fields}
             with self.subTest(fields=fields), patch.object(survey_service, "get_session", return_value=sess):
@@ -130,22 +142,31 @@ class QuickReportRuntimeToggleTests(_IsolatedSettings, unittest.IsolatedAsyncioT
         self.assertFalse(any(event["type"] == "report_done" for event in events))
         self.assertNotIn("report_versions", sess)
 
-    async def test_disabling_during_writing_does_not_change_inflight_report_mode(self):
-        sess = {**_base_session(), "pending_report_style": "quick"}
+    async def test_disabling_during_question_summary_does_not_change_inflight_report_mode(self):
+        sess = _quick_session(two_questions=True)
         self.set_enabled(True)
+        enabled_at_question_start = []
 
-        async def write_then_disable(*args, **kwargs):
+        async def summarize_then_disable(messages, **kwargs):
+            enabled_at_question_start.append(settings_service.is_quick_report_enabled())
             self.set_enabled(False)
-            return _draft(), "mock-model"
+            question = json.loads(messages[1]["content"])
+            return _draft(question["sources"][0]["response_id"]), "mock-model"
 
-        writer = AsyncMock(side_effect=write_then_disable)
-        with _isolated_report_runtime(sess, writer), patch.object(
-            survey_service, "_get_prompt_text", return_value=DEFAULT_QUICK_WRITER_REQUIREMENTS
-        ):
+        collector = AsyncMock(side_effect=summarize_then_disable)
+        with _quick_runtime(sess, collector) as runtime, patch.object(
+            survey_service, "is_quick_report_enabled", side_effect=settings_service.is_quick_report_enabled
+        ), patch.object(report_quick_pipeline, "LLM_QUICK_REPORT_CONCURRENCY", 1):
             events = _event_payloads([event async for event in survey_service.report_stream("quick-inflight", None)])
+            for forbidden in runtime["forbidden"]:
+                forbidden.assert_not_called()
+            runtime["history"].assert_called_once()
         self.assertFalse([event for event in events if event["type"] == "error"], events)
         self.assertTrue(any(event["type"] == "report_done" and event["report_style"] == "quick" for event in events))
-        self.assertEqual(writer.await_count, 1)
+        self.assertEqual(collector.await_count, 2)
+        self.assertEqual(enabled_at_question_start, [True, False])
+        self.assertEqual(sess["report_status"], "complete")
+        self.assertEqual(sess["report_mode"], "quick")
         self.assertFalse(settings_service.is_quick_report_enabled())
 
 

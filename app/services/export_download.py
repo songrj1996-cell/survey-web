@@ -4,8 +4,9 @@ import re
 
 from fastapi import HTTPException
 
-from app.services.report_history import _supports_report_versions
+from app.services.report_history import _supports_report_versions, quick_session_version_source
 from app.services.report_render import _prep_export_md, markdown_to_docx, report_markdown_to_pdf
+from app.services.report_modes import MODE_SNAPSHOT_FIELDS, prepare_report_markdown
 from app.services.report_versions import normalize_report_versions, resolve_report_version
 from app.storage.sessions import get_session
 
@@ -22,6 +23,7 @@ def _get_session_report_source(session_id: str, version=None) -> dict:
     sess = get_session(session_id)
     if not _supports_report_versions(sess) or not normalize_report_versions(sess):
         return sess
+    sess = quick_session_version_source(session_id, sess)
     try:
         selected = resolve_report_version(
             sess,
@@ -29,16 +31,17 @@ def _get_session_report_source(session_id: str, version=None) -> dict:
         )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return {**sess, **selected}
+    return {**{k: v for k, v in sess.items() if k not in MODE_SNAPSHOT_FIELDS}, **selected}
 
 
 async def prepare_word_download(
     session_id: str,
     version=None,
+    scope="body",
 ) -> tuple[bytes, str, str]:
     """返回 (docx_bytes, safe_title, title)。"""
     sess = _get_session_report_source(session_id, version)
-    report_md = sess.get("report_md", "")
+    report_md = prepare_report_markdown(sess, scope)
     if not report_md:
         raise HTTPException(status_code=400, detail="还没有生成报告")
     report_md = _prep_export_md(report_md, mode=sess.get("mode") or "")
@@ -51,10 +54,11 @@ async def prepare_word_download(
 async def prepare_markdown_download(
     session_id: str,
     version=None,
+    scope="body",
 ) -> tuple[bytes, str, str]:
     """返回 (md_bytes, safe_title, title)。"""
     sess = _get_session_report_source(session_id, version)
-    report_md = sess.get("report_md", "")
+    report_md = prepare_report_markdown(sess, scope)
     if not report_md:
         raise HTTPException(status_code=400, detail="还没有生成报告")
     report_md = _prep_export_md(report_md, mode=sess.get("mode") or "")
@@ -65,10 +69,11 @@ async def prepare_markdown_download(
 async def prepare_pdf_download(
     session_id: str,
     version=None,
+    scope="body",
 ) -> tuple[bytes, str, str]:
     """返回 (pdf_bytes, safe_title, title)。"""
     sess = _get_session_report_source(session_id, version)
-    report_md = sess.get("report_md", "")
+    report_md = prepare_report_markdown(sess, scope)
     if not report_md:
         raise HTTPException(status_code=400, detail="还没有生成报告")
     title, safe = _extract_title(report_md)
@@ -79,10 +84,10 @@ async def prepare_pdf_download(
     return pdf_bytes, safe, title
 
 
-def get_session_export_data(session_id: str, version=None) -> tuple[str, str]:
+def get_session_export_data(session_id: str, version=None, scope="body") -> tuple[str, str]:
     """返回 (report_md, mode)，供飞书导出使用。"""
     sess = _get_session_report_source(session_id, version)
-    report_md = sess.get("report_md", "")
+    report_md = prepare_report_markdown(sess, scope)
     if not report_md:
         raise HTTPException(status_code=400, detail="还没有生成报告")
     return report_md, sess.get("mode") or ""

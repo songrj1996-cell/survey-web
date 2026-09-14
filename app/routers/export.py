@@ -3,6 +3,8 @@
 下载内容准备在 services/export_download + export_history；
 飞书导出调用在 services/export_service。
 """
+from typing import Literal
+
 from fastapi import APIRouter, HTTPException, Request
 
 from app.core.responses import _make_download_response
@@ -32,11 +34,12 @@ async def export_word(
     session_id: str,
     request: Request,
     version: str | None = None,
+    scope: Literal["body", "evidence"] = "body",
 ):
     await require_session_request_access(
         request, session_id, login_resolver=_current_login,
     )
-    docx_bytes, safe_title, title = await prepare_word_download(session_id, version)
+    docx_bytes, safe_title, title = await prepare_word_download(session_id, version, scope=scope)
     await audit_log(
         request,
         "report",
@@ -56,11 +59,12 @@ async def export_markdown(
     session_id: str,
     request: Request,
     version: str | None = None,
+    scope: Literal["body", "evidence"] = "body",
 ):
     await require_session_request_access(
         request, session_id, login_resolver=_current_login,
     )
-    md_bytes, safe_title, title = await prepare_markdown_download(session_id, version)
+    md_bytes, safe_title, title = await prepare_markdown_download(session_id, version, scope=scope)
     await audit_log(
         request,
         "report",
@@ -76,11 +80,12 @@ async def export_pdf(
     session_id: str,
     request: Request,
     version: str | None = None,
+    scope: Literal["body", "evidence"] = "body",
 ):
     await require_session_request_access(
         request, session_id, login_resolver=_current_login,
     )
-    pdf_bytes, safe_title, title = await prepare_pdf_download(session_id, version)
+    pdf_bytes, safe_title, title = await prepare_pdf_download(session_id, version, scope=scope)
     await audit_log(
         request,
         "report",
@@ -96,12 +101,14 @@ async def export_word_history(
     history_id: str,
     request: Request,
     version: str | None = None,
+    scope: Literal["body", "evidence"] = "body",
 ):
     login = await _current_login(request)
     docx_bytes, safe_title, title = await prepare_word_history_download(
         history_id,
         login,
         version,
+        scope=scope,
     )
     await audit_log(
         request,
@@ -122,12 +129,14 @@ async def export_markdown_history(
     history_id: str,
     request: Request,
     version: str | None = None,
+    scope: Literal["body", "evidence"] = "body",
 ):
     login = await _current_login(request)
     md_bytes, safe_title, title = await prepare_markdown_history_download(
         history_id,
         login,
         version,
+        scope=scope,
     )
     await audit_log(
         request,
@@ -148,12 +157,14 @@ async def export_pdf_history(
     history_id: str,
     request: Request,
     version: str | None = None,
+    scope: Literal["body", "evidence"] = "body",
 ):
     login = await _current_login(request)
     pdf_bytes, safe_title, title = await prepare_pdf_history_download(
         history_id,
         login,
         version,
+        scope=scope,
     )
     await audit_log(
         request,
@@ -170,6 +181,7 @@ async def export_feishu(
     session_id: str,
     request: Request,
     version: str | None = None,
+    scope: Literal["body", "evidence"] = "body",
 ):
     login = await require_session_request_access(
         request, session_id, login_resolver=_current_login,
@@ -179,7 +191,7 @@ async def export_feishu(
     require_feishu_configured()
     if not login:
         raise HTTPException(status_code=401, detail="请先登录飞书")
-    report_md, mode = get_session_export_data(session_id, version)
+    report_md, mode = get_session_export_data(session_id, version, scope=scope)
     try:
         url = await _export_to_feishu(report_md, login, mode=mode)
     except Exception as e:
@@ -200,12 +212,13 @@ async def export_feishu_history(
     history_id: str,
     request: Request,
     version: str | None = None,
+    scope: Literal["body", "evidence"] = "body",
 ):
     require_feishu_configured()
     login = await _current_login(request)
     if not login:
         raise HTTPException(status_code=401, detail="请先登录飞书")
-    entry = get_history_export_entry(history_id, login, version)
+    entry = get_history_export_entry(history_id, login, version, scope=scope)
     entry_mode = entry.get("mode") or entry.get("plan", {}).get("mode", "")
     try:
         url = await _export_to_feishu(

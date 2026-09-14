@@ -18,11 +18,14 @@ from app.services.report_versions import (
     resolve_report_version,
 )
 from app.services.report_partial_rerun import partial_rerun_capability
+from app.services.report_modes import MODE_SNAPSHOT_FIELDS
+from app.services.report_quick_outline import build_quick_outline
 from app.storage.history import _load_history_with_report_numbers
 from app.storage.sessions import get_session  # kept as a stable patch seam for integrations
 
 
 _SELECTED_VERSION_FIELDS = (
+    *MODE_SNAPSHOT_FIELDS,
     "report_md",
     "title",
     "qa_context_md",
@@ -178,4 +181,5 @@ def get_history_entry(
             "rerun_details": deepcopy(selected.get("rerun_details") or {}),
             "partial_rerun": partial_rerun_capability(entry, selected),
         })
+    result["quick_outline"] = build_quick_outline(result)
     return result

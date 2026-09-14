@@ -40,9 +40,10 @@ from app.core.config import (
     LLM_QA_MODEL,
     LLM_QA_REASONING,
     LLM_REPORT_MODEL,
+    LLM_QUICK_REPORT_MODEL,
+    LLM_QUICK_REPORT_FALLBACK_MODELS,
     LLM_STREAM_HEARTBEAT_SECONDS,
     MAX_REPORT_VERSIONS,
-    LLM_QUICK_REPORT_STAGE_TIMEOUT_SECONDS,
 )
 from app.core.parsing import _parse_file
 from app.core.llm_context import current_llm_api_key
@@ -92,7 +93,6 @@ from app.services.qualitative_viewpoints import (
 )
 from app.services.report_engine import (
     _batch_qualitative_analysis,
-    _build_quick_evidence_catalog,
     _build_analysis_approach_block,
     _build_analysis_focus_block,
     _build_analysis_focus_mode_block,
@@ -131,10 +131,13 @@ from app.services.report_history import (
     DEFAULT_RERUN_VERSION_INSTRUCTION,
     _copy_report_version_state,
     append_exact_rerun_to_history,
+    append_quick_rerun_to_history,
+    complete_quick_report_in_history,
     append_partial_rerun_to_history,
     delete_history_report_version as _delete_history_report_version,
     find_exact_survey_duplicate_entry,
     find_exact_survey_duplicate_report,
+    quick_session_version_source,
     save_to_history,
     sync_exact_rerun_qa_to_history,
 )
@@ -152,6 +155,8 @@ from app.services.report_partial_rerun import (
 )
 from app.services.report_versions import (
     append_report_version,
+    complete_quick_report_version,
+    validate_quick_completion_base,
     delete_report_version,
     normalize_report_versions,
     report_version_summaries,
@@ -159,11 +164,18 @@ from app.services.report_versions import (
     sync_active_report_version,
     update_report_version,
 )
+from app.services.report_modes import (
+    MODE_SNAPSHOT_FIELDS, analysis_columns, collect_source_questions, freeze_report_inputs,
+    inherit_report_inputs, mode_fields, resolve_report_mode, selected_question_keys,
+    report_source_page, evidence_markdown, quick_qa_context, quick_objective_statistics, quick_report_title,
+    source_display_item, source_metadata_needs_backfill, enrich_source_metadata,
+)
+from app.services.report_quick_pipeline import run_quick_pipeline
+from app.services.report_quick_outline import build_quick_outline
 from app.services.session_access import require_session_access
 from app.services.settings_service import get_app_settings, is_quick_report_enabled
 from app.services.report_quick_mode import (
-    supports_quick_report, normalize_report_style, build_quick_query,
-    parse_quick_draft, render_quick_report,
+    supports_quick_report, normalize_report_style, render_quick_report,
 )
 from app.services.report_render import _inject_disclaimer, _inject_research_background
 from app.services.stats_presentation import (
@@ -187,6 +199,7 @@ from app.storage.sessions import get_session, new_session, save_session
 
 
 _REPORT_GENERATION_LOCKS: dict[str, asyncio.Lock] = {}
+_REPORT_CANCEL_EVENTS: dict[str, asyncio.Event] = {}
 _REPORT_RERUN_TARGET_LOCKS: dict[str, asyncio.Lock] = {}
 _NON_VERSIONED_REPORT_MODES = {"comment", "interview", "annotate"}
 _CHINESE_CHARACTER_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
@@ -965,7 +978,7 @@ async def columns_stream(session_id: str, request: Request):
                     ),
                 },
             )
-            yield sse_event({"type": "columns_ready", "columns": questions})
+            yield sse_event({"type": "columns_ready", "columns": _column_display_metadata(sess, questions)})
             return
 
         groups = _group_googleform_matrix(rows[0])
@@ -1041,7 +1054,7 @@ async def columns_stream(session_id: str, request: Request):
             f"会话：{session_id}；识别列数：{len(questions)}",
             metadata={"session_id": session_id, "columns": len(questions)},
         )
-        yield sse_event({"type": "columns_ready", "columns": questions})
+        yield sse_event({"type": "columns_ready", "columns": _column_display_metadata(sess, questions)})
     except Exception as e:
         import traceback; traceback.print_exc()
         yield sse_event({"type": "error", "message": str(e)})
@@ -1050,43 +1063,60 @@ async def columns_stream(session_id: str, request: Request):
 # ── 列确认 ──────────────────────────────────────────────────────
 
 
-def set_survey_analysis_settings(session_id: str, report_focus: str) -> dict:
+def _column_display_metadata(sess: dict, questions: list) -> list:
+    result = deepcopy(questions)
+    body = (sess.get("rows") or [])[1:]
+    for question in result:
+        indexes = question.get("column_indexes") or [question.get("index")]
+        indexes = [i for i in indexes if type(i) is int and i >= 0]
+        count = sum(any(i < len(row) and row[i] is not None and str(row[i]).strip() for i in indexes) for row in body)
+        question["response_count"] = count
+        question["empty_column"] = count == 0
+    return result
+
+
+def set_survey_analysis_settings(session_id: str, report_focus: str | None = None, *, report_mode: str | None = None) -> dict:
     """Persist the report focus without changing the authority of statistics."""
-    if report_focus not in {"insight", "statistics"}:
+    chosen_mode = report_mode or report_focus
+    if chosen_mode not in {"quick", "insight", "statistics"}:
         raise HTTPException(status_code=422, detail="不支持的报告重心")
+    report_focus = "statistics" if chosen_mode == "statistics" else "insight"
     sess = get_session(session_id)
     if sess.get("mode") not in {None, "", "qualitative", "standard", "survey", "quantitative", "crosstab"}:
         raise HTTPException(status_code=400, detail="只有问卷分析任务可以选择报告重心")
     if not sess.get("rows"):
         raise HTTPException(status_code=400, detail="请先上传回答数据")
     external = sess.get("stats_source") == "external_crosstab" or sess.get("mode") == "crosstab"
-    if external and report_focus != "statistics":
+    if external and chosen_mode != "statistics":
         raise HTTPException(status_code=409, detail="已上传专业统计表，报告重心固定为统计解读优先；请返回上传页移除统计表")
-    previous = sess.get("report_focus") or (
-        "statistics" if external or sess.get("mode") == "quantitative" or sess.get("analysis_mode") == "quantitative" else "insight"
-    )
-    if previous != report_focus and (
+    previous = resolve_report_mode(sess)
+    if chosen_mode == "quick" and not is_quick_report_enabled():
+        raise HTTPException(status_code=409, detail="管理员已关闭快速总结，请选择其他报告方式")
+    if previous != chosen_mode and (
         sess.get("plan_approved_at") or sess.get("report_md") or sess.get("stats_md")
         or sess.get("report_versions") or _report_generation_lock(session_id).locked()
     ):
         raise HTTPException(status_code=409, detail="方案已确认或报告已经开始，请重新开始分析后选择报告重心")
-    if previous != report_focus:
+    if previous != chosen_mode:
         # An unapproved draft belongs to its original focus and must be regenerated.
         for key in ("plan", "plan_revision_texts", "current_plan_revision_texts",
                     "preset_plan_revision_texts", "preset_analysis_focus",
                     "applied_analysis_preset_id", "applied_analysis_preset_fingerprint"):
             sess.pop(key, None)
     sess["report_focus"] = report_focus
+    sess.update(mode_fields(chosen_mode))
     sess["analysis_mode"] = "quantitative" if report_focus == "statistics" else "qualitative"
     sess["mode"] = "crosstab" if external else ("quantitative" if report_focus == "statistics" else "standard")
     sess["stats_source"] = "external_crosstab" if external else "python"
     save_session(session_id, sess)
-    return {key: sess[key] for key in ("report_focus", "analysis_mode", "mode", "stats_source")}
+    return {key: sess[key] for key in ("report_mode", "report_focus", "pending_report_style", "analysis_mode", "mode", "stats_source")}
 
 
-def set_survey_columns(session_id: str, columns: list) -> None:
+def set_survey_columns(session_id: str, columns: list, selected: list[str] | None = None) -> None:
     """存储用户确认后的列题型配置。"""
     sess = get_session(session_id)
+    if _report_generation_lock(session_id).locked():
+        raise HTTPException(status_code=409, detail="报告正在生成，暂时不能修改题目")
     columns = _reconcile_matrix_ranking_questions(sess.get("rows") or [], columns)
     previous_fingerprint = str(
         sess.get("analysis_preference_fingerprint")
@@ -1095,6 +1125,11 @@ def set_survey_columns(session_id: str, columns: list) -> None:
         or ""
     ).strip()
     sess["confirmed_columns"] = columns
+    try:
+        sess["selected_question_keys"] = selected_question_keys(columns, selected)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    sess["columns_confirmed_at"] = datetime.now().isoformat(timespec="milliseconds")
     sess["branch_rules"] = infer_branch_rules(sess.get("rows") or [], columns)
     _discard_stale_applied_analysis_preset(
         sess,
@@ -1234,8 +1269,11 @@ def apply_analysis_preset_to_session(
 
 def report_style_options(session_id: str) -> dict:
     sess = get_session(session_id)
-    allowed = supports_quick_report(sess) and is_quick_report_enabled()
-    return {"quick_enabled": allowed, "report_style": sess.get("pending_report_style", "full") if allowed else "full"}
+    external = sess.get("stats_source") == "external_crosstab" or sess.get("mode") == "crosstab"
+    allowed = (not external and sess.get("mode") in {None, "", "qualitative", "standard", "survey", "quantitative"}
+               and is_quick_report_enabled())
+    return {"quick_enabled": allowed, "report_style": "quick" if resolve_report_mode(sess) == "quick" else "full",
+            "report_mode": resolve_report_mode(sess), "fixed_mode": "statistics" if external else None}
 
 
 def _validate_report_style(sess: dict, value) -> str:
@@ -1251,13 +1289,22 @@ def _validate_report_style(sess: dict, value) -> str:
 def confirm_survey_plan(
     session_id: str,
     login: dict | None,
-    *, report_style: str = "full",
+    *, report_style: str = "full", plan: dict | None = None,
 ) -> dict:
     """确认当前方案，并在适用时保存同问卷可复用分析预设。"""
     sess = require_session_access(session_id, login, loader=get_session)
     if _report_generation_lock(session_id).locked():
         raise HTTPException(status_code=409, detail="报告正在生成，不能修改报告模式")
-    sess["pending_report_style"] = _validate_report_style(sess, report_style)
+    chosen = resolve_report_mode(sess) if sess.get("report_mode") else ("quick" if report_style == "quick" else resolve_report_mode(sess))
+    fields = mode_fields(chosen)
+    fields["pending_report_style"] = _validate_report_style(sess, fields["pending_report_style"])
+    sess.update(fields)
+    if plan is not None:
+        try:
+            sess["plan"] = survey_plan.validate_manual_plan(plan, analysis_columns(sess), len((sess.get("rows") or [[]])[0]))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        _ensure_branch_rules(sess)
     sess["plan_approved_at"] = datetime.now().isoformat(timespec="milliseconds")
     save_session(session_id, sess)
     try:
@@ -1369,7 +1416,7 @@ def prepare_duplicate_report_rerun(
             detail="原报告与当前上传数据或确认信息不再完全一致，请重新确认。",
         )
     plan = entry.get("plan")
-    if not isinstance(plan, dict):
+    if not isinstance(plan, dict) and resolve_report_mode(entry) != "quick":
         raise HTTPException(status_code=409, detail="原报告缺少可复用的分析方案")
 
     try:
@@ -1384,12 +1431,24 @@ def prepare_duplicate_report_rerun(
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    if resolve_report_mode(sess) == "quick" and resolve_report_mode(base_snapshot) == "quick":
+        # A re-upload has just passed the confirmation screen. Its confirmed
+        # types must not be replaced by stale definitions from a prior report.
+        sess["rerun_input_snapshot"] = freeze_report_inputs(sess)
+        plan = None
+    elif base_snapshot.get("input_snapshot"):
+        sess = inherit_report_inputs(sess, base_snapshot)
+        plan = sess.get("plan")
+    else:
+        sess.update(mode_fields(resolve_report_mode(base_snapshot)))
+        if sess.get("mode") != "crosstab":
+            sess["analysis_mode"] = "quantitative" if resolve_report_mode(base_snapshot) == "statistics" else "qualitative"
     report_style = _validate_report_style(sess, base_snapshot.get("report_style", "full"))
     supplement = str(instruction or "").strip()
     version_instruction = supplement or DEFAULT_RERUN_VERSION_INSTRUCTION
     target_version = _next_history_version_number(entry, versions)
     sess["plan"] = deepcopy(plan)
-    if isinstance(plan.get("branch_rules"), list):
+    if isinstance(plan, dict) and isinstance(plan.get("branch_rules"), list):
         sess["branch_rules"] = deepcopy(plan["branch_rules"])
     sess.update({
         "pending_report_style": report_style,
@@ -1409,6 +1468,8 @@ def prepare_duplicate_report_rerun(
         "instruction": version_instruction,
         "target_version": target_version,
         "skip_plan": True,
+        "report_mode": resolve_report_mode(sess),
+        "report_style": report_style,
         "plan": deepcopy(plan),
     }
 
@@ -1422,7 +1483,7 @@ async def plan_stream(session_id: str, request: Request):
     if _discard_stale_applied_analysis_preset(sess):
         save_session(session_id, sess)
     rows = sess.get("rows")
-    confirmed_columns = sess.get("confirmed_columns")
+    confirmed_columns = analysis_columns(sess)
     branch_rules = _ensure_branch_rules(sess)
     is_crosstab = sess.get("mode") == "crosstab"
     qualitative_context = sess.get("qualitative_context")
@@ -1830,7 +1891,7 @@ async def plan_revision_stream(session_id: str, user_text: str, request: Request
         new_plan = _normalize_plan_display_texts(new_plan)
 
         if sess.get("confirmed_columns"):
-            new_plan = survey_plan.merge_confirmed_into_plan(new_plan, sess["confirmed_columns"])
+            new_plan = survey_plan.merge_confirmed_into_plan(new_plan, analysis_columns(sess))
         if not analysis_focus_enabled:
             new_plan.pop("analysis_focus", None)
         new_plan["branch_rules"] = branch_rules
@@ -1945,7 +2006,9 @@ async def _answer_qa_direct(
     question: str,
 ) -> tuple[str, str, str]:
     """通过统一直连模型链回答报告追问，并返回实际使用的模型。"""
-    if source.get("rows"):
+    if source.get("input_snapshot") and source.get("qa_context_md"):
+        qa_context = str(source["qa_context_md"])
+    elif source.get("rows"):
         qa_context = _build_qa_context(source)
     else:
         qa_context = str(source.get("qa_context_md") or "").strip()
@@ -1963,7 +2026,421 @@ async def _answer_qa_direct(
     return normalize_glossary_terms(answer), model, qa_context
 
 
-async def report_stream(
+def cancel_report_run(session_id: str) -> dict:
+    event = _REPORT_CANCEL_EVENTS.get(session_id)
+    if event is None:
+        return {"ok": True, "cancelled": False}
+    event.set()
+    return {"ok": True, "cancelled": True}
+
+
+def _report_source_snapshot(session_id: str, *, version=None, history_id: str = "", login=None) -> dict:
+    owner_source = None
+    if history_id:
+        from app.services.history_service import get_history_entry
+        try:
+            snapshot = get_history_entry(history_id, login, version)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if snapshot is None:
+            raise HTTPException(status_code=404, detail="历史记录不存在")
+        owner_source = snapshot
+        if source_metadata_needs_backfill(snapshot) and not snapshot.get("rows"):
+            try:
+                candidate = require_session_access(history_id, login, loader=get_session)
+            except HTTPException:
+                candidate = None
+            if candidate is not None and _history_owner_key(candidate) == _history_owner_key(snapshot):
+                owner_source = candidate
+    else:
+        sess = require_session_access(session_id, login, loader=get_session)
+        sess = _quick_session_version_source(session_id, sess)
+        owner_source = sess
+        try:
+            snapshot = {**resolve_report_version(sess, version), "owner_key": _history_owner_key(sess)}
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return enrich_source_metadata(snapshot, owner_source)
+
+
+def get_report_sources(session_id: str, *, version=None, history_id: str = "", login=None, **page) -> dict:
+    snapshot = _report_source_snapshot(session_id, version=version, history_id=history_id, login=login)
+    return report_source_page(snapshot, **page)
+
+
+async def translate_report_sources(session_id: str, *, version: int, response_ids: list[str],
+                                   history_id: str = "", login=None) -> dict:
+    from app.services.report_source_translation import translate_report_source_items
+    snapshot = _report_source_snapshot(session_id, version=version, history_id=history_id, login=login)
+    questions = (snapshot.get("input_snapshot") or {}).get("source_questions")
+    if questions is None:
+        questions = (snapshot.get("quick_summary") or {}).get("questions") or []
+    sources = {str(item["response_id"]): source_display_item(question, item)
+               for question in questions for item in question.get("sources") or []}
+    ids = list(dict.fromkeys(response_ids))
+    if not ids or len(ids) > 50 or any(ref not in sources for ref in ids):
+        raise HTTPException(status_code=400, detail="所选原文不属于当前报告版本")
+    namespace = json.dumps({"report": history_id or session_id, "version": version,
+                            "owner": _history_owner_key(snapshot)}, sort_keys=True)
+    items = await translate_report_source_items([sources[ref] for ref in ids], namespace=namespace)
+    return {"items": items, "version": version}
+
+
+def prepare_quick_history_session(history_id: str, login, base_version=None) -> str:
+    entry = _find_history_for_login(_load_history(), history_id, login)
+    if not entry:
+        raise HTTPException(status_code=404, detail="历史报告不存在或无权访问")
+    base = resolve_report_version(entry, base_version)
+    if resolve_report_mode(base) != "quick" or not base.get("input_snapshot"):
+        raise HTTPException(status_code=409, detail="此历史版本需要从重新上传数据发起")
+    _validate_report_style({"mode": "standard", "analysis_mode": "qualitative"}, "quick")
+    sess = deepcopy(entry)
+    sess.update(mode_fields("quick"))
+    sess.update({"mode": "standard", "analysis_mode": "qualitative", "quick_history_rerun": True,
+                 "rerun_target_history_id": history_id, "rerun_base_version": base["version"]})
+    _assign_session_owner(sess, login)
+    sid = new_session()
+    save_session(sid, sess)
+    return sid
+
+
+async def report_stream(session_id: str, request: Request, *, instruction: str = "",
+                        base_version: int | None = None, generation_kind: str | None = None,
+                        retry_failed: bool = False):
+    """Select the version's engine before any planner/statistics/writer work; own cancellation."""
+    login = await _current_login(request)
+    sess = require_session_access(session_id, login, loader=get_session)
+    selected = sess
+    target_id = sess.get("rerun_target_history_id")
+    if target_id:
+        owner_source = _find_history_for_login(_load_history(), target_id, login)
+        # Fresh exact-upload sessions use the same ownership and input matcher as preparation.
+        if owner_source is None:
+            owner_source = find_exact_survey_duplicate_entry(sess, login, target_id)
+        if owner_source is None:
+            yield sse_event({"type": "error", "message": "原报告不存在或无权访问"})
+            return
+        if generation_kind != "regenerate" and not retry_failed and sess.get("rerun_completed_at"):
+            yield sse_event({"type": "error", "message": "本次历史重跑已经完成，请选择版本后重新生成"})
+            return
+        selected_base = base_version if generation_kind == "regenerate" or retry_failed else sess.get("rerun_base_version")
+        try:
+            selected = resolve_report_version(owner_source, selected_base)
+        except ValueError as exc:
+            yield sse_event({"type": "error", "message": str(exc)})
+            return
+    elif generation_kind == "regenerate" or retry_failed:
+        try:
+            selected = resolve_report_version(sess, base_version)
+        except ValueError as exc:
+            yield sse_event({"type": "error", "message": str(exc)})
+            return
+    if session_id in _REPORT_CANCEL_EVENTS:
+        yield sse_event({"type": "error", "message": "当前任务正在生成报告"})
+        return
+    cancel = asyncio.Event()
+    _REPORT_CANCEL_EVENTS[session_id] = cancel
+    yield sse_event({"type": "session_ready", "session_id": session_id})
+    queue = asyncio.Queue()
+    engine = _quick_report_stream if resolve_report_mode(selected) == "quick" else _full_report_stream
+    if retry_failed and engine is not _quick_report_stream:
+        _REPORT_CANCEL_EVENTS.pop(session_id, None)
+        yield sse_event({"type": "error", "message": "失败题目重试仅适用于快速总结"})
+        return
+
+    async def pump():
+        try:
+            options = {"instruction": instruction, "base_version": base_version, "generation_kind": generation_kind}
+            if engine is _quick_report_stream:
+                options["retry_failed"] = retry_failed
+            async for event in engine(session_id, request, **options):
+                await queue.put(event)
+        except Exception as exc:
+            await queue.put(sse_event({"type": "error", "message": getattr(exc, "detail", str(exc))}))
+        finally:
+            await queue.put(None)
+
+    task = asyncio.create_task(pump())
+    cancelled = asyncio.create_task(cancel.wait())
+    pending = None
+    try:
+        while True:
+            pending = asyncio.create_task(queue.get())
+            done, _ = await asyncio.wait({pending, cancelled}, timeout=1, return_when=asyncio.FIRST_COMPLETED)
+            while not done:
+                if hasattr(request, "is_disconnected") and await request.is_disconnected():
+                    cancel.set()
+                done, _ = await asyncio.wait({pending, cancelled}, timeout=1, return_when=asyncio.FIRST_COMPLETED)
+            if cancelled in done:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+                retained = []
+                if pending.done() and not pending.cancelled():
+                    retained.append(pending.result())
+                while not queue.empty():
+                    retained.append(queue.get_nowait())
+                saved_partial = False
+                for item in retained:
+                    if item and '"type": "report_done"' in item:
+                        saved_partial = True
+                        yield item
+                if not saved_partial:
+                    yield sse_event({"type": "cancelled", "message": "已停止生成"})
+                break
+            event = pending.result()
+            pending = None
+            if event is None:
+                break
+            yield event
+    finally:
+        for child in (task, cancelled, pending):
+            if child is not None:
+                child.cancel()
+                with suppress(asyncio.CancelledError):
+                    await child
+        _REPORT_CANCEL_EVENTS.pop(session_id, None)
+
+
+async def _quick_report_stream(session_id: str, request: Request, *, instruction: str = "",
+                               base_version=None, generation_kind=None, retry_failed=False):
+    login = await _current_login(request)
+    lock = _report_generation_lock(session_id)
+    if lock.locked():
+        raise ValueError("当前任务正在生成报告")
+    await lock.acquire()
+    target_lock = None
+    pipeline_task = None
+    try:
+        sess = deepcopy(require_session_access(session_id, login, loader=get_session))
+        _assign_session_owner(sess, login)
+        target_id = str(sess.get("rerun_target_history_id") or "")
+        owner_source = sess
+        if target_id:
+            target_lock = _report_rerun_target_lock(target_id)
+            if target_lock.locked():
+                target_lock = None
+                raise ValueError("原报告正在重新生成")
+            await target_lock.acquire()
+            owner_source = (_find_history_for_login(_load_history(), target_id, login)
+                            if sess.get("quick_history_rerun") else find_exact_survey_duplicate_entry(sess, login, target_id))
+            if not owner_source:
+                raise ValueError("原报告与当前上传数据不一致")
+            if generation_kind != "regenerate" and not retry_failed:
+                if sess.get("rerun_completed_at"):
+                    raise ValueError("本次历史重跑已经完成")
+                base_version = sess.get("rerun_base_version")
+                instruction = sess.get("rerun_instruction") or instruction
+        if retry_failed and not target_id:
+            target_lock = _report_rerun_target_lock(session_id)
+            if target_lock.locked():
+                target_lock = None
+                raise ValueError("当前版本正在补全，请等待本次处理完成")
+            await target_lock.acquire()
+            owner_source = _quick_session_version_source(session_id, sess)
+        versions = normalize_report_versions(owner_source)
+        if not retry_failed and len(versions) >= MAX_REPORT_VERSIONS:
+            raise ValueError(f"报告版本已达上限（{MAX_REPORT_VERSIONS} 个）")
+        kind = "regenerate" if target_id or generation_kind == "regenerate" or retry_failed else "initial"
+        base = None
+        if kind == "regenerate":
+            base = resolve_report_version(owner_source, base_version)
+            base_version = base["version"]
+            prepared_input = (deepcopy(sess.get("rerun_input_snapshot"))
+                if target_id and not sess.get("rerun_completed_at") and not retry_failed else None)
+            input_base = {**base, "input_snapshot": prepared_input} if prepared_input else base
+            if not retry_failed and source_metadata_needs_backfill(input_base):
+                # Only a new generation may enrich legacy input. Keep base intact
+                # for the history compare-and-swap and never change retry inputs.
+                metadata_owner = sess
+                if not sess.get("rows") and target_id:
+                    try:
+                        metadata_owner = require_session_access(target_id, login, loader=get_session)
+                    except HTTPException:
+                        metadata_owner = None
+                    if metadata_owner is not None and _history_owner_key(metadata_owner) != _history_owner_key(owner_source):
+                        metadata_owner = None
+                input_base = enrich_source_metadata(input_base, metadata_owner)
+            sess = inherit_report_inputs(sess, input_base)
+        elif versions:
+            raise ValueError("当前任务已有报告，请选择重新生成")
+        else:
+            input_base = None
+        _validate_report_style(sess, "quick")
+        if retry_failed:
+            validate_quick_completion_base(base)
+            # Cancellation may have saved only deterministic statistics, before
+            # the first subjective checkpoint. There is then no success to reuse.
+            previous_questions = (base.get("quick_summary") or {}).get("questions") or []
+            missing_success_checkpoint = (not base.get("quick_checkpoint") and
+                any(q.get("status") == "complete" for q in previous_questions))
+            if base.get("report_status") != "partial" or not previous_questions or missing_success_checkpoint:
+                raise ValueError("所选版本没有可重试的失败题目")
+        questions = deepcopy((input_base or {}).get("input_snapshot", {}).get("source_questions"))
+        if questions is None:
+            questions = collect_source_questions(sess)
+        frozen = deepcopy(input_base["input_snapshot"]) if input_base and input_base.get("input_snapshot") else freeze_report_inputs(sess, questions=questions)
+        started_at = datetime.now()
+        stats_started = time.perf_counter()
+        yield sse_event({"type": "analysis_progress", "phase": "quick_statistics", "status": "running",
+                         "message": "正在计算已选客观题的回答分布和量表统计"})
+        objective_stats = deepcopy(frozen.get("objective_stats"))
+        if objective_stats is None:
+            objective_stats = await asyncio.to_thread(quick_objective_statistics, sess)
+            frozen["objective_stats"] = deepcopy(objective_stats)
+        if not questions and not objective_stats.get("sections"):
+            raise ValueError(objective_stats.get("warning") or "快速总结需要至少选择一道可分析的题目")
+        stats_elapsed = round(time.perf_counter() - stats_started, 3)
+        objective_count = len(objective_stats.get("sections") or [])
+        yield sse_event({"type": "analysis_progress", "phase": "quick_statistics", "status": "complete",
+                         "message": f"已完成 {objective_count} 道客观题统计" if objective_count else "无需计算客观题统计",
+                         "completed": objective_count, "total": objective_count})
+        if not retry_failed:
+            frozen["summary_instruction"] = str(instruction or "").strip()
+        initial_checkpoint_session = deepcopy(require_session_access(session_id, login, loader=get_session))
+        initial_checkpoint_session["quick_run_checkpoint"] = deepcopy(base.get("quick_checkpoint") or {}) if retry_failed else {}
+        initial_checkpoint_session["quick_run_input_snapshot"] = deepcopy(frozen)
+        save_session(session_id, initial_checkpoint_session)
+        progress = asyncio.Queue()
+        tracker = _ReportLLMUsageTracker()
+
+        async def on_progress(event):
+            await progress.put(event)
+
+        async def on_checkpoint(checkpoint):
+            latest = deepcopy(require_session_access(session_id, login, loader=get_session))
+            latest["quick_run_checkpoint"] = deepcopy(checkpoint)
+            save_session(session_id, latest)
+
+        async def collect(messages, **kwargs):
+            if retry_failed:
+                question_key = json.loads(messages[-1]["content"]).get("question_key")
+                failed_keys = {q["question_key"] for q in base["quick_summary"]["questions"] if q.get("status") != "complete"}
+                if question_key not in failed_keys:
+                    raise ValueError("补全请求涉及成功题目，已阻止模型调用")
+            local_callback = kwargs.get("on_attempt_event")
+            tracking_callback = tracker.callback("themes")
+            primary_model = LLM_QUICK_REPORT_MODEL or next(iter(LLM_QUICK_REPORT_FALLBACK_MODELS), "")
+            requested_models = kwargs.get("models") or ()
+            selected_fallback = bool(primary_model and requested_models and requested_models[0] != primary_model)
+            async def combined(event):
+                # The quick pipeline selects models across separately bounded
+                # requests; retain that fallback attribution in the usage panel.
+                if selected_fallback:
+                    event = {**event, "fallback": True}
+                tracking_callback(event)
+                if local_callback:
+                    callback_result = local_callback(event)
+                    if hasattr(callback_result, "__await__"):
+                        await callback_result
+            kwargs["on_attempt_event"] = combined
+            return await collect_chat_completion(messages, **kwargs)
+
+        prompts = {key: _get_prompt_text(key) for key in
+                   ("quick_question_summary_system", "quick_batch_summary_system", "quick_question_merge_system")}
+        background = json.dumps({"context": sess.get("qualitative_context") or {},
+                                 "summary_instruction": frozen.get("summary_instruction", "")}, ensure_ascii=False, sort_keys=True)
+        pipeline_task = asyncio.create_task(run_quick_pipeline(
+            questions, background=background,
+            checkpoint=base.get("quick_checkpoint") if retry_failed else None,
+            retry_failed=bool(retry_failed and base.get("quick_checkpoint")), on_progress=on_progress, on_checkpoint=on_checkpoint,
+            collect=collect, prompts=prompts,
+        ))
+        yield sse_event({"type": "progress", "message": "开始按题目顺序整理全部主观回复"})
+        try:
+            while not pipeline_task.done():
+                try:
+                    update = await asyncio.wait_for(progress.get(), timeout=1)
+                    yield sse_event({"type": "analysis_progress", "phase": "quick_questions", **update})
+                except TimeoutError:
+                    yield sse_event({"type": "heartbeat"})
+            result = pipeline_task.result()
+        except asyncio.CancelledError:
+            pipeline_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await pipeline_task
+            latest_checkpoint = require_session_access(session_id, login, loader=get_session).get("quick_run_checkpoint") or {}
+            completed = {item["question_key"]: item for item in latest_checkpoint.get("questions") or []}
+            if not completed and not objective_count and not latest_checkpoint.get("steps"):
+                raise
+            stopped_questions = [deepcopy(completed.get(question["question_key"]) or
+                {**question, "status": "failed", "findings": [], "error": "cancelled"}) for question in questions]
+            result = {"questions": stopped_questions, "report_status": "complete" if len(completed) == len(questions) else "partial", "checkpoint": latest_checkpoint,
+                      "diagnostics": {"stop_reason": "cancelled", "completed_questions": len(completed),
+                                      "failed_questions": len(questions) - len(completed)}}
+        while not progress.empty():
+            yield sse_event({"type": "analysis_progress", "phase": "quick_questions", **progress.get_nowait()})
+        result["objective_stats"] = objective_stats
+        result["diagnostics"]["objective_statistics_seconds"] = stats_elapsed
+        result["diagnostics"]["objective_questions"] = objective_count
+        report_title = quick_report_title(sess, base)
+        markdown = render_quick_report(result, title=report_title)
+        tracker.finalize_open_attempts()
+        timing = {"plan_approved_at": started_at.isoformat(timespec="milliseconds"),
+                  "report_completed_at": datetime.now().isoformat(timespec="milliseconds"),
+                  "report_duration_seconds": round((datetime.now() - started_at).total_seconds(), 3)}
+        snapshot = {"report_mode": "quick", "report_style": "quick", "report_status": result["report_status"],
+                    "report_md": markdown, "title": report_title, "input_snapshot": frozen, "quick_summary": result,
+                    "quick_checkpoint": result.get("checkpoint") or {},
+                    "quick_report_diagnostics": result["diagnostics"], "report_llm_usage": tracker.snapshot(),
+                    "qa_context_md": quick_qa_context(markdown, frozen),
+                    "qa_messages": [], "report_writer_provider": "direct_llm", **timing}
+        latest = deepcopy(require_session_access(session_id, login, loader=get_session))
+        precommit = deepcopy(latest)
+        latest.update(mode_fields("quick"))
+        latest.update(timing)
+        if retry_failed:
+            history_id = target_id or session_id
+            history_entry = _find_history_for_login(_load_history(), history_id, login)
+            if history_entry:
+                committed_entry, version = complete_quick_report_in_history(
+                    history_id, snapshot, expected_base=base, login=login)
+                _copy_report_version_state(latest, committed_entry)
+                try:
+                    save_session(session_id, latest)
+                except Exception:
+                    # The history commit already succeeded. Reads recover from
+                    # its newer revision; never roll back a published result.
+                    pass
+            elif target_id:
+                raise ValueError("历史报告已不存在，补全结果未保存")
+            else:
+                version = complete_quick_report_version(latest, snapshot, expected_base=base)
+                try:
+                    save_session(session_id, latest)
+                    save_to_history(session_id, latest)
+                except Exception:
+                    save_session(session_id, precommit)
+                    raise
+        elif target_id:
+            committed_entry, version = append_quick_rerun_to_history(target_id, snapshot,
+                base_version=base_version, expected_input=base["input_snapshot"], instruction=instruction, login=login)
+            _copy_report_version_state(latest, committed_entry)
+            latest["rerun_completed_at"] = datetime.now().isoformat(timespec="seconds")
+            save_session(session_id, latest)
+        else:
+            version = append_report_version(latest, snapshot, kind=kind, base_version=base_version, instruction=instruction)
+            try:
+                save_session(session_id, latest)
+                save_to_history(session_id, latest)
+            except Exception:
+                save_session(session_id, precommit)
+                raise
+        yield sse_event({"type": "report_done", **_session_report_version_payload(latest), **version,
+                         "quick_outline": build_quick_outline(version),
+                         "completion": bool(retry_failed),
+                         **({"history_id": target_id} if target_id else {})})
+    finally:
+        if pipeline_task is not None and not pipeline_task.done():
+            pipeline_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await pipeline_task
+        if target_lock is not None:
+            target_lock.release()
+        lock.release()
+
+
+async def _full_report_stream(
     session_id: str,
     request: Request,
     *,
@@ -2034,9 +2511,9 @@ async def report_stream(
         prompt_instruction = str(instruction or "").strip()
         version_instruction = prompt_instruction
         if rerun_history_id:
-            if generation_kind not in (None, "initial"):
-                raise ValueError("历史重跑只能从数据确认流程发起")
-            if sess.get("rerun_completed_at"):
+            if generation_kind not in (None, "initial", "regenerate"):
+                raise ValueError("不支持的报告生成类型")
+            if generation_kind != "regenerate" and sess.get("rerun_completed_at"):
                 raise ValueError("本次历史重跑已经完成，请到原报告查看新版本")
             rerun_target_lock = _report_rerun_target_lock(rerun_history_id)
             if rerun_target_lock.locked():
@@ -2050,17 +2527,20 @@ async def report_stream(
             )
             if not rerun_entry:
                 raise ValueError("原报告与当前上传数据或确认信息不再完全一致")
-            if not isinstance(plan, dict) or plan != rerun_entry.get("plan"):
-                raise ValueError("当前分析方案与原报告不一致，请重新确认")
             existing_versions = normalize_report_versions(rerun_entry)
             resolved_kind = "regenerate"
             try:
-                resolved_base_version = int(sess.get("rerun_base_version"))
+                resolved_base_version = int(base_version or resolve_report_version(rerun_entry)["version"]) if generation_kind == "regenerate" else int(sess.get("rerun_base_version"))
             except (TypeError, ValueError) as exc:
                 raise ValueError("历史重跑缺少基础版本") from exc
             base_snapshot = resolve_report_version(rerun_entry, resolved_base_version)
+            expected_plan = (base_snapshot.get("input_snapshot") or {}).get("plan", rerun_entry.get("plan"))
+            if not isinstance(expected_plan, dict):
+                raise ValueError("所选版本缺少分析方案，请重新确认")
+            plan = deepcopy(expected_plan)
+            sess["plan"] = plan
             requested_report_style = base_snapshot.get("report_style", "full")
-            prompt_instruction = str(sess.get("rerun_supplement") or "").strip()
+            prompt_instruction = str(instruction if generation_kind == "regenerate" else sess.get("rerun_supplement") or "").strip()
             version_instruction = (
                 str(sess.get("rerun_instruction") or "").strip()
                 or DEFAULT_RERUN_VERSION_INSTRUCTION
@@ -2085,6 +2565,18 @@ async def report_stream(
                 requested_report_style = base_snapshot.get("report_style", "full")
 
         # 重生成沿用基础版本的模式，不能被新会话默认值或旧选择覆盖。
+        if resolved_kind == "regenerate" and base_snapshot.get("input_snapshot"):
+            sess = inherit_report_inputs(sess, base_snapshot)
+            plan, rows, stats_md = sess.get("plan"), sess.get("rows"), sess.get("stats_md")
+            open_text = survey_stats.collect_open_text(rows, plan, include_choice_other=True)
+            sess["open_text"] = open_text
+            is_crosstab = sess.get("mode") == "crosstab"
+            quantitative_first = sess.get("analysis_mode") == "quantitative" or is_crosstab
+            qualitative_context = sess.get("qualitative_context")
+            use_large_mode = is_crosstab or any(len(v) > LARGE_SAMPLE_THRESHOLD for v in open_text.values())
+        frozen_inputs = freeze_report_inputs(sess)
+        run_input_session = deepcopy(sess)
+        concise_insight = sess.get("report_mode") == "insight" and not quantitative_first
         report_style = _validate_report_style(sess, requested_report_style)
 
         if len(existing_versions) >= MAX_REPORT_VERSIONS:
@@ -2236,63 +2728,6 @@ async def report_stream(
             diagnostic_session["report_viewpoint_diagnostics"] = viewpoint_diagnostics
             save_session(session_id, diagnostic_session)
 
-        async def _quick_write():
-            nonlocal quick_diagnostics, writer_context_included
-            started = time.monotonic()
-            catalog = _build_quick_evidence_catalog(
-                stats_md, open_text, plan, clustered_themes, report_viewpoints, cluster_diagnostics,
-            )
-            writer_context_included = bool(viewpoint_stats_md)
-            quick_diagnostics = {
-                "schema_version": 1, "status": "running", "catalog_count": len(catalog),
-                "stage_budget_seconds": LLM_QUICK_REPORT_STAGE_TIMEOUT_SECONDS,
-                "logical_calls": 0, "planned_logical_calls": 1, "max_logical_calls": 2,
-                "input_char_count": 0, "output_char_count": 0, "stop_reason": "",
-            }
-            messages = [{"role": "system", "content": _get_prompt_text("quick_writer_requirements")}]
-            query = build_quick_query(catalog, context=qualitative_context,
-                                      focus=plan.get("analysis_focus"), instruction=prompt_instruction)
-            quick_diagnostics["input_char_count"] = len(query)
-            try:
-                async with asyncio.timeout(LLM_QUICK_REPORT_STAGE_TIMEOUT_SECONDS):
-                    for attempt in range(2):
-                        quick_diagnostics["logical_calls"] += 1
-                        async for event in _writer_call(query, messages=messages, step="quick_report" if not attempt else "quick_repair"):
-                            yield event
-                        answer, model = _writer_call.out
-                        writer_models_used.append(model)
-                        quick_diagnostics["output_char_count"] = len(answer)
-                        try:
-                            draft = parse_quick_draft(answer, catalog)
-                        except ValueError as exc:
-                            if attempt:
-                                raise
-                            quick_diagnostics["repair_reason"] = str(exc)
-                            yield sse_event({"type": "progress", "message": "快速报告结构或证据引用未通过检查，正在执行一次修复…"})
-                            query = f"上轮未通过校验：{exc}。请按原契约重新返回完整JSON，不能省略已要求的字段。"
-                            continue
-                        markdown, metrics = render_quick_report(draft, catalog)
-                        quick_diagnostics.update(metrics)
-                        quick_diagnostics.update(status="completed", stop_reason="validated", report_char_count=len(markdown))
-                        _quick_write.out = markdown
-                        for event in _content_events(markdown):
-                            yield event
-                        return
-            except BaseException as exc:
-                quick_diagnostics.update(status="failed", stop_reason="timeout" if isinstance(exc, TimeoutError) else "cancelled" if isinstance(exc, asyncio.CancelledError) else "validation_or_upstream_failure")
-                if isinstance(exc, TimeoutError):
-                    raise ValueError("快速报告写作超过阶段预算，本次未保存为成功报告") from exc
-                raise
-            finally:
-                quick_diagnostics["elapsed_seconds"] = round(time.monotonic() - started, 3)
-                if quick_diagnostics["status"] == "failed":
-                    diagnostic_session = deepcopy(sess)
-                    diagnostic_session["last_quick_report_failure"] = {
-                        **deepcopy(quick_diagnostics),
-                        "report_llm_usage": report_llm_usage.snapshot(),
-                    }
-                    save_session(session_id, diagnostic_session)
-
         yield _report_llm_status_event()
 
         if use_large_mode:
@@ -2425,59 +2860,53 @@ async def report_stream(
             )
             _persist_synthesis_failure_diagnostics()
 
-            if report_style == "quick":
-                yield _analysis_progress("writing", "active", "正在精写核心判断与关键发现，完整证据将保留在附录", next_steps=["校验并保存"])
-                async for event in _quick_write():
-                    yield event
-                full_report = _quick_write.out
-                yield _analysis_progress("writing", "completed", "快速报告正文与证据附录已生成")
-            else:
-                yield _analysis_progress(
-                    "writing",
-                    "active",
-                    "主题材料已准备完成，正在撰写报告正文",
-                    next_steps=["校验并保存"],
-                )
-                writer_query = _build_large_sample_writer_query(
-                    stats_md, clustered_themes, plan, rows[0], open_text,
-                    qualitative_context=qualitative_context,
-                    quantitative_first=quantitative_first,
-                    viewpoint_stats_md=viewpoint_stats_md,
-                )
+            yield _analysis_progress(
+                "writing",
+                "active",
+                "主题材料已准备完成，正在撰写报告正文",
+                next_steps=["校验并保存"],
+            )
+            writer_query = _build_large_sample_writer_query(
+                stats_md, clustered_themes, plan, rows[0], open_text,
+                qualitative_context=qualitative_context,
+                quantitative_first=quantitative_first,
+                concise_insight=concise_insight,
+                viewpoint_stats_md=viewpoint_stats_md,
+            )
+            writer_query = (
+                _build_report_generation_instruction_block(prompt_instruction)
+                + writer_query
+            )
+            if quantitative_first:
                 writer_query = (
-                    _build_report_generation_instruction_block(prompt_instruction)
+                    "<quantitative_report_rule>本报告以客观题统计为主、开放题分析为辅。"
+                    "正文必须优先解释关键分布和显著差异；完整逐题统计表将由系统确定性追加，"
+                    "不要自行重算或改写表内数字。</quantitative_report_rule>\n\n"
                     + writer_query
                 )
-                if quantitative_first:
+            if is_crosstab:
+                q_text = (sess.get("questionnaire_text") or "").strip()
+                if q_text:
+                    if len(q_text) > 8000:
+                        q_text = q_text[:8000] + "\n…（问卷过长，已截断）"
                     writer_query = (
-                        "<quantitative_report_rule>本报告以客观题统计为主、开放题分析为辅。"
-                        "正文必须优先解释关键分布和显著差异；完整逐题统计表将由系统确定性追加，"
-                        "不要自行重算或改写表内数字。</quantitative_report_rule>\n\n"
-                        + writer_query
+                        f"<questionnaire>\n以下是问卷原文（仅供理解题目意图与背景，"
+                        f"不要直接搬运）：\n{q_text}\n</questionnaire>\n\n" + writer_query
                     )
-                if is_crosstab:
-                    q_text = (sess.get("questionnaire_text") or "").strip()
-                    if q_text:
-                        if len(q_text) > 8000:
-                            q_text = q_text[:8000] + "\n…（问卷过长，已截断）"
-                        writer_query = (
-                            f"<questionnaire>\n以下是问卷原文（仅供理解题目意图与背景，"
-                            f"不要直接搬运）：\n{q_text}\n</questionnaire>\n\n" + writer_query
-                        )
-                writer_context_included = bool(
-                    viewpoint_stats_md and viewpoint_stats_md in writer_query
-                )
-                async for heartbeat in _writer_call(writer_query, step="large_sample_report"):
-                    yield heartbeat
-                full_report, model_used = _writer_call.out
-                writer_models_used.append(model_used)
-                yield _analysis_progress(
-                    "writing",
-                    "completed",
-                    "报告正文已生成，准备校验并保存",
-                )
-                for event in _content_events(full_report):
-                    yield event
+            writer_context_included = bool(
+                viewpoint_stats_md and viewpoint_stats_md in writer_query
+            )
+            async for heartbeat in _writer_call(writer_query, step="large_sample_report"):
+                yield heartbeat
+            full_report, model_used = _writer_call.out
+            writer_models_used.append(model_used)
+            yield _analysis_progress(
+                "writing",
+                "completed",
+                "报告正文已生成，准备校验并保存",
+            )
+            for event in _content_events(full_report):
+                yield event
         else:
             clustered_themes: dict = {}
             cluster_diagnostics: dict = {}
@@ -2599,100 +3028,96 @@ async def report_stream(
             )
             _persist_synthesis_failure_diagnostics()
 
-            if report_style == "quick":
-                yield _analysis_progress("writing", "active", "正在精写核心判断与关键发现，完整证据将保留在附录", next_steps=["校验并保存"])
-                async for event in _quick_write():
-                    yield event
-                full_report = _quick_write.out
-                yield _analysis_progress("writing", "completed", "快速报告正文与证据附录已生成")
-            else:
-                yield _analysis_progress(
-                    "writing",
-                    "active",
-                    "分析材料已准备完成，开始分章撰写报告",
-                    next_steps=["校验并保存"],
-                )
-                parts_meta = _writer_parts_meta(plan, rows[0])
-                writer_instruction_block = _build_report_generation_instruction_block(
-                    prompt_instruction
-                )
-                part_stats_by_title = render_qualitative_stats_by_part(stats_md, plan)
-                summary_stats_blocks = [
-                    _writer_stats_metadata(stats_md),
-                    *part_stats_by_title.values(),
-                ]
-                summary_stats_md = "\n\n".join(
-                    block for block in summary_stats_blocks if str(block or "").strip()
-                ) or str(stats_md or "")
+            yield _analysis_progress(
+                "writing",
+                "active",
+                "分析材料已准备完成，开始分章撰写报告",
+                next_steps=["校验并保存"],
+            )
+            parts_meta = _writer_parts_meta(plan, rows[0])
+            writer_instruction_block = _build_report_generation_instruction_block(
+                prompt_instruction
+            )
+            part_stats_by_title = render_qualitative_stats_by_part(stats_md, plan)
+            summary_stats_blocks = [
+                _writer_stats_metadata(stats_md),
+                *part_stats_by_title.values(),
+            ]
+            summary_stats_md = "\n\n".join(
+                block for block in summary_stats_blocks if str(block or "").strip()
+            ) or str(stats_md or "")
 
-                async def _round(
-                    query: str, messages: list[dict], *, step: str, part_index: int | None = None,
+            async def _round(
+                query: str, messages: list[dict], *, step: str, part_index: int | None = None,
+            ):
+                async for heartbeat in _writer_call(
+                    query, messages=messages, step=step, part_index=part_index,
                 ):
-                    async for heartbeat in _writer_call(
-                        query, messages=messages, step=step, part_index=part_index,
-                    ):
-                        yield heartbeat
-                    text, model = _writer_call.out
-                    writer_models_used.append(model)
-                    for event in _content_events(text):
-                        yield event
-                    _round.out = text
+                    yield heartbeat
+                text, model = _writer_call.out
+                writer_models_used.append(model)
+                for event in _content_events(text):
+                    yield event
+                _round.out = text
 
-                total_rounds = len(parts_meta) + 4
+            total_rounds = len(parts_meta) + (2 if concise_insight else 4)
+            yield sse_event({"type": "progress",
+                             "message": f"分章生成 1/{total_rounds}：准备数据并生成标题…"})
+            first_q = _build_writer_first_query(
+                stats_md,
+                open_text,
+                plan,
+                rows[0],
+                qualitative_context=qualitative_context,
+                analysis_focus=analysis_focus,
+                viewpoint_stats_md=viewpoint_stats_md,
+            )
+            first_q = writer_instruction_block + first_q
+            async for ev in _round(first_q, _new_writer_messages(), step="title"):
+                yield ev
+            title_text = _round.out
+            title_lines = []
+            for ln in title_text.split("\n"):
+                if ln.lstrip().startswith("## "):
+                    break
+                title_lines.append(ln)
+            title_block = "\n".join(title_lines).strip() or title_text.strip()
+
+            part_sections: list[str] = []
+            for m in parts_meta:
+                rnd = m["i"] + 1
                 yield sse_event({"type": "progress",
-                                 "message": f"分章生成 1/{total_rounds}：准备数据并生成标题…"})
-                first_q = _build_writer_first_query(
-                    stats_md,
-                    open_text,
-                    plan,
-                    rows[0],
+                                 "message": f"分章生成 {rnd}/{total_rounds}：Part {m['i']} {m['name']}…"})
+                yield sse_event({"type": "chunk", "content": "\n\n"})
+                part_title = f"Part {m['i']} {m['name']}"
+                part_viewpoint_stats_md = render_viewpoint_stats(
+                    clustered_themes,
+                    report_viewpoints,
+                    part_index=m["i"],
+                )
+                part_query = writer_instruction_block + _build_writer_part_context_query(
+                    m,
+                    part_stats_md=part_stats_by_title.get(part_title, ""),
+                    open_text=open_text,
+                    plan=plan,
+                    headers=rows[0],
                     qualitative_context=qualitative_context,
                     analysis_focus=analysis_focus,
-                    viewpoint_stats_md=viewpoint_stats_md,
+                    viewpoint_stats_md=part_viewpoint_stats_md,
+                    quantitative_first=quantitative_first,
+                    concise_insight=concise_insight,
                 )
-                first_q = writer_instruction_block + first_q
-                async for ev in _round(first_q, _new_writer_messages(), step="title"):
+                if viewpoint_stats_md and "<subjective_viewpoint_stats>" in part_viewpoint_stats_md:
+                    writer_context_included = True
+                async for ev in _round(
+                    part_query, _new_writer_messages(), step="part", part_index=m["i"],
+                ):
                     yield ev
-                title_text = _round.out
-                title_lines = []
-                for ln in title_text.split("\n"):
-                    if ln.lstrip().startswith("## "):
-                        break
-                    title_lines.append(ln)
-                title_block = "\n".join(title_lines).strip() or title_text.strip()
+                sec = _round.out
+                part_sections.append(sec.strip())
 
-                part_sections: list[str] = []
-                for m in parts_meta:
-                    rnd = m["i"] + 1
-                    yield sse_event({"type": "progress",
-                                     "message": f"分章生成 {rnd}/{total_rounds}：Part {m['i']} {m['name']}…"})
-                    yield sse_event({"type": "chunk", "content": "\n\n"})
-                    part_title = f"Part {m['i']} {m['name']}"
-                    part_viewpoint_stats_md = render_viewpoint_stats(
-                        clustered_themes,
-                        report_viewpoints,
-                        part_index=m["i"],
-                    )
-                    part_query = writer_instruction_block + _build_writer_part_context_query(
-                        m,
-                        part_stats_md=part_stats_by_title.get(part_title, ""),
-                        open_text=open_text,
-                        plan=plan,
-                        headers=rows[0],
-                        qualitative_context=qualitative_context,
-                        analysis_focus=analysis_focus,
-                        viewpoint_stats_md=part_viewpoint_stats_md,
-                        quantitative_first=quantitative_first,
-                    )
-                    if viewpoint_stats_md and "<subjective_viewpoint_stats>" in part_viewpoint_stats_md:
-                        writer_context_included = True
-                    async for ev in _round(
-                        part_query, _new_writer_messages(), step="part", part_index=m["i"],
-                    ):
-                        yield ev
-                    sec = _round.out
-                    part_sections.append(sec.strip())
-
+            bug_section = ""
+            if not concise_insight:
                 yield sse_event({"type": "progress",
                                  "message": f"分章生成 {total_rounds - 2}/{total_rounds}：核查待确认问题…"})
                 bug_query = writer_instruction_block + _build_writer_bug_context_query(
@@ -2708,25 +3133,27 @@ async def report_stream(
                 has_bug = bool(bug_clean) and bug_clean.upper().strip(" .。`*") != "NONE" and "## Bug" in bug_clean
                 bug_section = bug_clean if has_bug else ""
 
-                yield sse_event({"type": "progress",
-                                 "message": f"分章生成 {total_rounds - 1}/{total_rounds}：汇总核心结论…"})
-                yield sse_event({"type": "chunk", "content": "\n\n"})
-                core_query = writer_instruction_block + _build_writer_core_context_query(
-                    parts_meta,
-                    part_sections,
-                    stats_md=summary_stats_md,
-                    viewpoint_stats_md=viewpoint_stats_md,
-                    bug_section=bug_section,
-                    qualitative_context=qualitative_context,
-                    analysis_focus=analysis_focus,
-                )
-                core_messages = _new_writer_messages()
-                async for heartbeat in _writer_call(core_query, messages=core_messages, step="core"):
-                    yield heartbeat
-                core_text, core_model = _writer_call.out
-                writer_models_used.append(core_model)
-                core_block = core_text.strip()
+            yield sse_event({"type": "progress",
+                             "message": f"分章生成 {total_rounds if concise_insight else total_rounds - 1}/{total_rounds}：汇总核心结论…"})
+            yield sse_event({"type": "chunk", "content": "\n\n"})
+            core_query = writer_instruction_block + _build_writer_core_context_query(
+                parts_meta,
+                part_sections,
+                stats_md=summary_stats_md,
+                viewpoint_stats_md=viewpoint_stats_md,
+                bug_section=bug_section,
+                qualitative_context=qualitative_context,
+                analysis_focus=analysis_focus,
+                concise_insight=concise_insight,
+            )
+            core_messages = _new_writer_messages()
+            async for heartbeat in _writer_call(core_query, messages=core_messages, step="core"):
+                yield heartbeat
+            core_text, core_model = _writer_call.out
+            writer_models_used.append(core_model)
+            core_block = core_text.strip()
 
+            if not concise_insight:
                 yield sse_event({
                     "type": "progress",
                     "message": "正在局部复核核心结论的证据边界、原因场景与分析交付覆盖…",
@@ -2757,9 +3184,11 @@ async def report_stream(
                 if selected_core != core_block:
                     core_block = selected_core
 
-                for event in _content_events(core_block):
-                    yield event
+            for event in _content_events(core_block):
+                yield event
 
+            action_section = ""
+            if not concise_insight:
                 yield sse_event({"type": "progress",
                                  "message": f"分章生成 {total_rounds}/{total_rounds}：生成行动建议…"})
                 yield sse_event({"type": "chunk", "content": "\n\n"})
@@ -2806,18 +3235,18 @@ async def report_stream(
                 for event in _content_events(action_section):
                     yield event
 
-                yield _analysis_progress(
-                    "writing",
-                    "completed",
-                    f"报告正文 {total_rounds}/{total_rounds} 个生成步骤已完成",
-                )
+            yield _analysis_progress(
+                "writing",
+                "completed",
+                f"报告正文 {total_rounds}/{total_rounds} 个生成步骤已完成",
+            )
 
-                details_divider = "---------------- 以下为详细信息，各位可以按需查看 ----------------"
-                assembled = [title_block, core_block, details_divider, *part_sections]
-                if bug_section:
-                    assembled.append(bug_section)
-                assembled.append(action_section)
-                full_report = "\n\n".join(b for b in assembled if b)
+            details_divider = "" if concise_insight else "---------------- 以下为详细信息，各位可以按需查看 ----------------"
+            assembled = [title_block, core_block, details_divider, *part_sections]
+            if bug_section:
+                assembled.append(bug_section)
+            assembled.append(action_section)
+            full_report = "\n\n".join(b for b in assembled if b)
 
         yield _analysis_progress(
             "finalize",
@@ -2825,22 +3254,16 @@ async def report_stream(
             "正在核对统计引用、整理格式并保存报告",
         )
 
-        if report_style == "quick":
-            pass  # Complete deterministic statistics already live in the evidence appendix.
-        elif quantitative_first:
+        if quantitative_first:
             appendix = render_stats_appendix(
                 sess.get("stats_blocks") or [],
                 sess.get("stats_source") or "python",
             )
             if appendix:
                 full_report = "\n\n".join((full_report.rstrip(), appendix))
-        else:
+        elif not concise_insight:
             full_report = inject_qualitative_stats(full_report, stats_md, plan)
 
-        quick_appendix = ""
-        if report_style == "quick":
-            full_report, separator, appendix_body = full_report.partition("\n\n## 发现与证据附录\n\n")
-            quick_appendix = separator + appendix_body
 
         numeric_sources = "\n".join(
             source for source in (stats_md, viewpoint_stats_md) if source
@@ -2934,20 +3357,14 @@ async def report_stream(
             print(f"[stats] WARN drifted numbers: {drifted[:20]}")
 
         full_report = _inject_disclaimer(full_report, mode=sess.get("mode") or "")
-        full_report = _inject_research_background(full_report, qualitative_context)
+        if not concise_insight:
+            full_report = _inject_research_background(full_report, qualitative_context)
         full_report = normalize_glossary_terms(full_report)
-        full_report += quick_appendix
         viewpoint_diagnostics = finalize_viewpoint_diagnostics(
             viewpoint_diagnostics,
             full_report,
             writer_context_included=writer_context_included,
         )
-        if report_style == "quick":
-            viewpoint_diagnostics["writer_output"].update(
-                status="quick_contract_validated",
-                format="quick_v1",
-                quick_report_diagnostics=deepcopy(quick_diagnostics),
-            )
         viewpoint_catalog = viewpoint_diagnostics["catalog"]
         viewpoint_output = viewpoint_diagnostics["writer_output"]
         print(
@@ -2973,9 +3390,12 @@ async def report_stream(
             quick_diagnostics["writing_upstream_attempts"] = (
                 report_llm_usage.snapshot().get("phases", {}).get("writing", {}).get("call_count", 0)
             )
-        partial_rerun_source = build_partial_rerun_source(sess)
+        partial_rerun_source = build_partial_rerun_source(run_input_session)
+        if partial_rerun_source:
+            frozen_inputs["partial_rerun_source"] = deepcopy(partial_rerun_source)
         snapshot = {
             "report_style": report_style,
+            "report_mode": resolve_report_mode(sess), "report_status": "complete", "input_snapshot": frozen_inputs,
             **({"quick_report_diagnostics": deepcopy(quick_diagnostics)} if quick_diagnostics else {}),
             "report_md": full_report,
             "title": "",
@@ -3206,8 +3626,10 @@ async def partial_report_rerun_stream(
         capability = partial_rerun_capability(entry, base)
         if not capability.get("available"):
             raise ValueError(capability.get("reason") or "该版本不能局部重做")
-        plan = deepcopy(entry.get("plan") or {})
-        source = deepcopy(entry.get("partial_rerun_source") or {})
+        frozen = base.get("input_snapshot") or {}
+        plan = deepcopy(frozen.get("plan", entry.get("plan")) or {})
+        source = deepcopy(frozen.get("partial_rerun_source", entry.get("partial_rerun_source")) or {})
+        concise_insight = bool(frozen) and resolve_report_mode(base) == "insight"
         artifacts = deepcopy(base.get("analysis_artifacts") or {})
         target = resolve_partial_rerun_target(
             plan,
@@ -3352,7 +3774,7 @@ async def partial_report_rerun_stream(
             "writing",
             4,
             "active",
-            f"正在重写 {target['part_title']}，随后同步核心结论和行动建议",
+            f"正在重写 {target['part_title']}，随后同步总体判断" if concise_insight else f"正在重写 {target['part_title']}，随后同步核心结论和行动建议",
         )
         headers = source.get("headers") or []
         parts_meta = _writer_parts_meta(plan, headers)
@@ -3375,22 +3797,23 @@ async def partial_report_rerun_stream(
             "</part_theme_catalog>\n\n"
             f"{viewpoint_stats_md}\n\n"
             "基础 Part 中不属于重做目标、且未被新证据影响的有效信息应保留；受新主题影响的总结、观点和引用必须更新。"
-            "不要自行复制客观统计表，系统会在新 Part 校验后确定性注入一次。\n\n"
-            + _build_writer_part_query(part_meta, quantitative_first=False)
+            + ("仅保留支撑判断的必要数字，不展开完整统计表。\n\n" if concise_insight else "不要自行复制客观统计表，系统会在新 Part 校验后确定性注入一次。\n\n")
+            + ((_get_prompt_text("insight_writer_requirements") + f"\n只输出 ## {target['part_title']}；不要本节总结、独立行动清单或引用表，行动含义写在发现处。") if concise_insight else _build_writer_part_query(part_meta, quantitative_first=False))
         )
         async for event in writer_round(part_query):
             yield event
         new_part = validate_single_part(writer_round.out, target["part_title"])
         if part_stats and part_stats in new_part:
             raise ValueError("模型输出夹带了系统统计块，已拒绝重复插表")
-        new_part = inject_qualitative_stats(
-            new_part,
-            source.get("stats_md") or "",
-            plan,
-        )
-        validate_single_part(new_part, target["part_title"])
-        if part_stats and new_part.count(part_stats) != 1:
-            raise ValueError("新 Part 的客观统计未能安全地只注入一次")
+        if not concise_insight:
+            new_part = inject_qualitative_stats(
+                new_part,
+                source.get("stats_md") or "",
+                plan,
+            )
+            validate_single_part(new_part, target["part_title"])
+            if part_stats and new_part.count(part_stats) != 1:
+                raise ValueError("新 Part 的客观统计未能安全地只注入一次")
         patched_report = replace_h2_section(
             base_report,
             target["part_title"],
@@ -3411,62 +3834,66 @@ async def partial_report_rerun_stream(
                 analysis_focus=analysis_focus,
             )
         )
+        if concise_insight:
+            core_query = _build_writer_core_context_query(parts_meta, [patched_report], stats_md=source.get("stats_md") or "", viewpoint_stats_md=viewpoint_stats_md, bug_section="", qualitative_context=source.get("qualitative_context"), concise_insight=True)
         async for event in writer_round(core_query):
             yield event
         core_block = writer_round.out.strip()
-        review_messages = [
-            {"role": "system", "content": _get_report_writer_system_prompt()},
-            {"role": "user", "content": core_query},
-            {"role": "assistant", "content": core_block},
-            {"role": "user", "content": _build_writer_core_review_query(analysis_focus, has_bug)},
-        ]
-        try:
-            async for event in writer_round("", messages=review_messages):
-                yield event
-            core_block = _resolve_core_coverage_review(core_block, writer_round.out)
-        except Exception as review_error:
-            print(
-                "[partial-rerun] WARN optional core review skipped: "
-                f"{type(review_error).__name__}",
-                flush=True,
-            )
+        if not concise_insight:
+            review_messages = [
+                {"role": "system", "content": _get_report_writer_system_prompt()},
+                {"role": "user", "content": core_query},
+                {"role": "assistant", "content": core_block},
+                {"role": "user", "content": _build_writer_core_review_query(analysis_focus, has_bug)},
+            ]
+            try:
+                async for event in writer_round("", messages=review_messages):
+                    yield event
+                core_block = _resolve_core_coverage_review(core_block, writer_round.out)
+            except Exception as review_error:
+                print(
+                    "[partial-rerun] WARN optional core review skipped: "
+                    f"{type(review_error).__name__}",
+                    flush=True,
+                )
         patched_report = replace_core_block(patched_report, core_block)
 
-        action_query = (
-            "下面是目标 Part 与核心结论已经更新后的完整报告。只重新输出行动建议；"
-            "建议必须承接新结论，未受影响的有效动作保持稳定。\n\n"
-            f"<current_report>\n{patched_report}\n</current_report>\n\n"
-            f"{viewpoint_stats_md}\n\n"
-            + _build_writer_action_query(
-                parts_meta,
-                has_bug,
-                source.get("qualitative_context") or {},
-                analysis_focus=analysis_focus,
-                selected_core=core_block,
+        if not concise_insight:
+            action_query = (
+                "下面是目标 Part 与核心结论已经更新后的完整报告。只重新输出行动建议；"
+                "建议必须承接新结论，未受影响的有效动作保持稳定。\n\n"
+                f"<current_report>\n{patched_report}\n</current_report>\n\n"
+                f"{viewpoint_stats_md}\n\n"
+                + _build_writer_action_query(
+                    parts_meta,
+                    has_bug,
+                    source.get("qualitative_context") or {},
+                    analysis_focus=analysis_focus,
+                    selected_core=core_block,
+                )
             )
-        )
-        async for event in writer_round(action_query):
-            yield event
-        action_raw = writer_round.out
-        action_section = _normalize_action_section(action_raw)
-        if not action_section:
-            repair_messages = [
-                {"role": "system", "content": _get_report_writer_system_prompt()},
-                {"role": "user", "content": action_query},
-                {"role": "assistant", "content": action_raw},
-                {"role": "user", "content": _build_writer_action_repair_query()},
-            ]
-            async for event in writer_round("", messages=repair_messages):
+            async for event in writer_round(action_query):
                 yield event
-            action_section = _normalize_action_section(writer_round.out)
-        if not action_section:
-            raise ValueError("新行动建议未通过结构校验")
-        patched_report = replace_action_section(patched_report, action_section)
+            action_raw = writer_round.out
+            action_section = _normalize_action_section(action_raw)
+            if not action_section:
+                repair_messages = [
+                    {"role": "system", "content": _get_report_writer_system_prompt()},
+                    {"role": "user", "content": action_query},
+                    {"role": "assistant", "content": action_raw},
+                    {"role": "user", "content": _build_writer_action_repair_query()},
+                ]
+                async for event in writer_round("", messages=repair_messages):
+                    yield event
+                action_section = _normalize_action_section(writer_round.out)
+            if not action_section:
+                raise ValueError("新行动建议未通过结构校验")
+            patched_report = replace_action_section(patched_report, action_section)
         yield progress(
             "writing",
             4,
             "completed",
-            "目标 Part、核心结论和行动建议已完成严格结构校验",
+            "目标章节和总体判断已完成结构校验" if concise_insight else "目标 Part、核心结论和行动建议已完成严格结构校验",
         )
 
         yield progress(
@@ -3513,7 +3940,7 @@ async def partial_report_rerun_stream(
             "target_label": target["target_label"],
             "target_part": target["part_title"],
             "scope_keys": scope_keys,
-            "changed_sections": [target["part_title"], "核心结论", "行动建议"],
+            "changed_sections": [target["part_title"], "核心结论"] + ([] if concise_insight else ["行动建议"]),
             "full_report_rerun": False,
             "elapsed_seconds": elapsed_seconds,
             "theme_elapsed_seconds": partial_cluster_metrics.get("elapsed_seconds", 0),
@@ -3535,6 +3962,7 @@ async def partial_report_rerun_stream(
         }, patched_report)
         snapshot = {
             "report_md": patched_report,
+            **{key: deepcopy(base[key]) for key in ("report_mode", "report_style", "report_status", "input_snapshot") if key in base},
             "title": str(base.get("title") or ""),
             "qa_context_md": qa_context_md,
             "qa_messages": [],
@@ -3621,13 +4049,20 @@ def _session_report_version_payload(sess: dict) -> dict:
         "version_count": len(versions),
         "max_versions": MAX_REPORT_VERSIONS,
         # 新版本只能从重新上传后的数据确认页发起；报告页仅保留查看能力。
-        "can_generate_version": False,
+        "can_generate_version": len(versions) < MAX_REPORT_VERSIONS,
+        "report_mode": resolve_report_mode(resolve_report_version(sess)) if versions else resolve_report_mode(sess),
+        "report_status": resolve_report_version(sess).get("report_status", "complete") if versions else "complete",
     }
+
+
+def _quick_session_version_source(session_id: str, sess: dict) -> dict:
+    """Read the authoritative archive, including recovery after session save failure."""
+    return quick_session_version_source(session_id, sess, history_loader=_load_history)
 
 
 def get_session_report_versions(session_id: str) -> dict:
     """返回当前 session 的报告版本元数据，不包含多份正文。"""
-    sess = get_session(session_id)
+    sess = _quick_session_version_source(session_id, get_session(session_id))
     if not _uses_report_versions(sess):
         raise HTTPException(status_code=400, detail="该报告类型不支持版本管理")
     if not normalize_report_versions(sess):
@@ -3637,7 +4072,7 @@ def get_session_report_versions(session_id: str) -> dict:
 
 def get_session_report_version(session_id: str, version: int) -> dict:
     """读取当前 session 的指定报告版本，不改变 active 版本。"""
-    sess = get_session(session_id)
+    sess = _quick_session_version_source(session_id, get_session(session_id))
     if not _uses_report_versions(sess):
         raise HTTPException(status_code=400, detail="该报告类型不支持版本管理")
     try:
@@ -3650,6 +4085,9 @@ def get_session_report_version(session_id: str, version: int) -> dict:
         "selected_version": snapshot["version"],
         **_session_report_version_payload(sess),
         "report_style": snapshot.get("report_style", "full"),
+        "report_mode": resolve_report_mode(snapshot),
+        "report_status": snapshot.get("report_status", "complete"),
+        "quick_outline": build_quick_outline(snapshot),
     }
 
 
@@ -3750,9 +4188,17 @@ async def qa_stream(
         })
         return
     await operation_lock.acquire()
+    completion_lock = None
     try:
         # 与报告重跑共用同一把锁；锁内重读，避免排队请求回写旧版本快照。
         sess = require_session_access(session_id, login, loader=get_session)
+        sess = _quick_session_version_source(session_id, sess)
+        if resolve_report_mode(sess) == "quick":
+            candidate_lock = _report_rerun_target_lock(str(sess.get("rerun_target_history_id") or session_id))
+            if candidate_lock.locked():
+                raise ValueError("当前报告正在补全或处理追问，请完成后再试")
+            await candidate_lock.acquire()
+            completion_lock = candidate_lock
         _assign_session_owner(sess, login)
         uses_versions = _uses_report_versions(sess)
         if uses_versions:
@@ -3779,6 +4225,7 @@ async def qa_stream(
             yield event
         # 模型回答期间可能发生改名；提交 QA 前重读并在最新版本快照上更新。
         sess = require_session_access(session_id, login, loader=get_session)
+        sess = _quick_session_version_source(session_id, sess)
         precommit_session = deepcopy(sess)
         snapshot = (
             resolve_report_version(sess, selected_version)
@@ -3839,6 +4286,8 @@ async def qa_stream(
         import traceback; traceback.print_exc()
         yield sse_event({"type": "error", "message": str(e)})
     finally:
+        if completion_lock is not None:
+            completion_lock.release()
         operation_lock.release()
 
 
@@ -3861,11 +4310,18 @@ async def history_qa_stream(
         })
         return
     await operation_lock.acquire()
+    completion_lock = None
     try:
         # 路由鉴权后到 SSE 真正开始之间可能有短暂间隔；拿到互斥锁后
         # 重新读取，避免基于生成新版本前的旧快照回答。
         history = _load_history()
         entry = next(h for h in history if h["id"] == history_id)
+        if resolve_report_mode(entry) == "quick":
+            candidate_lock = _report_rerun_target_lock(history_id)
+            if candidate_lock.locked():
+                raise ValueError("当前报告正在补全或处理追问，请完成后再试")
+            await candidate_lock.acquire()
+            completion_lock = candidate_lock
         uses_versions = _uses_report_versions(entry)
         if uses_versions:
             snapshot = resolve_report_version(entry, version)
@@ -3972,6 +4428,8 @@ async def history_qa_stream(
         import traceback; traceback.print_exc()
         yield sse_event({"type": "error", "message": str(e)})
     finally:
+        if completion_lock is not None:
+            completion_lock.release()
         operation_lock.release()
 
 
@@ -4013,6 +4471,15 @@ def validate_plan_confirm_ready(session_id: str) -> None:
 def validate_report_ready(session_id: str) -> bool:
     """校验报告生成前置条件，返回 use_large_mode 供 router 选择正确的 analyst key。"""
     sess = get_session(session_id)
+    if resolve_report_mode(sess) == "quick":
+        _validate_report_style(sess, "quick")
+        if not sess.get("rows") or not sess.get("confirmed_columns"):
+            raise HTTPException(status_code=400, detail="请先确认数据和题目")
+        if not selected_question_keys(sess["confirmed_columns"], sess.get("selected_question_keys")):
+            raise HTTPException(status_code=400, detail="请选择至少一道可分析的题目")
+        if collect_source_questions(sess) and not (LLM_QUICK_REPORT_MODEL or LLM_QUICK_REPORT_FALLBACK_MODELS):
+            raise HTTPException(status_code=500, detail="未配置快速总结模型")
+        return False
     if not all([sess.get("plan"), sess.get("rows"), sess.get("stats_md")]):
         raise HTTPException(status_code=400, detail="请先完成统计计算")
     if not LLM_API_KEY:

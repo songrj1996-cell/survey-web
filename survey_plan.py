@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import re
+from copy import deepcopy
 from typing import Any
 
 VALID_ROLES = {
@@ -821,7 +822,7 @@ def merge_confirmed_into_plan(plan: dict, confirmed: list[dict]) -> dict:
     """
     new_cols = expand_confirmed_to_columns(confirmed)
     plan["columns"] = new_cols
-    valid_idx = {c["index"] for c in new_cols}
+    valid_idx = {c["index"] for c in new_cols if c["role"] not in NON_STAT_ROLES}
 
     # part 修补：保留 planner 的章节划分，但只留合法索引；矩阵成员对齐到兄弟列所在 part
     parts = plan.get("parts") or []
@@ -877,3 +878,15 @@ def merge_confirmed_into_plan(plan: dict, confirmed: list[dict]) -> dict:
             cleaned_ct.append(ct)
     plan["cross_tabs"] = cleaned_ct
     return plan
+
+
+def validate_manual_plan(plan: dict, confirmed: list[dict], header_count: int) -> dict:
+    """Validate editable structure while keeping confirmed column definitions authoritative."""
+    if not isinstance(plan, dict):
+        raise ValueError("分析方案必须是对象")
+    result = deepcopy(plan)
+    result["columns"] = expand_confirmed_to_columns(confirmed)
+    error = _validate_plan(result, header_count)
+    if error:
+        raise ValueError("分析方案无效：" + error)
+    return result

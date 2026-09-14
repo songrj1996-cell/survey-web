@@ -38,7 +38,6 @@ from app.services.glossary_service import (
     prepare_glossary_messages,
 )
 from app.services.question_detect import ROLE_LABEL_MAP
-from app.services.report_quick_mode import build_evidence_catalog
 from app.storage.prompts import (
     _get_large_sample_writer_requirements as _get_large_sample_writer_requirements_base,
     _get_planner_extra,
@@ -46,6 +45,7 @@ from app.storage.prompts import (
     _get_theme_extract_system_prompt,
     _get_theme_merge_system_prompt as _get_theme_merge_system_prompt_base,
     _get_writer_requirements,
+    _get_prompt_text,
 )
 
 _THEME_MERGE_RUNTIME_CONTRACT = """\
@@ -2330,6 +2330,7 @@ def _build_large_sample_writer_query(
     qualitative_context: dict | None = None,
     quantitative_first: bool = False,
     viewpoint_stats_md: str = "",
+    concise_insight: bool = False,
 ) -> str:
     parts_lines = ["  Part 1 受访者画像（固定）"]
     for i, p in enumerate(plan["parts"], 2):
@@ -2406,11 +2407,13 @@ def _build_large_sample_writer_query(
         has_satisfaction=bool(satisfaction_md),
         has_business_context=has_context,
     )
+    if concise_insight:
+        requirements = _get_prompt_text("insight_writer_requirements") + "\n" + _get_prompt_text("insight_core_requirements")
     qualitative_stats_rule = (
         "\n- 系统会在对应 Part 内确定性插入客观题统计表。不要自行复制客观题统计表或新增统计章节；"
         "必须在本节总结或后续主题分析中说明相关统计大致代表什么、有哪些样本或解释限制，"
         "无法形成可靠解释时不要机械复述最高项和最低项。"
-        if not quantitative_first else ""
+        if not quantitative_first and not concise_insight else ""
     )
     viewpoint_rule = (
         "\n- 玩家直接表达的观点，其人数、分母和占比必须逐字使用 "
@@ -2481,15 +2484,6 @@ def _writer_parts_meta(plan: dict, headers: list[str]) -> list[dict]:
             "filter_desc": _part_filter_desc(p, plan),
         })
     return meta
-
-
-def _build_quick_evidence_catalog(stats_md, open_text, plan, clustered_themes, report_viewpoints, diagnostics):
-    """Reuse source scopes and deterministic stats without full-writer requirements."""
-    # Keep the full deterministic result, including sample/filter notes and cross-tabs.
-    stats = {"问卷统计与样本口径": stats_md} if str(stats_md or "").strip() else {}
-    return build_evidence_catalog(
-        clustered_themes, report_viewpoints, list(_open_text_scopes(open_text, plan)), stats, diagnostics,
-    )
 
 
 def _build_writer_context(
@@ -2644,6 +2638,7 @@ def _build_writer_part_context_query(
     analysis_focus: dict | None = None,
     viewpoint_stats_md: str = "",
     quantitative_first: bool = False,
+    concise_insight: bool = False,
 ) -> str:
     """为单个 Part 构造自包含且不含其它 Part 原文的写作请求。"""
     plan_summary, open_text_md, requirements = _build_writer_context(
@@ -2655,6 +2650,16 @@ def _build_writer_part_context_query(
         viewpoint_stats_md=viewpoint_stats_md,
         part_index=part["i"],
     )
+    if concise_insight:
+        return (
+            f"{plan_summary}\n\n<stats>\n{part_stats_md}\n</stats>\n{open_text_md}\n{viewpoint_stats_md}\n"
+            + _build_business_context_block(qualitative_context, "仅用于本章决策问题")
+            + "\n" + _get_prompt_text("insight_writer_requirements")
+            + f"\n本轮只输出 ## Part {part['i']} {part['name']}，选择影响决策的发现；不写本节总结、总体判断或末尾行动清单。"
+            + "每条发现只展开一次，说明可靠数字、原因或场景、分歧与行动含义。跨题分析应标注为分析推断。"
+            + "数字仅取自提供的统计，分母、人群与分支不得改变；证据不足说明无法判断。"
+            + "正文不生成大段引文和逐观点引用表，用户可按题查看原文；低频严重风险保留并标注待核实。"
+        )
     return (
         "下面只提供当前 Part 可使用的证据；不得假设或引用其它 Part 的原文。\n\n"
         f"{plan_summary}\n\n"
@@ -3152,6 +3157,7 @@ def _build_writer_core_context_query(
     bug_section: str,
     qualitative_context: dict | None = None,
     analysis_focus: dict | None = None,
+    concise_insight: bool = False,
 ) -> str:
     """核心结论轮只读取章节成品和压缩统计，不再读取全量原始回答。"""
     generated_parts = "\n\n".join(section.strip() for section in part_sections if section.strip())
@@ -3169,6 +3175,11 @@ def _build_writer_core_context_query(
             "用于约束核心结论，原始回答已在各 Part 中完成归纳",
         )
     )
+    if concise_insight:
+        return "\n\n".join(evidence_blocks) + "\n" + _get_prompt_text("insight_core_requirements") + (
+            f"\n用 {CORE_START} 和 {CORE_END} 包裹总体判断。最多三条短判断，总计不超过250字；"
+            "不重复展开章节证据，不逐章摘要、不生成行动清单。不得补造原文中不存在的共同原因。"
+        )
     return (
         "\n\n".join(block for block in evidence_blocks if block)
         + "\n\n"
@@ -3405,6 +3416,9 @@ def _describe_qa_context_scope(qa_context: str) -> str:
     rows_match = re.search(r"<rows>\s*(.*?)\s*</rows>", qa_context or "", re.DOTALL)
     rows_block = rows_match.group(1).strip() if rows_match else ""
     base = "报告正文、分析方案、统计结果和业务背景"
+    if "<quick_summary_context>" in qa_context:
+        count = sum(1 for line in rows_block.splitlines() if line.strip())
+        return f"所选快速总结版本、必要背景及全部 {count} 条主观回复；没有精确观点人数统计。"
     if not rows_block or rows_block == "（无数据）":
         return f"{base}；该记录未保留可用的原始玩家反馈。"
 

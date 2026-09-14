@@ -26,6 +26,7 @@ from app.services.questionnaire_family_history import (
 )
 from app.services.report_versions import (
     append_report_version,
+    complete_quick_report_version,
     delete_report_version,
     normalize_report_versions,
     report_version_summaries,
@@ -33,6 +34,7 @@ from app.services.report_versions import (
     sync_active_report_version,
     update_report_version,
 )
+from app.services.report_modes import MODE_SNAPSHOT_FIELDS, resolve_report_mode
 from app.services.report_partial_rerun import (
     build_partial_rerun_source,
     build_plan_fingerprint,
@@ -58,6 +60,7 @@ _SURVEY_DUPLICATE_CONTEXT_FIELDS = (
 _SURVEY_DUPLICATE_CONTEXT_SIMILARITY = 0.80
 DEFAULT_RERUN_VERSION_INSTRUCTION = "未填写补充要求，本次为重新生成"
 _VERSION_MIRROR_FIELDS = (
+    *MODE_SNAPSHOT_FIELDS,
     "report_md",
     "title",
     "qa_context_md",
@@ -152,6 +155,9 @@ def _history_version_source(
     }
     for item in session_versions:
         version = item["version"]
+        persisted = merged_by_version.get(version, {})
+        if int(persisted.get("quick_completion_revision") or 0) > int(item.get("quick_completion_revision") or 0):
+            continue  # An old reader/QA session must not undo a saved completion.
         if version in history_numbers or version >= history_next_version:
             merged_by_version[version] = deepcopy(item)
     history_source["report_versions"] = [
@@ -291,7 +297,7 @@ def _has_complete_survey_duplicate_fingerprint(source: dict) -> bool:
 
 def _is_exact_survey_duplicate(entry: dict, sess: dict, login: dict | None) -> bool:
     """Match one owner's identical upload when its submitted context is >=80% similar."""
-    if not _supports_report_versions(entry) or not isinstance(entry.get("plan"), dict):
+    if not _supports_report_versions(entry) or (resolve_report_mode(entry) != "quick" and not isinstance(entry.get("plan"), dict)):
         return False
     if not _has_complete_survey_duplicate_fingerprint(entry):
         return False
@@ -512,7 +518,7 @@ def save_to_history(
                 "active_report_version": version_source["active_report_version"],
                 "next_report_version": version_source["next_report_version"],
             })
-            for field in ("report_llm_usage", "quick_report_diagnostics"):
+            for field in ("report_llm_usage", "quick_report_diagnostics", *MODE_SNAPSHOT_FIELDS):
                 if field in active_source:
                     entry[field] = deepcopy(active_source[field])
         if sess.get("mode") == "comment":
@@ -561,8 +567,49 @@ def _copy_report_version_state(target: dict, source: dict) -> None:
     ):
         if field in source:
             target[field] = deepcopy(source[field])
-        elif field in {"report_llm_usage", "quick_report_diagnostics"}:
+        elif field in {"report_llm_usage", "quick_report_diagnostics", *MODE_SNAPSHOT_FIELDS}:
             target.pop(field, None)
+
+
+def quick_session_version_source(session_id: str, sess: dict, *, history_loader=None) -> dict:
+    """Resolve quick snapshots from their owner's archive without writing either copy."""
+    if not any(resolve_report_mode(v) == "quick" for v in normalize_report_versions(sess)):
+        return sess
+    history_id = str(sess.get("rerun_target_history_id") or session_id)
+    load = history_loader if history_loader is not None else _load_history
+    entry = next((h for h in load() if h.get("id") == history_id
+                  and _history_owner_key(h) == _history_owner_key(sess)), None)
+    if not entry:
+        return sess
+    result = deepcopy(sess)
+    _copy_report_version_state(result, entry)
+    return result
+
+
+def complete_quick_report_in_history(history_id: str, snapshot: dict, *, expected_base: dict, login) -> tuple[dict, dict]:
+    """History is the authoritative completion store; publish in one atomic write."""
+    def persist(history):
+        entry = _find_history_for_login(history, history_id, login)
+        if not entry:
+            raise HTTPException(status_code=404, detail="历史报告不存在或无权访问")
+        committed = complete_quick_report_version(entry, snapshot, expected_base=expected_base)
+        return deepcopy(entry), deepcopy(committed)
+    return mutate_history(persist)
+
+
+def append_quick_rerun_to_history(history_id: str, snapshot: dict, *, base_version: int,
+                                   expected_input: dict, instruction: str, login) -> tuple[dict, dict]:
+    """Commit against the immutable selected quick version, independent of current entry settings."""
+    def persist(history):
+        entry = _find_history_for_login(history, history_id, login)
+        if not entry:
+            raise HTTPException(status_code=404, detail="历史报告不存在或无权访问")
+        base = resolve_report_version(entry, base_version)
+        if resolve_report_mode(base) != "quick" or base.get("input_snapshot") != expected_input:
+            raise HTTPException(status_code=409, detail="所选快速总结版本的来源已变化，本次结果未保存")
+        committed = append_report_version(entry, snapshot, kind="regenerate", base_version=base_version, instruction=instruction)
+        return deepcopy(entry), deepcopy(committed)
+    return mutate_history(persist)
 
 
 def append_exact_rerun_to_history(
@@ -587,7 +634,9 @@ def append_exact_rerun_to_history(
                 status_code=409,
                 detail="当前上传数据或确认信息已变化，请重新确认后再生成。",
             )
-        if not isinstance(sess.get("plan"), dict) or sess.get("plan") != entry.get("plan"):
+        selected_base = resolve_report_version(entry, base_version)
+        expected_plan = (selected_base.get("input_snapshot") or {}).get("plan", entry.get("plan"))
+        if not isinstance(sess.get("plan"), dict) or sess.get("plan") != expected_plan:
             raise HTTPException(
                 status_code=409,
                 detail="原报告的分析方案已变化，请重新确认后再生成。",
@@ -649,12 +698,14 @@ def append_partial_rerun_to_history(
         entry = _find_history_for_login(history, target_id, login)
         if not entry:
             raise HTTPException(status_code=404, detail="历史报告不存在或无权访问")
-        source = entry.get("partial_rerun_source")
+        base = resolve_report_version(entry, base_version)
+        frozen = base.get("input_snapshot") or {}
+        source = frozen.get("partial_rerun_source", entry.get("partial_rerun_source"))
         if not isinstance(source, dict):
             raise HTTPException(status_code=409, detail="该报告缺少局部重做来源数据")
         if (
             not verify_partial_rerun_source(source)
-            or build_plan_fingerprint(entry.get("plan") or {})
+            or build_plan_fingerprint(frozen.get("plan", entry.get("plan")) or {})
             != expected_plan_fingerprint
             or source.get("plan_fingerprint") != expected_plan_fingerprint
             or source.get("source_fingerprint") != expected_source_fingerprint

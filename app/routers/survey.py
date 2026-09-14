@@ -3,8 +3,9 @@
 业务编排、SSE 流程、session 推进、历史落库全部在 services/survey_service。
 跑数表(crosstab)模式复用本组的 plan/stats/report/qa 流程，仅上传入口在 routers/crosstab。
 """
-from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile, Query
 from fastapi.responses import JSONResponse, StreamingResponse
+from app.core.llm_context import bind_llm_api_key
 
 from app.core.config import (
     LLM_COLUMN_MODEL,
@@ -19,6 +20,7 @@ from app.schemas.requests import (
     QARequest,
     QualitativeContextRequest,
     ReportVersionRequest,
+    ReportSourceTranslationRequest,
     SurveyAnalysisSettingsRequest,
 )
 from app.services.audit import audit_log
@@ -32,6 +34,10 @@ from app.services.survey_service import (
     apply_analysis_preset_to_session,
     columns_stream,
     columns_require_llm,
+    cancel_report_run,
+    get_report_sources,
+    translate_report_sources,
+    prepare_quick_history_session,
     confirm_survey_plan,
     compute_survey_stats,
     delete_session_report_version,
@@ -68,7 +74,7 @@ async def update_analysis_settings(
     await require_session_request_access(
         request, session_id, login_resolver=_current_login,
     )
-    return set_survey_analysis_settings(session_id, req.report_focus)
+    return set_survey_analysis_settings(session_id, req.report_focus, report_mode=req.report_mode)
 
 
 @router.post("/api/upload")
@@ -133,7 +139,7 @@ async def confirm_columns(session_id: str, req: ColumnConfirmRequest, request: R
     login = await require_session_request_access(
         request, session_id, login_resolver=_current_login,
     )
-    set_survey_columns(session_id, req.columns)
+    set_survey_columns(session_id, req.columns, req.selected_question_keys)
     if login is None:
         login = await _current_login(request)
     preset_offer = get_analysis_preset_offer_for_session(session_id, login)
@@ -214,7 +220,7 @@ async def confirm_plan(req: PlanConfirmRequest, request: Request):
     if is_survey_plan_approval(req.user_text):
         if login is None:
             login = await _current_login(request)
-        result = confirm_survey_plan(req.session_id, login, report_style=req.report_style)
+        result = confirm_survey_plan(req.session_id, login, report_style=req.report_style, plan=req.plan)
         await audit_log(
             request, "survey", "确认分析方案",
             f"会话：{req.session_id}", metadata={"session_id": req.session_id},
@@ -325,13 +331,53 @@ async def generate_report_version(
     req: ReportVersionRequest,
     request: Request,
 ):
-    await require_session_request_access(
-        request, session_id, login_resolver=_current_login,
+    return await _report_rerun_response(session_id, req, request, retry_failed=False)
+
+
+async def _report_rerun_response(session_id, req, request, *, retry_failed):
+    if req.history_id:
+        login = await _current_login(request)
+        session_id = prepare_quick_history_session(req.history_id, login, req.base_version)
+    else:
+        await require_session_request_access(request, session_id, login_resolver=_current_login)
+    api_key = await require_request_llm_api_key(request)
+    return StreamingResponse(
+        stream_with_llm_api_key(
+            report_stream(session_id, request, instruction=req.instruction,
+                          base_version=req.base_version, generation_kind="regenerate", retry_failed=retry_failed),
+            api_key, request=request, category="survey", action="失败题目重试" if retry_failed else "重新生成报告",
+            reference_id=session_id, history_id=req.history_id or session_id,
+        ), media_type="text/event-stream",
     )
-    raise HTTPException(
-        status_code=405,
-        detail="报告页不再支持直接生成新版本，请重新上传数据并从数据确认页发起。",
-    )
+
+
+@router.post("/api/report/{session_id}/retry-failed")
+async def retry_failed_questions(session_id: str, req: ReportVersionRequest, request: Request):
+    return await _report_rerun_response(session_id, req, request, retry_failed=True)
+
+
+@router.post("/api/report/{session_id}/cancel")
+async def cancel_report(session_id: str, request: Request):
+    await require_session_request_access(request, session_id, login_resolver=_current_login)
+    return cancel_report_run(session_id)
+
+
+@router.get("/api/report/{session_id}/sources")
+async def report_sources(session_id: str, request: Request, version: int | None = Query(None, ge=1),
+                         history_id: str = "", question_key: str = "", offset: int = Query(0, ge=0),
+                         limit: int = Query(50, ge=1, le=200), q: str = Query("", max_length=500)):
+    login = await _current_login(request)
+    return get_report_sources(session_id, version=version, history_id=history_id, login=login,
+                              question_key=question_key, offset=offset, limit=limit, q=q)
+
+
+@router.post("/api/report/{session_id}/sources/translate")
+async def translate_report_sources_route(session_id: str, req: ReportSourceTranslationRequest, request: Request):
+    login = await _current_login(request)
+    api_key = await require_request_llm_api_key(request)
+    with bind_llm_api_key(api_key):
+        return await translate_report_sources(session_id, version=req.version,
+            response_ids=req.response_ids, history_id=req.history_id or "", login=login)
 
 
 @router.delete("/api/report/{session_id}/versions/{version}")
