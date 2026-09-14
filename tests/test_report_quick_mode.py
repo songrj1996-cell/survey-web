@@ -1,128 +1,179 @@
+"""Question-local contract checks for quick summaries."""
 from copy import deepcopy
 import json
-from pathlib import Path
 import unittest
-
-from app.services.report_quick_mode import (
-    build_evidence_catalog, build_quick_query, parse_quick_draft,
-    render_quick_report, supports_quick_report,
-)
-from app.services import history_service, report_versions, report_partial_rerun, survey_service
-from unittest.mock import patch
-from app.services import report_history, export_history
-from app.storage import history as history_storage
-from app.core import security
-import tempfile
-
-FIXTURE = Path(__file__).parent / 'fixtures/report_pipeline/quick_mode_cases.json'
+from app.services.report_quick_mode import (QuickStructureError, fill_question_evidence, parse_question_output,
+                                          question_output_contract, render_quick_report, normalize_report_style, supports_quick_report,
+                                          restore_missing_risk_candidates)
 
 
-class QuickReportContractTests(unittest.TestCase):
+def output(*, stage="question", refs=None, risk=False, risk_ids=None, text="等待影响体验"):
+    return {"schema_version": 2, "stage": stage,
+            "candidates" if stage == "batch" else "findings": [
+                {"text": text, "frequency": "部分提及", "risk": risk,
+                 "evidence_ids": refs or ["1/r1"], "risk_ids": risk_ids or []}], "empty_reason": ""}
+
+
+class QuickQuestionContractTests(unittest.TestCase):
+    def test_risk_recovery_restores_full_text_and_sources_but_rejects_other_errors(self):
+        sources = [{"response_id": "1/r1", "text": "正常", "profile": {"段位": "低段位"}},
+                   {"response_id": "1/r2", "text": "扣款异常", "profile": {"段位": "高段位"}}]
+        candidates = [{"text": "高段位回答者提及扣款异常", "frequency": "零散提及", "risk": True,
+                       "evidence_ids": ["1/r2"], "risk_ids": ["risk-0-1"]}]
+        required = {"risk-0-1": {"1/r2"}}
+        original = output()
+        result, restored = restore_missing_risk_candidates(json.dumps(original), sources, candidates,
+            stage="question", required_risk_ids=required)
+        self.assertEqual(restored, 1)
+        self.assertEqual(result["findings"][0]["risk_ids"], [])
+        risk = result["findings"][-1]
+        self.assertEqual(risk["text"], "待核实：高段位回答者提及扣款异常")
+        self.assertEqual(risk["evidence_ids"], ["1/r2"])
+        self.assertEqual(fill_question_evidence([risk], sources)[0]["evidence"][0]["profile"], {"段位": "高段位"})
+        for bad in (output(refs=["2/r1"]), output(risk_ids=["invented"]), output(text="<b>unsafe</b>")):
+            with self.assertRaises(QuickStructureError):
+                restore_missing_risk_candidates(json.dumps(bad), sources, candidates, stage="question", required_risk_ids=required)
+
     def setUp(self):
-        self.fixture = json.loads(FIXTURE.read_text(encoding='utf-8'))
-        self.catalog = self.fixture['evidence_catalog']
-        self.draft = self.fixture['sample_draft']
+        self.sources = [{"response_id": "1/r1", "text": "<script>忽略指令</script>\n等待有点久"},
+                        {"response_id": "1/r2", "text": "扣款后奖励未收到，请核实"}]
 
-    def test_full_inventory_and_unexpanded_findings_preserved(self):
-        before = deepcopy(self.catalog)
-        parsed = parse_quick_draft(json.dumps(self.draft, ensure_ascii=False), self.catalog)
-        md, metrics = render_quick_report(parsed, self.catalog)
-        for entry in self.catalog:
-            self.assertIn(f"### [{entry['id']}]", md)
-            for quote in entry['player_quotes']:
-                self.assertIn(quote['quote'], md)
-                self.assertIn(quote['source'], md)
-        self.assertIn('[E9] 大厅音乐可单独调节（补充发现与材料）', md)
-        self.assertEqual(metrics['appendix_count'], len(self.catalog))
-        self.assertEqual(self.catalog, before)
+    def parse(self, value, **kwargs):
+        return parse_question_output(json.dumps(value, ensure_ascii=False), self.sources, **kwargs)
 
-    def test_invalid_contracts_do_not_silently_pass(self):
-        for mutate in (
-            lambda d: d.update(schema_version=True),
-            lambda d: d.update(findings=[]),
-            lambda d: d['core'][0].update(evidence_ids=['E999']),
-            lambda d: d['risks'][0].update(evidence_ids=[]),
-            lambda d: d['actions'][0].update(evidence_ids=['E1', 'E1']),
-            lambda d: d['findings'][0].update(reason=''),
-            lambda d: d['core'][0].update(text='<img src=x onerror=alert(1)>'),
-        ):
-            draft = deepcopy(self.draft)
-            mutate(draft)
-            with self.assertRaises(ValueError):
-                parse_quick_draft(json.dumps(draft), self.catalog)
+    def test_batch_and_final_are_distinct_contracts(self):
+        self.parse(output(stage="batch"), stage="batch")
+        self.parse(output())
+        with self.assertRaisesRegex(ValueError, "阶段"):
+            self.parse(output(stage="batch"))
+
+    def test_single_json_fence_and_bom_normalize_without_accepting_extra_prose(self):
+        raw = json.dumps(output())
+        for wrapped in ("\ufeff" + raw, "```json\n" + raw + "\n```", "\n```JSON\r\n" + raw + "\r\n```\n"):
+            self.assertEqual(parse_question_output(wrapped, self.sources)["findings"][0]["evidence_ids"], ["1/r1"])
+        for invalid in ("说明：\n" + raw, "```json\n" + raw + "\n```\n其他内容", raw + "\n" + raw):
+            with self.assertRaises(QuickStructureError) as caught:
+                parse_question_output(invalid, self.sources)
+            self.assertEqual(caught.exception.issues, [{"code": "invalid_json", "path": "$"}])
+
+    def test_safe_validation_diagnostics_report_all_fixed_paths_not_invalid_values(self):
+        value = output(refs=["PRIVATE_UNKNOWN_SOURCE"])
+        value["findings"][0]["frequency"] = "PRIVATE_BAD_FREQUENCY"
+        value["findings"][0]["risk"] = "PRIVATE_BAD_RISK"
+        with self.assertRaises(QuickStructureError) as caught:
+            self.parse(value)
+        self.assertEqual(caught.exception.issues, [
+            {"code": "invalid_frequency", "path": "$.findings[0].frequency"},
+            {"code": "invalid_risk", "path": "$.findings[0].risk"},
+            {"code": "invalid_evidence_id", "path": "$.findings[0].evidence_ids[0]"},
+        ])
+        self.assertNotIn("PRIVATE", str(caught.exception))
+        self.assertNotIn("PRIVATE", json.dumps(caught.exception.issues))
+
+    def test_raw_batch_cannot_invent_risk_ids_and_contract_distinguishes_merge(self):
+        with self.assertRaises(QuickStructureError) as caught:
+            self.parse(output(stage="batch", risk=True, risk_ids=["invented-risk"]), stage="batch")
+        self.assertEqual(caught.exception.path, "$.candidates[0].risk_ids[0]")
+        self.assertIn("不生成 risk_ids", question_output_contract("batch"))
+        self.assertIn("所有输入 risk_ids", question_output_contract("batch", merging=True))
+        self.assertIn('"frequency":"部分提及"', question_output_contract("question"))
+
+    def test_refs_cannot_cross_question_even_among_duplicate_valid_refs(self):
+        for refs in (["2/r1"], ["1/r1", "1/r1", "2/r1"], ["1/r1", "1/r1", 1], [1]):
+            with self.subTest(refs=refs), self.assertRaisesRegex(ValueError, "引用|编号"):
+                self.parse(output(refs=refs))
+
+    def test_valid_evidence_and_risk_ids_deduplicate_in_first_seen_order(self):
+        value = output(refs=["1/r2", "1/r1", "1/r2", "1/r1"], risk=True,
+                       risk_ids=["risk-last", "risk-last"])
+        required = {"risk-last": {"1/r2"}}
+        finding = self.parse(value, required_risk_ids=required)["findings"][0]
+        self.assertEqual(finding["evidence_ids"], ["1/r2", "1/r1"])
+        self.assertEqual(finding["risk_ids"], ["risk-last"])
+        evidence = fill_question_evidence([finding], self.sources)[0]["evidence"]
+        self.assertEqual([source["response_id"] for source in evidence], ["1/r2", "1/r1"])
+        value["findings"][0]["risk_ids"].append("unknown-risk")
+        with self.assertRaisesRegex(ValueError, "来源无效"):
+            self.parse(value, required_risk_ids=required)
+
+    def test_quotes_are_server_filled_and_model_exact_counts_rejected(self):
+        draft = self.parse(output())
+        findings = fill_question_evidence(draft["findings"], self.sources)
+        self.assertEqual(findings[0]["evidence"][0]["text"], self.sources[0]["text"])
+        self.assertNotIn("evidence", draft["findings"][0])
+        for key, value in (("count", 8), ("percentage", 90), ("quotes", ["伪造原文"]), ("evidence", [])):
+            bad = output()
+            bad["findings"][0][key] = value
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "精确频次|原文"):
+                self.parse(bad)
+
+    def test_merge_cannot_drop_or_misattribute_rare_risk(self):
+        required = {"risk-last": {"1/r2"}}
+        with self.assertRaisesRegex(ValueError, "遗漏"):
+            self.parse(output(), required_risk_ids=required)
+        with self.assertRaisesRegex(ValueError, "来源不一致"):
+            self.parse(output(risk=True, risk_ids=["risk-last"]), required_risk_ids=required)
+        self.assertTrue(self.parse(output(refs=["1/r2"], risk=True, risk_ids=["risk-last"]), required_risk_ids=required)["findings"][0]["risk"])
+
+    def test_nonactionable_answers_can_produce_empty_findings(self):
+        value = {"schema_version": 2, "stage": "question", "findings": [], "empty_reason": "仅有无实质意见回答"}
+        self.assertEqual(self.parse(value)["findings"], [])
+        value["empty_reason"] = ""
         with self.assertRaises(ValueError):
-            parse_quick_draft('{"schema_version":1', self.catalog)
+            self.parse(value)
 
-    def test_degraded_scope_retains_whole_pool_and_identity_without_counts(self):
-        entries = [{'text': f'原文 {i}', 'ids': {'uid': str(i)}, 'profile': {'人群': '新玩家'}} for i in range(1201)]
-        clustered = {'part_1_col_1': {'themes': [{'id': 't1', 'name': '已识别', 'quotes': ['原文 0']}], 'filter_desc': '只看新玩家'}}
-        scopes = [('part_1_col_1', 1, 1, {'name': '体验'}, entries)]
-        catalog = build_evidence_catalog(clustered, [], scopes, {}, {'part_1_col_1': {'quality_status': 'degraded'}})
-        fallback = next(e for e in catalog if e['kind'] == 'raw_fallback')
-        self.assertEqual(len(fallback['player_quotes']), 1201)
-        self.assertEqual(fallback['player_quotes'][-1]['source']['ids']['uid'], '1200')
-        self.assertIn('没有可用的精确频次', catalog[0]['statistics'])
-        self.assertIn('只看新玩家', catalog[0]['scope'])
+    def test_renderer_preserves_order_without_body_annex_or_repeated_core(self):
+        result = {"report_status": "partial", "questions": [
+            {"question_key": "5", "question": "Q5 等待体验", "status": "complete", "findings": self.parse(output())["findings"], "sources": self.sources},
+            {"question_key": "9", "question": "Q9 奖励", "status": "failed", "findings": [], "sources": self.sources}]}
+        before = deepcopy(result)
+        markdown = render_quick_report(result)
+        self.assertLess(markdown.index("Q5"), markdown.index("Q9"))
+        for text in ("部分题目尚未完成", "部分提及", "等待影响体验"):
+            self.assertIn(text, markdown)
+        for text in ("核心判断", "行动建议", "发现与证据附录", "<script>", "扣款后"):
+            self.assertNotIn(text, markdown)
+        self.assertEqual(result, before)
 
-    def test_all_themes_not_only_displayed_themes_enter_catalog(self):
-        theme = {'id':'t1','name':'常见', 'count':10, 'percentage':10}
-        rare = {'id':'t2','name':'低频风险', 'count':1, 'percentage':1, 'quote_evidence':[{'quote':'风险原文', 'source':'uid=P1；人群=老玩家'}]}
-        catalog = build_evidence_catalog({1:{'themes':[theme], 'all_themes':[theme,rare], 'total':100,'count_unit':'players'}}, [], [(1,1,1,{'name':'体验'},[])], {}, {})
-        self.assertEqual([e['title'] for e in catalog], ['常见', '低频风险'])
-        self.assertEqual(catalog[1]['player_quotes'][0]['source'], 'uid=P1；人群=老玩家')
+    def test_renderer_interleaves_exact_statistics_with_subjective_question_order(self):
+        result = {"report_status": "complete", "objective_stats": {"markdown": "DO_NOT_REPEAT_ALL_STATS", "blocks": [],
+            "sections": [
+                {"question_key": "8", "question": "Q9 满意度", "source_order": 9, "markdown": "### Q9 满意度\n\n|评分|人数|\n|---|---|\n|5|2|"},
+                {"question_key": "0", "question": "Q1 选择", "source_order": 1, "markdown": "### Q1 选择\n\n|选项|人数|\n|---|---|\n|A|3|"},
+            ]}, "questions": [
+                {"question_key": "4", "question": "Q5 体验", "source_order": 5, "status": "complete", "findings": self.parse(output())["findings"]},
+                {"question_key": "0", "question": "Q1 其他补充", "source_order": 1, "status": "complete", "findings": []},
+            ]}
+        before = deepcopy(result)
+        markdown = render_quick_report(result)
+        headings = [line for line in markdown.splitlines() if line.startswith("## ")]
+        self.assertEqual(headings, ["## Q1 选择", "## Q1 其他补充", "## Q5 体验", "## Q9 满意度"])
+        self.assertIn("客观题为精确回答统计", markdown)
+        self.assertIn("主观题观点频次为粗略判断", markdown)
+        self.assertNotIn("DO_NOT_REPEAT_ALL_STATS", markdown)
+        self.assertNotIn("### Q", markdown)
+        self.assertEqual(result, before)
 
-    def test_source_text_cannot_inject_html_or_headings(self):
-        self.catalog[-1]['title'] = '<script>alert(1)</script>\n## forged'
-        self.catalog[-1]['player_quotes'][0]['quote'] = '<img src=x onerror=alert(1)>\n### [E1] spoof'
-        md, _ = render_quick_report(self.draft, self.catalog)
-        self.assertNotIn('<script>', md)
-        self.assertNotIn('<img', md)
-        self.assertNotIn('\n### [E1] spoof', md)
-
-    def test_modes_and_context_contract(self):
-        for source in ({'analysis_mode':'quantitative'}, *({'mode':m} for m in ('interview','comment','annotate','crosstab'))):
-            self.assertFalse(supports_quick_report(source))
-        self.assertTrue(supports_quick_report({}))
-        query = build_quick_query(self.catalog, context={'problem':'保持正向体验'}, focus={'core_question':'关键分歧'}, instruction='核实风险')
-        for text in ('保持正向体验', '关键分歧', '核实风险', 'E9', 'raw_fallback'):
-            self.assertIn(text, query)
-
-
-class QuickReportVersionTests(unittest.TestCase):
-    def test_history_persists_mode_and_selected_export_uses_same_version(self):
-        with tempfile.TemporaryDirectory(prefix='quick-version-test-') as temp, patch.object(history_storage,'HISTORY_FILE',str(Path(temp)/'history.json')), patch.object(security,'FEISHU_LOGIN_REQUIRED',False):
-            source={'id':'quick-history-test','filename':'synthetic.xlsx','mode':'','rows':[['反馈'],['合成原文']],'plan':{'parts':[],'columns':[]}}
-            report_versions.append_report_version(source,{'report_md':'# 完整旧版\nFULL_ONLY','qa_context_md':'FULL_QA'})
-            report_versions.append_report_version(source,{'report_md':'# 快速新版\nQUICK_ONLY\n## 发现与证据附录\n完整证据','report_style':'quick','quick_report_diagnostics':{'status':'completed'},'qa_context_md':'QUICK_QA'})
-            report_history.save_to_history('quick-history-test',source)
-            full=export_history.get_history_export_entry('quick-history-test',None,1)
-            quick=export_history.get_history_export_entry('quick-history-test',None,2)
-            self.assertEqual(full['report_style'],'full')
-            self.assertEqual(quick['report_style'],'quick')
-            self.assertEqual(full['qa_context_md'],'FULL_QA')
-            self.assertEqual(quick['qa_context_md'],'QUICK_QA')
-            self.assertNotIn('QUICK_ONLY',full['report_md'])
-            self.assertIn('完整证据',quick['report_md'])
-            self.assertNotIn('quick_report_diagnostics',full)
-            self.assertEqual(quick['quick_report_diagnostics']['status'],'completed')
-
-    def test_mixed_versions_do_not_inherit_style_or_diagnostics(self):
-        source = {'report_md':'# 旧版\n原文'}
-        report_versions.append_report_version(source, {'report_md':'# 快速\n<!--QUICK_REPORT_V1-->','report_style':'quick','quick_report_diagnostics':{'status':'completed'}})
-        self.assertEqual(report_versions.resolve_report_version(source,1)['report_style'],'full')
-        report_versions.append_report_version(source, {'report_md':'# 完整'})
-        self.assertEqual(source['report_style'],'full')
-        self.assertNotIn('quick_report_diagnostics', source)
-        with patch.object(survey_service,'get_session',return_value=source):
-            self.assertEqual(survey_service.get_session_report_version('s',2)['report_style'],'quick')
-            self.assertEqual(survey_service.get_session_report_version('s',1)['report_style'],'full')
-        self.assertEqual(report_versions.resolve_report_version(source,2)['quick_report_diagnostics']['status'],'completed')
-
-    def test_quick_partial_rerun_is_rejected_before_artifact_reuse(self):
-        capability = report_partial_rerun.partial_rerun_capability({}, {'report_style':'quick'})
-        self.assertFalse(capability['available'])
-        self.assertIn('快速报告',capability['reason'])
+    def test_mode_compatibility_helpers_preserve_statistics_exclusion(self):
+        self.assertTrue(supports_quick_report({"mode": "standard"}))
+        self.assertFalse(supports_quick_report({"mode": "crosstab"}))
+        self.assertFalse(supports_quick_report({"analysis_mode": "quantitative"}))
+        self.assertEqual(normalize_report_style(None), "full")
+        with self.assertRaises(ValueError):
+            normalize_report_style("invalid")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     unittest.main()
+
+
+class QuickGroupedDisplayTests(unittest.TestCase):
+    def test_group_order_risk_and_redundant_prefix_without_changing_sources(self):
+        from app.services.report_quick_mode import group_quick_markdown
+        source = "# 测试\n\n## 原因\n- **零散提及**：其他零散建议：换色\n- **反复出现**：喜欢\n- **部分提及 · 风险待核实**：难用\n- **反复提及**：简单\n\n> - **零散提及**：其他零散建议：原文保持\n"
+        result = group_quick_markdown(source)
+        self.assertIn("**反复提及：**\n\n1. 喜欢\n2. 简单", result)
+        self.assertIn("**部分提及：**\n\n1. **【风险】**难用", result)
+        self.assertIn("**零散提及：**\n\n1. 换色", result)
+        self.assertIn("> - **零散提及**：其他零散建议：原文保持", result)
+        self.assertEqual(group_quick_markdown(result), result)

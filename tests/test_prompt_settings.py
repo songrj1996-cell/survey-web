@@ -33,7 +33,12 @@ EXPECTED_PROMPT_KEYS = {
     "report_writer_system",
     "writer_requirements",
     "large_sample_writer_requirements",
-    "quick_writer_requirements",
+    "quick_question_summary_system",
+    "quick_batch_summary_system",
+    "quick_question_merge_system",
+    "insight_writer_requirements",
+    "insight_core_requirements",
+    "report_source_translation_system",
     "report_qa_system",
     "theme_extract_system",
     "theme_merge_system",
@@ -79,12 +84,13 @@ def _sha256(path: str) -> str:
 
 
 class PromptCatalogTests(unittest.TestCase):
-    def test_catalog_has_35_current_non_dify_entries_in_six_groups(self):
+    def test_catalog_has_40_current_non_dify_entries_in_six_groups(self):
         catalog = prompt_storage.DEFAULT_PROMPTS
 
         self.assertEqual(set(catalog), EXPECTED_PROMPT_KEYS)
-        self.assertEqual(len(catalog), 35)
+        self.assertEqual(len(catalog), 40)
         self.assertNotIn("upload_guide", catalog)
+        self.assertNotIn("quick_writer_requirements", catalog)
         self.assertEqual(
             {entry["group"] for entry in catalog.values()},
             {
@@ -176,6 +182,20 @@ class PromptCatalogTests(unittest.TestCase):
         self.assertNotIn("dify_url", migrated["column_detect_system"])
         self.assertEqual(migrated["future_prompt"]["current"], "keep me")
         self.assertIn("dify_analyst_system", migrated)
+
+    def test_retired_quick_global_prompt_cannot_override_new_question_contract(self):
+        legacy = {"quick_writer_requirements": {
+            "current": "OLD GLOBAL: classify every answer and write 5000 words",
+            "history": [{"content": "customized old global workflow"}], "version": 1,
+        }}
+        with tempfile.TemporaryDirectory(prefix="quick-prompt-isolation-") as temp_dir:
+            prompt_file = os.path.join(temp_dir, "prompts.json")
+            _write_json(prompt_file, legacy)
+            with patch.object(prompt_storage, "PROMPTS_FILE", prompt_file):
+                for key in ("quick_question_summary_system", "quick_batch_summary_system", "quick_question_merge_system"):
+                    current = prompt_storage._get_prompt_text(key)
+                    self.assertEqual(current, prompt_storage.DEFAULT_PROMPTS[key]["current"])
+                    self.assertNotIn("OLD GLOBAL", current)
 
     def test_version_bumps_refresh_defaults_but_preserve_custom_content(self):
         for key, previous_version in (
