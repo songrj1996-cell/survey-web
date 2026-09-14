@@ -13,8 +13,8 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Roboto+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/static/style.css?v=54" />
   <link rel="stylesheet" href="/static/questionnaire-sources.css?v=1" />
-  <link rel="stylesheet" href="/static/report-quick.css?v=1" />
-  <link rel="stylesheet" href="/static/survey-entry.css?v=3" />
+  <link rel="stylesheet" href="/static/report-quick.css?v=11" />
+  <link rel="stylesheet" href="/static/survey-entry.css?v=5" />
 </head>
 
 <body>
@@ -201,7 +201,7 @@
               </div>
               <div class="qe-file" data-entry-drop="statistics">
                 <input id="qe-statistics" type="file" accept=".xlsx" hidden>
-                <button class="qe-file-pick" type="button" data-entry-pick="statistics"><span class="qe-icon" aria-hidden="true">▦</span><span><strong>统计结果表</strong><small>仅适配倍市得专业统计表 XLSX，需配套问卷源文件；上传后固定采用“统计解读优先”</small><span class="qe-filename" data-entry-name="statistics">未选择文件</span></span><span class="qe-file-action">选择文件</span></button>
+                <button class="qe-file-pick" type="button" data-entry-pick="statistics"><span class="qe-icon" aria-hidden="true">▦</span><span><strong>统计结果表</strong><small>仅适配倍市得专业统计表 XLSX，需配套问卷源文件；上传后固定采用“统计解读”</small><span class="qe-filename" data-entry-name="statistics">未选择文件</span></span><span class="qe-file-action">选择文件</span></button>
                 <button class="qe-remove" type="button" data-entry-remove="statistics" hidden aria-label="移除统计结果表">移除</button>
               </div>
             </div>
@@ -239,35 +239,50 @@
         </div>
 
         <div id="qe-data-confirm">
-        <section class="qe-confirm-section" id="qe-focus-panel" aria-label="选择报告重心">
-          <div><h2 class="qe-section-title"><span class="qe-section-number" aria-hidden="true">1</span>选择报告重心</h2><p class="panel__desc">两种方式使用同一份回答数据；区别是正文优先回答什么，以及开放题分析到什么粒度。</p></div>
-          <div class="qe-notice" id="qe-focus-lock" hidden role="status"><strong>已上传专业统计表，报告重心已固定</strong><p>将以该表为正式统计口径，自动采用“统计解读优先”。如需观点洞察，请返回上传页移除统计表，其他文件会保留。</p><button class="btn btn--ghost" type="button" id="qe-return-upload">返回上传页移除统计表</button></div>
-            <div class="qe-focus-options" role="radiogroup" aria-label="报告重心">
+        <section class="qe-confirm-section qe-surface" id="qe-focus-panel" aria-label="选择报告方式">
+          <div><h2 class="qe-section-title"><span class="qe-section-number" aria-hidden="true">1</span>选择报告方式</h2><p class="panel__desc">按阅读目的选择；三种方式都保留题型、选项与原始数据的对应关系。</p></div>
+          <div class="qe-notice" id="qe-focus-lock" hidden role="status"><strong>已上传专业统计表，报告重心已固定</strong><p>将以该表为正式统计口径，自动采用“统计解读”。如需观点洞察，请返回上传页移除统计表，其他文件会保留。</p><button class="btn btn--ghost" type="button" id="qe-return-upload">返回上传页移除统计表</button></div>
+            <div class="qe-focus-options" role="radiogroup" aria-label="报告方式">
+              <button class="qe-focus-choice" type="button" role="radio" aria-checked="false" data-entry-focus="quick">
+                <span class="qe-choice-title"><strong>快速总结</strong><span class="qe-badge" data-entry-focus-badge="quick">可选择</span></span>
+                <p>呈现已选客观题统计，按原题顺序总结主观题回复与粗略频次。确认题目后直接开始。</p>
+                <small id="qe-quick-availability" role="status"></small>
+              </button>
               <button class="qe-focus-choice" type="button" role="radio" aria-checked="true" data-entry-focus="insight" aria-describedby="qe-insight-disabled">
-                <span class="qe-choice-title"><strong>观点洞察优先</strong><span class="qe-badge" data-entry-focus-badge="insight">当前选择</span></span>
-                <p>回答玩家有哪些不同想法、为什么、发生在什么情境，以及有哪些少数但重要的声音。</p>
+                <span class="qe-choice-title"><strong>观点洞察</strong><span class="qe-badge" data-entry-focus-badge="insight">当前选择</span></span>
+                <p>围绕研究目标分析玩家想法、原因与关键差异，只展开影响决策的重要发现。</p>
                 <span id="qe-insight-disabled" hidden>当前不可选：请先移除已上传的统计结果表。</span>
               </button>
               <button class="qe-focus-choice" type="button" role="radio" aria-checked="false" data-entry-focus="statistics">
-                <span class="qe-choice-title"><strong>统计解读优先</strong><span class="qe-badge" data-entry-focus-badge="statistics">可选择</span></span>
+                <span class="qe-choice-title"><strong>统计解读</strong><span class="qe-badge" data-entry-focus-badge="statistics">可选择</span></span>
                 <p>回答总体结果怎样、不同人群有何差异、哪些指标值得关注，以及开放题如何解释数字。</p>
               </button>
             </div>
           <p class="qe-hint" id="qe-focus-stats"></p>
           <details class="qe-focus-preview" id="qe-focus-preview">
             <summary>查看报告结构示例</summary>
-            <p class="qe-hint">仅用于说明两种重心的差异，实际分析思路和章节将在下一步生成。</p>
+            <p class="qe-hint">快速总结按原题顺序呈现；观点洞察与统计解读在下一步确认分析结构。</p>
             <div id="qe-focus-outline"></div>
           </details>
         </section>
-        <section class="qe-confirm-section" id="qe-columns-panel" aria-labelledby="qe-confirm-title">
+        <section class="qe-confirm-section qe-surface" id="qe-columns-panel" aria-labelledby="qe-confirm-title">
           <div class="col-confirm-header">
             <h2 class="qe-section-title"><span class="qe-section-number" aria-hidden="true">2</span><span id="qe-confirm-title">确认题型</span></h2>
             <span class="col-confirm-count" id="col-confirm-count"></span>
           </div>
           <p class="panel__desc" id="qe-confirm-description">请逐一核对题型与中文题名。题型直接影响后续统计口径。</p>
-          <p class="qe-hint" id="qe-columns-status" role="status" hidden>正在准备题型，可先选择报告重心、补充调研背景。</p>
+          <p class="qe-hint" id="qe-columns-status" role="status" hidden>正在准备题型，可先选择报告方式、补充调研背景。</p>
+          <div class="qe-question-toolbar" id="qe-question-toolbar" hidden>
+            <div class="qe-question-tabs" role="tablist" aria-label="题目筛选">
+              <button type="button" role="tab" aria-selected="true" data-question-filter="all">全部题目</button>
+              <button type="button" role="tab" aria-selected="false" data-question-filter="subjective">主观题</button>
+              <button type="button" role="tab" aria-selected="false" data-question-filter="pending">待确认</button>
+            </div>
+            <label class="qe-select-all"><input type="checkbox" id="qe-select-all" checked />全选当前列表</label>
+          </div>
+          <p class="qe-hint" id="qe-selection-hint"></p>
           <div class="col-list" id="col-list"></div>
+          <details class="qe-system-columns" id="qe-system-columns" hidden><summary id="qe-system-summary">系统字段与空白列</summary><div id="qe-system-list"></div></details>
         </section>
         <div class="context-form-wrap" id="context-form-wrap">
           <details class="context-form__details" id="context-form-details" open>
@@ -303,6 +318,13 @@
         </div>
       </section>
 
+      <dialog class="qe-editor" id="qe-column-editor" aria-labelledby="qe-editor-title">
+        <div class="qe-editor-head"><div><span class="qe-hint" id="qe-editor-number"></span><h2 id="qe-editor-title">编辑题目</h2></div><button type="button" class="btn btn--ghost" id="qe-editor-close" aria-label="关闭题目编辑">×</button></div>
+        <div class="qe-editor-body" id="qe-editor-body"></div>
+        <p class="qe-status is-error" id="qe-editor-error" role="alert"></p>
+        <div class="qe-editor-actions"><button class="btn btn--ghost" type="button" id="qe-editor-discard">放弃修改</button><button class="btn btn--primary" type="button" id="qe-editor-save">保存修改</button></div>
+      </dialog>
+      <dialog class="qe-editor" id="qe-plan-editor" aria-labelledby="qe-plan-editor-title"><div class="qe-editor-head"><h2 id="qe-plan-editor-title">编辑分析结构</h2><button class="btn btn--ghost" type="button" id="qe-plan-editor-close">关闭</button></div><div class="qe-editor-body" id="qe-plan-editor-body"></div><div class="qe-editor-actions"><button class="btn btn--ghost" type="button" id="qe-plan-editor-discard">放弃修改</button><button class="btn btn--primary" type="button" id="qe-plan-editor-save">保存结构</button></div></dialog>
       <!-- STEP 3: Plan -->
       <section class="panel panel--hidden" id="panel-3">
         <div class="step-bar" id="step-bar-3">
@@ -342,18 +364,7 @@
           </section>
           <div class="plan-card__sections" id="plan-card-content"></div>
           <div class="plan-actions">
-            <fieldset class="report-style-picker" id="report-style-picker" hidden>
-              <legend>报告模式</legend>
-              <div class="report-style-picker__options">
-                <label><input type="radio" name="report-style" value="full" checked />
-                  <span><strong>完整模式</strong><small>逐章展开分析，适合深入研究与完整归档</small></span>
-                </label>
-                <label><input type="radio" name="report-style" value="quick" />
-                  <span><strong>快速模式 <em>试用</em></strong><small>重点精写，全部已识别主题与证据按需查看</small></span>
-                </label>
-              </div>
-              <p>确认方案后开始生成。快速模式保留全量分析，主要减少写作和阅读负担；实际耗时取决于回答量。</p>
-            </fieldset>
+            <div class="qe-plan-edit-actions"><button class="btn btn--ghost" type="button" id="qe-plan-edit">编辑章节与顺序</button></div>
             <div class="plan-actions__hint">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <circle cx="12" cy="12" r="10" />
@@ -391,11 +402,11 @@
               class="step-bar__label">报告 &amp; 追问</span></button>
         </div>
         <div class="panel__header">
-          <h1 class="panel__title">生成分析报告</h1>
-          <p class="panel__desc" data-uitext="panel_report_desc">AI 正在基于确定性统计结果与开放题反馈逐章撰写报告，章节完成并校验后将自动展示。</p>
+          <h1 class="panel__title" id="report-generation-title">生成分析报告</h1>
+          <p class="panel__desc" id="report-generation-description" data-uitext="panel_report_desc">AI 正在基于确定性统计结果与开放题反馈逐章撰写报告，章节完成并校验后将自动展示。</p>
         </div>
 
-        <div class="report-progress" id="report-progress">
+        <div class="report-progress report-progress--compact" id="report-progress">
           <div class="progress-steps">
             <div class="progress-step progress-step--active" id="ps-stats">
               <div class="progress-step__dot"></div>
@@ -413,6 +424,7 @@
               </div>
             </div>
           </div>
+          <button class="btn btn--ghost" type="button" id="btn-report-cancel">停止生成</button>
         </div>
 
         <div class="report-error" id="report-error" role="alert" hidden>
@@ -423,6 +435,7 @@
           </div>
           <button class="btn btn--primary" id="btn-report-retry" type="button">重新生成报告</button>
         </div>
+
 
         <div class="report-stream-container" id="report-stream-container" style="display:none">
           <div class="report-stream-header">
@@ -528,6 +541,7 @@
             </div>
           </div>
           <div class="report-toolbar__actions">
+            <button class="btn btn--ghost" id="btn-report-regenerate" type="button">重新生成整份报告</button>
             <button class="btn btn--ghost" id="btn-report-partial-rerun" type="button">
               局部重做
             </button>
@@ -560,7 +574,8 @@
               </div>
             </div>
             <div class="export-dropdown" id="export-dropdown">
-              <button class="btn btn--ghost" id="btn-export-dropdown" type="button">
+
+              <button class="btn btn--ghost" id="btn-export-dropdown" type="button" aria-haspopup="menu" aria-expanded="false" aria-controls="export-dropdown-menu">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                   <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
                   <polyline points="7 10 12 15 17 10" />
@@ -572,31 +587,38 @@
                   <polyline points="6 9 12 15 18 9" />
                 </svg>
               </button>
-              <div class="export-dropdown__menu" id="export-dropdown-menu">
-                <button class="export-dropdown__item" id="btn-export-pdf" type="button">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-                    <polyline points="14 2 14 8 20 8" />
-                    <line x1="16" y1="13" x2="8" y2="13" />
-                    <line x1="16" y1="17" x2="8" y2="17" />
-                  </svg>
-                  下载 PDF
-                </button>
-                <div class="export-dropdown__sep"></div>
-                <button class="export-dropdown__item" id="btn-export-feishu" type="button">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-                    <polyline points="14 2 14 8 20 8" />
-                    <line x1="9" y1="13" x2="15" y2="13" />
-                    <line x1="9" y1="17" x2="13" y2="17" />
-                  </svg>
-                  导出飞书文档
-                </button>
+              <div class="export-dropdown__menu" id="export-dropdown-menu" role="menu" aria-label="导出报告">
+                <div class="report-export-format" data-export-format="pdf">
+                  <button class="export-dropdown__item" id="btn-export-pdf" data-export-format-trigger="pdf" type="button" role="menuitem" aria-haspopup="menu" aria-expanded="false" aria-controls="report-export-pdf-options">PDF<span aria-hidden="true">›</span></button>
+                  <div class="report-export-submenu" id="report-export-pdf-options" role="menu" aria-label="PDF导出内容" hidden>
+                    <button type="button" role="menuitem" data-report-export="pdf" data-export-scope="body">正文</button>
+                    <button type="button" role="menuitem" data-report-export="pdf" data-export-scope="evidence">正文 + 证据</button>
+                  </div>
+                </div>
+                <div class="report-export-format" data-export-format="word">
+                  <button class="export-dropdown__item" id="btn-export-word" data-export-format-trigger="word" type="button" role="menuitem" aria-haspopup="menu" aria-expanded="false" aria-controls="report-export-word-options">Word<span aria-hidden="true">›</span></button>
+                  <div class="report-export-submenu" id="report-export-word-options" role="menu" aria-label="Word导出内容" hidden>
+                    <button type="button" role="menuitem" data-report-export="word" data-export-scope="body">正文</button>
+                    <button type="button" role="menuitem" data-report-export="word" data-export-scope="evidence">正文 + 证据</button>
+                  </div>
+                </div>
+                <div class="report-export-format" data-export-format="md">
+                  <button class="export-dropdown__item" id="btn-export-md" data-export-format-trigger="md" type="button" role="menuitem" aria-haspopup="menu" aria-expanded="false" aria-controls="report-export-md-options">Markdown<span aria-hidden="true">›</span></button>
+                  <div class="report-export-submenu" id="report-export-md-options" role="menu" aria-label="Markdown导出内容" hidden>
+                    <button type="button" role="menuitem" data-report-export="md" data-export-scope="body">正文</button>
+                    <button type="button" role="menuitem" data-report-export="md" data-export-scope="evidence">正文 + 证据</button>
+                  </div>
+                </div>
+                <div class="report-export-format" data-export-format="feishu">
+                  <button class="export-dropdown__item" id="btn-export-feishu" data-export-format-trigger="feishu" type="button" role="menuitem" aria-haspopup="menu" aria-expanded="false" aria-controls="report-export-feishu-options">飞书文档<span aria-hidden="true">›</span></button>
+                  <div class="report-export-submenu" id="report-export-feishu-options" role="menu" aria-label="飞书文档导出内容" hidden>
+                    <button type="button" role="menuitem" data-report-export="feishu" data-export-scope="body">正文</button>
+                    <button type="button" role="menuitem" data-report-export="feishu" data-export-scope="evidence">正文 + 证据</button>
+                  </div>
+                </div>
                 <div id="feishu-link-inline" style="display:none"></div>
               </div>
             </div>
-            <button class="btn btn--ghost" id="btn-export-md" style="display:none"></button>
-            <button class="btn btn--primary" id="btn-export-word" style="display:none"></button>
           </div>
         </div>
 
@@ -616,6 +638,8 @@
                   </div>
                   <button type="button" id="btn-comparison-validation-alert">查看详情</button>
                 </div>
+                <section id="quick-retry-status" class="quick-retry-status" aria-label="题目重试进度" hidden></section>
+                <section id="report-evidence-tools" aria-label="报告来源与处理状态"></section>
                 <div class="report-content markdown-body" id="report-content"></div>
               </div>
             </div>
@@ -1998,16 +2022,18 @@
 
   <div class="toast-container" id="toast-container" aria-live="polite"></div>
 
+<dialog class="qe-editor" id="report-sources-dialog" aria-labelledby="report-sources-title"><div class="qe-editor-head"><div><h2 id="report-sources-title">回答原文</h2><p id="report-sources-context" class="qe-hint"></p></div><button class="btn btn--ghost" type="button" id="report-sources-close">关闭</button></div><div class="report-source-tabs" role="tablist" aria-label="原文范围"><button type="button" role="tab" data-source-view="evidence" aria-selected="false">精选证据</button><button type="button" role="tab" data-source-view="all" aria-selected="true">全部原文</button></div><form class="report-source-search" id="report-sources-search"><input id="report-sources-query" aria-label="搜索回答原文" placeholder="搜索本题回答" /><button class="btn btn--ghost" type="submit">搜索</button></form><div class="qe-editor-body" id="report-sources-list" role="status"></div><div class="qe-editor-actions"><span id="report-sources-page"></span><button class="btn btn--ghost" id="report-sources-prev" type="button">上一页</button><button class="btn btn--ghost" id="report-sources-next" type="button">下一页</button></div></dialog>
+<dialog class="qe-editor" id="report-regenerate-dialog" aria-labelledby="report-regenerate-title"><div class="qe-editor-head"><h2 id="report-regenerate-title">生成新版本</h2><button class="btn btn--ghost" type="button" id="report-regenerate-close">关闭</button></div><div class="qe-editor-body"><p id="report-regenerate-base"></p><label class="qe-editor-field">补充要求（选填）<textarea id="report-regenerate-instruction" rows="4"></textarea></label></div><div class="qe-editor-actions"><button class="btn btn--primary" type="button" id="report-regenerate-start">重新生成</button></div></dialog>
   <script src="https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js"></script>
   <!-- app.js 已按业务线拆分;顺序固定:core 最先,各 feature 居中(均含原顺序的初始化代码) -->
-  <script src="/static/js/core/core.js?v=34"></script>
-  <script src="/static/js/features/report-quick.js?v=1"></script>
-  <script src="/static/js/features/survey.js?v=42"></script>
-  <script src="/static/js/features/survey-entry.js?v=3"></script>
+  <script src="/static/js/core/core.js?v=36"></script>
+  <script src="/static/js/features/report-quick.js?v=9"></script>
+  <script src="/static/js/features/survey.js?v=36"></script>
+  <script src="/static/js/features/survey-entry.js?v=5"></script>
   <script src="/static/js/features/questionnaire-sources.js?v=2"></script>
-  <script src="/static/js/features/report.js?v=45"></script>
+  <script src="/static/js/features/report.js?v=51"></script>
   <script src="/static/js/features/profile.js?v=2"></script>
-  <script src="/static/js/features/settings.js?v=36"></script>
+  <script src="/static/js/features/settings.js?v=37"></script>
   <script src="/static/js/features/history.js?v=37"></script>
   <script src="/static/js/features/interview.js?v=10"></script>
   <script src="/static/js/features/interview-v2.js?v=7"></script>

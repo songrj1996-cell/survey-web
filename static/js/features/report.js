@@ -109,6 +109,8 @@ const REPORT_STATUS_LABELS = {
   completed: '已完成',
   degraded: '已降级',
   skipped: '已跳过',
+  failed: '未完成',
+  cancelled: '已停止',
 };
 
 function _normalizeReportUsageNumber(value) {
@@ -404,6 +406,7 @@ function _appendReportProgressDetail(progressState, message) {
 }
 
 function _reportQuestionLabel(item) {
+  if (item.phase === 'quick_questions') return item.question_name || item.question || `原始题目 ${item.question_key || ''}`;
   const part = Number(item.part_index) > 0
     ? `Part ${item.part_index}${item.part_name ? ` · ${item.part_name}` : ''}`
     : (item.part_name || '未分章开放题');
@@ -411,6 +414,13 @@ function _reportQuestionLabel(item) {
 }
 
 function _applyAnalysisProgress(progressState, event) {
+  if (event.phase === 'quick_statistics') {
+    event = {...event, status:{complete:'completed',running:'active'}[event.status] || event.status, phase_index:1, phase_total:1, item_total:event.total, item_index:event.completed};
+  }
+  if (event.phase === 'quick_questions') {
+    const status = {complete:'completed',reused:'completed',running:'active'}[event.status] || event.status;
+    event = {...event, scope_key:event.question_key, question_name:event.question, status, phase_index:1, phase_total:1, item_total:event.total, item_index:event.completed, message:status === 'completed' ? '本题已保存' : (status === 'failed' ? '本题未完成，可单独重试' : '正在整理本题全部回复')};
+  }
   progressState.structured = true;
   progressState.phase = event.phase || progressState.phase;
   progressState.phases[event.phase] = event.status || 'active';
@@ -435,10 +445,12 @@ function _applyAnalysisProgress(progressState, event) {
 
 function _reportProgressPercent(progressState) {
   const current = progressState.current || {};
+  if (current.phase === 'quick_statistics') return current.status === 'completed' ? 20 : 5;
+  if (current.phase === 'quick_questions') return Math.min(99, 20 + Math.round((Number(current.completed) || 0) / Math.max(1, Number(current.total) || 1) * 79));
   const phaseIndex = Math.max(1, Number(current.phase_index) || 1);
   const phaseTotal = Math.max(1, Number(current.phase_total) || 4);
   let withinPhase = ['completed', 'degraded', 'skipped'].includes(current.status) ? 1 : 0.08;
-  if (current.phase === 'themes' && Number(current.item_total)) {
+  if (['themes','quick_questions'].includes(current.phase) && Number(current.item_total)) {
     const itemTotal = Number(current.item_total);
     const completedItems = [...progressState.items.values()].filter(item =>
       ['completed', 'degraded', 'skipped'].includes(item.status)
@@ -467,6 +479,8 @@ function _renderReportPhaseTrack(progressState) {
 
 function _reportRemainingText(progressState) {
   const current = progressState.current || {};
+  if (current.phase === 'quick_statistics') return '客观题统计完成后，继续总结已选主观题（如有）并保存报告。';
+  if (current.phase === 'quick_questions') return '逐题完成后保存；已完成题目会保留，失败题目可单独重试。';
   if (current.phase === 'themes') {
     const total = Number(current.item_total) || 0;
     const completed = [...progressState.items.values()].filter(item =>
@@ -503,7 +517,7 @@ function _renderReportPreparationSteps(element, progressState) {
     const sample = document.createElement('span');
     sample.className = 'report-current-task__sample';
     const unit = current.count_unit === 'players' ? '名玩家' : '条回答';
-    sample.textContent = `${Number(current.respondent_count) || 0} ${unit}`;
+    sample.textContent = current.phase === 'quick_questions' && current.respondent_count == null ? '' : `${Number(current.respondent_count) || 0} ${unit}`;
     const message = document.createElement('p');
     message.textContent = current.message || '正在处理';
     currentCard.append(eyebrow, title, sample, message);
@@ -552,7 +566,7 @@ function _renderReportPreparationSteps(element, progressState) {
     label.textContent = _reportQuestionLabel(step);
     const unit = step.count_unit === 'players' ? '名玩家' : '条回答';
     const summary = document.createElement('small');
-    summary.textContent = `${Number(step.respondent_count) || 0} ${unit} · ${step.message || '等待处理'}`;
+    summary.textContent = step.phase === 'quick_questions' && step.respondent_count == null ? (step.message || '等待处理') : `${Number(step.respondent_count) || 0} ${unit} · ${step.message || '等待处理'}`;
     copy.append(label, summary);
     if (step.impact && step.impact !== 'none') {
       const impact = document.createElement('small');
@@ -602,6 +616,7 @@ function normalizeReportVersions(versions) {
         const isRerun = kind === 'regenerate' || kind === 'rerun' || item.base_version != null;
         return {
           version,
+          quick_completion_revision: Number(item.quick_completion_revision || 0),
           label: item.label || `V${version}`,
           created_at: item.created_at || '',
           instruction: rawInstruction || (isRerun ? EMPTY_RERUN_INSTRUCTION : ''),
@@ -609,6 +624,8 @@ function normalizeReportVersions(versions) {
           base_version: toFiniteVersion(item.base_version),
           title: item.title || '',
           report_style: item.report_style === 'quick' ? 'quick' : 'full',
+          report_mode: item.report_mode || (item.report_style === 'quick' ? 'quick' : 'insight'),
+          report_status: item.report_status || 'complete',
           plan_approved_at: item.plan_approved_at || '',
           report_completed_at: item.report_completed_at || '',
           report_duration_seconds: item.report_duration_seconds,
@@ -633,9 +650,44 @@ function toFiniteVersion(value) {
 let reportVersionLoadSerial = 0;
 let reportVersionLoadTarget = null;
 
+let quickRegenerationChecking = false;
+
+async function ensureQuickRegenerationAllowed() {
+  const ctx = activeReportCtx();
+  if (ctx.reportMode !== 'quick') return true;
+  if (quickRegenerationChecking) return false;
+  const full = () => (ctx.versions || []).length >= Number(ctx.maxVersions || 5);
+  const notifyFull = () => showToast(`报告版本已达上限（${ctx.maxVersions || 5} 个），请先删除一个旧版本。失败题目仍可补全当前版本。`, 'info', 7000);
+  if (full()) { notifyFull(); return false; }
+  const reportId = activeReportId(), mode = state.viewMode, version = activeVersionNumber();
+  quickRegenerationChecking = true;
+  updateReportActionAvailability();
+  try {
+    const url = mode === 'history' ? `/api/history/${encodeURIComponent(reportId)}?version=${version}`
+      : `/api/report/${encodeURIComponent(reportId)}/versions`;
+    const response = await fetch(url, {credentials:'same-origin', cache:'no-store'});
+    const data = await response.json();
+    if (activeReportCtx() !== ctx || activeReportId() !== reportId || state.viewMode !== mode || activeVersionNumber() !== version) return false;
+    if (!response.ok || !Array.isArray(data.versions)) throw new Error(data.detail || '无法确认报告版本数量');
+    ctx.versions = normalizeReportVersions(data.versions);
+    ctx.maxVersions = Number(data.max_versions || ctx.maxVersions || 5);
+    ctx.nextVersion = data.next_version || ctx.nextVersion;
+    updateReportVersionUi();
+    if (full()) { notifyFull(); return false; }
+    return true;
+  } catch (error) {
+    showToast(`未开始重新生成：${error.message}。当前报告已保留。`, 'error');
+    return false;
+  } finally {
+    quickRegenerationChecking = false;
+    updateReportActionAvailability();
+  }
+}
+
 function reportInteractionBusy() {
   return !!(
-    state.sessionReport.running
+    quickRegenerationChecking || state.sessionReport.running
+    || (typeof isQuickRetryRunning === 'function' && isQuickRetryRunning())
     || partialRerunRunning
     || state.qaLoading
     || state.reportVersionLoading
@@ -645,7 +697,8 @@ function reportInteractionBusy() {
 
 function activeReportInteractionBusy() {
   return !!(
-    partialRerunRunning
+    quickRegenerationChecking || partialRerunRunning
+    || (typeof isQuickRetryRunning === 'function' && isQuickRetryRunning())
     ||
     state.qaLoading
     || state.reportVersionLoading
@@ -658,6 +711,10 @@ function updateReportActionAvailability() {
   const busy = activeReportInteractionBusy();
   const renameBtn = $('btn-report-rename');
   if (renameBtn) renameBtn.disabled = !activeReportId() || busy;
+  const regenerateBtn = $('btn-report-regenerate');
+  if (regenerateBtn) regenerateBtn.disabled = !activeReportId() || busy;
+  document.querySelectorAll('[data-report-export], [data-export-format-trigger]').forEach(button => { button.disabled = busy; });
+  document.querySelectorAll('[data-quick-retry-failed]').forEach(button => { button.disabled = reportInteractionBusy(); });
   const exportDropdown = $('btn-export-dropdown');
   if (exportDropdown) exportDropdown.disabled = busy;
   const partialRerunBtn = $('btn-report-partial-rerun');
@@ -707,6 +764,14 @@ function syncReportVersionMeta(target, meta = {}) {
   if (!target.selectedVersion) target.selectedVersion = target.version || target.activeVersion || normalized.at(-1)?.version || null;
   const selectedSummary = normalized.find(item => item.version === target.selectedVersion);
   target.reportStyle = (meta.report_style ?? selectedSummary?.report_style) === 'quick' ? 'quick' : 'full';
+  target.reportMode = meta.report_mode || selectedSummary?.report_mode || (target.reportStyle === 'quick' ? 'quick' : 'insight');
+  target.reportStatus = meta.report_status || selectedSummary?.report_status || 'complete';
+  const snapshotMetaKey = `${target.id || state.sessionId}:${target.selectedVersion}`;
+  const sameSnapshot = target.snapshotMetaKey === snapshotMetaKey;
+  target.quickSummary = Object.prototype.hasOwnProperty.call(meta, 'quick_summary') ? meta.quick_summary : (sameSnapshot ? target.quickSummary : null);
+  target.inputSnapshot = Object.prototype.hasOwnProperty.call(meta, 'input_snapshot') ? meta.input_snapshot : (sameSnapshot ? target.inputSnapshot : null);
+  target.quickOutline = Object.prototype.hasOwnProperty.call(meta, 'quick_outline') ? meta.quick_outline : (sameSnapshot ? target.quickOutline : null);
+  target.snapshotMetaKey = snapshotMetaKey;
   const hasDuration = Object.prototype.hasOwnProperty.call(meta, 'report_duration_seconds')
     || Object.prototype.hasOwnProperty.call(selectedSummary || {}, 'report_duration_seconds');
   if (hasDuration) {
@@ -885,8 +950,17 @@ function updateReportVersionUi() {
 }
 
 async function runStats(options = {}) {
+  if (options.retryFailed && typeof retryFailedQuickReport === 'function') return retryFailedQuickReport();
+  if (typeof isQuickRetryRunning === 'function' && isQuickRetryRunning()) return;
   if (state.sessionReport.running) return;
-  const generationSessionId = state.sessionId;
+  const viewedReport = activeReportCtx();
+  if (options.regenerate && viewedReport.reportMode === 'quick' && !await ensureQuickRegenerationAllowed()) return false;
+  const returnToReport = options.regenerate && viewedReport.reportMode === 'quick'
+    ? {viewMode:state.viewMode, historyId:state.historyId, sessionId:state.sessionId, reportMode:state.reportMode,
+       sessionReport:JSON.parse(JSON.stringify(state.sessionReport)), historyReport:state.historyReport} : null;
+  const generationMode = options.quick ? 'quick' : ((options.regenerate || options.retryFailed) ? viewedReport.reportMode : state.reportMode);
+  let generationSessionId = options.historyId && (options.retryFailed || options.regenerate) ? options.historyId : state.sessionId;
+  if (options.historyId && (options.retryFailed || options.regenerate)) state.sessionId = generationSessionId;
   if (!generationSessionId) {
     showToast('当前分析任务已失效，请重新上传文件', 'error');
     return;
@@ -921,6 +995,9 @@ async function runStats(options = {}) {
   }
   state.viewMode = 'session';
   state.historyId = null;
+  state.reportMode = generationMode || 'insight';
+  state.sessionReport.reportMode = state.reportMode;
+  state.sessionReport.reportStyle = state.reportMode === 'quick' ? 'quick' : 'full';
   state.sessionReport.running = true;
   state.sessionReport.stream = '';
   state.sessionReport.reportMd = null;
@@ -929,6 +1006,20 @@ async function runStats(options = {}) {
   state.sessionReport.reportCompletedAt = '';
   state.sessionReport.reportLlmUsage = null;
   goStep(4);
+  const quickRun = generationMode === 'quick';
+  $('report-generation-title').textContent = quickRun ? '生成快速总结' : (generationMode === 'statistics' ? '生成统计解读' : '生成观点洞察');
+  $('report-generation-description').textContent = quickRun
+    ? '正在计算已选客观题统计，并逐题整理主观题全部回复、粗略频次与必要风险。'
+    : (generationMode === 'statistics'
+      ? '正在基于统计结果与开放题反馈生成解读，章节完成并校验后会自动展示。'
+      : '正在围绕研究目标分析已选题目，整理影响决策的重要发现，完成后会自动展示。');
+  $('btn-report-cancel').disabled = false;
+  $('btn-report-cancel').textContent = '停止生成';
+  $('ps-stats').querySelector('.progress-step__label').textContent = quickRun ? '整理题目与客观统计' : '计算统计数据';
+  $('ps-stats').querySelector('.progress-step__sub').textContent = quickRun ? '已选客观题统计、主观题与其他填空' : '频数 / 占比 / 交叉表（由 Python 精确计算）';
+  $('ps-writing').querySelector('.progress-step__label').textContent = quickRun ? '逐题总结' : '生成报告';
+  $('ps-writing').querySelector('.progress-step__sub').textContent = quickRun ? '按题目顺序整理重点与粗略频次' : '逐章生成并校验，完成后展示';
+  $('report-phase-track').hidden = quickRun;
   resetReportFailureUi();
   $('ps-stats').classList.remove('progress-step--done', 'progress-step--failed');
   $('ps-stats').classList.add('progress-step--active');
@@ -940,13 +1031,16 @@ async function runStats(options = {}) {
 
   let generationStatusTimer = null;
   let generationCompleted = false;
+  let generationCancelled = false;
 
   try {
-    const statsResp = await fetch(`/api/stats/${generationSessionId}`, { method: 'POST' });
-    if (!isCurrentGeneration()) return;
-    if (!statsResp.ok) {
-      const d = await statsResp.json();
-      throw new Error(d.detail || '统计计算失败');
+    if (!quickRun && !options.retryFailed && !options.regenerate) {
+      const statsResp = await fetch(`/api/stats/${generationSessionId}`, { method: 'POST' });
+      if (!isCurrentGeneration()) return;
+      if (!statsResp.ok) {
+        const d = await statsResp.json();
+        throw new Error(d.detail || '统计计算失败');
+      }
     }
     $('ps-stats').classList.remove('progress-step--active');
     $('ps-stats').classList.add('progress-step--done');
@@ -983,7 +1077,7 @@ async function runStats(options = {}) {
             ? `正在生成 ${currentStep}/${totalSteps}：${currentTask}`
             : currentTask
         ));
-      const percent = taskProgress.structured
+      const percent = generationCompleted ? 100 : taskProgress.structured
         ? _reportProgressPercent(taskProgress)
         : (totalSteps ? Math.round((completedSteps / totalSteps) * 100) : 0);
 
@@ -993,7 +1087,9 @@ async function runStats(options = {}) {
         meta.textContent = `${statusText} · ${connectionText} · 已等待 ${_formatReportWaitTime(waitedMs)}`;
       }
       if (count) {
-        if (structuredCurrent?.phase === 'themes' && Number(structuredCurrent.item_total)) {
+        if (structuredCurrent?.phase === 'quick_statistics') {
+          count.textContent = `客观题统计 ${Number(structuredCurrent.completed) || 0}/${Number(structuredCurrent.total) || 0} 道题`;
+        } else if (['themes', 'quick_questions'].includes(structuredCurrent?.phase) && Number(structuredCurrent.item_total)) {
           const done = [...taskProgress.items.values()].filter(item =>
             ['completed', 'degraded', 'skipped'].includes(item.status)
           ).length;
@@ -1015,6 +1111,14 @@ async function runStats(options = {}) {
 
     const onReportEvent = ev => {
       if (!isCurrentGeneration()) return;
+      if (ev.type === 'session_ready' && ev.session_id) {generationSessionId = ev.session_id; state.sessionId = ev.session_id;}
+      if (ev.type === 'cancelled') {
+        generationCancelled = true;
+        state.sessionReport.running = false;
+        showReportFailureUi(ev.message || '本次生成已停止');
+        showToast('本次生成已停止', 'info');
+        return;
+      }
       lastSignalAt = Date.now();
       if (ev.type === 'analysis_progress') {
         _applyAnalysisProgress(taskProgress, ev);
@@ -1135,10 +1239,19 @@ async function runStats(options = {}) {
         }
       }
     };
-    await consumeSSE(`/api/report/${generationSessionId}`, onReportEvent);
+    if (options.retryFailed || options.regenerate) {
+      await consumeSSEPost(`/api/report/${generationSessionId}/${options.retryFailed ? 'retry-failed' : 'versions'}`, {base_version: generationBaseVersion || options.baseVersion, instruction:generationInstruction, ...(options.historyId ? {history_id:options.historyId} : {})}, onReportEvent);
+    } else await consumeSSE(`/api/report/${generationSessionId}`, onReportEvent);
+    if (!generationCompleted && !generationCancelled) throw new Error('连接结束，尚未收到报告保存确认，请重试');
   } catch (e) {
     if (!isCurrentGeneration()) return;
     state.sessionReport.running = false;
+    if (returnToReport && /报告版本已达上限/.test(e.message)) {
+      Object.assign(state, returnToReport);
+      renderReportWorkspace(activeReportCtx().reportMd, {preserveQa:true});
+      showToast(`${e.message}，当前报告已保留，失败题目仍可补全。`, 'info', 7000);
+      return false;
+    }
     if (isLinkedRerun) {
       showReportFailureUi(e.message);
       showToast(`新版本生成失败：${e.message}`, 'error', 7000);
@@ -1148,11 +1261,13 @@ async function runStats(options = {}) {
     }
   } finally {
     if (generationStatusTimer) window.clearInterval(generationStatusTimer);
-    if (!isCurrentGeneration()) return;
-    if (isLinkedRerun && generationCompleted) state.sessionReport.pendingVersionRequest = null;
-    state.sessionReport.generatingVersion = null;
-    updateReportVersionUi();
-    applyQAAvailability();
+    if (isCurrentGeneration()) {
+      if (isLinkedRerun && generationCompleted) state.sessionReport.pendingVersionRequest = null;
+      state.sessionReport.generatingVersion = null;
+      $('btn-report-cancel').disabled = true;
+      updateReportVersionUi();
+      applyQAAvailability();
+    }
   }
   return generationCompleted;
 }
@@ -1337,6 +1452,7 @@ function enhanceReportTables() {
       && /选项|取值|子项|画像/.test(headerLabels[0] || '');
     if (isStatsTable) {
       table.classList.add('report-stats-table');
+      table.classList.toggle('report-stats-table--compact', headers.length <= 3);
       table.style.setProperty('--report-stats-min-width', `${Math.max(680, headers.length * 112)}px`);
       metricIndexes.forEach(index => headers[index]?.classList.add('report-stats-table__metric'));
       if (!table.parentElement?.classList.contains('report-table-scroll')) {
@@ -1344,6 +1460,11 @@ function enhanceReportTables() {
         wrapper.className = 'report-table-scroll report-stats-table-scroll';
         table.parentNode.insertBefore(wrapper, table);
         wrapper.appendChild(table);
+      }
+      if (headers.length > 3 && (activeReportCtx()?.reportMode === 'quick' || activeReportCtx()?.reportStyle === 'quick')) {
+        table.parentElement.tabIndex = 0;
+        table.parentElement.setAttribute('role', 'region');
+        table.parentElement.setAttribute('aria-label', '统计表，可横向滚动查看其他列');
       }
     }
 
@@ -1401,14 +1522,18 @@ function buildTOC() {
   $('report-toc').style.display = '';
   tocList.innerHTML = '';
   const links = [];
+  let groupList = null;
+  let groupDetails = null;
+  const linkGroups = [];
   filtered.forEach((h, idx) => {
     if (!h.id) h.id = `toc-h-${idx}`;
     const li = document.createElement('li');
     const a = document.createElement('a');
     a.href = `#${h.id}`;
-    a.textContent = h.textContent;
-    a.title = h.textContent;
-    a.setAttribute('aria-label', h.textContent);
+    const headingTitle = h.dataset.quickTitle || h.textContent;
+    a.textContent = headingTitle;
+    a.title = headingTitle;
+    a.setAttribute('aria-label', headingTitle);
     a.classList.add(`report-toc__link--${h.tagName.toLowerCase()}`);
     a.addEventListener('click', e => {
       e.preventDefault();
@@ -1421,11 +1546,29 @@ function buildTOC() {
       }
     });
     links.push(a);
-    li.appendChild(a);
-    tocList.appendChild(li);
+    if (h.dataset.quickOutlineGroup) {
+      groupDetails = document.createElement('details');
+      groupDetails.className = 'quick-toc-group';
+      groupDetails.open = true;
+      const summary = document.createElement('summary');
+      summary.appendChild(a);
+      groupList = document.createElement('ul');
+      groupDetails.append(summary, groupList);
+      li.appendChild(groupDetails);
+      tocList.appendChild(li);
+    } else if (h.dataset.quickOutlineLeaf && groupList) {
+      li.appendChild(a);
+      groupList.appendChild(li);
+    } else {
+      groupList = null; groupDetails = null;
+      li.appendChild(a);
+      tocList.appendChild(li);
+    }
+    linkGroups.push(groupDetails);
   });
 
   if (reportBody) {
+    let previousActiveIndex = -1;
     const updateActiveToc = () => {
       const marker = reportBody.scrollTop + 72;
       let activeIndex = 0;
@@ -1436,6 +1579,8 @@ function buildTOC() {
         if (top <= marker) activeIndex = index;
       });
       links.forEach((link, index) => link.classList.toggle('toc-active', index === activeIndex));
+      if (activeIndex !== previousActiveIndex && linkGroups[activeIndex]) linkGroups[activeIndex].open = true;
+      previousActiveIndex = activeIndex;
     };
     let activeFrame = null;
     _reportTocScrollHandler = () => {
@@ -1530,7 +1675,10 @@ function renderReportBreadcrumb() {
   const el = $('report-breadcrumb');
   if (!el) return;
   const isCrosstab = state.mode === 'crosstab';
-  const steps = isCrosstab
+  const quick = activeReportCtx()?.reportMode === 'quick' || activeReportCtx()?.reportStyle === 'quick';
+  const steps = quick
+    ? [{ n: 1, label: '上传数据' }, { n: 2, label: '数据确认' }, { n: 4, label: '生成总结' }, { n: 5, label: '报告 & 追问' }]
+    : isCrosstab
     ? [{ n: 1, label: '上传数据' }, { n: 3, label: '方案确认' }, { n: 4, label: '生成报告' }, { n: 5, label: '报告 & 追问' }]
     : [{ n: 1, label: '上传数据' }, { n: 2, label: '数据确认' }, { n: 3, label: '方案确认' }, { n: 4, label: '生成报告' }, { n: 5, label: '报告 & 追问' }];
   let html = '';
@@ -1540,7 +1688,7 @@ function renderReportBreadcrumb() {
     let cls = 'report-toolbar__step';
     if (isDone) cls += ' report-toolbar__step--done report-toolbar__step--clickable';
     if (isActive) cls += ' report-toolbar__step--active';
-    const displayNum = isCrosstab ? (i + 1) : n;
+    const displayNum = quick || isCrosstab ? (i + 1) : n;
     html += `<span class="${cls}" data-step="${n}">${displayNum}. ${label}</span>`;
     if (i < steps.length - 1) html += `<span class="report-toolbar__step-sep"> / </span>`;
   });
@@ -1613,7 +1761,8 @@ function applyQAAvailability() {
     btn.disabled = true;
     return;
   }
-  if (state.viewMode === 'session' && state.sessionReport.running) {
+  if ((state.viewMode === 'session' && state.sessionReport.running)
+      || (typeof isQuickRetryRunning === 'function' && isQuickRetryRunning())) {
     input.placeholder = '报告生成中，暂时不能追问';
     input.disabled = true;
     btn.disabled = true;
@@ -1657,7 +1806,7 @@ function setComparisonValidationModalOpen(open) {
   const modal = $('comparison-validation-modal');
   const trigger = $('btn-comparison-validation');
   if (!modal || !trigger) return;
-  const nextOpen = Boolean(open) && !trigger.disabled;
+  const nextOpen = Boolean(open) && !trigger.disabled && !trigger.hidden;
   modal.hidden = !nextOpen;
   trigger.setAttribute('aria-expanded', String(nextOpen));
   if (nextOpen) {
@@ -1683,6 +1832,7 @@ function normalizedComparisonValidationStatus(validation = activeReportCtx()?.co
 }
 
 function confirmComparisonValidationExport() {
+  if (activeReportCtx()?.reportMode === 'quick' || activeReportCtx()?.reportStyle === 'quick') return true;
   const audit = activeReportCtx()?.comparisonValidation || {};
   const status = normalizedComparisonValidationStatus(audit);
   if (status !== 'needs_review' && status !== 'incomplete') return true;
@@ -1705,6 +1855,15 @@ function renderComparisonValidation(validation) {
   const body = $('comparison-validation-body');
   if (!panel || !trigger || !triggerLabel || !alert || !alertTitle || !alertText
     || !statusNode || !countsNode || !body) return;
+
+  const quick = activeReportCtx()?.reportMode === 'quick' || activeReportCtx()?.reportStyle === 'quick';
+  trigger.hidden = quick;
+  trigger.style.display = quick ? 'none' : '';
+  if (quick) {
+    alert.hidden = true;
+    setComparisonValidationModalOpen(false);
+    return;
+  }
 
   const audit = validation && typeof validation === 'object' ? validation : {};
   const status = normalizedComparisonValidationStatus(audit);
@@ -1834,7 +1993,10 @@ function renderReportWorkspace(md, { preserveQa = true } = {}) {
 
   const reportContent = $('report-content');
   try {
-    reportContent.innerHTML = renderMarkdown(prepareReportMarkdownForPreview(md));
+    const previewMd = ctx.reportMode === 'quick' ? String(md || '')
+      .replace(/^(\s*[-*] \*\*)反复出现(?=\*\*[：:]| · )/gm, '$1反复提及')
+      .replace(/^(\s*[-*] \*\*(?:反复提及|部分提及|零散提及) · )风险待核实(?=\*\*[：:])/gm, '$1风险') : md;
+    reportContent.innerHTML = renderMarkdown(prepareReportMarkdownForPreview(previewMd));
   } catch (error) {
     console.error('[report] Markdown render failed, falling back to plain text:', error);
     reportContent.textContent = md || '';
@@ -1861,6 +2023,7 @@ function renderReportWorkspace(md, { preserveQa = true } = {}) {
   enhanceReportTables();
   renderQuickReportNavigation(md, ctx);
   buildTOC();
+  if (typeof renderQuickRetryStatus === 'function') renderQuickRetryStatus();
   switchReportTab('report');
   renderReportBreadcrumb();
   updateQaBadge();
@@ -1871,7 +2034,7 @@ function showReport(md, { notify = true } = {}) {
   ctx.reportMd = md;
   ctx.title = reportTitleFromMarkdown(md);
   renderReportWorkspace(md, { preserveQa: true });
-  if (notify && state.viewMode === 'session') showToast('报告生成完毕！', 'success');
+  if (notify && state.viewMode === 'session') showToast(ctx.reportStatus === 'partial' ? '已保存部分报告，可单独重试未完成题目' : '报告生成完毕！', ctx.reportStatus === 'partial' ? 'info' : 'success');
 }
 
 function switchReportContext(mode) {
@@ -2416,19 +2579,18 @@ $('btn-report-rename')?.addEventListener('click', startReportTitleEdit);
 // STEP 5: Export + QA
 // ============================================================
 
-$('btn-export-word').addEventListener('click', () => {
-  if (state.reportVersionLoading || (state.viewMode === 'session' && state.sessionReport.running)) {
+function downloadReportFile(format, scope = 'body') {
+  if (activeReportInteractionBusy()) {
     showToast('当前报告版本准备完成后再导出', 'info');
     return;
   }
   if (!confirmComparisonValidationExport()) return;
-  const version = activeVersionNumber();
-  if (state.viewMode === 'history' && state.historyId) {
-    window.location.href = withOptionalVersion(`/api/export/word-history/${state.historyId}`, version);
-  } else {
-    window.location.href = withOptionalVersion(`/api/export/word/${state.sessionId}`, version);
-  }
-});
+  const type = {pdf:'pdf', word:'word', md:'markdown'}[format];
+  const id = activeReportId();
+  if (!type || !id) { showToast('还没有可导出的报告', 'info'); return; }
+  const history = state.viewMode === 'history' ? '-history' : '';
+  window.location.href = reportExportUrl(`/api/export/${type}${history}/${encodeURIComponent(id)}`, activeVersionNumber(), scope);
+}
 
 // ── 飞书登录状态 + 权限门控 ──
 state.feishu = {
@@ -2493,24 +2655,6 @@ async function refreshFeishuStatus() {
 }
 
 // ── 飞书文档导出 ──
-$('btn-export-pdf').addEventListener('click', () => {
-  if (state.reportVersionLoading || (state.viewMode === 'session' && state.sessionReport.running)) {
-    showToast('当前报告版本准备完成后再导出', 'info');
-    return;
-  }
-  if (!confirmComparisonValidationExport()) return;
-  const version = activeVersionNumber();
-  if (state.viewMode === 'history' && state.historyId) {
-    window.location.href = withOptionalVersion(`/api/export/pdf-history/${state.historyId}`, version);
-  } else if (state.sessionId) {
-    window.location.href = withOptionalVersion(`/api/export/pdf/${state.sessionId}`, version);
-  } else {
-    showToast('还没有生成报告', 'error');
-  }
-});
-
-$('btn-export-feishu').addEventListener('click', exportFeishu);
-
 function showFeishuConfirmModal(email) {
   return new Promise(resolve => {
     let existing = $('feishu-export-modal');
@@ -2542,7 +2686,7 @@ function showFeishuConfirmModal(email) {
   });
 }
 
-async function exportFeishu() {
+async function exportFeishu(scope = 'body') {
   if (state.reportVersionLoading || (state.viewMode === 'session' && state.sessionReport.running)) {
     showToast('当前报告版本准备完成后再导出', 'info');
     return;
@@ -2577,8 +2721,8 @@ async function exportFeishu() {
   btn.textContent = '导出中…';
 
   const url = exportMode === 'history'
-    ? withOptionalVersion(`/api/export/feishu-history/${exportReportId}`, exportVersion)
-    : withOptionalVersion(`/api/export/feishu/${exportReportId}`, exportVersion);
+    ? reportExportUrl(`/api/export/feishu-history/${exportReportId}`, exportVersion, scope)
+    : reportExportUrl(`/api/export/feishu/${exportReportId}`, exportVersion, scope);
   try {
     const resp = await fetch(url, { method: 'POST' });
     const data = await resp.json();
@@ -2614,32 +2758,78 @@ function showFeishuLink(url) {
   }
 }
 
-// Export dropdown toggle
-$('btn-export-dropdown').addEventListener('click', e => {
-  e.stopPropagation();
+// Each format owns a scope submenu, shared by pointer, click and keyboard input.
+function setReportExportFormat(format, open = true, focus = false) {
+  document.querySelectorAll('[data-export-format]').forEach(group => {
+    const selected = open && group.dataset.exportFormat === format;
+    const trigger = group.querySelector('[data-export-format-trigger]');
+    const submenu = group.querySelector('.report-export-submenu');
+    group.classList.toggle('is-open', selected);
+    trigger.setAttribute('aria-expanded', String(selected));
+    submenu.hidden = !selected;
+    if (selected && focus) submenu.querySelector('button')?.focus();
+  });
+}
+function closeReportExportMenu() {
+  $('export-dropdown-menu').classList.remove('open');
+  $('btn-export-dropdown').setAttribute('aria-expanded', 'false');
+  setReportExportFormat('', false);
+}
+$('btn-export-dropdown').addEventListener('click', event => {
+  event.stopPropagation();
   setComparisonValidationModalOpen(false);
   setReportLlmPopoverOpen(false);
   setReportVersionMenuOpen(false);
-  $('export-dropdown-menu').classList.toggle('open');
+  const open = !$('export-dropdown-menu').classList.contains('open');
+  $('export-dropdown-menu').classList.toggle('open', open);
+  $('btn-export-dropdown').setAttribute('aria-expanded', String(open));
+  if (!open) setReportExportFormat('', false);
 });
-document.addEventListener('click', e => {
-  const dropdown = $('export-dropdown');
-  const menu = $('export-dropdown-menu');
-  if (menu && dropdown && !dropdown.contains(e.target)) menu.classList.remove('open');
+$('btn-export-dropdown').addEventListener('keydown', event => {
+  if (event.key !== 'ArrowDown') return;
+  event.preventDefault();
+  $('export-dropdown-menu').classList.add('open');
+  $('btn-export-dropdown').setAttribute('aria-expanded', 'true');
+  $('export-dropdown-menu').querySelector('[data-export-format-trigger]')?.focus();
 });
-$('btn-export-md').addEventListener('click', () => {
-  if (state.reportVersionLoading || (state.viewMode === 'session' && state.sessionReport.running)) {
-    showToast('当前报告版本准备完成后再导出', 'info');
+$('export-dropdown-menu').addEventListener('click', event => {
+  const trigger = event.target.closest('[data-export-format-trigger]');
+  if (trigger) {
+    event.stopPropagation();
+    setReportExportFormat(trigger.dataset.exportFormatTrigger, true);
     return;
   }
-  if (!confirmComparisonValidationExport()) return;
-  const blob = new Blob([state.reportMd || ''], { type: 'text/markdown;charset=utf-8' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `${($('report-title-display').textContent || '调研报告')}.md`;
-  a.click();
-  URL.revokeObjectURL(url);
+  const choice = event.target.closest('[data-report-export]');
+  if (!choice || choice.disabled) return;
+  const format = choice.dataset.reportExport, scope = choice.dataset.exportScope;
+  closeReportExportMenu();
+  if (format === 'feishu') exportFeishu(scope);
+  else downloadReportFile(format, scope);
+});
+document.querySelectorAll('[data-export-format]').forEach(group => group.addEventListener('pointerenter', event => {
+  if (event.pointerType === 'touch') return;
+  setReportExportFormat(group.dataset.exportFormat);
+}));
+$('export-dropdown-menu').addEventListener('keydown', event => {
+  const trigger = event.target.closest('[data-export-format-trigger]');
+  const choice = event.target.closest('[data-report-export]');
+  if (event.key === 'Escape') {
+    event.preventDefault(); closeReportExportMenu(); $('btn-export-dropdown').focus();
+  } else if (trigger && event.key === 'ArrowRight') {
+    event.preventDefault(); setReportExportFormat(trigger.dataset.exportFormatTrigger, true, true);
+  } else if (choice && event.key === 'ArrowLeft') {
+    event.preventDefault();
+    const owner = choice.closest('[data-export-format]');
+    setReportExportFormat('', false); owner.querySelector('[data-export-format-trigger]').focus();
+  } else if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+    event.preventDefault();
+    const items = trigger ? [...$('export-dropdown-menu').querySelectorAll('[data-export-format-trigger]')] : [...event.target.closest('.report-export-submenu').querySelectorAll('button')];
+    const next = (items.indexOf(event.target) + (event.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length;
+    items[next]?.focus();
+  }
+});
+document.addEventListener('click', event => {
+  if (!$('export-dropdown').contains(event.target)) closeReportExportMenu();
 });
 
 $('btn-qa-send').addEventListener('click', sendQA);

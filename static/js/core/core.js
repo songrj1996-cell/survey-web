@@ -16,6 +16,10 @@ const state = {
   questionnaireUsed: false,
   currentStep: 1,
   viewStep: 1,        // 当前查看的步骤（可回看已完成步骤，不影响 currentStep）
+  reportMode: 'insight', // Product mode; independent of data engine state.mode.
+  selectedQuestionKeys: null,
+  columnFilter: 'all',
+  columnDraftSession: null,
   columns: null,      // Step 2 题型数据
   planData: null,
   reportMd: null,
@@ -23,6 +27,7 @@ const state = {
   reportVersionLoading: false,
   historyLoading: false,
   reportGenerationSerial: 0,
+  quickRetry: null, // Running work is separate from the version being read.
   viewMode: 'session', // 'session' | 'history'
   historyId: null,     // 当前查看/续聊的历史 id
   reportStyleSelection: { sessionId: null, value: 'full', enabled: false, locked: false },
@@ -150,16 +155,14 @@ function renderStepBars() {
 
 // All questionnaire imports share five steps, including external statistics.
 function applyStepBarForMode() {
-  document.querySelectorAll('[data-survey-step="2"]').forEach(b => {
-    b.style.display = '';
-  });
-  const seq = [1, 2, 3, 4, 5];
+  const quick = state.reportMode === 'quick';
+  const seq = quick ? [1, 2, 4, 5] : [1, 2, 3, 4, 5];
   document.querySelectorAll('.step-bar').forEach(bar => {
-    seq.forEach((step, i) => {
-      const btn = bar.querySelector(`[data-survey-step="${step}"]`);
-      if (!btn) return;
+    bar.querySelectorAll('[data-survey-step]').forEach(btn => {
+      const step = Number(btn.dataset.surveyStep);
+      btn.hidden = !seq.includes(step);
       const num = btn.querySelector('.step-bar__num');
-      if (num) num.textContent = step;
+      if (num) num.textContent = String(seq.indexOf(step) + 1);
     });
   });
 }
@@ -237,7 +240,7 @@ function consumeSSE(url, onEvent) {
         }
         if (data.type === 'error') { es.close(); reject(new Error(data.message || data.msg || '服务端处理失败')); }
         if ([
-          'columns_ready', 'plan_ready', 'report_done', 'qa_done',
+          'columns_ready', 'plan_ready', 'report_done', 'qa_done', 'cancelled',
           'ai_detect_done', 'quality_done', 'comment_preprocess_done',
           'comment_quotes_done', 'comment_quotes_error',
         ].includes(data.type)) {
@@ -292,7 +295,7 @@ async function consumeSSEPost(url, body, onEvent) {
         const data = JSON.parse(raw);
         onEvent(data);
         if (data.type === 'error') throw new Error(data.message);
-        if (['plan_ready', 'report_done', 'qa_done'].includes(data.type)) return data;
+        if (['plan_ready', 'report_done', 'qa_done', 'cancelled'].includes(data.type)) return data;
       } catch (parseErr) {
         if (parseErr.message !== 'JSON') throw parseErr;
       }

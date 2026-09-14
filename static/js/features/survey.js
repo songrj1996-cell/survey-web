@@ -43,9 +43,13 @@ async function loadColumns() {
 }
 
 function renderColumnRows(columns) {
-  $('col-confirm-count').textContent = `共 ${columns.length} 道题`;
-  $('col-list').innerHTML = columns.map((c, i) => columnRowHTML(c, i)).join('');
-  columns.forEach((c, i) => updateExtra(i, c.role));
+  if (state.columnDraftSession !== state.sessionId) {
+    state.columns = columns.map(prepareColumnDraft);
+    state.columnDraftSession = state.sessionId;
+    state.selectedQuestionKeys = state.columns.filter(isSelectableColumn).map(columnQuestionKey);
+    state.columnFilter = 'all';
+  }
+  renderQuestionList();
   refreshContextFormVisibility();
 }
 
@@ -229,472 +233,247 @@ $('btn-duplicate-report-rerun')?.addEventListener('click', () => {
   });
 });
 
-function optionEditorHTML(i, c) {
-  const options = [...(c.options || [])];
-  (c.unmatched_values || [])
-    .filter(item => item?.suggested_handling === 'standard_option')
-    .forEach(item => {
-      const value = String(item?.value || '').trim();
-      if (value && !options.some(option => option.trim().toLocaleLowerCase() === value.toLocaleLowerCase())) {
-        options.push(value);
-      }
-    });
-  const aliases = c.value_aliases || {};
-  const aliasGroups = Object.entries(aliases).filter(([canon, values]) =>
-    Array.isArray(values) && values.some(v => String(v).trim() && String(v).trim() !== canon)
-  ).length;
-  const chips = options.map(opt => `<span class="option-summary-chip" title="${esc(opt)}">${esc(opt)}</span>`).join('');
-  const more = '';
-  const mergeBadge = aliasGroups ? `<span class="option-merge-badge">已合并 ${aliasGroups} 组</span>` : '';
-  const rows = options.map(opt => `
-    <div class="option-edit-row">
-      <div class="option-edit-row__main">
-        <textarea class="extra-input option-input" data-option="${i}" rows="2" placeholder="选项内容">${esc(opt)}</textarea>
-        <div class="option-alias-hint">${(aliases[opt] || []).map(a =>
-    `<span class="alias-chip"><span class="alias-chip__text" title="${esc(a)}">${esc(a)}</span><button class="alias-chip__remove" data-alias-col="${i}" data-alias-canon="${esc(opt)}" data-alias-val="${esc(a)}" title="移除此别名" type="button">×</button></span>`
-  ).join('')}<button class="alias-add-btn" data-alias-add-col="${i}" data-alias-add-canon="${esc(opt)}" title="添加别名" type="button">+</button></div>
-      </div>
-      <button class="btn-icon option-remove" data-option-remove="${i}" title="删除选项" type="button">×</button>
-    </div>
-  `).join('');
-  return `<div class="option-editor" data-option-editor="${i}">
-    <details class="option-editor__details" ${c.low_confidence ? 'open' : ''}>
-      <summary class="option-editor__summary">
-        <span class="option-editor__summary-main">${chips || '<span class="option-summary-empty">暂无选项</span>'}${more}</span>
-        <span class="option-editor__summary-actions">${mergeBadge}<span class="option-edit-link">编辑</span></span>
-      </summary>
-      <div class="option-editor__body">
-        <div class="option-editor__head">
-          <span>标准选项</span>
-          <button class="btn btn--ghost btn--sm option-add" data-option-add="${i}" type="button">添加选项</button>
-        </div>
-        <div class="option-editor__rows">${rows}</div>
-      </div>
-    </details>
-  </div>`;
+// COLUMN_MODEL_START: pure draft operations, also exercised by Node contract tests.
+function cloneColumn(value) { return JSON.parse(JSON.stringify(value)); }
+function columnQuestionKey(c) {
+  const indexes = c.column_indexes?.length ? c.column_indexes : [c.column_index ?? c.index];
+  return indexes.filter(v => v != null).map(Number).filter(Number.isFinite).sort((a,b) => a-b).join(':');
 }
-
-function otherTextHTML(i, c) {
-  const meta = c.other_text || {};
-  if (!meta) return '';
-  const examples = Array.isArray(meta.examples) ? meta.examples.slice(0, 5) : [];
-  const count = Number(meta.count || examples.length || 0);
-  const option = meta.option || 'Other / 其他';
-  const exampleHTML = examples.length
-    ? `<div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px;">${examples.map(v =>
-        `<span class="option-summary-chip" title="${esc(v)}">${esc(v)}</span>`
-      ).join('')}</div>`
-    : '';
-  const description = meta.provider_declared
-    ? `Google 表单结构允许 Other；当前回答接口不会逐条标记 Other。发现 ${count} 条不属于现有选项的候选内容，历史已删除选项也可能混入；确认后统计时计入「${esc(option)}」，并作为本题补充反馈。`
-    : `其他填空补充：检测到 ${count} 条；统计时计入「${esc(option)}」，报告中作为本题补充反馈`;
-  return `<div class="option-editor" data-other-text="${i}">
-    <div style="border:1px dashed var(--border);border-radius:8px;padding:10px 12px;background:rgba(255,255,255,.54);">
-      <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:var(--text-2);">
-        <input type="checkbox" data-other-text-enabled="${i}" ${meta.enabled !== false ? 'checked' : ''} />
-        <span>${description}</span>
-      </label>
-      ${exampleHTML}
-    </div>
-  </div>`;
+function isSelectableColumn(c) {
+  return !['ignore', 'id', 'mlbbid'].includes(c.role) && !c.empty_column && !c.is_empty && !!columnQuestionKey(c);
 }
-
-function unmatchedValuesHTML(i, c) {
-  const values = Array.isArray(c.unmatched_values)
-    ? c.unmatched_values.filter(item => item?.suggested_handling !== 'standard_option')
-    : [];
-  if (!values.length) return '';
-  const totalCount = values.reduce((sum, item) => sum + Number(item?.count || 0), 0);
-  const previewRows = values.map(item => `<div class="unmatched-value-row">
-    <span class="unmatched-value-row__text">${esc(item.value)}</span>
-    <span class="unmatched-value-row__count">${Number(item.count || 0)} 条</span>
-  </div>`).join('');
-  return `<div class="option-editor" data-unmatched-values="${i}">
-    <div style="border:1px dashed var(--border);border-radius:8px;padding:10px 12px;background:rgba(255,255,255,.54);">
-      <div style="font-size:13px;font-weight:600;color:var(--text);margin-bottom:6px;">未匹配内容</div>
-      <div class="unmatched-help">请先确认上方标准选项。与标准选项或别名匹配的内容会自动按选项统计，剩余内容再按下方方式统一处理。</div>
-      <label class="unmatched-bulk-row">
-        <span>批量处理</span>
-        <select class="extra-input unmatched-handling-select" data-unmatched-handling="${i}">
-          <option value="as_other" selected>剩余内容按 Other 填空处理</option>
-          <option value="keep_raw">剩余内容保留原值统计</option>
-        </select>
-      </label>
-      <details class="unmatched-preview" open>
-        <summary>逐条预览：${values.length} 种未匹配内容，共 ${totalCount} 条</summary>
-        <div class="unmatched-value-list">${previewRows}</div>
-      </details>
-    </div>
-  </div>`;
+function isIdentityColumn(c) { return ['id', 'mlbbid'].includes(c.role); }
+function isMainConfirmationColumn(c) { return isSelectableColumn(c) || isIdentityColumn(c); }
+function isSubjectiveColumn(c) {
+  return c.role === 'open_text' || (['single_choice','multi_choice'].includes(c.role) && !!c.other_text && c.other_text.enabled !== false);
 }
-
-function autosizeOptionTextareas(root = document) {
-  root.querySelectorAll('textarea.option-input').forEach(el => {
-    el.style.height = 'auto';
-    el.style.height = `${el.scrollHeight}px`;
+function columnSourceLabel(c, i, columns = []) {
+  if (isIdentityColumn(c)) return '身份';
+  const declared = c.question_number ?? c.question_no;
+  if (declared != null && String(declared).trim()) return /^q/i.test(String(declared)) ? String(declared) : `Q${declared}`;
+  const match = String(c.name || c.name_zh || '').match(/^\s*(Q\s*\d+(?:[.-]\d+)?|第\s*\d+\s*题)(?=[\s:：.、）)]|$)/i);
+  if (match) return match[1].replace(/\s/g,'');
+  if (!isSelectableColumn(c)) return `字段 ${i + 1}`;
+  const ordinal = columns.slice(0, i + 1).filter(isSelectableColumn).length;
+  return `Q${ordinal || i + 1}`;
+}
+function prepareColumnDraft(column) {
+  const c = cloneColumn(column);
+  c.options = [...(c.options || [])];
+  (c.unmatched_values || []).filter(item => item.suggested_handling === 'standard_option').forEach(item => {
+    if (!c.options.some(value => String(value).trim().toLocaleLowerCase() === String(item.value).trim().toLocaleLowerCase())) c.options.push(String(item.value));
   });
-}
-
-function matrixEditorHTML(i, c) {
-  const colIndexes = c.column_indexes || [];
-  const rows = c.rows || [];
-  const rowCount = Math.max(colIndexes.length, rows.length);
-  const summaryRows = rows.length ? rows : colIndexes.map((_, idx) => `子项${idx + 1}`);
-  const chips = summaryRows.slice(0, 5).map(row => `<span class="matrix-summary-chip">${esc(row)}</span>`).join('');
-  const more = summaryRows.length > 5 ? `<span class="matrix-summary-more">+${summaryRows.length - 5}</span>` : '';
-  const bodyRows = Array.from({ length: rowCount }).map((_, idx) => {
-    const colNo = colIndexes[idx] != null ? `列 ${colIndexes[idx]}` : `子项 ${idx + 1}`;
-    const value = rows[idx] || '';
-    return `<div class="matrix-edit-row">
-      <span class="matrix-edit-row__col">${esc(colNo)}</span>
-      <input class="extra-input matrix-row-input" data-matrix-row="${i}" data-matrix-row-idx="${idx}" value="${esc(value)}" placeholder="子项名称" />
-    </div>`;
-  }).join('');
-
-  return `<div class="matrix-editor" data-matrix-editor="${i}">
-    <details class="matrix-editor__details" ${c.low_confidence ? 'open' : ''}>
-      <summary class="matrix-editor__summary">
-        <span class="matrix-editor__summary-main">${chips || '<span class="matrix-summary-empty">暂无子项</span>'}${more}</span>
-        <span class="matrix-edit-link">编辑子项</span>
-      </summary>
-      <div class="matrix-editor__body">
-        <div class="matrix-editor__head">矩阵子项</div>
-        <div class="matrix-editor__rows">${bodyRows}</div>
-      </div>
-    </details>
-  </div>`;
-}
-
-function collectOptionsForColumn(i) {
-  const seen = new Set();
-  const values = [];
-  document.querySelectorAll(`.option-input[data-option="${i}"]`).forEach(input => {
-    const v = input.value.trim();
-    const key = v.toLocaleLowerCase();
-    if (v && !seen.has(key)) {
-      seen.add(key);
-      values.push(v);
-    }
-  });
-  return values;
-}
-
-function syncOptionSummary(i) {
-  const summary = document.querySelector(
-    `[data-option-editor="${i}"] .option-editor__summary-main`
-  );
-  if (!summary) return;
-  const options = collectOptionsForColumn(i);
-  summary.innerHTML = options.length
-    ? options.map(opt => `<span class="option-summary-chip" title="${esc(opt)}">${esc(opt)}</span>`).join('')
-    : '<span class="option-summary-empty">暂无选项</span>';
-}
-
-function collectMatrixRowsForColumn(i, c) {
-  const inputs = Array.from(document.querySelectorAll(`.matrix-row-input[data-matrix-row="${i}"]`));
-  if (!inputs.length) return c.rows || [];
-
-  return inputs.map((input, idx) => {
-    const value = input.value.trim();
-    return value || (c.rows || [])[idx] || `子项${idx + 1}`;
-  });
-}
-
-function buildEditedOptionAliases(c, editedOptions) {
-  const aliases = { ...(c.value_aliases || {}) };
-  const original = c.options_original || c.options || [];
-  const editedSet = new Set(editedOptions);
-  const norm = s => String(s || '').trim().toLocaleLowerCase();
-
-  // 只有长度相同时才做位置匹配推断重命名（纯重命名场景）
-  // 长度变了说明有增删，保守处理：只按名字保留既有 alias，不推断重命名，避免位移误归并
-  if (original.length === editedOptions.length) {
-    original.forEach((oldValue, idx) => {
-      const newValue = editedOptions[idx];
-      if (!oldValue || !newValue || norm(oldValue) === norm(newValue)) return;
-      aliases[newValue] = [...new Set([...(aliases[newValue] || []), oldValue, ...(aliases[oldValue] || [])])];
-      delete aliases[oldValue];
-    });
+  c.options_original = [...(c.options_original || c.options)];
+  c.value_aliases = cloneColumn(c.value_aliases || {});
+  if ((c.unmatched_values || []).some(v => v.suggested_handling !== 'standard_option')) {
+    c.unmatched_handling = c.unmatched_handling || (c.other_text?.enabled === false ? 'keep_raw' : 'as_other');
+    c.other_text = {...(c.other_text || {}), option:c.other_text?.option || 'Other / 其他', enabled:c.unmatched_handling !== 'keep_raw'};
   }
-
-  Object.keys(aliases).forEach(k => {
-    if (!editedSet.has(k)) delete aliases[k];
-  });
-  return aliases;
+  return c;
 }
+function renameColumnOptions(c, entries) {
+  const aliases = {};
+  const options = [];
+  entries.forEach(({value, previous, aliases: values = []}) => {
+    value = String(value || '').trim();
+    if (!value) return;
+    const canonical = options.find(v => v.toLocaleLowerCase() === value.toLocaleLowerCase()) || value;
+    if (!options.includes(canonical)) options.push(canonical);
+    const inherited = previous && previous !== canonical ? [previous, ...(c.value_aliases?.[previous] || [])] : [];
+    aliases[canonical] = [...new Set([...(aliases[canonical] || []), ...values, ...inherited])].filter(v => v && v !== canonical);
+  });
+  c.options = options;
+  c.value_aliases = aliases;
+  return c;
+}
+function serializeColumnDraft(column) {
+  const c = cloneColumn(column);
+  c.column_indexes = c.column_indexes || [c.column_index ?? c.index];
+  const choices = ['single_choice','multi_choice','profile_dim','matrix_single','matrix_multi'];
+  if (choices.includes(c.role)) {
+    const residuals = (c.unmatched_values || []).filter(v => v.suggested_handling !== 'standard_option');
+    if (residuals.length && c.unmatched_handling !== 'keep_raw') {
+      c.other_text = {...(c.other_text || {}), enabled:true, option:c.other_text?.option || 'Other / 其他'};
+    }
+    if (c.other_text?.enabled === false) {
+      const other = (c.other_text.option || 'Other / 其他').trim().toLocaleLowerCase();
+      c.options = c.options.filter(v => v.trim().toLocaleLowerCase() !== other);
+    } else if (c.other_text?.enabled && !c.options.includes(c.other_text.option || 'Other / 其他')) {
+      c.options.push(c.other_text.option || 'Other / 其他');
+    }
+    if (c.unmatched_handling === 'keep_raw' && residuals.length) c.other_text = {...(c.other_text || {}), enabled:false};
+  }
+  return c;
+}
+function selectedColumnsForSave(columns, keys) {
+  const selected = new Set(keys || []);
+  return columns.filter(c => isSelectableColumn(c) && selected.has(columnQuestionKey(c))).map(columnQuestionKey);
+}
+// COLUMN_MODEL_END
 
+let columnEditor = null;
+let columnEditorOpener = null;
 function columnRowHTML(c, i) {
-  const opts = ROLE_OPTIONS.map(([val, label]) =>
-    `<option value="${val}" ${val === c.role ? 'selected' : ''}>${label}</option>`
-  ).join('');
-  const name = c.name_zh || c.name || `列${(c.column_indexes || [])[0] ?? i}`;
-  const isMatrix = MATRIX_ROLES.includes(c.role) || (c.column_indexes || []).length > 1;
-  const matrixTag = isMatrix ? `<span class="col-row__tag">矩阵 · ${(c.column_indexes || []).length} 列</span>` : '';
-  const roleClass = c.role ? ` col-row--role-${c.role}` : '';
-  const lowConfClass = '';  // 不改背景色，跟随题型颜色
-  const lowConfBadge = c.low_confidence
-    ? `<div class="col-row__low-conf-badge"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>AI 判断信心低，请人工确认</div>`
-    : '';
-
-  return `<div class="col-row${roleClass}${lowConfClass}" data-card="${i}">
-    <span class="col-row__num">${i + 1}</span>
-    <div class="col-row__main">
-      <div class="col-row__name" title="${esc(name)}">${esc(name)}${matrixTag}</div>
-      ${lowConfBadge}
-      <div class="q-extra" data-extra="${i}"></div>
-    </div>
-    <select class="type-select col-row__select" data-card="${i}">${opts}</select>
-  </div>`;
+  const key = columnQuestionKey(c);
+  const selected = isSelectableColumn(c) && (state.selectedQuestionKeys || []).includes(key);
+  const name = c.name_zh || c.name || '未命名题目';
+  const options = ROLE_OPTIONS.map(([value,label]) => `<option value="${value}" ${c.role===value?'selected':''}>${label}</option>`).join('');
+  const preview = (MATRIX_ROLES.includes(c.role) ? c.rows : c.options) || [];
+  const responseCount = c.response_count ?? c.valid_response_count;
+  const roleClass = ROLE_OPTIONS.some(([value]) => value === c.role) ? ` col-row--role-${c.role}` : '';
+  return `<article class="col-row qe-question-row${roleClass}" data-question-row="${i}">
+    <label class="qe-question-select"><input type="checkbox" data-question-select="${i}" ${selected?'checked':''} ${isSelectableColumn(c)?'':'disabled'} aria-label="选择 ${esc(name)}" /></label>
+    <span class="col-row__num qe-question-number">${esc(columnSourceLabel(c,i,state.columns))}</span>
+    <div class="qe-question-main"><strong>${esc(name)}</strong><div class="qe-question-preview">${preview.slice(0,3).map(v=>`<span>${esc(v)}</span>`).join('')}${preview.length>3?`<span>+${preview.length-3}</span>`:''}</div>${c.low_confidence?'<small class="qe-pending">待确认题型</small>':''}${isIdentityColumn(c)?'<small>身份字段 · 保留用于对应回答，不计入分析题数</small>':''}${isSubjectiveColumn(c)&&c.role!=='open_text'?'<small>包含已启用的其他填空</small>':''}</div>
+    <span class="qe-response-count">${Number.isFinite(Number(responseCount))&&responseCount!=null?`${Number(responseCount)} 份回复`:''}</span>
+    <select class="type-select" data-question-type="${i}" aria-label="${esc(name)}的题型">${options}</select>
+    <button class="btn btn--ghost btn--sm" type="button" data-question-edit="${i}">编辑</button>
+  </article>`;
 }
-
-function updateExtra(i, role) {
-  const box = document.querySelector(`[data-extra="${i}"]`);
-  if (!box) return;
-  const c = state.columns[i] || {};
-  const bits = [];
-
-  if (MATRIX_ROLES.includes(role)) {
-    bits.push(matrixEditorHTML(i, c));
-  }
-
-  if (role === 'multi_choice') {
-    const delim = c.delimiter === '\n' ? '\\n' : (c.delimiter || '，');
-    bits.push(`<span class="q-extra-inline">分隔符
-      <input class="extra-input extra-input--sm" data-delim="${i}" value="${esc(delim)}" placeholder="，" /></span>`);
-  }
-
-  if (CHOICE_ROLES.includes(role)) {
-    bits.push(optionEditorHTML(i, c));
-    if ((role === 'single_choice' || role === 'multi_choice') && c.unmatched_values?.length) {
-      bits.push(unmatchedValuesHTML(i, c));
-    } else if ((role === 'single_choice' || role === 'multi_choice') && c.other_text) {
-      bits.push(otherTextHTML(i, c));
-    }
-  } else if (role === 'scale' || role === 'matrix_scale') {
-    const mn = (c.scale_min ?? 1), mx = (c.scale_max ?? 5);
-    bits.push(`<span class="q-extra-inline">量程
-      <input class="extra-input extra-input--sm" type="number" data-smin="${i}" value="${mn}" />
-      <span class="scale-sep">-</span>
-      <input class="extra-input extra-input--sm" type="number" data-smax="${i}" value="${mx}" /></span>`);
-  }
-
-  box.innerHTML = bits.join('');
-  box.style.display = bits.length ? 'flex' : 'none';
-  autosizeOptionTextareas(box);
+function visibleQuestionIndexes() {
+  return (state.columns || []).map((c,i)=>({c,i})).filter(({c})=>isMainConfirmationColumn(c) && (state.columnFilter==='all' || (state.columnFilter==='subjective'?isSubjectiveColumn(c):c.low_confidence))).map(({i})=>i);
 }
-
-$('col-list').addEventListener('change', e => {
-  const sel = e.target.closest('.type-select');
-  if (sel) {
-    const i = +sel.dataset.card;
-    const newRole = sel.value;
-    state.columns[i].role = newRole;
-    updateExtra(i, newRole);
-    // 同步更新颜色类
-    const row = document.querySelector(`.col-row[data-card="${i}"]`);
-    if (row) {
-      row.className = row.className.replace(/\bcol-row--role-\S+/g, '').trim();
-      if (newRole) row.classList.add(`col-row--role-${newRole}`);
-    }
-  }
-
-});
-
-$('col-list').addEventListener('input', e => {
-  const textarea = e.target.closest('textarea.option-input');
-  if (textarea) {
-    autosizeOptionTextareas(textarea.closest('.option-edit-row') || document);
-    syncOptionSummary(+textarea.dataset.option);
-  }
-});
-
-$('col-list').addEventListener('click', e => {
-  const addBtn = e.target.closest('[data-option-add]');
-  if (addBtn) {
-    const i = +addBtn.dataset.optionAdd;
-    const rows = document.querySelector(`[data-option-editor="${i}"] .option-editor__rows`);
-    if (rows) {
-      rows.insertAdjacentHTML('beforeend', `
-        <div class="option-edit-row">
-          <div class="option-edit-row__main">
-            <textarea class="extra-input option-input" data-option="${i}" rows="2" placeholder="选项内容"></textarea>
-            <div class="option-alias-hint"><button class="alias-add-btn" data-alias-add-col="${i}" data-alias-add-canon="" title="添加别名" type="button">+</button></div>
-          </div>
-          <button class="btn-icon option-remove" data-option-remove="${i}" title="删除选项" type="button">×</button>
-        </div>
-      `);
-      autosizeOptionTextareas(rows);
-      syncOptionSummary(i);
-      rows.querySelector('.option-edit-row:last-child .option-input')?.focus();
-    }
-  }
-
-  const removeBtn = e.target.closest('[data-option-remove]');
-  if (removeBtn) {
-    const i = +removeBtn.dataset.optionRemove;
-    removeBtn.closest('.option-edit-row')?.remove();
-    syncOptionSummary(i);
-  }
-
-  const aliasRemoveBtn = e.target.closest('.alias-chip__remove');
-  if (aliasRemoveBtn) {
-    const colIdx = +aliasRemoveBtn.dataset.aliasCol;
-    const canon = aliasRemoveBtn.dataset.aliasCanon;
-    const val = aliasRemoveBtn.dataset.aliasVal;
-    const col = state.columns[colIdx];
-    if (col?.value_aliases?.[canon]) {
-      col.value_aliases[canon] = col.value_aliases[canon].filter(a => a !== val);
-      if (!col.value_aliases[canon].length) delete col.value_aliases[canon];
-    }
-    aliasRemoveBtn.closest('.alias-chip')?.remove();
-  }
-
-  const aliasAddBtn = e.target.closest('.alias-add-btn');
-  if (aliasAddBtn) {
-    const colIdx = +aliasAddBtn.dataset.aliasAddCol;
-    // 新增选项行 canon 为空时，从同行 input 读取当前值
-    let canon = aliasAddBtn.dataset.aliasAddCanon;
-    if (!canon) {
-      canon = aliasAddBtn.closest('.option-edit-row')?.querySelector('.option-input')?.value?.trim() || '';
-    }
-    if (!canon) return;
-    const input = document.createElement('input');
-    input.className = 'alias-add-input';
-    input.placeholder = '输入别名，回车确认';
-    aliasAddBtn.replaceWith(input);
-    input.focus();
-
-    function commitAlias() {
-      const val = input.value.trim();
-      const col = state.columns[colIdx];
-      if (val && col) {
-        if (!col.value_aliases) col.value_aliases = {};
-        if (!col.value_aliases[canon]) col.value_aliases[canon] = [];
-        if (!col.value_aliases[canon].includes(val)) {
-          // 全局唯一化：从其他 canon 的 alias list 和 DOM 中移除相同值，避免同一原始值被两个标准选项覆盖映射
-          if (col.value_aliases) {
-            Object.keys(col.value_aliases).forEach(k => {
-              if (k === canon) return;
-              col.value_aliases[k] = col.value_aliases[k].filter(a => a !== val);
-              if (!col.value_aliases[k].length) delete col.value_aliases[k];
-            });
-          }
-          document.querySelectorAll(`.alias-chip__remove[data-alias-col="${colIdx}"]`).forEach(btn => {
-            if (btn.dataset.aliasCanon !== canon && btn.dataset.aliasVal === val) {
-              btn.closest('.alias-chip')?.remove();
-            }
-          });
-          col.value_aliases[canon].push(val);
-          const chip = document.createElement('span');
-          chip.className = 'alias-chip';
-          chip.innerHTML = `<span class="alias-chip__text" title="${esc(val)}">${esc(val)}</span><button class="alias-chip__remove" data-alias-col="${colIdx}" data-alias-canon="${esc(canon)}" data-alias-val="${esc(val)}" title="移除此别名" type="button">×</button>`;
-          input.parentNode.insertBefore(chip, input);
-        }
-      }
-      const newBtn = document.createElement('button');
-      newBtn.className = 'alias-add-btn';
-      newBtn.dataset.aliasAddCol = colIdx;
-      newBtn.dataset.aliasAddCanon = canon;
-      newBtn.title = '添加别名';
-      newBtn.type = 'button';
-      newBtn.textContent = '+';
-      input.replaceWith(newBtn);
-    }
-
-    input.addEventListener('keydown', ev => { if (ev.key === 'Enter') { ev.preventDefault(); commitAlias(); } });
-    input.addEventListener('blur', commitAlias);
-  }
-});
-
-function collectConfirmedColumns() {
-  return state.columns.map((c, i) => {
-    const role = (document.querySelector(`.type-select[data-card="${i}"]`) || {}).value || c.role;
-    const out = {
-      name_zh: c.name_zh || c.name || '',
-      role,
-      column_indexes: c.column_indexes || (c.index != null ? [c.index] : []),
-    };
-
-    if (role === 'multi_choice') {
-      const el = document.querySelector(`[data-delim="${i}"]`);
-      const entered = el ? el.value : (c.delimiter || '，');
-      out.delimiter = entered === '\\n' ? '\n' : (entered || c.delimiter || '，');
-    }
-
-    const otherEnabledEl = document.querySelector(`[data-other-text-enabled="${i}"]`);
-    const otherTextEnabled = otherEnabledEl
-      ? otherEnabledEl.checked
-      : c.other_text?.enabled !== false;
-
-    if (CHOICE_ROLES.includes(role)) {
-      let options = collectOptionsForColumn(i);
-      let optionsOriginal = [...(c.options_original || c.options || [])];
-      const unmatchedValues = Array.isArray(c.unmatched_values) ? c.unmatched_values : [];
-      const addOption = value => {
-        const text = String(value || '').trim();
-        if (!text) return;
-        const exists = options.some(option => option.trim().toLocaleLowerCase() === text.toLocaleLowerCase());
-        if (!exists) options.push(text);
-        const originalExists = optionsOriginal.some(option => String(option || '').trim().toLocaleLowerCase() === text.toLocaleLowerCase());
-        if (!originalExists) optionsOriginal.push(text);
-      };
-      const reviewResiduals = unmatchedValues.filter(item => item?.suggested_handling !== 'standard_option');
-      if (reviewResiduals.length) {
-        const handlingEl = document.querySelector(`[data-unmatched-handling="${i}"]`);
-        const handling = handlingEl?.value || 'as_other';
-        if (handling === 'as_other') {
-          const otherOption = 'Other / 其他';
-          addOption(otherOption);
-          out.other_text = {
-            enabled: true,
-            option: otherOption,
-            count: reviewResiduals.reduce((sum, item) => sum + Number(item.count || 0), 0),
-            examples: reviewResiduals.slice(0, 5).map(item => item.value),
-          };
-        }
-      }
-      // 关闭 Other 填空时移除系统补入的 Other 选项，避免后续统计仍把它
-      // 当作该题的标准选项；原始未识别值会按其真实值保留。
-      if (c.other_text && !otherTextEnabled) {
-        const otherOption = String(c.other_text.option || 'Other / 其他').trim().toLocaleLowerCase();
-        options = options.filter(option => option.trim().toLocaleLowerCase() !== otherOption);
-      }
-      if (options.length) {
-        out.options = options;
-        out.options_original = optionsOriginal;
-        const aliases = buildEditedOptionAliases(c, options);
-        if (Object.keys(aliases).length) out.value_aliases = aliases;
-      }
-    }
-
-    if (role === 'matrix_multi' && c.delimiter) out.delimiter = c.delimiter;
-
-    if (role === 'scale' || role === 'matrix_scale') {
-      const mnEl = document.querySelector(`[data-smin="${i}"]`);
-      const mxEl = document.querySelector(`[data-smax="${i}"]`);
-      out.scale_min = mnEl ? Number(mnEl.value) : (c.scale_min ?? 1);
-      out.scale_max = mxEl ? Number(mxEl.value) : (c.scale_max ?? 5);
-    }
-    if (MATRIX_ROLES.includes(role)) {
-      const rows = collectMatrixRowsForColumn(i, c);
-      if (rows.length) out.rows = rows;
-    }
-    if (!out.value_aliases && c.value_aliases && CHOICE_ROLES.includes(role)) {
-      out.value_aliases = c.value_aliases;
-    }
-    if (
-      (role === 'single_choice' || role === 'multi_choice')
-      && !out.other_text
-      && c.other_text
-      && !c.unmatched_values?.length
-    ) {
-      out.other_text = {
-        ...c.other_text,
-        enabled: otherTextEnabled,
-      };
-    }
-    return out;
+function renderQuestionList() {
+  if (!state.columns) return;
+  const indexes = visibleQuestionIndexes();
+  $('col-list').innerHTML = indexes.map(i=>columnRowHTML(state.columns[i],i)).join('') || '<p class="qe-hint">当前列表没有题目。</p>';
+  const system = state.columns.map((c,i)=>({c,i})).filter(({c})=>!isMainConfirmationColumn(c));
+  $('qe-system-list').innerHTML = system.map(({c,i})=>columnRowHTML(c,i)).join('');
+  $('qe-system-columns').hidden = !system.length;
+  $('qe-system-summary').textContent = `忽略字段与空白列 · ${system.length} 项（默认收起）`;
+  $('qe-question-toolbar').hidden = false;
+  const valid = state.columns.filter(isSelectableColumn);
+  const selected = selectedColumnsForSave(state.columns, state.selectedQuestionKeys);
+  $('col-confirm-count').textContent = `已选 ${selected.length} / ${valid.length} 道题`;
+  document.querySelectorAll('[data-question-filter]').forEach(button=>{
+    const filter=button.dataset.questionFilter;
+    const count = valid.filter(c=>filter==='all'||(filter==='subjective'?isSubjectiveColumn(c):c.low_confidence)).length;
+    button.textContent = `${{all:'全部题目',subjective:'主观题',pending:'待确认'}[filter]} ${count}`;
+    button.setAttribute('aria-selected',String(state.columnFilter===filter));
   });
+  const selectableIndexes = indexes.filter(i=>isSelectableColumn(state.columns[i]));
+  const n = selectableIndexes.filter(i=>selected.includes(columnQuestionKey(state.columns[i]))).length;
+  $('qe-select-all').checked = !!selectableIndexes.length && n===selectableIndexes.length;
+  $('qe-select-all').indeterminate = n>0 && n<selectableIndexes.length;
+  $('qe-select-all').disabled = !selectableIndexes.length;
+  const quick = state.reportMode==='quick';
+  const subjective = valid.filter(c=>selected.includes(columnQuestionKey(c))&&isSubjectiveColumn(c)).length;
+  $('qe-selection-hint').textContent = quick ? `已选题目中的 ${subjective} 道主观题（含其他填空）将逐题总结，已选客观题会呈现统计结果。` : '题型可直接修改；选项、矩阵子项与原值映射请点击编辑。';
+}
+$('qe-columns-panel').addEventListener('click',event=>{
+  const filter=event.target.closest('[data-question-filter]');
+  if (filter) {state.columnFilter=filter.dataset.questionFilter;renderQuestionList();}
+  const edit=event.target.closest('[data-question-edit]');
+  if(edit) openColumnEditor(Number(edit.dataset.questionEdit),edit);
+});
+$('qe-columns-panel').addEventListener('change',event=>{
+  if(surveyConfirmationIsLocked()) return;
+  const selection=event.target.closest('[data-question-select]');
+  if(selection){const key=columnQuestionKey(state.columns[Number(selection.dataset.questionSelect)]); const keys=new Set(state.selectedQuestionKeys);selection.checked?keys.add(key):keys.delete(key);state.selectedQuestionKeys=[...keys];renderQuestionList();}
+  const type=event.target.closest('[data-question-type]');
+  if(type){state.columns[Number(type.dataset.questionType)].role=type.value;renderQuestionList();}
+});
+$('qe-select-all').addEventListener('change',event=>{
+  const keys=new Set(state.selectedQuestionKeys);
+  visibleQuestionIndexes().filter(i=>isSelectableColumn(state.columns[i])).forEach(i=>{const key=columnQuestionKey(state.columns[i]);event.target.checked?keys.add(key):keys.delete(key);});
+  state.selectedQuestionKeys=[...keys];renderQuestionList();
+});
+function editorOptionHTML(value,index,c) {
+  return `<div class="qe-option-edit" data-edit-option-row data-previous="${esc(value)}"><input type="checkbox" data-merge-option="${index}" aria-label="合并选项 ${esc(value)}"/><div><label>选项 <textarea data-edit-option rows="2">${esc(value)}</textarea></label><label class="qe-alias-label">对应原值 / 别名（每行一个）<textarea data-edit-alias rows="2">${esc((c.value_aliases[value]||[]).join('\n'))}</textarea></label></div><button class="btn btn--ghost" type="button" data-remove-option="${index}" aria-label="删除选项 ${esc(value)}">×</button></div>`;
+}
+function renderColumnEditor() {
+  const c=columnEditor.draft;
+  $('qe-editor-number').textContent=columnSourceLabel(c,columnEditor.index,state.columns);
+  $('qe-editor-title').textContent=c.name_zh||c.name||'编辑题目';
+  const type=ROLE_OPTIONS.map(([value,label])=>`<option value="${value}" ${value===c.role?'selected':''}>${label}</option>`).join('');
+  let html=`<label class="qe-editor-field">题目名称<input data-edit-name value="${esc(c.name_zh||c.name||'')}" /></label><label class="qe-editor-field">题型<select data-edit-role>${type}</select></label><p class="qe-hint">对应原始列：${esc((c.column_indexes||[c.index]).join('、'))}。修改题型会保留其他题型的编辑设置。</p>`;
+  if (CHOICE_ROLES.includes(c.role)) {
+    html+=`<section><div class="qe-editor-section-title"><h3>选项与原值映射</h3><button class="btn btn--ghost" type="button" data-add-option>添加选项</button></div><p class="qe-hint">重命名会保留原值对应关系；勾选多个选项后可合并。</p><div id="qe-option-rows">${c.options.map((v,i)=>editorOptionHTML(v,i,c)).join('')}</div><div class="qe-merge-bar"><label>合并到 <select data-merge-target>${c.options.map((v,i)=>`<option value="${i}">${esc(v)}</option>`).join('')}</select></label><button class="btn btn--ghost" type="button" data-merge-options>合并勾选项</button></div></section>`;
+  }
+  if(['multi_choice','matrix_multi'].includes(c.role)) html+=`<label class="qe-editor-field">多选分隔符<input data-edit-delimiter value="${esc(c.delimiter==='\n'?'\\n':(c.delimiter||'，'))}" /><small>换行分隔请填写 \\n</small></label>`;
+  if(['scale','matrix_scale'].includes(c.role)) html+=`<div class="qe-editor-range"><label>量表最小值<input type="number" data-edit-min value="${Number(c.scale_min??1)}" /></label><label>量表最大值<input type="number" data-edit-max value="${Number(c.scale_max??5)}" /></label></div>`;
+  if(MATRIX_ROLES.includes(c.role)) html+=`<section><h3>矩阵子项</h3>${(c.column_indexes||[]).map((index,i)=>`<label class="qe-editor-field">原始列 ${index}<input data-edit-matrix="${i}" value="${esc(c.rows?.[i]||'')}" placeholder="子项名称" /></label>`).join('')}</section>`;
+  if(['single_choice','multi_choice'].includes(c.role)) {
+    const residuals=(c.unmatched_values||[]).filter(v=>v.suggested_handling!=='standard_option');
+    html+=`<section><h3>其他填空</h3><label class="qe-other-enable"><input type="checkbox" data-edit-other ${c.other_text?.enabled!==false&&c.other_text?'checked':''}/>保留 Other / 其他填空，并纳入主观题分析</label>`;
+    if(residuals.length) html+=`<label class="qe-editor-field">未匹配内容处理<select data-edit-unmatched><option value="as_other" ${c.unmatched_handling!=='keep_raw'?'selected':''}>剩余内容按 Other 填空处理</option><option value="keep_raw" ${c.unmatched_handling==='keep_raw'?'selected':''}>剩余内容保留原值统计</option></select></label><p class="qe-hint">如需映射到已有选项，请把原值加入该选项的别名。</p><details><summary>${residuals.length} 种未匹配内容</summary>${residuals.map(v=>`<p>${esc(v.value)} <small>${Number(v.count||0)} 条</small></p>`).join('')}</details>`;
+    html+='</section>';
+  }
+  html+='<label class="qe-other-enable"><input type="checkbox" data-edit-reviewed checked />已人工确认题型与选项</label>';
+  $('qe-editor-body').innerHTML=html;
+}
+function flushColumnEditor() {
+  if(!columnEditor) return;
+  const c=columnEditor.draft, root=$('qe-editor-body'), value=selector=>root.querySelector(selector)?.value;
+  c.name_zh=value('[data-edit-name]')?.trim() || c.name_zh || c.name;
+  if(root.querySelector('[data-edit-option-row]')) renameColumnOptions(c,[...root.querySelectorAll('[data-edit-option-row]')].map(row=>({value:row.querySelector('[data-edit-option]').value,previous:row.dataset.previous,aliases:row.querySelector('[data-edit-alias]').value.split('\n').map(v=>v.trim()).filter(Boolean)})));
+  else if(CHOICE_ROLES.includes(c.role)) {c.options=[];c.value_aliases={};}
+  if(value('[data-edit-delimiter]')!=null)c.delimiter=value('[data-edit-delimiter]')==='\\n'?'\n':value('[data-edit-delimiter]');
+  if(value('[data-edit-min]')!=null){c.scale_min=Number(value('[data-edit-min]'));c.scale_max=Number(value('[data-edit-max]'));}
+  if(root.querySelector('[data-edit-matrix]'))c.rows=[...root.querySelectorAll('[data-edit-matrix]')].map(el=>el.value.trim());
+  if(root.querySelector('[data-edit-other]')) c.other_text={...(c.other_text||{}),option:c.other_text?.option||'Other / 其他',enabled:root.querySelector('[data-edit-other]').checked};
+  if(value('[data-edit-unmatched]')!=null){c.unmatched_handling=value('[data-edit-unmatched]');c.other_text.enabled=c.unmatched_handling==='as_other';}
+}
+function openColumnEditor(index,opener) {
+  if(surveyConfirmationIsLocked())return;
+  columnEditor={index,draft:cloneColumn(state.columns[index]),initial:JSON.stringify(state.columns[index])};
+  columnEditorOpener=opener;$('qe-editor-error').textContent='';renderColumnEditor();$('qe-column-editor').showModal();
+}
+function closeColumnEditor(discard=false) {
+  if(!columnEditor)return;
+  flushColumnEditor();
+  if(!discard&&JSON.stringify(columnEditor.draft)!==columnEditor.initial&&!window.confirm('题目还有未保存修改。放弃这些修改并关闭？'))return;
+  $('qe-column-editor').close();columnEditor=null;columnEditorOpener?.focus();
+}
+$('qe-editor-close').addEventListener('click',()=>closeColumnEditor());
+$('qe-editor-discard').addEventListener('click',()=>closeColumnEditor(true));
+$('qe-column-editor').addEventListener('cancel',event=>{event.preventDefault();closeColumnEditor();});
+let columnEditorBackdropPressed = false;
+function isColumnEditorBackdrop(event) {
+  const dialog = $('qe-column-editor');
+  if (event.target !== dialog) return false;
+  const bounds = dialog.getBoundingClientRect();
+  return event.clientX < bounds.left || event.clientX > bounds.right
+    || event.clientY < bounds.top || event.clientY > bounds.bottom;
+}
+$('qe-column-editor').addEventListener('pointerdown', event => {
+  columnEditorBackdropPressed = event.button === 0 && isColumnEditorBackdrop(event);
+});
+$('qe-column-editor').addEventListener('pointercancel', () => { columnEditorBackdropPressed = false; });
+$('qe-column-editor').addEventListener('close', () => { columnEditorBackdropPressed = false; });
+$('qe-column-editor').addEventListener('click', event => {
+  const shouldClose = columnEditorBackdropPressed && isColumnEditorBackdrop(event);
+  columnEditorBackdropPressed = false;
+  if (shouldClose) closeColumnEditor();
+});
+$('qe-editor-save').addEventListener('click',()=>{
+  flushColumnEditor();const c=columnEditor.draft;
+  if(['scale','matrix_scale'].includes(c.role)&&(!Number.isFinite(c.scale_min)||!Number.isFinite(c.scale_max)||c.scale_min>=c.scale_max)){$('qe-editor-error').textContent='量表最小值必须小于最大值。';return;}
+  if(MATRIX_ROLES.includes(c.role)&&c.rows.some(v=>!v)){$('qe-editor-error').textContent='请补全矩阵子项名称。';return;}
+  const usedAliases=new Map();
+  for(const [canonical,aliases] of Object.entries(c.value_aliases||{})){for(const alias of aliases){if(usedAliases.has(alias)&&usedAliases.get(alias)!==canonical){$('qe-editor-error').textContent='同一个原值不能映射到多个选项，请调整别名。';return;}usedAliases.set(alias,canonical);}}
+  if(CHOICE_ROLES.includes(c.role)&&!c.options.length){$('qe-editor-error').textContent='请至少保留一个选项。';return;}
+  if($('qe-editor-body').querySelector('[data-edit-reviewed]').checked)c.low_confidence=false;
+  const index=columnEditor.index;state.columns[index]=cloneColumn(c);$('qe-column-editor').close();columnEditor=null;renderQuestionList();document.querySelector(`[data-question-edit="${index}"]`)?.focus();showToast('题目设置已保存','success');
+});
+$('qe-editor-body').addEventListener('change',event=>{
+  if(event.target.matches('[data-edit-other]')) { const handling=$('qe-editor-body').querySelector('[data-edit-unmatched]'); if(handling)handling.value=event.target.checked?'as_other':'keep_raw'; }
+  if(event.target.matches('[data-edit-unmatched]')) { const enabled=$('qe-editor-body').querySelector('[data-edit-other]'); if(enabled)enabled.checked=event.target.value==='as_other'; }
+  if(event.target.matches('[data-edit-role]')){const role=event.target.value;flushColumnEditor();columnEditor.draft.role=role;renderColumnEditor();}
+});
+$('qe-editor-body').addEventListener('click',event=>{
+  const add=event.target.closest('[data-add-option]');const remove=event.target.closest('[data-remove-option]');const merge=event.target.closest('[data-merge-options]');
+  if(!add&&!remove&&!merge)return;
+  const marked=[...$('qe-editor-body').querySelectorAll('[data-merge-option]:checked')].map(el=>Number(el.dataset.mergeOption));
+  const target=Number($('qe-editor-body').querySelector('[data-merge-target]')?.value);
+  flushColumnEditor();const c=columnEditor.draft;
+  if(add)c.options.push('');
+  if(remove){const old=c.options.splice(Number(remove.dataset.removeOption),1)[0];delete c.value_aliases[old];}
+  if(merge){if(marked.length<2){showToast('请至少勾选两个选项','info');return;}const canonical=c.options[target];if(!canonical)return;c.value_aliases[canonical]=[...new Set([...(c.value_aliases[canonical]||[]),...marked.filter(i=>i!==target).flatMap(i=>[c.options[i],...(c.value_aliases[c.options[i]]||[])])])];c.options=c.options.filter((v,i)=>!marked.includes(i)||i===target);Object.keys(c.value_aliases).forEach(key=>{if(!c.options.includes(key))delete c.value_aliases[key];});}
+  renderColumnEditor();
+});
+function collectConfirmedColumns() {
+  return (state.columns || []).map(serializeColumnDraft);
 }
 
 $('btn-start-plan').addEventListener('click', () => submitSurveyEntry());
@@ -712,7 +491,7 @@ async function startPlan() {
       const resp = await fetch(`/api/columns/${state.sessionId}/confirm`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ columns }),
+        body: JSON.stringify({ columns, selected_question_keys: selectedColumnsForSave(columns, state.selectedQuestionKeys) }),
       });
       confirmData = await resp.json().catch(() => ({}));
       if (!resp.ok) {
@@ -780,6 +559,7 @@ async function startPlan() {
               prepared.target_version || (Number(duplicate.version_count || 1) + 1),
             ) || 2;
             state.planData = prepared.plan || state.planData;
+            state.reportMode = prepared.report_mode || (prepared.report_style === 'quick' ? 'quick' : state.reportMode);
             state.sessionReport.pendingVersionRequest = {
               linkedHistoryId: historyId,
               baseVersion,
@@ -803,6 +583,11 @@ async function startPlan() {
         return;
       }
     }
+  }
+
+  if (state.reportMode === 'quick') {
+    await runStats({ quick: true });
+    return;
   }
 
   // 进入 Step 3，开始 AI 规划
@@ -1185,6 +970,7 @@ async function confirmPlan(text) {
         session_id: state.sessionId,
         user_text: text,
         report_style: reportStyle,
+        plan: state.planData,
       }, ev => {
         if (ev.type === 'progress') {
           const el = $('plan-stream-text');
@@ -1270,3 +1056,51 @@ async function confirmPlan(text) {
     syncPlanActionButtons();
   }
 }
+
+// Manual outline changes are local until the same confirmed plan is submitted.
+let manualPlanEditor = null;
+function flushManualPlanEditor() {
+  if (!manualPlanEditor) return;
+  document.querySelectorAll('[data-plan-part]').forEach(row => {
+    const part = manualPlanEditor.draft.parts[Number(row.dataset.planPart)];
+    part.name = row.querySelector('[data-plan-name]').value.trim();
+    part.scope = row.querySelector('[data-plan-scope]').value.trim();
+    part.column_indexes = [...row.querySelectorAll('[data-plan-column]:checked')].map(input => Number(input.value));
+  });
+}
+function renderManualPlanEditor() {
+  const plan = manualPlanEditor.draft;
+  $('qe-plan-editor-body').innerHTML = plan.parts.map((part,i) => `<section class="qe-plan-part-editor" data-plan-part="${i}"><label class="qe-editor-field">章节 ${i+1}<input data-plan-name value="${esc(part.name||'')}" /></label><label class="qe-editor-field">分析重点<textarea data-plan-scope rows="2">${esc(part.scope||'')}</textarea></label><details><summary>本章题目 · ${(part.column_indexes||[]).length} 项</summary>${(plan.columns||[]).filter(c=>!['ignore','id','mlbbid'].includes(c.role)).map(c=>`<label class="qe-other-enable"><input type="checkbox" data-plan-column value="${Number(c.index)}" ${(part.column_indexes||[]).includes(c.index)?'checked':''} />${esc(c.name_zh||c.name||('原始列 '+c.index))}</label>`).join('')}</details><footer><button class="btn btn--ghost" type="button" data-plan-move="${i}" data-direction="-1" ${i===0?'disabled':''}>上移</button><button class="btn btn--ghost" type="button" data-plan-move="${i}" data-direction="1" ${i===plan.parts.length-1?'disabled':''}>下移</button><button class="btn btn--ghost" type="button" data-plan-remove="${i}" ${plan.parts.length===1?'disabled':''}>删除章节</button></footer></section>`).join('')+'<button class="btn btn--ghost" type="button" data-plan-add>添加章节</button>';
+}
+$('qe-plan-edit').addEventListener('click',()=>{
+  if (!state.planData || state.currentStep!==3 || $('plan-input').disabled) return;
+  manualPlanEditor={draft:cloneColumn(state.planData),initial:JSON.stringify(state.planData)};
+  renderManualPlanEditor();$('qe-plan-editor').showModal();
+});
+function closeManualPlanEditor(discard=false) {
+  if(!manualPlanEditor)return;
+  flushManualPlanEditor();
+  if(!discard&&JSON.stringify(manualPlanEditor.draft)!==manualPlanEditor.initial&&!window.confirm('分析结构还有未保存修改。放弃修改并关闭？'))return;
+  manualPlanEditor=null;$('qe-plan-editor').close();$('qe-plan-edit').focus();
+}
+$('qe-plan-editor-close').addEventListener('click',()=>closeManualPlanEditor());
+$('qe-plan-editor-discard').addEventListener('click',()=>closeManualPlanEditor(true));
+$('qe-plan-editor').addEventListener('cancel',event=>{event.preventDefault();closeManualPlanEditor();});
+$('qe-plan-editor-body').addEventListener('click',event=>{
+  const move=event.target.closest('[data-plan-move]'),remove=event.target.closest('[data-plan-remove]'),add=event.target.closest('[data-plan-add]');
+  if(!move&&!remove&&!add)return;
+  flushManualPlanEditor();const parts=manualPlanEditor.draft.parts;
+  if(move){const i=Number(move.dataset.planMove),j=i+Number(move.dataset.direction);[parts[i],parts[j]]=[parts[j],parts[i]];}
+  if(remove&&parts.length>1)parts.splice(Number(remove.dataset.planRemove),1);
+  if(add)parts.push({name:'新增章节',scope:'',column_indexes:[]});
+  renderManualPlanEditor();
+});
+$('qe-plan-editor-save').addEventListener('click',()=>{
+  flushManualPlanEditor();
+  if(manualPlanEditor.draft.parts.some(part=>!part.name)){showToast('请填写每个章节的名称','info');return;}
+  state.planData=cloneColumn(manualPlanEditor.draft);manualPlanEditor=null;$('qe-plan-editor').close();showPlanCard(state.planData,[]);showToast('分析结构已保存；确认方案后开始生成','success');
+});
+window.addEventListener('beforeunload',event=>{
+  if(columnEditor){flushColumnEditor();if(JSON.stringify(columnEditor.draft)!==columnEditor.initial){event.preventDefault();event.returnValue='';}}
+  if(manualPlanEditor){flushManualPlanEditor();if(JSON.stringify(manualPlanEditor.draft)!==manualPlanEditor.initial){event.preventDefault();event.returnValue='';}}
+});

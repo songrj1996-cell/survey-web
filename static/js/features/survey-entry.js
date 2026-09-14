@@ -12,12 +12,16 @@ const ENTRY_FILE_RULES = {
   statistics: { label: '统计结果表', extension: /\.xlsx$/i },
 };
 const ENTRY_FOCUS = {
+  quick: {
+    label: '快速总结', open: '客观题统计与主观题逐题总结',
+    outline: [['逐题重点', '直接呈现已选客观题统计，并整理主观题回复'], ['粗略频次', '反复出现、部分提及、零散提及；不做精确人数统计'], ['必要风险', '保留可能改变决策的风险，并注明待核实'], ['按需原文', '原始回答单独查看或导出']],
+  },
   insight: {
-    label: '观点洞察优先', open: '深入拆解观点、原因、情境与分歧',
-    outline: [['核心观点与决策含义', '呈现主要观点、少数声音和证据边界'], ['原因、情境与分歧', '归纳使用场景与不同玩家的反馈'], ['关键人群差异', '统计数字辅助解释观点'], ['行动建议', '连接玩家证据与待验证问题']],
+    label: '观点洞察', open: '深入拆解观点、原因、情境与分歧',
+    outline: [['核心观点与决策含义', '呈现主要观点、少数声音和证据边界'], ['原因、情境与分歧', '归纳使用场景与不同玩家的反馈'], ['关键人群差异', '统计数字辅助解释观点'], ['发现中的决策含义', '证据与行动含义就近说明，避免重复总结']],
   },
   statistics: {
-    label: '统计解读优先', open: '解释关键统计结果背后的原因',
+    label: '统计解读', open: '解释关键统计结果背后的原因',
     outline: [['总体指标表现', '解释满意度、偏好分布与关键结果'], ['核心人群差异', '比较画像和行为分组的统计差异'], ['开放题原因解释', '用代表性反馈解释重要数字'], ['完整统计附录', '保留正式统计结果和数据来源']],
   },
 };
@@ -36,7 +40,8 @@ function entryError(data, fallback) {
   return typeof data?.detail === 'string' ? data.detail : (data?.detail?.message || fallback);
 }
 function entrySyncFocus() {
-  surveyEntry.focus = entryHasStatistics() ? 'statistics' : surveyEntry.preferredFocus;
+  surveyEntry.focus = entryHasStatistics() || surveyEntry.statsSource === 'external_crosstab' ? 'statistics' : surveyEntry.preferredFocus;
+  if (state.currentStep <= 2) state.reportMode = surveyEntry.focus;
 }
 function entrySetBusy(busy) { surveyEntry.busy = busy; renderSurveyEntry(); }
 
@@ -70,8 +75,8 @@ function renderSurveyEntry() {
     : '自动识别会参考配套问卷；仅有回答表时按通用表格读取，请在下一步核对题型。';
   $('qe-upload-rule').hidden = !files.statistics;
   $('qe-upload-rule').textContent = files.questionnaire
-    ? '已上传专业统计表：后续将固定采用“统计解读优先”。移除统计表后，两种重心重新开放。'
-    : '已选择专业统计表：请补充配套的倍市得问卷源文件后继续；后续报告重心固定为“统计解读优先”。';
+    ? '已上传专业统计表：后续将固定采用“统计解读”。移除统计表后，三种方式重新开放。'
+    : '已选择专业统计表：请补充配套的倍市得问卷源文件后继续；后续报告重心固定为“统计解读”。';
   $('qe-upload').disabled = locked || !files.responses || (!!files.statistics && !files.questionnaire);
   $('qe-upload').textContent = surveyEntry.busy ? '正在读取数据…' : (state.sessionId ? '数据已上传' : '上传文件并继续');
   renderSurveyFocus();
@@ -87,7 +92,7 @@ function entryFileChanged(key, file) {
   surveyEntry.files[key] = file;
   surveyEntry.importSignature = '';
   entrySyncFocus();
-  entryStatus(key === 'statistics' && !file ? '已移除统计表，其他文件已保留；两种报告重心重新开放。' : '');
+  entryStatus(key === 'statistics' && !file ? '已移除统计表，其他文件已保留；三种报告方式重新开放。' : '');
   renderSurveyEntry();
 }
 
@@ -142,13 +147,16 @@ function entryInitializeSession(data) {
   state.surveySource = data.source_type || (entryHasStatistics() ? 'bested' : 'google');
   state.questionnaireUsed = !!data.questionnaire_used;
   const external = data.stats_source === 'external_crosstab' || data.mode === 'crosstab';
-  $('qe-confirm-title').textContent = external ? '确认统计结构' : '确认题型';
+  $('qe-confirm-title').textContent = external ? '确认统计结构' : '确认要分析的题目';
   $('qe-confirm-description').textContent = external
     ? '题目与统计分组沿用已上传的专业统计表，请核对数据来源后继续。'
     : (state.questionnaireUsed ? '已从问卷源文件读取题型、选项和矩阵结构，请逐一核对。' : '请逐一核对识别出的题型与中文题名。题型直接影响后续统计口径。');
   state.viewMode = 'session';
   state.historyId = null;
   state.columns = null;
+  state.columnDraftSession = null;
+  state.selectedQuestionKeys = null;
+  state.columnFilter = 'all';
   state.planData = null;
   state.reportMd = null;
   state.reportVersionLoading = false;
@@ -170,6 +178,7 @@ function entryInitializeSession(data) {
   renderPreview(data);
   refreshContextFormVisibility();
   goStep(2);
+  loadReportStyleOptions();
   renderSurveyEntry();
 }
 
@@ -264,7 +273,7 @@ Object.defineProperty(window, 'surveySessionIngress', {
 
 function renderSurveyFocus() {
   entrySyncFocus();
-  const locked = entryHasStatistics();
+  const locked = entryHasStatistics() || surveyEntry.statsSource === 'external_crosstab';
   const busy = surveyEntryBusy();
   const readonly = state.currentStep > 2;
   const inputLocked = surveyConfirmationIsLocked();
@@ -275,13 +284,14 @@ function renderSurveyFocus() {
   document.querySelectorAll('[data-entry-focus]').forEach(button => {
     const key = button.dataset.entryFocus;
     const active = key === surveyEntry.focus;
-    button.disabled = inputLocked || (locked && key === 'insight');
+    button.disabled = inputLocked || (locked && key !== 'statistics') || (key === 'quick' && !state.reportStyleSelection.enabled);
     button.classList.toggle('is-selected', active);
     button.setAttribute('aria-checked', String(active));
     document.querySelector('[data-entry-focus-badge="' + key + '"]').textContent =
       locked ? (active ? '已自动选择' : '暂不可选') : (active ? '当前选择' : '可选择');
   });
-  $('qe-focus-stats').textContent = locked ? '统计来源：已上传的专业统计表' : '统计来源：根据回答数据自动计算；两种报告重心均可选择。';
+  $('qe-focus-stats').textContent = locked ? '统计来源：已上传的专业统计表' : (surveyEntry.focus === 'quick' ? '已选客观题统计 + 主观题逐题总结 · 观点使用粗略频次' : (surveyEntry.focus === 'insight' ? '围绕研究目标解释观点、原因与关键差异，突出影响决策的发现。' : '围绕客观题分布、量表结果与人群差异组织报告，开放题辅助解释数字。'));
+  $('qe-quick-availability').textContent = state.reportStyleSelection.enabled ? '' : '管理员暂未开放快速总结';
   $('qe-focus-outline').innerHTML = ENTRY_FOCUS[surveyEntry.focus].outline
     .map(([title, text]) => '<div class="qe-outline-row"><strong>' + esc(title) + '</strong><p>' + esc(text) + '</p></div>').join('');
   $('qe-return-upload').disabled = busy || readonly;
@@ -289,11 +299,15 @@ function renderSurveyFocus() {
   $('qe-confirm-action').textContent = surveyEntry.columnsLoading
     ? (state.questionnaireUsed ? '题型读取中，完成后可继续' : '题型识别中，完成后可继续')
     : (busy ? '正在处理…' : (state.sessionId && state.mode !== 'crosstab' && !state.columns
-      ? '请先完成题型识别' : '确认并生成分析方案'));
+      ? '请先完成题型识别' : (surveyEntry.focus === 'quick' ? '开始总结' : '确认并生成分析方案')));
+  document.querySelectorAll('#context-form-wrap .context-form__field').forEach((field,i)=>{field.hidden = surveyEntry.focus === 'quick' && i > 0;});
+  document.querySelector('label[for="ctx-problem"]').textContent = surveyEntry.focus === 'quick' ? '必要背景或术语说明（选填）' : '业务问题/业务痛点/业务规划是什么？';
+  if (state.columns && state.mode !== 'crosstab') renderQuestionList();
+  applyStepBarForMode();
 }
 document.querySelectorAll('[data-entry-focus]').forEach(button => {
   button.addEventListener('click', () => {
-    if (surveyConfirmationIsLocked() || entryHasStatistics()) return;
+    if (surveyConfirmationIsLocked() || entryHasStatistics() || surveyEntry.statsSource === 'external_crosstab' || (button.dataset.entryFocus === 'quick' && !state.reportStyleSelection.enabled)) return;
     surveyEntry.preferredFocus = button.dataset.entryFocus;
     renderSurveyFocus();
   });
@@ -320,7 +334,7 @@ function renderSurveyPlanSettings() {
     ['数据导入', surveyEntry.method === 'link' ? 'Google Form Link' : '上传本地文件'],
     ['调研平台', surveyEntry.method === 'link' ? 'Google Forms' : (state.surveySource === 'bested' ? '倍市得' : (surveyEntry.platform === 'google' ? 'Google Forms' : '通用表格（请核对题型）'))],
     ['统计来源', surveyEntry.statsSource === 'external_crosstab' ? '使用已上传的统计结果' : '系统自动统计'],
-    ['报告重心', selected.label + (entryHasStatistics() ? '（已固定）' : '')],
+    ['报告方式', selected.label + (entryHasStatistics() ? '（已固定）' : '')],
     ['开放题作用', selected.open],
   ];
   $('qe-plan-settings-content').innerHTML = pairs.map(([key,value]) => '<dt>' + esc(key) + '</dt><dd>' + esc(value) + '</dd>').join('');
@@ -334,17 +348,20 @@ async function submitSurveyEntry() {
     return;
   }
   entrySyncFocus();
+  if (surveyEntry.focus === 'quick' && !state.reportStyleSelection.enabled) { showToast('管理员暂未开放快速总结，请选择其他报告方式或稍后再试', 'info'); return; }
+  if (state.mode !== 'crosstab' && !selectedColumnsForSave(state.columns, state.selectedQuestionKeys).length) { showToast('请至少选择一道题目', 'info'); return; }
   entrySetBusy(true);
   renderSurveyFocus();
   $('qe-focus-status').textContent = '正在保存分析方式…';
   try {
     const response = await fetch('/api/analysis-settings/' + state.sessionId, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ report_focus: surveyEntry.focus }),
+      body: JSON.stringify({ report_mode: surveyEntry.focus }),
     });
     const data = await response.json();
     if (!response.ok) throw new Error(entryError(data, '保存报告重心失败'));
     state.mode = data.mode || null;
+    state.reportMode = data.report_mode || surveyEntry.focus;
     surveyEntry.statsSource = data.stats_source;
     if (state.mode === 'crosstab') {
       const ctxResponse = await fetch('/api/survey-context/' + state.sessionId, {
@@ -382,6 +399,9 @@ function resetUploadZone() {
   surveyEntry.importSignature = '';
   state.uploadedFilename = '';
   state.questionnaireUsed = false;
+  state.columnDraftSession = null;
+  state.selectedQuestionKeys = null;
+  state.columnFilter = 'all';
   Object.keys(ENTRY_FILE_RULES).forEach(key => { $('qe-' + key).value = ''; });
   $('qe-focus-preview').open = false;
   $('context-form-details').open = true;

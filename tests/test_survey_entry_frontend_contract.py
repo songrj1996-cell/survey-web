@@ -39,7 +39,7 @@ class SurveyEntryFrontendContractTests(unittest.TestCase):
             self.assertIn(text, HTML)
 
     def test_both_focus_choices_and_recovery_controls_remain_visible_in_dom(self):
-        for value in ("insight", "statistics"):
+        for value in ("quick", "insight", "statistics"):
             self.assertIn(f'data-entry-focus="{value}"', HTML)
         for node_id in ("qe-focus-lock", "qe-return-upload", "qe-plan-settings", "qe-retry-plan"):
             self.assertIn(node_id, Elements().ids)
@@ -47,7 +47,7 @@ class SurveyEntryFrontendContractTests(unittest.TestCase):
     def test_settings_persist_before_planning_and_external_lock_is_source_scoped(self):
         self.assertIn("surveyEntry.method === 'local' && !!surveyEntry.files.statistics", ENTRY)
         self.assertLess(ENTRY.index("fetch('/api/analysis-settings/"), ENTRY.index("await startPlan()"))
-        self.assertIn("body: JSON.stringify({ report_focus: surveyEntry.focus })", ENTRY)
+        self.assertIn("body: JSON.stringify({ report_mode: surveyEntry.focus })", ENTRY)
 
     def test_readonly_google_panel_blocks_keyboard_and_pointer_interaction(self):
         self.assertIn("toggleAttribute('inert', locked)", ENTRY)
@@ -96,6 +96,25 @@ class SurveyEntryFrontendContractTests(unittest.TestCase):
         self.assertIn("goStep(2)", back)
         self.assertNotIn("renderColumns", back)
         self.assertNotIn("clearContext", back)
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required for draft verification")
+    def test_column_draft_serialization_is_independent_of_visible_rows(self):
+        result = subprocess.run([shutil.which("node"), str(ROOT.parent / "tests/test_survey_columns_frontend.js")], capture_output=True, text=True, encoding="utf-8", timeout=20)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_quick_accepts_objective_only_selection(self):
+        submit = ENTRY.split('async function submitSurveyEntry()', 1)[1].split('function returnToSurveyFocus()', 1)[0]
+        self.assertIn('selectedColumnsForSave(state.columns, state.selectedQuestionKeys).length', submit)
+        self.assertNotIn('state.columns.some(c => isSubjectiveColumn', submit)
+
+    def test_question_tabs_and_selection_are_separate_from_role(self):
+        tabs = re.findall(r'data-question-filter="(\w+)"', HTML)
+        self.assertEqual(tabs, ["all", "subjective", "pending"])
+        self.assertIn("selected_question_keys: selectedColumnsForSave", SURVEY)
+        self.assertIn("state.columnFilter = 'all'", SURVEY)
+        self.assertIn("state.selectedQuestionKeys = state.columns.filter(isSelectableColumn)", SURVEY)
+        self.assertIn('id="qe-column-editor"', HTML)
+        self.assertIn('id="qe-plan-editor"', HTML)
 
     @unittest.skipUnless(shutil.which("node"), "Node.js is required for the draft timing regression")
     def test_column_readiness_preserves_unsaved_input_and_intentionally_cleared_fields(self):

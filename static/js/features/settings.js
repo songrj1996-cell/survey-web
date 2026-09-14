@@ -1952,11 +1952,11 @@ async function loadSystemSettings() {
         </label>
       </div>
       <div class="uitext-card">
-        <div class="uitext-card__label">问卷分析·快速报告模式</div>
-        <div class="prompt-card__desc">开启后，定性问卷的方案确认页可手动选择快速模式。保存后生效，无需重启服务；关闭不影响正在生成的报告及已有报告的查看、追问和导出。</div>
+        <div class="uitext-card__label">问卷分析·快速总结</div>
+        <div class="prompt-card__desc">开启后，数据确认页可选择快速总结，按原题顺序整理主观题回复。保存后生效，无需重启服务；关闭不影响正在生成的报告及已有报告的查看、追问和导出。</div>
         <label class="setting-toggle">
           <input type="checkbox" id="setting-report-quick-mode" ${data.report_quick_mode_enabled ? 'checked' : ''} />
-          <span>开放快速报告模式</span>
+          <span>开放快速总结</span>
         </label>
       </div>
     `;
@@ -1986,7 +1986,7 @@ $('stab-content-system')?.addEventListener('change', async e => {
     input.checked = !!data[settingKey];
     showToast('平台设置已保存', 'success');
     if (settingKey === 'report_quick_mode_enabled'
-        && state.currentStep === 3 && state.sessionId
+        && state.currentStep === 2 && state.sessionId
         && !state.reportStyleSelection?.locked
         && typeof loadReportStyleOptions === 'function') {
       await loadReportStyleOptions();
