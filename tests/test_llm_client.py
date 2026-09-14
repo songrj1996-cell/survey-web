@@ -258,6 +258,44 @@ class DirectLLMClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(client.calls[0]["url"].endswith("/responses"))
         self.assertEqual(client.calls[0]["json"]["instructions"], "rules")
 
+    async def test_optional_http_cap_counts_protocol_and_usage_compatibility_requests(self):
+        client = _FakeClient([
+            _FakeResponse(404, body=b"not found"),
+            _FakeResponse(400, body=b"unknown parameter stream_options"),
+            _FakeResponse(429, body=b"rate limit"),
+        ])
+        events = []
+        with (
+            patch.object(llm_client, "LLM_API_BASE", "https://llm.example/v1"),
+            patch.object(llm_client, "LLM_API_KEY", "secret"),
+            patch.object(llm_client.httpx, "AsyncClient", return_value=client),
+            patch.object(llm_client.asyncio, "sleep", new=AsyncMock()),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "budget exhausted"):
+                await llm_client.collect_chat_completion(
+                    [{"role": "user", "content": "synthetic input"}],
+                    models=("gpt-test", "fallback-test"), max_http_attempts=3,
+                    on_attempt_event=events.append,
+                )
+        self.assertEqual(len(client.calls), 3)
+        self.assert_attempt_pairs(events)
+        self.assertEqual([e["attempt_kind"] for e in events if e["status"] == "started"],
+                         ["initial", "protocol_fallback", "usage_compatibility"])
+
+    async def test_optional_http_cap_limits_model_fallback_and_validates_before_network(self):
+        client = _FakeClient([_FakeResponse(401, body=b"unauthorized")])
+        with (
+            patch.object(llm_client, "LLM_API_BASE", "https://llm.example/v1"),
+            patch.object(llm_client, "LLM_API_KEY", "secret"),
+            patch.object(llm_client.httpx, "AsyncClient", return_value=client),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "budget exhausted"):
+                await llm_client.collect_chat_completion([], models=("gpt-a", "gpt-b"), max_http_attempts=1)
+            for value in (0, -1, True, "3"):
+                with self.subTest(value=value), self.assertRaises(ValueError):
+                    await llm_client.collect_chat_completion([], max_http_attempts=value)
+        self.assertEqual(len(client.calls), 1)
+
     async def test_responses_reports_actual_model_and_normalized_usage(self):
         client = _FakeClient([_FakeResponse(lines=[
             _sse({"type": "response.output_text.delta", "delta": "answer"}),

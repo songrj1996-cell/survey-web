@@ -788,13 +788,18 @@ async def collect_chat_completion(
     reasoning_effort: str | None = None,
     on_attempt_event: _AttemptEventCallback | None = None,
     api_key: str | None = None,
+    max_http_attempts: int | None = None,
 ) -> tuple[str, str]:
     """返回完整回答和实际请求模型；失败轮次不会暴露半截文本。
 
     若提供 ``on_attempt_event``，每次真实 HTTP 请求都会发送一条 ``started``
     和一条 ``completed``/``failed``；同一对事件共享 ``call_id``，``attempt``
     则在本次 collect 调用内按真实请求顺序递增。
+    max_http_attempts 若给定，限制包括重试、协议兼容与模型回退在内的真实请求总数。
+    省略时保持既有每模型/协议重试行为。
     """
+    if max_http_attempts is not None and (type(max_http_attempts) is not int or max_http_attempts < 1):
+        raise ValueError("max_http_attempts must be a positive integer")
     if not LLM_API_BASE:
         raise RuntimeError("未配置 LLM_API_BASE")
     request_api_key = str(api_key or current_llm_api_key()).strip()
@@ -860,6 +865,8 @@ async def collect_chat_completion(
             chat_include_usage: bool = True,
         ) -> _LLMResult:
             nonlocal attempt_number, previous_attempt
+            if max_http_attempts is not None and attempt_number >= max_http_attempts:
+                raise RuntimeError("LLM actual HTTP attempt budget exhausted") from last_error
             attempt_number += 1
             attempt_kind = "initial"
             if previous_attempt:
@@ -976,6 +983,8 @@ async def collect_chat_completion(
                     except (httpx.TimeoutException, httpx.TransportError) as exc:
                         last_error = exc
 
+                    if max_http_attempts is not None and attempt_number >= max_http_attempts:
+                        raise RuntimeError("LLM actual HTTP attempt budget exhausted") from last_error
                     if attempt < LLM_REPORT_MAX_ATTEMPTS:
                         await asyncio.sleep(min(8, 2 ** (attempt - 1)))
 
