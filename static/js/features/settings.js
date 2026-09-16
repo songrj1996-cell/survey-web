@@ -512,8 +512,6 @@ function renderGlossaryTab() {
         <span>${glossaryUiState.revision ? `版本 ${esc(glossaryUiState.revision)}` : '版本未返回'}</span>
       </div>
 
-      ${visibleItems.length ? glossaryTableHtml(visibleItems, languages) : `<div class="glossary-empty">没有符合当前筛选条件的术语。</div>`}
-
       <section class="glossary-panel${glossaryUiState.editor.open ? '' : ' glossary-panel--hidden'}" id="glossary-editor-panel">
         <div class="glossary-panel__head">
           <div>
@@ -580,14 +578,16 @@ function renderGlossaryTab() {
             ${(previewStats.errors ?? 0) ? `<span>异常 ${esc(previewStats.errors)} 条</span>` : ''}
           </div>
           ${previewErrors.length ? `<div class="glossary-alert glossary-alert--warning">${previewErrors.map(error => `<div>${esc(error)}</div>`).join('')}</div>` : ''}
-          ${glossaryPreviewRowsHtml(preview, previewLanguages)}
           <div class="glossary-import__warning">若文件被替换，或其他管理员先修改了术语库，确认时会要求重新预览。</div>
           <div class="glossary-panel__actions">
             <button class="btn btn--ghost btn--sm" type="button" data-glossary-repreview ${glossaryUiState.importer.busy ? 'disabled' : ''}>重新预览</button>
             <button class="btn btn--primary btn--sm" type="button" data-glossary-commit ${glossaryUiState.importer.busy || !previewCanCommit ? 'disabled' : ''}>${glossaryUiState.importer.busy ? '导入中…' : `确认导入 ${(previewStats.total ?? previewRows.length ?? 0)} 条`}</button>
           </div>
+          ${glossaryPreviewRowsHtml(preview, previewLanguages)}
         ` : ''}
       </section>
+
+      ${visibleItems.length ? glossaryTableHtml(visibleItems, languages) : `<div class="glossary-empty">没有符合当前筛选条件的术语。</div>`}
     </section>
   `;
 }
@@ -657,6 +657,8 @@ function openGlossaryEditor(item = null) {
     });
   }
   renderGlossaryTab();
+  document.querySelector('#glossary-editor-panel .glossary-panel__head')?.scrollIntoView({ behavior: 'instant', block: 'nearest' });
+  $('glossary-editor-category')?.focus({ preventScroll: true });
 }
 
 function closeGlossaryEditor() {
@@ -832,6 +834,7 @@ async function previewGlossaryImport(file) {
     error: '',
   });
   renderGlossaryTab();
+  $('glossary-import-panel')?.scrollIntoView({ behavior: 'instant', block: 'start' });
   try {
     const form = new FormData();
     form.append('file', file);
