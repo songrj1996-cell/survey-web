@@ -266,7 +266,7 @@ function prepareColumnDraft(column) {
   c.options_original = [...(c.options_original || c.options)];
   c.value_aliases = cloneColumn(c.value_aliases || {});
   if ((c.unmatched_values || []).some(v => v.suggested_handling !== 'standard_option')) {
-    c.unmatched_handling = c.unmatched_handling || (c.other_text?.enabled === false ? 'keep_raw' : 'as_other');
+    c.unmatched_handling = c.unmatched_handling || (c.other_text?.enabled === false || (c.role === 'profile_dim' && c.other_text?.enabled !== true) ? 'keep_raw' : 'as_other');
     c.other_text = {...(c.other_text || {}), option:c.other_text?.option || 'Other / 其他', enabled:c.unmatched_handling !== 'keep_raw'};
   }
   return c;
@@ -292,6 +292,10 @@ function serializeColumnDraft(column) {
   const choices = ['single_choice','multi_choice','profile_dim','matrix_single','matrix_multi'];
   if (choices.includes(c.role)) {
     const residuals = (c.unmatched_values || []).filter(v => v.suggested_handling !== 'standard_option');
+    if (c.role === 'profile_dim' && residuals.length) {
+      c.unmatched_handling = c.unmatched_handling || (c.other_text?.enabled === true ? 'as_other' : 'keep_raw');
+      if (c.unmatched_handling === 'keep_raw') c.other_text = {...(c.other_text || {}), enabled:false};
+    }
     if (residuals.length && c.unmatched_handling !== 'keep_raw') {
       c.other_text = {...(c.other_text || {}), enabled:true, option:c.other_text?.option || 'Other / 其他'};
     }
@@ -393,10 +397,14 @@ function renderColumnEditor() {
   if(['multi_choice','matrix_multi'].includes(c.role)) html+=`<label class="qe-editor-field">多选分隔符<input data-edit-delimiter value="${esc(c.delimiter==='\n'?'\\n':(c.delimiter||'，'))}" /><small>换行分隔请填写 \\n</small></label>`;
   if(['scale','matrix_scale'].includes(c.role)) html+=`<div class="qe-editor-range"><label>量表最小值<input type="number" data-edit-min value="${Number(c.scale_min??1)}" /></label><label>量表最大值<input type="number" data-edit-max value="${Number(c.scale_max??5)}" /></label></div>`;
   if(MATRIX_ROLES.includes(c.role)) html+=`<section><h3>矩阵子项</h3>${(c.column_indexes||[]).map((index,i)=>`<label class="qe-editor-field">原始列 ${index}<input data-edit-matrix="${i}" value="${esc(c.rows?.[i]||'')}" placeholder="子项名称" /></label>`).join('')}</section>`;
-  if(['single_choice','multi_choice'].includes(c.role)) {
+  if(['single_choice','multi_choice','profile_dim'].includes(c.role)) {
     const residuals=(c.unmatched_values||[]).filter(v=>v.suggested_handling!=='standard_option');
     html+=`<section><h3>其他填空</h3><label class="qe-other-enable"><input type="checkbox" data-edit-other ${c.other_text?.enabled!==false&&c.other_text?'checked':''}/>保留 Other / 其他填空，并纳入主观题分析</label>`;
-    if(residuals.length) html+=`<label class="qe-editor-field">未匹配内容处理<select data-edit-unmatched><option value="as_other" ${c.unmatched_handling!=='keep_raw'?'selected':''}>剩余内容按 Other 填空处理</option><option value="keep_raw" ${c.unmatched_handling==='keep_raw'?'selected':''}>剩余内容保留原值统计</option></select></label><p class="qe-hint">如需映射到已有选项，请把原值加入该选项的别名。</p><details><summary>${residuals.length} 种未匹配内容</summary>${residuals.map(v=>`<p>${esc(v.value)} <small>${Number(v.count||0)} 条</small></p>`).join('')}</details>`;
+    const renderResiduals = values => values.map(v=>`<p>${esc(v.value)} <small>${Number(v.count||0)} 条</small></p>`).join('');
+    const residualPreview = c.role === 'profile_dim' && residuals.length > 10
+      ? renderResiduals(residuals.slice(0,10)) + `<details><summary>查看其余 ${residuals.length-10} 种取值</summary>${renderResiduals(residuals.slice(10))}</details>`
+      : renderResiduals(residuals);
+    if(residuals.length) html+=`<label class="qe-editor-field">未匹配内容处理<select data-edit-unmatched><option value="as_other" ${c.unmatched_handling!=='keep_raw'?'selected':''}>剩余内容按 Other 填空处理</option><option value="keep_raw" ${c.unmatched_handling==='keep_raw'?'selected':''}>剩余内容保留原值统计</option></select></label><p class="qe-hint">如需映射到已有选项，请把原值加入该选项的别名。</p><details><summary>${residuals.length} 种未匹配内容</summary>${residualPreview}</details>`;
     html+='</section>';
   }
   html+='<label class="qe-other-enable"><input type="checkbox" data-edit-reviewed checked />已人工确认题型与选项</label>';

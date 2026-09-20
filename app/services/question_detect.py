@@ -462,6 +462,27 @@ def _real_option_counts_for_question(rows: list[list], q: dict) -> Counter:
     return counts
 
 
+def _profile_option_candidates(q: dict, values: list[str], counts: Counter) -> set[str]:
+    """Only recover small, repeated categorical vocabularies; never infer aliases."""
+    if q.get("choice_mode") == "multiple" or len(values) > 20:
+        return set()
+    candidates = {
+        _norm_option_key(value)
+        for value in values
+        if len(value) <= 50 and "\n" not in value and "\r" not in value
+        and not _split_short_choice_list(value)[1]
+        and not _is_other_option_label(value)
+        and counts[_norm_option_key(value)] >= 2
+    }
+    total = sum(counts.values())
+    if len(candidates) < 2 or not total:
+        return set()
+    # Use the same repeated-value coverage as _choice_structure.
+    if sum(counts[key] for key in candidates) / total < 0.65:
+        return set()
+    return candidates
+
+
 def _sanitize_choice_options(rows: list[list], questions: list[dict]) -> list[dict]:
     """Ground choice options in real cell values while preserving canonical aliases.
 
@@ -479,7 +500,10 @@ def _sanitize_choice_options(rows: list[list], questions: list[dict]) -> list[di
             continue
         real_options = _real_options_for_question(rows, q)
         real_counts = _real_option_counts_for_question(rows, q)
-        total_real_values = sum(real_counts.values())
+        profile_candidates = (
+            _profile_option_candidates(q, real_options, real_counts)
+            if role == "profile_dim" else set()
+        )
         real_by_key = {_norm_option_key(o): o for o in real_options}
         if not real_by_key:
             continue
@@ -542,7 +566,7 @@ def _sanitize_choice_options(rows: list[list], questions: list[dict]) -> list[di
                 continue
             add_canonical(str(canonical), aliases if isinstance(aliases, (list, tuple)) else [])
 
-        if not had_declared_options:
+        if not had_declared_options and role != "profile_dim":
             for opt in real_options:
                 add_canonical(opt, [])
         else:
@@ -566,9 +590,12 @@ def _sanitize_choice_options(rows: list[list], questions: list[dict]) -> list[di
             ]
             for opt in uncovered:
                 count = real_counts.get(_norm_option_key(opt), 0)
+                if role == "profile_dim" and _norm_option_key(opt) in profile_candidates:
+                    add_canonical(opt, [])
+                    continue
                 if _is_other_option_label(opt):
                     suggestion = "other_text"
-                elif _looks_like_numbered_choice(opt, cleaned_options):
+                elif role != "profile_dim" and _looks_like_numbered_choice(opt, cleaned_options):
                     suggestion = "standard_option"
                 else:
                     suggestion = "review"
@@ -580,7 +607,7 @@ def _sanitize_choice_options(rows: list[list], questions: list[dict]) -> list[di
             if uncovered:
                 q["low_confidence"] = True
 
-        if cleaned_options:
+        if cleaned_options or role == "profile_dim":
             q["options"] = cleaned_options
             q["options_original"] = cleaned_originals
             if unmatched_values:
@@ -620,6 +647,8 @@ def _build_column_detect_query(rows: list[list], groups: list[dict]) -> str:
         + "\n</columns>\n\n"
         + "选项边界（严格执行）：options 必须由该列「去重取值」里的真实单元格取值或多选拆分值支撑；不得从题干/表头中抽取选项。若 New Medal 等词只出现在题干里、没有出现在该列取值里，不得写入 options。若多语言取值语义相同，options 请写合并后的中文标准值，并在 value_aliases 中列出支撑它的真实取值。\n\n"
         + "请按 system prompt 约定的 JSON schema 输出。"
+        + "\n画像题（profile_dim）：固定分类须完整列出 options，并为译名提供真实取值对应的 value_aliases，不能只列需翻译的少数选项。"
+        + "无法可靠翻译时保留原值，不猜同义关系。若取值大量分散或包含自由填写长句，不要逐条扩成标准选项；只列有把握的固定类别，其余原值由程序保留供确认。"
     )
 
 
