@@ -163,7 +163,7 @@ class PromptCatalogTests(unittest.TestCase):
         self.assertEqual(migrated["column_detect_system"]["version"], 2)
         self.assertEqual(migrated["survey_planner_system"]["version"], 4)
         self.assertEqual(migrated["writer_requirements"]["version"], 15)
-        self.assertEqual(migrated["annotate_quality_system"]["version"], 4)
+        self.assertEqual(migrated["annotate_quality_system"]["version"], 12)
         self.assertEqual(migrated["theme_extract_system"]["version"], 3)
         self.assertEqual(migrated["theme_merge_system"]["version"], 2)
         self.assertEqual(migrated["response_classify_system"]["version"], 2)
@@ -201,57 +201,56 @@ class PromptCatalogTests(unittest.TestCase):
         for key, previous_version in (
             ("survey_planner_system", 3),
             ("writer_requirements", 11),
-            ("annotate_quality_system", 3),
+            ("annotate_quality_system", 4),
+            ("annotate_quality_system", 5),
+            ("annotate_quality_system", 6),
+            ("annotate_quality_system", 7),
+            ("annotate_quality_system", 8),
+            ("annotate_quality_system", 9),
+            ("annotate_quality_system", 10),
+            ("annotate_quality_system", 11),
             ("theme_extract_system", 2),
             ("theme_merge_system", 1),
             ("response_classify_system", 1),
             ("interview_v2_report_system", 1),
             ("interview_v2_report_claim_extract_system", 1),
         ):
-            with self.subTest(key=key, content="default"):
-                stored = deepcopy(prompt_storage.DEFAULT_PROMPTS[key])
-                stored.update({
-                    "current": "OUTDATED_DEFAULT",
-                    "history": [],
-                    "version": previous_version,
-                })
-
-                prompt_storage._sync_entry(
-                    stored,
-                    prompt_storage.DEFAULT_PROMPTS[key],
-                )
-
-                self.assertEqual(
-                    stored["current"],
-                    prompt_storage.DEFAULT_PROMPTS[key]["current"],
-                )
-                self.assertEqual(
-                    stored["version"],
-                    prompt_storage.DEFAULT_PROMPTS[key]["version"],
-                )
-
-            with self.subTest(key=key, content="custom"):
-                stored = deepcopy(prompt_storage.DEFAULT_PROMPTS[key])
-                stored.update({
-                    "current": f"CUSTOM_{key}",
-                    "history": [{
+            for customized in (False, True):
+                with self.subTest(key=key, previous_version=previous_version, customized=customized):
+                    stored = deepcopy(prompt_storage.DEFAULT_PROMPTS[key])
+                    prior_history = [{
                         "ts": "2026-01-01",
                         "content": "earlier content",
                         "note": "customized",
-                    }],
-                    "version": previous_version,
-                })
+                    }] if customized else []
+                    old_content = f"CUSTOM_{key}" if customized else "OUTDATED_DEFAULT"
+                    stored.update({
+                        "current": old_content,
+                        "history": prior_history,
+                        "version": previous_version,
+                    })
+                    with tempfile.TemporaryDirectory(prefix="prompt-version-migration-") as temp_dir:
+                        prompt_file = os.path.join(temp_dir, "prompts.json")
+                        _write_json(prompt_file, {key: stored})
+                        with patch.object(prompt_storage, "PROMPTS_FILE", prompt_file):
+                            migrated = prompt_storage._load_prompts()
+                            first_hash = _sha256(prompt_file)
+                            second = prompt_storage._load_prompts()
+                            second_hash = _sha256(prompt_file)
+                        persisted = _read_json(prompt_file)
 
-                prompt_storage._sync_entry(
-                    stored,
-                    prompt_storage.DEFAULT_PROMPTS[key],
-                )
-
-                self.assertEqual(stored["current"], f"CUSTOM_{key}")
-                self.assertEqual(
-                    stored["version"],
-                    prompt_storage.DEFAULT_PROMPTS[key]["version"],
-                )
+                    expected_content = (
+                        old_content if customized else prompt_storage.DEFAULT_PROMPTS[key]["current"]
+                    )
+                    self.assertEqual(migrated[key]["current"], expected_content)
+                    self.assertEqual(
+                        migrated[key]["version"],
+                        prompt_storage.DEFAULT_PROMPTS[key]["version"],
+                    )
+                    self.assertEqual(migrated[key]["history"], prior_history)
+                    self.assertEqual(persisted[key], migrated[key])
+                    self.assertEqual(migrated, second)
+                    self.assertEqual(first_hash, second_hash)
 
     def test_qualitative_prompts_use_semantic_boundaries_without_count_caps(self):
         extract_prompt = prompt_storage.DEFAULT_PROMPTS["theme_extract_system"]["current"]

@@ -349,13 +349,13 @@ DEFAULT_PROMPTS: dict = {
     "annotate_quality_system": _prompt(
         "annotate_quality_system",
         "回答质量识别 System Prompt",
-        "用于逐题标记玩家开放题回答的质量类型、理由与证据。",
+        "按题意标记各题质量，并基于完整主观回答独立判断整体质量、说明理由。",
         group="数据标注",
         group_order=50,
         order=20,
         kind="system",
         current=DEFAULT_ANNOTATE_QUALITY_SYSTEM_PROMPT,
-        version=4,
+        version=12,
     ),
     "annotate_translation_system": _prompt(
         "annotate_translation_system",
