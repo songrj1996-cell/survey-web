@@ -122,6 +122,13 @@ def get_history_list(login: dict | None, mode: str = "") -> list[dict]:
             "annotate_confirmed_ai_count": h.get("annotate_confirmed_ai_count", 0),
             "annotate_quality_count": h.get("annotate_quality_count", 0),
             "annotate_has_download": bool(h.get("annotate_result_path")),
+            "annotate_completion": ({
+                "partial": bool(h["annotate_completion"].get("partial")),
+                "total": h["annotate_completion"].get("total", 0),
+                "complete": h["annotate_completion"].get("complete", 0),
+                "missing_count": len(h["annotate_completion"].get("missing_ids", [])),
+            } if h.get("annotate_completion") else None),
+            "annotate_updated_at": h.get("annotate_updated_at", ""),
             **family_history_summary(h),
             "annotate_quality_duration_seconds": h.get(
                 "annotate_quality_duration_seconds"

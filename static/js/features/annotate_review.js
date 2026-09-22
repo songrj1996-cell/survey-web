@@ -22,7 +22,7 @@
   const ui = { view: 'queue', status: 'recommended', focus: 'all', confidence: 'all', label: 'all',
     selected: '', page: 0, drafts: new Map(), saving: false, message: '', error: false,
     generation: 0, cache: null };
-  function isBusy() { return ui.saving || annState.qualityReviewRunning; }
+  function isBusy() { return ui.saving || annState.qualityReviewRunning || annState.partialRetryRunning; }
   function announce(message, error = false) { ui.message = message; ui.error = error; }
   function reset() {
     ui.generation += 1;
@@ -217,10 +217,10 @@
   }
   function renderExport() {
     const all = entries();
-    find('ar-export-view').innerHTML = `<h3>当前结果预览</h3><p class="ar-footnote">展示当前已返回的 ${all.length} 题，不受复核筛选影响。${incomplete() ? '技术结果未完整，下载暂不可用。' : '仅缺信心或待人工核对，不影响下载。'}</p>
+    find('ar-export-view').innerHTML = `<h3>当前结果预览</h3><p class="ar-footnote">展示当前已返回的 ${all.length} 题，不受复核筛选影响。${incomplete() ? '部分完成：可下载已有结果，未完成项标为待补齐。' : '仅缺信心或待人工核对，不影响下载。'}</p>
       <div class="ar-table-wrap"><table><thead><tr><th>玩家 / 题目</th><th>AI 原判</th><th>有效性信心</th><th>当前标签</th><th>人工状态</th></tr></thead><tbody>${all.slice(0, 100).map(row => `<tr><td>${esc(row.playerId)} / ${annState.openTextCols.indexOf(row.col) + 1}</td><td>${esc(row.ai || (row.blank ? 'N/A' : '未提供'))}</td><td>${esc(row.blank ? '不适用' : row.signal.confidence)}</td><td>${esc(row.blank ? 'N/A' : row.final || '待补齐')}</td><td>${esc(statusText(row))}</td></tr>`).join('')}</tbody></table></div>
       <p class="ar-footnote">${all.length > 100 ? '页面仅预览前 100 题；下载不按页面截断。' : ''}此表用于核对页面结果；Excel 沿用现有字段，尚不保证包含逐题信心或独立人工确认记录。</p>
-      <button class="btn btn--primary" type="button" data-ar-action="download"${incomplete() || isBusy() ? ' disabled' : ''}>下载结果 Excel</button>`;
+      <button class="btn btn--primary" type="button" data-ar-action="download"${isBusy() ? ' disabled' : ''}>下载结果 Excel</button>`;
   }
   function render() {
     if (!annState.tasks.quality) return false;
@@ -239,7 +239,7 @@
     find('ar-message').textContent = ui.message;
     find('ar-message').classList.toggle('ar-message--error', ui.error);
     find('ar-message').setAttribute('role', ui.error ? 'alert' : 'status');
-    $('ann-btn-download').disabled = incomplete() || isBusy();
+    $('ann-btn-download').disabled = isBusy();
     $('ann-btn-restart').disabled = isBusy();
     return true;
   }
@@ -281,10 +281,10 @@
   }
   function download() {
     if (!annState.tasks.quality) return false;
-    if (incomplete() || isBusy() || !annState.sessionId) {
+    if (isBusy() || !annState.sessionId) {
       announce('结果尚未完整或正在保存，请完成后再下载。', true); render(); return true;
     }
-    window.location.href = `/api/annotate/${encodeURIComponent(annState.sessionId)}/download`;
+    annDownloadResults();
     return true;
   }
   root.addEventListener('change', event => {

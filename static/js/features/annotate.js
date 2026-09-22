@@ -4,6 +4,9 @@
 
 const annState = {
   sessionId: null,
+  completion: null,
+  historySaved: null,
+  partialRetryRunning: false,
   currentStep: 1,
   headers: [],
   headersZh: [],
@@ -304,7 +307,7 @@ async function annStartAnnotation() {
 
 // ── ANN STEP 3: AI 检测 ────────────────────────────────────
 
-async function annRunAiDetect() {
+async function annRunAiDetect(options = {}) {
   const bar = $('ann-ai-progress-bar');
   const msg = $('ann-ai-progress-msg');
   const warnLog = $('ann-ai-warn-log');
@@ -331,7 +334,7 @@ async function annRunAiDetect() {
   const diagnostics = [];
 
   try {
-    await consumeSSE(`/api/annotate/${annState.sessionId}/run-ai-detect`, ev => {
+    await consumeSSE(annRetryUrl("run-ai-detect", options.retryIds), ev => {
       if (ev.type === 'started') {
         bar.style.width = '2%';
         msg.textContent = ev.msg || `已连接，准备分析 ${ev.rows || 0} 行，约 ${ev.total_batches || 0} 批`;
@@ -364,6 +367,8 @@ async function annRunAiDetect() {
         appendAiLog(warning);
       }
       if (ev.type === 'ai_detect_done') {
+        annState.completion = ev.completion || null;
+        annState.historySaved = ev.history_saved ?? null;
         bar.style.width = '100%';
         const results = ev.results || [];
         const missingIds = ev.missing_ids || [];
@@ -392,7 +397,8 @@ async function annRunAiDetect() {
 
     if (annState.missingAiIds.length > 0) {
       backBtn.style.display = '';
-      showToast('AI 识别结果不完整，已停止后续任务', 'error');
+      annGoStep(6);
+      annShowDone();
       return;
     }
 
@@ -652,11 +658,6 @@ async function annAfterAiConfirm() {
   if (annState.tasks.quality) {
     annGoStep(5);
     await annRunQuality();
-  } else if (annState.missingTranslationIds.length > 0) {
-    annGoStep(3);
-    const retryBtn = $('ann-btn-ai-back');
-    if (retryBtn) retryBtn.style.display = '';
-    showToast('AI 判断已完成，但中文翻译仍不完整，请重试补齐后再下载', 'error');
   } else {
     annGoStep(6);
     annShowDone();
@@ -700,7 +701,7 @@ async function annRunQuality(options = {}) {
   warnLog.innerHTML = '';
 
   try {
-    await consumeSSE(`/api/annotate/${encodeURIComponent(runSessionId)}/run-quality`, ev => {
+    await consumeSSE(annRetryUrl("run-quality", options.retryIds), ev => {
       if (annState.sessionId !== runSessionId) return;
       if (ev.type === 'progress') {
         const pct = ev.total > 0 ? Math.round((ev.done / ev.total) * 100) : 0;
@@ -714,6 +715,8 @@ async function annRunQuality(options = {}) {
         warnLog.appendChild(div);
       }
       if (ev.type === 'quality_done') {
+        annState.completion = ev.completion || null;
+        annState.historySaved = ev.history_saved ?? null;
         completed = true;
         bar.style.width = '100%';
         const missingQIds = ev.missing_ids || [];
@@ -763,12 +766,8 @@ async function annRunQuality(options = {}) {
       }
       retryActions.style.display = '';
       $('ann-btn-quality-preview').hidden = annState.qualityResults.length === 0;
-      showToast(
-        incompleteQualityCount > 0
-          ? '质量打标结果不完整，已停留在当前步骤'
-          : '中文翻译仍不完整，请重试补齐后再下载',
-        'error',
-      );
+      annGoStep(6);
+      annShowDone();
       return;
     }
     if (!preserveReview) annGoStep(6);
@@ -791,8 +790,12 @@ function annBuildDoneSummary() {
     ? annState.aiResults.length
     : annState.qualityCount;
   const lines = [
-    `<div class="ann-summary-title">${annHasIncompleteResults() ? '当前标注结果' : `完成共 ${totalCount} 条反馈的标注`}</div>`,
+    `<div class="ann-summary-title">${annHasIncompleteResults() || annState.completion?.partial ? '当前标注结果（部分完成）' : `完成共 ${totalCount} 条反馈的标注`}</div>`,
   ];
+  if (annState.completion) {
+    const c = annState.completion;
+    lines.push(`<p>共 ${c.total} 位玩家，${c.complete} 位结果完整，${c.missing_ids.length} 位有待补齐项。以下质量结论仅基于已完成判断。</p>`);
+  }
   if (annState.tasks.ai_detect) {
     lines.push(
       `<div class="ann-summary-line">AI 识别结果：${annState.reviewAiResults.length} 条进入人工复核，${annState.confirmedAiIds.size} 位确认高概率 AI</div>`
@@ -816,7 +819,7 @@ function annBuildDoneSummary() {
 }
 
 function annHasIncompleteResults() {
-  return [annState.missingAiIds, annState.missingQualityIds, annState.missingOverallIds, annState.missingTranslationIds]
+  return annState.completion?.partial || [annState.missingAiIds, annState.missingQualityIds, annState.missingOverallIds, annState.missingTranslationIds]
     .some(ids => (ids || []).length > 0);
 }
 
@@ -835,18 +838,22 @@ function annShowDone(options = {}) {
   if (missingParts.length) {
     $('ann-done-text').innerHTML =
       summary +
-      `<div class="ann-summary-error">结果不完整：${missingParts.join('；')}，下载已被阻断。请返回对应任务重试。</div>`;
-    $('ann-btn-download').disabled = true;
-    if (notify) showToast('可预览已返回结果，补齐后才能下载', 'error');
+      `<div class="ann-summary-error">部分完成：${missingParts.join('；')}。已有结果可下载，缺失项标为待补齐。</div>`;
+    $('ann-btn-download').disabled = false;
+    if (notify) showToast('部分完成：可下载已有结果，也可选择失败项补齐', 'info');
   } else {
     $('ann-done-text').innerHTML = summary;
     $('ann-btn-download').disabled = false;
     if (notify) showToast('标注完成，请预览结果后下载', 'success');
   }
+  if (annState.historySaved === false) {
+    $('ann-done-text').innerHTML += '<p role="alert">历史保存未成功；页面结果仍保留，请尝试下载，勿关闭页面。</p>';
+  }
   const canCompleteQuality = annState.tasks.quality && (missingQ.length || missingOverall.length || missingTranslations.length);
   $('ann-btn-quality-complete').hidden = !canCompleteQuality;
   $('ann-btn-quality-complete').style.display = canCompleteQuality ? '' : 'none';
   annRenderQualityPreview();
+  annRenderPartialRetry();
 }
 
 const ANN_EDITABLE_QUALITY_LABELS = ['无效反馈', '有效反馈', '优秀反馈'];
@@ -1245,7 +1252,7 @@ $('ann-btn-quality-complete').addEventListener('click', () => {
 
 $('ann-btn-download').addEventListener('click', () => {
   if (window.AnnotateReview?.download()) return;
-  window.location.href = `/api/annotate/${annState.sessionId}/download`;
+  annDownloadResults();
 });
 
 $('ann-btn-quality-preview').addEventListener('click', () => {
@@ -1261,6 +1268,8 @@ $('ann-btn-restart').addEventListener('click', () => {
   if (!confirm('确定要重新标注吗？当前标注数据将被清除。')) return;
   window.AnnotateReview?.reset();
   annState.sessionId = null;
+  annState.completion = null;
+  annState.historySaved = null;
   annState.currentStep = 1;
   annState.headers = [];
   annState.idCol = 1;
@@ -1313,3 +1322,79 @@ fetch('/api/upload-guide')
     if (el && content) el.innerHTML = marked.parse(content);
   })
   .catch(() => { });
+
+
+// A failed download must never navigate away from the in-memory task.
+async function annDownloadResults(historyId = null) {
+  if (!historyId && (!annState.sessionId || annState.partialRetryRunning || annState.qualityReviewRunning || annState.qualityReviewSaving)) return;
+  const sid = annState.sessionId;
+  try {
+    const response = await fetch(historyId ? `/api/annotate-history/${encodeURIComponent(historyId)}/download` : `/api/annotate/${encodeURIComponent(sid)}/download`);
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      throw new Error(typeof error.detail === 'string' ? error.detail : `下载失败（${response.status}），已有结果仍保留`);
+    }
+    const blob = await response.blob();
+    const disposition = response.headers.get('Content-Disposition') || '';
+    const match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+    const filename = match ? decodeURIComponent(match[1]) : '标注结果.xlsx';
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url; link.download = filename;
+    document.body.appendChild(link); link.click(); link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+  } catch (error) { showToast(error.message, 'error'); }
+}
+
+function annRetryUrl(stage, ids) {
+  const query = new URLSearchParams();
+  if (ids) ids.forEach(id => query.append('retry_ids', String(id)));
+  return `/api/annotate/${encodeURIComponent(annState.sessionId)}/${stage}${query.size ? '?' + query.toString() : ''}`;
+}
+
+function annRenderPartialRetry() {
+  let box = $('ann-partial-retry');
+  if (!box) {
+    box = document.createElement('section'); box.id = 'ann-partial-retry';
+    box.style.cssText = 'text-align:left;padding:16px 0';
+    $('ann-done-text').insertAdjacentElement('afterend', box);
+  }
+  const aiPending = annState.missingAiIds.length > 0;
+  const gaps = annState.completion?.gaps || {};
+  const ids = aiPending ? annState.missingAiIds : [...new Set([
+    ...Object.keys(gaps), ...annState.missingQualityIds, ...annState.missingOverallIds, ...annState.missingTranslationIds,
+  ])];
+  box.hidden = !ids.length;
+  if (!ids.length) { box.innerHTML = ''; return; }
+  const busy = annState.partialRetryRunning || annState.qualityReviewRunning || annState.qualityReviewSaving;
+  box.innerHTML = `<h3>选择失败项重跑</h3><p>按玩家选择，仅补其缺失项，已完成判断保留。重跑结果更新同一条历史记录。${aiPending ? '当前先补 AI 识别，完成确认后继续质量打标。' : ''}</p>
+    <button type="button" class="btn btn--ghost" data-partial-all ${busy ? 'disabled' : ''}>全选 / 取消全选</button>
+    <div style="max-height:240px;overflow:auto">${ids.map(id => `<label style="display:block;padding:8px 0"><input type="checkbox" data-partial-id value="${esc(String(id))}" ${busy ? 'disabled' : ''}> ${esc(String(id))}：${esc((gaps[id] || [aiPending ? 'AI 判断待补齐' : '结果待补齐']).join('、'))}</label>`).join('')}</div>
+    <button type="button" class="btn btn--primary" data-partial-run ${busy ? 'disabled' : ''}>${busy ? '正在补齐…' : '重跑所选失败项'}</button>`;
+  box.querySelector('[data-partial-all]').onclick = () => {
+    const inputs = [...box.querySelectorAll('[data-partial-id]')];
+    const checked = !inputs.every(input => input.checked);
+    inputs.forEach(input => { input.checked = checked; });
+  };
+  box.querySelector('[data-partial-run]').onclick = async () => {
+    const selected = [...box.querySelectorAll('[data-partial-id]:checked')].map(input => input.value);
+    if (!selected.length) { showToast('请先选择要补齐的玩家', 'info'); return; }
+    if (annState.partialRetryRunning || annState.qualityReviewRunning || annState.qualityReviewSaving) return;
+    annState.partialRetryRunning = true;
+    annRenderPartialRetry();
+    try {
+      if (aiPending || !annState.tasks.quality) {
+        annGoStep(3);
+        await annRunAiDetect({retryIds: selected});
+      } else {
+        annGoStep(5);
+        await annRunQuality({retryIds: selected, preserveReview: true});
+        annGoStep(6); annShowDone({quiet: true});
+      }
+    } finally {
+      annState.partialRetryRunning = false;
+      annRenderPartialRetry();
+      window.AnnotateReview?.render();
+    }
+  };
+}

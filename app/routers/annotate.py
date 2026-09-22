@@ -2,7 +2,7 @@
 
 业务编排、SSE 流程、session 推进、历史落库全部在 services/annotate_workflow。
 """
-from fastapi import APIRouter, Depends, File, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Request, UploadFile, Query
 from fastapi.responses import StreamingResponse
 
 from app.core.responses import _make_download_response
@@ -22,6 +22,7 @@ from app.services.annotate_workflow import (
     peek_annotate_session,
     validate_annotate_session_for_ai,
     validate_annotate_session_for_quality,
+    validate_annotate_retry_ids,
 )
 from app.services.audit import audit_log
 from app.services.auth import _current_login, _require_feature
@@ -83,18 +84,19 @@ async def annotate_confirm_columns(sid: str, req: AnnotateConfirmRequest, reques
 
 
 @router.get("/api/annotate/{sid}/run-ai-detect")
-async def annotate_run_ai_detect(sid: str, request: Request):
+async def annotate_run_ai_detect(sid: str, request: Request, retry_ids: list[str] | None = Query(default=None)):
     await require_session_request_access(
         request,
         sid,
         login_resolver=_current_login,
         loader=peek_annotate_session,
     )
+    selected = validate_annotate_retry_ids(sid, retry_ids)
     validate_annotate_session_for_ai(sid)
     api_key = await require_request_llm_api_key(request)
     return StreamingResponse(
         stream_with_llm_api_key(
-            ai_detect_stream(sid, request),
+            ai_detect_stream(sid, request, retry_ids=selected),
             api_key,
             request=request,
             category="annotate",
@@ -158,7 +160,7 @@ async def annotate_quality_review(
 
 
 @router.get("/api/annotate/{sid}/run-quality")
-async def annotate_run_quality(sid: str, request: Request):
+async def annotate_run_quality(sid: str, request: Request, retry_ids: list[str] | None = Query(default=None)):
     from app.services.annotate_workflow import quality_stream
     await require_session_request_access(
         request,
@@ -166,11 +168,12 @@ async def annotate_run_quality(sid: str, request: Request):
         login_resolver=_current_login,
         loader=peek_annotate_session,
     )
+    selected = validate_annotate_retry_ids(sid, retry_ids)
     validate_annotate_session_for_quality(sid)
     api_key = await require_request_llm_api_key(request)
     return StreamingResponse(
         stream_with_llm_api_key(
-            quality_stream(sid, request),
+            quality_stream(sid, request, retry_ids=selected),
             api_key,
             request=request,
             category="annotate",

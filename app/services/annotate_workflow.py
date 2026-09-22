@@ -388,34 +388,86 @@ def _annotate_incomplete_detail(sess: dict) -> str:
     return "；".join(parts)
 
 
+def _annotate_completion(sess: dict) -> dict:
+    """Describe missing work without treating it as a model quality verdict."""
+    gaps = {}
+    tasks = sess.get("tasks") or {}
+    ai = {str(r.get("id", "")): r for r in sess.get("ai_results", [])}
+    quality = {str(r.get("id", "")): r for r in sess.get("quality_results", [])}
+    excluded = set(sess.get("confirmed_ai_ids") or [])
+    for row in (sess.get("rows") or [])[1:]:
+        rid = _row_id(row, sess.get("id_col", 1))
+        parts = []
+        if tasks.get("ai_detect") and (rid not in ai or rid in sess.get("missing_ai_ids", [])):
+            parts.append("AI判断")
+        if tasks.get("quality") and rid not in excluded:
+            result = quality.get(rid, {})
+            for col in sorted(_quality_invalid_cols(result, row, sess.get("open_text_cols") or [])):
+                parts.append(f"第{col + 1}列质量判断")
+            if not _has_valid_overall(result):
+                parts.append("整体质量判断")
+        translations = {**(ai.get(rid, {}).get("translations") or {}),
+                        **(quality.get(rid, {}).get("translations") or {})}
+        if any(tasks.values()):
+            for col in sess.get("open_text_cols") or []:
+                original = str(row[col] or "").strip() if col < len(row) else ""
+                if original and not _translation_is_usable(original, translations.get(f"col_{col}", "")):
+                    parts.append(f"第{col + 1}列中文翻译")
+        if parts:
+            gaps[rid] = parts
+    detail = _annotate_incomplete_detail(sess)
+    total = max(0, len(sess.get("rows") or []) - 1)
+    return {"partial": bool(detail or gaps), "total": total, "complete": total - len(gaps),
+            "missing_ids": sorted(gaps), "gaps": gaps, "detail": detail,
+            "ai_confirmation_complete": bool(sess.get("ai_confirmation_complete"))}
+
+
+def validate_annotate_retry_ids(sid: str, retry_ids: list[str] | None) -> set[str] | None:
+    if retry_ids is None:
+        return None
+    selected = {value.strip() for value in retry_ids if value.strip()}
+    available = set(_annotate_completion(get_annotate_session(sid))["missing_ids"])
+    if not selected or not selected <= available:
+        raise HTTPException(status_code=400, detail="请选择当前仍有缺项的玩家；已完成或不存在的玩家不能重跑")
+    return selected
+
+
 def _build_annotate_excel_from_session(sess: dict) -> tuple[bytes, str]:
     rows = sess.get("rows")
-    headers = sess.get("headers")
+    headers = sess.get("headers") or (rows[0] if rows else [])
     if not rows:
         raise HTTPException(status_code=400, detail="会话中没有数据")
-    incomplete = _annotate_incomplete_detail(sess)
-    if incomplete:
-        raise HTTPException(status_code=400, detail=f"结果不完整，无法下载：{incomplete}。请返回重试对应任务。")
+    completion = _annotate_completion(sess)
+    quality_results = deepcopy(sess.get("quality_results", []))
+    row_map = {_row_id(row, sess.get("id_col", 1)): row for row in rows[1:]}
+    for result in quality_results:
+        row = row_map.get(str(result.get("id", "")), [])
+        for col in _quality_invalid_cols(result, row, sess.get("open_text_cols", [])):
+            for field in ("q_labels", "q_reasons", "q_evidence"):
+                result.get(field, {}).pop(f"col_{col}", None)
+        if not _has_valid_overall(result):
+            result.update(overall="", overall_reason="", overall_pending=True)
     filename = sess.get("filename", "annotated")
     excel_bytes = annotate.generate_annotated_excel(
         rows,
         headers,
-        sess.get("ai_results", []),
+        [result for result in sess.get("ai_results", [])
+         if str(result.get("id", "")) not in (sess.get("missing_ai_ids") or [])],
         set(sess.get("confirmed_ai_ids", [])),
-        sess.get("quality_results", []),
+        quality_results,
         sess.get("open_text_cols", []),
         sess.get("id_col", 1),
         sess.get("tasks", {}),
+        completion=completion,
     )
     return excel_bytes, _annotate_download_filename(filename)
 
 
 async def _save_annotate_result_history(sid: str, sess: dict, request: Request) -> None:
-    if _annotate_incomplete_detail(sess):
-        return
     login = await _current_login(request)
     require_loaded_session_access(sess, login)
     _assign_session_owner(sess, login)
+    sess = deepcopy(sess)
     loop = asyncio.get_event_loop()
     excel_bytes, download_name = await loop.run_in_executor(
         None,
@@ -424,8 +476,34 @@ async def _save_annotate_result_history(sid: str, sess: dict, request: Request) 
     )
     ANNOTATE_RESULT_DIR.mkdir(parents=True, exist_ok=True)
     result_path = _annotate_result_path(sid)
-    result_path.write_bytes(excel_bytes)
-    save_annotate_to_history(sid, sess, str(result_path), download_name)
+    # Publish only a fully serialized workbook. Keep the old download if generation fails.
+    temporary = result_path.with_name(f".{result_path.name}.{uuid.uuid4().hex}.tmp")
+    previous = result_path.read_bytes() if result_path.exists() else None
+    try:
+        temporary.write_bytes(excel_bytes)
+        temporary.replace(result_path)
+        snapshot = {**sess, "completion": _annotate_completion(sess)}
+        try:
+            save_annotate_to_history(sid, snapshot, str(result_path), download_name)
+        except Exception:
+            if previous is not None:
+                temporary.write_bytes(previous)
+                temporary.replace(result_path)
+            raise
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+async def _publish_annotate_result(sid: str, sess: dict, request: Request) -> str:
+    """A storage failure must not hide the results already produced by the model."""
+    try:
+        await _save_annotate_result_history(sid, sess, request)
+        sess["history_save_error"] = ""
+        return ""
+    except Exception as exc:
+        message = f"历史保存失败，已有结果仍保留，可重试下载：{_public_llm_error(str(exc))}"
+        sess["history_save_error"] = message
+        return message
 
 
 def _annotate_ai_log(message: str, **fields) -> None:
@@ -1515,12 +1593,15 @@ async def _repair_missing_translations(
     id_col: int,
     open_text_cols: list[int],
     stage: str,
+    retry_ids: set[str] | None = None,
 ) -> tuple[set[str], str]:
     """Only translate missing cells through the shared translation model chain."""
     rows_by_id = {_row_id(row, id_col): row for row in batch_rows}
     results_by_id = {str(result.get("id", "")): result for result in results}
 
     for row_id, result in results_by_id.items():
+        if retry_ids is not None and row_id not in retry_ids:
+            continue
         row = rows_by_id.get(row_id)
         if row is None:
             continue
@@ -1642,9 +1723,9 @@ async def _repair_missing_translations(
                         item["key"]
                     ] = translation
 
-    pending = pending_items()
+    pending = [item for item in pending_items() if retry_ids is None or item["id"] in retry_ids]
     await run_repair_pass(pending, 20, "primary")
-    pending = pending_items()
+    pending = [item for item in pending_items() if retry_ids is None or item["id"] in retry_ids]
     if pending:
         await run_repair_pass(pending, 5, "retry", fallback_first=True)
 
@@ -1819,7 +1900,7 @@ async def build_and_save_annotate_download(sid: str, request: Request) -> tuple[
     excel_bytes, download_name = await loop.run_in_executor(
         None, _build_annotate_excel_from_session, sess
     )
-    await _save_annotate_result_history(sid, sess, request)
+    await _publish_annotate_result(sid, sess, request)
     return excel_bytes, download_name
 
 
@@ -1898,7 +1979,7 @@ async def _run_ai_batch_checked(
     return batch_num, valid, missing, translation_missing, detail
 
 
-async def ai_detect_stream(sid: str, request: Request):
+async def ai_detect_stream(sid: str, request: Request, retry_ids: set[str] | None = None):
     """Run only missing AI rows, retain prior trusted results, and repair translations."""
     sess = get_annotate_session(sid)
     if sess.get("ai_status") != "running":
@@ -1918,6 +1999,8 @@ async def ai_detect_stream(sid: str, request: Request):
     }
     target_ids = expected_ids - set(results_by_id)
     target_ids.update(sess.get("missing_ai_ids") or [])
+    if retry_ids is not None:
+        target_ids &= retry_ids
     for row_id in target_ids:
         results_by_id.pop(row_id, None)
 
@@ -1963,9 +2046,12 @@ async def ai_detect_stream(sid: str, request: Request):
 
         async def run_with_sem(batch_num: int, batch: list):
             async with sem:
-                return await _run_ai_batch_checked(
-                    sid, batch_num, batch, headers, open_text_cols, id_col, background,
-                )
+                try:
+                    return await _run_ai_batch_checked(
+                        sid, batch_num, batch, headers, open_text_cols, id_col, background,
+                    )
+                except Exception as exc:
+                    return batch_num, [], {_row_id(row, id_col) for row in batch}, set(), _public_llm_error(str(exc))
 
         pending = {
             asyncio.create_task(run_with_sem(index, batch))
@@ -2019,6 +2105,7 @@ async def ai_detect_stream(sid: str, request: Request):
             id_col,
             open_text_cols,
             "ai-final",
+            retry_ids=retry_ids,
         )
         sess["ai_results"] = all_results
         sess["ai_status"] = "complete" if not all_missing_ids else "incomplete"
@@ -2042,11 +2129,9 @@ async def ai_detect_stream(sid: str, request: Request):
                 sess["confirmed_ai_ids"] = []
             elif not sess.get("ai_confirmation_complete"):
                 sess["confirmed_ai_ids"] = []
-        if (
-            not _annotate_incomplete_detail(sess)
-            and not (sess.get("tasks") or {}).get("quality")
-        ):
-            await _save_annotate_result_history(sid, sess, request)
+        save_error = await _publish_annotate_result(sid, sess, request)
+        if save_error:
+            yield sse_event({"type": "warn", "msg": save_error})
         await audit_log(
             request, "annotate", "完成 AI 作答识别",
             f"会话：{sid}；结果数：{len(all_results)}；高风险数：{len(high_prob)}；待复核数：{len(review_results)}",
@@ -2058,7 +2143,7 @@ async def ai_detect_stream(sid: str, request: Request):
             },
         )
         yield sse_event({
-            "type": "ai_detect_done",
+            "type": "ai_detect_done", "completion": _annotate_completion(sess), "history_saved": not bool(sess.get("history_save_error")),
             "results": all_results,
             "high_prob": high_prob,
             "review_results": review_results,
@@ -2394,7 +2479,7 @@ async def _run_one_quality_batch_strict(
     )
 
 
-async def quality_stream(sid: str, request: Request):
+async def quality_stream(sid: str, request: Request, retry_ids: set[str] | None = None):
     """Run only missing quality rows and retain prior trusted labels."""
     sess = get_annotate_session(sid)
     _prepare_quality_policy(sess)
@@ -2417,6 +2502,8 @@ async def quality_stream(sid: str, request: Request):
     }
     question_gaps, overall_gaps = _quality_gap_ids(sess)
     target_ids = question_gaps | overall_gaps
+    if retry_ids is not None:
+        target_ids &= retry_ids
 
     empty_rows = [
         row for row in body
@@ -2460,7 +2547,7 @@ async def quality_stream(sid: str, request: Request):
         order = {_row_id(row, id_col): index for index, row in enumerate(body)}
         for row in body:
             result = results_by_id.get(_row_id(row, id_col))
-            if result is not None:
+            if result is not None and (retry_ids is None or _row_id(row, id_col) in retry_ids):
                 _project_quality_review_signals(result, row, open_text_cols)
         sess["quality_results"] = sorted(
             results_by_id.values(), key=lambda result: order.get(str(result.get("id", "")), len(order)),
@@ -2487,21 +2574,24 @@ async def quality_stream(sid: str, request: Request):
 
         async def run_with_sem(batch_num: int, batch: list):
             async with sem:
-                return await _run_one_quality_batch_strict(
-                    sid,
-                    batch_num,
-                    batch,
-                    headers,
-                    open_text_cols,
-                    id_col,
-                    include_translations,
-                    headers_zh,
-                    existing_results=[
-                        results_by_id[_row_id(row, id_col)] for row in batch
-                        if _row_id(row, id_col) in results_by_id
-                    ],
-                    background=background,
-                )
+                try:
+                    return await _run_one_quality_batch_strict(
+                        sid,
+                        batch_num,
+                        batch,
+                        headers,
+                        open_text_cols,
+                        id_col,
+                        include_translations,
+                        headers_zh,
+                        existing_results=[
+                            results_by_id[_row_id(row, id_col)] for row in batch
+                            if _row_id(row, id_col) in results_by_id
+                        ],
+                        background=background,
+                    )
+                except Exception as exc:
+                    return batch_num, [results_by_id[_row_id(row, id_col)] for row in batch if _row_id(row, id_col) in results_by_id], {_row_id(row, id_col) for row in batch}, _public_llm_error(str(exc))
 
         pending = {
             asyncio.create_task(run_with_sem(index, batch))
@@ -2560,6 +2650,7 @@ async def quality_stream(sid: str, request: Request):
             id_col,
             open_text_cols,
             "quality-final",
+            retry_ids=retry_ids,
         )
         order = {_row_id(row, id_col): index for index, row in enumerate(rows[1:])}
         all_results.sort(key=lambda result: order.get(str(result.get("id", "")), len(order)))
@@ -2577,8 +2668,9 @@ async def quality_stream(sid: str, request: Request):
         sess.pop("missing_translation_ids", None)
         if missing_translation_ids:
             sess["missing_translation_ids"] = sorted(missing_translation_ids)
-        if not _annotate_incomplete_detail(sess):
-            await _save_annotate_result_history(sid, sess, request)
+        save_error = await _publish_annotate_result(sid, sess, request)
+        if save_error:
+            yield sse_event({"type": "warn", "msg": save_error})
         await audit_log(
             request, "annotate", "完成回答质量打标",
             f"会话：{sid}；结果数：{len(all_results)}；未回填：{len(all_missing_ids)}",
@@ -2591,7 +2683,7 @@ async def quality_stream(sid: str, request: Request):
             },
         )
         yield sse_event({
-            "type": "quality_done", "count": len(all_results),
+            "type": "quality_done", "completion": _annotate_completion(sess), "history_saved": not bool(sess.get("history_save_error")), "count": len(all_results),
             "complete_count": len(expected_ids - all_missing_ids - missing_overall_ids),
             "results": all_results, "missing_ids": sorted(all_missing_ids),
             "missing_overall_ids": sorted(missing_overall_ids),

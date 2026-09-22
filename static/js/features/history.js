@@ -258,6 +258,10 @@ function historySourceMeta(mode) {
 }
 
 function historyQaMeta(h) {
+  if (h.mode === "annotate" && h.annotate_completion) {
+    const c = h.annotate_completion;
+    return {key: c.partial ? "pending" : "done", label: c.partial ? (c.missing_count ? `部分完成 · ${c.missing_count} 位待补齐 · 可下载` : "待确认 · 可下载") : "标注已完成"};
+  }
   if (h.mode === 'interview') return { key: 'disabled', label: '证据型报告' };
   if (h.mode === 'comment') return { key: 'disabled', label: '无追问功能' };
   if (h.mode === 'annotate') return { key: 'disabled', label: '无追问功能' };
@@ -296,7 +300,7 @@ $('history-body').addEventListener('click', async e => {
     e.stopPropagation();
     const card = downloadBtn.closest('[data-hist-id]');
     if (card?.dataset.histId) {
-      window.location.href = `/api/annotate-history/${card.dataset.histId}/download`;
+      await annDownloadResults(card.dataset.histId);
     }
     return;
   }

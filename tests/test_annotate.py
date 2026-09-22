@@ -726,7 +726,7 @@ class AnnotateRuleTests(unittest.TestCase):
         self.assertIn("中文翻译缺失 2 行", detail)
         self.assertNotIn("AI 检测漏返", detail)
 
-    def test_incomplete_detail_blocks_empty_or_partial_task_results(self):
+    def test_incomplete_detail_describes_empty_or_partial_task_results(self):
         session = {
             "rows": [["ID", "Q1"], ["P1", "a"], ["P2", "b"]],
             "id_col": 0,
@@ -743,8 +743,10 @@ class AnnotateRuleTests(unittest.TestCase):
 
         self.assertIn("AI 检测漏返 1 行", detail)
         self.assertIn("质量打标漏返 2 行", detail)
-        with self.assertRaises(HTTPException):
-            annotate_workflow._build_annotate_excel_from_session(session)
+        data, _ = annotate_workflow._build_annotate_excel_from_session(session)
+        workbook = openpyxl.load_workbook(io.BytesIO(data))
+        self.assertIn("完成情况", workbook.sheetnames)
+        self.assertEqual(workbook["完成情况"].cell(2, 2).value, "部分完成")
 
     def test_query_budget_trims_only_model_copy_and_splits_large_batches(self):
         source = "x" * 2000
@@ -2039,7 +2041,7 @@ class HolisticQualityTests(unittest.IsolatedAsyncioTestCase):
         ):
             events = [json.loads(raw.removeprefix("data: ")) async for raw in annotate_workflow.quality_stream(sid, object())]
         model.assert_not_awaited()
-        save.assert_not_awaited()
+        save.assert_awaited_once()
         self.assertEqual(session["rows"], original_rows)
         self.assertEqual(session["background"], "背景条件" * 2000)
         self.assertEqual(session["quality_status"], "incomplete")
@@ -2159,10 +2161,12 @@ class HolisticQualityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first_done["complete_count"], 0)
         self.assertEqual(len(session["quality_results"]), 1)
         self.assertEqual(session["quality_status"], "incomplete")
-        save.assert_not_awaited()
+        save.assert_awaited_once()
         self.assertNotIn("quality_completed_at", session)
-        with self.assertRaises(HTTPException):
-            annotate_workflow._build_annotate_excel_from_session(session)
+        data, _ = annotate_workflow._build_annotate_excel_from_session(session)
+        workbook = openpyxl.load_workbook(io.BytesIO(data))
+        self.assertIn("完成情况", workbook.sheetnames)
+        self.assertEqual(workbook["完成情况"].cell(2, 2).value, "部分完成")
         with (
             patch.object(annotate_workflow, "_call_quality_model", new=AsyncMock(return_value=([self.make_model_result()], ""))) as retry,
             patch.object(annotate_workflow, "_repair_missing_translations", new=AsyncMock(return_value=(set(), ""))),
@@ -2265,8 +2269,10 @@ class HolisticQualityTests(unittest.IsolatedAsyncioTestCase):
         detail = annotate_workflow._annotate_incomplete_detail(session)
         self.assertIn("整体质量判断待补", detail)
         self.assertNotIn("质量打标漏返", detail)
-        with self.assertRaises(HTTPException):
-            annotate_workflow._build_annotate_excel_from_session(session)
+        data, _ = annotate_workflow._build_annotate_excel_from_session(session)
+        workbook = openpyxl.load_workbook(io.BytesIO(data))
+        self.assertIn("完成情况", workbook.sheetnames)
+        self.assertEqual(workbook["完成情况"].cell(2, 2).value, "部分完成")
 
     async def test_fresh_players_with_different_blank_columns_share_one_quality_call(self):
         rows = [["P1", "没有", ""], ["P2", "", "按钮太小"]]
@@ -2542,7 +2548,7 @@ class QualityMinimumRequirementTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("本次是否返回整体判断：否", query)
                 self.assertIn(session["rows"][1][2], query)
 
-    async def test_repeated_failed_check_stops_after_two_passes_and_blocks_export(self):
+    async def test_repeated_failed_check_stops_after_two_passes_and_allows_partial_export(self):
         session = self.make_session()
         bad = self.make_model_result()
         bad["q_checks"]["col_1"] = None
@@ -2557,8 +2563,10 @@ class QualityMinimumRequirementTests(unittest.IsolatedAsyncioTestCase):
         session["quality_results"] = retained
         session["quality_status"] = "complete"
         self.assertEqual(annotate_workflow._quality_gap_ids(session), ({"P1"}, set()))
-        with self.assertRaises(HTTPException):
-            annotate_workflow._build_annotate_excel_from_session(session)
+        data, _ = annotate_workflow._build_annotate_excel_from_session(session)
+        workbook = openpyxl.load_workbook(io.BytesIO(data))
+        self.assertIn("完成情况", workbook.sheetnames)
+        self.assertEqual(workbook["完成情况"].cell(2, 2).value, "部分完成")
 
     async def test_legacy_partial_repair_requires_new_check_without_upgrading_trusted_questions(self):
         existing = self.make_result()
@@ -2730,7 +2738,7 @@ class InvalidQualityReviewTests(unittest.IsolatedAsyncioTestCase):
         for field in ("overall", "overall_reason", "translations", "human_reviews", "quality_review_baseline"):
             self.assertEqual(result[field], trusted[field])
 
-    async def test_failed_review_stays_pending_blocks_export_and_stops_after_one_stage(self):
+    async def test_failed_review_stays_pending_allows_partial_export_and_stops_after_one_stage(self):
         bad_quote = self.make_review()
         bad_quote["q_evidence"]["col_2"] = "其他题或模型编造的原文"
         bad_check = self.make_review()
@@ -2758,8 +2766,10 @@ class InvalidQualityReviewTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(retained[0]["q_invalid_reviews"]["col_2"]["status"], "pending")
                 session.update(quality_results=retained, quality_status="complete")
                 self.assertEqual(annotate_workflow._quality_gap_ids(session), ({"P1"}, set()))
-                with self.assertRaises(HTTPException):
-                    annotate_workflow._build_annotate_excel_from_session(session)
+                data, _ = annotate_workflow._build_annotate_excel_from_session(session)
+                workbook = openpyxl.load_workbook(io.BytesIO(data))
+                self.assertIn("完成情况", workbook.sheetnames)
+                self.assertEqual(workbook["完成情况"].cell(2, 2).value, "部分完成")
 
     async def test_review_runs_once_after_structural_repair_and_excludes_unrepaired_questions(self):
         session = self.make_session()
@@ -2807,8 +2817,10 @@ class InvalidQualityReviewTests(unittest.IsolatedAsyncioTestCase):
         session = self.make_session([existing])
         session["quality_status"] = "complete"
         self.assertEqual(annotate_workflow._quality_gap_ids(session), ({"P1"}, set()))
-        with self.assertRaises(HTTPException):
-            annotate_workflow._build_annotate_excel_from_session(session)
+        data, _ = annotate_workflow._build_annotate_excel_from_session(session)
+        workbook = openpyxl.load_workbook(io.BytesIO(data))
+        self.assertIn("完成情况", workbook.sheetnames)
+        self.assertEqual(workbook["完成情况"].cell(2, 2).value, "部分完成")
         with (
             patch.object(annotate_workflow, "_call_quality_model", new=AsyncMock()) as initial,
             patch.object(annotate_workflow, "_call_invalid_quality_review", new=AsyncMock(return_value=([], "not available"))) as review,
@@ -3312,3 +3324,215 @@ class ValidityConfidenceTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PartialDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    make_session = HolisticQualityTests.make_session
+    make_result = HolisticQualityTests.make_result
+    make_model_result = HolisticQualityTests.make_model_result
+    store_session = HolisticQualityTests.store_session
+
+    def test_all_failed_export_preserves_rows_and_never_invents_ai_or_quality(self):
+        session = self.make_session()
+        session["tasks"]["ai_detect"] = True
+        before = deepcopy(session)
+        data, _ = annotate_workflow._build_annotate_excel_from_session(session)
+        workbook = openpyxl.load_workbook(io.BytesIO(data))
+        sheet = workbook["标注结果"]
+        values = [cell.value for cell in sheet[2]]
+        self.assertEqual(sheet.max_row, 2)
+        self.assertIn(session["rows"][1][2], values)
+        self.assertEqual(values[0], "待补齐")
+        self.assertNotIn("非高概率AI作答", values)
+        self.assertNotIn("无效反馈", values)
+        self.assertGreaterEqual(values.count("待补齐"), 5)
+        self.assertEqual(session, before)
+
+    async def test_selected_retry_preserves_other_players_and_human_labels(self):
+        result = self.make_result()
+        result["q_labels"].pop("col_2")
+        result["human_reviews"] = {"col_1": {"from_label": "优秀反馈", "to_label": "有效反馈"}}
+        other = deepcopy(result); other["id"] = "P2"
+        session = self.make_session([result, other])
+        session["rows"].append(["P2", *session["rows"][1][1:]])
+        sid = self.store_session(session)
+        before = deepcopy(other)
+        with (
+            patch.object(annotate_workflow, "_call_quality_model", new=AsyncMock(return_value=([self.make_model_result()], ""))) as model,
+            patch.object(annotate_workflow, "_save_annotate_result_history", new=AsyncMock()) as save,
+            patch.object(annotate_workflow, "audit_log", new=AsyncMock()),
+        ):
+            events = [json.loads(raw.removeprefix("data: ")) async for raw in annotate_workflow.quality_stream(sid, object(), retry_ids={"P1"})]
+        self.assertEqual(model.await_count, 1)
+        payload = model.await_args.args[0].split("<questionnaire_data>\n", 1)[1].split("\n</questionnaire_data>", 1)[0]
+        self.assertEqual([row["id"] for row in json.loads(payload)], ["P1"])
+        self.assertEqual(other, before)
+        self.assertEqual(result["q_labels"]["col_1"], "有效反馈")
+        self.assertEqual(result["human_reviews"]["col_1"]["to_label"], "有效反馈")
+        self.assertEqual(events[-1]["missing_ids"], ["P2"])
+        save.assert_awaited_once()
+
+    def test_retry_selection_rejects_complete_unknown_empty_ids(self):
+        complete = self.make_result()
+        complete["translations"] = {"col_1": "没有", "col_2": "按钮太小，连续点击时容易误触旁边的图标"}
+        session = self.make_session([complete]); session["quality_status"] = "complete"
+        session["rows"].append(["P2", "没有", "按钮太小"])
+        sid = self.store_session(session)
+        self.assertEqual(annotate_workflow.validate_annotate_retry_ids(sid, ["P2"]), {"P2"})
+        for ids in (["P1"], ["P3"], [], ["P2", "P3"]):
+            with self.subTest(ids=ids), self.assertRaises(HTTPException):
+                annotate_workflow.validate_annotate_retry_ids(sid, ids)
+
+    async def test_translation_retry_does_not_touch_unselected_players(self):
+        results = [{"id": "P1", "translations": {}}, {"id": "P2", "translations": {}}]
+        rows = [["P1", "The menu is confusing"], ["P2", "The button is small"]]
+        with patch.object(annotate_workflow, "_call_translation_model", new=AsyncMock(return_value=([
+            {"id": "P1", "key": "col_1", "translation": "菜单令人困惑"},
+        ], ""))) as model:
+            missing, _ = await annotate_workflow._repair_missing_translations("sid", results, rows, 0, [1], "test", retry_ids={"P1"})
+        self.assertEqual(missing, {"P2"})
+        self.assertEqual(results[1]["translations"], {})
+        self.assertNotIn("The button is small", model.await_args.args[0])
+
+    async def test_batch_exception_still_delivers_and_archives_all_failed_rows(self):
+        session = self.make_session(); sid = self.store_session(session)
+        with (
+            patch.object(annotate_workflow, "_run_one_quality_batch_strict", new=AsyncMock(side_effect=RuntimeError("synthetic failure"))),
+            patch.object(annotate_workflow, "_save_annotate_result_history", new=AsyncMock()) as save,
+            patch.object(annotate_workflow, "audit_log", new=AsyncMock()),
+        ):
+            events = [json.loads(raw.removeprefix("data: ")) async for raw in annotate_workflow.quality_stream(sid, object())]
+        self.assertEqual(events[-1]["type"], "quality_done")
+        self.assertEqual(events[-1]["missing_ids"], ["P1"])
+        self.assertTrue(events[-1]["completion"]["partial"])
+        save.assert_awaited_once()
+
+    async def test_history_failure_does_not_hide_final_results(self):
+        session = self.make_session([self.make_result()]); sid = self.store_session(session)
+        with (
+            patch.object(annotate_workflow, "_save_annotate_result_history", new=AsyncMock(side_effect=OSError("disk full"))),
+            patch.object(annotate_workflow, "audit_log", new=AsyncMock()),
+        ):
+            events = [json.loads(raw.removeprefix("data: ")) async for raw in annotate_workflow.quality_stream(sid, object())]
+        self.assertEqual(events[-1]["type"], "quality_done")
+        self.assertFalse(events[-1]["history_saved"])
+        self.assertEqual(len(events[-1]["results"]), 1)
+        self.assertTrue(any("历史保存失败" in event.get("msg", "") for event in events))
+
+    async def test_history_is_replaced_in_place_and_failed_save_keeps_old_download(self):
+        import tempfile
+        from app.storage import history
+        session = self.make_session(); sid = self.store_session(session)
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(annotate_workflow, "ANNOTATE_RESULT_DIR", Path(directory)),
+            patch.object(history, "HISTORY_FILE", str(Path(directory) / "history.json")),
+            patch.object(annotate_workflow, "_current_login", new=AsyncMock(return_value=None)),
+            patch.object(annotate_workflow, "require_loaded_session_access"),
+        ):
+            await annotate_workflow._save_annotate_result_history(sid, session, object())
+            records = history._load_history()
+            self.assertEqual(len(records), 1)
+            first = records[0]
+            self.assertTrue(first["annotate_completion"]["partial"])
+            result = self.make_result()
+            result["translations"] = {"col_1": "没有", "col_2": "按钮太小，连续点击时容易误触旁边的图标"}
+            session.update(quality_results=[result], quality_status="complete")
+            await annotate_workflow._save_annotate_result_history(sid, session, object())
+            records = history._load_history()
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["id"], sid)
+            self.assertEqual(records[0]["report_no"], first["report_no"])
+            self.assertEqual(records[0]["created_at"], first["created_at"])
+            self.assertFalse(records[0]["annotate_completion"]["partial"])
+            path = Path(records[0]["annotate_result_path"])
+            saved = path.read_bytes()
+            with patch.object(annotate_workflow, "save_annotate_to_history", side_effect=OSError("write failed")):
+                with self.assertRaises(OSError):
+                    await annotate_workflow._save_annotate_result_history(sid, session, object())
+            self.assertEqual(path.read_bytes(), saved)
+            self.assertEqual(history._load_history(), records)
+            self.assertFalse(list(Path(directory).glob("*.tmp")))
+
+
+    async def test_retry_api_checks_owner_before_selection_and_forwards_ids(self):
+        import httpx
+        from fastapi import FastAPI
+        from app.routers import annotate as api
+        session = self.make_session(); sid = self.store_session(session)
+        app = FastAPI(); app.include_router(api.router)
+        app.dependency_overrides[api._require_annotate_access] = lambda: None
+        async def wrap(stream, *args, **kwargs):
+            async for chunk in stream:
+                yield chunk
+        seen = []
+        async def run(session_id, request, retry_ids=None):
+            seen.append(retry_ids)
+            yield 'data: {"type":"quality_done"}\n\n'
+        with (
+            patch.object(api, "require_session_request_access", new=AsyncMock(side_effect=HTTPException(403, "owner mismatch"))),
+            patch.object(api, "require_request_llm_api_key", new=AsyncMock()) as key,
+        ):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+                response = await client.get(f"/api/annotate/{sid}/run-quality?retry_ids=P1")
+            self.assertEqual(response.status_code, 403)
+            key.assert_not_awaited()
+        with (
+            patch.object(api, "require_session_request_access", new=AsyncMock()),
+            patch.object(api, "require_request_llm_api_key", new=AsyncMock(return_value="synthetic")),
+            patch.object(api, "stream_with_llm_api_key", wrap),
+            patch.object(annotate_workflow, "quality_stream", run),
+        ):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+                bad = await client.get(f"/api/annotate/{sid}/run-quality?retry_ids=foreign")
+                self.assertEqual(bad.status_code, 400)
+                response = await client.get(f"/api/annotate/{sid}/run-quality?retry_ids=P1")
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(seen, [{"P1"}])
+                repeated = await client.get(f"/api/annotate/{sid}/run-quality?retry_ids=P1")
+                self.assertEqual(repeated.status_code, 409)
+
+    async def test_ai_partial_result_is_also_archived_and_selectively_retried(self):
+        session = self.make_session()
+        session["tasks"] = {"ai_detect": True, "quality": False}
+        session["rows"].append(["P2", *session["rows"][1][1:]])
+        sid = self.store_session(session)
+        async def batch(sid, number, rows, *args):
+            self.assertEqual([row[0] for row in rows], ["P1"])
+            return number, [{"id": "P1", "ai_prob": 0, "translations": {}}], set(), set(), ""
+        with (
+            patch.object(annotate_workflow, "_run_ai_batch_checked", batch),
+            patch.object(annotate_workflow, "_save_annotate_result_history", new=AsyncMock()) as save,
+            patch.object(annotate_workflow, "audit_log", new=AsyncMock()),
+        ):
+            events = [json.loads(raw.removeprefix("data: ")) async for raw in annotate_workflow.ai_detect_stream(sid, object(), retry_ids={"P1"})]
+        self.assertEqual(events[-1]["type"], "ai_detect_done")
+        self.assertEqual(events[-1]["missing_ids"], ["P2"])
+        self.assertTrue(events[-1]["completion"]["partial"])
+        save.assert_awaited_once()
+
+
+    def test_history_list_exposes_status_not_player_ids_and_respects_owner(self):
+        from app.services import history_service
+        from app.core import security
+        base = {"id": "current", "mode": "annotate", "title": "synthetic", "filename": "synthetic.xlsx", "created_at": "2026-01-01", "owner_key": "email:owner@example.test"}
+        current = {**base, "annotate_completion": {"partial": True, "total": 3, "complete": 2, "missing_ids": ["P1"], "gaps": {"P1": ["quality"]}}}
+        legacy = {**base, "id": "legacy"}
+        foreign = {**current, "id": "foreign", "owner_key": "email:other@example.test"}
+        with (
+            patch.object(history_service, "_load_history_with_report_numbers", return_value=[current, legacy, foreign]),
+            patch.object(security, "FEISHU_LOGIN_REQUIRED", True),
+        ):
+            rows = history_service.get_history_list({"email": "owner@example.test"}, "annotate")
+        self.assertEqual([r["id"] for r in rows], ["current", "legacy"])
+        self.assertEqual(rows[0]["annotate_completion"], {"partial": True, "total": 3, "complete": 2, "missing_count": 1})
+        self.assertIsNone(rows[1]["annotate_completion"])
+
+
+    async def test_download_still_returns_excel_when_history_storage_fails(self):
+        session = self.make_session(); sid = self.store_session(session)
+        with patch.object(annotate_workflow, "_save_annotate_result_history", new=AsyncMock(side_effect=OSError("synthetic storage failure"))):
+            data, name = await annotate_workflow.build_and_save_annotate_download(sid, object())
+        self.assertIn("完成情况", openpyxl.load_workbook(io.BytesIO(data)).sheetnames)
+        self.assertTrue(name.endswith(".xlsx"))
+        self.assertIn("历史保存失败", session["history_save_error"])
