@@ -11,7 +11,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Roboto+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/style.css?v=54" />
+  <link rel="stylesheet" href="/static/style.css?v=55" />
   <link rel="stylesheet" href="/static/questionnaire-sources.css?v=1" />
   <link rel="stylesheet" href="/static/report-quick.css?v=11" />
   <link rel="stylesheet" href="/static/survey-entry.css?v=5" />
@@ -1118,7 +1118,6 @@
             </section>
           </div>
           </div>
-        </div>
       </section>
 
       <!-- ======================================================
@@ -1202,19 +1201,19 @@
             <input type="checkbox" id="task-quality" />
             <span class="ann-task-label">
               <strong>回答质量打标</strong>
-              <span>为每道已回答的主观题打上 无效反馈 / 有效反馈 / 优秀反馈 标签；未回答题记为 N/A</span>
+              <span>结合题意逐题标注 无效反馈 / 有效反馈 / 优秀反馈，并根据完整作答独立判断整体质量；未回答题记为 N/A</span>
             </span>
           </label>
         </div>
 
-        <!-- 调研背景（可选，用于 AI 识别） -->
+        <!-- 调研背景（可选，用于 AI 识别和质量判断） -->
         <div class="ann-background-block" id="ann-background-block" style="display:none">
           <div class="ann-background-head">
-            <label class="ann-label">调研背景说明（可选）</label>
-            <span>仅帮助判断 AI 作答，不会写入导出结果</span>
+            <label class="ann-label" for="ann-background">调研背景说明（可选）</label>
+            <span id="ann-background-hint">帮助 AI 作答识别和质量判断；未提供的前置评分不会自动读取</span>
           </div>
-          <textarea class="plan-input ann-background-textarea" id="ann-background" rows="5"
-            placeholder="例如：这是一份 MLBB 玩家对新英雄技能满意度的调研，主要了解玩家对新英雄操作手感、强度感知和对局体验的看法。可以补充样本来源、活动背景、预期回答风格等。"></textarea>
+          <textarea class="plan-input ann-background-textarea" id="ann-background" rows="5" aria-describedby="ann-background-hint"
+            placeholder="可补充调研目的、样本来源、已知前置评分和跳题条件。例如：某题仅向低评分玩家展示，用于追问不满意原因。"></textarea>
         </div>
 
         <!-- 列确认 -->
@@ -1403,7 +1402,7 @@
         </div>
         <div class="panel__header">
           <h1 class="panel__title">回答质量打标中…</h1>
-          <p class="panel__desc" data-uitext="ann_panel_quality_desc">正在分批标注每道主观题的回答质量，请耐心等待</p>
+          <p class="panel__desc" data-uitext="ann_panel_quality_desc">正在结合题意标注逐题质量，并根据每位玩家的完整作答独立判断整体质量，请耐心等待</p>
         </div>
         <div class="ann-progress-block" id="ann-quality-progress">
           <div class="ann-progress-bar-wrap">
@@ -1412,6 +1411,7 @@
           <div class="ann-progress-msg" id="ann-quality-progress-msg">准备中…</div>
         </div>
         <div class="ann-warn-log" id="ann-quality-warn-log"></div>
+        <button class="btn btn--ghost" id="ann-btn-quality-preview" type="button" hidden>查看已返回结果与待补齐项</button>
       </section>
 
       <!-- ANN STEP 6: 结果预览 + 下载 -->
@@ -1432,7 +1432,7 @@
         </div>
         <div class="panel__header">
           <h1 class="panel__title">标注结果预览</h1>
-          <p class="panel__desc" data-uitext="ann_panel_done_desc">查看完整标注、判断依据与回答原文，确认后下载结果</p>
+          <p class="panel__desc" data-uitext="ann_panel_done_desc">查看逐题标签、整体判断及回答原文；新版整体质量独立判断，人工修改逐题标签后保留原整体判断</p>
         </div>
         <div class="ann-done-block">
           <div class="ann-result-summary">
@@ -1445,6 +1445,8 @@
             <div class="ann-done-text" id="ann-done-text">标注完成</div>
           </div>
           <div class="ann-review-block" id="ann-quality-preview-block" hidden>
+            <div id="ann-quality-review-enhanced" class="ann-review-v2" aria-label="逐题质量复核"></div>
+            <div id="ann-quality-review-legacy">
             <div class="ann-quality-review-header">
               <div class="ann-quality-filter-toolbar">
                 <label>
@@ -1454,6 +1456,7 @@
                     <option value="无效反馈">无效反馈</option>
                     <option value="有效反馈">有效反馈</option>
                     <option value="优秀反馈">优秀反馈</option>
+                    <option value="待补">整体待补</option>
                   </select>
                 </label>
                 <label>
@@ -1464,6 +1467,7 @@
                     <option value="有效反馈">含有效反馈</option>
                     <option value="优秀反馈">含优秀反馈</option>
                     <option value="N/A">含 N/A</option>
+                    <option value="待补">含待补判断</option>
                   </select>
                 </label>
                 <label>
@@ -1491,10 +1495,12 @@
               </aside>
               <section class="ann-ai-profile-pane ann-quality-profile-pane" id="ann-quality-profile-pane" aria-label="玩家质量档案"></section>
             </div>
+            </div>
           </div>
           <div class="ann-result-actions">
             <button class="btn btn--ghost" id="ann-btn-restart">重新标注</button>
             <div class="ann-result-actions__primary">
+              <button class="btn btn--ghost" id="ann-btn-quality-complete" hidden style="display:none">补齐未完成结果</button>
               <button class="btn btn--primary" id="ann-btn-download">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                   <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
@@ -2034,12 +2040,13 @@
   <script src="/static/js/features/report.js?v=51"></script>
   <script src="/static/js/features/profile.js?v=2"></script>
   <script src="/static/js/features/settings.js?v=37"></script>
-  <script src="/static/js/features/history.js?v=37"></script>
+  <script src="/static/js/features/history.js?v=38"></script>
   <script src="/static/js/features/interview.js?v=10"></script>
   <script src="/static/js/features/interview-v2.js?v=7"></script>
   <script src="/static/js/features/nav.js?v=38"></script>
   <script src="/static/js/features/comment.js?v=29"></script>
-<script src="/static/js/features/annotate.js?v=40"></script>
+<script src="/static/js/features/annotate.js?v=43"></script>
+<script src="/static/js/features/annotate_review.js?v=2"></script>
 </body>
 
 </html>

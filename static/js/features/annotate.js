@@ -30,8 +30,11 @@ const annState = {
   qualityQuestionIndex: 0,
   qualityReviewLayout: 'split',
   qualityReviewSaving: false,
+  qualityReviewRunning: false,
+  reviewFilename: '',
   missingAiIds: [],
   missingQualityIds: [],
+  missingOverallIds: [],
   missingTranslationIds: [],
 };
 
@@ -82,6 +85,8 @@ async function annHandleUpload(file) {
     if (!resp.ok) throw new Error(data.detail || '上传失败');
 
     annState.sessionId = data.session_id;
+    window.AnnotateReview?.reset();
+    annState.reviewFilename = data.filename || file.name;
     annState.headers = data.headers;
     annState.headersZh = data.headers_zh || data.headers;
     annState.idCol = data.id_col;
@@ -226,7 +231,7 @@ function annSyncTaskCards() {
   $(id).addEventListener('change', () => {
     annState.tasks.ai_detect = $('task-ai-detect').checked;
     annState.tasks.quality = $('task-quality').checked;
-    $('ann-background-block').style.display = annState.tasks.ai_detect ? '' : 'none';
+    $('ann-background-block').style.display = (annState.tasks.ai_detect || annState.tasks.quality) ? '' : 'none';
     annSyncTaskCards();
     annUpdateStartBtn();
   });
@@ -280,6 +285,9 @@ async function annStartAnnotation() {
     annState.qualityResults = [];
     annState.qualityCount = 0;
     annState.qualityDurationSeconds = null;
+    annState.missingQualityIds = [];
+    annState.missingOverallIds = [];
+    annState.missingTranslationIds = [];
 
     if (annState.tasks.ai_detect) {
       annGoStep(3);
@@ -657,7 +665,13 @@ async function annAfterAiConfirm() {
 
 // ── ANN STEP 5: 质量打标 ───────────────────────────────────
 
-async function annRunQuality() {
+async function annRunQuality(options = {}) {
+  if (annState.qualityReviewRunning || annState.qualityReviewSaving) return;
+  const runSessionId = annState.sessionId;
+  const preserveReview = options.preserveReview === true;
+  let completed = false;
+  annState.qualityReviewRunning = true;
+  window.AnnotateReview?.render();
   const bar = $('ann-quality-progress-bar');
   const msg = $('ann-quality-progress-msg');
   const warnLog = $('ann-quality-warn-log');
@@ -686,7 +700,8 @@ async function annRunQuality() {
   warnLog.innerHTML = '';
 
   try {
-    await consumeSSE(`/api/annotate/${annState.sessionId}/run-quality`, ev => {
+    await consumeSSE(`/api/annotate/${encodeURIComponent(runSessionId)}/run-quality`, ev => {
+      if (annState.sessionId !== runSessionId) return;
       if (ev.type === 'progress') {
         const pct = ev.total > 0 ? Math.round((ev.done / ev.total) * 100) : 0;
         bar.style.width = `${pct}%`;
@@ -699,54 +714,73 @@ async function annRunQuality() {
         warnLog.appendChild(div);
       }
       if (ev.type === 'quality_done') {
+        completed = true;
         bar.style.width = '100%';
         const missingQIds = ev.missing_ids || [];
+        const missingOverallIds = ev.missing_overall_ids || [];
         const missingTranslationIds = ev.missing_translation_ids || [];
-        annState.qualityCount = ev.count;
+        annState.qualityCount = ev.complete_count ?? ev.count ?? 0;
         annState.qualityResults = ev.results || [];
         annState.qualityDurationSeconds = ev.quality_duration_seconds ?? null;
-        annState.qualityReviewPlayerId = null;
-        annState.qualityQuestionIndex = 0;
-        annState.qualityReviewLayout = 'split';
+        if (!preserveReview) {
+          annState.qualityReviewPlayerId = null;
+          annState.qualityQuestionIndex = 0;
+          annState.qualityReviewLayout = 'split';
+        }
         annState.qualityReviewSaving = false;
         annState.missingQualityIds = missingQIds;
+        annState.missingOverallIds = missingOverallIds;
         annState.missingTranslationIds = missingTranslationIds;
-        if (missingQIds.length > 0) {
-          msg.textContent = `质量打标完成，共 ${ev.count} 条结果（${missingQIds.length} 行重试后仍未回填）`;
+        window.AnnotateReview?.ingest(ev);
+        $('ann-btn-quality-preview').hidden = false;
+        if (missingQIds.length > 0 || missingOverallIds.length > 0) {
+          msg.textContent = `已有 ${annState.qualityCount} 行质量判断完整；逐题判断待补 ${missingQIds.length} 行，整体判断待补 ${missingOverallIds.length} 行`;
         } else if (missingTranslationIds.length > 0) {
-          msg.textContent = `质量打标完成，共 ${ev.count} 条结果；${missingTranslationIds.length} 行中文翻译仍待补齐`;
+          msg.textContent = `质量判断完成，共 ${annState.qualityCount} 条结果；${missingTranslationIds.length} 行中文翻译仍待补齐`;
         } else {
-          msg.textContent = `质量打标完成，共 ${ev.count} 条结果`;
+          msg.textContent = `质量打标完成，共 ${annState.qualityCount} 条结果`;
         }
       }
     });
-    if (annState.missingQualityIds.length > 0 || annState.missingTranslationIds.length > 0) {
+    if (annState.sessionId !== runSessionId) return;
+    if (!completed) throw new Error('连接已结束，尚未收到完整结果；已有结果会保留');
+    if (annState.missingQualityIds.length > 0 || annState.missingOverallIds.length > 0 || annState.missingTranslationIds.length > 0) {
       const missingQualityCount = annState.missingQualityIds.length;
+      const missingOverallCount = annState.missingOverallIds.length;
+      const incompleteQualityCount = new Set([...annState.missingQualityIds, ...annState.missingOverallIds].map(String)).size;
       const missingTranslationCount = annState.missingTranslationIds.length;
-      const retainedSummary = `已完成 ${annState.qualityCount} 行质量打标，结果会保留。`;
-      if (missingQualityCount > 0 && missingTranslationCount > 0) {
+      const retainedSummary = `已有 ${annState.qualityCount} 行质量判断完整，已成功的逐题和整体判断均会保留。`;
+      const retryScope = `逐题判断待补 ${missingQualityCount} 行，整体判断待补 ${missingOverallCount} 行。仅处理未完成行，结合该玩家完整作答补齐缺失判断。`;
+      if (incompleteQualityCount > 0 && missingTranslationCount > 0) {
         retryBtn.textContent = '重试失败行并补译';
-        retryHint.textContent = `质量打标失败 ${missingQualityCount} 行，中文翻译待补 ${missingTranslationCount} 行。${retainedSummary}仅重新判断失败行的主观题，并补齐缺失译文。`;
-      } else if (missingQualityCount > 0) {
-        retryBtn.textContent = `重试失败的 ${missingQualityCount} 行`;
-        retryHint.textContent = `${retainedSummary}仅重新判断失败行的主观题。`;
+        retryHint.textContent = `${retainedSummary}${retryScope}中文翻译待补 ${missingTranslationCount} 行。`;
+      } else if (incompleteQualityCount > 0) {
+        retryBtn.textContent = `补齐未完成的 ${incompleteQualityCount} 行`;
+        retryHint.textContent = `${retainedSummary}${retryScope}`;
       } else {
         retryBtn.textContent = `补齐 ${missingTranslationCount} 行中文翻译`;
         retryHint.textContent = '质量打标已完成，本次仅补齐缺失译文，保留已有质量结果。';
       }
       retryActions.style.display = '';
+      $('ann-btn-quality-preview').hidden = annState.qualityResults.length === 0;
       showToast(
-        annState.missingQualityIds.length > 0
+        incompleteQualityCount > 0
           ? '质量打标结果不完整，已停留在当前步骤'
           : '中文翻译仍不完整，请重试补齐后再下载',
         'error',
       );
       return;
     }
-    annGoStep(6);
+    if (!preserveReview) annGoStep(6);
     annShowDone();
   } catch (e) {
-    showToast(`质量打标失败：${e.message}`, 'error');
+    if (annState.sessionId === runSessionId) showToast(`质量打标失败：${e.message}`, 'error');
+  } finally {
+    if (annState.sessionId === runSessionId) {
+      annState.qualityReviewRunning = false;
+      if (preserveReview) annShowDone({ quiet: true });
+      window.AnnotateReview?.render();
+    }
   }
 }
 
@@ -757,7 +791,7 @@ function annBuildDoneSummary() {
     ? annState.aiResults.length
     : annState.qualityCount;
   const lines = [
-    `<div class="ann-summary-title">完成共 ${totalCount} 条反馈的标注</div>`,
+    `<div class="ann-summary-title">${annHasIncompleteResults() ? '当前标注结果' : `完成共 ${totalCount} 条反馈的标注`}</div>`,
   ];
   if (annState.tasks.ai_detect) {
     lines.push(
@@ -765,13 +799,13 @@ function annBuildDoneSummary() {
     );
   }
   if (annState.tasks.quality) {
-    const counts = { '优秀反馈': 0, '有效反馈': 0, '无效反馈': 0 };
+    const counts = { '优秀反馈': 0, '有效反馈': 0, '无效反馈': 0, '待补': 0 };
     annState.qualityResults.forEach(result => {
-      const overall = annCanonicalQualityLabel(result.overall, true);
+      const overall = annQualityOverallLabel(result);
       if (Object.hasOwn(counts, overall)) counts[overall] += 1;
     });
     lines.push(
-      `<div class="ann-summary-line">质量打标结果：优秀反馈 ${counts['优秀反馈']} 条，有效反馈 ${counts['有效反馈']} 条，无效反馈 ${counts['无效反馈']} 条</div>`
+      `<div class="ann-summary-line">整体质量：优秀反馈 ${counts['优秀反馈']} 条，有效反馈 ${counts['有效反馈']} 条，无效反馈 ${counts['无效反馈']} 条${counts['待补'] ? `，待补 ${counts['待补']} 条` : ''}</div>`
     );
     const duration = formatReportDuration(annState.qualityDurationSeconds);
     if (duration) {
@@ -781,27 +815,38 @@ function annBuildDoneSummary() {
   return lines.join('');
 }
 
-function annShowDone() {
+function annHasIncompleteResults() {
+  return [annState.missingAiIds, annState.missingQualityIds, annState.missingOverallIds, annState.missingTranslationIds]
+    .some(ids => (ids || []).length > 0);
+}
+
+function annShowDone(options = {}) {
+  const notify = !options.quiet;
   const summary = annBuildDoneSummary();
   const missingAi = annState.missingAiIds || [];
   const missingQ = annState.missingQualityIds || [];
+  const missingOverall = annState.missingOverallIds || [];
   const missingTranslations = annState.missingTranslationIds || [];
   const missingParts = [];
   if (missingAi.length) missingParts.push(`AI 检测漏返 ${missingAi.length} 行`);
-  if (missingQ.length) missingParts.push(`质量打标漏返 ${missingQ.length} 行`);
+  if (missingQ.length) missingParts.push(`逐题判断待补 ${missingQ.length} 行`);
+  if (missingOverall.length) missingParts.push(`整体判断待补 ${missingOverall.length} 行`);
   if (missingTranslations.length) missingParts.push(`中文翻译缺失 ${missingTranslations.length} 行`);
   if (missingParts.length) {
     $('ann-done-text').innerHTML =
       summary +
       `<div class="ann-summary-error">结果不完整：${missingParts.join('；')}，下载已被阻断。请返回对应任务重试。</div>`;
     $('ann-btn-download').disabled = true;
-    showToast('部分行未能回填，下载已被阻断', 'error');
+    if (notify) showToast('可预览已返回结果，补齐后才能下载', 'error');
   } else {
     $('ann-done-text').innerHTML = summary;
     $('ann-btn-download').disabled = false;
-    annRenderQualityPreview();
-    showToast('标注完成，请预览结果后下载', 'success');
+    if (notify) showToast('标注完成，请预览结果后下载', 'success');
   }
+  const canCompleteQuality = annState.tasks.quality && (missingQ.length || missingOverall.length || missingTranslations.length);
+  $('ann-btn-quality-complete').hidden = !canCompleteQuality;
+  $('ann-btn-quality-complete').style.display = canCompleteQuality ? '' : 'none';
+  annRenderQualityPreview();
 }
 
 const ANN_EDITABLE_QUALITY_LABELS = ['无效反馈', '有效反馈', '优秀反馈'];
@@ -817,9 +862,32 @@ function annCanonicalQualityLabel(label, overall = false) {
   return normalized;
 }
 
+function annUsesHolisticQuality(result) {
+  return Number(result?.quality_policy_version || 0) >= 5
+    || ['model_holistic', 'empty_no_answers'].includes(result?.overall_source);
+}
+
+function annQualityOverallLabel(result) {
+  const holistic = annUsesHolisticQuality(result);
+  const label = annCanonicalQualityLabel(result?.overall, !holistic);
+  if (result?.overall_pending || !ANN_EDITABLE_QUALITY_LABELS.includes(label)) return '待补';
+  return label;
+}
+
+function annQualityOverallSourceText(result) {
+  if (!annUsesHolisticQuality(result)) return '旧规则：整体按逐题标签折算，保留原有判断口径';
+  if (result.overall_source === 'empty_no_answers') return '全部主观题未作答：没有可供整体判断的回答';
+  return '整体独立判断，不随逐题标签自动折算';
+}
+
+function annQualityOverallReason(result) {
+  if (annQualityOverallLabel(result) === '待补') return '整体判断尚未完整返回，请补齐后查看';
+  return result?.overall_reason || '暂无整体判断依据';
+}
+
 function annQualityQuestionLabel(result, key) {
   if (annIsEffectivelyEmptyAnswer((result?.originals || {})[key])) return 'N/A';
-  return annCanonicalQualityLabel((result?.q_labels || {})[key]) || '无效反馈';
+  return annCanonicalQualityLabel((result?.q_labels || {})[key]) || '待补';
 }
 
 function annQualityLabelClass(label) {
@@ -828,7 +896,8 @@ function annQualityLabelClass(label) {
     '有效反馈': 'ann-quality-badge--valid',
     '优秀反馈': 'ann-quality-badge--excellent',
     'N/A': 'ann-quality-badge--na',
-  }[label] || 'ann-quality-badge--invalid';
+    '待补': 'ann-quality-badge--na',
+  }[label] || 'ann-quality-badge--na';
 }
 
 function annQualityHumanReviews(result) {
@@ -840,7 +909,7 @@ function annQualityBaseline(result, key, emptyAnswer = false) {
   return {
     label: emptyAnswer
       ? 'N/A'
-      : annCanonicalQualityLabel(baseline.label || (result?.q_labels || {})[key]) || '无效反馈',
+      : annCanonicalQualityLabel(baseline.label || (result?.q_labels || {})[key]) || '待补',
     reason: baseline.reason || (result?.q_reasons || {})[key] || '',
   };
 }
@@ -865,7 +934,7 @@ function annFilteredQualityResults() {
   const questionFilter = $('ann-quality-question-filter').value;
   const adjustmentFilter = $('ann-quality-adjustment-filter').value;
   return annState.qualityResults.filter(result => (
-    (overallFilter === 'all' || annCanonicalQualityLabel(result.overall, true) === overallFilter)
+    (overallFilter === 'all' || annQualityOverallLabel(result) === overallFilter)
     && annQualityMatchesQuestionFilters(result, questionFilter, adjustmentFilter)
   ));
 }
@@ -893,17 +962,19 @@ function annPreferredQualityQuestionIndex(result) {
 }
 
 function annRenderQualitySummary() {
-  const counts = { '无效反馈': 0, '有效反馈': 0, '优秀反馈': 0 };
+  const counts = { '无效反馈': 0, '有效反馈': 0, '优秀反馈': 0, '待补': 0 };
   annState.qualityResults.forEach(result => {
-    const overall = annCanonicalQualityLabel(result.overall, true);
+    const overall = annQualityOverallLabel(result);
     if (Object.hasOwn(counts, overall)) counts[overall] += 1;
   });
-  $('ann-quality-summary-grid').innerHTML = [
+  const items = [
     ['全部玩家', annState.qualityResults.length],
     ['无效反馈', counts['无效反馈']],
     ['有效反馈', counts['有效反馈']],
     ['优秀反馈', counts['优秀反馈']],
-  ].map(([label, count]) => `
+  ];
+  if (counts['待补']) items.push(['整体待补', counts['待补']]);
+  $('ann-quality-summary-grid').innerHTML = items.map(([label, count]) => `
     <div class="ann-quality-summary-item">
       <span>${label}</span><strong>${count} 位</strong>
     </div>`).join('');
@@ -929,13 +1000,13 @@ function annRenderQualityPlayerList(results) {
   list.innerHTML = results.map(result => {
     const adjustedCount = Object.keys(annQualityHumanReviews(result)).length;
     const active = String(result.id) === String(annState.qualityReviewPlayerId);
-    const overall = annCanonicalQualityLabel(result.overall, true) || '无效反馈';
+    const overall = annQualityOverallLabel(result);
     return `<button class="ann-ai-candidate-card ann-quality-player-card${active ? ' ann-ai-candidate-card--active' : ''}"
       type="button" data-ann-quality-player-id="${esc(result.id)}">
       <span class="ann-ai-candidate-id">${esc(result.id)}</span>
       <span class="ann-quality-badge ${annQualityLabelClass(overall)}">${esc(overall)}</span>
       <span class="ann-ai-candidate-reason">${esc(
-        adjustedCount ? `已人工调整 ${adjustedCount} 道题` : (result.overall_reason || '暂无整体判断依据')
+        adjustedCount ? `已人工调整 ${adjustedCount} 道题` : annQualityOverallReason(result)
       )}</span>
       <em class="ann-quality-review-status${adjustedCount ? ' ann-quality-review-status--adjusted' : ''}">
         ${adjustedCount ? '已人工复核' : '尚未修改'}
@@ -965,7 +1036,9 @@ function annRenderQualityProfile(results) {
   const baseline = annQualityBaseline(result, key, emptyAnswer);
   const review = annQualityHumanReviews(result)[key];
   const adjustedCount = Object.keys(annQualityHumanReviews(result)).length;
-  const disabled = emptyAnswer || annState.qualityReviewSaving;
+  const incomplete = annHasIncompleteResults();
+  const disabled = emptyAnswer || incomplete || annState.qualityReviewSaving;
+  const overall = annQualityOverallLabel(result);
   const questionDots = annState.openTextCols.map((questionCol, index) => {
     const questionKey = `col_${questionCol}`;
     const questionLabel = annQualityQuestionLabel(result, questionKey);
@@ -987,8 +1060,10 @@ function annRenderQualityProfile(results) {
       </div>
       <div class="ann-quality-overall-card">
         <span>当前整体质量</span>
-        <strong class="ann-quality-badge ${annQualityLabelClass(annCanonicalQualityLabel(result.overall, true))}">${esc(annCanonicalQualityLabel(result.overall, true) || '无效反馈')}</strong>
-        <p>${esc(result.overall_reason || '')}</p>
+        <strong class="ann-quality-badge ${annQualityLabelClass(overall)}">${esc(overall)}</strong>
+        <p>${esc(annQualityOverallReason(result))}</p>
+        <p>${esc(annQualityOverallSourceText(result))}</p>
+        ${annUsesHolisticQuality(result) && adjustedCount ? `<p>${esc(result.overall_review_note || `已人工调整 ${adjustedCount} 道题；整体保留原判断，未重新评估`)}</p>` : ''}
       </div>
     </div>
     <div class="ann-ai-player-nav">
@@ -1013,7 +1088,7 @@ function annRenderQualityProfile(results) {
         <div class="ann-quality-evidence-card">
           <span>AI 原始标签与判断依据</span>
           <strong class="ann-quality-badge ${annQualityLabelClass(baseline.label)}">${esc(baseline.label)}</strong>
-          <p>${esc(baseline.reason || '未提供判断依据')}</p>
+          <p>${esc(baseline.reason || (baseline.label === '待补' ? '逐题判断尚未完整返回' : '未提供判断依据'))}</p>
         </div>
         <div class="ann-quality-evidence-card">
           <span>原文证据</span>
@@ -1028,11 +1103,13 @@ function annRenderQualityProfile(results) {
         <div class="ann-quality-save-state" aria-live="polite">
           ${annState.qualityReviewSaving
             ? '正在保存人工调整…'
-            : review
-              ? `人工调整记录：${esc(annCanonicalQualityLabel(review.from_label))} → ${esc(annCanonicalQualityLabel(review.to_label))}；下载时以当前标签为准`
-              : emptyAnswer
-                ? '当前标签固定为 N/A；不参与整体质量计算'
-                : '尚未修改，当前采用 AI 原始标签'}
+            : incomplete
+              ? '结果尚未完整，请先补齐逐题判断、整体判断和译文后再人工调整'
+              : review
+                ? `人工调整记录：${esc(annCanonicalQualityLabel(review.from_label))} → ${esc(annCanonicalQualityLabel(review.to_label))}；下载时以当前标签为准`
+                : emptyAnswer
+                  ? '当前题未作答，标签固定为 N/A'
+                  : '尚未修改，当前采用 AI 原始标签'}
         </div>
       </div>
     </div>`;
@@ -1051,6 +1128,7 @@ function annSetQualityReviewLayout(layout) {
 }
 
 function annRenderQualityPreview() {
+  if (window.AnnotateReview?.render()) return;
   const block = $('ann-quality-preview-block');
   if (!annState.tasks.quality || annState.qualityResults.length === 0) {
     block.hidden = true;
@@ -1075,7 +1153,7 @@ function annGoToQualityPlayer(playerId) {
 }
 
 async function annApplyQualityLabel(label) {
-  if (annState.qualityReviewSaving) return;
+  if (annState.qualityReviewSaving || annHasIncompleteResults()) return;
   const results = annFilteredQualityResults();
   const result = annCurrentQualityResult(results);
   const col = annState.openTextCols[annState.qualityQuestionIndex];
@@ -1100,9 +1178,12 @@ async function annApplyQualityLabel(label) {
     const index = annState.qualityResults.findIndex(item => String(item.id) === String(result.id));
     if (index >= 0 && data.result) annState.qualityResults[index] = data.result;
     annState.qualityReviewSaving = false;
-    $('ann-done-text').innerHTML = annBuildDoneSummary();
-    annRenderQualityPreview();
-    showToast(data.changed ? '人工标签已保存，整体质量已重新计算' : '当前标签无需修改', 'success');
+    annShowDone({ quiet: true });
+    const savedResult = data.result || result;
+    const savedMessage = annUsesHolisticQuality(savedResult)
+      ? '人工标签已保存，整体保留原判断，未重新评估'
+      : '人工标签已保存，整体质量已按旧规则重新计算';
+    showToast(data.changed ? savedMessage : '当前标签无需修改', 'success');
   } catch (e) {
     annState.qualityReviewSaving = false;
     annRenderQualityPreview();
@@ -1156,12 +1237,29 @@ for (const filterId of [
 $('ann-quality-layout-split').addEventListener('click', () => annSetQualityReviewLayout('split'));
 $('ann-quality-layout-focus').addEventListener('click', () => annSetQualityReviewLayout('focus'));
 
+$('ann-btn-quality-complete').addEventListener('click', () => {
+  if (annState.qualityReviewRunning || annState.qualityReviewSaving || window.AnnotateReview?.busy()) return;
+  annGoStep(5);
+  annRunQuality();
+});
+
 $('ann-btn-download').addEventListener('click', () => {
+  if (window.AnnotateReview?.download()) return;
   window.location.href = `/api/annotate/${annState.sessionId}/download`;
 });
 
+$('ann-btn-quality-preview').addEventListener('click', () => {
+  annGoStep(6);
+  annShowDone();
+});
+
 $('ann-btn-restart').addEventListener('click', () => {
+  if (annState.qualityReviewRunning || annState.qualityReviewSaving || window.AnnotateReview?.busy()) {
+    showToast('请等待当前保存或补齐完成后再开始新标注', 'info');
+    return;
+  }
   if (!confirm('确定要重新标注吗？当前标注数据将被清除。')) return;
+  window.AnnotateReview?.reset();
   annState.sessionId = null;
   annState.currentStep = 1;
   annState.headers = [];
@@ -1186,8 +1284,11 @@ $('ann-btn-restart').addEventListener('click', () => {
   annState.qualityReviewSaving = false;
   annState.missingAiIds = [];
   annState.missingQualityIds = [];
+  annState.missingOverallIds = [];
   annState.missingTranslationIds = [];
   $('ann-btn-download').disabled = true;
+  $('ann-btn-quality-complete').hidden = true;
+  $('ann-btn-quality-complete').style.display = 'none';
   $('task-ai-detect').checked = false;
   $('task-quality').checked = false;
   $('ann-quality-overall-filter').value = 'all';

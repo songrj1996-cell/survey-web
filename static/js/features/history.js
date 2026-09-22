@@ -310,7 +310,7 @@ $('history-body').addEventListener('click', async e => {
   const card = e.target.closest('[data-hist-id]');
   if (!card) return;
   if (card.dataset.histMode === 'annotate') {
-    showToast('数据标注记录没有预览，请点击下载按钮获取 Excel', 'info');
+    showToast('数据标注历史暂不支持恢复完整复核状态，请点击下载按钮获取 Excel', 'info');
     return;
   }
   const id = card.dataset.histId;

@@ -6832,6 +6832,111 @@ body {
   margin-bottom: 12px;
 }
 
+/* Per-question confidence and human review. All styles stay inside the annotate surface. */
+.ann-review-v2 { width: 100%; min-width: 0; color: var(--text); font-size: 13px; }
+.ann-review-v2 [hidden] { display: none !important; }
+.ann-review-v2 h2 { font-size: 20px; }
+.ann-review-v2 h3 { font-size: 15px; }
+.ann-review-v2 h4 { font-size: 13px; }
+.ann-review-v2 p { overflow-wrap: anywhere; }
+.ann-review-v2 button:focus-visible,
+.ann-review-v2 select:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.ann-review-v2 button:disabled { opacity: .5; cursor: not-allowed; }
+.ann-review-v2 .ar-muted,
+.ann-review-v2 .ar-footnote { color: var(--text-2); font-size: 12px; }
+.ann-review-v2 .ar-heading,
+.ann-review-v2 .ar-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.ann-review-v2 .ar-heading,
+.ann-review-v2 .ar-between { justify-content: space-between; }
+.ann-review-v2 .ar-heading { gap: 12px; margin-bottom: 14px; }
+.ann-review-v2 .ar-tabs { display: flex; flex-wrap: wrap; gap: 18px; border-bottom: 1px solid var(--border); margin-bottom: 16px; }
+.ann-review-v2 .ar-tabs button { padding: 7px 0 10px; color: var(--text-2); border: 0; border-bottom: 2px solid transparent; background: none; font: inherit; cursor: pointer; }
+.ann-review-v2 .ar-tabs button[aria-pressed="true"] { color: var(--accent); border-bottom-color: var(--accent); }
+.ann-review-v2 .ar-summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-bottom: 15px; }
+.ann-review-v2 .ar-summary > div { padding: 13px 15px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); min-width: 0; }
+.ann-review-v2 .ar-summary span,
+.ann-review-v2 .ar-summary small { display: block; color: var(--text-2); font-size: 12px; }
+.ann-review-v2 .ar-summary strong { display: block; font-size: 23px; font-weight: 600; margin: 3px 0; font-variant-numeric: tabular-nums; }
+.ann-review-v2 .ar-toolbar { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+.ann-review-v2 .ar-status-tabs { display: flex; flex-wrap: wrap; gap: 3px; padding: 4px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); }
+.ann-review-v2 .ar-status-tabs button { padding: 7px 9px; border: 0; border-radius: 5px; background: transparent; color: var(--text-2); font: inherit; font-size: 12px; cursor: pointer; }
+.ann-review-v2 .ar-status-tabs button[aria-pressed="true"] { background: var(--accent-soft); color: var(--accent); }
+.ann-review-v2 .ar-filters { display: flex; flex-wrap: wrap; gap: 8px; }
+.ann-review-v2 .ar-filters label { display: grid; gap: 4px; color: var(--text-2); font-size: 12px; }
+.ann-review-v2 .ar-filters .type-select { min-width: 105px; max-width: 100%; }
+.ann-review-v2 .ar-workspace { display: grid; grid-template-columns: 240px minmax(0, 1fr); gap: 16px; align-items: start; }
+.ann-review-v2 .ar-queue-pane { min-width: 0; }
+.ann-review-v2 #ar-list-caption { margin: 0 0 8px; }
+.ann-review-v2 #ar-list { display: grid; gap: 8px; }
+.ann-review-v2 .ar-candidate { display: grid; gap: 8px; text-align: left; width: 100%; min-width: 0; padding: 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); color: var(--text); font: inherit; cursor: pointer; }
+.ann-review-v2 .ar-candidate[aria-pressed="true"] { background: var(--accent-soft); border-color: var(--accent); box-shadow: inset 3px 0 var(--accent); }
+.ann-review-v2 .ar-candidate-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; color: var(--text-2); font-size: 12px; }
+.ann-review-v2 .ar-candidate strong { overflow-wrap: anywhere; }
+.ann-review-v2 .ar-badge { display: inline-flex; padding: 2px 7px; border-radius: 5px; background: var(--surface-2); color: var(--text-2); font-size: 12px; overflow-wrap: anywhere; }
+.ann-review-v2 .ar-badge--warning { background: color-mix(in srgb, var(--amber) 12%, var(--surface)); color: color-mix(in srgb, var(--amber) 55%, var(--text)); }
+.ann-review-v2 .ar-detail { min-width: 0; padding: 19px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); }
+.ann-review-v2 .ar-question { margin-top: 16px; padding-bottom: 16px; border-bottom: 1px solid var(--border); }
+.ann-review-v2 .ar-question h3 { margin-top: 5px; overflow-wrap: anywhere; }
+.ann-review-v2 .ar-question p { margin-top: 5px; }
+.ann-review-v2 .ar-reason { padding: 12px 14px; margin: 14px 0; border-radius: var(--radius-sm); background: var(--surface-2); }
+.ann-review-v2 .ar-reason--priority { background: color-mix(in srgb, var(--amber) 10%, var(--surface)); }
+.ann-review-v2 .ar-reason p { margin: 6px 0; white-space: pre-wrap; }
+.ann-review-v2 .ar-answers,
+.ann-review-v2 .ar-evidence { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 13px; }
+.ann-review-v2 .ar-answers p { margin-top: 7px; padding: 10px 12px; border-left: 3px solid var(--border); background: var(--surface-2); white-space: pre-wrap; }
+.ann-review-v2 .ar-evidence { margin-top: 16px; border-top: 1px solid var(--border); padding-top: 14px; }
+.ann-review-v2 .ar-evidence p { margin-top: 7px; white-space: pre-wrap; }
+.ann-review-v2 .ar-overall { margin-top: 15px; color: var(--text-2); }
+.ann-review-v2 .ar-overall summary,
+.ann-review-v2 .ar-events summary { cursor: pointer; font-size: 12px; }
+.ann-review-v2 .ar-overall p { margin-top: 7px; white-space: pre-wrap; }
+.ann-review-v2 .ar-edit { margin-top: 17px; padding-top: 15px; border-top: 1px solid var(--border); }
+.ann-review-v2 .ar-labels { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
+.ann-review-v2 .ar-labels button { padding: 8px 12px; border: 1px solid var(--border); background: var(--surface); color: var(--text); border-radius: 7px; font: inherit; cursor: pointer; }
+.ann-review-v2 .ar-labels button[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.ann-review-v2 .ar-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 12px 0 9px; }
+.ann-review-v2 .ar-actions .btn { padding: 8px 11px; }
+.ann-review-v2 .ar-next { margin-left: auto; }
+.ann-review-v2 .ar-events { margin-top: 14px; color: var(--text-2); }
+.ann-review-v2 .ar-events p { margin-top: 5px; }
+.ann-review-v2 .ar-pagination { display: flex; justify-content: space-between; align-items: center; gap: 7px; margin-top: 12px; font-size: 12px; }
+.ann-review-v2 .ar-pagination .btn { padding: 7px 8px; }
+.ann-review-v2 .ar-empty { padding: 32px 13px; text-align: center; color: var(--text-2); }
+.ann-review-v2 .ar-footnote { margin: 13px 0; }
+.ann-review-v2 .ar-notice { padding: 12px 14px; margin: 12px 0; background: var(--surface-2); border-radius: var(--radius-sm); overflow-wrap: anywhere; }
+.ann-review-v2 .ar-notice p { margin-top: 5px; }
+.ann-review-v2 .ar-message { min-height: 20px; color: color-mix(in srgb, var(--green) 60%, var(--text)); margin-top: 12px; }
+.ann-review-v2 .ar-message--error { color: var(--red); }
+.ann-review-v2 .ar-table-wrap { max-width: 100%; overflow-x: auto; margin-top: 12px; }
+.ann-review-v2 table { border-collapse: collapse; width: 100%; min-width: 540px; font-size: 12px; text-align: left; }
+.ann-review-v2 th,
+.ann-review-v2 td { padding: 9px; border-bottom: 1px solid var(--border); vertical-align: top; }
+.ann-review-v2 th { color: var(--text-2); }
+.ann-review-v2 .ar-stats-list { display: grid; gap: 9px; margin-top: 18px; }
+@media (max-width: 950px) {
+  .ann-review-v2 .ar-workspace { grid-template-columns: 205px minmax(0, 1fr); gap: 12px; }
+  .ann-review-v2 .ar-detail { padding: 15px; }
+  .ann-review-v2 .ar-answers,
+  .ann-review-v2 .ar-evidence { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 680px) {
+  .ann-review-v2 .ar-workspace { grid-template-columns: minmax(0, 1fr); }
+  .ann-review-v2 #ar-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .ann-review-v2 .ar-candidate { padding: 10px; }
+  .ann-review-v2 .ar-summary { gap: 6px; }
+  .ann-review-v2 .ar-summary > div { padding: 10px; }
+  .ann-review-v2 .ar-summary strong { font-size: 19px; }
+  .ann-review-v2 .ar-summary small { display: none; }
+  .ann-review-v2 .ar-filters { width: 100%; }
+  .ann-review-v2 .ar-filters label { flex: 1 1 110px; }
+  .ann-review-v2 .ar-filters .type-select { width: 100%; font-size: 16px; }
+  .ann-review-v2 .ar-tabs { gap: 14px; }
+  .ann-review-v2 .ar-next { margin-left: 0; }
+  .ann-review-v2 .ar-status-tabs button,
+  .ann-review-v2 .ar-labels button,
+  .ann-review-v2 .ar-actions .btn { min-height: 42px; }
+}
+
 .ann-quality-filter-toolbar {
   display: flex;
   align-items: flex-end;

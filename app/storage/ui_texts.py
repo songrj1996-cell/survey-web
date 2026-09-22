@@ -58,12 +58,12 @@ DEFAULT_UI_TEXTS: dict = {
     "ann_panel_quality_desc": {
         "key": "ann_panel_quality_desc",
         "label": "数据标注·打标中说明",
-        "current": "正在分批标注每道主观题的回答质量，请耐心等待",
+        "current": "正在结合题意标注逐题质量，并根据每位玩家的完整作答独立判断整体质量，请耐心等待",
     },
     "ann_panel_done_desc": {
         "key": "ann_panel_done_desc",
         "label": "数据标注·完成说明",
-        "current": "所有标注任务已完成，可下载 Excel 文件",
+        "current": "查看逐题标签、整体判断及回答原文；新版整体质量独立判断，人工修改逐题标签后保留原整体判断",
     },
 }
 
