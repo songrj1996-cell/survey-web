@@ -426,10 +426,24 @@ def validate_annotate_retry_ids(sid: str, retry_ids: list[str] | None) -> set[st
     if retry_ids is None:
         return None
     selected = {value.strip() for value in retry_ids if value.strip()}
-    available = set(_annotate_completion(get_annotate_session(sid))["missing_ids"])
-    if not selected or not selected <= available:
-        raise HTTPException(status_code=400, detail="请选择当前仍有缺项的玩家；已完成或不存在的玩家不能重跑")
-    return selected
+    if not selected:
+        raise HTTPException(status_code=400, detail="请至少选择一位待补齐玩家")
+
+    sess = get_annotate_session(sid)
+    known_ids = {
+        _row_id(row, sess.get("id_col", 1))
+        for row in (sess.get("rows") or [])[1:]
+        if _row_id(row, sess.get("id_col", 1))
+    }
+    unknown = selected - known_ids
+    if unknown:
+        raise HTTPException(status_code=400, detail="所选玩家不属于当前任务，请刷新结果后重新选择")
+
+    available = set(_annotate_completion(sess)["missing_ids"])
+    retryable = selected & available
+    if not retryable:
+        raise HTTPException(status_code=400, detail="所选玩家当前都没有缺项，请刷新结果后重新选择")
+    return retryable
 
 
 def _build_annotate_excel_from_session(sess: dict) -> tuple[bytes, str]:
