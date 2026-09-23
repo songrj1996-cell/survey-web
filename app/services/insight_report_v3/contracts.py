@@ -7,6 +7,7 @@ import hashlib
 import json
 import re
 
+from app.core.config import INSIGHT_V3_FINDINGS_PROMPT_VERSION
 from app.services.report_engine import (
     _open_text_scopes,
     _part_filter_desc,
@@ -14,7 +15,10 @@ from app.services.report_engine import (
     _response_ref,
 )
 from app.services.report_partial_rerun import build_plan_fingerprint
-from app.services.insight_report_v3.frequency import validate_frequency
+from app.services.insight_report_v3.frequency import (
+    FREQUENCY_RULES_VERSION,
+    validate_frequency,
+)
 
 
 FINDINGS_SCHEMA_VERSION = "insight-findings-v1"
@@ -292,6 +296,8 @@ def build_stage_source_contract(
         "file_sha256": file_hash,
         "plan_fingerprint": build_plan_fingerprint(plan),
         "source_registry_fingerprint": _canonical_sha256(source_registry),
+        "frequency_rules_version": FREQUENCY_RULES_VERSION,
+        "findings_prompt_version": INSIGHT_V3_FINDINGS_PROMPT_VERSION,
     }
     return {
         "source_binding": source_binding,

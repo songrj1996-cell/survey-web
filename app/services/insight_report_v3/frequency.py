@@ -5,6 +5,9 @@ from __future__ import annotations
 from math import ceil
 
 
+FREQUENCY_RULES_VERSION = "frequency-v2-strict-monotonic"
+
+
 FREQUENCY_TIER_RULES = {
     "绝大多数": ("ratio", 0.50, 5, 0),
     "普遍": ("ratio", 0.50, 5, 0),
