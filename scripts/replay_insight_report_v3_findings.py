@@ -76,31 +76,6 @@ async def _consume_service_stream(stream, label: str) -> None:
             raise RuntimeError(f"{label}失败：{payload.get('message') or '未知错误'}")
 
 
-def _columns_for_auto_confirmation(columns: list, branch_rules: list) -> list:
-    """Resolve branch selectors the same way a human column confirmation must.
-
-    The existing planner only permits single-choice columns in part filters.
-    Detection can legitimately label a branch selector as ``profile_dim``;
-    inferred branch rules provide deterministic evidence that the column is
-    also the questionnaire's single-choice routing question.
-    """
-    parent_indexes = {
-        rule.get("parent_index")
-        for rule in branch_rules or []
-        if isinstance(rule, dict) and type(rule.get("parent_index")) is int
-    }
-    confirmed = deepcopy(columns)
-    for column in confirmed:
-        if not isinstance(column, dict):
-            continue
-        if column.get("index") not in parent_indexes:
-            continue
-        if column.get("role") != "profile_dim" or not column.get("options"):
-            continue
-        column["role"] = "single_choice"
-    return confirmed
-
-
 async def _prepare_session(xlsx_path: Path, context: dict) -> str:
     from app.schemas.requests import QualitativeContextRequest
     from app.services.survey_service import (
@@ -130,13 +105,6 @@ async def _prepare_session(xlsx_path: Path, context: dict) -> str:
     if not isinstance(columns, list) or not columns:
         raise RuntimeError("题型识别没有产生可确认列")
     set_survey_columns(session_id, columns)
-    session = get_session(session_id)
-    auto_confirmed = _columns_for_auto_confirmation(
-        columns,
-        session.get("branch_rules") or [],
-    )
-    if auto_confirmed != columns:
-        set_survey_columns(session_id, auto_confirmed)
     if context:
         save_qualitative_context(
             session_id,

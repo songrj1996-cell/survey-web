@@ -1,4 +1,6 @@
 import unittest
+from pathlib import Path
+from unittest.mock import AsyncMock, Mock, patch
 
 from app.services.insight_report_v3.contracts import (
     FORBIDDEN_MODEL_OUTPUT_FIELDS,
@@ -7,7 +9,7 @@ from app.services.insight_report_v3.contracts import (
     hydrate_findings,
     validate_findings_payload,
 )
-from scripts.replay_insight_report_v3_findings import _columns_for_auto_confirmation
+from scripts.replay_insight_report_v3_findings import _prepare_session
 
 
 def _plan():
@@ -38,20 +40,6 @@ def _open_text():
 
 
 class InsightReportV3ContractTests(unittest.TestCase):
-    def test_auto_confirmation_promotes_only_inferred_profile_branch_parent(self):
-        columns = [
-            {"index": 0, "role": "profile_dim", "options": ["A", "B"]},
-            {"index": 1, "role": "profile_dim", "options": ["X", "Y"]},
-            {"index": 2, "role": "open_text"},
-        ]
-        confirmed = _columns_for_auto_confirmation(
-            columns,
-            [{"parent_index": 1, "allowed_options": ["X"]}],
-        )
-        self.assertEqual(confirmed[0]["role"], "profile_dim")
-        self.assertEqual(confirmed[1]["role"], "single_choice")
-        self.assertEqual(columns[1]["role"], "profile_dim")
-
     def test_model_output_field_whitelists_exclude_raw_text_fields(self):
         for fields in MODEL_OUTPUT_FIELD_WHITELISTS.values():
             self.assertTrue(fields.isdisjoint(FORBIDDEN_MODEL_OUTPUT_FIELDS))
@@ -133,6 +121,74 @@ class InsightReportV3ContractTests(unittest.TestCase):
             payload, valid_short_ids={"r0001"}, respondent_total=1,
         )
         self.assertIn("不存在的短 ID", error)
+
+
+class InsightReportV3ReplayPreparationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_auto_preparation_confirms_detected_role_and_profile_fields_unchanged(self):
+        columns = [{
+            "index": 1,
+            "role": "single_choice",
+            "use_as_profile": True,
+            "profile_scope": "analysis",
+            "options": ["女性", "男性"],
+        }]
+        plan = {
+            "columns": columns,
+            "parts": [{"name": "全部", "column_indexes": [1]}],
+        }
+
+        async def empty_stream():
+            if False:
+                yield ""
+
+        set_columns = Mock()
+        with (
+            patch.object(Path, "read_bytes", return_value=b"xlsx"),
+            patch(
+                "app.services.survey_service.handle_survey_upload",
+                new=AsyncMock(return_value={"session_id": "session-1"}),
+            ),
+            patch(
+                "app.services.survey_service.columns_stream",
+                new=Mock(side_effect=lambda *_args, **_kwargs: empty_stream()),
+            ),
+            patch(
+                "app.services.survey_service.plan_stream",
+                new=Mock(side_effect=lambda *_args, **_kwargs: empty_stream()),
+            ),
+            patch(
+                "app.services.survey_service.compute_survey_stats",
+                new=AsyncMock(),
+            ),
+            patch(
+                "app.services.survey_service.set_survey_analysis_settings",
+                new=Mock(),
+            ),
+            patch(
+                "app.services.survey_service.set_survey_columns",
+                new=set_columns,
+            ),
+            patch(
+                "app.services.survey_service.save_qualitative_context",
+                new=Mock(),
+            ),
+            patch(
+                "app.services.survey_service.confirm_survey_plan",
+                new=Mock(),
+            ),
+            patch(
+                "app.storage.sessions.get_session",
+                new=Mock(side_effect=[{"columns_detected": columns}, {"plan": plan}]),
+            ),
+        ):
+            session_id = await _prepare_session(Path("input.xlsx"), {})
+
+        self.assertEqual(session_id, "session-1")
+        set_columns.assert_called_once_with("session-1", columns)
+        confirmed = set_columns.call_args.args[1][0]
+        self.assertEqual(confirmed["role"], "single_choice")
+        self.assertIs(confirmed["use_as_profile"], True)
+        self.assertEqual(confirmed["profile_scope"], "analysis")
 
 
 if __name__ == "__main__":
