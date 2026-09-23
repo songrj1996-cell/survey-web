@@ -22,7 +22,9 @@
   "questions": [
     {
       "name_zh": "中文题名（把英文/原文题目翻译成简洁中文；已是中文则原样精简）",
-      "role": "single_choice|multi_choice|scale|profile_dim|open_text|id|mlbbid|matrix_scale|matrix_multi|ignore",
+      "role": "single_choice|multi_choice|scale|open_text|id|mlbbid|matrix_scale|matrix_single|matrix_multi|ignore",
+      "use_as_profile": false,
+      "profile_scope": "analysis|label",
       "column_indexes": [列号...],
       "delimiter": "，",
       "options": ["选项A","选项B"],
@@ -41,11 +43,15 @@
 - options：选项题清单。优先使用合并后的中文标准值；中文标准值可以不直接出现在原始数据里，但必须能由 value_aliases 中的真实取值支撑。
 - scale_min/scale_max：scale 和 matrix_scale 必填，是评分量程（如 1 和 5）。
 - rows：matrix_scale / matrix_multi 必填，与 column_indexes 顺序一一对应，用 <columns> 里给出的子项标签。
-- value_aliases：仅对选项题（single_choice / profile_dim / multi_choice / matrix_multi）给出。我会在每列附「去重取值」，请把语义相同但写法/语种不同的取值（如 神话/Mythic/Mítica、中国/China/CN）归并到同一个**中文标准值**：key=中文标准值，value=所有原始变体。只有确属同义才合并，拿不准就不合并；无同义可并可省略或给 {}。options 也用中文标准值，且每个中文标准值都必须能由 value_aliases 或真实取值支撑。
+- value_aliases：仅对选项题（single_choice / multi_choice / matrix_single / matrix_multi）给出。我会在每列附「去重取值」，请把语义相同但写法/语种不同的取值（如 神话/Mythic/Mítica、中国/China/CN）归并到同一个**中文标准值**：key=中文标准值，value=所有原始变体。只有确属同义才合并，拿不准就不合并；无同义可并可省略或给 {}。options 也用中文标准值，且每个中文标准值都必须能由 value_aliases 或真实取值支撑。
 
 角色判断要点：
 - 玩家ID/编号/邮箱 → id；明确是 MLBB 游戏内 ID → mlbbid；提交时间戳、序号等无分析价值的 → ignore
-- 年龄段、段位、地区、性别等用于分群对比的 → profile_dim
+- 题型按真实回答结构判断，不因画像用途改变；任何分析题型都可以设置 use_as_profile=true
+- profile_scope=analysis 表示进入画像概览、分群、交叉分析和引用标注；label 表示仅用于引用标注
+- use_as_profile=true 但缺少 profile_scope 时按 analysis；use_as_profile=false 时忽略 profile_scope
+- open_text 画像只能使用 label；id、mlbbid、ignore 不得标为画像
+- 多选画像进入 analysis 时按选项分别计入分组，同一受访者可以属于多个分组
 - 单个数值评分（1–5、1–10、NPS 等）→ scale
 - 一个单元格里出现多个选项（有分隔符）、语义是"可多选" → multi_choice，并给出 options
 - 较长的主观文字回答 → open_text

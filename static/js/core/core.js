@@ -83,7 +83,6 @@ window.__surveyState = state;
 const ROLE_OPTIONS = [
   ['id', '用户 ID'],
   ['mlbbid', 'MLBB ID'],
-  ['profile_dim', '画像维度'],
   ['single_choice', '单选题'],
   ['multi_choice', '多选题'],
   ['scale', '量表题'],
@@ -94,7 +93,10 @@ const ROLE_OPTIONS = [
   ['ignore', '忽略此列'],
 ];
 const MATRIX_ROLES = ['matrix_scale', 'matrix_single', 'matrix_multi'];
-const CHOICE_ROLES = ['single_choice', 'profile_dim', 'multi_choice', 'matrix_single', 'matrix_multi'];
+const CHOICE_ROLES = ['single_choice', 'multi_choice', 'matrix_single', 'matrix_multi'];
+const PROFILE_ANALYSIS_ROLES = ['single_choice', 'multi_choice', 'scale', 'matrix_scale', 'matrix_single', 'matrix_multi'];
+const PROFILE_LABEL_ROLES = [...PROFILE_ANALYSIS_ROLES, 'open_text'];
+// PROFILE_ROLE_CONSTANTS_END
 
 // ── DOM 引用 ──
 const $ = id => document.getElementById(id);
@@ -253,6 +255,80 @@ function consumeSSE(url, onEvent) {
     };
     es.onerror = () => { es.close(); reject(new Error('连接中断，请刷新重试')); };
   });
+}
+
+// ── SSE consumer (GET / fetch) ──
+// EventSource does not expose a failed HTTP response body. Annotation retries use
+// this reader so validation errors can be shown without changing existing callers.
+async function consumeSSEGet(url, onEvent, doneTypes = []) {
+  const resp = await fetch(url, { method: 'GET', headers: { Accept: 'text/event-stream' } });
+  if (!resp.ok) {
+    const text = await resp.text();
+    let detail = text;
+    try {
+      const parsed = JSON.parse(text);
+      detail = typeof parsed.detail === 'string' ? parsed.detail
+        : parsed.detail ? JSON.stringify(parsed.detail) : text;
+    } catch { }
+    throw new Error(detail || `请求失败（${resp.status}）`);
+  }
+
+  const contentType = resp.headers.get('Content-Type') || '';
+  if (!contentType.includes('text/event-stream') || !resp.body) {
+    throw new Error('服务端未返回实时处理结果');
+  }
+
+  const terminalTypes = new Set(doneTypes);
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  const handleBlock = block => {
+    const raw = block.split(/\r?\n/)
+      .filter(line => line.startsWith('data:'))
+      .map(line => line.slice(5).trimStart())
+      .join('\n')
+      .trim();
+    if (!raw) return null;
+    let data;
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      throw new Error('服务端返回了无法解析的实时数据');
+    }
+    onEvent(data);
+    if (data.type === 'error') {
+      throw new Error(data.message || data.msg || '服务端处理失败');
+    }
+    return terminalTypes.has(data.type) ? data : null;
+  };
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+      let boundary;
+      while ((boundary = buffer.match(/\r?\n\r?\n/))) {
+        const block = buffer.slice(0, boundary.index);
+        buffer = buffer.slice(boundary.index + boundary[0].length);
+        const terminal = handleBlock(block);
+        if (terminal) {
+          await reader.cancel().catch(() => {});
+          return terminal;
+        }
+      }
+      if (done) break;
+    }
+
+    if (buffer.trim()) {
+      const terminal = handleBlock(buffer);
+      if (terminal) return terminal;
+    }
+    throw new Error('连接已结束，尚未收到完整结果；已有结果会保留');
+  } catch (error) {
+    await reader.cancel().catch(() => {});
+    throw error;
+  }
 }
 
 // ── SSE from POST (fetch + ReadableStream) ──

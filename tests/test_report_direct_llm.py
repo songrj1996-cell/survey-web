@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from unittest.mock import AsyncMock, patch
 
+from app.services import report_engine
 from app.services import report_history
 from app.services import survey_service
 from app.storage import history as history_storage
@@ -234,6 +235,44 @@ class DirectReportServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('全部 2 条原始玩家反馈', _describe_qa_context_scope(full_context))
         self.assertIn('抽样的 100 条原始玩家反馈（原始共 2418 条）', _describe_qa_context_scope(sampled_context))
         self.assertIn('未保留可用的原始玩家反馈', _describe_qa_context_scope(missing_context))
+
+    def test_qa_sampling_stratifies_only_by_analysis_profiles(self):
+        rows = [
+            ["性别", "熟练英雄", "反馈"],
+            *[["女", "Layla", "体验反馈" * 2000] for _ in range(12)],
+        ]
+        plan = {
+            "columns": [
+                {
+                    "index": 0,
+                    "role": "single_choice",
+                    "use_as_profile": True,
+                    "profile_scope": "analysis",
+                },
+                {
+                    "index": 1,
+                    "role": "single_choice",
+                    "use_as_profile": True,
+                    "profile_scope": "label",
+                },
+                {"index": 2, "role": "open_text", "use_as_profile": False},
+            ]
+        }
+
+        with patch.object(
+            report_engine,
+            "_stratified_sample",
+            return_value=rows[1:3],
+        ) as stratified:
+            formatted = report_engine._format_rows_for_qa(rows, plan)
+
+        self.assertGreater(
+            len("\n".join(json.dumps(row, ensure_ascii=False) for row in rows[1:])),
+            60000,
+        )
+        stratified.assert_called_once()
+        self.assertEqual(stratified.call_args.args[1], [0])
+        self.assertIn("已按画像维度分层抽样到 2 行", formatted)
 
     async def test_qa_stream_emits_scope_before_answer(self):
         qa_context = '<qa_context><rows>\n{"id": "p-1"}\n</rows></qa_context>'

@@ -5,13 +5,13 @@
 import re
 from collections import Counter
 
+from app.core.column_roles import is_profile_grouping, normalize_profile_fields, question_type
 from app.core.ranking import diagnose_matrix_ranking
 
 
 ROLE_LABEL_MAP = {
     "id":            "用户ID",
     "mlbbid":        "MLBB ID",
-    "profile_dim":   "画像维度",
     "single_choice": "单选题",
     "multi_choice":  "多选题",
     "scale":         "量表题",
@@ -323,7 +323,6 @@ def _fmt_distinct(body: list[list], idx: int, n: int = 60) -> str:
 
 CHOICE_ROLES = {
     "single_choice",
-    "profile_dim",
     "multi_choice",
     "matrix_single",
     "matrix_multi",
@@ -418,7 +417,7 @@ def _split_option_cell(
 
 def _real_options_for_question(rows: list[list], q: dict) -> list[str]:
     body = rows[1:]
-    role = q.get("role")
+    role = question_type(q)
     cis = q.get("column_indexes") or []
     delimiter = q.get("delimiter")
     known_values = _known_option_values(q)
@@ -442,7 +441,7 @@ def _real_options_for_question(rows: list[list], q: dict) -> list[str]:
 
 def _real_option_counts_for_question(rows: list[list], q: dict) -> Counter:
     body = rows[1:]
-    role = q.get("role")
+    role = question_type(q)
     cis = q.get("column_indexes") or []
     delimiter = q.get("delimiter")
     known_values = _known_option_values(q)
@@ -495,14 +494,15 @@ def _sanitize_choice_options(rows: list[list], questions: list[dict]) -> list[di
         if confidence in {"low", "medium"}:
             q["low_confidence"] = True
 
-        role = q.get("role")
+        role = question_type(q)
+        profile = is_profile_grouping(q)
         if role not in CHOICE_ROLES:
             continue
         real_options = _real_options_for_question(rows, q)
         real_counts = _real_option_counts_for_question(rows, q)
         profile_candidates = (
             _profile_option_candidates(q, real_options, real_counts)
-            if role == "profile_dim" else set()
+            if profile else set()
         )
         real_by_key = {_norm_option_key(o): o for o in real_options}
         if not real_by_key:
@@ -566,7 +566,7 @@ def _sanitize_choice_options(rows: list[list], questions: list[dict]) -> list[di
                 continue
             add_canonical(str(canonical), aliases if isinstance(aliases, (list, tuple)) else [])
 
-        if not had_declared_options and role != "profile_dim":
+        if not had_declared_options and not profile:
             for opt in real_options:
                 add_canonical(opt, [])
         else:
@@ -590,12 +590,12 @@ def _sanitize_choice_options(rows: list[list], questions: list[dict]) -> list[di
             ]
             for opt in uncovered:
                 count = real_counts.get(_norm_option_key(opt), 0)
-                if role == "profile_dim" and _norm_option_key(opt) in profile_candidates:
+                if profile and _norm_option_key(opt) in profile_candidates:
                     add_canonical(opt, [])
                     continue
                 if _is_other_option_label(opt):
                     suggestion = "other_text"
-                elif role != "profile_dim" and _looks_like_numbered_choice(opt, cleaned_options):
+                elif not profile and _looks_like_numbered_choice(opt, cleaned_options):
                     suggestion = "standard_option"
                 else:
                     suggestion = "review"
@@ -607,7 +607,7 @@ def _sanitize_choice_options(rows: list[list], questions: list[dict]) -> list[di
             if uncovered:
                 q["low_confidence"] = True
 
-        if cleaned_options or role == "profile_dim":
+        if cleaned_options or profile:
             q["options"] = cleaned_options
             q["options_original"] = cleaned_originals
             if unmatched_values:
@@ -647,7 +647,7 @@ def _build_column_detect_query(rows: list[list], groups: list[dict]) -> str:
         + "\n</columns>\n\n"
         + "选项边界（严格执行）：options 必须由该列「去重取值」里的真实单元格取值或多选拆分值支撑；不得从题干/表头中抽取选项。若 New Medal 等词只出现在题干里、没有出现在该列取值里，不得写入 options。若多语言取值语义相同，options 请写合并后的中文标准值，并在 value_aliases 中列出支撑它的真实取值。\n\n"
         + "请按 system prompt 约定的 JSON schema 输出。"
-        + "\n画像题（profile_dim）：固定分类须完整列出 options，并为译名提供真实取值对应的 value_aliases，不能只列需翻译的少数选项。"
+        + "\n进入画像分析的选择题（use_as_profile=true 且 profile_scope=analysis）：固定分类须完整列出 options，并为译名提供真实取值对应的 value_aliases，不能只列需翻译的少数选项。"
         + "无法可靠翻译时保留原值，不猜同义关系。若取值大量分散或包含自由填写长句，不要逐条扩成标准选项；只列有把握的固定类别，其余原值由程序保留供确认。"
     )
 
@@ -720,6 +720,7 @@ def _enrich_questions(questions: list[dict], headers: list[str], groups: list[di
         if g["type"] == "matrix":
             matrix_rows_by_first[g["member_indexes"][0]] = g["row_labels"]
     for q in questions:
+        normalize_profile_fields(q)
         cis = q.get("column_indexes") or []
         if not q.get("name_zh"):
             first = cis[0] if cis else None

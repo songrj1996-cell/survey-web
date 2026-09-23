@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, patch
 
 import survey_plan
 from app.schemas.requests import QualitativeContextRequest
-from app.services import survey_service
+from app.services import report_engine, survey_service
 
 
 def _analysis_focus() -> dict:
@@ -22,8 +22,18 @@ def _analysis_focus() -> dict:
 def _plan_json(*, include_analysis_focus: bool = True) -> str:
     plan = {
         "columns": [
-            {"index": 0, "name": "段位", "role": "profile_dim"},
-            {"index": 1, "name": "主玩位置", "role": "profile_dim"},
+            {
+                "index": 0,
+                "name": "段位",
+                "role": "single_choice",
+                "use_as_profile": True,
+            },
+            {
+                "index": 1,
+                "name": "主玩位置",
+                "role": "single_choice",
+                "use_as_profile": True,
+            },
             {
                 "index": 2,
                 "name": "界面满意度",
@@ -60,6 +70,31 @@ def _open_text_plan_json_with_unexpected_focus() -> str:
 
 
 class DirectSurveyPlannerTests(unittest.IsolatedAsyncioTestCase):
+    def test_label_profiles_are_displayed_but_not_used_for_planner_grouping_or_sampling(self):
+        confirmed = [{
+            "name_zh": "熟练英雄",
+            "role": "open_text",
+            "use_as_profile": True,
+            "profile_scope": "label",
+            "column_indexes": [0],
+        }]
+        query = report_engine._build_planner_query_with_confirmed(
+            [["熟练英雄"], ["Layla"]], confirmed,
+        )
+        self.assertIn("画像维度（仅引用标注）", query)
+        self.assertIn("没有可进入画像分析的分组维度", query)
+
+        plan = {"columns": [{
+            "index": 0,
+            "role": "open_text",
+            "use_as_profile": True,
+            "profile_scope": "label",
+        }]}
+        rows = [["熟练英雄"], *[["Layla" * 300] for _ in range(100)]]
+        with patch.object(report_engine, "_stratified_sample", return_value=rows[1:]) as stratified:
+            report_engine._format_rows_for_qa(rows, plan)
+        self.assertEqual(stratified.call_args.args[1], [])
+
     def test_analysis_approach_is_free_form_and_optional_for_legacy_requests(self):
         approach = "先跨案例比较，再围绕决策问题组织证据；案例 A 只作反证。"
 
@@ -198,6 +233,144 @@ class DirectSurveyPlannerTests(unittest.IsolatedAsyncioTestCase):
         ])
         self.assertEqual(merged["parts"][1]["column_indexes"], [1, 2])
         self.assertEqual(merged["parts"][2]["column_indexes"], [1, 2])
+
+    def test_plan_normalizes_legacy_and_invalid_profile_combinations(self):
+        legacy = json.loads(_plan_json())
+        legacy["columns"][0] = {
+            "index": 0,
+            "name": "段位",
+            "role": "profile_dim",
+            "profile_scope": "label",
+        }
+
+        parsed, error = survey_plan.parse_plan_from_llm(
+            json.dumps(legacy, ensure_ascii=False),
+            3,
+        )
+
+        self.assertIsNone(error)
+        self.assertEqual(parsed["columns"][0]["role"], "single_choice")
+        self.assertTrue(parsed["columns"][0]["use_as_profile"])
+        self.assertEqual(parsed["columns"][0]["profile_scope"], "analysis")
+
+        invalid = {
+            "columns": [
+                {
+                    "index": 0,
+                    "name": "熟练英雄",
+                    "role": "open_text",
+                    "use_as_profile": True,
+                    "profile_scope": "analysis",
+                },
+                {
+                    "index": 1,
+                    "name": "用户编号",
+                    "role": "id",
+                    "use_as_profile": True,
+                    "profile_scope": "analysis",
+                },
+            ],
+            "parts": [{"name": "反馈", "column_indexes": [0]}],
+            "cross_tabs": [],
+            "open_questions": [],
+            "summary": "分析反馈",
+        }
+        parsed, error = survey_plan.parse_plan_from_llm(
+            json.dumps(invalid, ensure_ascii=False), 2,
+        )
+
+        self.assertIsNone(error)
+        self.assertEqual(parsed["columns"][0]["profile_scope"], "label")
+        self.assertTrue(parsed["columns"][0]["use_as_profile"])
+        self.assertFalse(parsed["columns"][1]["use_as_profile"])
+        self.assertNotIn("profile_scope", parsed["columns"][1])
+
+    def test_profile_question_cross_tabs_are_dropped_during_parse_and_merge(self):
+        plan = {
+            "columns": [
+                {
+                    "index": 0,
+                    "name": "性别",
+                    "role": "single_choice",
+                    "use_as_profile": True,
+                    "profile_scope": "analysis",
+                },
+                {
+                    "index": 1,
+                    "name": "近期游玩情况",
+                    "role": "single_choice",
+                    "use_as_profile": True,
+                    "profile_scope": "analysis",
+                },
+                {
+                    "index": 2,
+                    "name": "熟练英雄",
+                    "role": "open_text",
+                    "use_as_profile": True,
+                    "profile_scope": "label",
+                },
+                {"index": 3, "name": "满意度", "role": "scale", "min": 1, "max": 5},
+            ],
+            "parts": [{"name": "整体分析", "column_indexes": [0, 1, 2, 3]}],
+            "cross_tabs": [
+                {"profile_index": 0, "question_index": 1},
+                {"profile_index": 0, "question_index": 2},
+                {"profile_index": 0, "question_index": 3},
+            ],
+            "open_questions": [],
+            "summary": "分析画像与满意度",
+        }
+
+        parsed, error = survey_plan.parse_plan_from_llm(
+            json.dumps(plan, ensure_ascii=False), 4,
+        )
+
+        self.assertIsNone(error)
+        self.assertEqual(
+            parsed["cross_tabs"],
+            [{"profile_index": 0, "question_index": 3}],
+        )
+
+        parsed["cross_tabs"] = [
+            {"profile_index": 0, "question_index": 1},
+            {"profile_index": 0, "question_index": 2},
+            {"profile_index": 0, "question_index": 3},
+        ]
+        merged = survey_plan.merge_confirmed_into_plan(parsed, [
+            {
+                "name_zh": "性别",
+                "role": "single_choice",
+                "use_as_profile": True,
+                "profile_scope": "analysis",
+                "column_indexes": [0],
+            },
+            {
+                "name_zh": "近期游玩情况",
+                "role": "single_choice",
+                "use_as_profile": True,
+                "profile_scope": "analysis",
+                "column_indexes": [1],
+            },
+            {
+                "name_zh": "熟练英雄",
+                "role": "open_text",
+                "use_as_profile": True,
+                "profile_scope": "label",
+                "column_indexes": [2],
+            },
+            {
+                "name_zh": "满意度",
+                "role": "scale",
+                "scale_min": 1,
+                "scale_max": 5,
+                "column_indexes": [3],
+            },
+        ])
+
+        self.assertEqual(
+            merged["cross_tabs"],
+            [{"profile_index": 0, "question_index": 3}],
+        )
 
     def test_plan_rejects_overlapping_filters_for_reused_columns(self):
         plan = {
@@ -448,7 +621,7 @@ class DirectSurveyPlannerTests(unittest.IsolatedAsyncioTestCase):
         sess = {"rows": rows}
         answer = """```json
 {"questions":[
-  {"name_zh":"主玩位置","role":"profile_dim","column_indexes":[0],
+  {"name_zh":"主玩位置","role":"single_choice","use_as_profile":true,"column_indexes":[0],
    "options":["坦克","法师","射手"],
    "value_aliases":{"坦克":["Tank"],"法师":["Mage"],"射手":["Marksman"]}},
   {"name_zh":"新界面满意度","role":"scale","column_indexes":[1],
@@ -482,6 +655,8 @@ class DirectSurveyPlannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sess["column_provider"], "direct_llm")
         self.assertEqual(sess["column_model"], "gpt-5.6-terra")
         self.assertEqual(sess["columns_detected"][0]["name_zh"], "主玩位置")
+        self.assertEqual(sess["columns_detected"][0]["role"], "single_choice")
+        self.assertTrue(sess["columns_detected"][0]["use_as_profile"])
         self.assertEqual(
             collect.await_args.kwargs["models"],
             ("gpt-5.6-terra", "qwen3.7-plus"),
@@ -494,7 +669,7 @@ class DirectSurveyPlannerTests(unittest.IsolatedAsyncioTestCase):
     async def test_columns_stream_repairs_invalid_json_without_dify_conversation(self):
         rows = [["Rank"], ["Mythic"], ["Epic"]]
         valid = """```json
-{"questions":[{"name_zh":"段位","role":"profile_dim","column_indexes":[0],
+{"questions":[{"name_zh":"段位","role":"single_choice","use_as_profile":true,"column_indexes":[0],
 "options":["神话","史诗"],"value_aliases":{"神话":["Mythic"],"史诗":["Epic"]}}]}
 ```"""
         collect = AsyncMock(
@@ -535,13 +710,15 @@ class DirectSurveyPlannerTests(unittest.IsolatedAsyncioTestCase):
         confirmed = [
             {
                 "name_zh": "段位",
-                "role": "profile_dim",
+                "role": "single_choice",
+                "use_as_profile": True,
                 "column_indexes": [0],
                 "options": ["神话"],
             },
             {
                 "name_zh": "主玩位置",
-                "role": "profile_dim",
+                "role": "single_choice",
+                "use_as_profile": True,
                 "column_indexes": [1],
                 "options": ["坦克"],
             },
@@ -714,8 +891,8 @@ class DirectSurveyPlannerTests(unittest.IsolatedAsyncioTestCase):
         sess = {
             "rows": [["段位", "主玩位置", "满意度"], ["神话", "坦克", "5"]],
             "confirmed_columns": [
-                {"name_zh": "段位", "role": "profile_dim", "column_indexes": [0]},
-                {"name_zh": "主玩位置", "role": "profile_dim", "column_indexes": [1]},
+                {"name_zh": "段位", "role": "single_choice", "use_as_profile": True, "column_indexes": [0]},
+                {"name_zh": "主玩位置", "role": "single_choice", "use_as_profile": True, "column_indexes": [1]},
                 {
                     "name_zh": "满意度",
                     "role": "scale",
@@ -759,7 +936,11 @@ class DirectSurveyPlannerTests(unittest.IsolatedAsyncioTestCase):
         sess = {
             "mode": "crosstab",
             "rows": rows,
-            "confirmed_columns": [{"name": "改进建议", "role": "open_text"}],
+            "confirmed_columns": [{
+                "name": "改进建议",
+                "role": "open_text",
+                "column_indexes": [0],
+            }],
             "questionnaire_text": "Q1. How satisfied are you?\nQ2. Why?",
             "crosstab_questions": ["满意度", "改进建议"],
         }

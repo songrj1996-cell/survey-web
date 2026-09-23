@@ -931,6 +931,8 @@ def save_annotate_to_history(sid: str, sess: dict, result_path: str, download_na
             "rows_fed": False,
             "mode": "annotate",
             "row_count": max(0, len(sess.get("rows") or []) - 1),
+            "annotate_completion": deepcopy(sess.get("completion") or {}),
+            "annotate_updated_at": datetime.now().isoformat(),
             "annotate_result_path": result_path,
             "annotate_download_name": download_name,
             "annotate_ai_count": len(sess.get("ai_results") or []),

@@ -111,7 +111,7 @@ DEFAULT_PROMPTS: dict = {
         order=20,
         kind="system",
         current=DEFAULT_COLUMN_DETECT_SYSTEM_PROMPT,
-        version=2,
+        version=4,
     ),
     "survey_planner_system": _prompt(
         "survey_planner_system",
@@ -122,7 +122,7 @@ DEFAULT_PROMPTS: dict = {
         order=30,
         kind="system",
         current=DEFAULT_SURVEY_PLANNER_SYSTEM_PROMPT,
-        version=4,
+        version=7,
     ),
     "crosstab_planner_system": _prompt(
         "crosstab_planner_system",

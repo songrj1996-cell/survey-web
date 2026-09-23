@@ -9,7 +9,7 @@
       3. ## Part X 章节，每个客观题（single/multi/scale）下面同时含：
          - 总体频数/占比表
          - 该题 × 每个画像维度的交叉表（行=画像取值，列=各选项的频数+占比）
-         - profile_dim 列在 part 里只标注"已在画像概览展示"
+         - 画像列也按单选题完整统计，但不与其他画像列交叉（交叉表只用于业务题 × 画像）
       4. open_text 题在 part 里只标"开放题，N 条非空回答 → 见 <open_text> 块"
   · open_text_by_col：{col_index: [{"ids":{...}, "profile":{...}, "text":...}, ...]}
       每条原文绑定该用户的所有 id 列值 + 画像维度值，让 LLM 能按观点聚合 + 引用原话时附 ID 和画像
@@ -39,6 +39,7 @@ import statistics
 from collections import Counter
 from typing import Any, Callable
 
+from app.core.column_roles import is_profile_dim, is_profile_grouping, question_type
 from app.core.ranking import parse_rank_value
 
 _MATRIX_ROLES = ("matrix_scale", "matrix_single", "matrix_multi")
@@ -141,9 +142,10 @@ def compute(
     total = len(body)
 
     cols_by_index: dict[int, dict] = {c["index"]: c for c in plan["columns"]}
-    profile_cols = [c for c in plan["columns"] if c["role"] == "profile_dim"]
-    mlbb_id_cols = [c for c in plan["columns"] if c["role"] == "mlbbid"]
-    id_cols = [c for c in plan["columns"] if c["role"] == "id"]
+    profile_cols_label = [c for c in plan["columns"] if is_profile_dim(c)]
+    profile_cols_grouping = [c for c in plan["columns"] if is_profile_grouping(c)]
+    mlbb_id_cols = [c for c in plan["columns"] if question_type(c) == "mlbbid"]
+    id_cols = [c for c in plan["columns"] if question_type(c) == "id"]
     segment_indexes = {
         part.get("filter", {}).get("column_index")
         for part in plan.get("parts") or []
@@ -164,10 +166,10 @@ def compute(
     md_parts.append("")
 
     # 画像维度概览（让 LLM 在报告开头直接引用）
-    if profile_cols:
+    if profile_cols_grouping:
         md_parts.append("## 画像维度概览")
         md_parts.append("")
-        for p_col in profile_cols:
+        for p_col in profile_cols_grouping:
             section = _render_profile_overview(p_col, headers, body)
             md_parts.append(section)
             md_parts.append("")
@@ -186,7 +188,8 @@ def compute(
             if not col:
                 continue
             # 矩阵题：跨多列，按 matrix_group 合并渲染一次
-            if col["role"] in _MATRIX_ROLES:
+            role = question_type(col)
+            if role in _MATRIX_ROLES:
                 grp = col.get("matrix_group") or col.get("name") or f"矩阵题{col_idx}"
                 if grp in rendered_matrix:
                     continue
@@ -194,16 +197,16 @@ def compute(
                     cols_by_index[j]
                     for j in part["column_indexes"]
                     if cols_by_index.get(j)
-                    and cols_by_index[j]["role"] == col["role"]
+                    and question_type(cols_by_index[j]) == role
                     and (cols_by_index[j].get("matrix_group") or "") == (col.get("matrix_group") or "")
                 ]
-                section = _render_matrix(grp, col["role"], members, headers, part_body)
+                section = _render_matrix(grp, role, members, headers, part_body)
                 rendered_matrix.add(grp)
                 if section:
                     md_parts.append(section)
                     md_parts.append("")
                 continue
-            section = _render_column(col, headers, part_body, profile_cols)
+            section = _render_column(col, headers, part_body, profile_cols_grouping)
             if section:
                 md_parts.append(section)
                 md_parts.append("")
@@ -211,14 +214,14 @@ def compute(
     # 开放题数据池：每条原文带 ids + profile
     open_text: dict[int, list[dict]] = {}
     for c in plan["columns"]:
-        if c["role"] == "open_text":
+        if question_type(c) == "open_text":
             open_text[c["index"]] = _collect_open_text(
-                c["index"], body, headers, mlbb_id_cols + id_cols, profile_cols, segment_cols
+                c["index"], body, headers, mlbb_id_cols + id_cols, profile_cols_label, segment_cols
             )
     for c in plan["columns"]:
-        if c["role"] in ("single_choice", "multi_choice"):
+        if question_type(c) in ("single_choice", "multi_choice"):
             entries = _collect_choice_other_text(
-                c, body, headers, mlbb_id_cols + id_cols, profile_cols, segment_cols
+                c, body, headers, mlbb_id_cols + id_cols, profile_cols_label, segment_cols
             )
             if entries:
                 open_text.setdefault(c["index"], []).extend(entries)
@@ -237,9 +240,9 @@ def collect_open_text(rows: list[list], plan: dict, *, include_choice_other: boo
         return {}
     headers = rows[0]
     body = rows[1:]
-    profile_cols = [c for c in plan["columns"] if c["role"] == "profile_dim"]
-    mlbb_id_cols = [c for c in plan["columns"] if c["role"] == "mlbbid"]
-    id_cols = [c for c in plan["columns"] if c["role"] == "id"]
+    profile_cols_label = [c for c in plan["columns"] if is_profile_dim(c)]
+    mlbb_id_cols = [c for c in plan["columns"] if question_type(c) == "mlbbid"]
+    id_cols = [c for c in plan["columns"] if question_type(c) == "id"]
     segment_indexes = {
         part.get("filter", {}).get("column_index")
         for part in plan.get("parts") or []
@@ -248,13 +251,13 @@ def collect_open_text(rows: list[list], plan: dict, *, include_choice_other: boo
     segment_cols = [c for c in plan["columns"] if c["index"] in segment_indexes]
     open_text: dict[int, list[dict]] = {}
     for c in plan["columns"]:
-        if c["role"] == "open_text":
+        if question_type(c) == "open_text":
             open_text[c["index"]] = _collect_open_text(
-                c["index"], body, headers, mlbb_id_cols + id_cols, profile_cols, segment_cols
+                c["index"], body, headers, mlbb_id_cols + id_cols, profile_cols_label, segment_cols
             )
-        elif include_choice_other and c["role"] in ("single_choice", "multi_choice"):
+        elif include_choice_other and question_type(c) in ("single_choice", "multi_choice"):
             entries = _collect_choice_other_text(
-                c, body, headers, mlbb_id_cols + id_cols, profile_cols, segment_cols
+                c, body, headers, mlbb_id_cols + id_cols, profile_cols_label, segment_cols
             )
             if entries:
                 open_text[c["index"]] = entries
@@ -412,11 +415,30 @@ def _render_profile_overview(p_col: dict, headers: list[str], body: list[list]) 
     aliases = p_col.get("value_aliases")
     norm = _make_normalizer(aliases)
     raw = _column_values(body, p_col["index"])
-    nonblank = [norm(v) for v in raw if v.strip()]
+    nonblank = [v for v in raw if v.strip()]
     if not nonblank:
         return f"### {name}\n\n（该画像维度无有效数据）"
-    counts = Counter(nonblank)
-    total = sum(counts.values())
+    role = question_type(p_col)
+    multi = role in {"multi_choice", "matrix_multi"}
+    if multi:
+        delimiter = p_col.get("delimiter") or _guess_delimiter(nonblank)
+        options = p_col.get("options")
+        other_label = _choice_other_label(p_col)
+        other_values = _choice_other_values(p_col, norm)
+        counts: Counter = Counter()
+        for value in nonblank:
+            counts.update(set(_split_by_vocab(
+                value,
+                options,
+                delimiter,
+                norm,
+                other_label=other_label,
+                other_values=other_values,
+            )))
+        total = len(nonblank)
+    else:
+        counts = Counter(norm(v) for v in nonblank)
+        total = len(nonblank)
     lines = [f"### {name}"]
     lines.append("")
     lines.append("| 取值 | 频数 | 占比 |")
@@ -424,6 +446,8 @@ def _render_profile_overview(p_col: dict, headers: list[str], body: list[list]) 
     for v, n in counts.most_common():
         lines.append(f"| {_md_escape(v)} | {n} | {_pct(n, total)} |")
     lines.append(f"\n（共 {total} 份非空回答）")
+    if multi:
+        lines.append("\n> 多值画像：同一受访者可计入多个分组，各分组人数有重叠，合计可能超过样本量。")
     return "\n".join(lines)
 
 
@@ -435,7 +459,7 @@ def _render_profile_overview(p_col: dict, headers: list[str], body: list[list]) 
 def _render_column(
     col: dict, headers: list[str], body: list[list], profile_cols: list[dict]
 ) -> str:
-    role = col["role"]
+    role = question_type(col)
     idx = col["index"]
     name = col.get("name") or _safe_header(headers, idx)
     title = f"### {name}"
@@ -443,9 +467,6 @@ def _render_column(
     if role in ("id", "mlbbid", "ignore"):
         label = {"id": "用户ID", "mlbbid": "MLBB ID", "ignore": "已忽略"}.get(role, "")
         return f"{title}\n\n（{label}列，不参与统计）"
-
-    if role == "profile_dim":
-        return f"{title}\n\n（画像维度，分布表见上方「画像维度概览」章节）"
 
     raw_values = _column_values(body, idx)
     nonblank_raw = [v for v in raw_values if v.strip()]
@@ -525,8 +546,8 @@ def _append_cross_tabs(
     other_label: str | None = None,
     other_values: set[str] | None = None,
 ) -> str:
-    """单选/多选题：跟每个 profile_dim 配交叉表。"""
-    if not profile_cols:
+    """单选/多选题：跟每个画像维度配交叉表。画像列自身不参与交叉。"""
+    if not profile_cols or is_profile_dim(col):
         return ""
     out = []
     q_norm_fn = _make_normalizer(col.get("value_aliases"))
@@ -536,8 +557,14 @@ def _append_cross_tabs(
         p_raw = _column_values(body, p_col["index"])
         p_name = p_col.get("name") or _safe_header(headers, p_col["index"])
         p_norm_fn = _make_normalizer(p_col.get("value_aliases"))
+        p_single = question_type(p_col) not in {"multi_choice", "matrix_multi"}
+        p_delimiter = p_col.get("delimiter") or _guess_delimiter([v for v in p_raw if v.strip()])
+        p_other_label = _choice_other_label(p_col)
+        p_other_values = _choice_other_values(p_col, p_norm_fn)
         ct_md = _cross_tab_categorical(
             p_raw, q_raw, p_norm=p_norm_fn, q_norm=q_norm_fn,
+            p_single=p_single, p_options=p_col.get("options"), p_delimiter=p_delimiter,
+            p_other_label=p_other_label, p_other_values=p_other_values,
             single=single, delimiter=delimiter, options=options, other_label=other_label,
             other_values=other_values,
         )
@@ -553,14 +580,25 @@ def _append_cross_tabs_scale(
     body: list[list],
     headers: list[str],
 ) -> str:
-    if not profile_cols:
+    if not profile_cols or is_profile_dim(col):
         return ""
     out = []
     for p_col in profile_cols:
         p_raw = _column_values(body, p_col["index"])
         p_name = p_col.get("name") or _safe_header(headers, p_col["index"])
         p_norm = _make_normalizer(p_col.get("value_aliases"))
-        ct_md = _cross_tab_scale(p_raw, q_raw, p_norm=p_norm)
+        p_single = question_type(p_col) not in {"multi_choice", "matrix_multi"}
+        p_delimiter = p_col.get("delimiter") or _guess_delimiter([v for v in p_raw if v.strip()])
+        ct_md = _cross_tab_scale(
+            p_raw,
+            q_raw,
+            p_norm=p_norm,
+            p_single=p_single,
+            p_options=p_col.get("options"),
+            p_delimiter=p_delimiter,
+            p_other_label=_choice_other_label(p_col),
+            p_other_values=_choice_other_values(p_col, p_norm),
+        )
         if ct_md:
             out.append(f"\n\n**按「{p_name}」分组（量表均值对比）**\n\n{ct_md}")
     return "".join(out)
@@ -688,6 +726,11 @@ def _cross_tab_categorical(
     *,
     p_norm: Callable[[str], str],
     q_norm: Callable[[str], str],
+    p_single: bool = True,
+    p_options: list[str] | None = None,
+    p_delimiter: str = ",",
+    p_other_label: str | None = None,
+    p_other_values: set[str] | None = None,
     single: bool,
     delimiter: str = ",",
     options: list[str] | None = None,
@@ -704,10 +747,28 @@ def _cross_tab_categorical(
     if not pairs:
         return "（无有效配对数据）"
 
-    # 应用 normalizer
-    pairs_norm = [(p_norm(p), q) for p, q in pairs]
+    # 应用画像侧 normalizer；多值画像的一名受访者可进入多个分组。
+    pairs_norm: list[tuple[list[str], str]] = []
+    for p, q in pairs:
+        values = (
+            [p_norm(p)]
+            if p_single
+            else list(dict.fromkeys(_split_by_vocab(
+                p,
+                p_options,
+                p_delimiter,
+                p_norm,
+                other_label=p_other_label,
+                other_values=p_other_values,
+            )))
+        )
+        values = [value for value in values if value]
+        if values:
+            pairs_norm.append((values, q))
+    if not pairs_norm:
+        return "（无有效配对数据）"
 
-    p_options = list(dict.fromkeys(p for p, _ in pairs_norm))
+    profile_options = list(dict.fromkeys(p for values, _ in pairs_norm for p in values))
     known_options = _choice_norm_options(options, q_norm, other_label)
 
     def normalize_q(q: str) -> str:
@@ -739,23 +800,24 @@ def _cross_tab_categorical(
         q_options = q_set
 
     p_totals: Counter = Counter()
-    for p, _ in pairs_norm:
-        p_totals[p] += 1
+    for profiles, _ in pairs_norm:
+        for p in profiles:
+            p_totals[p] += 1
 
     grid: dict[tuple[str, str], int] = {}
-    for p, q in pairs_norm:
+    for profiles, q in pairs_norm:
         if single:
-            qn = normalize_q(q)
-            grid[(p, qn)] = grid.get((p, qn), 0) + 1
+            q_values = {normalize_q(q)}
         else:
-            opts = set(_split_by_vocab(
+            q_values = set(_split_by_vocab(
                 q, options, delimiter, q_norm,
                 other_label=other_label,
                 other_values=other_values,
             ))
-            for o in opts:
-                if o:
-                    grid[(p, o)] = grid.get((p, o), 0) + 1
+        for p in profiles:
+            for q_value in q_values:
+                if q_value:
+                    grid[(p, q_value)] = grid.get((p, q_value), 0) + 1
 
     has_low = False
     lines: list[str] = []
@@ -763,7 +825,7 @@ def _cross_tab_categorical(
     lines.append("| " + " | ".join(header_cells) + " |")
     lines.append("|" + "|".join(["---"] * len(header_cells)) + "|")
     # 按 profile 总计降序
-    for p in sorted(p_options, key=lambda x: -p_totals[x]):
+    for p in sorted(profile_options, key=lambda x: -p_totals[x]):
         row_cells = [_md_escape(p)]
         denom = p_totals[p]
         for o in q_options:
@@ -778,6 +840,9 @@ def _cross_tab_categorical(
     if has_low:
         lines.append("")
         lines.append("> `*` 该格样本量 < 5，谨慎解读")
+    if not p_single:
+        lines.append("")
+        lines.append("> 多值画像：同一受访者可计入多个分组，各分组人数有重叠，合计可能超过样本量。")
     if not single:
         lines.append("")
         lines.append(
@@ -787,7 +852,15 @@ def _cross_tab_categorical(
 
 
 def _cross_tab_scale(
-    p_raw: list[str], q_raw: list[str], *, p_norm: Callable[[str], str]
+    p_raw: list[str],
+    q_raw: list[str],
+    *,
+    p_norm: Callable[[str], str],
+    p_single: bool = True,
+    p_options: list[str] | None = None,
+    p_delimiter: str = ",",
+    p_other_label: str | None = None,
+    p_other_values: set[str] | None = None,
 ) -> str:
     pairs = []
     invalid = 0
@@ -795,7 +868,20 @@ def _cross_tab_scale(
         if not p.strip() or not q.strip():
             continue
         try:
-            pairs.append((p_norm(p.strip()), float(q.strip())))
+            profiles = (
+                [p_norm(p.strip())]
+                if p_single
+                else list(dict.fromkeys(_split_by_vocab(
+                    p,
+                    p_options,
+                    p_delimiter,
+                    p_norm,
+                    other_label=p_other_label,
+                    other_values=p_other_values,
+                )))
+            )
+            number = float(q.strip())
+            pairs.extend((profile, number) for profile in profiles if profile)
         except (ValueError, TypeError):
             invalid += 1
 
@@ -824,6 +910,8 @@ def _cross_tab_scale(
     if has_low:
         lines.append("")
         lines.append("> `*` 该画像取值的样本量 < 5，均值不稳定，谨慎解读")
+    if not p_single:
+        lines.append("> 多值画像：同一受访者可计入多个分组，各分组人数有重叠，合计可能超过样本量。")
     if invalid:
         lines.append(f"> 另有 {invalid} 条非数字回答未参与计算")
     return "\n".join(lines)
@@ -902,7 +990,7 @@ def _collect_choice_other_text(
         return []
 
     idx = col["index"]
-    role = col["role"]
+    role = question_type(col)
     norm = _make_normalizer(col.get("value_aliases"))
     known_options = _choice_norm_options(options, norm, other_label)
     other_values = _choice_other_values(col, norm)
@@ -975,8 +1063,8 @@ def _build_open_text_entry(
         i = c["index"]
         v = _format_cell(row[i]) if i < len(row) else ""
         if v.strip():
-            key = "MLBB ID" if c.get("role") == "mlbbid" else (c.get("name") or _safe_header(headers, i))
-            if c.get("role") == "mlbbid":
+            key = "MLBB ID" if question_type(c) == "mlbbid" else (c.get("name") or _safe_header(headers, i))
+            if question_type(c) == "mlbbid":
                 v = _format_mlbb_id(v)
             ids[key] = v.strip()
 
@@ -1539,7 +1627,7 @@ def build_comparison_fact_catalog(rows: list[list], plan: dict) -> list[dict]:
         column
         for column in (plan.get("columns") or [])
         if isinstance(column, dict)
-        and column.get("role") == "scale"
+        and question_type(column) == "scale"
         and isinstance(column.get("index"), int)
         and 0 <= column["index"] < len(headers)
     ]

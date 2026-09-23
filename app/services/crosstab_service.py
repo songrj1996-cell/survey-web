@@ -36,6 +36,8 @@ def _build_crosstab_columns(headers: list[str], q_title_map: dict[int, str]) -> 
         hs = str(h).strip()
         low = hs.lower()
         role = "ignore"
+        use_as_profile = False
+        profile_scope = None
         name = hs
         if hs.endswith("__open"):
             role = "open_text"
@@ -49,14 +51,19 @@ def _build_crosstab_columns(headers: list[str], q_title_map: dict[int, str]) -> 
         elif low in ("response id", "responseid"):
             role = "id"
         elif hs in ("段位", "等级", "性别", "年龄", "区服", "国家", "地区", "服务器"):
-            role = "profile_dim"
+            role = "single_choice"
+            use_as_profile = True
+            profile_scope = "analysis"
         cols.append({
             "index": i,
             "name": name,
             "role": role,
+            "use_as_profile": use_as_profile,
             "source": "crosstab",
             "column_indexes": [i],
         })
+        if profile_scope:
+            cols[-1]["profile_scope"] = profile_scope
     return cols
 
 

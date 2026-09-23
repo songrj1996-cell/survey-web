@@ -9,6 +9,7 @@ import time
 from contextlib import suppress
 from copy import deepcopy
 
+from app.core.column_roles import is_profile_dim, is_profile_grouping, profile_scope, question_type
 from app.core.config import (
     BATCH_SIZE,
     CORE_END,
@@ -447,16 +448,28 @@ def _build_planner_query_with_confirmed(
     """构建给 Planner 的完整 query，含用户确认的题型（逻辑题，矩阵题跨多列）。"""
     sample_md = _build_planner_sample(rows)
 
+    def role_view(column: dict) -> dict:
+        if column.get("role"):
+            return column
+        return {**column, "role": column.get("confirmed_type") or "single_choice"}
+
     confirmed_lines = []
     for q in confirmed_columns:
         # 兼容旧结构（confirmed_type/index）与新结构（role/name_zh/column_indexes）
-        role = q.get("role") or q.get("confirmed_type") or "single_choice"
+        view = role_view(q)
+        role = question_type(view)
         name = q.get("name_zh") or q.get("name") or "?"
         cis = q.get("column_indexes") or ([q["index"]] if "index" in q else [])
-        label = ROLE_LABEL_MAP.get(role, role)
+        label = (
+            "画像维度（仅引用标注）"
+            if is_profile_dim(view) and profile_scope(view) == "label"
+            else "画像维度（进入分析）"
+            if is_profile_dim(view)
+            else ROLE_LABEL_MAP.get(role, role)
+        )
         extra = ""
         if role in (
-            "single_choice", "profile_dim", "multi_choice", "matrix_single", "matrix_multi",
+            "single_choice", "multi_choice", "matrix_single", "matrix_multi",
         ) and q.get("options"):
             opts = "、".join(str(o) for o in q["options"][:12])
             extra += f"，选项: {opts}"
@@ -479,10 +492,10 @@ def _build_planner_query_with_confirmed(
     extra_instructions = _get_planner_extra()
 
     # 检测是否存在画像维度列，生成对应的画像约束指令
-    profile_dims = [q for q in confirmed_columns if (q.get("role") or q.get("confirmed_type")) == "profile_dim"]
+    profile_dims = [q for q in confirmed_columns if is_profile_grouping(role_view(q))]
     if not profile_dims:
         profile_constraint = (
-            "\n⚠️ 画像约束（严格执行）：本问卷中用户**没有将任何题目标注为画像维度**。\n"
+            "\n⚠️ 画像约束（严格执行）：本问卷中没有可进入画像分析的分组维度。\n"
             "- cross_tabs 数组**必须为空** []\n"
             "- open_questions **不得**建议将任何题目用作用户画像或分组维度\n"
             "- 报告不应包含任何「用户画像」/「人群结构」分析章节\n"
@@ -531,7 +544,7 @@ def _build_plan_revision_query(
     profile_indexes = sorted({
         col["index"]
         for col in (plan or {}).get("columns", [])
-        if col.get("role") == "profile_dim" and isinstance(col.get("index"), int)
+        if is_profile_grouping(col) and isinstance(col.get("index"), int)
     })
     if profile_indexes:
         profile_constraint = (
@@ -540,7 +553,7 @@ def _build_plan_revision_query(
         )
     else:
         profile_constraint = (
-            "6. 交叉分析约束：当前方案没有画像维度列，cross_tabs 必须为 []；"
+            "6. 交叉分析约束：当前方案没有可进入画像分析的分组维度，cross_tabs 必须为 []；"
             "不得输出 profile_index 为 null 的交叉分析项。\n"
         )
     local_scope_rule = (
@@ -3402,7 +3415,7 @@ def _format_rows_for_qa(rows: list[list], plan: dict) -> str:
 
     dump = "\n".join(json.dumps(row_obj(r), ensure_ascii=False) for r in body)
     if len(dump) > QA_MAX:
-        pidxs = [c["index"] for c in plan.get("columns", []) if c.get("role") == "profile_dim"]
+        pidxs = [c["index"] for c in plan.get("columns", []) if is_profile_grouping(c)]
         sampled = _stratified_sample(body, pidxs, 100)
         note = (
             f"# 原始数据共 {total} 行，超出上下文上限，已按画像维度分层抽样到 {len(sampled)} 行。\n\n"

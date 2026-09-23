@@ -235,6 +235,42 @@ $('btn-duplicate-report-rerun')?.addEventListener('click', () => {
 
 // COLUMN_MODEL_START: pure draft operations, also exercised by Node contract tests.
 function cloneColumn(value) { return JSON.parse(JSON.stringify(value)); }
+function profileAnalysisRoles() {
+  return typeof PROFILE_ANALYSIS_ROLES === 'undefined'
+    ? ['single_choice','multi_choice','scale','matrix_scale','matrix_single','matrix_multi']
+    : PROFILE_ANALYSIS_ROLES;
+}
+function profileLabelRoles() {
+  return typeof PROFILE_LABEL_ROLES === 'undefined'
+    ? [...profileAnalysisRoles(),'open_text']
+    : PROFILE_LABEL_ROLES;
+}
+function normalizeColumnProfile(c) {
+  const legacyProfile = c.role === 'profile_dim';
+  if (legacyProfile) c.role = 'single_choice';
+  const eligible = profileLabelRoles().includes(c.role);
+  c.use_as_profile = eligible && (legacyProfile || c.use_as_profile === true);
+  if (!c.use_as_profile) {
+    delete c.profile_scope;
+    return c;
+  }
+  c.profile_scope = legacyProfile ? 'analysis' : (c.profile_scope === 'label' ? 'label' : 'analysis');
+  if (!profileAnalysisRoles().includes(c.role)) c.profile_scope = 'label';
+  return c;
+}
+function columnProfileMode(c) {
+  if (!c.use_as_profile) return 'none';
+  return c.profile_scope === 'label' ? 'label' : 'analysis';
+}
+function setColumnProfileMode(c, mode) {
+  c.use_as_profile = mode === 'analysis' || mode === 'label';
+  if (c.use_as_profile) c.profile_scope = mode;
+  return normalizeColumnProfile(c);
+}
+function profileModeOptions(c) {
+  const mode = columnProfileMode(c);
+  return `<option value="none" ${mode==='none'?'selected':''}>不作为画像</option><option value="analysis" ${mode==='analysis'?'selected':''} ${profileAnalysisRoles().includes(c.role)?'':'disabled'}>画像 — 进入画像分析 + 引用标注</option><option value="label" ${mode==='label'?'selected':''}>画像 — 仅引用标注</option>`;
+}
 function columnQuestionKey(c) {
   const indexes = c.column_indexes?.length ? c.column_indexes : [c.column_index ?? c.index];
   return indexes.filter(v => v != null).map(Number).filter(Number.isFinite).sort((a,b) => a-b).join(':');
@@ -259,6 +295,7 @@ function columnSourceLabel(c, i, columns = []) {
 }
 function prepareColumnDraft(column) {
   const c = cloneColumn(column);
+  normalizeColumnProfile(c);
   c.options = [...(c.options || [])];
   (c.unmatched_values || []).filter(item => item.suggested_handling === 'standard_option').forEach(item => {
     if (!c.options.some(value => String(value).trim().toLocaleLowerCase() === String(item.value).trim().toLocaleLowerCase())) c.options.push(String(item.value));
@@ -266,7 +303,7 @@ function prepareColumnDraft(column) {
   c.options_original = [...(c.options_original || c.options)];
   c.value_aliases = cloneColumn(c.value_aliases || {});
   if ((c.unmatched_values || []).some(v => v.suggested_handling !== 'standard_option')) {
-    c.unmatched_handling = c.unmatched_handling || (c.other_text?.enabled === false || (c.role === 'profile_dim' && c.other_text?.enabled !== true) ? 'keep_raw' : 'as_other');
+    c.unmatched_handling = c.unmatched_handling || (c.other_text?.enabled === false || (columnProfileMode(c) === 'analysis' && c.other_text?.enabled !== true) ? 'keep_raw' : 'as_other');
     c.other_text = {...(c.other_text || {}), option:c.other_text?.option || 'Other / 其他', enabled:c.unmatched_handling !== 'keep_raw'};
   }
   return c;
@@ -288,11 +325,12 @@ function renameColumnOptions(c, entries) {
 }
 function serializeColumnDraft(column) {
   const c = cloneColumn(column);
+  normalizeColumnProfile(c);
   c.column_indexes = c.column_indexes || [c.column_index ?? c.index];
-  const choices = ['single_choice','multi_choice','profile_dim','matrix_single','matrix_multi'];
+  const choices = ['single_choice','multi_choice','matrix_single','matrix_multi'];
   if (choices.includes(c.role)) {
     const residuals = (c.unmatched_values || []).filter(v => v.suggested_handling !== 'standard_option');
-    if (c.role === 'profile_dim' && residuals.length) {
+    if (columnProfileMode(c) === 'analysis' && residuals.length) {
       c.unmatched_handling = c.unmatched_handling || (c.other_text?.enabled === true ? 'as_other' : 'keep_raw');
       if (c.unmatched_handling === 'keep_raw') c.other_text = {...(c.other_text || {}), enabled:false};
     }
@@ -307,6 +345,7 @@ function serializeColumnDraft(column) {
     }
     if (c.unmatched_handling === 'keep_raw' && residuals.length) c.other_text = {...(c.other_text || {}), enabled:false};
   }
+  normalizeColumnProfile(c);
   return c;
 }
 function selectedColumnsForSave(columns, keys) {
@@ -328,9 +367,10 @@ function columnRowHTML(c, i) {
   return `<article class="col-row qe-question-row${roleClass}" data-question-row="${i}">
     <label class="qe-question-select"><input type="checkbox" data-question-select="${i}" ${selected?'checked':''} ${isSelectableColumn(c)?'':'disabled'} aria-label="选择 ${esc(name)}" /></label>
     <span class="col-row__num qe-question-number">${esc(columnSourceLabel(c,i,state.columns))}</span>
-    <div class="qe-question-main"><strong>${esc(name)}</strong><div class="qe-question-preview">${preview.slice(0,3).map(v=>`<span>${esc(v)}</span>`).join('')}${preview.length>3?`<span>+${preview.length-3}</span>`:''}</div>${c.low_confidence?'<small class="qe-pending">待确认题型</small>':''}${isIdentityColumn(c)?'<small>身份字段 · 保留用于对应回答，不计入分析题数</small>':''}${isSubjectiveColumn(c)&&c.role!=='open_text'?'<small>包含已启用的其他填空</small>':''}</div>
+    <div class="qe-question-main"><strong>${esc(name)}</strong><div class="qe-question-preview">${preview.slice(0,3).map(v=>`<span>${esc(v)}</span>`).join('')}${preview.length>3?`<span>+${preview.length-3}</span>`:''}</div>${c.low_confidence?'<small class="qe-pending">待确认题型</small>':''}${isIdentityColumn(c)?'<small>身份字段 · 保留用于对应回答，不计入分析题数</small>':''}${isSubjectiveColumn(c)&&c.role!=='open_text'?'<small>包含已启用的其他填空</small>':''}${c.use_as_profile&&c.role==='open_text'?'<small class="qe-profile-notice">该题型不支持进入画像分析，已按仅标注处理</small>':''}</div>
     <span class="qe-response-count">${Number.isFinite(Number(responseCount))&&responseCount!=null?`${Number(responseCount)} 份回复`:''}</span>
     <select class="type-select" data-question-type="${i}" aria-label="${esc(name)}的题型">${options}</select>
+    <label class="qe-profile-toggle"><span>画像用途</span><select data-question-profile="${i}" ${PROFILE_LABEL_ROLES.includes(c.role)?'':'disabled'} aria-label="${esc(name)}的画像用途">${profileModeOptions(c)}</select></label>
     <button class="btn btn--ghost btn--sm" type="button" data-question-edit="${i}">编辑</button>
   </article>`;
 }
@@ -374,8 +414,10 @@ $('qe-columns-panel').addEventListener('change',event=>{
   if(surveyConfirmationIsLocked()) return;
   const selection=event.target.closest('[data-question-select]');
   if(selection){const key=columnQuestionKey(state.columns[Number(selection.dataset.questionSelect)]); const keys=new Set(state.selectedQuestionKeys);selection.checked?keys.add(key):keys.delete(key);state.selectedQuestionKeys=[...keys];renderQuestionList();}
+  const profile=event.target.closest('[data-question-profile]');
+  if(profile){const c=state.columns[Number(profile.dataset.questionProfile)];setColumnProfileMode(c,profile.value);renderQuestionList();}
   const type=event.target.closest('[data-question-type]');
-  if(type){state.columns[Number(type.dataset.questionType)].role=type.value;renderQuestionList();}
+  if(type){const c=state.columns[Number(type.dataset.questionType)];c.role=type.value;normalizeColumnProfile(c);renderQuestionList();}
 });
 $('qe-select-all').addEventListener('change',event=>{
   const keys=new Set(state.selectedQuestionKeys);
@@ -390,18 +432,19 @@ function renderColumnEditor() {
   $('qe-editor-number').textContent=columnSourceLabel(c,columnEditor.index,state.columns);
   $('qe-editor-title').textContent=c.name_zh||c.name||'编辑题目';
   const type=ROLE_OPTIONS.map(([value,label])=>`<option value="${value}" ${value===c.role?'selected':''}>${label}</option>`).join('');
-  let html=`<label class="qe-editor-field">题目名称<input data-edit-name value="${esc(c.name_zh||c.name||'')}" /></label><label class="qe-editor-field">题型<select data-edit-role>${type}</select></label><p class="qe-hint">对应原始列：${esc((c.column_indexes||[c.index]).join('、'))}。修改题型会保留其他题型的编辑设置。</p>`;
+  const profileNotice = c.use_as_profile && c.role === 'open_text' ? '<p class="qe-profile-notice">该题型不支持进入画像分析，已按仅标注处理</p>' : '';
+  let html=`<label class="qe-editor-field">题目名称<input data-edit-name value="${esc(c.name_zh||c.name||'')}" /></label><label class="qe-editor-field">题型<select data-edit-role>${type}</select></label><label class="qe-editor-field">画像用途<select data-edit-profile ${PROFILE_LABEL_ROLES.includes(c.role)?'':'disabled'}>${profileModeOptions(c)}</select></label>${profileNotice}<p class="qe-hint">进入画像分析会用于画像概览、分群对比和引用标注；仅引用标注只补充原文的受访者背景。对应原始列：${esc((c.column_indexes||[c.index]).join('、'))}。</p>`;
   if (CHOICE_ROLES.includes(c.role)) {
     html+=`<section><div class="qe-editor-section-title"><h3>选项与原值映射</h3><button class="btn btn--ghost" type="button" data-add-option>添加选项</button></div><p class="qe-hint">重命名会保留原值对应关系；勾选多个选项后可合并。</p><div id="qe-option-rows">${c.options.map((v,i)=>editorOptionHTML(v,i,c)).join('')}</div><div class="qe-merge-bar"><label>合并到 <select data-merge-target>${c.options.map((v,i)=>`<option value="${i}">${esc(v)}</option>`).join('')}</select></label><button class="btn btn--ghost" type="button" data-merge-options>合并勾选项</button></div></section>`;
   }
   if(['multi_choice','matrix_multi'].includes(c.role)) html+=`<label class="qe-editor-field">多选分隔符<input data-edit-delimiter value="${esc(c.delimiter==='\n'?'\\n':(c.delimiter||'，'))}" /><small>换行分隔请填写 \\n</small></label>`;
   if(['scale','matrix_scale'].includes(c.role)) html+=`<div class="qe-editor-range"><label>量表最小值<input type="number" data-edit-min value="${Number(c.scale_min??1)}" /></label><label>量表最大值<input type="number" data-edit-max value="${Number(c.scale_max??5)}" /></label></div>`;
   if(MATRIX_ROLES.includes(c.role)) html+=`<section><h3>矩阵子项</h3>${(c.column_indexes||[]).map((index,i)=>`<label class="qe-editor-field">原始列 ${index}<input data-edit-matrix="${i}" value="${esc(c.rows?.[i]||'')}" placeholder="子项名称" /></label>`).join('')}</section>`;
-  if(['single_choice','multi_choice','profile_dim'].includes(c.role)) {
+  if(['single_choice','multi_choice'].includes(c.role)) {
     const residuals=(c.unmatched_values||[]).filter(v=>v.suggested_handling!=='standard_option');
     html+=`<section><h3>其他填空</h3><label class="qe-other-enable"><input type="checkbox" data-edit-other ${c.other_text?.enabled!==false&&c.other_text?'checked':''}/>保留 Other / 其他填空，并纳入主观题分析</label>`;
     const renderResiduals = values => values.map(v=>`<p>${esc(v.value)} <small>${Number(v.count||0)} 条</small></p>`).join('');
-    const residualPreview = c.role === 'profile_dim' && residuals.length > 10
+    const residualPreview = columnProfileMode(c) === 'analysis' && residuals.length > 10
       ? renderResiduals(residuals.slice(0,10)) + `<details><summary>查看其余 ${residuals.length-10} 种取值</summary>${renderResiduals(residuals.slice(10))}</details>`
       : renderResiduals(residuals);
     if(residuals.length) html+=`<label class="qe-editor-field">未匹配内容处理<select data-edit-unmatched><option value="as_other" ${c.unmatched_handling!=='keep_raw'?'selected':''}>剩余内容按 Other 填空处理</option><option value="keep_raw" ${c.unmatched_handling==='keep_raw'?'selected':''}>剩余内容保留原值统计</option></select></label><p class="qe-hint">如需映射到已有选项，请把原值加入该选项的别名。</p><details><summary>${residuals.length} 种未匹配内容</summary>${residualPreview}</details>`;
@@ -414,6 +457,8 @@ function flushColumnEditor() {
   if(!columnEditor) return;
   const c=columnEditor.draft, root=$('qe-editor-body'), value=selector=>root.querySelector(selector)?.value;
   c.name_zh=value('[data-edit-name]')?.trim() || c.name_zh || c.name;
+  const profile=root.querySelector('[data-edit-profile]');
+  if(profile)setColumnProfileMode(c,profile.value);else normalizeColumnProfile(c);
   if(root.querySelector('[data-edit-option-row]')) renameColumnOptions(c,[...root.querySelectorAll('[data-edit-option-row]')].map(row=>({value:row.querySelector('[data-edit-option]').value,previous:row.dataset.previous,aliases:row.querySelector('[data-edit-alias]').value.split('\n').map(v=>v.trim()).filter(Boolean)})));
   else if(CHOICE_ROLES.includes(c.role)) {c.options=[];c.value_aliases={};}
   if(value('[data-edit-delimiter]')!=null)c.delimiter=value('[data-edit-delimiter]')==='\\n'?'\n':value('[data-edit-delimiter]');
@@ -467,7 +512,7 @@ $('qe-editor-save').addEventListener('click',()=>{
 $('qe-editor-body').addEventListener('change',event=>{
   if(event.target.matches('[data-edit-other]')) { const handling=$('qe-editor-body').querySelector('[data-edit-unmatched]'); if(handling)handling.value=event.target.checked?'as_other':'keep_raw'; }
   if(event.target.matches('[data-edit-unmatched]')) { const enabled=$('qe-editor-body').querySelector('[data-edit-other]'); if(enabled)enabled.checked=event.target.value==='as_other'; }
-  if(event.target.matches('[data-edit-role]')){const role=event.target.value;flushColumnEditor();columnEditor.draft.role=role;renderColumnEditor();}
+  if(event.target.matches('[data-edit-role]')){const role=event.target.value;flushColumnEditor();columnEditor.draft.role=role;normalizeColumnProfile(columnEditor.draft);renderColumnEditor();}
 });
 $('qe-editor-body').addEventListener('click',event=>{
   const add=event.target.closest('[data-add-option]');const remove=event.target.closest('[data-remove-option]');const merge=event.target.closest('[data-merge-options]');
@@ -677,8 +722,12 @@ function buildPlanHTML(plan, headers) {
     });
   });
 
-  const rolePresentation = role => ({
-    profile_dim: ['画像题', '统计各选项人数与占比'],
+  const rolePresentation = column => {
+    const legacyProfile = column.role === 'profile_dim';
+    const role = legacyProfile ? 'single_choice' : column.role;
+    if (legacyProfile || (column.use_as_profile === true && column.profile_scope !== 'label')) return ['画像题 · 进入分析', '用于画像概览、分群对比和引用标注'];
+    if (column.use_as_profile === true) return ['画像题 · 仅标注', '仅用于原文引用的受访者背景标注，不参与画像概览或分组对比'];
+    return ({
     single_choice: ['单选题', '统计各选项人数与占比'],
     multi_choice: ['多选题', '统计各选项选择人数与占比'],
     scale: ['量表题', '分析评分分布与集中趋势'],
@@ -686,7 +735,8 @@ function buildPlanHTML(plan, headers) {
     matrix_scale: ['矩阵量表', '按矩阵子项比较评分表现'],
     matrix_single: ['矩阵单选', '按矩阵子项比较单选分布'],
     matrix_multi: ['矩阵多选', '按矩阵子项比较选择分布'],
-  }[role] || ['分析题', '结合本题有效回答进行分析']);
+    }[role] || ['分析题', '结合本题有效回答进行分析']);
+  };
 
   const logicalIndexesFor = (idx, partSet) => {
     const col = colMap[idx];
@@ -715,7 +765,7 @@ function buildPlanHTML(plan, headers) {
     const logicalIndexes = logicalIndexesFor(idx, partSet);
     logicalIndexes.forEach(itemIdx => visited.add(itemIdx));
     const name = col.matrix_group || columnDisplayName(idx) || '未命名题目';
-    const [roleLabel, method] = rolePresentation(col.role);
+    const [roleLabel, method] = rolePresentation(col);
     const applicability = ruleByTargetIndex.get(idx);
     const applicabilityCoveredByPart = Boolean(
       applicability
@@ -729,6 +779,10 @@ function buildPlanHTML(plan, headers) {
         <span class="plan-outline__role">${esc(roleLabel)}</span>
       </div>
       <div class="plan-outline__method">${esc(method)}</div>`;
+
+    if (col.use_as_profile === true && col.role === 'open_text') {
+      itemHTML += '<div class="qe-profile-notice">该题型不支持进入画像分析，已按仅标注处理</div>';
+    }
 
     if (applicability && !nested && !applicabilityCoveredByPart) {
       const { rule, target } = applicability;

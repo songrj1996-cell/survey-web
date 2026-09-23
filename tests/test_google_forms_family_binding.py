@@ -146,7 +146,9 @@ class GoogleFormsFamilyBindingTests(unittest.TestCase):
             item for item in binding.columns_detected
             if item.source_question_id == "system:source_language"
         )
-        self.assertEqual(language_column.role, "profile_dim")
+        self.assertEqual(language_column.role, "single_choice")
+        self.assertTrue(language_column.use_as_profile)
+        self.assertEqual(language_column.profile_scope, "analysis")
         self.assertIn("排位", binding.rows[1])
         self.assertIn("排位", binding.rows[2])
 

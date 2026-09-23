@@ -943,6 +943,7 @@ def generate_annotated_excel(
     open_text_cols: list[int],
     id_col: int,
     tasks: dict,
+    completion: dict | None = None,
 ) -> bytes:
     """保留原表并追加可复核的 AI、质量、原文证据和中文翻译列。"""
     do_ai = bool(tasks.get("ai_detect"))
@@ -1000,7 +1001,11 @@ def generate_annotated_excel(
         output_row: list = []
         if do_ai:
             output_row.extend([
-                "高概率AI作答" if is_ai else "非高概率AI作答",
+                "高概率AI作答" if is_ai else (
+                    "待补齐" if not ai_info else (
+                        "待人工确认" if completion is not None and not completion.get("ai_confirmation_complete") else "非高概率AI作答"
+                    )
+                ),
                 ai_info.get("ai_prob", ""),
                 ai_info.get("polish_prob", ""),
                 ai_info.get("reason", ""),
@@ -1009,9 +1014,9 @@ def generate_annotated_excel(
             ])
         if do_quality:
             output_row.extend([
-                "高概率AI作答" if is_ai else canonical_quality_label(
+                "高概率AI作答" if is_ai else ("待补齐" if quality_info.get("overall_pending") else canonical_quality_label(
                     quality_info.get("overall", ""), overall=True,
-                ),
+                ) or "待补齐"),
                 "已确认高概率AI作答，不进入质量打标" if is_ai else quality_overall_display_reason(quality_info),
             ])
 
@@ -1023,12 +1028,17 @@ def generate_annotated_excel(
                 value = "-" if is_ai else canonical_quality_label(
                     (quality_info.get("q_labels") or {}).get(key, "")
                 )
+                if not is_ai and value not in {"无效反馈", "有效反馈", "优秀反馈", "N/A"}:
+                    original = row_data[col_idx] if col_idx < len(row_data) else ""
+                    value = "待补齐" if str(original or "").strip() else "N/A"
             elif spec_type == "quality_reason":
                 value = "-" if is_ai else (quality_info.get("q_reasons") or {}).get(key, "")
             elif spec_type == "quality_evidence":
                 value = "-" if is_ai else (quality_info.get("q_evidence") or {}).get(key, "")
             elif spec_type == "translation":
                 value = translations.get(key, "")
+                if not value and col_idx < len(row_data) and str(row_data[col_idx] or "").strip():
+                    value = "待补齐"
             else:
                 value = row_data[col_idx] if col_idx < len(row_data) else ""
             output_row.append(value)
@@ -1059,6 +1069,23 @@ def generate_annotated_excel(
         ws.column_dimensions[letter].width = width
 
     ws.freeze_panes = "A2"
+    if completion is not None:
+        summary = wb.create_sheet("完成情况")
+        summary.append(["项目", "说明"])
+        summary.append(["任务状态", "部分完成" if completion.get("partial") else "已完成"])
+        summary.append(["说明", "仅已完成的判断可用于质量结论；待补齐不是无效或普通。原始回答全部保留。"])
+        summary.append(["样本数", completion.get("total", 0)])
+        summary.append(["完整样本数", completion.get("complete", 0)])
+        summary.append(["待补齐样本数", len(completion.get("missing_ids", []))])
+        summary.append(["详细状态", completion.get("detail", "")])
+        summary.append(["玩家ID", "待补齐内容"])
+        for player_id, parts in completion.get("gaps", {}).items():
+            summary.append([player_id, "、".join(parts)])
+        summary.column_dimensions["A"].width = 28
+        summary.column_dimensions["B"].width = 90
+        for row in summary:
+            for cell in row:
+                cell.alignment = Alignment(vertical="top", wrap_text=True)
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()

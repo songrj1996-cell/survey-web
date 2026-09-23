@@ -4,6 +4,7 @@ from copy import deepcopy
 
 from app.services.question_detect import (
     _build_column_detect_query,
+    _enrich_questions,
     _group_googleform_matrix,
     _heuristic_questions,
     _heuristic_type,
@@ -15,12 +16,37 @@ from app.core.ranking import diagnose_matrix_ranking, parse_rank_value
 
 
 class QuestionDetectTests(unittest.TestCase):
+    def test_enrichment_normalizes_profile_scope_without_rejecting_stale_combinations(self):
+        questions = [
+            {
+                "name_zh": "熟练英雄",
+                "role": "open_text",
+                "use_as_profile": True,
+                "profile_scope": "analysis",
+                "column_indexes": [0],
+            },
+            {
+                "name_zh": "用户编号",
+                "role": "id",
+                "use_as_profile": True,
+                "profile_scope": "label",
+                "column_indexes": [1],
+            },
+        ]
+
+        result = _enrich_questions(questions, ["熟练英雄", "用户编号"], [])
+
+        self.assertTrue(result[0]["use_as_profile"])
+        self.assertEqual(result[0]["profile_scope"], "label")
+        self.assertFalse(result[1]["use_as_profile"])
+        self.assertNotIn("profile_scope", result[1])
+
     def test_profile_partial_aliases_recover_repeated_ranks_without_guessing_translation(self):
         counts = {"Epic": 3, "Mythical Glory": 31, "Mythical Immortal": 35,
                   "I don't play Ranked": 1, "Mythic": 8, "Legend": 4,
                   "Mythical Honor": 12, "Di bawah Epic": 1}
         rows = [["rank"]] + [[value] for value, count in counts.items() for _ in range(count)]
-        q = {"role": "profile_dim", "column_indexes": [0],
+        q = {"role": "single_choice", "use_as_profile": True, "column_indexes": [0],
              "value_aliases": {"史诗以下": ["Di bawah Epic"], "不玩排位": ["I don't play Ranked"]}}
         result = _sanitize_choice_options(rows, [q])[0]
         self.assertEqual(len(result["options"]), 8)
@@ -31,7 +57,7 @@ class QuestionDetectTests(unittest.TestCase):
 
     def test_profile_complete_aliases_are_preserved_without_duplicate_raw_options(self):
         rows = [["rank"], ["Epic"], ["Epic"], ["Legend"], ["Legend"]]
-        q = {"role": "profile_dim", "column_indexes": [0], "options": ["史诗", "传奇"],
+        q = {"role": "single_choice", "use_as_profile": True, "column_indexes": [0], "options": ["史诗", "传奇"],
              "value_aliases": {"史诗": ["Epic"], "传奇": ["Legend"]}}
         result = _sanitize_choice_options(rows, [deepcopy(q)])[0]
         self.assertEqual(result["options"], q["options"])
@@ -49,7 +75,7 @@ class QuestionDetectTests(unittest.TestCase):
             for declared in ({}, {"options": ["Known"], "value_aliases": {"Known": ["Known"]}}):
                 with self.subTest(distinct=len(set(values)), declared=bool(declared)):
                     rows = [["profile"]] + [[v] for v in values]
-                    q = {"role": "profile_dim", "column_indexes": [0], **deepcopy(declared)}
+                    q = {"role": "single_choice", "use_as_profile": True, "column_indexes": [0], **deepcopy(declared)}
                     result = _sanitize_choice_options(rows, [q])[0]
                     self.assertEqual(result["options"], declared.get("options", []))
                     self.assertEqual(sum(v["count"] for v in result["unmatched_values"]), len(values))
@@ -57,22 +83,22 @@ class QuestionDetectTests(unittest.TestCase):
 
     def test_profile_rare_values_and_multiple_choice_combinations_are_not_auto_added(self):
         rows = [["profile"], *[["A"]]*5, *[["B"]]*5, ["rare"], ["Other"]]
-        result = _sanitize_choice_options(rows, [{"role": "profile_dim", "column_indexes": [0]}])[0]
+        result = _sanitize_choice_options(rows, [{"role": "single_choice", "use_as_profile": True, "column_indexes": [0]}])[0]
         self.assertEqual(result["options"], ["A", "B"])
         self.assertEqual({x["value"] for x in result["unmatched_values"]}, {"rare", "Other"})
         rows = [["profile"], *[["A, B"]]*5, *[["B, C"]]*5]
-        result = _sanitize_choice_options(rows, [{"role": "profile_dim", "choice_mode": "multiple", "column_indexes": [0]}])[0]
+        result = _sanitize_choice_options(rows, [{"role": "single_choice", "use_as_profile": True, "choice_mode": "multiple", "column_indexes": [0]}])[0]
         self.assertEqual(result["options"], [])
         self.assertEqual(len(result["unmatched_values"]), 2)
 
     def test_profile_recovery_requires_majority_coverage_and_respects_vocabulary_boundary(self):
         values = ["A"]*2 + ["B"]*2 + [f"rare {i}" for i in range(6)]
         result = _sanitize_choice_options([["profile"]]+[[v] for v in values],
-                                         [{"role": "profile_dim", "column_indexes": [0]}])[0]
+                                         [{"role": "single_choice", "use_as_profile": True, "column_indexes": [0]}])[0]
         self.assertEqual(result["options"], [])
         values = [f"category {i}" for i in range(20) for _ in range(2)]
         result = _sanitize_choice_options([["profile"]]+[[v] for v in values],
-                                         [{"role": "profile_dim", "column_indexes": [0]}])[0]
+                                         [{"role": "single_choice", "use_as_profile": True, "column_indexes": [0]}])[0]
         self.assertEqual(len(result["options"]), 20)
 
     def test_profile_query_requires_complete_categories_but_not_free_text_expansion(self):

@@ -1,7 +1,7 @@
 """调研分析的"分析方案"数据结构 + 解析 + 卡片渲染 + 用户意图判断。
 
 planner Dify 应用输出一段 JSON（用 ```json 围栏包），描述这份问卷怎么分析：
-- columns: 每列的角色（id / profile_dim / single_choice / multi_choice / scale / open_text / ignore）
+- columns: 每列的题型，以及是否用作画像维度
 - parts:   报告章节划分（每个 part 内同时含客观题和主观题，**不**按题型割裂）
 - cross_tabs: 画像 × 题目的交叉分析建议
 - analysis_focus: 可选的报告分析主线与交付要求
@@ -17,10 +17,18 @@ import re
 from copy import deepcopy
 from typing import Any
 
+from app.core.column_roles import (
+    is_profile_dim,
+    is_profile_grouping,
+    normalize_profile_fields,
+    profile_scope,
+    question_type,
+)
+
 VALID_ROLES = {
     "id",
     "mlbbid",
-    "profile_dim",
+    "profile_dim",  # 仅兼容旧 plan；新数据统一使用 single_choice + use_as_profile
     "single_choice",
     "multi_choice",
     "scale",
@@ -80,6 +88,23 @@ def parse_plan_from_llm(
     if ignore_analysis_focus:
         data.pop("analysis_focus", None)
 
+    columns = data.get("columns")
+    cross_tabs = data.get("cross_tabs")
+    if isinstance(columns, list) and isinstance(cross_tabs, list):
+        profile_indexes = {
+            column.get("index")
+            for column in columns
+            if isinstance(column, dict) and is_profile_dim(column)
+        }
+        data["cross_tabs"] = [
+            cross_tab
+            for cross_tab in cross_tabs
+            if not (
+                isinstance(cross_tab, dict)
+                and cross_tab.get("question_index") in profile_indexes
+            )
+        ]
+
     err = _validate_plan(
         data,
         header_count,
@@ -87,6 +112,8 @@ def parse_plan_from_llm(
     )
     if err:
         return None, err
+    for column in data["columns"]:
+        normalize_profile_fields(column)
     return data, None
 
 
@@ -261,9 +288,13 @@ def _validate_plan(
         if idx in seen_indexes:
             return f"duplicate column index: {idx}"
         seen_indexes.add(idx)
-        role = c.get("role")
-        if role not in VALID_ROLES:
-            return f"invalid role: {role}"
+        raw_role = c.get("role")
+        if raw_role not in VALID_ROLES:
+            return f"invalid role: {raw_role}"
+        if "use_as_profile" in c and not isinstance(c.get("use_as_profile"), bool):
+            return f"column {idx} use_as_profile must be boolean"
+        normalize_profile_fields(c)
+        role = question_type(c)
         if role == "multi_choice" and not c.get("delimiter"):
             # 允许 LLM 不给 delimiter，下游会启发式识别；不报错
             pass
@@ -300,7 +331,7 @@ def _validate_plan(
     # id / ignore 不参与章节统计，允许不在任何 part 里；其他角色必须至少归到一个 part。
     # 带单选题筛选条件的 Part 可以复用同一组业务题，用于按互斥选项分别成章。
     must_be_in_part = {
-        c["index"] for c in cols if c["role"] not in NON_STAT_ROLES
+        c["index"] for c in cols if question_type(c) not in NON_STAT_ROLES
     }
     for p in parts:
         if not isinstance(p, dict):
@@ -318,8 +349,13 @@ def _validate_plan(
             filter_idx = part_filter.get("column_index")
             allowed = part_filter.get("allowed_options")
             filter_col = cols_by_index.get(filter_idx)
-            if not filter_col or filter_col.get("role") != "single_choice":
+            if not filter_col or question_type(filter_col) != "single_choice":
                 return f"part {p.get('name')!r} filter must reference a single_choice column"
+            if not isinstance(filter_col.get("options"), list) or not any(
+                isinstance(option, str) and option.strip()
+                for option in filter_col.get("options") or []
+            ):
+                return f"part {p.get('name')!r} filter column must declare options"
             if not isinstance(allowed, list) or not allowed or any(
                 not isinstance(option, str) or not option.strip() for option in allowed
             ):
@@ -374,7 +410,7 @@ def _validate_plan(
         parent_placements = part_index_filters.get(filter_idx) or []
         if not any(placement is None for placement in parent_placements):
             return f"filter column {filter_idx} must appear in an unfiltered overview part"
-    # 必须分章节的列（即 profile_dim / single_choice / multi_choice / scale / open_text）
+    # 必须分章节的列（即所有参与统计的题型）
     # 必须恰好出现在某个 part 里
     part_indexes_seen = set(part_index_filters)
     missing = must_be_in_part - part_indexes_seen
@@ -387,7 +423,7 @@ def _validate_plan(
     cross_tabs = data.get("cross_tabs", [])
     if cross_tabs and not isinstance(cross_tabs, list):
         return "cross_tabs must be list"
-    profile_dims = {c["index"] for c in cols if c["role"] == "profile_dim"}
+    profile_dims = {c["index"] for c in cols if is_profile_grouping(c)}
     for ct in cross_tabs:
         if not isinstance(ct, dict):
             return "cross_tabs contains non-object"
@@ -421,6 +457,8 @@ _ROLE_LABELS: dict[str, tuple[str, str]] = {
     "id": ("🆔", "用户ID（不参与统计）"),
     "mlbbid": ("🎮", "MLBB ID（不参与统计）"),
     "profile_dim": ("📊", "画像维度"),
+    "profile_analysis": ("📊", "画像 · 进入分析与引用标注"),
+    "profile_label": ("🏷️", "画像 · 仅引用标注"),
     "single_choice": ("✅", "单选题"),
     "multi_choice": ("☑️", "多选题"),
     "scale": ("🔢", "量表题"),
@@ -433,7 +471,7 @@ _ROLE_LABELS: dict[str, tuple[str, str]] = {
 
 # 渲染顺序
 _ROLE_ORDER = (
-    "id", "mlbbid", "profile_dim", "single_choice", "multi_choice",
+    "id", "mlbbid", "profile_dim", "profile_analysis", "profile_label", "single_choice", "multi_choice",
     "scale", "matrix_scale", "matrix_single", "matrix_multi", "open_text", "ignore",
 )
 
@@ -442,7 +480,11 @@ def render_plan_for_user(plan: dict, headers: list[str]) -> str:
     """渲染 plan 成飞书卡片 markdown。"""
     cols_by_role: dict[str, list[dict]] = {}
     for c in plan["columns"]:
-        cols_by_role.setdefault(c["role"], []).append(c)
+        if is_profile_dim(c):
+            display_role = "profile_label" if profile_scope(c) == "label" else "profile_analysis"
+        else:
+            display_role = question_type(c)
+        cols_by_role.setdefault(display_role, []).append(c)
 
     lines: list[str] = ["📋 **我的分析方案，请你确认**", ""]
 
@@ -477,10 +519,13 @@ def render_plan_for_user(plan: dict, headers: list[str]) -> str:
         for c in cols:
             name = c.get("name") or _short_name(headers, c["index"])
             extra = ""
-            if role == "multi_choice" and c.get("delimiter"):
+            actual_role = question_type(c)
+            if actual_role == "multi_choice" and c.get("delimiter"):
                 extra = f"（分隔符: `{c['delimiter']}`）"
-            elif role == "scale":
+            elif actual_role == "scale":
                 extra = f"（{c.get('min')}–{c.get('max')}）"
+            elif role == "profile_label" and actual_role == "open_text":
+                extra = "（开放题不支持进入画像分析，已按仅标注处理）"
             lines.append(f"    · {name}{extra}")
             # 每列下方展示同义合并（如果有）
             aliases = c.get("value_aliases") or {}
@@ -528,7 +573,11 @@ def render_plan_for_user(plan: dict, headers: list[str]) -> str:
         lines.append("⚠️ **信心较低的列**（请你确认我猜对没）")
         for c in low_conf:
             name = c.get("name") or _short_name(headers, c["index"])
-            emoji, label = _ROLE_LABELS.get(c["role"], ("", c["role"]))
+            if is_profile_dim(c):
+                display_role = "profile_label" if profile_scope(c) == "label" else "profile_analysis"
+            else:
+                display_role = question_type(c)
+            emoji, label = _ROLE_LABELS.get(display_role, ("", display_role))
             lines.append(f"  · {name} → {emoji} {label}（信心: {c['confidence']}）")
         lines.append("")
 
@@ -711,9 +760,13 @@ def parse_columns_from_llm(
     for q in questions:
         if not isinstance(q, dict):
             return None, "questions contains non-object"
-        role = q.get("role")
-        if role not in VALID_ROLES:
-            return None, f"invalid role: {role}"
+        raw_role = q.get("role")
+        if raw_role not in VALID_ROLES:
+            return None, f"invalid role: {raw_role}"
+        if "use_as_profile" in q and not isinstance(q.get("use_as_profile"), bool):
+            return None, f"question {q.get('name_zh')!r} use_as_profile must be boolean"
+        normalize_profile_fields(q)
+        role = question_type(q)
         cis = q.get("column_indexes")
         if not isinstance(cis, list) or not cis:
             return None, f"question {q.get('name_zh')!r} missing column_indexes"
@@ -760,58 +813,71 @@ def expand_confirmed_to_columns(confirmed: list[dict]) -> list[dict]:
     """
     out: list[dict] = []
     for q in confirmed:
-        role = q.get("role") or "single_choice"
-        name = (q.get("name_zh") or q.get("name") or "").strip()
-        cis = q.get("column_indexes") or []
+        normalized = normalize_profile_fields(deepcopy(q))
+        role = question_type(normalized) or "single_choice"
+        profile = is_profile_dim(normalized)
+        scope = profile_scope(normalized) if profile else None
+        name = (normalized.get("name_zh") or normalized.get("name") or "").strip()
+        cis = normalized.get("column_indexes") or []
         # 同义归并映射（多语种/异写）——选项题才有意义
-        aliases = q.get("value_aliases") if isinstance(q.get("value_aliases"), dict) else None
+        aliases = normalized.get("value_aliases") if isinstance(normalized.get("value_aliases"), dict) else None
         if role in MATRIX_ROLES:
-            rows = q.get("rows") or []
+            rows = normalized.get("rows") or []
             for k, idx in enumerate(cis):
                 row_label = rows[k] if k < len(rows) else f"行{k + 1}"
                 col: dict = {
                     "index": idx,
                     "role": role,
+                    "use_as_profile": profile,
                     "name": f"{name} - {row_label}" if name else row_label,
                     "matrix_group": name or "矩阵题",
                     "matrix_row": row_label,
                 }
+                if profile:
+                    col["profile_scope"] = scope
                 if role == "matrix_scale":
-                    col["min"] = q.get("scale_min")
-                    col["max"] = q.get("scale_max")
+                    col["min"] = normalized.get("scale_min")
+                    col["max"] = normalized.get("scale_max")
                 if role in ("matrix_single", "matrix_multi"):
-                    if q.get("options"):
-                        col["options"] = list(q["options"])
-                    if q.get("options_original"):
-                        col["options_original"] = list(q["options_original"])
-                    if role == "matrix_multi" and q.get("delimiter"):
-                        col["delimiter"] = q["delimiter"]
+                    if normalized.get("options"):
+                        col["options"] = list(normalized["options"])
+                    if normalized.get("options_original"):
+                        col["options_original"] = list(normalized["options_original"])
+                    if role == "matrix_multi" and normalized.get("delimiter"):
+                        col["delimiter"] = normalized["delimiter"]
                     if aliases:
                         col["value_aliases"] = aliases
-                    if role == "matrix_single" and q.get("analysis_semantic") == "ranking":
+                    if role == "matrix_single" and normalized.get("analysis_semantic") == "ranking":
                         col["analysis_semantic"] = "ranking"
-                        col["ranking_size"] = q.get("ranking_size") or len(cis)
+                        col["ranking_size"] = normalized.get("ranking_size") or len(cis)
                         col["rank_direction"] = "lower_is_better"
                 out.append(col)
         else:
             idx = cis[0]
-            col = {"index": idx, "role": role, "name": name or None}
-            if role in ("single_choice", "profile_dim", "multi_choice"):
-                if q.get("options"):
-                    col["options"] = list(q["options"])
-                if q.get("options_original"):
-                    col["options_original"] = list(q["options_original"])
+            col = {
+                "index": idx,
+                "role": role,
+                "use_as_profile": profile,
+                "name": name or None,
+            }
+            if profile:
+                col["profile_scope"] = scope
+            if role in ("single_choice", "multi_choice"):
+                if normalized.get("options"):
+                    col["options"] = list(normalized["options"])
+                if normalized.get("options_original"):
+                    col["options_original"] = list(normalized["options_original"])
             if role == "multi_choice":
-                if q.get("delimiter"):
-                    col["delimiter"] = q["delimiter"]
+                if normalized.get("delimiter"):
+                    col["delimiter"] = normalized["delimiter"]
             if role == "scale":
-                col["min"] = q.get("scale_min")
-                col["max"] = q.get("scale_max")
-            # single_choice / profile_dim / multi_choice 都可带同义归并
-            if aliases and role in ("single_choice", "profile_dim", "multi_choice"):
+                col["min"] = normalized.get("scale_min")
+                col["max"] = normalized.get("scale_max")
+            # single_choice / multi_choice 都可带同义归并
+            if aliases and role in ("single_choice", "multi_choice"):
                 col["value_aliases"] = aliases
-            if role in ("single_choice", "multi_choice") and isinstance(q.get("other_text"), dict):
-                col["other_text"] = dict(q["other_text"])
+            if role in ("single_choice", "multi_choice") and isinstance(normalized.get("other_text"), dict):
+                col["other_text"] = dict(normalized["other_text"])
             out.append(col)
     return out
 
@@ -822,7 +888,7 @@ def merge_confirmed_into_plan(plan: dict, confirmed: list[dict]) -> dict:
     """
     new_cols = expand_confirmed_to_columns(confirmed)
     plan["columns"] = new_cols
-    valid_idx = {c["index"] for c in new_cols if c["role"] not in NON_STAT_ROLES}
+    valid_idx = {c["index"] for c in new_cols if question_type(c) not in NON_STAT_ROLES}
 
     # part 修补：保留 planner 的章节划分，但只留合法索引；矩阵成员对齐到兄弟列所在 part
     parts = plan.get("parts") or []
@@ -837,7 +903,7 @@ def merge_confirmed_into_plan(plan: dict, confirmed: list[dict]) -> dict:
     # 矩阵题：把同 group 的成员列都塞进「已有任一成员所在」的 part
     groups: dict[str, list[int]] = {}
     for c in new_cols:
-        if c["role"] in MATRIX_ROLES:
+        if question_type(c) in MATRIX_ROLES:
             groups.setdefault(c["matrix_group"], []).append(c["index"])
     for members in groups.values():
         target_pis = sorted({pi for i in members for pi in placed.get(i, set())})
@@ -862,19 +928,28 @@ def merge_confirmed_into_plan(plan: dict, confirmed: list[dict]) -> dict:
                 placed.setdefault(i, set()).add(target_pi)
 
     # 任何「应入 part 但没落位」的统计列，兜底塞进第一个 part
-    must = {c["index"] for c in new_cols if c["role"] not in NON_STAT_ROLES}
+    must = {c["index"] for c in new_cols if question_type(c) not in NON_STAT_ROLES}
     missing = must - set(placed)
     if missing and parts:
         parts[0]["column_indexes"].extend(sorted(missing))
 
-    # cross_tabs：丢弃引用了非法/矩阵列的项（矩阵 × 画像本期不算）
-    matrix_idx = {c["index"] for c in new_cols if c["role"] in MATRIX_ROLES}
-    profile_idx = {c["index"] for c in new_cols if c["role"] == "profile_dim"}
+    # cross_tabs：丢弃引用了非法/矩阵/画像题目列的项
+    matrix_idx = {c["index"] for c in new_cols if question_type(c) in MATRIX_ROLES}
+    profile_idx = {c["index"] for c in new_cols if is_profile_dim(c)}
+    grouping_profile_idx = {
+        c["index"] for c in new_cols if is_profile_grouping(c)
+    }
     cleaned_ct = []
     for ct in plan.get("cross_tabs") or []:
         pi = ct.get("profile_index")
         qi = ct.get("question_index")
-        if pi in profile_idx and qi in valid_idx and qi not in matrix_idx and qi != pi:
+        if (
+            pi in grouping_profile_idx
+            and qi in valid_idx
+            and qi not in matrix_idx
+            and qi not in profile_idx
+            and qi != pi
+        ):
             cleaned_ct.append(ct)
     plan["cross_tabs"] = cleaned_ct
     return plan
