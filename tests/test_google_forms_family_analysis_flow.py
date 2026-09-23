@@ -149,7 +149,14 @@ class GoogleFormsFamilyAnalysisFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["languages"], ["en", "id"])
         self.assertEqual(payload["duplicate_response_count"], 1)
         self.assertEqual(stored["column_provider"], "questionnaire")
-        self.assertEqual(ready["columns"], stored["columns_detected"])
+        persisted_view = deepcopy(ready["columns"])
+        for column in persisted_view:
+            self.assertIn("response_count", column)
+            self.assertIn("empty_column", column)
+            column.pop("response_count")
+            column.pop("empty_column")
+        self.assertEqual(persisted_view, stored["columns_detected"])
+        self.assertTrue(all("response_count" not in column for column in stored["columns_detected"]))
         self.assertFalse(requires_llm)
         self.assertEqual(
             stored["questionnaire_family_ref"]["family_id"],
@@ -215,7 +222,12 @@ class GoogleFormsFamilyAnalysisFlowTests(unittest.IsolatedAsyncioTestCase):
         plan = {
             "columns": [
                 {"index": 1, "name": "原因", "role": "open_text"},
-                {"index": 5, "name": "来源语言", "role": "profile_dim"},
+                {
+                    "index": 5,
+                    "name": "来源语言",
+                    "role": "single_choice",
+                    "use_as_profile": True,
+                },
                 {"index": 6, "name": "Google 回答来源", "role": "id"},
             ],
             "parts": [{"name": "Feedback", "column_indexes": [1]}],

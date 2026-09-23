@@ -30,6 +30,8 @@ class SnapshotDetectedColumn:
     name_zh: str
     role: str
     column_indexes: tuple[int, ...]
+    use_as_profile: bool = False
+    profile_scope: str | None = None
     source_question_id: str | None = None
     delimiter: str | None = None
     options: tuple[str, ...] = ()
@@ -42,10 +44,13 @@ class SnapshotDetectedColumn:
         value: dict[str, Any] = {
             "name_zh": self.name_zh,
             "role": self.role,
+            "use_as_profile": self.use_as_profile,
             "column_indexes": list(self.column_indexes),
         }
         if self.source_question_id is not None:
             value["source_question_id"] = self.source_question_id
+        if self.use_as_profile:
+            value["profile_scope"] = self.profile_scope or "analysis"
         if self.delimiter is not None:
             value["delimiter"] = self.delimiter
         if self.options:
@@ -197,8 +202,10 @@ def _question_columns(
     headers.append("来源语言")
     detected.append(SnapshotDetectedColumn(
         name_zh="来源语言",
-        role="profile_dim",
+        role="single_choice",
         column_indexes=(language_index,),
+        use_as_profile=True,
+        profile_scope="analysis",
         source_question_id="system:source_language",
         options=tuple(item.language for item in family.variants),
     ))

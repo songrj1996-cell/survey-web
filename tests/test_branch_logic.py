@@ -18,6 +18,29 @@ def _question(name, role, index, **extra):
 
 
 class BranchLogicTests(unittest.TestCase):
+    def test_legacy_and_current_profile_columns_remain_valid_branch_parents(self):
+        rows = [["画像", "后续题"]]
+        rows += [["A", "回答"] for _ in range(3)]
+        rows += [["B", ""] for _ in range(3)]
+
+        for parent in (
+            _question("画像", "profile_dim", 0, options=["A", "B"]),
+            _question(
+                "画像",
+                "single_choice",
+                0,
+                use_as_profile=True,
+                options=["A", "B"],
+            ),
+        ):
+            with self.subTest(role=parent["role"]):
+                rules = infer_branch_rules(
+                    rows,
+                    [parent, _question("后续题", "open_text", 1)],
+                )
+                self.assertEqual(len(rules), 1)
+                self.assertEqual(rules[0]["allowed_options"], ["A"])
+
     def test_multilingual_aliases_are_merged_before_inference(self):
         columns = [
             _question(

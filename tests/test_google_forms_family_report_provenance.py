@@ -99,7 +99,12 @@ class GoogleFormsFamilyReportProvenanceTests(unittest.IsolatedAsyncioTestCase):
             "columns": [
                 {"index": 0, "name": "偏好模式", "role": "single_choice"},
                 {"index": 1, "name": "原因", "role": "open_text"},
-                {"index": 5, "name": "来源语言", "role": "profile_dim"},
+                {
+                    "index": 5,
+                    "name": "来源语言",
+                    "role": "single_choice",
+                    "use_as_profile": True,
+                },
                 {"index": 6, "name": "Google 回答来源", "role": "id"},
             ],
             "parts": [{"name": "Feedback", "column_indexes": [1]}],

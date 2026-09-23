@@ -160,8 +160,8 @@ class PromptCatalogTests(unittest.TestCase):
             migrated["column_detect_system"]["current"],
             prompt_storage.DEFAULT_PROMPTS["column_detect_system"]["current"],
         )
-        self.assertEqual(migrated["column_detect_system"]["version"], 2)
-        self.assertEqual(migrated["survey_planner_system"]["version"], 4)
+        self.assertEqual(migrated["column_detect_system"]["version"], 4)
+        self.assertEqual(migrated["survey_planner_system"]["version"], 7)
         self.assertEqual(migrated["writer_requirements"]["version"], 15)
         self.assertEqual(migrated["annotate_quality_system"]["version"], 12)
         self.assertEqual(migrated["theme_extract_system"]["version"], 3)
@@ -199,7 +199,10 @@ class PromptCatalogTests(unittest.TestCase):
 
     def test_version_bumps_refresh_defaults_but_preserve_custom_content(self):
         for key, previous_version in (
+            ("column_detect_system", 3),
             ("survey_planner_system", 3),
+            ("survey_planner_system", 5),
+            ("survey_planner_system", 6),
             ("writer_requirements", 11),
             ("annotate_quality_system", 4),
             ("annotate_quality_system", 5),
@@ -251,6 +254,13 @@ class PromptCatalogTests(unittest.TestCase):
                     self.assertEqual(persisted[key], migrated[key])
                     self.assertEqual(migrated, second)
                     self.assertEqual(first_hash, second_hash)
+
+    def test_survey_planner_prompt_forbids_profile_as_cross_tab_question(self):
+        prompt = prompt_storage.DEFAULT_PROMPTS["survey_planner_system"]["current"]
+
+        self.assertIn("question_index", prompt)
+        self.assertIn("不得指向任何 use_as_profile=true 的列", prompt)
+        self.assertIn("禁止生成“画像 × 画像”", prompt)
 
     def test_qualitative_prompts_use_semantic_boundaries_without_count_caps(self):
         extract_prompt = prompt_storage.DEFAULT_PROMPTS["theme_extract_system"]["current"]

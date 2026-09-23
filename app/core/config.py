@@ -638,7 +638,9 @@ DEFAULT_COLUMN_DETECT_SYSTEM_PROMPT = """\
   "questions": [
     {
       "name_zh": "中文题名（把英文/原文题目翻译成简洁中文；已是中文则原样精简）",
-      "role": "single_choice|multi_choice|scale|profile_dim|open_text|id|mlbbid|matrix_scale|matrix_single|matrix_multi|ignore",
+      "role": "single_choice|multi_choice|scale|open_text|id|mlbbid|matrix_scale|matrix_single|matrix_multi|ignore",
+      "use_as_profile": false,
+      "profile_scope": "analysis|label",
       "column_indexes": [0],
       "delimiter": "，",
       "options": ["选项A", "选项B"],
@@ -660,7 +662,7 @@ DEFAULT_COLUMN_DETECT_SYSTEM_PROMPT = """\
   选项中本身可能包含逗号，不能因此错误拆分。
 - scale_min/scale_max：scale 和 matrix_scale 必填。
 - rows：matrix_scale / matrix_single / matrix_multi 必填，与 column_indexes 顺序一一对应。
-- value_aliases：仅对 single_choice / profile_dim / multi_choice / matrix_single / matrix_multi 给出。
+- value_aliases：仅对 single_choice / multi_choice / matrix_single / matrix_multi 给出。
   把确属同义但写法或语种不同的取值归到同一个中文标准值；拿不准就不合并。
   options 使用中文标准值。无同义可并时可省略或给 {}。
 
@@ -668,7 +670,13 @@ DEFAULT_COLUMN_DETECT_SYSTEM_PROMPT = """\
 - 玩家 ID、编号、邮箱 → id；明确是 MLBB 游戏内 ID → mlbbid；提交时间戳、序号等
   无分析价值的字段 → ignore。
 - 年龄段、段位、地区、性别、游戏年限、每日游戏时长、付费层级、主玩位置、英雄类型、
-  设备等可用于分群对比的字段 → profile_dim。
+  设备等用户背景字段可设置 use_as_profile=true，题型仍按真实回答结构判断，不因画像用途改变。
+- use_as_profile 必须是布尔值。为 true 时 profile_scope 必须是 analysis 或 label：适合稳定分群、
+  概览和交叉对比的写 analysis；只是补充用户信息、没有可靠分群意义的写 label。
+- 兼容旧数据：use_as_profile=true 但缺少 profile_scope 时按 analysis；use_as_profile=false 时忽略 profile_scope。
+- single_choice、multi_choice、scale、matrix_scale、matrix_single、matrix_multi 可使用 analysis 或 label；
+  open_text 只能使用 label；id、mlbbid、ignore 的 use_as_profile 必须为 false。
+- 多选画像进入 analysis 时按选项分别计入分组，同一受访者可以属于多个分组。
 - 单个数值评分（1–5、1–10、NPS 等）→ scale。
 - 一个单元格里出现多个选项，且语义是“可多选” → multi_choice，并给出 options。
 - 较长的主观文字回答 → open_text。
@@ -700,7 +708,9 @@ DEFAULT_SURVEY_PLANNER_SYSTEM_PROMPT = """\
     {
       "index": 0,
       "name": "中文短名",
-      "role": "id|mlbbid|profile_dim|single_choice|multi_choice|scale|matrix_scale|matrix_single|matrix_multi|open_text|ignore",
+      "role": "id|mlbbid|single_choice|multi_choice|scale|matrix_scale|matrix_single|matrix_multi|open_text|ignore",
+      "use_as_profile": false,
+      "profile_scope": "analysis|label",
       "delimiter": "，",
       "min": 1,
       "max": 5,
@@ -739,7 +749,7 @@ DEFAULT_SURVEY_PLANNER_SYSTEM_PROMPT = """\
   matrix_row 表示矩阵归属；同一矩阵的所有列必须整体放入同一个 part。
 - filter 是可选字段。只有需要按某道已确认的 single_choice 题的不同选项分别成章时才使用；
   column_index 必须指向该 single_choice 列，allowed_options 只能使用其已确认的标准选项。
-- profile_dim / single_choice / multi_choice / scale / matrix_scale / matrix_single / matrix_multi /
+- single_choice / multi_choice / scale / matrix_scale / matrix_single / matrix_multi /
   open_text 必须至少出现在一个 part 的 column_indexes 中。通常只能出现一次；只有多个 Part 分别带有同一
   single_choice 筛选列、且 allowed_options 互不重叠时，才允许复用同一组题目列。
 - 当用户要求按选择某个方案/模式的人群分别分析时，应为每个选项建立独立 Part，并在每个 Part 内复用
@@ -749,8 +759,8 @@ DEFAULT_SURVEY_PLANNER_SYSTEM_PROMPT = """\
 - id / mlbbid / ignore 不得放入任何 part。
 - cross_tabs 不确定时必须输出 []。每一项必须同时包含整数 profile_index 和整数
   question_index，不能缺字段、不能为 null，二者不能相同。
-- profile_index 只能引用 role 为 profile_dim 的列；question_index 必须引用参与分析的
-  业务题目列；不要用矩阵题子项做 cross_tabs。
+- profile_index 只能引用 use_as_profile=true 且 profile_scope=analysis 的列；question_index 必须引用参与分析的
+  业务题目列，且不得指向任何 use_as_profile=true 的列，禁止生成“画像 × 画像”；不要用矩阵题子项做 cross_tabs。
 - 只有用户消息包含 `<analysis_focus_mode>enabled</analysis_focus_mode>` 时才允许输出 analysis_focus；
   若标记为 disabled，必须忽略 analysis_approach，并从输出 JSON 中省略 analysis_focus。
 - 在 analysis_focus 已启用的前提下，用户消息包含 `<analysis_approach>` 时必须输出，并完整包含
@@ -770,15 +780,18 @@ name 字段规则：
 role 选择规则：
 - id：用户身份标识列，例如用户 ID、Discord、WhatsApp、邮箱。
 - mlbbid：MLBB ID。
-- profile_dim：可用于分群分析的字段，包括段位、游戏年限、时长、地区、年龄、性别、
-  设备、主玩位置、英雄类型和付费层级。
-- single_choice：选项有限且不属于画像的单选题。
+- single_choice：选项有限的单选题。题型只描述回答结构，不因画像用途改变。
+- use_as_profile：任何分析题型都可为 true。profile_scope=analysis 表示进入画像概览、分群、
+  交叉分析和引用标注；profile_scope=label 表示只作为原文引用的用户背景标注。
+- use_as_profile=true 但缺少 profile_scope 时按 analysis；use_as_profile=false 时忽略 profile_scope。
+- open_text 标为画像时 profile_scope 只能是 label；id、mlbbid、ignore 不得标为画像。
+- multi_choice 和 matrix_multi 可使用 analysis，按选项分别计入分组，同一受访者可属于多个分组。
 - multi_choice：多选题，必须给 delimiter。
 - scale：1-N 量表或评分题，必须给 min 和 max。
 - matrix_scale / matrix_single / matrix_multi：矩阵子项列，必须给 matrix_group 和 matrix_row。
 - open_text：开放文本题。
 - ignore：时间戳、提交 ID 等无分析价值的系统字段。
-- 不要把满意度评分、功能偏好、是否支持某方案等业务问题误判为 profile_dim。
+- 不要仅因题目可统计就设为画像；满意度、功能偏好、是否支持某方案等业务结果通常不是用户背景。
 
 parts 划分规则：
 - 按问卷业务主题和题目上下文划分，不按题型机械切分。
@@ -795,7 +808,7 @@ value_aliases 规则：
 
 open_questions 规则：
 - 只在确实看不懂列含义、对画像归属不确定或章节逻辑需要确认时提出，完全确定则输出 []。
-- 使用中文自然语言，不得出现 col、profile_dim、single_choice 等内部字段或角色名。
+- 使用中文自然语言，不得出现 col、use_as_profile、single_choice 等内部字段或角色名。
 - 列编号使用中文，列名使用 columns 中的中文短名，角色名称使用用户画像、单选题、
   多选题、量表题、开放题、用户 ID、忽略列等中文。
 - 不得再次询问用户已经确认的题型、选项或选项归并方式。

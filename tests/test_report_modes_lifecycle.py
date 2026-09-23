@@ -36,8 +36,8 @@ def profile_source():
             "confirmed_columns": [
                 {"role": "id", "name_zh": "记录编号", "column_indexes": [0]},
                 {"role": "mlbbid", "name_zh": "玩家编号", "column_indexes": [1]},
-                {"role": "profile_dim", "name_zh": "段位", "column_indexes": [2], "value_aliases": {"黄金": ["Gold"]}},
-                {"role": "profile_dim", "name_zh": "局数", "column_indexes": [3]},
+                {"role": "single_choice", "use_as_profile": True, "name_zh": "段位", "column_indexes": [2], "value_aliases": {"黄金": ["Gold"]}},
+                {"role": "single_choice", "use_as_profile": True, "name_zh": "局数", "column_indexes": [3]},
                 {"role": "open_text", "name_zh": "体验", "column_indexes": [4]},
                 {"role": "single_choice", "name_zh": "偏好", "column_indexes": [5], "options": ["A", "其他"], "other_text": {"enabled": True}},
                 {"role": "mlbbid", "name_zh": "另一编号", "column_indexes": [6]},
@@ -53,6 +53,36 @@ def legacy_profile_snapshot(sess):
 
 
 class FrozenModeTests(unittest.TestCase):
+    def test_unselected_label_profile_scope_survives_background_restore(self):
+        sess = {
+            "rows": [
+                ["熟练英雄", "体验反馈"],
+                ["Layla, Miya", "操作顺手"],
+            ],
+            "confirmed_columns": [
+                {
+                    "role": "open_text",
+                    "use_as_profile": True,
+                    "profile_scope": "label",
+                    "name_zh": "熟练英雄",
+                    "column_indexes": [0],
+                },
+                {"role": "open_text", "name_zh": "体验反馈", "column_indexes": [1]},
+            ],
+            "selected_question_keys": ["1"],
+        }
+        before = deepcopy(sess)
+
+        analysis = modes.analysis_columns(sess)
+        self.assertEqual(analysis[0]["role"], "ignore")
+        self.assertFalse(analysis[0]["use_as_profile"])
+        self.assertEqual(analysis[0]["profile_scope"], "label")
+
+        questions = modes.collect_source_questions(sess)
+
+        self.assertEqual(questions[0]["sources"][0]["profile"], {"熟练英雄": "Layla, Miya"})
+        self.assertEqual(sess, before)
+
     def test_all_confirmed_profile_and_id_fields_are_retained_when_not_selected(self):
         sess = profile_source()
         before = deepcopy(sess)
@@ -137,7 +167,7 @@ class FrozenModeTests(unittest.TestCase):
                          ["b", 3, "黄金", 99], ["c", "bad", "Gold", 99], ["d", "", "", 99]],
                 "confirmed_columns": [{"role": "id", "column_indexes": [0]},
                     {"role": "scale", "name": "评分", "column_indexes": [1], "scale_min": 1, "scale_max": 3},
-                    {"role": "profile_dim", "name": "段位", "column_indexes": [2], "value_aliases": {"黄金": ["Gold"]}},
+                    {"role": "single_choice", "use_as_profile": True, "name": "段位", "column_indexes": [2], "value_aliases": {"黄金": ["Gold"]}},
                     {"role": "scale", "name": "不选", "column_indexes": [3]}],
                 "selected_question_keys": ["1", "2"]}
         before = deepcopy(sess)
@@ -466,6 +496,7 @@ class QuickLifecycleTests(unittest.IsolatedAsyncioTestCase):
         fresh = profile_source()
         old = deepcopy(fresh)
         old["confirmed_columns"][2]["role"] = "ignore"
+        old["confirmed_columns"][2]["use_as_profile"] = False
         versions.append_report_version(old, snapshot(old), kind="initial")
         before = deepcopy(old)
         saved, calls = [], []

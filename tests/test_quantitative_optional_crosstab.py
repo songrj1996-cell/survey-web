@@ -1,10 +1,20 @@
 import unittest
 from unittest.mock import patch
 
-from app.services.crosstab_service import handle_crosstab_upload
+from app.services.crosstab_service import _build_crosstab_columns, handle_crosstab_upload
 
 
 class QuantitativeOptionalCrosstabTests(unittest.IsolatedAsyncioTestCase):
+    def test_deterministic_profile_columns_use_the_split_schema(self):
+        columns = _build_crosstab_columns(["段位", "普通字段"], {})
+
+        self.assertEqual(columns[0]["role"], "single_choice")
+        self.assertTrue(columns[0]["use_as_profile"])
+        self.assertEqual(columns[0]["profile_scope"], "analysis")
+        self.assertEqual(columns[1]["role"], "ignore")
+        self.assertFalse(columns[1]["use_as_profile"])
+        self.assertNotIn("profile_scope", columns[1])
+
     async def test_missing_crosstab_uses_questionnaire_columns_and_python_stats(self):
         session = {}
         imported = {

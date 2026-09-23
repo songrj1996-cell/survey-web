@@ -144,7 +144,12 @@ class QuickReportFlowTests(unittest.IsolatedAsyncioTestCase):
     async def test_five_versions_allow_only_failed_completion_with_all_profiles(self):
         sess = _quick_session(two_questions=True)
         for index, name in enumerate(('段位', '场次', '偏好'), start=3):
-            sess['confirmed_columns'].append({'column_indexes': [index], 'name': name, 'role': 'profile_dim'})
+            sess['confirmed_columns'].append({
+                'column_indexes': [index],
+                'name': name,
+                'role': 'single_choice',
+                'use_as_profile': True,
+            })
         for i, row in enumerate(sess['rows']):
             row.extend(['Gold' if i % 2 else 'Silver', str(i), '合作'])
         async def first(messages, **kwargs):

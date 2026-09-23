@@ -83,7 +83,6 @@ window.__surveyState = state;
 const ROLE_OPTIONS = [
   ['id', '用户 ID'],
   ['mlbbid', 'MLBB ID'],
-  ['profile_dim', '画像维度'],
   ['single_choice', '单选题'],
   ['multi_choice', '多选题'],
   ['scale', '量表题'],
@@ -94,7 +93,10 @@ const ROLE_OPTIONS = [
   ['ignore', '忽略此列'],
 ];
 const MATRIX_ROLES = ['matrix_scale', 'matrix_single', 'matrix_multi'];
-const CHOICE_ROLES = ['single_choice', 'profile_dim', 'multi_choice', 'matrix_single', 'matrix_multi'];
+const CHOICE_ROLES = ['single_choice', 'multi_choice', 'matrix_single', 'matrix_multi'];
+const PROFILE_ANALYSIS_ROLES = ['single_choice', 'multi_choice', 'scale', 'matrix_scale', 'matrix_single', 'matrix_multi'];
+const PROFILE_LABEL_ROLES = [...PROFILE_ANALYSIS_ROLES, 'open_text'];
+// PROFILE_ROLE_CONSTANTS_END
 
 // ── DOM 引用 ──
 const $ = id => document.getElementById(id);

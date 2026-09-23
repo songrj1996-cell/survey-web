@@ -9,10 +9,11 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any
 
+from app.core.column_roles import question_type
 from app.core.config import BRANCH_ANOMALY_MIN_ANSWERS, BRANCH_MAX_LEAKAGE_RATE
 
 
-_PARENT_ROLES = {"single_choice", "profile_dim"}
+_PARENT_ROLES = {"single_choice"}
 _SKIP_TARGET_ROLES = {"id", "mlbbid", "ignore"}
 
 
@@ -245,8 +246,8 @@ def infer_branch_rules(rows: list[list], confirmed_columns: list[dict]) -> list[
 
     headers = list(rows[0])
     body = [list(row) for row in rows[1:]]
-    parents = [q for q in confirmed_columns if q.get("role") in _PARENT_ROLES]
-    targets = [q for q in confirmed_columns if q.get("role") not in _SKIP_TARGET_ROLES]
+    parents = [q for q in confirmed_columns if question_type(q) in _PARENT_ROLES]
+    targets = [q for q in confirmed_columns if question_type(q) not in _SKIP_TARGET_ROLES]
     parent_profiles = [(parent, _parent_profile(body, parent)) for parent in parents]
     target_profiles = [(target, _target_profile(body, target)) for target in targets]
 

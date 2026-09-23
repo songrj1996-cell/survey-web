@@ -106,7 +106,12 @@ async def _browser_analysis_session(family_id: str):
         "rows": [["反馈", "来源语言", "Google 回答来源"], ["很好", "en", "en|v1|r1"]],
         "columns_detected": [
             {"name_zh": "反馈", "role": "open_text", "column_indexes": [0]},
-            {"name_zh": "来源语言", "role": "profile_dim", "column_indexes": [1]},
+            {
+                "name_zh": "来源语言",
+                "role": "single_choice",
+                "use_as_profile": True,
+                "column_indexes": [1],
+            },
             {"name_zh": "Google 回答来源", "role": "id", "column_indexes": [2]},
         ],
         "column_provider": "questionnaire",

@@ -90,7 +90,7 @@
 .qe-question-tabs button {font:inherit;font-size:13px;border:0;background:transparent;color:var(--text-2);padding:11px 14px;border-radius:10px;cursor:pointer;}
 .qe-question-tabs button[aria-selected=true] {background:var(--accent-soft);color:var(--accent);font-weight:600;}
 .qe-select-all,.qe-other-enable {display:flex;gap:9px;align-items:center;font-size:13px;color:var(--text-2);}
-.qe-question-row {display:grid;grid-template-columns:20px 48px minmax(0,1fr) auto 115px auto;align-items:center;gap:12px;padding:10px 14px;}
+.qe-question-row {display:grid;grid-template-columns:20px 48px minmax(0,1fr) auto 115px minmax(190px,auto) auto;align-items:center;gap:12px;padding:10px 14px;}
 .qe-question-row input[type=checkbox],.qe-select-all input,.qe-other-enable input,.qe-option-edit>input {width:17px;height:17px;accent-color:var(--accent);flex-shrink:0;}
 .qe-question-number {display:inline-flex;align-items:center;justify-content:center;margin-top:0;white-space:nowrap;}
 .qe-question-main {min-width:0;}
@@ -102,6 +102,10 @@
 .qe-question-preview span {font-size:11px;max-width:190px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:2px 7px;background:var(--surface-2);color:var(--text-2);border-radius:4px;}
 .qe-response-count {font-size:12px;color:var(--text-2);white-space:nowrap;}
 .qe-question-row .type-select {width:115px;max-width:100%;background:var(--surface);}
+.qe-profile-toggle {display:grid;gap:4px;color:var(--text-2);font-size:11px;line-height:1.3;white-space:nowrap;}
+.qe-profile-toggle select {font:inherit;color:var(--text);background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:7px 9px;max-width:230px;}
+.qe-profile-toggle:has(select:disabled) {opacity:.55;}
+.qe-profile-notice {color:var(--amber,#ac7019);background:color-mix(in srgb,var(--amber,#ac7019) 10%,transparent);border-radius:8px;padding:8px 10px;margin:10px 0;font-size:12px;}
 .qe-system-columns {margin-top:18px;padding-top:15px;border-top:1px solid var(--border);}
 .qe-system-columns #qe-system-list {display:flex;flex-direction:column;gap:6px;}
 .qe-system-columns>summary {cursor:pointer;color:var(--text-2);font-size:13px;margin-bottom:12px;}
@@ -132,5 +136,5 @@
 .qe-plan-part-editor footer {display:flex;gap:8px;}
 .qe-editor #qe-editor-error {margin:0;padding:0 28px 12px;}
 #qe-question-toolbar[hidden],#qe-system-columns[hidden],.step-bar [hidden],#context-form-wrap [hidden] {display:none!important;}
-@media(max-width:1050px){.qe-question-row {grid-template-columns:20px 48px minmax(0,1fr) 115px auto;}.qe-response-count {grid-column:3;grid-row:2;}.qe-question-row .type-select {grid-column:4;grid-row:1;}.qe-question-row>button {grid-column:5;grid-row:1;}.qe-focus-options {gap:10px;}.qe-focus-choice {padding:14px;}.qe-choice-title {flex-wrap:wrap;}}
-@media(max-width:760px){.qe-focus-options {grid-template-columns:1fr;}.qe-question-row {grid-template-columns:20px 44px minmax(0,1fr);gap:10px;padding:12px;}.qe-question-row .type-select {grid-column:3;grid-row:auto;width:100%;}.qe-question-row>button {grid-column:2;grid-row:auto;}.qe-response-count {grid-column:3;grid-row:auto;}.qe-editor-head,.qe-editor-body {padding:20px;}.qe-editor-actions {padding:16px 20px;}.qe-question-toolbar {align-items:flex-start;}.qe-select-all {margin-bottom:6px;}}
+@media(max-width:1050px){.qe-question-row {grid-template-columns:20px 48px minmax(0,1fr) 115px auto auto;}.qe-response-count {grid-column:3;grid-row:2;}.qe-question-row .type-select {grid-column:4;grid-row:1;}.qe-profile-toggle {grid-column:5;grid-row:1;}.qe-question-row>button {grid-column:6;grid-row:1;}.qe-focus-options {gap:10px;}.qe-focus-choice {padding:14px;}.qe-choice-title {flex-wrap:wrap;}}
+@media(max-width:760px){.qe-focus-options {grid-template-columns:1fr;}.qe-question-row {grid-template-columns:20px 44px minmax(0,1fr);gap:10px;padding:12px;}.qe-question-main {grid-column:3;grid-row:1;}.qe-response-count {grid-column:3;grid-row:2;}.qe-question-row .type-select {grid-column:3;grid-row:3;width:100%;}.qe-profile-toggle {grid-column:3;grid-row:4;}.qe-question-row>button {grid-column:2;grid-row:5;}.qe-editor-head,.qe-editor-body {padding:20px;}.qe-editor-actions {padding:16px 20px;}.qe-question-toolbar {align-items:flex-start;}.qe-select-all {margin-bottom:6px;}}

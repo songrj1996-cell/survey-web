@@ -7,6 +7,7 @@ import re
 
 import survey_plan
 import survey_stats
+from app.core.column_roles import is_profile_dim, profile_scope, question_type
 from app.services.branch_logic import branch_rule_for_column, branch_rule_label
 
 
@@ -14,7 +15,7 @@ REPORT_MODES = {"quick", "insight", "statistics"}
 MODE_SNAPSHOT_FIELDS = ("report_mode", "report_status", "input_snapshot", "quick_summary", "quick_checkpoint")
 MODE_OBJECT_FIELDS = ("input_snapshot", "quick_summary", "quick_checkpoint")
 _SUPPORT_ROLES = {"id", "mlbbid", "ignore"}
-_OBJECTIVE_ROLES = {"single_choice", "multi_choice", "scale", "profile_dim", "matrix_scale", "matrix_single", "matrix_multi"}
+_OBJECTIVE_ROLES = {"single_choice", "multi_choice", "scale", "matrix_scale", "matrix_single", "matrix_multi"}
 
 
 def quick_report_title(source: dict, base: dict | None = None) -> str:
@@ -54,7 +55,7 @@ def question_key(column: dict) -> str:
 
 
 def selected_question_keys(columns: list[dict], selected=None) -> list[str]:
-    available = [question_key(c) for c in columns if c.get("role") not in _SUPPORT_ROLES]
+    available = [question_key(c) for c in columns if question_type(c) not in _SUPPORT_ROLES]
     if selected is None:
         return available
     if not isinstance(selected, list) or any(not isinstance(k, str) for k in selected):
@@ -71,8 +72,9 @@ def analysis_columns(source: dict) -> list[dict]:
     for column in columns:
         if not column.get("column_indexes"):
             column["column_indexes"] = [column.get("column_index", column.get("index"))]
-        if column.get("role") not in _SUPPORT_ROLES and question_key(column) not in selected:
+        if question_type(column) not in _SUPPORT_ROLES and question_key(column) not in selected:
             column["role"] = "ignore"
+            column["use_as_profile"] = False
     return columns
 
 
@@ -86,8 +88,10 @@ def collect_source_questions(source: dict) -> list[dict]:
     # Profile fields remain respondent background even when excluded as an
     # analysis question. This does not change the selected statistics columns.
     for confirmed, column in zip(source.get("confirmed_columns") or [], collection_columns):
-        if confirmed.get("role") == "profile_dim":
-            column["role"] = "profile_dim"
+        if is_profile_dim(confirmed):
+            column["role"] = question_type(confirmed)
+            column["use_as_profile"] = True
+            column["profile_scope"] = profile_scope(confirmed)
     plan = {"columns": survey_plan.expand_confirmed_to_columns(collection_columns), "parts": [],
             "branch_rules": deepcopy(source.get("branch_rules") or [])}
     rows = source.get("rows") or []
@@ -97,9 +101,10 @@ def collect_source_questions(source: dict) -> list[dict]:
     display_plan = deepcopy(plan)
     names = {}
     for column in display_plan["columns"]:
-        if column["role"] not in {"profile_dim", "id", "mlbbid"}:
+        role = question_type(column)
+        if not is_profile_dim(column) and role not in {"id", "mlbbid"}:
             continue
-        group = "profile" if column["role"] == "profile_dim" else "ids"
+        group = "profile" if is_profile_dim(column) else "ids"
         index = column["index"]
         header = rows[0][index] if rows and index < len(rows[0]) else f"列{index + 1}"
         column["name"] = str(column.get("name") or header)
@@ -116,15 +121,16 @@ def collect_source_questions(source: dict) -> list[dict]:
     questions = []
     for ordinal, column in enumerate(columns, 1):
         indexes = column.get("column_indexes") or []
-        if column.get("role") == "ignore":
+        role = question_type(column)
+        if role == "ignore":
             continue
         entries = []
         display_entries = []
         for idx in indexes:
             entries.extend(pools.get(idx, pools.get(str(idx), [])))
             display_entries.extend(display_pools.get(idx, display_pools.get(str(idx), [])))
-        is_open = column.get("role") == "open_text"
-        is_other = column.get("role") in {"single_choice", "multi_choice"} and (column.get("other_text") or {}).get("enabled")
+        is_open = role == "open_text"
+        is_other = role in {"single_choice", "multi_choice"} and (column.get("other_text") or {}).get("enabled")
         if not (is_open or is_other):
             continue
         key = question_key(column)
@@ -223,7 +229,7 @@ def quick_objective_statistics(source: dict) -> dict:
     Inferred branch conditions are labelled, not used to discard actual answers.
     """
     columns = analysis_columns(source)
-    selected = [(order, c) for order, c in enumerate(columns, 1) if c.get("role") in _OBJECTIVE_ROLES]
+    selected = [(order, c) for order, c in enumerate(columns, 1) if question_type(c) in _OBJECTIVE_ROLES]
     rows = source.get("rows") or []
     if selected and not rows:
         return {"markdown": "", "blocks": [], "sections": [],
@@ -232,8 +238,7 @@ def quick_objective_statistics(source: dict) -> dict:
     for order, column in selected:
         expanded = survey_plan.expand_confirmed_to_columns([column])
         for item in expanded:
-            if item["role"] == "profile_dim":
-                item["role"] = "single_choice"
+            item["use_as_profile"] = False
         indexes = [item["index"] for item in expanded]
         plan = {"columns": expanded, "parts": [{"name": "客观题统计", "column_indexes": indexes}]}
         markdown, _ = survey_stats.compute(rows, plan)

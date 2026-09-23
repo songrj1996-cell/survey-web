@@ -1,6 +1,9 @@
+from copy import deepcopy
+import hashlib
 import unittest
 
 import crosstab_parser
+import survey_plan
 from app.services.report_render import _prep_export_md
 from app.services.stats_presentation import (
     inject_qualitative_stats,
@@ -11,6 +14,143 @@ from survey_stats import compute, structured_tables
 
 
 class StatsPresentationTests(unittest.TestCase):
+    def test_legacy_and_split_profile_plans_are_byte_identical(self):
+        rows = [
+            ["段位", "模式"],
+            ["黄金", "排位"],
+            ["白银", "娱乐"],
+            ["黄金", "娱乐"],
+        ]
+        legacy = {
+            "columns": [
+                {
+                    "index": 0,
+                    "name": "段位",
+                    "role": "profile_dim",
+                    "options": ["黄金", "白银"],
+                },
+                {
+                    "index": 1,
+                    "name": "模式",
+                    "role": "single_choice",
+                    "options": ["排位", "娱乐"],
+                },
+            ],
+            "parts": [{"name": "整体", "column_indexes": [0, 1]}],
+            "cross_tabs": [{"profile_index": 0, "question_index": 1}],
+            "open_questions": [],
+        }
+        current = deepcopy(legacy)
+        current["columns"][0]["role"] = "single_choice"
+        current["columns"][0]["use_as_profile"] = True
+
+        self.assertEqual(
+            survey_plan.render_plan_for_user(legacy, rows[0]),
+            survey_plan.render_plan_for_user(current, rows[0]),
+        )
+        self.assertEqual(compute(rows, legacy), compute(rows, current))
+
+    def test_no_profile_plan_and_stats_match_pre_change_golden_bytes(self):
+        rows = [["模式", "反馈"], ["A", "好"], ["B", ""]]
+        plan = {
+            "columns": [
+                {
+                    "index": 0,
+                    "name": "模式",
+                    "role": "single_choice",
+                    "options": ["A", "B"],
+                },
+                {"index": 1, "name": "反馈", "role": "open_text"},
+            ],
+            "parts": [{"name": "整体", "column_indexes": [0, 1]}],
+            "cross_tabs": [],
+            "open_questions": [],
+        }
+
+        rendered = survey_plan.render_plan_for_user(plan, rows[0])
+        stats_md, _ = compute(rows, plan)
+
+        self.assertEqual(
+            hashlib.sha256(rendered.encode("utf-8")).hexdigest(),
+            "bb9c43cae1d2b9c0a242f82f3ac7c76832e803050872ffbe05c170af6c9c689a",
+        )
+        self.assertEqual(
+            hashlib.sha256(stats_md.encode("utf-8")).hexdigest(),
+            "07a1454b4bc7472280958d309f40ca8bb2932ec42c8d1b6c2bef1a470a568508",
+        )
+
+    def test_label_profile_is_only_attached_to_open_text_evidence(self):
+        rows = [
+            ["熟练英雄", "段位", "反馈"],
+            ["Layla, Miya", "黄金", "操作顺手"],
+            ["Bruno", "白银", "需要优化"],
+        ]
+        plan = {
+            "columns": [
+                {
+                    "index": 0,
+                    "name": "熟练英雄",
+                    "role": "open_text",
+                    "use_as_profile": True,
+                    "profile_scope": "label",
+                },
+                {
+                    "index": 1,
+                    "name": "段位",
+                    "role": "single_choice",
+                    "use_as_profile": True,
+                    "profile_scope": "analysis",
+                },
+                {"index": 2, "name": "反馈", "role": "open_text"},
+            ],
+            "parts": [{"name": "整体", "column_indexes": [0, 1, 2]}],
+        }
+
+        stats_md, open_text = compute(rows, plan)
+        overview = stats_md.split("## Part 1", 1)[0]
+
+        self.assertIn("### 段位", overview)
+        self.assertNotIn("### 熟练英雄", overview)
+        self.assertNotIn("按「熟练英雄」分组", stats_md)
+        self.assertEqual(
+            open_text[2][0]["profile"],
+            {"熟练英雄": "Layla, Miya", "段位": "黄金"},
+        )
+
+    def test_multi_choice_profile_counts_each_selected_group_with_overlap_note(self):
+        rows = [
+            ["常玩位置", "模式", "评分"],
+            ["发育路,游走", "排位", "5"],
+            ["发育路", "娱乐", "3"],
+            ["游走", "排位", "4"],
+        ]
+        plan = {
+            "columns": [
+                {
+                    "index": 0,
+                    "name": "常玩位置",
+                    "role": "multi_choice",
+                    "use_as_profile": True,
+                    "profile_scope": "analysis",
+                    "options": ["发育路", "游走"],
+                    "delimiter": ",",
+                },
+                {"index": 1, "name": "模式", "role": "single_choice", "options": ["排位", "娱乐"]},
+                {"index": 2, "name": "评分", "role": "scale", "min": 1, "max": 5},
+            ],
+            "parts": [{"name": "整体", "column_indexes": [0, 1, 2]}],
+        }
+
+        stats_md, _ = compute(rows, plan)
+
+        self.assertIn("| 发育路 | 2 | 66.7% |", stats_md)
+        self.assertIn("| 游走 | 2 | 66.7% |", stats_md)
+        self.assertIn("各分组人数有重叠，合计可能超过样本量", stats_md)
+        self.assertIn("| 发育路 | 1* (50.0%) | 1* (50.0%) | 2 |", stats_md)
+        self.assertIn("| 游走 | 2* (100.0%) | 0 (0.0%) | 2 |", stats_md)
+        self.assertIn("| 发育路 | 2* | 4.00 |", stats_md)
+        self.assertIn("| 游走 | 2* | 4.50 |", stats_md)
+
     def test_filtered_parts_use_aliases_and_keep_open_text_segments(self):
         rows = [
             ["模式", "原因", "满意度"],
