@@ -131,9 +131,6 @@
 .qe-merge-bar label {display:flex;align-items:center;gap:10px;min-width:0;flex:1;}
 .qe-editor-range {display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:18px 0;}
 .qe-editor-range label {display:grid;gap:8px;}
-.qe-plan-edit-actions {margin-bottom:14px;}
-.qe-plan-part-editor {padding:18px 0;border-bottom:1px solid var(--border);}
-.qe-plan-part-editor footer {display:flex;gap:8px;}
 .qe-editor #qe-editor-error {margin:0;padding:0 28px 12px;}
 #qe-question-toolbar[hidden],#qe-system-columns[hidden],.step-bar [hidden],#context-form-wrap [hidden] {display:none!important;}
 @media(max-width:1050px){.qe-question-row {grid-template-columns:20px 48px minmax(0,1fr) 115px auto auto;}.qe-response-count {grid-column:3;grid-row:2;}.qe-question-row .type-select {grid-column:4;grid-row:1;}.qe-profile-toggle {grid-column:5;grid-row:1;}.qe-question-row>button {grid-column:6;grid-row:1;}.qe-focus-options {gap:10px;}.qe-focus-choice {padding:14px;}.qe-choice-title {flex-wrap:wrap;}}

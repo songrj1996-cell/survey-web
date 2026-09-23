@@ -1119,50 +1119,6 @@ async function confirmPlan(text) {
   }
 }
 
-// Manual outline changes are local until the same confirmed plan is submitted.
-let manualPlanEditor = null;
-function flushManualPlanEditor() {
-  if (!manualPlanEditor) return;
-  document.querySelectorAll('[data-plan-part]').forEach(row => {
-    const part = manualPlanEditor.draft.parts[Number(row.dataset.planPart)];
-    part.name = row.querySelector('[data-plan-name]').value.trim();
-    part.scope = row.querySelector('[data-plan-scope]').value.trim();
-    part.column_indexes = [...row.querySelectorAll('[data-plan-column]:checked')].map(input => Number(input.value));
-  });
-}
-function renderManualPlanEditor() {
-  const plan = manualPlanEditor.draft;
-  $('qe-plan-editor-body').innerHTML = plan.parts.map((part,i) => `<section class="qe-plan-part-editor" data-plan-part="${i}"><label class="qe-editor-field">章节 ${i+1}<input data-plan-name value="${esc(part.name||'')}" /></label><label class="qe-editor-field">分析重点<textarea data-plan-scope rows="2">${esc(part.scope||'')}</textarea></label><details><summary>本章题目 · ${(part.column_indexes||[]).length} 项</summary>${(plan.columns||[]).filter(c=>!['ignore','id','mlbbid'].includes(c.role)).map(c=>`<label class="qe-other-enable"><input type="checkbox" data-plan-column value="${Number(c.index)}" ${(part.column_indexes||[]).includes(c.index)?'checked':''} />${esc(c.name_zh||c.name||('原始列 '+c.index))}</label>`).join('')}</details><footer><button class="btn btn--ghost" type="button" data-plan-move="${i}" data-direction="-1" ${i===0?'disabled':''}>上移</button><button class="btn btn--ghost" type="button" data-plan-move="${i}" data-direction="1" ${i===plan.parts.length-1?'disabled':''}>下移</button><button class="btn btn--ghost" type="button" data-plan-remove="${i}" ${plan.parts.length===1?'disabled':''}>删除章节</button></footer></section>`).join('')+'<button class="btn btn--ghost" type="button" data-plan-add>添加章节</button>';
-}
-$('qe-plan-edit').addEventListener('click',()=>{
-  if (!state.planData || state.currentStep!==3 || $('plan-input').disabled) return;
-  manualPlanEditor={draft:cloneColumn(state.planData),initial:JSON.stringify(state.planData)};
-  renderManualPlanEditor();$('qe-plan-editor').showModal();
-});
-function closeManualPlanEditor(discard=false) {
-  if(!manualPlanEditor)return;
-  flushManualPlanEditor();
-  if(!discard&&JSON.stringify(manualPlanEditor.draft)!==manualPlanEditor.initial&&!window.confirm('分析结构还有未保存修改。放弃修改并关闭？'))return;
-  manualPlanEditor=null;$('qe-plan-editor').close();$('qe-plan-edit').focus();
-}
-$('qe-plan-editor-close').addEventListener('click',()=>closeManualPlanEditor());
-$('qe-plan-editor-discard').addEventListener('click',()=>closeManualPlanEditor(true));
-$('qe-plan-editor').addEventListener('cancel',event=>{event.preventDefault();closeManualPlanEditor();});
-$('qe-plan-editor-body').addEventListener('click',event=>{
-  const move=event.target.closest('[data-plan-move]'),remove=event.target.closest('[data-plan-remove]'),add=event.target.closest('[data-plan-add]');
-  if(!move&&!remove&&!add)return;
-  flushManualPlanEditor();const parts=manualPlanEditor.draft.parts;
-  if(move){const i=Number(move.dataset.planMove),j=i+Number(move.dataset.direction);[parts[i],parts[j]]=[parts[j],parts[i]];}
-  if(remove&&parts.length>1)parts.splice(Number(remove.dataset.planRemove),1);
-  if(add)parts.push({name:'新增章节',scope:'',column_indexes:[]});
-  renderManualPlanEditor();
-});
-$('qe-plan-editor-save').addEventListener('click',()=>{
-  flushManualPlanEditor();
-  if(manualPlanEditor.draft.parts.some(part=>!part.name)){showToast('请填写每个章节的名称','info');return;}
-  state.planData=cloneColumn(manualPlanEditor.draft);manualPlanEditor=null;$('qe-plan-editor').close();showPlanCard(state.planData,[]);showToast('分析结构已保存；确认方案后开始生成','success');
-});
 window.addEventListener('beforeunload',event=>{
   if(columnEditor){flushColumnEditor();if(JSON.stringify(columnEditor.draft)!==columnEditor.initial){event.preventDefault();event.returnValue='';}}
-  if(manualPlanEditor){flushManualPlanEditor();if(JSON.stringify(manualPlanEditor.draft)!==manualPlanEditor.initial){event.preventDefault();event.returnValue='';}}
 });
