@@ -3372,15 +3372,24 @@ class PartialDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[-1]["missing_ids"], ["P2"])
         save.assert_awaited_once()
 
-    def test_retry_selection_rejects_complete_unknown_empty_ids(self):
+    def test_retry_selection_filters_complete_and_rejects_unknown_or_empty_ids(self):
+        incomplete = self.make_result()
+        incomplete["q_labels"].pop("col_2")
         complete = self.make_result()
+        complete["id"] = "P2"
         complete["translations"] = {"col_1": "没有", "col_2": "按钮太小，连续点击时容易误触旁边的图标"}
-        session = self.make_session([complete]); session["quality_status"] = "complete"
-        session["rows"].append(["P2", "没有", "按钮太小"])
+        session = self.make_session([incomplete, complete])
+        session["rows"].append(["P2", "没有", "按钮太小，连续点击时容易误触旁边的图标"])
         sid = self.store_session(session)
-        self.assertEqual(annotate_workflow.validate_annotate_retry_ids(sid, ["P2"]), {"P2"})
-        for ids in (["P1"], ["P3"], [], ["P2", "P3"]):
-            with self.subTest(ids=ids), self.assertRaises(HTTPException):
+        self.assertIsNone(annotate_workflow.validate_annotate_retry_ids(sid, None))
+        self.assertEqual(annotate_workflow.validate_annotate_retry_ids(sid, ["P1"]), {"P1"})
+        self.assertEqual(annotate_workflow.validate_annotate_retry_ids(sid, ["P1", "P2"]), {"P1"})
+        with self.assertRaisesRegex(HTTPException, "当前都没有缺项"):
+            annotate_workflow.validate_annotate_retry_ids(sid, ["P2"])
+        with self.assertRaisesRegex(HTTPException, "至少选择"):
+            annotate_workflow.validate_annotate_retry_ids(sid, [])
+        for ids in (["P3"], ["P1", "P3"]):
+            with self.subTest(ids=ids), self.assertRaisesRegex(HTTPException, "不属于当前任务"):
                 annotate_workflow.validate_annotate_retry_ids(sid, ids)
 
     async def test_translation_retry_does_not_touch_unselected_players(self):
@@ -3459,7 +3468,11 @@ class PartialDeliveryTests(unittest.IsolatedAsyncioTestCase):
         import httpx
         from fastapi import FastAPI
         from app.routers import annotate as api
-        session = self.make_session(); sid = self.store_session(session)
+        complete = self.make_result(); complete["id"] = "P2"
+        complete["translations"] = {"col_1": "没有", "col_2": "按钮太小，连续点击时容易误触旁边的图标"}
+        session = self.make_session([complete])
+        session["rows"].append(["P2", "没有", "按钮太小，连续点击时容易误触旁边的图标"])
+        sid = self.store_session(session)
         app = FastAPI(); app.include_router(api.router)
         app.dependency_overrides[api._require_annotate_access] = lambda: None
         async def wrap(stream, *args, **kwargs):
@@ -3486,7 +3499,7 @@ class PartialDeliveryTests(unittest.IsolatedAsyncioTestCase):
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
                 bad = await client.get(f"/api/annotate/{sid}/run-quality?retry_ids=foreign")
                 self.assertEqual(bad.status_code, 400)
-                response = await client.get(f"/api/annotate/{sid}/run-quality?retry_ids=P1")
+                response = await client.get(f"/api/annotate/{sid}/run-quality?retry_ids=P1&retry_ids=P2")
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual(seen, [{"P1"}])
                 repeated = await client.get(f"/api/annotate/{sid}/run-quality?retry_ids=P1")
@@ -3496,6 +3509,11 @@ class PartialDeliveryTests(unittest.IsolatedAsyncioTestCase):
         session = self.make_session()
         session["tasks"] = {"ai_detect": True, "quality": False}
         session["rows"].append(["P2", *session["rows"][1][1:]])
+        session["ai_status"] = "incomplete"
+        session["missing_ai_ids"] = ["P1"]
+        session["ai_results"] = [{"id": "P2", "ai_prob": 0, "translations": {
+            "col_1": "没有", "col_2": "按钮太小，连续点击时容易误触旁边的图标",
+        }}]
         sid = self.store_session(session)
         async def batch(sid, number, rows, *args):
             self.assertEqual([row[0] for row in rows], ["P1"])
@@ -3505,10 +3523,12 @@ class PartialDeliveryTests(unittest.IsolatedAsyncioTestCase):
             patch.object(annotate_workflow, "_save_annotate_result_history", new=AsyncMock()) as save,
             patch.object(annotate_workflow, "audit_log", new=AsyncMock()),
         ):
-            events = [json.loads(raw.removeprefix("data: ")) async for raw in annotate_workflow.ai_detect_stream(sid, object(), retry_ids={"P1"})]
+            retry_ids = annotate_workflow.validate_annotate_retry_ids(sid, ["P1", "P2"])
+            self.assertEqual(retry_ids, {"P1"})
+            events = [json.loads(raw.removeprefix("data: ")) async for raw in annotate_workflow.ai_detect_stream(sid, object(), retry_ids=retry_ids)]
         self.assertEqual(events[-1]["type"], "ai_detect_done")
-        self.assertEqual(events[-1]["missing_ids"], ["P2"])
-        self.assertTrue(events[-1]["completion"]["partial"])
+        self.assertEqual(events[-1]["missing_ids"], [])
+        self.assertFalse(events[-1]["completion"]["partial"])
         save.assert_awaited_once()
 
 
