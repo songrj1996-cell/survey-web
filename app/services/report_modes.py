@@ -12,7 +12,11 @@ from app.services.branch_logic import branch_rule_for_column, branch_rule_label
 
 
 REPORT_MODES = {"quick", "insight", "statistics"}
-MODE_SNAPSHOT_FIELDS = ("report_mode", "report_status", "input_snapshot", "quick_summary", "quick_checkpoint")
+REPORT_ENGINES = {"legacy", "insight_v3"}
+MODE_SNAPSHOT_FIELDS = (
+    "report_mode", "report_engine", "report_status", "input_snapshot",
+    "quick_summary", "quick_checkpoint",
+)
 MODE_OBJECT_FIELDS = ("input_snapshot", "quick_summary", "quick_checkpoint")
 _SUPPORT_ROLES = {"id", "mlbbid", "ignore"}
 _OBJECTIVE_ROLES = {"single_choice", "multi_choice", "scale", "matrix_scale", "matrix_single", "matrix_multi"}
@@ -38,6 +42,28 @@ def resolve_report_mode(source: dict) -> str:
     if source.get("report_focus") == "statistics" or source.get("mode") in {"quantitative", "crosstab"}:
         return "statistics"
     return "insight"
+
+
+def resolve_report_engine(
+    source: dict,
+    *,
+    new_report: bool = False,
+    insight_v3_enabled: bool = False,
+) -> str:
+    """Bind regenerations to their snapshot; only new insight reports use the flag."""
+    explicit = source.get("report_engine")
+    if explicit in REPORT_ENGINES:
+        return explicit
+    # Missing report_mode identifies pre-binding/legacy sessions. They may
+    # resolve to "insight" for display compatibility, but must not be silently
+    # migrated to a different report engine on their next write.
+    if (
+        new_report
+        and insight_v3_enabled
+        and source.get("report_mode") == "insight"
+    ):
+        return "insight_v3"
+    return "legacy"
 
 
 def mode_fields(mode: str) -> dict:

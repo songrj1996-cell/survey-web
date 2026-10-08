@@ -198,6 +198,14 @@ def partial_rerun_capability(entry: dict, snapshot: dict) -> dict:
     }
     if snapshot.get("report_style") == "quick":
         return {**unavailable, "reason": "快速总结可使用失败题目重试或整份重新生成。"}
+    if (
+        snapshot.get("report_engine") == "insight_v3"
+        or snapshot.get("analyst_app") == "insight_v3"
+    ):
+        return {
+            **unavailable,
+            "reason": "新版报告暂不支持局部重做，请整份重新生成。",
+        }
     if (entry.get("mode") or "") in {"comment", "interview", "annotate", "crosstab"}:
         return {**unavailable, "reason": "当前报告类型暂不支持局部重做。"}
     frozen = snapshot.get("input_snapshot") or {}

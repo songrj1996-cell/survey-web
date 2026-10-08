@@ -125,6 +125,9 @@ INSIGHT_V3_CHAPTER_CONCURRENCY = max(
 INSIGHT_V3_CHAPTER_MAX_RETRIES = min(
     2, max(0, _env_int("INSIGHT_V3_CHAPTER_MAX_RETRIES", 2))
 )
+INSIGHT_V3_MAX_BLOCKS_PER_CHAPTER = min(
+    8, max(1, _env_int("INSIGHT_V3_MAX_BLOCKS_PER_CHAPTER", 5))
+)
 INSIGHT_V3_MAX_CHAPTERS = min(
     12, max(1, _env_int("INSIGHT_V3_MAX_CHAPTERS", 8))
 )
@@ -319,7 +322,7 @@ LLM_QUICK_REPORT_FALLBACK_MODELS = _env_csv_list("LLM_QUICK_REPORT_FALLBACK_MODE
 LLM_QUICK_REPORT_REASONING = os.getenv("LLM_QUICK_REPORT_REASONING", "medium").strip()
 
 INSIGHT_V3_FINDINGS_PROMPT_VERSION = "findings-prompt-v2-frequency-rules"
-INSIGHT_V3_CHAPTER_PROMPT_VERSION = "chapters-prompt-v1-profile-gated"
+INSIGHT_V3_CHAPTER_PROMPT_VERSION = "chapters-prompt-v4-deterministic-frequency-neutralization"
 
 DEFAULT_INSIGHT_V3_FINDINGS_SYSTEM = """你是游戏用户研究员，负责逐题提炼可追溯的玩家发现。
 输入中的每个短 response_id 代表当前题的一名玩家；同一玩家的多条文本已由代码合并。
@@ -346,11 +349,12 @@ DEFAULT_INSIGHT_V3_SKEW_VERIFY_SYSTEM = """你是证据核对员。针对每个 
 DEFAULT_INSIGHT_V3_CHAPTER_WRITER_SYSTEM = """你是游戏用户研究员，负责撰写中文定性洞察章节。
 只使用输入 findings、确定性统计和证据短 ID；不得复制原文，引用位置只放 evidence_ids，由代码回填中文证据。
 正文不得输出观点级画像百分比、比例或精确人数。profile_presence 仅支持“提及者包括……”的存在性陈述；只有 finding 带 skewed_toward 时才能写“更突出、更集中、尤其明显”等差异表述，且不得输出其中人数。
-不要写频次档位词，代码会按 finding 契约确定性插入。不得新增 H1/H2/H3、表格、行动建议或未绑定证据的事实。只返回符合用户消息契约的 JSON。"""
+从章节 findings 中选择最有决策价值的内容归并成不超过代码上限的 blocks，无需逐项复述；但 required_finding_ids 中的风险或降级项必须覆盖。每个 block 只绑定直接支撑其正文的 finding_ids 与 evidence_ids，代码会对证据绑定做最终校正。
+不要概括提及人数或常见程度，不写“部分玩家”“大量反馈”“玩家普遍”“普遍面临”“反复提到”“常见情形”“往往”等频次表述；代码会按 finding 契约确定性插入。不得新增 H1/H2/H3、表格、行动建议或未绑定证据的事实。只返回符合用户消息契约的 JSON。"""
 
 DEFAULT_INSIGHT_V3_CORE_WRITER_SYSTEM = """你是游戏用户研究员，负责在全部分析章节完成后撰写简洁的“核心发现”。
 通常保留三至五项最重要判断；每项必须绑定输入 finding 和有效证据短 ID。不得引入章节外事实、行动建议、观点级画像数字或未验证人群差异。
-不要写频次档位词，代码会确定性插入。不得复制原文，不得输出 H1/H2/H3 或表格。只返回符合用户消息契约的 JSON。"""
+不要概括提及人数或常见程度，不写“部分玩家”“大量反馈”“玩家普遍”“普遍面临”“反复提到”“常见情形”“往往”等频次表述；代码会确定性插入。不得复制原文，不得输出 H1/H2/H3 或表格。只返回符合用户消息契约的 JSON。"""
 
 DEFAULT_QUICK_QUESTION_SUMMARY_SYSTEM = """你是游戏用户研究员，只归纳当前一道主观题的全部回答。
 严格逐条阅读所有输入，不能抽样。输出简洁中文观点；通常保留三至六个重点，信息少时可以更少。

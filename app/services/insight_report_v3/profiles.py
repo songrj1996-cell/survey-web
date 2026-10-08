@@ -28,7 +28,7 @@ PROFILE_DIFFERENCE_TERMS = (
     "显著集中",
 )
 _PERCENT_RE = re.compile(r"(?:\d+(?:\.\d+)?\s*%|百分之[零〇一二两三四五六七八九十百点\d]+)")
-_EXACT_PEOPLE_RE = re.compile(r"\d+\s*(?:名|位|个)?\s*(?:玩家|受访者|用户|人)\b")
+_EXACT_PEOPLE_RE = re.compile(r"\d+\s*(?:名|位|个)?\s*(?:玩家|受访者|用户|人)")
 
 
 def _clean(value) -> str:
@@ -361,7 +361,24 @@ def validate_profile_language(
     mentions_profile = any(token in content for token in profile_tokens)
     if mentions_profile and _PERCENT_RE.search(content):
         return "观点级画像表述不得包含百分比"
-    if mentions_profile and _EXACT_PEOPLE_RE.search(content):
+    profile_before_count = any(
+        re.search(
+            rf"{re.escape(token)}[^。！？；;\n]{{0,16}}"
+            r"\d+\s*(?:(?:名|位)(?:玩家|受访者|用户)?|"
+            r"个(?:玩家|受访者|用户|人)|玩家|受访者|用户|人|人次)",
+            content,
+        )
+        for token in profile_tokens
+    )
+    count_before_profile = any(
+        re.search(
+            rf"\d+\s*(?:名|位|个)?\s*{re.escape(token)}"
+            r"\s*(?:玩家|受访者|用户|人)?",
+            content,
+        )
+        for token in profile_tokens
+    )
+    if _EXACT_PEOPLE_RE.search(content) or profile_before_count or count_before_profile:
         return "观点级画像表述不得包含精确人数"
 
     used_difference = next(

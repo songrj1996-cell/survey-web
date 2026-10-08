@@ -9,6 +9,8 @@ from app.services.insight_report_v3.contracts import (
     hydrate_findings,
     validate_findings_payload,
 )
+from app.services.insight_report_v3.frequency import FREQUENCY_RULES_VERSION
+from app.core.config import INSIGHT_V3_FINDINGS_PROMPT_VERSION
 from scripts.replay_insight_report_v3_findings import _prepare_session
 
 
@@ -77,6 +79,14 @@ class InsightReportV3ContractTests(unittest.TestCase):
             all(source_id.startswith("ir3v1-") for source_id in question["all_source_ids"])
         )
         self.assertNotIn("r0001", contract["source_registry"])
+        self.assertEqual(
+            contract["source_binding"]["frequency_rules_version"],
+            FREQUENCY_RULES_VERSION,
+        )
+        self.assertEqual(
+            contract["source_binding"]["findings_prompt_version"],
+            INSIGHT_V3_FINDINGS_PROMPT_VERSION,
+        )
 
     def test_short_ids_are_validated_then_hydrated_to_global_ids(self):
         contract = build_stage_source_contract(

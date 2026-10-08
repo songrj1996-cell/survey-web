@@ -25,6 +25,7 @@ def is_survey_plan_approval(user_text: str) -> bool:
 from fastapi import HTTPException, Request
 
 from app.core.config import (
+    INSIGHT_REPORT_V3_ENABLED,
     LARGE_SAMPLE_THRESHOLD,
     LLM_API_KEY,
     LLM_COLUMN_FALLBACK_MODELS,
@@ -166,10 +167,11 @@ from app.services.report_versions import (
 )
 from app.services.report_modes import (
     MODE_SNAPSHOT_FIELDS, analysis_columns, collect_source_questions, freeze_report_inputs,
-    inherit_report_inputs, mode_fields, resolve_report_mode, selected_question_keys,
+    inherit_report_inputs, mode_fields, resolve_report_engine, resolve_report_mode, selected_question_keys,
     report_source_page, evidence_markdown, quick_qa_context, quick_objective_statistics, quick_report_title,
     source_display_item, source_metadata_needs_backfill, enrich_source_metadata,
 )
+from app.services.insight_report_v3 import generate_insight_report_v3
 from app.services.report_quick_pipeline import run_quick_pipeline
 from app.services.report_quick_outline import build_quick_outline
 from app.services.session_access import require_session_access
@@ -2730,7 +2732,73 @@ async def _full_report_stream(
 
         yield _report_llm_status_event()
 
-        if use_large_mode:
+        v3_pipeline_artifacts: dict = {}
+        report_engine_source = (
+            base_snapshot if resolved_kind == "regenerate" else sess
+        )
+        report_engine = resolve_report_engine(
+            report_engine_source,
+            new_report=resolved_kind == "initial",
+            insight_v3_enabled=INSIGHT_REPORT_V3_ENABLED,
+        )
+        if report_engine == "insight_v3" and (
+            resolve_report_mode(sess) != "insight" or quantitative_first
+        ):
+            raise ValueError("已保存的 insight_v3 引擎与当前报告模式不兼容，已拒绝静默回退旧引擎")
+        use_insight_v3 = report_engine == "insight_v3"
+
+        if use_insight_v3:
+            def _v3_attempt_event(event: dict) -> None:
+                phase = str(event.get("phase") or "writing")
+                if phase not in _REPORT_LLM_PHASES:
+                    phase = "writing"
+                report_llm_usage.callback(phase)(event)
+
+            async for stream_kind, item in _iterate_report_llm_stage(
+                generate_insight_report_v3(
+                    open_text=open_text,
+                    plan=plan,
+                    headers=list(rows[0]),
+                    file_sha256=str(sess.get("file_sha256") or sess.get("questionnaire_sha256") or ""),
+                    stats_md=stats_md,
+                    structured_tables=list(sess.get("stats_blocks") or survey_stats.structured_tables(stats_md)),
+                    qualitative_context=qualitative_context,
+                    existing_findings=sess.get("insight_v3_findings"),
+                    translation_namespace=f"insight-v3:{session_id}:{report_run_id}",
+                    on_attempt_event=_v3_attempt_event,
+                )
+            ):
+                if stream_kind == "llm_status":
+                    yield item
+                    continue
+                event_type, payload = item
+                if event_type == "progress":
+                    yield sse_event({"type": "progress", "message": payload})
+                elif event_type == "analysis_progress":
+                    yield sse_event({"type": "analysis_progress", **payload})
+                elif event_type == "heartbeat":
+                    yield sse_event({"type": "heartbeat"})
+                elif event_type == "artifacts":
+                    v3_pipeline_artifacts.update(deepcopy(payload))
+                    if payload.get("insight_v3_findings") is not None:
+                        latest_session = require_session_access(
+                            session_id, login, loader=get_session,
+                        )
+                        latest_session["insight_v3_findings"] = deepcopy(
+                            payload["insight_v3_findings"]
+                        )
+                        save_session(session_id, latest_session)
+                        sess = latest_session
+                elif event_type == "result":
+                    full_report = payload
+            if not str(locals().get("full_report") or "").strip():
+                raise RuntimeError("insight_v3 没有生成报告正文")
+            writer_models_used.extend(
+                v3_pipeline_artifacts.get("writer_models_used") or []
+            )
+            for event in _content_events(full_report):
+                yield event
+        elif use_large_mode:
             total_open_text = sum(len(v) for v in open_text.values())
             start_msg = (
                 f"跑数表模式：数字取自跑数表，开始对 {total_open_text} 条主观题回复做聚类"
@@ -3254,9 +3322,31 @@ async def _full_report_stream(
             "正在核对统计引用、整理格式并保存报告",
         )
 
-        if quantitative_first:
+        if use_insight_v3 or quantitative_first:
+            appendix_blocks = list(sess.get("stats_blocks") or [])
+            if use_insight_v3:
+                selected_sample_titles = {
+                    str(title or "").strip()
+                    for title in (
+                        (v3_pipeline_artifacts.get("viewpoint_diagnostics") or {})
+                        .get("sample_overview", {})
+                        .get("table_titles", [])
+                    )
+                    if str(title or "").strip()
+                }
+                per_question_blocks = [
+                    block for block in appendix_blocks
+                    if str(block.get("part") or "").strip()
+                ]
+                if per_question_blocks:
+                    appendix_blocks = per_question_blocks
+                appendix_blocks = [
+                    block for block in appendix_blocks
+                    if str(block.get("title") or "").strip()
+                    not in selected_sample_titles
+                ]
             appendix = render_stats_appendix(
-                sess.get("stats_blocks") or [],
+                appendix_blocks,
                 sess.get("stats_source") or "python",
             )
             if appendix:
@@ -3360,23 +3450,41 @@ async def _full_report_stream(
         if not concise_insight:
             full_report = _inject_research_background(full_report, qualitative_context)
         full_report = normalize_glossary_terms(full_report)
-        viewpoint_diagnostics = finalize_viewpoint_diagnostics(
-            viewpoint_diagnostics,
-            full_report,
-            writer_context_included=writer_context_included,
-        )
-        viewpoint_catalog = viewpoint_diagnostics["catalog"]
-        viewpoint_output = viewpoint_diagnostics["writer_output"]
-        print(
-            "[viewpoint-diagnostics] "
-            f"session={session_id} "
-            f"catalog_entries={viewpoint_catalog['entry_count']} "
-            f"context_included={writer_context_included} "
-            f"viewpoint_blocks={viewpoint_output['viewpoint_block_count']} "
-            f"mention_blocks={viewpoint_output['mention_block_count']} "
-            f"status={viewpoint_output['status']}",
-            flush=True,
-        )
+        if use_insight_v3:
+            viewpoint_diagnostics = deepcopy(
+                v3_pipeline_artifacts.get("viewpoint_diagnostics") or {
+                    "schema_version": "insight-v3-diagnostics-v1",
+                    "engine": "insight_v3",
+                    "questions": [],
+                    "chapters": [],
+                    "audit": {"status": "not_enabled", "unresolved_count": 0},
+                }
+            )
+            print(
+                "[viewpoint-diagnostics] "
+                f"session={session_id} engine=insight_v3 "
+                f"questions={len(viewpoint_diagnostics.get('questions') or [])} "
+                f"chapters={len(viewpoint_diagnostics.get('chapters') or [])}",
+                flush=True,
+            )
+        else:
+            viewpoint_diagnostics = finalize_viewpoint_diagnostics(
+                viewpoint_diagnostics,
+                full_report,
+                writer_context_included=writer_context_included,
+            )
+            viewpoint_catalog = viewpoint_diagnostics["catalog"]
+            viewpoint_output = viewpoint_diagnostics["writer_output"]
+            print(
+                "[viewpoint-diagnostics] "
+                f"session={session_id} "
+                f"catalog_entries={viewpoint_catalog['entry_count']} "
+                f"context_included={writer_context_included} "
+                f"viewpoint_blocks={viewpoint_output['viewpoint_block_count']} "
+                f"mention_blocks={viewpoint_output['mention_block_count']} "
+                f"status={viewpoint_output['status']}",
+                flush=True,
+            )
         qa_context_md = _build_qa_context(sess, full_report)
         writer_model = ",".join(dict.fromkeys(writer_models_used))
         # 生成期间仍可能发生改名等非模型写入；提交前重读最新 session，
@@ -3395,7 +3503,8 @@ async def _full_report_stream(
             frozen_inputs["partial_rerun_source"] = deepcopy(partial_rerun_source)
         snapshot = {
             "report_style": report_style,
-            "report_mode": resolve_report_mode(sess), "report_status": "complete", "input_snapshot": frozen_inputs,
+            "report_mode": resolve_report_mode(sess), "report_engine": report_engine,
+            "report_status": "complete", "input_snapshot": frozen_inputs,
             **({"quick_report_diagnostics": deepcopy(quick_diagnostics)} if quick_diagnostics else {}),
             "report_md": full_report,
             "title": "",
@@ -3404,19 +3513,25 @@ async def _full_report_stream(
             "qa_provider": "",
             "qa_model": "",
             "analyst_conv_id": "",
-            "analyst_app": "large" if use_large_mode else "standard",
+            "analyst_app": "insight_v3" if use_insight_v3 else ("large" if use_large_mode else "standard"),
             "report_writer_provider": "direct_llm",
             "report_writer_model": writer_model,
             "report_llm_usage": report_llm_usage.snapshot(),
             "viewpoint_diagnostics": viewpoint_diagnostics,
-            "analysis_artifacts": build_analysis_artifacts(
-                partial_rerun_source,
-                use_large_mode=use_large_mode,
-                clustered_themes=clustered_themes,
-                report_viewpoints=report_viewpoints,
-                viewpoint_stats_md=viewpoint_stats_md,
-                cluster_diagnostics=cluster_diagnostics,
-                cluster_metrics=cluster_metrics,
+            **(
+                {}
+                if use_insight_v3
+                else {
+                    "analysis_artifacts": build_analysis_artifacts(
+                        partial_rerun_source,
+                        use_large_mode=use_large_mode,
+                        clustered_themes=clustered_themes,
+                        report_viewpoints=report_viewpoints,
+                        viewpoint_stats_md=viewpoint_stats_md,
+                        cluster_diagnostics=cluster_diagnostics,
+                        cluster_metrics=cluster_metrics,
+                    )
+                }
             ),
             "comparison_validation": comparison_validation,
             **completion_timing,

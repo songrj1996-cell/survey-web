@@ -53,6 +53,56 @@ def legacy_profile_snapshot(sess):
 
 
 class FrozenModeTests(unittest.TestCase):
+    def test_report_engine_is_bound_to_saved_version_and_only_new_insight_uses_flag(self):
+        self.assertEqual(
+            modes.resolve_report_engine(
+                {"report_mode": "insight"},
+                new_report=True,
+                insight_v3_enabled=True,
+            ),
+            "insight_v3",
+        )
+        self.assertEqual(
+            modes.resolve_report_engine(
+                {},
+                new_report=True,
+                insight_v3_enabled=True,
+            ),
+            "legacy",
+        )
+        self.assertEqual(
+            modes.resolve_report_engine(
+                {"report_mode": "quick"},
+                new_report=True,
+                insight_v3_enabled=True,
+            ),
+            "legacy",
+        )
+        self.assertEqual(
+            modes.resolve_report_engine(
+                {"report_mode": "insight", "report_engine": "insight_v3"},
+                new_report=False,
+                insight_v3_enabled=False,
+            ),
+            "insight_v3",
+        )
+        self.assertEqual(
+            modes.resolve_report_engine(
+                {"report_mode": "insight", "report_engine": "legacy"},
+                new_report=False,
+                insight_v3_enabled=True,
+            ),
+            "legacy",
+        )
+        self.assertEqual(
+            modes.resolve_report_engine(
+                {"report_mode": "insight"},
+                new_report=False,
+                insight_v3_enabled=True,
+            ),
+            "legacy",
+        )
+
     def test_unselected_label_profile_scope_survives_background_restore(self):
         sess = {
             "rows": [

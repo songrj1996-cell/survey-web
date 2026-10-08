@@ -228,6 +228,19 @@ def _entry():
 
 
 class PartialRerunContractTests(unittest.TestCase):
+    def test_v3_version_has_explicit_whole_report_rerun_reason(self):
+        entry = _entry()
+        snapshot = report_versions.resolve_report_version(entry, 1)
+        snapshot["report_engine"] = "insight_v3"
+        snapshot["analyst_app"] = "insight_v3"
+        snapshot.pop("analysis_artifacts", None)
+        capability = report_partial_rerun.partial_rerun_capability(entry, snapshot)
+        self.assertFalse(capability["available"])
+        self.assertEqual(
+            capability["reason"],
+            "新版报告暂不支持局部重做，请整份重新生成。",
+        )
+
     def test_source_is_minimal_and_fingerprinted(self):
         entry = _entry()
         source = entry["partial_rerun_source"]

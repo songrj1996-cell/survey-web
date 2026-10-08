@@ -149,6 +149,11 @@ def _isolated_report_runtime(sess: dict, writer: AsyncMock):
         )
         stack.enter_context(patch.object(survey_service, "_assign_session_owner"))
         stack.enter_context(patch.object(survey_service, "_ensure_branch_rules"))
+        # These tests exercise the legacy writer/version contract. V3 binding
+        # has dedicated integration coverage and must not change their call graph.
+        stack.enter_context(
+            patch.object(survey_service, "INSIGHT_REPORT_V3_ENABLED", False)
+        )
         stack.enter_context(
             patch.object(
                 survey_service,
@@ -246,6 +251,7 @@ class SurveyReportVersionGenerationTests(
             sess["report_versions"][0]["comparison_validation"]["status"],
             "passed",
         )
+        self.assertEqual(sess["report_versions"][0]["report_engine"], "legacy")
         self.assertIsNone(sess["report_versions"][0]["base_version"])
         runtime["save_session"].assert_called_once_with(
             "initial-version-session", sess
