@@ -14,7 +14,7 @@
   <link rel="stylesheet" href="/static/style.css?v=55" />
   <link rel="stylesheet" href="/static/questionnaire-sources.css?v=1" />
   <link rel="stylesheet" href="/static/report-quick.css?v=11" />
-  <link rel="stylesheet" href="/static/survey-entry.css?v=7" />
+  <link rel="stylesheet" href="/static/survey-entry.css?v=8" />
 </head>
 
 <body>
@@ -324,7 +324,6 @@
         <p class="qe-status is-error" id="qe-editor-error" role="alert"></p>
         <div class="qe-editor-actions"><button class="btn btn--ghost" type="button" id="qe-editor-discard">放弃修改</button><button class="btn btn--primary" type="button" id="qe-editor-save">保存修改</button></div>
       </dialog>
-      <dialog class="qe-editor" id="qe-plan-editor" aria-labelledby="qe-plan-editor-title"><div class="qe-editor-head"><h2 id="qe-plan-editor-title">编辑分析结构</h2><button class="btn btn--ghost" type="button" id="qe-plan-editor-close">关闭</button></div><div class="qe-editor-body" id="qe-plan-editor-body"></div><div class="qe-editor-actions"><button class="btn btn--ghost" type="button" id="qe-plan-editor-discard">放弃修改</button><button class="btn btn--primary" type="button" id="qe-plan-editor-save">保存结构</button></div></dialog>
       <!-- STEP 3: Plan -->
       <section class="panel panel--hidden" id="panel-3">
         <div class="step-bar" id="step-bar-3">
@@ -364,7 +363,6 @@
           </section>
           <div class="plan-card__sections" id="plan-card-content"></div>
           <div class="plan-actions">
-            <div class="qe-plan-edit-actions"><button class="btn btn--ghost" type="button" id="qe-plan-edit">编辑章节与顺序</button></div>
             <div class="plan-actions__hint">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <circle cx="12" cy="12" r="10" />
@@ -2034,7 +2032,7 @@
   <!-- app.js 已按业务线拆分;顺序固定:core 最先,各 feature 居中(均含原顺序的初始化代码) -->
   <script src="/static/js/core/core.js?v=38"></script>
   <script src="/static/js/features/report-quick.js?v=9"></script>
-  <script src="/static/js/features/survey.js?v=39"></script>
+  <script src="/static/js/features/survey.js?v=40"></script>
   <script src="/static/js/features/survey-entry.js?v=5"></script>
   <script src="/static/js/features/questionnaire-sources.js?v=2"></script>
   <script src="/static/js/features/report.js?v=51"></script>

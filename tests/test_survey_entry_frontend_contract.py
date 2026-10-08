@@ -114,7 +114,101 @@ class SurveyEntryFrontendContractTests(unittest.TestCase):
         self.assertIn("state.columnFilter = 'all'", SURVEY)
         self.assertIn("state.selectedQuestionKeys = state.columns.filter(isSelectableColumn)", SURVEY)
         self.assertIn('id="qe-column-editor"', HTML)
-        self.assertIn('id="qe-plan-editor"', HTML)
+
+    def test_manual_plan_editor_is_removed_without_removing_revision_controls(self):
+        css = (ROOT / "survey-entry.css").read_text(encoding="utf-8")
+        for removed in ("qe-plan-edit", "qe-plan-part-editor", "manualPlanEditor", "ManualPlanEditor"):
+            self.assertNotIn(removed, HTML + SURVEY + css)
+        for node_id in ("plan-input", "btn-plan-ok", "btn-plan-revise", "qe-column-editor"):
+            self.assertIn(node_id, Elements().ids)
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required for plan interaction checks")
+    def test_confirmation_revision_and_column_unload_guard_remain_functional(self):
+        script = r"""
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
+const source = fs.readFileSync(process.argv[1], 'utf8');
+const elements = {};
+const element = id => elements[id] ||= {
+  value: '', style: {}, disabled: false,
+  addEventListener(name, callback) { this[name] = callback; },
+  querySelector() { return this; },
+};
+const initialPlan = {parts: [{name: 'Original'}], columns: [{index: 0}]};
+const revisedPlan = {parts: [{name: 'Revised'}], columns: [{index: 0}]};
+const requests = [], rendered = [], errors = [], pending = [];
+let statsCalls = 0, unload, flushes = 0;
+const sandbox = {
+  $: element,
+  state: {sessionId: 'synthetic-session', planData: initialPlan},
+  selectedReportStyle: () => 'full', lockReportStyleSelection() {},
+  syncPlanActionButtons() {}, _updateProgressStatus() {}, showToast() {},
+  showBlockingFlowError: (...args) => errors.push(args),
+  showPlanCard: (...args) => rendered.push(args),
+  runStats: async () => { statsCalls++; },
+  consumeSSEPost: async (url, body, onEvent) => {
+    requests.push({url, body});
+    if (body.user_text === 'ok') onEvent({type: 'json', approved: true});
+    else onEvent({type: 'plan_ready', plan: revisedPlan, headers: ['Question']});
+  },
+  window: {addEventListener(name, callback) {
+    assert.equal(name, 'beforeunload'); unload = callback;
+  }},
+  columnEditor: null,
+  flushColumnEditor() { flushes++; },
+};
+vm.createContext(sandbox);
+vm.runInContext(source.slice(source.indexOf("$('btn-plan-ok').addEventListener")), sandbox);
+// Track promises from the real button/keyboard handlers, which intentionally return void.
+vm.runInContext('const originalConfirmPlan = confirmPlan; confirmPlan = text => track(originalConfirmPlan(text));',
+  Object.assign(sandbox, {track: promise => { pending.push(promise); return promise; }}));
+(async () => {
+  element('btn-plan-ok').click();
+  await pending.shift();
+  assert.equal(requests[0].url, '/api/plan/confirm');
+  assert.equal(requests[0].body.plan, initialPlan);
+  assert.equal(requests[0].body.report_style, 'full');
+  assert.equal(statsCalls, 1);
+  element('plan-input').value = 'Change chapter order';
+  element('btn-plan-ok').click();
+  assert.equal(requests.length, 1, 'unsubmitted feedback must block approval');
+  element('btn-plan-revise').click();
+  await pending.shift();
+  assert.equal(requests[1].body.user_text, 'Change chapter order');
+  assert.equal(Object.hasOwn(requests[1].body, 'plan'), false);
+  assert.equal(sandbox.state.planData, revisedPlan);
+  assert.equal(rendered[0][0], revisedPlan);
+  assert.equal(statsCalls, 1, 'revision must wait for confirmation');
+  element('plan-input').value = '';
+  element('btn-plan-ok').click();
+  await pending.shift();
+  assert.equal(requests[2].body.plan, revisedPlan);
+  assert.equal(statsCalls, 2);
+  element('plan-input').value = 'Keyboard revision';
+  let keyPrevented = false;
+  element('plan-input').keydown({key: 'Enter', ctrlKey: true,
+    preventDefault() { keyPrevented = true; }});
+  await pending.shift();
+  assert.equal(keyPrevented, true);
+  assert.equal(requests[3].body.user_text, 'Keyboard revision');
+  assert.deepEqual(errors, []);
+  for (const draft of [null, {name: 'Original'}, {name: 'Changed'}]) {
+    sandbox.columnEditor = draft && {draft, initial: JSON.stringify({name: 'Original'})};
+    let prevented = false;
+    const event = {preventDefault() { prevented = true; }};
+    unload(event);
+    assert.equal(prevented, draft?.name === 'Changed');
+    if (prevented) assert.equal(event.returnValue, '');
+  }
+  assert.equal(flushes, 2);
+})().catch(error => { console.error(error); process.exitCode = 1; });
+"""
+        result = subprocess.run(
+            [shutil.which("node"), "-e", script, str(ROOT / "js/features/survey.js")],
+            capture_output=True, text=True, encoding="utf-8", timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     @unittest.skipUnless(shutil.which("node"), "Node.js is required for the draft timing regression")
     def test_column_readiness_preserves_unsaved_input_and_intentionally_cleared_fields(self):
