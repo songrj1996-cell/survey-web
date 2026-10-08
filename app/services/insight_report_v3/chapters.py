@@ -11,6 +11,7 @@ import re
 import time
 
 from app.core.config import (
+    DEFAULT_INSIGHT_V3_ACTION_WRITER_SYSTEM,
     DEFAULT_INSIGHT_V3_CHAPTER_PLAN_SYSTEM,
     DEFAULT_INSIGHT_V3_CHAPTER_WRITER_SYSTEM,
     DEFAULT_INSIGHT_V3_CORE_WRITER_SYSTEM,
@@ -18,6 +19,8 @@ from app.core.config import (
     DEFAULT_INSIGHT_V3_SKEW_VERIFY_SYSTEM,
     INSIGHT_V3_CHAPTER_CONCURRENCY,
     INSIGHT_V3_CHAPTER_MAX_RETRIES,
+    INSIGHT_V3_MAX_GENERAL_ACTIONS,
+    INSIGHT_V3_MAX_GROUP_ACTIONS,
     INSIGHT_V3_MAX_BLOCKS_PER_CHAPTER,
     INSIGHT_V3_MAX_CHAPTERS,
     INSIGHT_V3_MAX_GROUP_CHAPTERS,
@@ -34,6 +37,7 @@ from app.services.insight_report_v3.frequency import (
 from app.services.insight_report_v3.profiles import (
     evaluate_skew,
     filter_group_sources,
+    preflight_skew_candidate,
     profile_catalog,
     profile_option_exists,
     validate_profile_language,
@@ -63,8 +67,24 @@ _SKEW_ROOT_FIELDS = frozenset({"matches"})
 _SKEW_MATCH_FIELDS = frozenset({"finding_id", "response_ids"})
 _WRITER_ROOT_FIELDS = frozenset({"chapter_id", "blocks"})
 _WRITER_BLOCK_FIELDS = frozenset(
-    {"id", "heading", "body", "finding_ids", "evidence_ids"}
+    {"id", "heading", "body", "finding_ids", "evidence_ids", "evidence_points"}
 )
+_EVIDENCE_POINT_FIELDS = frozenset({"evidence_id", "summary"})
+_ACTION_ROOT_FIELDS = frozenset({"actions"})
+_ACTION_FIELDS = frozenset({
+    "id",
+    "title",
+    "action_scope",
+    "target_group",
+    "problem",
+    "objective",
+    "design_directions",
+    "validation_plan",
+    "finding_ids",
+    "evidence_gap",
+    "required_data",
+})
+_ACTION_GROUP_FIELDS = frozenset({"profile_name", "profile_value"})
 _FINDING_KINDS = frozenset({"pain", "motivation", "risk", "wish", "fact", "uncertain"})
 _FORBIDDEN_RAW_FIELDS = frozenset(
     {"quote", "excerpt", "snippet", "original", "source_text", "translation"}
@@ -73,16 +93,18 @@ _FORBIDDEN_FIXED_TITLES = ("调研背景", "样本概况", "核心发现", "统�
 _NUMBER_RE = re.compile(r"(?<![A-Za-z])\d+(?:\.\d+)?%?")
 _MARKDOWN_HEADING_RE = re.compile(r"(?m)^\s*#{1,6}\s+")
 _MARKDOWN_TABLE_RE = re.compile(r"(?m)^\s*\|.*\|\s*$")
+_PLAYER_SUBJECT_PATTERN = r"(?:[\u4e00-\u9fffA-Za-z0-9_-]{1,12})?玩家"
 _FREQUENCY_SUBJECT_PREFIX_RE = re.compile(
-    r"^(?:(?:绝大多数|普遍|大量|很多|不少|多名|部分|少数|个别)"
-    r"(?:玩家|受访者|用户|人)|有玩家|有受访者)\s*"
+    r"^(?:(?:绝大多数|大多数|多数|普遍|大量|很多|不少|多名|部分|少数|个别)"
+    rf"(?:{_PLAYER_SUBJECT_PATTERN}|受访者|用户|人)|有玩家|有受访者)\s*"
     r"(?:认为|表示|提到|指出|反馈|强调|关注|观察到|报告称)?\s*"
 )
 _FREQUENCY_CLAIM_PATTERNS = (
     re.compile(
-        r"(?:绝大多数|普遍|大量|很多|不少|多名|部分|少数|个别)\s*"
-        r"(?:玩家|受访者|用户|人|反馈|回答|提及|样本|观点)"
+        r"(?:绝大多数|大多数|多数|普遍|大量|很多|不少|多名|部分|少数|个别)\s*"
+        rf"(?:{_PLAYER_SUBJECT_PATTERN}|受访者|用户|人|反馈|回答|描述|提及|样本|观点)"
     ),
+    re.compile(rf"(?:{_PLAYER_SUBJECT_PATTERN}|受访者|用户|人)(?:大多数|多数)"),
     re.compile(r"普遍"),
     re.compile(r"(?:反复|多次|频繁)(?:被)?(?:提到|提及|反馈|描述|列为|写到)"),
     re.compile(r"常见(?:情形|观点|反馈|回答|说法|原因|选择|模式)"),
@@ -138,12 +160,17 @@ def _neutralize_frequency_claims(value: str) -> tuple[str, list[str]]:
             break
         terms.extend(matched_terms)
         updated = re.sub(
-            r"(?:绝大多数|大量|很多|不少|多名|部分|少数|个别)\s*"
-            r"(玩家|受访者|用户|人|反馈|回答|提及|样本|观点)",
-            r"\1",
+            r"(?:绝大多数|大多数|多数|大量|很多|不少|多名|部分|少数|个别)\s*"
+            rf"({_PLAYER_SUBJECT_PATTERN}|受访者|用户|人|反馈|回答|描述|提及|样本|观点)",
+            lambda match: "提及者" if match.group(1) == "人" else match.group(1),
             text,
         )
-        updated = re.sub(r"有(?:玩家|受访者)", "提及者", updated)
+        updated = re.sub(
+            rf"({_PLAYER_SUBJECT_PATTERN}|受访者|用户|人)(?:大多数|多数)",
+            r"\1",
+            updated,
+        )
+        updated = re.sub(r"(?<![所没])有(?:玩家|受访者)", "有提及者", updated)
         updated = re.sub(r"多道题均有提及", "相关材料有提及", updated)
         updated = re.sub(r"普遍", "", updated)
         updated = re.sub(
@@ -408,6 +435,285 @@ def _fallback_chapter_plan(findings: list[dict]) -> dict:
         "report_title": "观点洞察报告",
         "chapters": chapters,
         "suspected_skews": [],
+    }
+
+
+_GROUP_DELIVERABLE_MARKERS = (
+    "人群",
+    "群体",
+    "玩家",
+    "用户",
+    "受访者",
+    "专章",
+    "专项",
+    "观察",
+    "画像",
+)
+
+
+def _profile_value_aliases(profile_name: str, profile_value: str) -> set[str]:
+    value = _clean(profile_value).casefold()
+    name = _clean(profile_name).casefold()
+    aliases = {value}
+    if "性别" in name:
+        if value in {"女", "女性", "female"}:
+            aliases.update({"女性", "女玩家", "女性玩家", "female"})
+        elif value in {"男", "男性", "male"}:
+            aliases.update({"男性", "男玩家", "男性玩家", "male"})
+    return {alias for alias in aliases if alias}
+
+
+def _deliverable_mentions_option(
+    deliverable: str,
+    *,
+    profile_name: str,
+    profile_value: str,
+) -> bool:
+    text = _clean(deliverable).casefold().replace(" ", "")
+    if not text or not any(marker in text for marker in _GROUP_DELIVERABLE_MARKERS):
+        return False
+    name = _clean(profile_name).casefold().replace(" ", "")
+    aliases = _profile_value_aliases(profile_name, profile_value)
+    for alias in aliases:
+        normalized = alias.replace(" ", "")
+        if len(normalized) >= 2 and normalized in text:
+            return True
+        if len(normalized) == 1 and (
+            f"{normalized}玩家" in text
+            or f"{normalized}用户" in text
+            or f"{normalized}群体" in text
+            or (name in text and normalized in text)
+        ):
+            return True
+    return False
+
+
+def required_group_chapters(
+    *,
+    plan: dict,
+    profiles: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    """Resolve explicitly named expected-deliverable groups without guessing."""
+    focus = (plan or {}).get("analysis_focus")
+    if not isinstance(focus, dict) or not focus:
+        return [], []
+    deliverables = focus.get("expected_deliverables")
+    if not isinstance(deliverables, list):
+        return [], []
+    options = [
+        {
+            "profile_name": _clean(item.get("profile_name")),
+            "profile_value": _clean(value),
+        }
+        for item in profiles or []
+        for value in item.get("values") or []
+        if _clean(item.get("profile_name")) and _clean(value)
+    ]
+    resolved: list[dict] = []
+    unresolved: list[dict] = []
+    for raw in deliverables:
+        deliverable = _clean(raw)
+        matches = [
+            option for option in options
+            if _deliverable_mentions_option(
+                deliverable,
+                profile_name=option["profile_name"],
+                profile_value=option["profile_value"],
+            )
+        ]
+        unique = list({
+            (item["profile_name"], item["profile_value"]): item
+            for item in matches
+        }.values())
+        if len(unique) == 1:
+            item = {**unique[0], "expected_deliverable": deliverable}
+            if not any(
+                existing["profile_name"] == item["profile_name"]
+                and existing["profile_value"] == item["profile_value"]
+                for existing in resolved
+            ):
+                resolved.append(item)
+        elif len(unique) > 1:
+            unresolved.append({
+                "expected_deliverable": deliverable,
+                "reason": "ambiguous_profile_group",
+                "matches": unique,
+            })
+        elif any(
+            marker in deliverable
+            for marker in ("人群", "群体", "专章", "专项", "画像")
+        ):
+            unresolved.append({
+                "expected_deliverable": deliverable,
+                "reason": "profile_group_not_in_catalog",
+                "matches": [],
+            })
+    return resolved, unresolved
+
+
+def _renumber_chapters(chapters: list[dict]) -> None:
+    for index, chapter in enumerate(chapters, 1):
+        chapter["id"] = f"c{index:02d}"
+
+
+def _merge_last_regular_chapter(chapters: list[dict]) -> bool:
+    regular_indexes = [
+        index for index, chapter in enumerate(chapters)
+        if not isinstance(chapter.get("group_focus"), dict)
+    ]
+    if len(regular_indexes) < 2:
+        return False
+    source_index = regular_indexes[-1]
+    target_index = regular_indexes[-2]
+    source = chapters[source_index]
+    target = chapters[target_index]
+    target["finding_ids"] = list(dict.fromkeys([
+        *(target.get("finding_ids") or []),
+        *(source.get("finding_ids") or []),
+    ]))
+    target["stat_ids"] = list(dict.fromkeys([
+        *(target.get("stat_ids") or []),
+        *(source.get("stat_ids") or []),
+    ]))[:3]
+    target["purpose"] = (
+        f"{_clean(target.get('purpose'))}；并覆盖{_clean(source.get('title'))}相关发现"
+    ).strip("；")
+    del chapters[source_index]
+    return True
+
+
+def ensure_required_group_chapters(
+    chapter_plan: dict,
+    *,
+    plan: dict,
+    profiles: list[dict],
+) -> tuple[dict, dict]:
+    """Guarantee uniquely resolved group deliverables after model planning."""
+    updated = deepcopy(chapter_plan)
+    chapters = updated.setdefault("chapters", [])
+    focus = (plan or {}).get("analysis_focus")
+    if not isinstance(focus, dict) or not focus:
+        return updated, {
+            "status": "missing",
+            "message": "未提供分析主线，章节按问卷结构组织，未规划人群专章",
+            "required": [],
+            "inserted": [],
+            "already_present": [],
+            "unresolved": [],
+        }
+
+    requested, unresolved = required_group_chapters(plan=plan, profiles=profiles)
+    required = requested[:INSIGHT_V3_MAX_GROUP_CHAPTERS]
+    for overflow in requested[INSIGHT_V3_MAX_GROUP_CHAPTERS:]:
+        unresolved.append({
+            **overflow,
+            "reason": "group_chapter_limit",
+        })
+    required_keys = {
+        (item["profile_name"], item["profile_value"])
+        for item in required
+    }
+    existing_by_key = {
+        (
+            _clean((chapter.get("group_focus") or {}).get("profile_name")),
+            _clean((chapter.get("group_focus") or {}).get("profile_value")),
+        ): chapter
+        for chapter in chapters
+        if isinstance(chapter.get("group_focus"), dict)
+    }
+    already_present: list[dict] = []
+    inserted: list[dict] = []
+
+    for request in required:
+        key = (request["profile_name"], request["profile_value"])
+        if key in existing_by_key:
+            already_present.append(deepcopy(request))
+            continue
+
+        current_group_chapters = [
+            chapter for chapter in chapters
+            if isinstance(chapter.get("group_focus"), dict)
+        ]
+        if len(current_group_chapters) >= INSIGHT_V3_MAX_GROUP_CHAPTERS:
+            group_key_counts: dict[tuple[str, str], int] = defaultdict(int)
+            for current in current_group_chapters:
+                current_key = (
+                    _clean(current["group_focus"].get("profile_name")),
+                    _clean(current["group_focus"].get("profile_value")),
+                )
+                group_key_counts[current_key] += 1
+            replacement = None
+            for candidate in reversed(current_group_chapters):
+                candidate_key = (
+                    _clean(candidate["group_focus"].get("profile_name")),
+                    _clean(candidate["group_focus"].get("profile_value")),
+                )
+                if candidate_key not in required_keys or group_key_counts[candidate_key] > 1:
+                    replacement = candidate
+                    break
+            if replacement is not None:
+                replacement["group_focus"] = {
+                    "profile_name": request["profile_name"],
+                    "profile_value": request["profile_value"],
+                }
+                replacement["title"] = f"{request['profile_value']}群体观察"
+                replacement["purpose"] = (
+                    f"按已确认交付要求归纳{request['profile_name']}为"
+                    f"{request['profile_value']}玩家的开放题体验，不进行群体高低比较"
+                )
+                existing_by_key[key] = replacement
+                inserted.append({**deepcopy(request), "mode": "replaced_unrequested_group"})
+                continue
+            unresolved.append({**deepcopy(request), "reason": "group_chapter_limit"})
+            continue
+
+        if len(chapters) >= INSIGHT_V3_MAX_CHAPTERS and not _merge_last_regular_chapter(chapters):
+            replacement = next((
+                chapter for chapter in reversed(chapters)
+                if not isinstance(chapter.get("group_focus"), dict)
+            ), None)
+            if replacement is None:
+                unresolved.append({**deepcopy(request), "reason": "chapter_capacity_exhausted"})
+                continue
+            replacement["group_focus"] = {
+                "profile_name": request["profile_name"],
+                "profile_value": request["profile_value"],
+            }
+            replacement["title"] = f"{request['profile_value']}群体观察"
+            replacement["purpose"] = (
+                f"按已确认交付要求归纳{request['profile_name']}为"
+                f"{request['profile_value']}玩家的开放题体验，不进行群体高低比较"
+            )
+            existing_by_key[key] = replacement
+            inserted.append({**deepcopy(request), "mode": "repurposed_regular_chapter"})
+            continue
+
+        chapter = {
+            "id": "",
+            "title": f"{request['profile_value']}群体观察",
+            "purpose": (
+                f"按已确认交付要求归纳{request['profile_name']}为"
+                f"{request['profile_value']}玩家的开放题体验，不进行群体高低比较"
+            ),
+            "finding_ids": [],
+            "stat_ids": [],
+            "group_focus": {
+                "profile_name": request["profile_name"],
+                "profile_value": request["profile_value"],
+            },
+        }
+        chapters.append(chapter)
+        existing_by_key[key] = chapter
+        inserted.append({**deepcopy(request), "mode": "appended"})
+
+    _renumber_chapters(chapters)
+    return updated, {
+        "status": "present",
+        "message": "已按明确分析主线核对人群专章",
+        "required": deepcopy(required),
+        "inserted": inserted,
+        "already_present": already_present,
+        "unresolved": unresolved,
     }
 
 
@@ -713,6 +1019,7 @@ async def verify_suspected_skews(
         _clean(item.get("scope_key")): item
         for item in source_contract.get("questions") or []
     }
+    registry = source_contract.get("source_registry") or {}
     grouped: dict[str, list[dict]] = defaultdict(list)
     diagnostics: list[dict] = []
     for suspect in (suspected_skews or [])[:INSIGHT_V3_MAX_SKEW_CANDIDATES]:
@@ -725,6 +1032,28 @@ async def verify_suspected_skews(
                 **deepcopy(suspect),
                 "status": "unavailable",
                 "reason": "scope_source_mapping_missing",
+            })
+            continue
+        question = questions_by_scope[scope_key]
+        scope_response_ids = list(dict.fromkeys(
+            source_id
+            for source_ids in (question.get("short_id_map") or {}).values()
+            for source_id in source_ids
+        ))
+        preflight = preflight_skew_candidate(
+            scope_response_ids=scope_response_ids,
+            source_registry=registry,
+            plan=plan,
+            profile_name=_clean(suspect.get("profile_name")),
+            profile_value=_clean(suspect.get("profile_value")),
+        )
+        if preflight.get("status") != "eligible":
+            diagnostics.append({
+                **deepcopy(suspect),
+                "status": "unavailable",
+                "reason": preflight.get("reason") or "skew_preflight_failed",
+                "diagnostics": deepcopy(preflight.get("diagnostics") or {}),
+                "preflight": True,
             })
             continue
         grouped[scope_key].append(deepcopy(suspect))
@@ -789,7 +1118,6 @@ async def verify_suspected_skews(
             _index, (scope_key, call) = payload
             calls[scope_key] = call
 
-    registry = source_contract.get("source_registry") or {}
     for scope_key in selected_scopes:
         question = questions_by_scope[scope_key]
         call = calls.get(scope_key) or {}
@@ -838,6 +1166,7 @@ async def verify_suspected_skews(
             })
     return result_findings, {
         "requested_count": len(suspected_skews or []),
+        "prefiltered_count": sum(bool(item.get("preflight")) for item in diagnostics),
         "verification_call_count": len(calls),
         "verified_count": sum(item.get("status") == "verified" for item in diagnostics),
         "items": diagnostics,
@@ -940,6 +1269,51 @@ def _validate_writer_output(
             not isinstance(item, str) or item not in valid_short_ids for item in evidence_ids
         ):
             return f"blocks[{index}] 的 evidence_ids 无效"
+        evidence_points = block.get("evidence_points")
+        if not isinstance(evidence_points, list):
+            return f"blocks[{index}] 的 evidence_points 必须是数组"
+        seen_point_ids: set[str] = set()
+        for point_index, point in enumerate(evidence_points):
+            if not isinstance(point, dict) or set(point) != _EVIDENCE_POINT_FIELDS:
+                return f"blocks[{index}].evidence_points[{point_index}] 字段不符合契约"
+            evidence_id = _clean(point.get("evidence_id"))
+            summary = point.get("summary")
+            if evidence_id not in evidence_ids or evidence_id in seen_point_ids:
+                return f"blocks[{index}].evidence_points[{point_index}] 引用无效或重复"
+            seen_point_ids.add(evidence_id)
+            if not isinstance(summary, str) or not _clean(summary):
+                return f"blocks[{index}].evidence_points[{point_index}] 缺少 summary"
+            normalized_summary, summary_terms = _neutralize_frequency_claims(
+                " ".join(summary.split())
+            )
+            if (
+                not normalized_summary
+                or len(normalized_summary) > 180
+                or len(re.findall(r"[。！？!?]", normalized_summary)) > 1
+            ):
+                return f"blocks[{index}].evidence_points[{point_index}] 必须是一句不超过 180 字的概括"
+            if _MARKDOWN_HEADING_RE.search(normalized_summary) or _MARKDOWN_TABLE_RE.search(normalized_summary):
+                return f"blocks[{index}].evidence_points[{point_index}] 不得包含 Markdown 标题或表格"
+            point["summary"] = normalized_summary
+            if summary_terms and frequency_rewrites is not None:
+                frequency_rewrites.append({
+                    "block_id": block_id,
+                    "evidence_id": evidence_id,
+                    "terms": list(dict.fromkeys(summary_terms)),
+                })
+            profile_error = validate_profile_language(
+                normalized_summary,
+                findings=[findings_by_id[item] for item in finding_ids],
+                catalog=profiles,
+            )
+            if profile_error:
+                return f"blocks[{index}].evidence_points[{point_index}]：{profile_error}"
+            for number in _NUMBER_RE.findall(normalized_summary):
+                if number not in numeric_sources:
+                    return (
+                        f"blocks[{index}].evidence_points[{point_index}] "
+                        f"包含来源中不存在的数字：{number}"
+                    )
         if not any(allowed_by_short[item] & set(finding_ids) for item in valid_short_ids):
             return f"blocks[{index}] 的 finding 没有可回绑的代表证据"
         heading = block.get("heading")
@@ -1025,6 +1399,16 @@ def _canonicalize_block_evidence(
         if selected != requested:
             rebound_count += 1
         item["evidence_ids"] = selected
+        points_by_id = {
+            _clean(point.get("evidence_id")): deepcopy(point)
+            for point in item.get("evidence_points") or []
+            if isinstance(point, dict)
+        }
+        item["evidence_points"] = [
+            points_by_id[short_id]
+            for short_id in selected
+            if short_id in points_by_id
+        ]
         canonical.append(item)
     return canonical, rebound_count
 
@@ -1051,12 +1435,22 @@ async def _translate_evidence(
         translated_by_short = {item["response_id"]: item for item in translated}
     hydrated = []
     for block in blocks:
-        item = {key: deepcopy(value) for key, value in block.items() if key != "evidence_ids"}
+        point_by_short = {
+            _clean(point.get("evidence_id")): _clean(point.get("summary"))
+            for point in block.get("evidence_points") or []
+            if isinstance(point, dict)
+        }
+        item = {
+            key: deepcopy(value)
+            for key, value in block.items()
+            if key not in {"evidence_ids", "evidence_points"}
+        }
         item["evidence"] = []
         for short_id in block.get("evidence_ids") or []:
             translated = translated_by_short.get(short_id) or {}
             item["evidence"].append({
                 "response_id": short_to_global[short_id],
+                "evidence_point": point_by_short.get(short_id, ""),
                 "translation_zh": _clean(translated.get("translation_zh")),
                 "translation_status": translated.get("translation_status") or "failed",
                 **(
@@ -1137,6 +1531,7 @@ def _fallback_blocks(
             "body": body or "该发现需要人工复核。",
             "finding_ids": group,
             "evidence_ids": evidence_ids,
+            "evidence_points": [],
         })
     return blocks
 
@@ -1155,6 +1550,34 @@ async def _write_one_section(
 ) -> dict:
     chapter_id = chapter["id"]
     finding_ids = list(dict.fromkeys(chapter.get("finding_ids") or []))
+    group_focus = chapter.get("group_focus")
+    if not finding_ids and isinstance(group_focus, dict):
+        profile_name = _clean(group_focus.get("profile_name"))
+        profile_value = _clean(group_focus.get("profile_value"))
+        return {
+            **deepcopy(chapter),
+            "blocks": [{
+                "id": "group-evidence-gap",
+                "heading": f"{profile_value or '该'}群体材料暂不足",
+                "body": (
+                    f"已按{profile_name or '画像'}为{profile_value or '目标取值'}筛选开放题材料，"
+                    "但尚未形成可通过证据绑定校验的稳定发现。若要完成该人群观察，"
+                    "需要补充该人群更完整的有效开放题反馈及具体体验场景。"
+                ),
+                "finding_ids": [],
+                "evidence": [],
+            }],
+            "diagnostics": {
+                "status": "degraded",
+                "logical_attempts": 0,
+                "attempts": [],
+                "models": [],
+                "reason": "group_findings_unavailable",
+                "evidence_rebound_count": 0,
+                "frequency_rewrite_count": 0,
+                "frequency_rewrites": [],
+            },
+        }
     sources, short_to_global, allowed_by_short = _chapter_sources(
         finding_ids,
         findings_by_id=findings_by_id,
@@ -1191,6 +1614,10 @@ async def _write_one_section(
         "body": "中文分析正文，不含频次词；引用位置由 evidence_ids 表示",
         "finding_ids": [finding_ids[0]] if finding_ids else [],
         "evidence_ids": [sources[0]["response_id"]] if sources else [],
+        "evidence_points": ([{
+            "evidence_id": sources[0]["response_id"],
+            "summary": "该条证据的一句话中文要点",
+        }] if sources else []),
     }]}
     query = (
         "<contract>\n" + _safe_json(contract) + "\n</contract>\n"
@@ -1412,3 +1839,331 @@ async def write_core_findings(
         core_context=compact_chapters,
         on_attempt_event=on_attempt_event,
     )
+
+
+def _action_group_bindings(chapters: list[dict]) -> tuple[set[tuple[str, str]], dict[str, tuple[str, str]]]:
+    group_options: set[tuple[str, str]] = set()
+    finding_groups: dict[str, tuple[str, str]] = {}
+    for chapter in chapters or []:
+        focus = chapter.get("group_focus")
+        if not isinstance(focus, dict):
+            continue
+        key = (
+            _clean(focus.get("profile_name")),
+            _clean(focus.get("profile_value")),
+        )
+        if not all(key):
+            continue
+        group_options.add(key)
+        for finding_id in chapter.get("finding_ids") or []:
+            finding_groups[_clean(finding_id)] = key
+    return group_options, finding_groups
+
+
+def _normalize_action_text(value: str) -> tuple[str, list[str]]:
+    text = " ".join(_clean(value).split())
+    text = re.sub(r"^(?:[-*]|\d+[.)、])\s*", "", text)
+    return _neutralize_frequency_claims(text)
+
+
+def _validate_action_output(
+    data: dict | None,
+    *,
+    findings_by_id: dict[str, dict],
+    chapters: list[dict],
+    profiles: list[dict],
+    numeric_sources: str,
+) -> str | None:
+    if not isinstance(data, dict) or set(data) != _ACTION_ROOT_FIELDS:
+        return "根节点必须且只能包含 actions"
+    forbidden = _forbidden_field_path(data)
+    if forbidden:
+        return f"行动建议包含禁止的原文字段：{forbidden}"
+    actions = data.get("actions")
+    if not isinstance(actions, list):
+        return "actions 必须是数组"
+    general_count = sum(item.get("action_scope") == "general" for item in actions if isinstance(item, dict))
+    group_count = sum(item.get("action_scope") == "group" for item in actions if isinstance(item, dict))
+    if general_count > INSIGHT_V3_MAX_GENERAL_ACTIONS:
+        return f"普通行动建议不得超过 {INSIGHT_V3_MAX_GENERAL_ACTIONS} 条"
+    if group_count > INSIGHT_V3_MAX_GROUP_ACTIONS:
+        return f"人群专项建议不得超过 {INSIGHT_V3_MAX_GROUP_ACTIONS} 条"
+
+    group_options, finding_groups = _action_group_bindings(chapters)
+    seen_ids: set[str] = set()
+    for index, action in enumerate(actions, 1):
+        if not isinstance(action, dict) or set(action) != _ACTION_FIELDS:
+            return f"actions[{index - 1}] 必须恰好包含内部 11 字段"
+        expected_id = f"a{index:02d}"
+        if action.get("id") != expected_id or expected_id in seen_ids:
+            return f"行动建议 ID 必须从 a01 连续编号，当前应为 {expected_id}"
+        seen_ids.add(expected_id)
+        action_scope = action.get("action_scope")
+        if action_scope not in {"general", "group"}:
+            return f"actions[{index - 1}] 的 action_scope 无效"
+        finding_ids = action.get("finding_ids")
+        if not isinstance(finding_ids, list) or not 1 <= len(finding_ids) <= 3:
+            return f"actions[{index - 1}] 必须绑定 1 至 3 个 finding_id"
+        if len(finding_ids) != len(set(finding_ids)) or any(
+            not isinstance(item, str) or item not in findings_by_id
+            for item in finding_ids
+        ):
+            return f"actions[{index - 1}] 的 finding_ids 含重复或未知 ID"
+
+        target_group = action.get("target_group")
+        if action_scope == "general":
+            if target_group is not None:
+                return f"actions[{index - 1}] 的普通建议不得设置 target_group"
+        else:
+            if not isinstance(target_group, dict) or set(target_group) != _ACTION_GROUP_FIELDS:
+                return f"actions[{index - 1}] 的人群建议缺少合法 target_group"
+            target_key = (
+                _clean(target_group.get("profile_name")),
+                _clean(target_group.get("profile_value")),
+            )
+            if target_key not in group_options:
+                return f"actions[{index - 1}] 指向未规划的人群专章"
+            if not any(finding_groups.get(finding_id) == target_key for finding_id in finding_ids):
+                return f"actions[{index - 1}] 未绑定对应人群专章的 finding"
+
+        scalar_fields = (
+            "title",
+            "problem",
+            "objective",
+            "validation_plan",
+            "evidence_gap",
+            "required_data",
+        )
+        normalized_texts: list[str] = []
+        for field in scalar_fields:
+            value = action.get(field)
+            if not isinstance(value, str):
+                return f"actions[{index - 1}].{field} 必须是字符串"
+            normalized, _terms = _normalize_action_text(value)
+            if field in {"title", "problem", "objective", "validation_plan"} and not normalized:
+                return f"actions[{index - 1}].{field} 不得为空"
+            if "\n" in value or _MARKDOWN_HEADING_RE.search(value) or _MARKDOWN_TABLE_RE.search(value):
+                return f"actions[{index - 1}].{field} 不得包含 Markdown 标题或表格"
+            action[field] = normalized
+            if normalized:
+                normalized_texts.append(normalized)
+
+        directions = action.get("design_directions")
+        if not isinstance(directions, list) or not 1 <= len(directions) <= 3:
+            return f"actions[{index - 1}].design_directions 必须包含 1 至 3 项"
+        normalized_directions: list[str] = []
+        for direction_index, direction in enumerate(directions):
+            if not isinstance(direction, str):
+                return f"actions[{index - 1}].design_directions[{direction_index}] 必须是字符串"
+            normalized, _terms = _normalize_action_text(direction)
+            if not normalized or _MARKDOWN_HEADING_RE.search(direction) or _MARKDOWN_TABLE_RE.search(direction):
+                return f"actions[{index - 1}].design_directions[{direction_index}] 无效"
+            normalized_directions.append(normalized)
+            normalized_texts.append(normalized)
+        action["design_directions"] = normalized_directions
+
+        bound_findings = [findings_by_id[finding_id] for finding_id in finding_ids]
+        needs_gap = any(
+            finding.get("degraded") or finding.get("kind") == "uncertain"
+            for finding in bound_findings
+        )
+        has_gap = bool(action["evidence_gap"])
+        has_required_data = bool(action["required_data"])
+        if has_gap != has_required_data:
+            return f"actions[{index - 1}] 的 evidence_gap 与 required_data 必须同时填写或同时留空"
+        if needs_gap and not has_gap:
+            return f"actions[{index - 1}] 绑定不确定或降级 finding 时必须说明证据缺口与所需数据"
+
+        combined = "\n".join(normalized_texts)
+        if _frequency_claim_term(combined):
+            return f"actions[{index - 1}] 不得自行写观点频次"
+        profile_error = validate_profile_language(
+            combined,
+            findings=bound_findings,
+            catalog=profiles,
+        )
+        if profile_error:
+            return f"actions[{index - 1}]：{profile_error}"
+        for number in _NUMBER_RE.findall(combined):
+            if number not in numeric_sources:
+                return f"actions[{index - 1}] 包含来源中不存在的数字：{number}"
+    return None
+
+
+async def write_actions(
+    *,
+    chapters: list[dict],
+    core_blocks: list[dict],
+    findings_by_id: dict[str, dict],
+    profiles: list[dict],
+    qualitative_context: dict | None,
+    on_attempt_event=None,
+) -> dict:
+    covered_ids = list(dict.fromkeys(
+        finding_id
+        for collection in (
+            *(chapter.get("blocks") or [] for chapter in chapters),
+            core_blocks or [],
+        )
+        for block in collection
+        for finding_id in block.get("finding_ids") or []
+        if finding_id in findings_by_id
+    ))
+    if not covered_ids:
+        return {
+            "actions": [],
+            "chapter_note": (
+                "现有材料尚未形成可通过 finding 绑定校验的行动建议。"
+                "如需形成方案，应补充明确的产品约束、目标用户和可验证的业务问题。"
+            ),
+            "diagnostics": {
+                "status": "skipped",
+                "logical_attempts": 0,
+                "attempts": [],
+                "models": [],
+                "reason": "no_written_findings",
+            },
+        }
+
+    compact_chapters = [
+        {
+            "id": chapter.get("id"),
+            "title": chapter.get("title"),
+            "purpose": chapter.get("purpose"),
+            "group_focus": deepcopy(chapter.get("group_focus")),
+            "finding_ids": list(dict.fromkeys(chapter.get("finding_ids") or [])),
+            "blocks": [
+                {
+                    "heading": block.get("heading"),
+                    "body": block.get("body"),
+                    "finding_ids": block.get("finding_ids"),
+                }
+                for block in chapter.get("blocks") or []
+            ],
+        }
+        for chapter in chapters
+    ]
+    compact_core = [
+        {
+            "heading": block.get("heading"),
+            "body": block.get("body"),
+            "finding_ids": block.get("finding_ids"),
+        }
+        for block in core_blocks or []
+    ]
+    finding_payload = [
+        {
+            "id": finding_id,
+            "claim": _claim_without_frequency_prefix(findings_by_id[finding_id].get("claim")),
+            "kind": findings_by_id[finding_id].get("kind"),
+            "caveat": _clean(findings_by_id[finding_id].get("caveat")),
+            "degraded": bool(findings_by_id[finding_id].get("degraded")),
+            **writer_profile_payload(findings_by_id[finding_id]),
+        }
+        for finding_id in covered_ids
+    ]
+    contract = {"actions": [{
+        "id": "a01",
+        "title": "面向业务读者的建议标题",
+        "action_scope": "general|group",
+        "target_group": None,
+        "problem": "该建议要处理的、已由 finding 支撑的问题",
+        "objective": "希望改善的体验或决策目标",
+        "design_directions": ["可考虑的设计方向，不写编号"],
+        "validation_plan": "如何验证方向是否有效，不新增无来源数值目标",
+        "finding_ids": [covered_ids[0]],
+        "evidence_gap": "证据足够时留空；不足时说明缺口",
+        "required_data": "无缺口时留空；有缺口时说明所需补充数据",
+    }]}
+    query = (
+        "<contract>\n" + _safe_json(contract) + "\n</contract>\n"
+        + "<limits>普通建议最多 " + str(INSIGHT_V3_MAX_GENERAL_ACTIONS)
+        + " 条；人群专项建议最多 " + str(INSIGHT_V3_MAX_GROUP_ACTIONS)
+        + " 条；允许 actions=[]，不得为凑数量提出无证据建议。</limits>\n"
+        + "<business_context>\n" + _safe_json(qualitative_context or {}) + "\n</business_context>\n"
+        + "<core_findings>\n" + _safe_json(compact_core) + "\n</core_findings>\n"
+        + "<completed_chapters>\n" + _safe_json(compact_chapters) + "\n</completed_chapters>\n"
+        + "<findings>\n" + _safe_json(finding_payload) + "\n</findings>"
+    )
+    numeric_sources = "\n".join((
+        _safe_json(finding_payload),
+        _safe_json(compact_core),
+        _safe_json(compact_chapters),
+    ))
+    attempts: list[dict] = []
+    models: list[str] = []
+
+    async def _on_attempt(event: dict):
+        await _forward_attempt_event(on_attempt_event, {
+            **event,
+            "phase": "writing",
+            "step": "actions",
+        })
+
+    for logical_attempt in range(INSIGHT_V3_CHAPTER_MAX_RETRIES + 1):
+        repair_errors: list[str] = []
+        result = await _direct_json_call(
+            DEFAULT_INSIGHT_V3_ACTION_WRITER_SYSTEM,
+            query,
+            models=tuple(model for model in (LLM_REPORT_MODEL, *LLM_REPORT_FALLBACK_MODELS) if model),
+            max_tokens=LLM_REPORT_MAX_TOKENS,
+            reasoning_effort=None,
+            validator=lambda data: _validate_action_output(
+                data,
+                findings_by_id=findings_by_id,
+                chapters=chapters,
+                profiles=profiles,
+                numeric_sources=numeric_sources,
+            ),
+            on_repair=repair_errors.append,
+            on_attempt_event=_on_attempt,
+        )
+        if result.get("model"):
+            models.append(result["model"])
+        attempts.append({
+            "attempt": logical_attempt + 1,
+            "model": _clean(result.get("model")),
+            "repaired": bool(result.get("repaired")),
+            "repair_errors": repair_errors,
+            "error": _clean(result.get("error"))[:300],
+            "duration_seconds": float(result.get("duration_seconds") or 0.0),
+        })
+        if result.get("data") is None:
+            continue
+        actions = deepcopy(result["data"]["actions"])
+        return {
+            "actions": actions,
+            "chapter_note": (
+                "现有材料未形成可通过 finding 绑定校验的行动建议。"
+                "如需形成方案，应补充明确的产品约束、目标用户和验证条件。"
+                if not actions else ""
+            ),
+            "diagnostics": {
+                "status": "complete",
+                "logical_attempts": logical_attempt + 1,
+                "attempts": attempts,
+                "models": list(dict.fromkeys(models)),
+                "reason": "no_grounded_actions" if not actions else "",
+                "action_count": len(actions),
+                "general_action_count": sum(item["action_scope"] == "general" for item in actions),
+                "group_action_count": sum(item["action_scope"] == "group" for item in actions),
+            },
+        }
+
+    return {
+        "actions": [],
+        "chapter_note": (
+            "行动建议生成未通过证据绑定校验，因此未用合理化叙述补齐。"
+            "如需形成方案，应补充明确的产品约束、目标用户和验证条件后重新生成。"
+        ),
+        "diagnostics": {
+            "status": "degraded",
+            "logical_attempts": len(attempts),
+            "attempts": attempts,
+            "models": list(dict.fromkeys(models)),
+            "reason": "action_writer_retry_exhausted",
+            "action_count": 0,
+            "general_action_count": 0,
+            "group_action_count": 0,
+        },
+    }

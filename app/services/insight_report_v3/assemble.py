@@ -192,9 +192,54 @@ def finding_frequency_label(findings: list[dict]) -> str:
 def _evidence_quote_lines(translation: str) -> list[str]:
     lines = translation.splitlines() or [translation]
     return [
-        f"> 代表反馈：{lines[0]}",
+        f"> {lines[0]}",
         *(f"> {line}" if line else ">" for line in lines[1:]),
     ]
+
+
+def build_evidence_index(
+    *,
+    core_blocks: list[dict],
+    chapters: list[dict],
+) -> list[dict]:
+    """Deduplicate full translations while retaining every body reference."""
+    ordered_sections = [
+        ("三、核心发现", core_blocks or []),
+        *(
+            (
+                f"{_section_number(index)}、{_clean(chapter.get('title'))}",
+                chapter.get("blocks") or [],
+            )
+            for index, chapter in enumerate(chapters or [], 4)
+        ),
+    ]
+    by_response: dict[str, dict] = {}
+    ordered: list[dict] = []
+    for section_label, blocks in ordered_sections:
+        for block in blocks:
+            heading = _clean(block.get("heading")) or "关键发现"
+            reference = f"{section_label} / {heading}"
+            for evidence in block.get("evidence") or []:
+                response_id = _clean(evidence.get("response_id"))
+                if not response_id:
+                    continue
+                entry = by_response.get(response_id)
+                if entry is None:
+                    entry = {
+                        "evidence_id": f"E-{len(ordered) + 1:03d}",
+                        "response_id": response_id,
+                        "translation_zh": _clean(evidence.get("translation_zh")),
+                        "translation_status": evidence.get("translation_status") or "failed",
+                        "references": [],
+                    }
+                    by_response[response_id] = entry
+                    ordered.append(entry)
+                elif not entry["translation_zh"] and _clean(evidence.get("translation_zh")):
+                    entry["translation_zh"] = _clean(evidence.get("translation_zh"))
+                    entry["translation_status"] = evidence.get("translation_status") or "failed"
+                if reference not in entry["references"]:
+                    entry["references"].append(reference)
+    return ordered
 
 
 def render_written_section(
@@ -203,6 +248,7 @@ def render_written_section(
     blocks: list[dict],
     findings_by_id: dict[str, dict],
     section_index: int,
+    evidence_ids: dict[str, str],
 ) -> str:
     lines = [f"## {_section_number(section_index)}、{_clean(section_title)}"]
     for block in blocks or []:
@@ -217,12 +263,89 @@ def render_written_section(
         if body:
             lines.extend(["", body])
         for evidence in block.get("evidence") or []:
-            translation = _clean(evidence.get("translation_zh"))
-            if translation:
-                lines.append("")
-                lines.extend(_evidence_quote_lines(translation))
+            evidence_id = evidence_ids.get(_clean(evidence.get("response_id")))
+            if not evidence_id:
+                continue
+            point = _clean(evidence.get("evidence_point"))
+            if point:
+                lines.extend(["", f"- **证据要点：** {point}（详见 {evidence_id}）"])
             else:
-                lines.extend(["", "> 代表反馈的中文翻译暂不可用；来源编号已保留供人工核对。"])
+                lines.extend(["", f"- **证据要点：** 详见 {evidence_id}。"])
+    return "\n".join(lines).strip()
+
+
+def render_actions_section(
+    *,
+    actions: list[dict],
+    chapter_note: str,
+    section_index: int,
+) -> str:
+    lines = [f"## {_section_number(section_index)}、行动建议"]
+    if not actions:
+        lines.extend(["", _clean(chapter_note) or "现有证据不足以形成可绑定、可验证的行动建议。"])
+        return "\n".join(lines).strip()
+
+    for index, action in enumerate(actions, 1):
+        title = _clean(action.get("title")) or "待验证的产品方向"
+        lines.extend(["", f"**建议{_section_number(index)}：{title}**"])
+        target_group = action.get("target_group")
+        if isinstance(target_group, dict):
+            profile_name = _clean(target_group.get("profile_name"))
+            profile_value = _clean(target_group.get("profile_value"))
+            if profile_value:
+                lines.extend(["", f"这是一项面向{profile_value}群体的专项建议，依据该人群专章中的定性材料提出。"])
+            elif profile_name:
+                lines.extend(["", f"这是一项面向{profile_name}相关群体的专项建议。"])
+        problem = _clean(action.get("problem"))
+        objective = _clean(action.get("objective"))
+        if problem and objective:
+            lines.extend(["", f"{problem.rstrip('。.!！?？；;')}。建议目标是{objective.rstrip('。.!！?？；;')}。"])
+        elif problem or objective:
+            lines.extend(["", problem or objective])
+
+        directions = [
+            _clean(item) for item in action.get("design_directions") or [] if _clean(item)
+        ]
+        if directions:
+            lines.extend(["", "可考虑的设计方向："])
+            lines.extend(f"{direction_index}. {direction}" for direction_index, direction in enumerate(directions, 1))
+        validation_plan = _clean(action.get("validation_plan"))
+        if validation_plan:
+            validation_detail = re.sub(r"^(?:可)?通过\s*", "", validation_plan).rstrip("。.!！?？；;")
+            lines.extend(["", f"实施前后可通过{validation_detail}来验证这一方向是否有效。"])
+        evidence_gap = _clean(action.get("evidence_gap"))
+        required_data = _clean(action.get("required_data"))
+        if evidence_gap and required_data:
+            gap_detail = evidence_gap.rstrip("。.!！?？；;")
+            required_detail = re.sub(r"^需要补充\s*", "", required_data).rstrip("。.!！?？；;")
+            lines.extend(["", f"当前证据边界是{gap_detail}；在进一步决策前仍需补充{required_detail}。"])
+    return "\n".join(lines).strip()
+
+
+def render_evidence_appendix(evidence_index: list[dict]) -> str:
+    if not evidence_index:
+        return ""
+    lines = [
+        "## 附录 A：完整证据索引",
+        "",
+        "正文只保留一句话证据要点；本附录保存完整中文译文，并列出全部引用位置。",
+    ]
+    for entry in evidence_index:
+        lines.extend([
+            "",
+            f"### {entry['evidence_id']}",
+            "",
+            f"- **引用位置：** {'；'.join(entry.get('references') or [])}",
+            f"- **来源编号：** {_clean(entry.get('response_id'))}",
+            "",
+            "**完整中文译文：**",
+            "",
+        ])
+        translation = _clean(entry.get("translation_zh"))
+        if translation:
+            lines.extend(_evidence_quote_lines(translation))
+        else:
+            lines.append("> 中文翻译暂不可用；来源编号已保留供人工核对。")
     return "\n".join(lines).strip()
 
 
@@ -234,13 +357,26 @@ def assemble_report(
     core_blocks: list[dict],
     chapters: list[dict],
     findings_by_id: dict[str, dict],
+    actions: list[dict] | None = None,
+    action_note: str = "",
+    evidence_index: list[dict] | None = None,
 ) -> str:
     title = _clean(report_title) or "观点洞察报告"
+    index = evidence_index if evidence_index is not None else build_evidence_index(
+        core_blocks=core_blocks,
+        chapters=chapters,
+    )
+    evidence_ids = {
+        _clean(item.get("response_id")): _clean(item.get("evidence_id"))
+        for item in index
+        if _clean(item.get("response_id")) and _clean(item.get("evidence_id"))
+    }
     core = render_written_section(
         section_title="核心发现",
         blocks=core_blocks,
         findings_by_id=findings_by_id,
         section_index=3,
+        evidence_ids=evidence_ids,
     )
     rendered = [f"# {title}", _clean(background_md), _clean(sample_md), core]
     for offset, chapter in enumerate(chapters, 4):
@@ -249,5 +385,12 @@ def assemble_report(
             blocks=chapter.get("blocks") or [],
             findings_by_id=findings_by_id,
             section_index=offset,
+            evidence_ids=evidence_ids,
         ))
+    rendered.append(render_actions_section(
+        actions=actions or [],
+        chapter_note=action_note,
+        section_index=4 + len(chapters),
+    ))
+    rendered.append(render_evidence_appendix(index))
     return "\n\n".join(section for section in rendered if section).strip()

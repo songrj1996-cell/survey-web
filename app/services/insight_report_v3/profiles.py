@@ -240,6 +240,110 @@ def _respondent_values(
     return respondents, values, conflicts
 
 
+def preflight_skew_candidate(
+    *,
+    scope_response_ids: list[str],
+    source_registry: dict[str, dict],
+    plan: dict,
+    profile_name: str,
+    profile_value: str,
+) -> dict:
+    """Reject fixed-scope candidates that cannot pass the current skew gates.
+
+    This check deliberately knows nothing about who supports the finding. It
+    only asks whether *any* supporter subset drawn from the current question
+    could satisfy every configured threshold. Eligible candidates still need
+    the existing model-backed supporter enumeration and ``evaluate_skew``.
+    """
+    field = next(
+        (
+            item for item in analysis_profile_fields(plan)
+            if item["profile_name"] == profile_name
+        ),
+        None,
+    )
+    if field is None:
+        return {
+            "status": "unavailable",
+            "reason": "profile_not_analysis_scoped",
+            "diagnostics": {},
+        }
+
+    scope_respondents, scope_values, scope_conflicts = _respondent_values(
+        scope_response_ids,
+        source_registry=source_registry,
+        field=field,
+    )
+    scope_total = len(scope_respondents)
+    scope_known = len(scope_values)
+    target_scope = sum(value == profile_value for value in scope_values.values())
+    coverage = scope_known / scope_total if scope_total else 0.0
+    baseline_share = target_scope / scope_known if scope_known else 0.0
+
+    # To maximize the target share while still passing the minimum known
+    # supporter gate, choose the smallest allowed supporter set and fill it
+    # with as many target-group respondents as the fixed scope contains.
+    minimum_supporter_set = max(
+        INSIGHT_V3_SKEW_MIN_SUPPORTERS,
+        INSIGHT_V3_SKEW_MIN_TARGET_SUPPORTERS,
+    )
+    maximum_target_share = (
+        min(1.0, target_scope / minimum_supporter_set)
+        if minimum_supporter_set > 0 and scope_known >= minimum_supporter_set
+        else 0.0
+    )
+    maximum_gap = maximum_target_share - baseline_share
+    maximum_lift = (
+        maximum_target_share / baseline_share
+        if baseline_share > 0 else 0.0
+    )
+    diagnostics = {
+        "scope_respondent_count": scope_total,
+        "scope_known_profile_count": scope_known,
+        "profile_coverage": round(coverage, 6),
+        "target_scope_count": target_scope,
+        "baseline_share": round(baseline_share, 6),
+        "theoretical_max_target_share": round(maximum_target_share, 6),
+        "theoretical_max_gap": round(maximum_gap, 6),
+        "theoretical_max_lift": round(maximum_lift, 6),
+        "scope_conflict_count": len(scope_conflicts),
+    }
+
+    fixed_checks = (
+        (scope_known >= INSIGHT_V3_SKEW_MIN_SCOPE_KNOWN, "scope_known_too_small"),
+        (coverage >= INSIGHT_V3_SKEW_MIN_PROFILE_COVERAGE, "profile_coverage_too_low"),
+        (scope_known >= INSIGHT_V3_SKEW_MIN_SUPPORTERS, "scope_too_small_for_supporter_floor"),
+        (
+            target_scope >= INSIGHT_V3_SKEW_MIN_TARGET_SUPPORTERS,
+            "target_scope_too_small_for_threshold",
+        ),
+    )
+    failed = next((reason for passed, reason in fixed_checks if not passed), "")
+    if failed:
+        return {
+            "status": "unavailable",
+            "reason": failed,
+            "diagnostics": diagnostics,
+        }
+
+    mathematically_reachable = all((
+        maximum_target_share >= INSIGHT_V3_SKEW_MIN_TARGET_SHARE,
+        maximum_gap >= INSIGHT_V3_SKEW_MIN_GAP,
+        maximum_lift >= INSIGHT_V3_SKEW_MIN_LIFT,
+    ))
+    if not mathematically_reachable:
+        return {
+            "status": "unavailable",
+            "reason": "skew_threshold_mathematically_unreachable",
+            "diagnostics": diagnostics,
+        }
+    return {
+        "status": "eligible",
+        "reason": "preflight_passed",
+        "diagnostics": diagnostics,
+    }
+
+
 def evaluate_skew(
     *,
     scope_response_ids: list[str],

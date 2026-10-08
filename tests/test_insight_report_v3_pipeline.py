@@ -16,7 +16,6 @@ def _plan():
             {"index": 1, "name": "体验反馈", "role": "open_text"},
         ],
         "parts": [{"name": "体验", "column_indexes": [1]}],
-        "analysis_focus": {"report_organization": "围绕体验阻力组织"},
     }
 
 
@@ -126,6 +125,7 @@ class InsightV3PipelineTests(unittest.IsolatedAsyncioTestCase):
                     "finding_ids": ["1/f1"],
                     "evidence": [{
                         "response_id": source_id,
+                        "evidence_point": "失败后被队友归责会放大压力",
                         "translation_zh": "失败时经常只怪我。",
                         "translation_status": "source_zh",
                     }],
@@ -149,6 +149,7 @@ class InsightV3PipelineTests(unittest.IsolatedAsyncioTestCase):
                     "finding_ids": ["1/f1"],
                     "evidence": [{
                         "response_id": source_id,
+                        "evidence_point": "失败后被队友归责会削弱学习意愿",
                         "translation_zh": "失败时经常只怪我。",
                         "translation_status": "source_zh",
                     }],
@@ -161,12 +162,40 @@ class InsightV3PipelineTests(unittest.IsolatedAsyncioTestCase):
                 },
             }
 
+        async def fake_actions(**_kwargs):
+            return {
+                "actions": [{
+                    "id": "a01",
+                    "title": "降低失败后的单人归责",
+                    "action_scope": "general",
+                    "target_group": None,
+                    "problem": "失败责任集中会放大压力",
+                    "objective": "让协作与责任来源更容易被理解",
+                    "design_directions": ["补充协作状态反馈"],
+                    "validation_plan": "结合试用反馈核对责任理解是否改善",
+                    "finding_ids": ["1/f1"],
+                    "evidence_gap": "",
+                    "required_data": "",
+                }],
+                "chapter_note": "",
+                "diagnostics": {
+                    "status": "complete",
+                    "logical_attempts": 1,
+                    "attempts": [],
+                    "models": ["mock-actions"],
+                    "action_count": 1,
+                    "general_action_count": 1,
+                    "group_action_count": 0,
+                },
+            }
+
         stage_one = Mock(side_effect=AssertionError("compatible findings must be reused"))
         with (
             patch.object(pipeline, "generate_insight_findings", new=stage_one),
             patch.object(pipeline, "plan_chapters", new=fake_plan_chapters),
             patch.object(pipeline, "write_chapters", new=fake_write_chapters),
             patch.object(pipeline, "write_core_findings", new=fake_core),
+            patch.object(pipeline, "write_actions", new=fake_actions),
         ):
             events = [
                 event
@@ -202,12 +231,22 @@ class InsightV3PipelineTests(unittest.IsolatedAsyncioTestCase):
             final_artifacts["viewpoint_diagnostics"]["chapters"][0]["status"],
             "complete",
         )
+        self.assertEqual(final_artifacts["viewpoint_diagnostics"]["actions"]["action_count"], 1)
+        self.assertEqual(final_artifacts["viewpoint_diagnostics"]["evidence_index"]["entry_count"], 1)
+        self.assertEqual(
+            final_artifacts["viewpoint_diagnostics"]["analysis_focus"]["message"],
+            "未提供分析主线，章节按问卷结构组织，未规划人群专章",
+        )
         report = next(payload for kind, payload in events if kind == "result")
         self.assertIn("## 一、调研背景", report)
         self.assertIn("## 二、样本概况", report)
         self.assertIn("## 三、核心发现", report)
         self.assertIn("## 四、压力与协作", report)
-        self.assertIn("> 代表反馈：失败时经常只怪我。", report)
+        self.assertIn("## 五、行动建议", report)
+        self.assertIn("**证据要点：** 失败后被队友归责会放大压力（详见 E-001）", report)
+        self.assertIn("## 附录 A：完整证据索引", report)
+        self.assertEqual(report.count("失败时经常只怪我。"), 1)
+        self.assertNotIn("代表反馈", report)
 
 
 if __name__ == "__main__":

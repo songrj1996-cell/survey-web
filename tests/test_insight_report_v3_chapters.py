@@ -1,3 +1,4 @@
+from copy import deepcopy
 import unittest
 from unittest.mock import patch
 
@@ -106,10 +107,12 @@ class InsightV3ChapterContractTests(unittest.TestCase):
                 "body": "失败归因会放大压力。",
                 "finding_ids": ["1/f1"],
                 "evidence_ids": ["r0002"],
+                "evidence_points": [{"evidence_id": "r0002", "summary": "错误来源的概括"}],
             }],
             allowed_by_short={"r0001": {"1/f1"}, "r0002": {"1/f2"}},
         )
         self.assertEqual(blocks[0]["evidence_ids"], ["r0001"])
+        self.assertEqual(blocks[0]["evidence_points"], [])
         self.assertEqual(rebound_count, 1)
 
     def test_frequency_gate_distinguishes_claims_from_game_terms(self):
@@ -133,6 +136,7 @@ class InsightV3ChapterContractTests(unittest.TestCase):
                 "body": "玩家普遍反复提到被迫补位，这种情况往往带来压力。",
                 "finding_ids": ["1/f1"],
                 "evidence_ids": ["r0001"],
+                "evidence_points": [{"evidence_id": "r0001", "summary": "玩家普遍提到被迫补位"}],
             }],
         }
         rewrites = []
@@ -153,6 +157,7 @@ class InsightV3ChapterContractTests(unittest.TestCase):
         self.assertNotIn("普遍", data["blocks"][0]["body"])
         self.assertNotIn("反复提到", data["blocks"][0]["body"])
         self.assertNotIn("往往", data["blocks"][0]["body"])
+        self.assertNotIn("普遍", data["blocks"][0]["evidence_points"][0]["summary"])
         self.assertEqual(rewrites[0]["block_id"], "b1")
 
     def test_writer_gate_neutralizes_frequency_synonyms_from_real_replay(self):
@@ -179,6 +184,25 @@ class InsightV3ChapterContractTests(unittest.TestCase):
         self.assertIn("全部分析章节", body_terms)
         self.assertIn("反复出现", body_terms)
         self.assertIn("未见明显分歧", body_terms)
+
+        phrasing, phrasing_terms = chapters._neutralize_frequency_claims(
+            "也有玩家是在补位时尝试；部分老玩家不需要引导；部分描述提到需要适应；不少人转向其他位置。"
+        )
+        self.assertIn("也有提及者是在补位时尝试", phrasing)
+        self.assertIn("老玩家不需要引导", phrasing)
+        self.assertIn("描述提到需要适应", phrasing)
+        self.assertIn("提及者转向其他位置", phrasing)
+        self.assertNotIn("部分", phrasing)
+        self.assertIn("有玩家", phrasing_terms)
+        self.assertIn("部分老玩家", phrasing_terms)
+        self.assertIn("部分描述", phrasing_terms)
+        self.assertIn("不少人", phrasing_terms)
+
+        all_players, all_player_terms = chapters._neutralize_frequency_claims(
+            "该入口不应强制呈现给所有玩家。"
+        )
+        self.assertEqual(all_players, "该入口不应强制呈现给相关玩家。")
+        self.assertIn("所有玩家", all_player_terms)
 
     def test_writer_finding_exposes_only_local_representative_ids(self):
         payload = chapters._writer_finding(
@@ -242,6 +266,149 @@ class InsightV3ChapterContractTests(unittest.TestCase):
         )
         self.assertIn("重复", error)
 
+    def test_expected_deliverable_guarantees_group_chapter_but_missing_focus_does_not(self):
+        chapter_plan = {
+            "report_title": "体验洞察",
+            "chapters": [{
+                "id": "c01",
+                "title": "体验阻力",
+                "purpose": "解释主要问题",
+                "finding_ids": ["1/f1"],
+                "stat_ids": [],
+                "group_focus": None,
+            }],
+            "suspected_skews": [],
+        }
+        focused_plan = _profile_plan()
+        focused_plan["analysis_focus"] = {
+            "expected_deliverables": ["形成女性玩家群体观察"],
+        }
+        reconciled, diagnostics = chapters.ensure_required_group_chapters(
+            chapter_plan,
+            plan=focused_plan,
+            profiles=[{"profile_name": "性别", "values": ["女性", "男性"]}],
+        )
+        group_chapters = [
+            item for item in reconciled["chapters"]
+            if item.get("group_focus") == {"profile_name": "性别", "profile_value": "女性"}
+        ]
+        self.assertEqual(len(group_chapters), 1)
+        self.assertEqual(diagnostics["status"], "present")
+        self.assertEqual(diagnostics["inserted"][0]["mode"], "appended")
+
+        unchanged, missing = chapters.ensure_required_group_chapters(
+            chapter_plan,
+            plan=_profile_plan(),
+            profiles=[{"profile_name": "性别", "values": ["女性", "男性"]}],
+        )
+        self.assertEqual(len(unchanged["chapters"]), 1)
+        self.assertEqual(
+            missing["message"],
+            "未提供分析主线，章节按问卷结构组织，未规划人群专章",
+        )
+
+    def test_action_contract_requires_bound_findings_and_keeps_internal_shape(self):
+        findings = {
+            "1/f1": {
+                "id": "1/f1",
+                "claim": "失败归因带来压力",
+                "kind": "pain",
+                "degraded": False,
+                "skewed_toward": [],
+            },
+        }
+        completed = [{
+            "id": "c01",
+            "title": "压力来源",
+            "finding_ids": ["1/f1"],
+            "group_focus": None,
+        }]
+        valid = {"actions": [{
+            "id": "a01",
+            "title": "降低失败后的单人归责压力",
+            "action_scope": "general",
+            "target_group": None,
+            "problem": "不少老玩家认为失败后责任集中到单一职责会放大体验压力",
+            "objective": "让责任与协作状态更容易被理解",
+            "design_directions": ["玩家多数会从协作状态反馈中受益", "让异常责任归属便于复盘"],
+            "validation_plan": "结合试用反馈核对玩家是否更容易理解责任来源",
+            "finding_ids": ["1/f1"],
+            "evidence_gap": "",
+            "required_data": "",
+        }]}
+        self.assertIsNone(chapters._validate_action_output(
+            valid,
+            findings_by_id=findings,
+            chapters=completed,
+            profiles=[],
+            numeric_sources="",
+        ))
+        self.assertEqual(valid["actions"][0]["problem"], "老玩家认为失败后责任集中到单一职责会放大体验压力")
+        self.assertEqual(valid["actions"][0]["design_directions"][0], "玩家会从协作状态反馈中受益")
+        invalid = {"actions": [{**valid["actions"][0], "finding_ids": ["unknown"]}]}
+        self.assertIn("未知", chapters._validate_action_output(
+            invalid,
+            findings_by_id=findings,
+            chapters=completed,
+            profiles=[],
+            numeric_sources="",
+        ))
+
+    def test_action_contract_enforces_caps_and_group_difference_gate(self):
+        findings = {
+            "group:c02/g1": {
+                "id": "group:c02/g1",
+                "claim": "女性玩家提到协作压力",
+                "kind": "pain",
+                "degraded": False,
+                "skewed_toward": [],
+            },
+        }
+        completed = [{
+            "id": "c02",
+            "title": "女性群体观察",
+            "finding_ids": ["group:c02/g1"],
+            "group_focus": {"profile_name": "性别", "profile_value": "女性"},
+        }]
+
+        def action(index: int) -> dict:
+            return {
+                "id": f"a{index:02d}",
+                "title": "为女性玩家提供更清楚的协作提示",
+                "action_scope": "group",
+                "target_group": {"profile_name": "性别", "profile_value": "女性"},
+                "problem": "女性玩家更突出地受到协作压力影响",
+                "objective": "降低协作信息不清带来的体验压力",
+                "design_directions": ["补充协作状态提示"],
+                "validation_plan": "通过该人群的后续访谈核对理解是否改善",
+                "finding_ids": ["group:c02/g1"],
+                "evidence_gap": "",
+                "required_data": "",
+            }
+
+        difference_error = chapters._validate_action_output(
+            {"actions": [action(1)]},
+            findings_by_id=findings,
+            chapters=completed,
+            profiles=[{"profile_name": "性别", "values": ["女性", "男性"]}],
+            numeric_sources="",
+        )
+        self.assertIn("没有 skewed_toward", difference_error)
+
+        too_many = []
+        for index in range(1, chapters.INSIGHT_V3_MAX_GROUP_ACTIONS + 2):
+            item = action(index)
+            item["problem"] = "协作状态难以理解"
+            too_many.append(item)
+        cap_error = chapters._validate_action_output(
+            {"actions": deepcopy(too_many)},
+            findings_by_id=findings,
+            chapters=completed,
+            profiles=[{"profile_name": "性别", "values": ["女性", "男性"]}],
+            numeric_sources="",
+        )
+        self.assertIn("人群专项建议不得超过", cap_error)
+
     def test_writer_gate_blocks_unverified_difference_and_profile_counts(self):
         profiles = [{"profile_name": "性别", "values": ["女性", "男性"]}]
         base = {
@@ -252,6 +419,7 @@ class InsightV3ChapterContractTests(unittest.TestCase):
                 "body": "该视角在女性玩家中更突出。",
                 "finding_ids": ["1/f1"],
                 "evidence_ids": ["r0001"],
+                "evidence_points": [],
             }],
         }
         kwargs = {
@@ -302,6 +470,7 @@ class InsightV3ChapterContractTests(unittest.TestCase):
                 "body": "技能组合带来额外学习成本。",
                 "finding_ids": ["1/f1"],
                 "evidence_ids": ["r0001"],
+                "evidence_points": [],
             }],
         }
         findings = {
@@ -349,6 +518,10 @@ class InsightV3ProfileCallTests(unittest.IsolatedAsyncioTestCase):
                     "body": "失败归因会放大压力。",
                     "finding_ids": ["1/f1"],
                     "evidence_ids": ["r0001"],
+                    "evidence_points": [{
+                        "evidence_id": "r0001",
+                        "summary": "失败后被队友归责会放大压力",
+                    }],
                 }],
             }
             self.assertIsNone(kwargs["validator"](data))
@@ -400,6 +573,10 @@ class InsightV3ProfileCallTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(captured["namespace"], "owner:session:run")
         self.assertEqual(result["blocks"][0]["evidence"][0]["translation_status"], "complete")
+        self.assertEqual(
+            result["blocks"][0]["evidence"][0]["evidence_point"],
+            "失败后被队友归责会放大压力",
+        )
 
     async def test_group_extraction_uses_one_short_id_per_player_then_hydrates(self):
         registry = _registry(2)
@@ -505,6 +682,48 @@ class InsightV3ProfileCallTests(unittest.IsolatedAsyncioTestCase):
             [{"profile_name": "性别", "profile_value": "女性", "supporter_count": 7}],
         )
         self.assertEqual(diagnostics["verified_count"], 1)
+
+    async def test_skew_preflight_rejects_small_scope_without_model_call(self):
+        registry = _registry(10)
+        short_map = {
+            f"r{index:04d}": [f"global-{index}"]
+            for index in range(1, 11)
+        }
+        source_contract = {
+            "source_registry": registry,
+            "questions": [{
+                "scope_key": "1",
+                "question": "体验反馈",
+                "model_sources": [],
+                "short_id_map": short_map,
+            }],
+        }
+        call = patch.object(
+            chapters,
+            "_direct_json_call",
+            side_effect=AssertionError("small scope must be prefiltered"),
+        )
+        with call as mocked:
+            _findings, diagnostics = await chapters.verify_suspected_skews(
+                findings=[{
+                    "id": "1/f1",
+                    "claim": "失败归因带来压力",
+                    "scope_key": "1",
+                    "skewed_toward": [],
+                }],
+                suspected_skews=[{
+                    "finding_id": "1/f1",
+                    "profile_name": "性别",
+                    "profile_value": "女性",
+                    "reason": "待核对",
+                }],
+                source_contract=source_contract,
+                plan=_profile_plan(),
+            )
+        mocked.assert_not_called()
+        self.assertEqual(diagnostics["prefiltered_count"], 1)
+        self.assertEqual(diagnostics["verification_call_count"], 0)
+        self.assertEqual(diagnostics["items"][0]["reason"], "scope_known_too_small")
 
 
 if __name__ == "__main__":

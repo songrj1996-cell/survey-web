@@ -50,7 +50,7 @@ class InsightV3AssembleTests(unittest.TestCase):
         self.assertGreaterEqual(len(prose), 300)
         self.assertLessEqual(len(prose), 500)
 
-    def test_assembly_uses_fixed_first_three_sections_and_inline_evidence(self):
+    def test_assembly_uses_evidence_points_narrative_actions_and_deduplicated_appendix(self):
         finding = {
             "id": "2/f1",
             "question_key": "2",
@@ -65,7 +65,12 @@ class InsightV3AssembleTests(unittest.TestCase):
                 "heading": "责任压力影响意愿",
                 "body": "失败时的归因压力会削弱继续学习意愿。",
                 "finding_ids": ["2/f1"],
-                "evidence": [{"translation_zh": "输了以后经常只怪打野。\n队友也没有来支援。"}],
+                "evidence": [{
+                    "response_id": "global-1",
+                    "evidence_point": "失败后被归责且缺少队友支援",
+                    "translation_zh": "输了以后经常只怪打野。\n队友也没有来支援。",
+                    "translation_status": "source_zh",
+                }],
             }],
             chapters=[{
                 "id": "c01",
@@ -75,19 +80,81 @@ class InsightV3AssembleTests(unittest.TestCase):
                     "heading": "失败归因集中",
                     "body": "反馈反复指向队友协作不足。",
                     "finding_ids": ["2/f1"],
-                    "evidence": [{"translation_zh": "队友不来帮忙却怪我。"}],
+                    "evidence": [{
+                        "response_id": "global-1",
+                        "evidence_point": "队友未支援却把失败责任归给打野",
+                        "translation_zh": "输了以后经常只怪打野。\n队友也没有来支援。",
+                        "translation_status": "source_zh",
+                    }],
                 }],
             }],
             findings_by_id={"2/f1": finding},
+            actions=[{
+                "id": "a01",
+                "title": "强化协作状态反馈，降低单人归责",
+                "action_scope": "general",
+                "target_group": None,
+                "problem": "失败责任容易集中到单一职责。",
+                "objective": "让队伍更容易理解支援与责任来源。",
+                "design_directions": ["补充关键支援状态反馈", "提供便于复盘的协作信息"],
+                "validation_plan": "可通过结合试用反馈核对玩家能否理解责任来源。",
+                "finding_ids": ["2/f1"],
+                "evidence_gap": "还缺少上线后的行为证据。",
+                "required_data": "需要补充改版后的任务完成数据。",
+            }],
         )
         self.assertTrue(report.startswith("# 体验洞察报告"))
         self.assertLess(report.index("## 一、调研背景"), report.index("## 二、样本概况"))
         self.assertLess(report.index("## 二、样本概况"), report.index("## 三、核心发现"))
         self.assertIn("## 四、责任与协作压力", report)
+        self.assertIn("## 五、行动建议", report)
         self.assertIn("**提及情况：** 部分。", report)
-        self.assertIn("> 代表反馈：队友不来帮忙却怪我。", report)
-        self.assertIn("> 代表反馈：输了以后经常只怪打野。\n> 队友也没有来支援。", report)
+        self.assertIn("**证据要点：** 失败后被归责且缺少队友支援（详见 E-001）", report)
+        self.assertIn("**建议一：强化协作状态反馈，降低单人归责**", report)
+        self.assertIn("可考虑的设计方向：\n1. 补充关键支援状态反馈", report)
+        self.assertIn("实施前后可通过结合试用反馈", report)
+        self.assertNotIn("可通过可通过", report)
+        self.assertNotIn("可通过通过", report)
+        self.assertIn("仍需补充改版后的任务完成数据", report)
+        self.assertNotIn("补充需要补充", report)
+        self.assertNotIn("。。", report)
+        self.assertNotIn("。；", report)
+        self.assertIn("## 附录 A：完整证据索引", report)
+        self.assertEqual(report.count("### E-001"), 1)
+        self.assertEqual(report.count("输了以后经常只怪打野。"), 1)
+        self.assertIn("三、核心发现 / 责任压力影响意愿", report)
+        self.assertIn("四、责任与协作压力 / 失败归因集中", report)
+        self.assertNotIn("代表反馈", report)
+        self.assertNotIn("design_directions", report)
+        self.assertNotIn("finding_ids", report)
         self.assertNotIn("玩家ID | 画像信息", report)
+
+    def test_missing_evidence_summary_points_to_full_index_without_truncation(self):
+        translation = "这是一段需要完整保留、不能截短的多句反馈。\n第二句仍然属于同一条来源。"
+        report = assemble_report(
+            report_title="证据回退测试",
+            background_md="## 一、调研背景\n\n背景。",
+            sample_md="## 二、样本概况\n\n概况。",
+            core_blocks=[{
+                "id": "core-1",
+                "heading": "待核对发现",
+                "body": "正文只保留索引入口。",
+                "finding_ids": ["1/f1"],
+                "evidence": [{
+                    "response_id": "global-2",
+                    "evidence_point": "",
+                    "translation_zh": translation,
+                    "translation_status": "source_zh",
+                }],
+            }],
+            chapters=[],
+            findings_by_id={"1/f1": {"id": "1/f1", "frequency_tier": "有玩家"}},
+            actions=[],
+            action_note="当前证据不足以形成建议。",
+        )
+        self.assertIn("- **证据要点：** 详见 E-001。", report)
+        self.assertEqual(report.count("这是一段需要完整保留、不能截短的多句反馈。"), 1)
+        self.assertIn("> 第二句仍然属于同一条来源。", report)
 
 
 if __name__ == "__main__":

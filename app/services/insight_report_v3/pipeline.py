@@ -7,22 +7,26 @@ from copy import deepcopy
 import time
 
 from app.core.config import (
+    INSIGHT_V3_ACTION_PROMPT_VERSION,
     INSIGHT_V3_CHAPTER_CONCURRENCY,
     INSIGHT_V3_CHAPTER_PROMPT_VERSION,
     LLM_STREAM_HEARTBEAT_SECONDS,
 )
 from app.services.insight_report_v3.assemble import (
     assemble_report,
+    build_evidence_index,
     render_research_background,
     render_sample_overview,
 )
 from app.services.insight_report_v3.chapters import (
     build_stats_catalog,
+    ensure_required_group_chapters,
     extract_group_findings,
     flatten_findings,
     plan_chapters,
     verify_suspected_skews,
     write_chapters,
+    write_actions,
     write_core_findings,
 )
 from app.services.insight_report_v3.contracts import (
@@ -37,8 +41,8 @@ from app.services.insight_report_v3.profiles import (
 from app.services.report_engine import _run_bounded_calls
 
 
-PIPELINE_SCHEMA_VERSION = "insight-report-v3-stage2-v1"
-DIAGNOSTICS_SCHEMA_VERSION = "insight-v3-diagnostics-v1"
+PIPELINE_SCHEMA_VERSION = "insight-report-v3-stage2-v2"
+DIAGNOSTICS_SCHEMA_VERSION = "insight-v3-diagnostics-v2"
 
 
 def _analysis_progress(phase: str, status: str, message: str, **extra) -> dict:
@@ -255,6 +259,12 @@ async def generate_insight_report_v3(
             "reason": "no_findings",
         }
 
+    chapter_plan, analysis_focus_diagnostics = ensure_required_group_chapters(
+        chapter_plan,
+        plan=plan,
+        profiles=profiles,
+    )
+
     group_diagnostics: dict[str, dict] = {}
     group_findings: list[dict] = []
     group_chapters = [
@@ -296,6 +306,7 @@ async def generate_insight_report_v3(
     else:
         skew_diagnostics = {
             "requested_count": 0,
+            "prefiltered_count": 0,
             "verification_call_count": 0,
             "verified_count": 0,
             "items": [],
@@ -376,6 +387,19 @@ async def generate_insight_report_v3(
             "reason": "no_findings",
         }
 
+    async for kind, payload in _wait_task_with_heartbeats(write_actions(
+        chapters=written_chapters,
+        core_blocks=core_blocks,
+        findings_by_id=findings_by_id,
+        profiles=profiles,
+        qualitative_context=qualitative_context,
+        on_attempt_event=on_attempt_event,
+    )):
+        yield (kind, payload)
+    action_result = _wait_task_with_heartbeats.result
+    actions = action_result.get("actions") or []
+    action_diagnostics = action_result.get("diagnostics") or {}
+
     background_md = render_research_background(qualitative_context)
     sample_md, selected_sample_tables = render_sample_overview(
         stats_md,
@@ -389,12 +413,18 @@ async def generate_insight_report_v3(
         core_blocks=core_blocks,
         chapters=written_chapters,
         findings_by_id=findings_by_id,
+        actions=actions,
+        action_note=action_result.get("chapter_note") or "",
+        evidence_index=(evidence_index := build_evidence_index(
+            core_blocks=core_blocks,
+            chapters=written_chapters,
+        )),
     )
 
     yield ("analysis_progress", _analysis_progress(
         "writing",
         "completed",
-        f"{len(written_chapters)} 个分析章节与核心发现已完成",
+        f"{len(written_chapters)} 个分析章节、核心发现与行动建议已完成",
         item_total=len(written_chapters),
         item_index=len(written_chapters),
     ))
@@ -432,6 +462,7 @@ async def generate_insight_report_v3(
             plan_diagnostics.get("models") or [],
             skew_diagnostics.get("models") or [],
             core_diagnostics.get("models") or [],
+            action_diagnostics.get("models") or [],
             *(
                 (diagnostics.get("models") or [])
                 for diagnostics in group_diagnostics.values()
@@ -448,10 +479,20 @@ async def generate_insight_report_v3(
         "findings_reused": reused_findings,
         "questions": _diagnostic_question_rows(findings_artifact),
         "chapter_plan": deepcopy(plan_diagnostics),
+        "analysis_focus": deepcopy(analysis_focus_diagnostics),
         "group_chapters": deepcopy(group_diagnostics),
         "skew_verification": deepcopy(skew_diagnostics),
         "chapters": chapter_rows,
         "core": deepcopy(core_diagnostics),
+        "actions": {
+            **deepcopy(action_diagnostics),
+            "prompt_version": INSIGHT_V3_ACTION_PROMPT_VERSION,
+            "items": deepcopy(actions),
+        },
+        "evidence_index": {
+            "entry_count": len(evidence_index),
+            "reference_count": sum(len(item.get("references") or []) for item in evidence_index),
+        },
         "sample_overview": {
             "table_count": len(selected_sample_tables),
             "table_titles": [item.get("title") for item in selected_sample_tables],

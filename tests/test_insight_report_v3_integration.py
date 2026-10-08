@@ -103,10 +103,16 @@ def _fake_v3_generator(calls):
         })
         yield ("artifacts", {
             "viewpoint_diagnostics": {
-                "schema_version": "insight-v3-diagnostics-v1",
+                "schema_version": "insight-v3-diagnostics-v2",
                 "engine": "insight_v3",
                 "questions": [{"scope_key": "0", "status": "complete"}],
                 "chapters": [{"chapter_id": "c01", "status": "complete"}],
+                "analysis_focus": {
+                    "status": "missing",
+                    "message": "未提供分析主线，章节按问卷结构组织，未规划人群专章",
+                },
+                "actions": {"status": "complete", "action_count": 1, "items": []},
+                "evidence_index": {"entry_count": 1, "reference_count": 1},
                 "sample_overview": {"table_count": 1, "table_titles": ["性别"]},
                 "audit": {"status": "not_enabled", "unresolved_count": 0},
             },
@@ -115,7 +121,8 @@ def _fake_v3_generator(calls):
         yield (
             "result",
             "# 玩家体验洞察\n\n## 一、调研背景\n\n背景。\n\n"
-            "## 二、样本概况\n\n概况。\n\n## 三、核心发现\n\n发现。",
+            "## 二、样本概况\n\n概况。\n\n## 三、核心发现\n\n发现。\n\n"
+            "## 四、行动建议\n\n建议。\n\n## 附录 A：完整证据索引\n\n证据。",
         )
 
     return generate
@@ -230,6 +237,8 @@ class InsightV3SurveyIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(item.get("type") == "error" for item in payloads))
         done = next(item for item in payloads if item.get("type") == "report_done")
         self.assertIn("## 统计附录", done["report_md"])
+        self.assertLess(done["report_md"].index("## 四、行动建议"), done["report_md"].index("## 附录 A"))
+        self.assertLess(done["report_md"].index("## 附录 A"), done["report_md"].index("## 统计附录"))
         progress = [item for item in payloads if item.get("type") == "analysis_progress"]
         observed = {
             (item["phase"], item["phase_index"], item["phase_total"])

@@ -4,6 +4,7 @@ from app.services.insight_report_v3.profiles import (
     attach_profile_presence,
     evaluate_skew,
     filter_group_sources,
+    preflight_skew_candidate,
     profile_catalog,
     validate_profile_language,
 )
@@ -139,6 +140,41 @@ class InsightV3ProfileTests(unittest.TestCase):
         )
         self.assertEqual(failed["status"], "not_skewed")
         self.assertIsNone(failed["skewed_toward"])
+
+    def test_skew_preflight_covers_scope_floor_and_mathematical_reachability(self):
+        too_small = preflight_skew_candidate(
+            scope_response_ids=[f"global-{index}" for index in range(1, 11)],
+            source_registry=_registry(10),
+            plan=_plan(),
+            profile_name="性别",
+            profile_value="女性",
+        )
+        self.assertEqual(too_small["reason"], "scope_known_too_small")
+
+        reachable = preflight_skew_candidate(
+            scope_response_ids=[f"global-{index}" for index in range(1, 21)],
+            source_registry=_registry(),
+            plan=_plan(),
+            profile_name="性别",
+            profile_value="女性",
+        )
+        self.assertEqual(reachable["status"], "eligible")
+
+        high_baseline_registry = _registry()
+        for index in range(11, 19):
+            high_baseline_registry[f"global-{index}"]["profile"]["性别"] = "女性"
+        unreachable = preflight_skew_candidate(
+            scope_response_ids=[f"global-{index}" for index in range(1, 21)],
+            source_registry=high_baseline_registry,
+            plan=_plan(),
+            profile_name="性别",
+            profile_value="女性",
+        )
+        self.assertEqual(
+            unreachable["reason"],
+            "skew_threshold_mathematically_unreachable",
+        )
+        self.assertLess(unreachable["diagnostics"]["theoretical_max_lift"], 1.5)
 
     def test_writer_gate_rejects_unverified_difference_and_profile_precision(self):
         catalog = profile_catalog(_registry(), _plan())
