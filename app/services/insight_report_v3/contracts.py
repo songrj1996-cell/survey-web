@@ -28,15 +28,38 @@ MODEL_ROOT_FIELDS = frozenset({"findings"})
 MODEL_FINDING_FIELDS = frozenset(
     {"id", "claim", "kind", "frequency_tier", "support_count", "response_ids", "caveat"}
 )
+MODEL_AUDIT_ROOT_FIELDS = frozenset({"issues"})
+MODEL_AUDIT_ISSUE_FIELDS = frozenset(
+    {"claim_id", "problem_type", "problem", "severity"}
+)
+MODEL_AUDIT_REPAIR_ROOT_FIELDS = frozenset({"repairs"})
+MODEL_AUDIT_REPAIR_FIELDS = frozenset({"claim_id", "heading", "body"})
 MODEL_OUTPUT_FIELD_WHITELISTS = {
     "root": MODEL_ROOT_FIELDS,
     "finding": MODEL_FINDING_FIELDS,
+    "audit_root": MODEL_AUDIT_ROOT_FIELDS,
+    "audit_issue": MODEL_AUDIT_ISSUE_FIELDS,
+    "audit_repair_root": MODEL_AUDIT_REPAIR_ROOT_FIELDS,
+    "audit_repair": MODEL_AUDIT_REPAIR_FIELDS,
 }
 FORBIDDEN_MODEL_OUTPUT_FIELDS = frozenset(
     {"quote", "text", "excerpt", "snippet", "original", "source_text", "translation"}
 )
 FINDING_KINDS = frozenset({"pain", "motivation", "risk", "wish", "fact", "uncertain"})
+AUDIT_PROBLEM_TYPES = frozenset({
+    "contradiction",
+    "unsupported_detail",
+    "unsupported_causality",
+    "scope_shift",
+    "polarity_shift",
+    "condition_shift",
+    "mistranslation",
+    "other",
+})
+AUDIT_SEVERITIES = frozenset({"warning", "blocking"})
 _HEX_64_RE = re.compile(r"^[0-9a-f]{64}$")
+_MARKDOWN_HEADING_RE = re.compile(r"(?m)^\s*#{1,6}\s+")
+_MARKDOWN_TABLE_RE = re.compile(r"(?m)^\s*\|.*\|\s*$")
 
 
 def _canonical_sha256(value) -> str:
@@ -145,6 +168,80 @@ def validate_findings_payload(
         )
         if frequency_error:
             return f"findings[{index}]：{frequency_error}"
+    return None
+
+
+def validate_audit_payload(
+    data: dict | None,
+    *,
+    valid_claim_ids: set[str],
+) -> str | None:
+    """Validate the short-ID-only semantic-audit response."""
+    if not isinstance(data, dict) or set(data) != MODEL_AUDIT_ROOT_FIELDS:
+        return "JSON 根节点必须且只能包含 issues"
+    forbidden_path = _forbidden_field_path(data)
+    if forbidden_path:
+        return f"审校输出包含禁止的原文字段：{forbidden_path}"
+    issues = data.get("issues")
+    if not isinstance(issues, list):
+        return "issues 必须是数组"
+    seen: set[str] = set()
+    for index, issue in enumerate(issues):
+        if not isinstance(issue, dict) or set(issue) != MODEL_AUDIT_ISSUE_FIELDS:
+            return f"issues[{index}] 字段不符合白名单"
+        claim_id = issue.get("claim_id")
+        if not isinstance(claim_id, str) or claim_id not in valid_claim_ids:
+            return f"issues[{index}] 引用了不存在的 claim_id"
+        if claim_id in seen:
+            return f"issues[{index}] 的 claim_id 重复"
+        seen.add(claim_id)
+        if issue.get("problem_type") not in AUDIT_PROBLEM_TYPES:
+            return f"issues[{index}] 的 problem_type 不在白名单内"
+        if issue.get("severity") not in AUDIT_SEVERITIES:
+            return f"issues[{index}] 的 severity 不在白名单内"
+        problem = issue.get("problem")
+        if (
+            not isinstance(problem, str)
+            or not problem.strip()
+            or len(problem.strip()) > 240
+            or "\n" in problem
+        ):
+            return f"issues[{index}] 的 problem 必须是 1—240 字单行说明"
+    return None
+
+
+def validate_audit_repair_payload(
+    data: dict | None,
+    *,
+    expected_claim_ids: set[str],
+) -> str | None:
+    """Validate a one-shot text-only repair without allowing binding changes."""
+    if not isinstance(data, dict) or set(data) != MODEL_AUDIT_REPAIR_ROOT_FIELDS:
+        return "JSON 根节点必须且只能包含 repairs"
+    forbidden_path = _forbidden_field_path(data)
+    if forbidden_path:
+        return f"审校修复输出包含禁止的原文字段：{forbidden_path}"
+    repairs = data.get("repairs")
+    if not isinstance(repairs, list):
+        return "repairs 必须是数组"
+    ids: list[str] = []
+    for index, repair in enumerate(repairs):
+        if not isinstance(repair, dict) or set(repair) != MODEL_AUDIT_REPAIR_FIELDS:
+            return f"repairs[{index}] 字段不符合白名单"
+        claim_id = repair.get("claim_id")
+        if not isinstance(claim_id, str) or claim_id not in expected_claim_ids:
+            return f"repairs[{index}] 引用了不存在的 claim_id"
+        ids.append(claim_id)
+        for field in ("heading", "body"):
+            value = repair.get(field)
+            if not isinstance(value, str) or not value.strip():
+                return f"repairs[{index}].{field} 必须是非空字符串"
+            if _MARKDOWN_HEADING_RE.search(value) or _MARKDOWN_TABLE_RE.search(value):
+                return f"repairs[{index}].{field} 不得包含 Markdown 标题或表格"
+    if len(ids) != len(set(ids)):
+        return "repairs 的 claim_id 不得重复"
+    if set(ids) != expected_claim_ids:
+        return "repairs 必须恰好覆盖本次全部 claim_id"
     return None
 
 

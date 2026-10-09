@@ -25,6 +25,11 @@ _NUMBER_WORDS = (
     "零", "一", "二", "三", "四", "五", "六", "七", "八", "九", "十", "十一", "十二",
     "十三", "十四", "十五", "十六", "十七", "十八", "十九", "二十",
 )
+_VALIDATION_SEMANTICS_RE = re.compile(
+    r"(?:验证|核验|校验|检验|评估|衡量|复核|核对|确认|对比|比较|监测|监控|观察|"
+    r"跟踪|追踪|回归测试|A\s*/\s*B\s*测试)",
+    re.IGNORECASE,
+)
 
 
 def _clean(value) -> str:
@@ -312,7 +317,11 @@ def render_actions_section(
         validation_plan = _clean(action.get("validation_plan"))
         if validation_plan:
             validation_detail = re.sub(r"^(?:可)?通过\s*", "", validation_plan).rstrip("。.!！?？；;")
-            lines.extend(["", f"实施前后可通过{validation_detail}来验证这一方向是否有效。"])
+            if _VALIDATION_SEMANTICS_RE.search(validation_detail):
+                validation_sentence = f"实施前后可通过{validation_detail}。"
+            else:
+                validation_sentence = f"实施前后可通过{validation_detail}来验证这一方向是否有效。"
+            lines.extend(["", validation_sentence])
         evidence_gap = _clean(action.get("evidence_gap"))
         required_data = _clean(action.get("required_data"))
         if evidence_gap and required_data:
@@ -349,6 +358,25 @@ def render_evidence_appendix(evidence_index: list[dict]) -> str:
     return "\n".join(lines).strip()
 
 
+def render_unresolved_audit_notice(unresolved: list[dict] | None) -> str:
+    """Render every unresolved audit item without presenting it as a confirmed error."""
+    items = [item for item in (unresolved or []) if isinstance(item, dict)]
+    if not items:
+        return ""
+    lines = [
+        "> **语义审校提示：** 本报告有 "
+        f"{len(items)} 项未能由自动审校完整确认，报告已保留并需要人工复核。"
+        "下列项目不代表一定错误。",
+    ]
+    for item in items:
+        section = _clean(item.get("section")) or "未定位章节"
+        heading = _clean(item.get("heading")) or _clean(item.get("target")) or "未命名内容"
+        target = _clean(item.get("target")) or "待审校内容"
+        problem = _clean(item.get("problem")) or "未完成证据审校"
+        lines.append(f"> - **{section} / {heading}（{target}）：** {problem}")
+    return "\n".join(lines)
+
+
 def assemble_report(
     *,
     report_title: str,
@@ -360,6 +388,7 @@ def assemble_report(
     actions: list[dict] | None = None,
     action_note: str = "",
     evidence_index: list[dict] | None = None,
+    audit_unresolved: list[dict] | None = None,
 ) -> str:
     title = _clean(report_title) or "观点洞察报告"
     index = evidence_index if evidence_index is not None else build_evidence_index(
@@ -378,7 +407,13 @@ def assemble_report(
         section_index=3,
         evidence_ids=evidence_ids,
     )
-    rendered = [f"# {title}", _clean(background_md), _clean(sample_md), core]
+    rendered = [
+        f"# {title}",
+        render_unresolved_audit_notice(audit_unresolved),
+        _clean(background_md),
+        _clean(sample_md),
+        core,
+    ]
     for offset, chapter in enumerate(chapters, 4):
         rendered.append(render_written_section(
             section_title=chapter.get("title") or f"分析主题 {offset - 3}",

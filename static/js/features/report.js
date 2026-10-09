@@ -1053,6 +1053,7 @@ async function runStats(options = {}) {
     let currentTask = '正在准备报告内容';
     let completedSteps = 0;
     const taskProgress = _createReportTaskProgress();
+    let insightAudit = null;
     let stepStartedAt = Date.now();
     let lastSignalAt = Date.now();
 
@@ -1121,6 +1122,7 @@ async function runStats(options = {}) {
       }
       lastSignalAt = Date.now();
       if (ev.type === 'analysis_progress') {
+        if (ev.phase === 'audit') insightAudit = { ...ev };
         _applyAnalysisProgress(taskProgress, ev);
         _renderReportPhaseTrack(taskProgress);
         const remaining = $('report-progress-remaining');
@@ -1236,6 +1238,14 @@ async function runStats(options = {}) {
           }
         } else if (state.viewMode !== 'session') {
           showToast('当前报告已生成完成，可点击「当前分析」查看', 'success', 7000);
+        }
+        if (['needs_review', 'incomplete'].includes(insightAudit?.audit_status)) {
+          const unresolvedCount = Number(insightAudit.unresolved_count) || 0;
+          const prefix = insightAudit.audit_status === 'incomplete'
+            ? '语义审校未完整执行'
+            : '语义审校仍有待确认项';
+          const countText = unresolvedCount ? `，共有 ${unresolvedCount} 项` : '';
+          showToast(`${prefix}${countText}需要人工复核；报告已保存并在标题下方标注。`, 'info', 10000);
         }
       }
     };

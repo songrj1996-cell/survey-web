@@ -1,3 +1,4 @@
+from copy import deepcopy
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
@@ -7,6 +8,8 @@ from app.services.insight_report_v3.contracts import (
     MODEL_OUTPUT_FIELD_WHITELISTS,
     build_stage_source_contract,
     hydrate_findings,
+    validate_audit_payload,
+    validate_audit_repair_payload,
     validate_findings_payload,
 )
 from app.services.insight_report_v3.frequency import FREQUENCY_RULES_VERSION
@@ -131,6 +134,40 @@ class InsightReportV3ContractTests(unittest.TestCase):
             payload, valid_short_ids={"r0001"}, respondent_total=1,
         )
         self.assertIn("不存在的短 ID", error)
+
+    def test_audit_contract_accepts_only_known_short_claim_ids(self):
+        valid = {"issues": [{
+            "claim_id": "c001",
+            "problem_type": "scope_shift",
+            "problem": "结论范围超过绑定证据",
+            "severity": "blocking",
+        }]}
+        self.assertIsNone(validate_audit_payload(valid, valid_claim_ids={"c001", "c002"}))
+        invalid = deepcopy(valid)
+        invalid["issues"][0]["claim_id"] = "global-source-id"
+        self.assertIn(
+            "不存在的 claim_id",
+            validate_audit_payload(invalid, valid_claim_ids={"c001", "c002"}),
+        )
+
+    def test_audit_repair_must_exactly_cover_requested_blocks_without_binding_fields(self):
+        valid = {"repairs": [{
+            "claim_id": "c001",
+            "heading": "压力与责任",
+            "body": "反馈同时提到归责与压力感受。",
+        }]}
+        self.assertIsNone(validate_audit_repair_payload(
+            valid, expected_claim_ids={"c001"},
+        ))
+        missing = {"repairs": []}
+        self.assertIn("恰好覆盖", validate_audit_repair_payload(
+            missing, expected_claim_ids={"c001"},
+        ))
+        rebound = deepcopy(valid)
+        rebound["repairs"][0]["finding_ids"] = ["1/f1"]
+        self.assertIn("字段不符合白名单", validate_audit_repair_payload(
+            rebound, expected_claim_ids={"c001"},
+        ))
 
 
 class InsightReportV3ReplayPreparationTests(unittest.IsolatedAsyncioTestCase):

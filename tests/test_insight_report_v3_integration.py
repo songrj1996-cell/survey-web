@@ -97,13 +97,15 @@ def _fake_v3_generator(calls):
             "phase": "audit",
             "phase_index": 3,
             "phase_total": 4,
-            "status": "skipped",
-            "message": "阶段三尚未启用",
-            "impact": "仍需人工复核",
+            "status": "completed",
+            "message": "语义审校完成",
+            "impact": "none",
+            "audit_status": "passed",
+            "unresolved_count": 0,
         })
         yield ("artifacts", {
             "viewpoint_diagnostics": {
-                "schema_version": "insight-v3-diagnostics-v2",
+                "schema_version": "insight-v3-diagnostics-v3",
                 "engine": "insight_v3",
                 "questions": [{"scope_key": "0", "status": "complete"}],
                 "chapters": [{"chapter_id": "c01", "status": "complete"}],
@@ -114,7 +116,32 @@ def _fake_v3_generator(calls):
                 "actions": {"status": "complete", "action_count": 1, "items": []},
                 "evidence_index": {"entry_count": 1, "reference_count": 1},
                 "sample_overview": {"table_count": 1, "table_titles": ["性别"]},
-                "audit": {"status": "not_enabled", "unresolved_count": 0},
+                "audit": {
+                    "status": "passed",
+                    "unresolved_count": 0,
+                    "planned_unit_count": 3,
+                    "audited_unit_count": 3,
+                    "initial_coverage_rate": 1.0,
+                    "capacity_issue_count": 0,
+                    "unit_status_counts": {
+                        "passed": 3,
+                        "evidence_fallback": 0,
+                        "repaired": 0,
+                        "needs_review": 0,
+                        "incomplete": 0,
+                    },
+                    "initial_batch_count": 2,
+                    "repair_batch_count": 0,
+                    "reaudit_batch_count": 0,
+                    "concurrency": 4,
+                    "peak_concurrency": 2,
+                },
+                "frequency_review": {
+                    "status": "clear",
+                    "candidate_count": 0,
+                    "auto_blocked_count": 0,
+                    "candidates": [],
+                },
             },
             "writer_models_used": ["mock-v3-writer"],
         })
@@ -256,6 +283,10 @@ class InsightV3SurveyIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["analyst_app"], "insight_v3")
         self.assertNotIn("analysis_artifacts", snapshot)
         self.assertEqual(snapshot["viewpoint_diagnostics"]["engine"], "insight_v3")
+        audit_diagnostics = snapshot["viewpoint_diagnostics"]["audit"]
+        self.assertEqual(audit_diagnostics["initial_coverage_rate"], 1.0)
+        self.assertEqual(sum(audit_diagnostics["unit_status_counts"].values()), 3)
+        self.assertEqual(audit_diagnostics["capacity_issue_count"], 0)
         self.assertEqual(snapshot["comparison_validation"]["status"], "passed")
         runtime["inject"].assert_not_called()
         appendix_blocks = runtime["render_appendix"].call_args.args[0]

@@ -37,6 +37,28 @@ def _registry(total=20):
 
 
 class InsightV3ChapterContractTests(unittest.TestCase):
+    def test_stage_three_repair_reuses_writer_frequency_and_numeric_gates(self):
+        normalized, error = chapters.normalize_report_block_text(
+            heading="多数玩家认为失败压力明显",
+            body="7名玩家都提到责任归属。",
+            findings=[{"skewed_toward": []}],
+            profiles=[],
+            numeric_sources="",
+        )
+        self.assertIsNone(normalized)
+        self.assertTrue("精确人数" in error or "数字" in error)
+
+        normalized, error = chapters.normalize_report_block_text(
+            heading="多数玩家认为失败压力明显",
+            body="反馈提到责任归属与压力感受。",
+            findings=[{"skewed_toward": []}],
+            profiles=[],
+            numeric_sources="",
+        )
+        self.assertIsNone(error)
+        self.assertNotIn("多数玩家", normalized["heading"])
+        self.assertTrue(any("多数" in item for item in normalized["frequency_terms"]))
+
     def test_writer_fallback_keeps_one_bound_evidence_id_per_finding(self):
         blocks = chapters._fallback_blocks(
             ["1/f1"],

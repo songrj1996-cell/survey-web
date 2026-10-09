@@ -18,6 +18,10 @@ from app.services.insight_report_v3.assemble import (
     render_research_background,
     render_sample_overview,
 )
+from app.services.insight_report_v3.audit import (
+    audit_report_sections,
+    scan_frequency_review_candidates,
+)
 from app.services.insight_report_v3.chapters import (
     build_stats_catalog,
     ensure_required_group_chapters,
@@ -41,8 +45,8 @@ from app.services.insight_report_v3.profiles import (
 from app.services.report_engine import _run_bounded_calls
 
 
-PIPELINE_SCHEMA_VERSION = "insight-report-v3-stage2-v2"
-DIAGNOSTICS_SCHEMA_VERSION = "insight-v3-diagnostics-v2"
+PIPELINE_SCHEMA_VERSION = "insight-report-v3-stage3-v1"
+DIAGNOSTICS_SCHEMA_VERSION = "insight-v3-diagnostics-v3"
 
 
 def _analysis_progress(phase: str, status: str, message: str, **extra) -> dict:
@@ -400,6 +404,66 @@ async def generate_insight_report_v3(
     actions = action_result.get("actions") or []
     action_diagnostics = action_result.get("diagnostics") or {}
 
+    yield ("analysis_progress", _analysis_progress(
+        "writing",
+        "completed",
+        f"{len(written_chapters)} 个分析章节、核心发现与行动建议已完成",
+        item_total=len(written_chapters),
+        item_index=len(written_chapters),
+    ))
+    yield ("analysis_progress", _analysis_progress(
+        "audit",
+        "active",
+        "正在逐项核对正文结论、证据要点与绑定原文",
+        item_total=0,
+        item_index=0,
+    ))
+
+    async for kind, payload in _wait_task_with_heartbeats(audit_report_sections(
+        core_blocks=core_blocks,
+        chapters=written_chapters,
+        findings_by_id=findings_by_id,
+        source_registry=findings_artifact.get("source_registry") or {},
+        profiles=profiles,
+        on_attempt_event=on_attempt_event,
+    )):
+        yield (kind, payload)
+    audit_result = _wait_task_with_heartbeats.result
+    core_blocks = audit_result.get("core_blocks") or []
+    written_chapters = audit_result.get("chapters") or []
+    audit_unresolved = audit_result.get("unresolved") or []
+    audit_diagnostics = audit_result.get("diagnostics") or {}
+    audit_status = audit_diagnostics.get("status") or "incomplete"
+    audit_progress_status = (
+        "degraded" if audit_status in {"needs_review", "incomplete"} else "completed"
+    )
+    audit_messages = {
+        "passed": "语义审校完成，未发现与绑定原文冲突的表述",
+        "repaired": "语义审校完成，已定向修复并复核发现的问题",
+        "needs_review": f"语义审校完成，仍有 {len(audit_unresolved)} 项需要人工复核",
+        "incomplete": f"语义审校未完整执行，仍有 {len(audit_unresolved)} 项需要人工复核",
+        "skipped": "没有需要语义审校的模型正文",
+    }
+    yield ("analysis_progress", _analysis_progress(
+        "audit",
+        audit_progress_status,
+        audit_messages.get(audit_status, audit_messages["incomplete"]),
+        audit_status=audit_status,
+        unresolved_count=len(audit_unresolved),
+        impact=(
+            "报告已保存并在标题下方逐项标出待人工复核内容"
+            if audit_unresolved else "none"
+        ),
+    ))
+    if audit_diagnostics.get("warned"):
+        yield ("progress", "语义审校耗时超过告警阈值，但未中止报告生成。")
+
+    frequency_review = scan_frequency_review_candidates(
+        core_blocks=core_blocks,
+        chapters=written_chapters,
+        actions=actions,
+    )
+
     background_md = render_research_background(qualitative_context)
     sample_md, selected_sample_tables = render_sample_overview(
         stats_md,
@@ -419,21 +483,8 @@ async def generate_insight_report_v3(
             core_blocks=core_blocks,
             chapters=written_chapters,
         )),
+        audit_unresolved=audit_unresolved,
     )
-
-    yield ("analysis_progress", _analysis_progress(
-        "writing",
-        "completed",
-        f"{len(written_chapters)} 个分析章节、核心发现与行动建议已完成",
-        item_total=len(written_chapters),
-        item_index=len(written_chapters),
-    ))
-    yield ("analysis_progress", _analysis_progress(
-        "audit",
-        "skipped",
-        "阶段三语义审校尚未启用；代码证据门禁已执行",
-        impact="曲解原文的语义风险仍需阶段三模型审校或人工复核",
-    ))
 
     chapter_rows = [
         {
@@ -497,7 +548,8 @@ async def generate_insight_report_v3(
             "table_count": len(selected_sample_tables),
             "table_titles": [item.get("title") for item in selected_sample_tables],
         },
-        "audit": {"status": "not_enabled", "unresolved_count": 0},
+        "audit": deepcopy(audit_diagnostics),
+        "frequency_review": deepcopy(frequency_review),
         "elapsed_seconds": round(time.monotonic() - started, 3),
     }
     yield ("artifacts", {

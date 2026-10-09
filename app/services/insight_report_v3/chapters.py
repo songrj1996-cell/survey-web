@@ -1226,6 +1226,46 @@ def _writer_finding(finding: dict, global_to_short: dict[str, str]) -> dict:
     }
 
 
+def normalize_report_block_text(
+    *,
+    heading,
+    body,
+    findings: list[dict],
+    profiles: list[dict],
+    numeric_sources: str,
+) -> tuple[dict | None, str | None]:
+    """Apply the writer's deterministic text gates to a stage-three repair."""
+    if not isinstance(heading, str) or not _clean(heading):
+        return None, "heading 必须是非空字符串"
+    if not isinstance(body, str) or not _clean(body):
+        return None, "body 必须是非空字符串"
+    normalized_heading, heading_terms = _neutralize_frequency_claims(heading)
+    normalized_body, body_terms = _neutralize_frequency_claims(body)
+    if not normalized_heading or not normalized_body:
+        return None, "去除模型自报频次后 heading/body 为空"
+    combined = f"{normalized_heading}\n{normalized_body}"
+    if _MARKDOWN_HEADING_RE.search(combined) or _MARKDOWN_TABLE_RE.search(combined):
+        return None, "不得包含 Markdown 标题或表格"
+    used_frequency = _frequency_claim_term(combined)
+    if used_frequency:
+        return None, f"不得自行写频次词“{used_frequency}”"
+    profile_error = validate_profile_language(
+        combined,
+        findings=findings,
+        catalog=profiles,
+    )
+    if profile_error:
+        return None, profile_error
+    for number in _NUMBER_RE.findall(combined):
+        if number not in numeric_sources:
+            return None, f"包含未由所选统计表提供的数字：{number}"
+    return {
+        "heading": normalized_heading,
+        "body": normalized_body,
+        "frequency_terms": list(dict.fromkeys([*heading_terms, *body_terms])),
+    }, None
+
+
 def _validate_writer_output(
     data: dict | None,
     *,
@@ -1316,38 +1356,23 @@ def _validate_writer_output(
                     )
         if not any(allowed_by_short[item] & set(finding_ids) for item in valid_short_ids):
             return f"blocks[{index}] 的 finding 没有可回绑的代表证据"
-        heading = block.get("heading")
-        body = block.get("body")
-        if not isinstance(heading, str) or not _clean(heading) or not isinstance(body, str) or not _clean(body):
-            return f"blocks[{index}] 的 heading/body 必须是非空字符串"
-        normalized_heading, heading_terms = _neutralize_frequency_claims(heading)
-        normalized_body, body_terms = _neutralize_frequency_claims(body)
-        if not normalized_heading or not normalized_body:
-            return f"blocks[{index}] 去除模型自报频次后 heading/body 为空"
-        block["heading"] = normalized_heading
-        block["body"] = normalized_body
-        rewritten_terms = list(dict.fromkeys([*heading_terms, *body_terms]))
+        normalized_text, text_error = normalize_report_block_text(
+            heading=block.get("heading"),
+            body=block.get("body"),
+            findings=[findings_by_id[item] for item in finding_ids],
+            profiles=profiles,
+            numeric_sources=numeric_sources,
+        )
+        if text_error:
+            return f"blocks[{index}]：{text_error}"
+        block["heading"] = normalized_text["heading"]
+        block["body"] = normalized_text["body"]
+        rewritten_terms = normalized_text["frequency_terms"]
         if rewritten_terms and frequency_rewrites is not None:
             frequency_rewrites.append({
                 "block_id": block_id,
                 "terms": rewritten_terms,
             })
-        combined = f"{normalized_heading}\n{normalized_body}"
-        if _MARKDOWN_HEADING_RE.search(combined) or _MARKDOWN_TABLE_RE.search(combined):
-            return f"blocks[{index}] 不得包含 Markdown 标题或表格"
-        used_frequency = _frequency_claim_term(combined)
-        if used_frequency:
-            return f"blocks[{index}] 不得自行写频次词“{used_frequency}”"
-        profile_error = validate_profile_language(
-            combined,
-            findings=[findings_by_id[item] for item in finding_ids],
-            catalog=profiles,
-        )
-        if profile_error:
-            return f"blocks[{index}]：{profile_error}"
-        for number in _NUMBER_RE.findall(combined):
-            if number not in numeric_sources:
-                return f"blocks[{index}] 包含未由所选统计表提供的数字：{number}"
     missing_required = required_finding_ids - covered
     if missing_required:
         return f"章节遗漏必须覆盖的风险或降级 finding：{sorted(missing_required)[0]}"

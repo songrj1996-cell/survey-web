@@ -3,6 +3,7 @@ import unittest
 
 from app.services.insight_report_v3.assemble import (
     assemble_report,
+    render_actions_section,
     render_sample_overview,
     select_sample_tables,
 )
@@ -113,6 +114,7 @@ class InsightV3AssembleTests(unittest.TestCase):
         self.assertIn("**建议一：强化协作状态反馈，降低单人归责**", report)
         self.assertIn("可考虑的设计方向：\n1. 补充关键支援状态反馈", report)
         self.assertIn("实施前后可通过结合试用反馈", report)
+        self.assertNotIn("核对玩家能否理解责任来源来验证", report)
         self.assertNotIn("可通过可通过", report)
         self.assertNotIn("可通过通过", report)
         self.assertIn("仍需补充改版后的任务完成数据", report)
@@ -155,6 +157,41 @@ class InsightV3AssembleTests(unittest.TestCase):
         self.assertIn("- **证据要点：** 详见 E-001。", report)
         self.assertEqual(report.count("这是一段需要完整保留、不能截短的多句反馈。"), 1)
         self.assertIn("> 第二句仍然属于同一条来源。", report)
+
+    def test_validation_plan_with_existing_validation_semantics_has_no_duplicate_suffix(self):
+        action = {
+            "title": "保留挽回空间",
+            "problem": "失败后缺少挽回空间",
+            "objective": "让玩家更容易感知局势变化",
+            "design_directions": [],
+            "validation_plan": "通过可用性测试并辅以定性访谈验证玩家对挽回空间的感受变化",
+            "evidence_gap": "",
+            "required_data": "",
+        }
+        rendered = render_actions_section(actions=[action], chapter_note="", section_index=4)
+        self.assertIn("定性访谈验证玩家对挽回空间的感受变化。", rendered)
+        self.assertNotIn("验证玩家对挽回空间的感受变化来验证", rendered)
+
+    def test_unresolved_audit_items_are_listed_immediately_after_title(self):
+        report = assemble_report(
+            report_title="审校提示测试",
+            background_md="## 一、调研背景\n\n背景。",
+            sample_md="## 二、样本概况\n\n概况。",
+            core_blocks=[],
+            chapters=[],
+            findings_by_id={},
+            actions=[],
+            audit_unresolved=[{
+                "section": "核心发现",
+                "heading": "压力来源",
+                "target": "正文结论",
+                "problem": "修复后仍无法确认因果表述",
+            }],
+        )
+        self.assertLess(report.index("语义审校提示"), report.index("## 一、调研背景"))
+        self.assertIn("1 项未能由自动审校完整确认", report)
+        self.assertIn("核心发现 / 压力来源（正文结论）", report)
+        self.assertIn("不代表一定错误", report)
 
 
 if __name__ == "__main__":

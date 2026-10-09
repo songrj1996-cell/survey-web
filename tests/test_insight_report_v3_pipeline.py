@@ -189,6 +189,24 @@ class InsightV3PipelineTests(unittest.IsolatedAsyncioTestCase):
                 },
             }
 
+        async def fake_audit(**kwargs):
+            return {
+                "core_blocks": deepcopy(kwargs["core_blocks"]),
+                "chapters": deepcopy(kwargs["chapters"]),
+                "unresolved": [],
+                "diagnostics": {
+                    "schema_version": "insight-audit-v1",
+                    "status": "passed",
+                    "stop_reason": "all_claims_supported",
+                    "logical_call_count": 1,
+                    "upstream_attempt_count": 1,
+                    "unresolved_count": 0,
+                    "models": ["mock-audit"],
+                    "elapsed_seconds": 0.1,
+                    "warned": False,
+                },
+            }
+
         stage_one = Mock(side_effect=AssertionError("compatible findings must be reused"))
         with (
             patch.object(pipeline, "generate_insight_findings", new=stage_one),
@@ -196,6 +214,7 @@ class InsightV3PipelineTests(unittest.IsolatedAsyncioTestCase):
             patch.object(pipeline, "write_chapters", new=fake_write_chapters),
             patch.object(pipeline, "write_core_findings", new=fake_core),
             patch.object(pipeline, "write_actions", new=fake_actions),
+            patch.object(pipeline, "audit_report_sections", new=fake_audit),
         ):
             events = [
                 event
@@ -233,6 +252,8 @@ class InsightV3PipelineTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(final_artifacts["viewpoint_diagnostics"]["actions"]["action_count"], 1)
         self.assertEqual(final_artifacts["viewpoint_diagnostics"]["evidence_index"]["entry_count"], 1)
+        self.assertEqual(final_artifacts["viewpoint_diagnostics"]["audit"]["status"], "passed")
+        self.assertIn("frequency_review", final_artifacts["viewpoint_diagnostics"])
         self.assertEqual(
             final_artifacts["viewpoint_diagnostics"]["analysis_focus"]["message"],
             "未提供分析主线，章节按问卷结构组织，未规划人群专章",
