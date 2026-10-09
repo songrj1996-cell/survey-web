@@ -98,7 +98,10 @@ class InsightV3PipelineTests(unittest.IsolatedAsyncioTestCase):
                         "purpose": "解释体验阻力",
                         "finding_ids": ["1/f1"],
                         "stat_ids": [],
-                        "group_focus": None,
+                        "group_focus": {
+                            "profile_name": "性别",
+                            "profile_value": "女性",
+                        },
                     }],
                     "suspected_skews": [],
                 },
@@ -111,6 +114,10 @@ class InsightV3PipelineTests(unittest.IsolatedAsyncioTestCase):
             )
 
         async def fake_write_chapters(**_kwargs):
+            self.assertTrue(all(
+                chapter.get("group_focus") is None
+                for chapter in _kwargs["chapters"]
+            ))
             chapter = {
                 "id": "c01",
                 "title": "压力与协作",
@@ -208,9 +215,13 @@ class InsightV3PipelineTests(unittest.IsolatedAsyncioTestCase):
             }
 
         stage_one = Mock(side_effect=AssertionError("compatible findings must be reused"))
+        group_extractor = Mock(
+            side_effect=AssertionError("missing focus must not run group extraction")
+        )
         with (
             patch.object(pipeline, "generate_insight_findings", new=stage_one),
             patch.object(pipeline, "plan_chapters", new=fake_plan_chapters),
+            patch.object(pipeline, "extract_group_findings", new=group_extractor),
             patch.object(pipeline, "write_chapters", new=fake_write_chapters),
             patch.object(pipeline, "write_core_findings", new=fake_core),
             patch.object(pipeline, "write_actions", new=fake_actions),
@@ -232,6 +243,7 @@ class InsightV3PipelineTests(unittest.IsolatedAsyncioTestCase):
             ]
 
         stage_one.assert_not_called()
+        group_extractor.assert_not_called()
         progress = [payload for kind, payload in events if kind == "analysis_progress"]
         self.assertEqual(
             {(item["phase"], item["phase_index"], item["phase_total"]) for item in progress},
@@ -246,11 +258,28 @@ class InsightV3PipelineTests(unittest.IsolatedAsyncioTestCase):
 
         final_artifacts = [payload for kind, payload in events if kind == "artifacts"][-1]
         self.assertTrue(final_artifacts["viewpoint_diagnostics"]["findings_reused"])
+        self.assertTrue(all(
+            chapter.get("group_focus") is None
+            for chapter in final_artifacts["insight_v3_chapter_plan"]["chapters"]
+        ))
+        self.assertEqual(final_artifacts["viewpoint_diagnostics"]["group_chapters"], {})
+        self.assertTrue(
+            final_artifacts["viewpoint_diagnostics"]["analysis_focus"]["fallback_used"]
+        )
+        self.assertEqual(
+            len(final_artifacts["viewpoint_diagnostics"]["analysis_focus"]
+                ["rejected_unrequested_group_chapters"]),
+            1,
+        )
         self.assertEqual(
             final_artifacts["viewpoint_diagnostics"]["chapters"][0]["status"],
             "complete",
         )
         self.assertEqual(final_artifacts["viewpoint_diagnostics"]["actions"]["action_count"], 1)
+        self.assertEqual(
+            final_artifacts["viewpoint_diagnostics"]["actions"]["group_action_count"],
+            0,
+        )
         self.assertEqual(final_artifacts["viewpoint_diagnostics"]["evidence_index"]["entry_count"], 1)
         self.assertEqual(final_artifacts["viewpoint_diagnostics"]["audit"]["status"], "passed")
         self.assertIn("frequency_review", final_artifacts["viewpoint_diagnostics"])

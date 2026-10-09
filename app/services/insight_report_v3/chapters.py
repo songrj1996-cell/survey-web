@@ -325,6 +325,7 @@ def _validate_chapter_plan(
     non_degraded_ids: set[str],
     stat_ids: set[str],
     profiles: list[dict],
+    allow_group_chapters: bool,
 ) -> str | None:
     if not isinstance(data, dict) or set(data) != _PLANNER_ROOT_FIELDS:
         return "根节点必须且只能包含 report_title、chapters、suspected_skews"
@@ -369,6 +370,8 @@ def _validate_chapter_plan(
             return f"章节 {expected_id} 的 stat_ids 无效或超过 3 个"
         focus = chapter.get("group_focus")
         if focus is not None:
+            if not allow_group_chapters:
+                return f"章节 {expected_id} 在 analysis_focus 缺失时不得设置 group_focus"
             group_count += 1
             if not isinstance(focus, dict) or set(focus) != _GROUP_FOCUS_FIELDS:
                 return f"章节 {expected_id} 的 group_focus 无效"
@@ -587,12 +590,26 @@ def ensure_required_group_chapters(
     *,
     plan: dict,
     profiles: list[dict],
+    findings: list[dict],
 ) -> tuple[dict, dict]:
     """Guarantee uniquely resolved group deliverables after model planning."""
     updated = deepcopy(chapter_plan)
     chapters = updated.setdefault("chapters", [])
     focus = (plan or {}).get("analysis_focus")
     if not isinstance(focus, dict) or not focus:
+        rejected = [
+            {
+                "chapter_id": _clean(chapter.get("id")),
+                "title": _clean(chapter.get("title")),
+                "group_focus": deepcopy(chapter.get("group_focus")),
+            }
+            for chapter in chapters
+            if isinstance(chapter.get("group_focus"), dict)
+        ]
+        if rejected:
+            suspected_skews = deepcopy(updated.get("suspected_skews") or [])
+            updated = _fallback_chapter_plan(findings)
+            updated["suspected_skews"] = suspected_skews
         return updated, {
             "status": "missing",
             "message": "未提供分析主线，章节按问卷结构组织，未规划人群专章",
@@ -600,6 +617,8 @@ def ensure_required_group_chapters(
             "inserted": [],
             "already_present": [],
             "unresolved": [],
+            "rejected_unrequested_group_chapters": rejected,
+            "fallback_used": bool(rejected),
         }
 
     requested, unresolved = required_group_chapters(plan=plan, profiles=profiles)
@@ -714,6 +733,8 @@ def ensure_required_group_chapters(
         "inserted": inserted,
         "already_present": already_present,
         "unresolved": unresolved,
+        "rejected_unrequested_group_chapters": [],
+        "fallback_used": False,
     }
 
 
@@ -729,6 +750,8 @@ async def plan_chapters(
     finding_ids = {item["id"] for item in findings}
     non_degraded_ids = {item["id"] for item in findings if not item.get("degraded")}
     stat_ids = {item["id"] for item in stats_catalog}
+    analysis_focus = (plan or {}).get("analysis_focus")
+    has_analysis_focus = isinstance(analysis_focus, dict) and bool(analysis_focus)
     contract = {
         "report_title": "单行中文标题",
         "chapters": [{
@@ -751,8 +774,15 @@ async def plan_chapters(
         + f"<limits>最多 {INSIGHT_V3_MAX_CHAPTERS} 个章节；人群专章最多 "
         + f"{INSIGHT_V3_MAX_GROUP_CHAPTERS} 个；suspected_skews 最多 "
         + f"{INSIGHT_V3_MAX_SKEW_CANDIDATES} 项。</limits>\n"
+        + "<group_chapter_policy>"
+        + (
+            "analysis_focus 已提供，可在已确认主线范围内规划人群专章。"
+            if has_analysis_focus
+            else "analysis_focus 缺失，所有章节的 group_focus 必须为 null，不得自行规划人群专章。"
+        )
+        + "</group_chapter_policy>\n"
         + "<analysis_focus>\n"
-        + _safe_json((plan or {}).get("analysis_focus") or {})
+        + _safe_json(analysis_focus or {})
         + "\n</analysis_focus>\n"
         + "<business_context>\n"
         + _safe_json(qualitative_context or {})
@@ -792,6 +822,7 @@ async def plan_chapters(
                 non_degraded_ids=non_degraded_ids,
                 stat_ids=stat_ids,
                 profiles=profiles,
+                allow_group_chapters=has_analysis_focus,
             ),
             on_repair=repair_errors.append,
             on_attempt_event=_on_attempt,

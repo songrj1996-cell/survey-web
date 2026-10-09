@@ -267,6 +267,7 @@ async def generate_insight_report_v3(
         chapter_plan,
         plan=plan,
         profiles=profiles,
+        findings=base_findings,
     )
 
     group_diagnostics: dict[str, dict] = {}

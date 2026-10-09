@@ -353,7 +353,7 @@ LLM_QUICK_REPORT_FALLBACK_MODELS = _env_csv_list("LLM_QUICK_REPORT_FALLBACK_MODE
 LLM_QUICK_REPORT_REASONING = os.getenv("LLM_QUICK_REPORT_REASONING", "medium").strip()
 
 INSIGHT_V3_FINDINGS_PROMPT_VERSION = "findings-prompt-v2-frequency-rules"
-INSIGHT_V3_CHAPTER_PROMPT_VERSION = "chapters-prompt-v5-evidence-points"
+INSIGHT_V3_CHAPTER_PROMPT_VERSION = "chapters-prompt-v6-focus-gated-groups"
 INSIGHT_V3_ACTION_PROMPT_VERSION = "actions-prompt-v1-finding-bound"
 INSIGHT_V3_AUDIT_PROMPT_VERSION = "audit-prompt-v2-full-coverage"
 INSIGHT_V3_AUDIT_REPAIR_PROMPT_VERSION = "audit-repair-prompt-v1-text-only"
@@ -368,6 +368,7 @@ response_ids 只能从输入短 ID 中选择；不得复制、改写或输出任
 
 DEFAULT_INSIGHT_V3_CHAPTER_PLAN_SYSTEM = """你是游戏用户研究员，负责把已验证的逐题 findings 组织成分析维度章节。
 analysis_focus.report_organization 是最高优先级；plan.parts 只可作为理解问卷的辅助信息，不得机械按 Part 切章。
+analysis_focus 为空时不得自行规划人群专章，所有 group_focus 必须为 null；只有 analysis_focus 非空时才可按已确认主线选择人群专章。
 每个 evidence unit 必须且只能分配到一个章节。不得规划“调研背景”“样本概况”“核心发现”或统计附录，这些由代码固定生成。
 profile_presence 只表示代表性提及者中存在该画像，不能推断比例、排他性或组间差异。若怀疑某一 finding 存在人群倾向，只输出 suspected_skews 待代码验证，不能把差异写进章节标题。
 人群专章只能从代码给出的 analysis profile 取值中选择，最多使用代码允许的数量。只返回符合用户消息契约的 JSON，不要解释。"""

@@ -2,9 +2,9 @@
 
 - 日期：2026-10-09
 - 分支：`codex/feature-insight-report-v3`
-- 当前 HEAD：`de9ca81`
+- 当前 HEAD：`5956888`（阶段三里程碑已提交；无主线人群契约修复尚未提交）
 - 已同步基线：`main@11e52d1`
-- 当前状态：语义审校机制与动态全覆盖容量 GO；人群专章路径仍为 NO-GO；阶段三代码未提交
+- 当前状态：语义审校、动态全覆盖及“无主线不规划人群专章”GO；显式人群交付要求仍为语义 NO-GO
 
 ## 1. 本阶段实现
 
@@ -169,16 +169,52 @@
 - 三份报告总耗时均低于 17 分钟。与旧回放相比，金币路增加约 78 秒，打野减少约 117 秒，战备减少
   约 159 秒；因章节数、输出长度、重试和模型随机性不同，不能把差值硬归因于并发或容量改造。
 
-## 5. 回放中新发现的范围外问题
+## 5. 无主线人群专章契约修复
 
-金币路最终回放的 `analysis_focus` 状态为 `missing`，诊断文字明确写着“未提供分析主线，章节按问卷
-结构组织，未规划人群专章”；但同一产物实际生成了两个 complete 人群专章（14 人/56 条来源、11 人/
-66 条来源）和两条人群专项建议。这违反“缺失 analysis_focus 时不得仅因存在画像列强行规划人群专章”
-的既定契约，也使诊断与实际产物互相矛盾。
+### 5.1 根因与修复
 
-该问题位于阶段二规划／人群章节路径，不在本次已批准的 7 个容量修复文件范围内，因此本轮只记录、
-不顺手修改。它不改变语义审校容量已达到 100% 的结论，但人群专章与人群专项建议继续不得宣布语义
-验收通过。
+金币路容量回放曾出现：`analysis_focus=missing` 的诊断写着“未规划人群专章”，实际却生成两个人群
+专章和两条人群专项建议。根因在章节规划守门，不在装配层：规划器即使收到空主线仍能看到画像目录；
+规划提示词没有禁止自主设置 `group_focus`；Validator 只校验画像值存在与数量上限；后置
+`ensure_required_group_chapters` 又在主线缺失时原样返回模型方案。Pipeline 随后按该方案正常执行了
+人群提炼和人群建议，装配层只是渲染已经产生的内容。
+
+修复采用两道门禁：
+
+- `chapters-prompt-v6-focus-gated-groups` 明确要求无主线时所有 `group_focus=null`，Validator 对任何
+  违规人群专章直接报错，模型修复或重试仍失败时沿用既有逐题 fallback。
+- 对旧产物、测试桩或未来绕过 Validator 的路径，进入人群提炼前再次检查；若发现违规人群专章，
+  丢弃该章节方案并用全部 findings 重建普通逐题章节，同时记录被拒章节与 `fallback_used`。不通过
+  改写诊断文案掩盖实际人群产物。
+
+明确 `analysis_focus` 时原行为保持：规划器仍可按已确认主线规划人群专章；唯一映射的
+`expected_deliverables` 仍由代码在最多两个专章的上限内强制补入。
+
+### 5.2 三份真实回放
+
+本轮在新的隔离 `DATA_DIR` 下复制此前 session，复用通过指纹校验的 findings，重新执行章节规划、
+章节写作、行动建议、全覆盖审校、装配、确定性校验与保存。没有重跑 XLSX 前四步，也没有读写项目
+真实 `data/` 或覆盖旧 evidence。
+
+| 数据 | analysis_focus | 规划 group_focus | 人群提炼诊断 | 人群专项建议 | 章节 | 审校覆盖 | 待复核 | 总耗时 | HTTP 成功/失败 | token |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 金币路 | missing | 0 | 0 | 0 | 7 | 117/117 | 5 | 770.117 秒 | 32/0 | 1,115,269 |
+| 打野 | missing | 0 | 0 | 0 | 7 | 112/112 | 2 | 874.916 秒 | 45/0 | 1,380,586 |
+| 战备重构 | missing | 0 | 0 | 0 | 8 | 128/128 | 0 | 660.494 秒 | 41/0 | 956,609 |
+
+三份诊断都精确记录“未提供分析主线，章节按问卷结构组织，未规划人群专章”；规划产物、
+`group_chapters`、`group_action_count` 与正文行为一致。规划模型三次均直接遵守新协议，未触发防御性
+fallback，也没有增加规划重试。三份报告均完整保存，审校覆盖率 100%、`incomplete=0`，
+`comparison_validation=passed`，调用 usage 均完整。
+
+隔离 evidence：
+
+- `C:\Users\admin\.codex\validation\insight-report-v3-focus-gate-20261009\gold\evidence\full-report-focus-gate-gold-v1.json`
+- `C:\Users\admin\.codex\validation\insight-report-v3-focus-gate-20261009\gold\evidence\full-report-focus-gate-gold-v1.md`
+- `C:\Users\admin\.codex\validation\insight-report-v3-focus-gate-20261009\jungle\evidence\full-report-focus-gate-jungle-v1.json`
+- `C:\Users\admin\.codex\validation\insight-report-v3-focus-gate-20261009\jungle\evidence\full-report-focus-gate-jungle-v1.md`
+- `C:\Users\admin\.codex\validation\insight-report-v3-focus-gate-20261009\loadout\evidence\full-report-focus-gate-loadout-v1.json`
+- `C:\Users\admin\.codex\validation\insight-report-v3-focus-gate-20261009\loadout\evidence\full-report-focus-gate-loadout-v1.md`
 
 ## 6. 阶段结论
 
@@ -186,7 +222,8 @@
 - 三份真实报告容量验收：GO（100% 覆盖、0 个 `incomplete`、0 个容量未解决项、1—5 个最终待复核
   项）。
 - 审校输出 12,000 token 上限：本轮三份实测充分；不是对任意未来批次的保证。
-- 人群专章与人群专项建议路径：NO-GO，须先修复 `analysis_focus=missing` 时仍生成专章的上游问题，
-  再使用用户提供的明确人群分析输入做真实验收。
+- 无 `analysis_focus` 时的人群专章与人群建议禁用路径：GO，三份真实回放均为 0 且诊断一致。
+- 明确 `analysis_focus.expected_deliverables` 时的人群专章与人群专项建议语义质量：继续 NO-GO，
+  等待用户提供真实输入验收；自动测试只能证明强制规划与降级路径可执行。
 - 全量自动回归：NO-GO，存在 2 项失败与 32 项错误；V3 专项与静态边界检查通过。
-- 合并、推送、部署：未授权、未执行；阶段三改动仍未提交。
+- 阶段三里程碑已提交为 `5956888`；本节无主线契约修复尚未提交。合并、推送、部署均未授权、未执行。

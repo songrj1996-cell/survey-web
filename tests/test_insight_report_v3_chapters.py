@@ -274,8 +274,19 @@ class InsightV3ChapterContractTests(unittest.TestCase):
             non_degraded_ids=findings,
             stat_ids={"s001"},
             profiles=[{"profile_name": "性别", "values": ["女性", "男性"]}],
+            allow_group_chapters=True,
         )
         self.assertIsNone(error)
+
+        error = chapters._validate_chapter_plan(
+            valid,
+            finding_ids=findings,
+            non_degraded_ids=findings,
+            stat_ids={"s001"},
+            profiles=[{"profile_name": "性别", "values": ["女性", "男性"]}],
+            allow_group_chapters=False,
+        )
+        self.assertIn("analysis_focus 缺失", error)
 
         invalid = {**valid, "chapters": [dict(valid["chapters"][0])]}
         invalid["chapters"][0]["finding_ids"] = ["1/f1", "1/f1"]
@@ -285,6 +296,7 @@ class InsightV3ChapterContractTests(unittest.TestCase):
             non_degraded_ids=findings,
             stat_ids={"s001"},
             profiles=[{"profile_name": "性别", "values": ["女性", "男性"]}],
+            allow_group_chapters=True,
         )
         self.assertIn("重复", error)
 
@@ -305,10 +317,16 @@ class InsightV3ChapterContractTests(unittest.TestCase):
         focused_plan["analysis_focus"] = {
             "expected_deliverables": ["形成女性玩家群体观察"],
         }
+        finding_rows = [{
+            "id": "1/f1",
+            "question": "体验反馈",
+            "scope_key": "1",
+        }]
         reconciled, diagnostics = chapters.ensure_required_group_chapters(
             chapter_plan,
             plan=focused_plan,
             profiles=[{"profile_name": "性别", "values": ["女性", "男性"]}],
+            findings=finding_rows,
         )
         group_chapters = [
             item for item in reconciled["chapters"]
@@ -322,11 +340,33 @@ class InsightV3ChapterContractTests(unittest.TestCase):
             chapter_plan,
             plan=_profile_plan(),
             profiles=[{"profile_name": "性别", "values": ["女性", "男性"]}],
+            findings=finding_rows,
         )
         self.assertEqual(len(unchanged["chapters"]), 1)
+        self.assertFalse(missing["fallback_used"])
         self.assertEqual(
             missing["message"],
             "未提供分析主线，章节按问卷结构组织，未规划人群专章",
+        )
+
+        rogue = deepcopy(chapter_plan)
+        rogue["chapters"][0]["title"] = "女性玩家体验阻力"
+        rogue["chapters"][0]["group_focus"] = {
+            "profile_name": "性别",
+            "profile_value": "女性",
+        }
+        fallback, rejected = chapters.ensure_required_group_chapters(
+            rogue,
+            plan=_profile_plan(),
+            profiles=[{"profile_name": "性别", "values": ["女性", "男性"]}],
+            findings=finding_rows,
+        )
+        self.assertTrue(rejected["fallback_used"])
+        self.assertEqual(len(rejected["rejected_unrequested_group_chapters"]), 1)
+        self.assertTrue(all(item.get("group_focus") is None for item in fallback["chapters"]))
+        self.assertEqual(
+            [finding_id for item in fallback["chapters"] for finding_id in item["finding_ids"]],
+            ["1/f1"],
         )
 
     def test_action_contract_requires_bound_findings_and_keeps_internal_shape(self):
