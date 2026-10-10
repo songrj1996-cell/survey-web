@@ -660,6 +660,22 @@ body {
   box-shadow: none !important;
 }
 
+.ann-quality-preview-button {
+  align-self: flex-end;
+  width: auto;
+  max-width: 100%;
+  justify-content: center;
+  margin-top: 16px;
+  min-height: 42px;
+  padding: 10px 18px;
+  font-weight: 650;
+  box-shadow: 0 8px 22px var(--accent-glow);
+}
+
+.ann-quality-preview-button[hidden] {
+  display: none;
+}
+
 /* ── Upload ────────────────────────────────────────── */
 .upload-zone {
   border: 2px dashed var(--border);

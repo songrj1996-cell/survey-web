@@ -669,11 +669,23 @@ async function annAfterAiConfirm() {
 
 // ── ANN STEP 5: 质量打标 ───────────────────────────────────
 
+function annMergeQualityResults(incoming, replace = false) {
+  if (!Array.isArray(incoming) || incoming.length === 0) return;
+  const merged = new Map();
+  if (!replace) {
+    annState.qualityResults.forEach(result => merged.set(String(result?.id ?? ''), result));
+  }
+  incoming.forEach(result => merged.set(String(result?.id ?? ''), result));
+  merged.delete('');
+  annState.qualityResults = [...merged.values()];
+}
+
 async function annRunQuality(options = {}) {
   if (annState.partialRetrySyncing || annState.qualityReviewRunning || annState.qualityReviewSaving) return;
   const runSessionId = annState.sessionId;
   const preserveReview = options.preserveReview === true;
   let completed = false;
+  let receivedResults = false;
   annState.qualityReviewRunning = true;
   window.AnnotateReview?.render();
   const bar = $('ann-quality-progress-bar');
@@ -702,14 +714,27 @@ async function annRunQuality(options = {}) {
   bar.style.width = '0%';
   msg.textContent = '正在连接…';
   warnLog.innerHTML = '';
+  $('ann-btn-quality-preview').hidden = annState.qualityResults.length === 0;
 
   try {
     await consumeSSEGet(annRetryUrl("run-quality", options.retryIds), ev => {
       if (annState.sessionId !== runSessionId) return;
       if (ev.type === 'progress') {
-        const pct = ev.total > 0 ? Math.round((ev.done / ev.total) * 100) : 0;
+        const pct = ev.phase === 'translation'
+          ? 95
+          : ev.total > 0 ? Math.min(94, Math.round((ev.done / ev.total) * 94)) : 0;
         bar.style.width = `${pct}%`;
         msg.textContent = ev.msg || `${ev.done}/${ev.total} 批已完成`;
+        if (Array.isArray(ev.results) && ev.results.length > 0) {
+          receivedResults = true;
+          annMergeQualityResults(ev.results);
+          annState.qualityCount = ev.complete_count ?? annState.qualityCount;
+          annState.missingQualityIds = ev.missing_ids || annState.missingQualityIds;
+          annState.missingOverallIds = ev.missing_overall_ids || annState.missingOverallIds;
+          annState.completion = ev.completion || annState.completion;
+          window.AnnotateReview?.ingest();
+          $('ann-btn-quality-preview').hidden = false;
+        }
       }
       if (ev.type === 'warn') {
         const div = document.createElement('div');
@@ -726,7 +751,7 @@ async function annRunQuality(options = {}) {
         const missingOverallIds = ev.missing_overall_ids || [];
         const missingTranslationIds = ev.missing_translation_ids || [];
         annState.qualityCount = ev.complete_count ?? ev.count ?? 0;
-        annState.qualityResults = ev.results || [];
+        annMergeQualityResults(ev.results || [], true);
         annState.qualityDurationSeconds = ev.quality_duration_seconds ?? null;
         if (!preserveReview) {
           annState.qualityReviewPlayerId = null;
@@ -738,7 +763,7 @@ async function annRunQuality(options = {}) {
         annState.missingOverallIds = missingOverallIds;
         annState.missingTranslationIds = missingTranslationIds;
         window.AnnotateReview?.ingest(ev);
-        $('ann-btn-quality-preview').hidden = false;
+        $('ann-btn-quality-preview').hidden = annState.qualityResults.length === 0;
         if (missingQIds.length > 0 || missingOverallIds.length > 0) {
           msg.textContent = `已有 ${annState.qualityCount} 行质量判断完整；逐题判断待补 ${missingQIds.length} 行，整体判断待补 ${missingOverallIds.length} 行`;
         } else if (missingTranslationIds.length > 0) {
@@ -777,16 +802,24 @@ async function annRunQuality(options = {}) {
     annShowDone();
   } catch (e) {
     if (annState.sessionId === runSessionId) {
-      showToast(`质量打标失败：${e.message}`, 'error');
-      const recovered = await annRefreshPartialRetry({ notifyFailure: false });
-      if (recovered && annState.sessionId === runSessionId) {
+      if (receivedResults && annState.qualityResults.length > 0) {
         annGoStep(6);
         annShowDone({ quiet: true, refreshCompletion: false });
-        showToast('已从历史记录恢复最新完成情况，可继续补齐缺失项', 'info');
-      } else if (annHasIncompleteResults()) {
-        annGoStep(6);
-        annShowDone({ quiet: true, refreshCompletion: false });
-        showToast('未能读取最新完成情况，页面暂按已有状态显示；重试时服务端会自动跳过已完成项', 'info');
+        showToast(`连接提前结束，已保留 ${annState.qualityResults.length} 条已返回结果；可查看并继续补齐缺失项`, 'info');
+      } else {
+        showToast(`质量打标失败：${e.message}`, 'error');
+        const recovered = annState.historySaved === true
+          ? await annRefreshPartialRetry({ notifyFailure: false })
+          : null;
+        if (recovered && annState.sessionId === runSessionId) {
+          annGoStep(6);
+          annShowDone({ quiet: true, refreshCompletion: false });
+          showToast('已从历史记录恢复最新完成情况，可继续补齐缺失项', 'info');
+        } else if (annHasIncompleteResults()) {
+          annGoStep(6);
+          annShowDone({ quiet: true, refreshCompletion: false });
+          showToast('页面暂按已有状态显示；重试时服务端会自动跳过已完成项', 'info');
+        }
       }
     }
   } finally {
@@ -872,7 +905,8 @@ function annShowDone(options = {}) {
   if (
     options.refreshCompletion !== false
     && annHasIncompleteResults()
-    && annState.historySaved !== false
+    && annState.historySaved === true
+    && !annState.qualityReviewRunning
     && annState.completion
     && annState.partialRetrySyncedCompletion !== annState.completion
     && !annState.partialRetrySyncing

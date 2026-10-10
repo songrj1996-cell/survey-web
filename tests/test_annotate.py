@@ -1150,6 +1150,124 @@ class AnnotateReviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(event.get("type") == "heartbeat" for event in events))
         self.assertEqual(events[-1]["type"], "quality_done")
 
+    async def test_quality_stream_sends_each_completed_batch_results_before_terminal_event(self):
+        sid = "test-quality-progress-results"
+        rows = [["ID", "Q1"], ["P1", "answer one"], ["P2", "answer two"]]
+        annotate_workflow.annotate_sessions[sid] = {
+            "rows": rows,
+            "headers": ["ID", "Q1"],
+            "headers_zh": ["ID", "问题一"],
+            "id_col": 0,
+            "open_text_cols": [1],
+            "tasks": {"quality": True, "ai_detect": False},
+        }
+        self.addCleanup(annotate_workflow.annotate_sessions.pop, sid, None)
+
+        def quality_result(player_id: str, answer: str) -> dict:
+            return {
+                "id": player_id,
+                "q_labels": {"col_1": "普通反馈"},
+                "q_reasons": {"col_1": "回答满足题意"},
+                "q_evidence": {"col_1": answer},
+                "translations": {"col_1": f"{answer} 译文"},
+                "originals": {"col_1": answer},
+                "overall": "普通反馈",
+                "overall_reason": "整体回答满足题意",
+                "overall_source": "model_holistic",
+            }
+
+        async def run_batch(_sid, batch_num, batch, *args, **kwargs):
+            player_id, answer = batch[0]
+            return batch_num, [quality_result(player_id, answer)], set(), ""
+
+        with (
+            patch.object(
+                annotate_workflow, "_chunk_rows_by_query_budget",
+                return_value=[[rows[1]], [rows[2]]],
+            ),
+            patch.object(annotate_workflow, "_run_one_quality_batch_strict", side_effect=run_batch),
+            patch.object(
+                annotate_workflow, "_repair_missing_translations",
+                new=AsyncMock(return_value=(set(), "")),
+            ),
+            patch.object(annotate_workflow, "_publish_annotate_result", new=AsyncMock(return_value="")),
+            patch.object(annotate_workflow, "audit_log", new=AsyncMock()),
+        ):
+            events = [
+                self._decode_sse_event(raw)
+                async for raw in annotate_workflow.quality_stream(sid, object())
+            ]
+
+        batch_progress = [
+            event for event in events
+            if event.get("type") == "progress" and event.get("results")
+        ]
+        self.assertEqual(len(batch_progress), 2)
+        self.assertEqual(
+            {result["id"] for event in batch_progress for result in event["results"]},
+            {"P1", "P2"},
+        )
+        for event in batch_progress:
+            self.assertIn("complete_count", event)
+            self.assertIn("missing_ids", event)
+            self.assertIn("missing_overall_ids", event)
+            self.assertIn("completion", event)
+        self.assertEqual(events[-1]["type"], "quality_done")
+
+    async def test_quality_stream_reports_translation_progress_while_repair_is_waiting(self):
+        sid = "test-quality-translation-progress"
+        annotate_workflow.annotate_sessions[sid] = {
+            "rows": [["ID", "Q1"], ["P1", "answer"]],
+            "headers": ["ID", "Q1"],
+            "headers_zh": ["ID", "问题一"],
+            "id_col": 0,
+            "open_text_cols": [1],
+            "tasks": {"quality": True, "ai_detect": False},
+        }
+        self.addCleanup(annotate_workflow.annotate_sessions.pop, sid, None)
+        result = {
+            "id": "P1",
+            "q_labels": {"col_1": "普通反馈"},
+            "q_reasons": {"col_1": "回答满足题意"},
+            "q_evidence": {"col_1": "answer"},
+            "translations": {},
+            "originals": {"col_1": "answer"},
+            "overall": "普通反馈",
+            "overall_reason": "整体回答满足题意",
+            "overall_source": "model_holistic",
+        }
+
+        async def delayed_translation(*args, **kwargs):
+            await asyncio.sleep(0.02)
+            return set(), ""
+
+        with (
+            patch.object(annotate_workflow, "_ANNOTATE_SSE_HEARTBEAT_SECONDS", 0.001),
+            patch.object(
+                annotate_workflow, "_run_one_quality_batch_strict",
+                new=AsyncMock(return_value=(1, [result], set(), "")),
+            ),
+            patch.object(
+                annotate_workflow, "_repair_missing_translations", side_effect=delayed_translation,
+            ),
+            patch.object(annotate_workflow, "_publish_annotate_result", new=AsyncMock(return_value="")),
+            patch.object(annotate_workflow, "audit_log", new=AsyncMock()),
+        ):
+            events = [
+                self._decode_sse_event(raw)
+                async for raw in annotate_workflow.quality_stream(sid, object())
+            ]
+
+        translation_progress = [
+            event for event in events if event.get("phase") == "translation"
+        ]
+        self.assertGreaterEqual(len(translation_progress), 2)
+        self.assertTrue(all(
+            event["msg"] == "质量判断已返回，正在补齐中文翻译…"
+            for event in translation_progress
+        ))
+        self.assertEqual(events[-1]["type"], "quality_done")
+
     async def test_quality_retry_processes_only_missing_rows_and_preserves_valid_results(self):
         sid = "test-quality-missing-only"
         existing = {

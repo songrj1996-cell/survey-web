@@ -109,6 +109,13 @@ function environment() {
 }
 
 async function check() {
+  const pageSource = fs.readFileSync(path.join(root, 'static/index.html'), 'utf8');
+  const styleSource = fs.readFileSync(path.join(root, 'static/style.css'), 'utf8');
+  assert.match(pageSource, /class="btn btn--primary ann-quality-preview-button"[^>]* hidden/,
+    'partial preview is presented as a primary button and starts hidden');
+  assert.match(styleSource, /\.ann-quality-preview-button\[hidden\]\s*\{\s*display:\s*none/,
+    'button display rules cannot override its hidden state');
+
   // Production GET SSE reader: chunked UTF-8, multiple events, real errors and early EOF.
   const payload = Buffer.from(
     'data: {"type":"progress","msg":"处理中"}\r\n\r\n'
@@ -235,10 +242,58 @@ async function check() {
 
   // A failed GET handshake surfaces the backend detail, never a generic disconnect.
   env = environment(); ({context, run, messages} = env);
+  run(`annState.qualityResults=[{id:'P0', originals:{col_1:'已有结果'}, q_labels:{col_1:'普通反馈'},
+    q_reasons:{col_1:'已有可信结果'}, overall:'普通反馈', overall_reason:'已有可信结果'}]`);
   context.fetch = async () => jsonResponse(400, {detail: '所选玩家当前都没有缺项，请刷新结果后重新选择'});
   await run("annRunQuality({retryIds:['P1'], preserveReview:true})");
   assert.ok(messages.some(item => /所选玩家当前都没有缺项/.test(item.message)));
   assert.ok(!messages.some(item => /连接中断/.test(item.message)));
+
+  // Batch results become previewable before the terminal event; a later disconnect keeps them in memory.
+  env = environment(); ({context, run, $, messages} = env);
+  let unexpectedHistoryReads = 0;
+  context.fetch = async () => { unexpectedHistoryReads += 1; return jsonResponse(404, {detail:'历史记录不存在'}); };
+  context.consumeSSEGet = async (url, onEvent) => {
+    onEvent({type:'progress', done:1, total:1, complete_count:1,
+      results:[{id:'P1', originals:{col_1:'具体回答'}, translations:{col_1:'具体回答'},
+        q_labels:{col_1:'普通反馈'}, q_reasons:{col_1:'回答满足题意'}, q_evidence:{col_1:'具体回答'},
+        overall:'普通反馈', overall_reason:'整体回答满足题意'}],
+      missing_ids:['P2'], missing_overall_ids:['P2'], completion:completion(['P2'])});
+    onEvent({type:'progress', phase:'translation', done:1, total:1,
+      msg:'质量判断已返回，正在补齐中文翻译…'});
+    throw new Error('模拟连接提前结束');
+  };
+  await run('annRunQuality()');
+  assert.equal(run('annState.qualityResults.length'), 1);
+  assert.equal(run('annState.qualityCount'), 1);
+  assert.equal($('ann-btn-quality-preview').hidden, false);
+  assert.equal($('ann-quality-progress-bar').style.width, '95%');
+  assert.equal(run('annState.currentStep'), 6);
+  assert.equal(unexpectedHistoryReads, 0, 'in-memory batch results avoid a premature history GET');
+  assert.ok(messages.some(item => /已保留 1 条已返回结果/.test(item.message)));
+
+  // Opening the partial preview while quality work is still running never reads absent or stale history.
+  env = environment(); ({context, run, $} = env);
+  run(`Object.assign(annState, {qualityReviewRunning:true, historySaved:true, qualityCount:1,
+    qualityResults:[{id:'P1', originals:{col_1:'具体回答'}, q_labels:{col_1:'普通反馈'},
+      q_reasons:{col_1:'回答满足题意'}, overall:'普通反馈', overall_reason:'整体回答满足题意'}],
+    completion:${JSON.stringify(completion(['P2']))}, missingQualityIds:['P2'], missingOverallIds:['P2']})`);
+  let previewHistoryReads = 0;
+  context.fetch = async () => { previewHistoryReads += 1; return jsonResponse(404, {detail:'历史记录不存在'}); };
+  $('ann-btn-quality-preview').events.click();
+  await flushAsync();
+  assert.equal(run('annState.currentStep'), 6);
+  assert.equal(previewHistoryReads, 0, 'running preview must not replace live results with history');
+
+  // Before any result record arrives, the preview stays hidden and no unknown history is requested.
+  env = environment(); ({context, run, $, messages} = env);
+  run('annState.historySaved=null');
+  let unknownHistoryReads = 0;
+  context.fetch = async () => { unknownHistoryReads += 1; return jsonResponse(404, {detail:'历史记录不存在'}); };
+  context.consumeSSEGet = async () => { throw new Error('模拟首批前中断'); };
+  await run('annRunQuality()');
+  assert.equal($('ann-btn-quality-preview').hidden, true);
+  assert.equal(unknownHistoryReads, 0, 'history recovery requires evidence that history was saved');
 
   // If history is unavailable, selection remains usable and the backend is still the final filter.
   env = environment(); ({context, run, $, messages} = env);
@@ -256,7 +311,7 @@ async function check() {
   assert.equal(fallbackUrls.length, 1);
   assert.ok(messages.some(item => /未能校正最新缺项/.test(item.message)));
 
-  console.log('PASS: partial review editability, technical-row lock, authoritative retry sync, mixed selection filtering, HTTP detail, safe fallback, and GET SSE framing');
+  console.log('PASS: incremental quality preview, disconnect retention, hidden/button styling, translation progress, safe history recovery, review editability, retry sync, and GET SSE framing');
 }
 
 function serveFixture() {
@@ -286,7 +341,18 @@ function serveFixture() {
         callback({type:'quality_done',results,count:2,complete_count:2-missing.length,missing_ids:missing,missing_overall_ids:missing,missing_translation_ids:[],history_saved:true,
           completion:{partial:missing.length>0,total:2,complete:2-missing.length,missing_ids:missing,gaps:Object.fromEntries(missing.map(id=>[id,['质量判断']]))}});
       }
-      annGoStep(6);annShowDone({quiet:true});
+      if(new URLSearchParams(location.search).has('quality-running')){
+        annState.qualityResults=[{id:'P1',originals:{col_1:'没有问题'},translations:{col_1:'没有问题'},
+          q_labels:{col_1:'有效反馈'},q_reasons:{col_1:'明确回答没有问题'},overall:'有效反馈',overall_pending:false,
+          overall_reason:'回答满足题意'}];
+        annState.qualityCount=1;
+        annGoStep(5);
+        $('ann-quality-progress-bar').style.width='95%';
+        $('ann-quality-progress-msg').textContent='质量判断已返回，正在补齐中文翻译…';
+        $('ann-btn-quality-preview').hidden=false;
+      }else{
+        annGoStep(6);annShowDone({quiet:true});
+      }
       </script></body>`);
   http.createServer((request, response) => {
     const pathname = new URL(request.url, 'http://localhost').pathname;

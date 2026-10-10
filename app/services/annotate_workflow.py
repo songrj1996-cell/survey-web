@@ -2623,6 +2623,7 @@ async def quality_stream(sid: str, request: Request, retry_ids: set[str] | None 
 
     retain_progress()
     pending: set[asyncio.Task] = set()
+    translation_task: asyncio.Task | None = None
     try:
         yield sse_event({
             "type": "progress", "done": 0, "total": len(batches),
@@ -2673,7 +2674,7 @@ async def quality_stream(sid: str, request: Request, retry_ids: set[str] | None 
                 done_count += 1
                 for result in batch_results:
                     results_by_id[str(result.get("id", "")).strip()] = result
-                retain_progress()
+                missing_questions, missing_overall = retain_progress()
                 if missing or err:
                     yield sse_event({
                         "type": "warn",
@@ -2682,6 +2683,11 @@ async def quality_stream(sid: str, request: Request, retry_ids: set[str] | None 
                 yield sse_event({
                     "type": "progress", "done": done_count, "total": len(batches),
                     "msg": f"第 {batch_num} 批已处理，{len(missing)} 行仍待补齐（{done_count}/{len(batches)}）",
+                    "results": batch_results,
+                    "complete_count": len(expected_ids - missing_questions - missing_overall),
+                    "missing_ids": sorted(missing_questions),
+                    "missing_overall_ids": sorted(missing_overall),
+                    "completion": _annotate_completion(sess),
                 })
 
         all_missing_ids, missing_overall_ids = retain_progress()
@@ -2704,7 +2710,13 @@ async def quality_stream(sid: str, request: Request, retry_ids: set[str] | None 
             str(result.get("id", "")): result
             for result in all_results if str(result.get("id", ""))
         })
-        missing_translation_ids, _ = await _repair_missing_translations(
+        translation_progress = {
+            "type": "progress", "phase": "translation",
+            "done": len(batches), "total": len(batches),
+            "msg": "质量判断已返回，正在补齐中文翻译…",
+        }
+        yield sse_event(translation_progress)
+        translation_task = asyncio.create_task(_repair_missing_translations(
             sid,
             list(translation_targets.values()),
             rows[1:],
@@ -2712,7 +2724,15 @@ async def quality_stream(sid: str, request: Request, retry_ids: set[str] | None 
             open_text_cols,
             "quality-final",
             retry_ids=retry_ids,
-        )
+        ))
+        while not translation_task.done():
+            finished, _ = await asyncio.wait(
+                {translation_task}, timeout=_ANNOTATE_SSE_HEARTBEAT_SECONDS,
+            )
+            if not finished:
+                yield sse_event(translation_progress)
+        missing_translation_ids, _ = await translation_task
+        translation_task = None
         order = {_row_id(row, id_col): index for index, row in enumerate(rows[1:])}
         all_results.sort(key=lambda result: order.get(str(result.get("id", "")), len(order)))
         sess["quality_results"] = all_results
@@ -2763,3 +2783,6 @@ async def quality_stream(sid: str, request: Request, retry_ids: set[str] | None 
             task.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
+        if translation_task is not None and not translation_task.done():
+            translation_task.cancel()
+            await asyncio.gather(translation_task, return_exceptions=True)
