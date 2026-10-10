@@ -44,7 +44,6 @@ async def app_lifespan(app_instance):
 
 app = FastAPI(title="调研分析平台", lifespan=app_lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-app.add_middleware(RequestLoggingContextMiddleware)
 _sweep_old_sessions()  # 启动时清理过期 session 文件
 
 static_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "static")
@@ -83,6 +82,10 @@ async def feishu_auth_middleware(request: Request, call_next):
     if not _login_allowed(login):
         return _forbidden_response(request, login)
     return await call_next(request)
+
+
+# 必须最后注册，确保未登录或无权限请求也先绑定操作人，再进入登录门控。
+app.add_middleware(RequestLoggingContextMiddleware)
 
 
 # ── 业务路由 ────────────────────────────────────────────────

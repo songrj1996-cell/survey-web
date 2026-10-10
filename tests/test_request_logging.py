@@ -40,6 +40,11 @@ async def _receive():
 
 
 class RequestLoggingContextTests(unittest.IsolatedAsyncioTestCase):
+    def test_request_logging_wraps_authentication_guard(self):
+        from app.main import app
+
+        self.assertIs(app.user_middleware[0].cls, request_logging.RequestLoggingContextMiddleware)
+
     async def test_concurrent_users_never_share_operator_context(self):
         ready = 0
         ready_lock = asyncio.Lock()
