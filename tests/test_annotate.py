@@ -930,6 +930,84 @@ class AnnotateReviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("human_reviews", result)
         self.assertEqual(save_result.await_count, 2)
 
+    async def test_quality_review_allows_complete_question_while_another_question_is_incomplete(self):
+        sid = "test-quality-human-review-with-unrelated-gap"
+        complete = {
+            "id": "P1",
+            "q_labels": {"col_1": "普通反馈"},
+            "q_reasons": {"col_1": "回答满足题意"},
+            "q_evidence": {"col_1": "具体回答"},
+            "translations": {"col_1": "具体回答"},
+            "originals": {"col_1": "具体回答"},
+            "overall": "普通反馈",
+            "overall_reason": "整体回答满足题意",
+        }
+        incomplete = {
+            "id": "P2",
+            "q_labels": {},
+            "q_reasons": {},
+            "q_evidence": {},
+            "translations": {"col_1": "另一条回答"},
+            "originals": {"col_1": "另一条回答"},
+            "overall": "普通反馈",
+            "overall_reason": "整体回答满足题意",
+        }
+        annotate_workflow.annotate_sessions[sid] = {
+            "rows": [["ID", "Q1"], ["P1", "具体回答"], ["P2", "另一条回答"]],
+            "headers": ["ID", "Q1"],
+            "headers_zh": ["ID", "问题一"],
+            "id_col": 0,
+            "open_text_cols": [1],
+            "tasks": {"quality": True, "ai_detect": False},
+            "quality_status": "incomplete",
+            "quality_results": [complete, incomplete],
+            "missing_quality_ids": ["P2"],
+        }
+        self.addCleanup(annotate_workflow.annotate_sessions.pop, sid, None)
+
+        with patch.object(
+            annotate_workflow,
+            "_save_annotate_result_history",
+            new=AsyncMock(),
+        ) as save_result:
+            changed = await annotate_workflow.annotate_apply_quality_review(
+                sid, "P1", 1, "优秀反馈", object()
+            )
+            with self.assertRaisesRegex(HTTPException, "当前题标签不完整"):
+                await annotate_workflow.annotate_apply_quality_review(
+                    sid, "P2", 1, "有效反馈", object()
+                )
+
+        self.assertTrue(changed["changed"])
+        self.assertEqual(complete["q_labels"]["col_1"], "优秀反馈")
+        self.assertEqual(incomplete["q_labels"], {})
+        save_result.assert_awaited_once()
+
+    async def test_quality_review_stays_blocked_while_quality_run_is_active(self):
+        sid = "test-quality-human-review-while-running"
+        annotate_workflow.annotate_sessions[sid] = {
+            "rows": [["ID", "Q1"], ["P1", "具体回答"]],
+            "headers": ["ID", "Q1"],
+            "id_col": 0,
+            "open_text_cols": [1],
+            "tasks": {"quality": True},
+            "quality_status": "running",
+            "quality_results": [{
+                "id": "P1",
+                "q_labels": {"col_1": "普通反馈"},
+                "q_reasons": {"col_1": "回答满足题意"},
+                "originals": {"col_1": "具体回答"},
+                "overall": "普通反馈",
+                "overall_reason": "整体回答满足题意",
+            }],
+        }
+        self.addCleanup(annotate_workflow.annotate_sessions.pop, sid, None)
+
+        with self.assertRaisesRegex(HTTPException, "质量打标正在运行"):
+            await annotate_workflow.annotate_apply_quality_review(
+                sid, "P1", 1, "优秀反馈", object()
+            )
+
     async def test_quality_review_keeps_empty_answer_fixed_as_na(self):
         sid = "test-quality-empty-human-review"
         result = {

@@ -1842,9 +1842,8 @@ async def annotate_apply_quality_review(
     sess = get_annotate_session(sid)
     if not (sess.get("tasks") or {}).get("quality"):
         raise HTTPException(status_code=400, detail="当前任务未启用质量打标")
-    incomplete = _annotate_incomplete_detail(sess)
-    if incomplete:
-        raise HTTPException(status_code=409, detail=f"结果尚未完整，不能人工改标：{incomplete}")
+    if sess.get("quality_status") == "running":
+        raise HTTPException(status_code=409, detail="质量打标正在运行，请完成后再进行人工复核")
 
     normalized_id = str(player_id or "").strip()
     normalized_label = str(label or "").strip()

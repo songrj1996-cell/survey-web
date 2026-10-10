@@ -144,6 +144,34 @@ async function check() {
   assert.match(messages.at(-1).message, /模拟下载失败/);
   assert.equal(downloads.length, 0);
 
+  // An unrelated technical gap does not lock a complete question; the gap itself stays locked.
+  env = environment(); ({context, run, $} = env);
+  run(`Object.assign(annState, {
+    headers:['ID','Q1'], headersZh:['ID','问题一'], missingQualityIds:['P2'], missingOverallIds:[],
+    qualityResults:[
+      {id:'P1', originals:{col_1:'具体回答'}, translations:{col_1:'具体回答'},
+        q_labels:{col_1:'普通反馈'}, q_reasons:{col_1:'回答满足题意'}, q_evidence:{col_1:'具体回答'},
+        overall:'普通反馈', overall_reason:'整体回答满足题意',
+        q_review_signals:{col_1:{schema_version:1, applicable:true, validity_confidence:'low',
+          review_recommended:true, reason_codes:['valid_invalid_boundary'], reason:'建议人工核对',
+          source:'model_review', assessed_label:'普通反馈'}}},
+      {id:'P2', originals:{col_1:'另一条回答'}, translations:{col_1:'另一条回答'},
+        q_labels:{}, q_reasons:{}, q_evidence:{}, overall:'普通反馈', overall_reason:'整体回答满足题意',
+        q_review_signals:{col_1:{schema_version:1, applicable:true, validity_confidence:'low',
+          review_recommended:false, reason_codes:[], reason:'', source:'pending_quality', assessed_label:''}}}
+    ]
+  }); AnnotateReview.ingest(); AnnotateReview.render();`);
+  let detail = $('ann-quality-review-enhanced').querySelector('#ar-detail').innerHTML;
+  assert.match(detail, /本题结果完整，可先人工改标/);
+  assert.doesNotMatch(detail, /data-ar-label="优秀反馈"[^>]* disabled/,
+    'complete question remains editable while another player has a technical gap');
+  const reviewRoot = $('ann-quality-review-enhanced');
+  reviewRoot.events.click({target:{closest:() => ({disabled:false, dataset:{arStatus:'technical'}})}});
+  detail = reviewRoot.querySelector('#ar-detail').innerHTML;
+  assert.match(detail, /本题结果不完整，请先补齐/);
+  assert.match(detail, /data-ar-label="优秀反馈"[^>]* disabled/,
+    'the technical question itself stays read-only');
+
   // AI-stage stale completion and stale missing arrays are replaced by the archived one-row truth.
   env = environment(); ({context, run, $, messages} = env);
   context.fetch = async url => {
@@ -228,7 +256,7 @@ async function check() {
   assert.equal(fallbackUrls.length, 1);
   assert.ok(messages.some(item => /未能校正最新缺项/.test(item.message)));
 
-  console.log('PASS: authoritative retry sync, mixed selection filtering, HTTP detail, safe fallback, and GET SSE framing');
+  console.log('PASS: partial review editability, technical-row lock, authoritative retry sync, mixed selection filtering, HTTP detail, safe fallback, and GET SSE framing');
 }
 
 function serveFixture() {

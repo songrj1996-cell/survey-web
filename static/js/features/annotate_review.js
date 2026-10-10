@@ -102,7 +102,7 @@
   }
   function editable(row) {
     return row && !row.blank && !row.technical && row.hasOriginal && labels.includes(row.final)
-      && !!annState.sessionId && !incomplete();
+      && !!annState.sessionId;
   }
   function draftFor(row) { return ui.drafts.get(row.id) || row.final; }
   function statusText(row) {
@@ -198,7 +198,7 @@
           <button class="btn btn--ghost" type="button" data-ar-action="restore"${!canEdit || !labels.includes(row.ai) || row.final === row.ai || isBusy() ? ' disabled' : ''}>恢复 AI 原标签</button>
           <button class="btn btn--ghost ar-next" type="button" data-ar-action="next">下一题 →</button></div>
         <div class="ar-actions"><button class="btn btn--ghost" type="button" disabled>确认原判（尚未支持）</button><button class="btn btn--ghost" type="button" disabled>撤销确认（尚未支持）</button></div>
-        <p class="ar-muted">${row.blank ? 'N/A 不参与人工复核数量统计。' : row.technical ? '本题结果不完整，请先补齐。' : !row.hasOriginal ? '缺少原文，不能核对并保存结论。' : incomplete() ? '尚有技术缺项，请先补齐后再保存标签。' : '当前支持改标与恢复原标签；独立确认状态、复核备注及完整操作历史尚不能保存。'}</p>
+        <p class="ar-muted">${row.blank ? 'N/A 不参与人工复核数量统计。' : row.technical ? '本题结果不完整，请先补齐。' : !row.hasOriginal ? '缺少原文，不能核对并保存结论。' : incomplete() ? '本题结果完整，可先人工改标；其他技术缺项仍需单独补齐。独立确认状态仍未记录。' : '当前支持改标与恢复原标签；独立确认状态、复核备注及完整操作历史尚不能保存。'}</p>
         ${incomplete() ? retryControl() : ''}</div>
       <details class="ar-events"><summary>本题改标记录</summary>${row.adjusted ? `<p>${esc(labelOf(row.legacy.from_label))} → ${esc(labelOf(row.legacy.to_label))}</p>` : '<p>当前没有已保存的改标差异。</p>'}<p>当前记录只反映标签差异，恢复原标签后差异会消失；不代表完整操作历史。</p></details>`;
   }
