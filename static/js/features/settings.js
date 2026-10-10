@@ -932,6 +932,7 @@ const PERMISSION_FEATURES = [
   { key: 'interview', label: '访谈报告', desc: '访谈记录上传与证据型报告生成' },
   { key: 'annotate', label: '数据标注', desc: '样本质量检测与数据标注' },
   { key: 'comment', label: '评论分析', desc: '评论主题、情感与舆情分析' },
+  { key: 'reward', label: '奖励整理', desc: 'Excel 奖励汇总、冲突核对与名单导出' },
 ];
 
 async function loadPermsTab() {

@@ -436,6 +436,27 @@ BRANCH_MAX_LEAKAGE_RATE = min(
     max(0.0, _env_float("BRANCH_MAX_LEAKAGE_RATE", 0.05)),
 )
 
+# 奖励整理：纯本地 Excel 解析与临时会话边界。
+REWARD_ROSTER_ELIGIBLE_STATUS = (
+    os.getenv("REWARD_ROSTER_ELIGIBLE_STATUS", "群内人员").strip() or "群内人员"
+)
+REWARD_ROSTER_MAX_UPLOAD_BYTES = max(
+    1024 * 1024,
+    _env_int("REWARD_ROSTER_MAX_UPLOAD_BYTES", 20 * 1024 * 1024),
+)
+REWARD_ROSTER_MAX_SHEETS = max(
+    1,
+    _env_int("REWARD_ROSTER_MAX_SHEETS", 64),
+)
+REWARD_ROSTER_MAX_ROWS_PER_SHEET = max(
+    1,
+    _env_int("REWARD_ROSTER_MAX_ROWS_PER_SHEET", 100000),
+)
+REWARD_ROSTER_SESSION_TTL_SECONDS = max(
+    300,
+    _env_int("REWARD_ROSTER_SESSION_TTL_SECONDS", 7200),
+)
+
 # 数据标注：AI 内容生成风险阈值与批处理参数。
 # 润色概率仅用于展示，不参与 AI 作答确认。
 ANNOTATE_AI_REVIEW_THRESHOLD = min(

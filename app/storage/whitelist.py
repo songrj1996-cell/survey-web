@@ -3,12 +3,13 @@ import json
 
 from app.core.config import WHITELIST_FILE
 
-_PERMS_SCHEMA_VERSION = 3
+_PERMS_SCHEMA_VERSION = 4
 
 
 def _migrate_whitelist_perms(users: list[dict]) -> bool:
     """逐版本升级历史白名单，保留已有用户对新增功能的访问能力。
-    v2 给已有访问权限的用户补 comment；v3 给 survey 用户补 interview。
+    v2 给已有访问权限的用户补 comment；v3 给 survey 用户补 interview；
+    v4 登记 reward 独立权限，但不自动授予现有普通成员。
     用 perms_v 标记已迁移，迁移后管理员再取消权限也不会被重新加上。
     返回是否发生改动（需要回写）。"""
     changed = False

@@ -11,6 +11,7 @@ AUDIT_FEATURES = [
     {"key": "quant", "label": "定量分析"},
     {"key": "annotate", "label": "数据标注"},
     {"key": "comment", "label": "评论分析"},
+    {"key": "reward", "label": "奖励整理"},
     {"key": "report", "label": "报告导出与追问"},
     {"key": "settings", "label": "平台设置"},
     {"key": "admin", "label": "权限管理"},

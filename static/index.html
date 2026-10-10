@@ -11,7 +11,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Roboto+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/style.css?v=56" />
+  <link rel="stylesheet" href="/static/style.css?v=59" />
   <link rel="stylesheet" href="/static/questionnaire-sources.css?v=1" />
   <link rel="stylesheet" href="/static/report-quick.css?v=11" />
   <link rel="stylesheet" href="/static/survey-entry.css?v=8" />
@@ -97,6 +97,17 @@
               <path d="m9 12 2 2 4-4" />
             </svg>
             <span>数据标注</span>
+          </div>
+        </div>
+
+        <!-- 奖励整理 -->
+        <div class="nav-item" id="nav-reward">
+          <div class="nav-item__header" id="nav-header-reward">
+            <svg class="nav-item__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="3" y="8" width="18" height="13" rx="2" />
+              <path d="M12 8v13M3 12h18M7.5 8C5 8 4 6.8 4 5.5S5 3 6.5 3C9 3 12 8 12 8M16.5 8C19 8 20 6.8 20 5.5S19 3 17.5 3C15 3 12 8 12 8" />
+            </svg>
+            <span>奖励整理</span>
           </div>
         </div>
 
@@ -1513,6 +1524,126 @@
       </section>
 
       <!-- ======================================================
+           奖励整理面板（独立模块，4 步）
+           ====================================================== -->
+
+      <section class="panel panel--hidden" id="rr-panel-1">
+        <div class="step-bar rr-step-bar">
+          <button class="step-bar__item step-bar__item--active" type="button"><span class="step-bar__num">1</span><span class="step-bar__label">上传 Excel</span></button>
+          <button class="step-bar__item" type="button"><span class="step-bar__num">2</span><span class="step-bar__label">选择与映射</span></button>
+          <button class="step-bar__item" type="button"><span class="step-bar__num">3</span><span class="step-bar__label">处理冲突</span></button>
+          <button class="step-bar__item" type="button"><span class="step-bar__num">4</span><span class="step-bar__label">核对与导出</span></button>
+        </div>
+        <div class="panel__header">
+          <h1 class="panel__title">上传奖励统计 Excel</h1>
+          <p class="panel__desc">文件只用于本次本地计算，不调用模型。上传后可从整个 Excel 中选择参与统计的 sheet。</p>
+        </div>
+        <div class="upload-zone rr-upload-zone" id="rr-upload-zone">
+          <input type="file" id="rr-file-input" accept=".xlsx" hidden />
+          <div class="upload-zone__icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 16V4m0 0L7 9m5-5 5 5"/><path d="M5 14v5h14v-5"/></svg>
+          </div>
+          <div class="upload-zone__title">拖入 Excel，或点击选择文件</div>
+          <div class="upload-zone__hint">仅支持 .xlsx，系统不会修改原文件</div>
+        </div>
+        <div class="rr-file-card" id="rr-file-card" hidden></div>
+        <div class="panel-actions">
+          <button class="btn btn--primary" id="rr-btn-upload" type="button" disabled>读取 sheet</button>
+        </div>
+      </section>
+
+      <section class="panel panel--hidden" id="rr-panel-2">
+        <div class="step-bar rr-step-bar">
+          <button class="step-bar__item step-bar__item--done" type="button"><span class="step-bar__num">✓</span><span class="step-bar__label">上传 Excel</span></button>
+          <button class="step-bar__item step-bar__item--active" type="button"><span class="step-bar__num">2</span><span class="step-bar__label">选择与映射</span></button>
+          <button class="step-bar__item" type="button"><span class="step-bar__num">3</span><span class="step-bar__label">处理冲突</span></button>
+          <button class="step-bar__item" type="button"><span class="step-bar__num">4</span><span class="step-bar__label">核对与导出</span></button>
+        </div>
+        <div class="panel__header">
+          <h1 class="panel__title">设置奖励统计范围</h1>
+          <p class="panel__desc">依次选择奖励日期和需要统计的 sheet，再核对各 sheet 的字段映射。</p>
+        </div>
+        <section class="rr-surface rr-config-module">
+          <div class="rr-config-module__head">
+            <div><h2>1. 选择奖励日期</h2><p>日期来自 Excel 中识别到的日期列，可按年、月或具体日期多选。</p></div>
+            <span class="rr-selection-count" id="rr-date-selected-count">未选择</span>
+          </div>
+          <div class="rr-date-tree" id="rr-date-tree"></div>
+          <div class="rr-field-help">只统计所选日期且状态为“<span id="rr-eligible-status">群内人员</span>”的记录</div>
+        </section>
+        <section class="rr-surface rr-config-module">
+          <div class="rr-config-module__head">
+            <div><h2>2. 选择需要进入统计的 sheet</h2><p>这里列出 Excel 内全部 sheet，只勾选本次需要统计的内容。</p></div>
+            <span class="rr-selection-count" id="rr-sheet-selected-count">未选择</span>
+          </div>
+          <div class="rr-sheet-list" id="rr-sheet-list"></div>
+        </section>
+        <section class="rr-surface rr-config-module">
+          <div class="rr-config-module__head">
+            <div><h2>3. 字段映射</h2><p>逐个确认所选 sheet 中的日期、任务、账号、状态和奖励列。</p></div>
+          </div>
+          <div class="rr-mapping-list" id="rr-mapping-list"><div class="rr-empty">选择 sheet 后显示字段映射</div></div>
+        </section>
+        <div class="panel-actions panel-actions--spread">
+          <button class="btn btn--ghost" id="rr-btn-back-upload" type="button">返回重选文件</button>
+          <button class="btn btn--primary" id="rr-btn-analyze" type="button" disabled>检查奖励与冲突</button>
+        </div>
+      </section>
+
+      <section class="panel panel--hidden" id="rr-panel-3">
+        <div class="step-bar rr-step-bar">
+          <button class="step-bar__item step-bar__item--done" type="button"><span class="step-bar__num">✓</span><span class="step-bar__label">上传 Excel</span></button>
+          <button class="step-bar__item step-bar__item--done" type="button"><span class="step-bar__num">✓</span><span class="step-bar__label">选择与映射</span></button>
+          <button class="step-bar__item step-bar__item--active" type="button"><span class="step-bar__num">3</span><span class="step-bar__label">处理冲突</span></button>
+          <button class="step-bar__item" type="button"><span class="step-bar__num">4</span><span class="step-bar__label">核对与导出</span></button>
+        </div>
+        <div class="panel__header">
+          <h1 class="panel__title">处理重复账号与异常数据</h1>
+          <p class="panel__desc">同一账号在多个 sheet 中出现时必须人工核对；同一任务最终只能保留一条奖励来源。</p>
+        </div>
+        <div id="rr-analysis-summary"></div>
+        <div id="rr-invalid-list"></div>
+        <div class="rr-conflict-list" id="rr-conflict-list"></div>
+        <div class="panel-actions panel-actions--spread">
+          <button class="btn btn--ghost" id="rr-btn-back-mapping" type="button">返回调整映射</button>
+          <button class="btn btn--primary" id="rr-btn-resolve" type="button">确认全部处理结果</button>
+        </div>
+      </section>
+
+      <section class="panel panel--hidden" id="rr-panel-4">
+        <div class="step-bar rr-step-bar">
+          <button class="step-bar__item step-bar__item--done" type="button"><span class="step-bar__num">✓</span><span class="step-bar__label">上传 Excel</span></button>
+          <button class="step-bar__item step-bar__item--done" type="button"><span class="step-bar__num">✓</span><span class="step-bar__label">选择与映射</span></button>
+          <button class="step-bar__item step-bar__item--done" type="button"><span class="step-bar__num">✓</span><span class="step-bar__label">处理冲突</span></button>
+          <button class="step-bar__item step-bar__item--active" type="button"><span class="step-bar__num">4</span><span class="step-bar__label">核对与导出</span></button>
+        </div>
+        <div class="panel__header">
+          <h1 class="panel__title">核对奖励名单并导出</h1>
+          <p class="panel__desc">账号已去重并稳定排序。导出前可展开核对每条奖励的原始 sheet、任务和 playerid。</p>
+        </div>
+        <div class="rr-result-summary" id="rr-result-summary"></div>
+        <div class="rr-result-grid">
+          <section class="rr-surface">
+            <div class="rr-section-title">按任务统计</div>
+            <div id="rr-task-stats"></div>
+          </section>
+          <section class="rr-surface">
+            <div class="rr-section-title">账号奖励明细</div>
+            <div class="rr-account-list" id="rr-account-list"></div>
+          </section>
+        </div>
+        <section class="rr-surface">
+          <div class="rr-section-head"><div class="rr-section-title">复制用备注</div><div class="rr-note-tabs"><button class="rr-note-tab rr-note-tab--active" type="button" data-rr-note="simple">简版</button><button class="rr-note-tab" type="button" data-rr-note="full">完整版</button></div></div>
+          <textarea class="rr-output" id="rr-note-output" readonly></textarea>
+          <button class="btn btn--ghost btn--sm" id="rr-btn-copy-note" type="button">复制备注</button>
+        </section>
+        <section class="rr-surface">
+          <div class="rr-section-head"><div><div class="rr-section-title">TXT 导出预览</div><div class="rr-section-hint">无表头，Tab 分隔：zoneid、uid、301-总钻石</div></div><button class="btn btn--primary" id="rr-btn-download" type="button">下载 TXT</button></div>
+          <pre class="rr-txt-preview" id="rr-txt-preview"></pre>
+        </section>
+      </section>
+
+      <!-- ======================================================
            评论舆情分析面板（独立模块，3 步）
            ====================================================== -->
 
@@ -2035,13 +2166,14 @@
   <script src="/static/js/features/survey.js?v=40"></script>
   <script src="/static/js/features/survey-entry.js?v=5"></script>
   <script src="/static/js/features/questionnaire-sources.js?v=2"></script>
-  <script src="/static/js/features/report.js?v=51"></script>
+  <script src="/static/js/features/report.js?v=52"></script>
   <script src="/static/js/features/profile.js?v=2"></script>
-  <script src="/static/js/features/settings.js?v=37"></script>
+  <script src="/static/js/features/settings.js?v=38"></script>
   <script src="/static/js/features/history.js?v=38"></script>
   <script src="/static/js/features/interview.js?v=10"></script>
   <script src="/static/js/features/interview-v2.js?v=7"></script>
-  <script src="/static/js/features/nav.js?v=38"></script>
+  <script src="/static/js/features/reward-roster.js?v=3"></script>
+  <script src="/static/js/features/nav.js?v=39"></script>
   <script src="/static/js/features/comment.js?v=29"></script>
 <script src="/static/js/features/annotate.js?v=45"></script>
 <script src="/static/js/features/annotate_review.js?v=3"></script>

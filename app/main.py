@@ -96,6 +96,7 @@ from app.routers import (
     history,
     interview,
     profile,
+    reward_roster,
     settings_api,
     survey,
 )
@@ -141,6 +142,7 @@ app.include_router(comment_analysis.router)
 app.include_router(annotate.router)
 app.include_router(interview.router)
 app.include_router(profile.router)
+app.include_router(reward_roster.router)
 
 if INTERVIEW_V2_ENABLED:
     from app.routers import interview_v2

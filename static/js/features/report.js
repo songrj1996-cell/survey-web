@@ -2595,7 +2595,7 @@ function downloadReportFile(format, scope = 'body') {
 // ── 飞书登录状态 + 权限门控 ──
 state.feishu = {
   configured: false, logged_in: false, allowed: true, name: '', email: '',
-  perms: ['survey', 'interview', 'annotate', 'comment'], is_admin: false
+  perms: ['survey', 'interview', 'annotate', 'comment', 'reward'], is_admin: false
 };
 
 function applyPermGating() {
@@ -2604,19 +2604,22 @@ function applyPermGating() {
   const hasInterview = perms.includes('interview');
   const hasAnnotate = perms.includes('annotate');
   const hasComment = perms.includes('comment');
+  const hasReward = perms.includes('reward');
   // 侧边栏：无权限则隐藏入口
   const navSurvey = $('nav-survey');
   const navInterview = $('nav-interview');
   const navAnnotate = $('nav-annotate');
   const navComment = $('nav-comment');
+  const navReward = $('nav-reward');
   if (navSurvey) navSurvey.style.display = hasSurvey ? '' : 'none';
   if (navInterview) navInterview.style.display = hasInterview ? '' : 'none';
   if (navAnnotate) navAnnotate.style.display = hasAnnotate ? '' : 'none';
   if (navComment) navComment.style.display = hasComment ? '' : 'none';
+  if (navReward) navReward.style.display = hasReward ? '' : 'none';
   // 如果当前模式无权限，切换到第一个有权限的模式
   const allowedModes = [
     ['survey', hasSurvey], ['interview', hasInterview],
-    ['annotate', hasAnnotate], ['comment', hasComment],
+    ['annotate', hasAnnotate], ['comment', hasComment], ['reward', hasReward],
   ].filter(([, ok]) => ok).map(([m]) => m);
   if (!allowedModes.includes(currentMode) && allowedModes.length) {
     switchMode(allowedModes[0]);

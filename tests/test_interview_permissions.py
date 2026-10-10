@@ -10,7 +10,7 @@ class InterviewPermissionMigrationTests(unittest.TestCase):
     def test_interview_is_an_independent_permission(self):
         self.assertEqual(
             ALL_PERMS,
-            ["survey", "interview", "annotate", "comment"],
+            ["survey", "interview", "annotate", "comment", "reward"],
         )
 
     def test_v2_survey_user_receives_interview_once(self):
@@ -35,6 +35,17 @@ class InterviewPermissionMigrationTests(unittest.TestCase):
         self.assertFalse(_migrate_whitelist_perms(users))
         self.assertEqual(users[0]["perms"], ["survey"])
 
+    def test_v3_user_does_not_receive_reward_permission(self):
+        users = [{
+            "email": "legacy@example.com",
+            "perms": ["survey", "interview", "comment"],
+            "perms_v": 3,
+        }]
+
+        self.assertTrue(_migrate_whitelist_perms(users))
+        self.assertEqual(users[0]["perms"], ["survey", "interview", "comment"])
+        self.assertEqual(users[0]["perms_v"], _PERMS_SCHEMA_VERSION)
+
 
 class InterviewRoutePermissionTests(unittest.IsolatedAsyncioTestCase):
     async def test_status_requires_interview_permission(self):
@@ -52,4 +63,3 @@ class InterviewRoutePermissionTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

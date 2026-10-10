@@ -17,6 +17,11 @@ $('btn-restart').addEventListener('click', () => {
     showToast('已重置，请重新上传文件', 'info');
     return;
   }
+  if (currentMode === 'reward') {
+    rrReset();
+    showToast('已重置，请重新上传奖励 Excel', 'info');
+    return;
+  }
   if (currentMode === 'interview') {
     ivReset();
     showToast('已重置，请重新上传文件', 'info');
@@ -110,8 +115,9 @@ const annPanelIds = [1, 2, 3, 4, 5, 6];
 const annPanels = annPanelIds.map(n => $(`ann-panel-${n}`));
 
 const cmPanels = [1, 2, 3].map(n => $(`cm-panel-${n}`));
+const rrPanels = [1, 2, 3, 4].map(n => $(`rr-panel-${n}`));
 
-let currentMode = 'survey'; // 'survey' | 'interview' | 'annotate' | 'comment'
+let currentMode = 'survey'; // 'survey' | 'interview' | 'annotate' | 'comment' | 'reward'
 
 function switchMode(mode) {
   if (currentMode === 'survey' && mode !== 'survey' && reportInteractionBusy()) {
@@ -123,6 +129,7 @@ function switchMode(mode) {
   const isInterview = mode === 'interview';
   const isAnnotate = mode === 'annotate';
   const isComment = mode === 'comment';
+  const isReward = mode === 'reward';
 
   // 一级导航激活状态
   $('nav-survey').classList.toggle('nav-item--active', isSurvey);
@@ -132,6 +139,7 @@ function switchMode(mode) {
   $('nav-annotate').classList.toggle('nav-item--active', isAnnotate);
   $('nav-annotate').classList.toggle('nav-item--expanded', isAnnotate);
   $('nav-comment').classList.toggle('nav-item--active', isComment);
+  $('nav-reward').classList.toggle('nav-item--active', isReward);
   $('nav-settings').classList.remove('nav-item--active');
 
   // 历史记录是全局入口，不随当前功能模块切换
@@ -141,14 +149,17 @@ function switchMode(mode) {
   ivPanels.forEach(p => p && p.classList.add('panel--hidden'));
   annPanels.forEach(p => p.classList.add('panel--hidden'));
   cmPanels.forEach(p => p && p.classList.add('panel--hidden'));
+  rrPanels.forEach(p => p && p.classList.add('panel--hidden'));
   if (isSurvey) {
     goStep(state.currentStep);
   } else if (isInterview) {
     ivGoStep(ivState.currentStep);
   } else if (isAnnotate) {
     annGoStep(annState.currentStep);
-  } else {
+  } else if (isComment) {
     cmGoStep(cmState.currentStep);
+  } else {
+    rrGoStep(rrState.currentStep);
   }
 }
 
@@ -157,6 +168,7 @@ $('nav-header-survey').addEventListener('click', () => switchMode('survey'));
 $('nav-header-interview').addEventListener('click', () => switchMode('interview'));
 $('nav-header-annotate').addEventListener('click', () => switchMode('annotate'));
 $('nav-header-comment').addEventListener('click', () => switchMode('comment'));
+$('nav-header-reward').addEventListener('click', () => switchMode('reward'));
 
 // 设置入口
 $('nav-header-settings').addEventListener('click', () => {
@@ -164,6 +176,7 @@ $('nav-header-settings').addEventListener('click', () => {
   $('nav-survey').classList.remove('nav-item--active');
   $('nav-interview').classList.remove('nav-item--active');
   $('nav-annotate').classList.remove('nav-item--active');
+  $('nav-reward').classList.remove('nav-item--active');
   openDrawer('settings-drawer');
   loadActiveSettingsTab();
 });
