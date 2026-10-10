@@ -29,8 +29,43 @@ class RuntimeLoggingTests(unittest.TestCase):
         self.assertEqual(
             output.getvalue().strip(),
             "[2026-10-10 15:02:41.238+08:00] [成功] [数据标注] 模型调用完成"
-            "｜模型：gpt-5.6-terra｜尝试次数：1｜返回字符数：3669",
+            "｜操作人：系统任务｜模型：gpt-5.6-terra｜尝试次数：1｜返回字符数：3669",
         )
+
+    def test_bound_operator_shows_name_without_email(self):
+        output = io.StringIO()
+        operator = runtime_logging.runtime_operator_from_login({
+            "name": "测试用户",
+            "email": "tester@example.com",
+        })
+        token = runtime_logging.bind_runtime_operator(operator)
+        try:
+            with patch.object(runtime_logging, "_timestamp", return_value="TIME"), redirect_stdout(output):
+                runtime_logging.runtime_log("问卷报告", "info", "开始生成")
+        finally:
+            runtime_logging.reset_runtime_operator(token)
+
+        self.assertIn("操作人：测试用户", output.getvalue())
+        self.assertNotIn("tester@example.com", output.getvalue())
+        self.assertNotIn("example.com", output.getvalue())
+        self.assertEqual(runtime_logging.current_runtime_operator(), "系统任务")
+
+    def test_logged_in_user_without_name_does_not_fall_back_to_identifier(self):
+        operator = runtime_logging.runtime_operator_from_login({
+            "email": "tester@example.com",
+            "open_id": "ou_1234567890abcdef",
+        })
+        self.assertEqual(operator, "已登录用户")
+
+    def test_operator_control_characters_cannot_modify_terminal_output(self):
+        operator = runtime_logging.runtime_operator_from_login({
+            "name": "测试\n用户\x1b[31m",
+            "email": "safe@example.com",
+        })
+        self.assertNotIn("\n", operator)
+        self.assertNotIn("\x1b", operator)
+        self.assertIn("测试 用户 [31m", operator)
+        self.assertNotIn("example.com", operator)
 
     def test_sensitive_fields_are_masked_or_shortened(self):
         output = io.StringIO()
@@ -93,6 +128,42 @@ class RuntimeLoggingTests(unittest.TestCase):
         self.assertIn("可能尚未保存", rendered)
         self.assertIn("HTTP 404", rendered)
 
+    def test_profile_route_is_described_as_personal_account_settings(self):
+        record = logging.LogRecord(
+            "uvicorn.access",
+            logging.INFO,
+            "",
+            0,
+            '%s - "%s %s HTTP/%s" %d',
+            ("127.0.0.1:50000", "GET", "/api/profile", "1.1", 200),
+            None,
+        )
+        with patch.object(runtime_logging, "_timestamp", return_value="TIME"):
+            rendered = runtime_logging.HumanAccessFormatter().format(record)
+
+        self.assertIn("[个人中心]", rendered)
+        self.assertIn("读取当前账号和个人配置完成", rendered)
+        self.assertNotIn("玩家画像", rendered)
+
+    def test_access_operator_is_consumed_once_without_leaking_to_next_request(self):
+        formatter = runtime_logging.HumanAccessFormatter()
+        runtime_logging.register_access_operator(("127.0.0.1", 50123), "请求用户")
+        record = logging.LogRecord(
+            "uvicorn.access",
+            logging.INFO,
+            "",
+            0,
+            '%s - "%s %s HTTP/%s" %d',
+            ("127.0.0.1:50123", "GET", "/api/history", "1.1", 200),
+            None,
+        )
+        with patch.object(runtime_logging, "_timestamp", return_value="TIME"):
+            first = formatter.format(record)
+            second = formatter.format(record)
+
+        self.assertIn("操作人：请求用户", first)
+        self.assertIn("操作人：系统任务", second)
+
     def test_success_and_server_error_access_logs_are_distinct(self):
         formatter = runtime_logging.HumanAccessFormatter()
         cases = (
@@ -127,7 +198,10 @@ class RuntimeLoggingTests(unittest.TestCase):
         )
         with patch.object(runtime_logging, "_timestamp", return_value="TIME"):
             rendered = runtime_logging.HumanSystemFormatter().format(record)
-        self.assertEqual(rendered, "[TIME] [信息] [服务] 应用启动完成，可以开始访问")
+        self.assertEqual(
+            rendered,
+            "[TIME] [信息] [服务] 应用启动完成，可以开始访问｜操作人：系统任务",
+        )
 
     def test_unknown_system_message_keeps_original_details(self):
         record = logging.LogRecord(

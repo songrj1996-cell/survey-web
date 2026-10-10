@@ -19,16 +19,43 @@ from app.storage.logins import _save_web_logins, _sync_web_logins_from_disk, web
 from app.storage.whitelist import _load_whitelist
 
 
-async def _current_login(request: Request) -> dict | None:
-    """从 cookie 取登录态；token 临过期则尝试刷新。返回 None 表示未登录。"""
+_REQUEST_LOGIN_CACHE_ATTR = "_survey_web_login_candidate"
+_REQUEST_LOGIN_MISSING = object()
+
+
+def _request_login_candidate(request: Request) -> tuple[str, dict | None]:
+    cached = getattr(request.state, _REQUEST_LOGIN_CACHE_ATTR, _REQUEST_LOGIN_MISSING)
     sid = request.cookies.get(COOKIE_NAME, "")
+    if cached is not _REQUEST_LOGIN_MISSING:
+        return sid, cached
+    if not sid:
+        setattr(request.state, _REQUEST_LOGIN_CACHE_ATTR, None)
+        return "", None
     _sync_web_logins_from_disk()
     login = web_logins.get(sid)
+    setattr(request.state, _REQUEST_LOGIN_CACHE_ATTR, login)
+    return sid, login
+
+
+def _login_for_request_logging(request: Request) -> dict | None:
+    """只读取请求发起人，不刷新或改写登录态。"""
+    _sid, login = _request_login_candidate(request)
+    if not login:
+        return None
+    if login.get("expires_at", 0) and login["expires_at"] < time.time():
+        return None
+    return login
+
+
+async def _current_login(request: Request) -> dict | None:
+    """从 cookie 取登录态；token 临过期则尝试刷新。返回 None 表示未登录。"""
+    sid, login = _request_login_candidate(request)
     if not login:
         return None
     now = time.time()
     if login.get("expires_at", 0) and login["expires_at"] < now:
         web_logins.pop(sid, None)
+        setattr(request.state, _REQUEST_LOGIN_CACHE_ATTR, None)
         _save_web_logins()
         return None
     if login.get("exp", 0) < time.time() + 120 and login.get("refresh"):
@@ -38,6 +65,7 @@ async def _current_login(request: Request) -> dict | None:
             _save_web_logins()
         except Exception:
             web_logins.pop(sid, None)
+            setattr(request.state, _REQUEST_LOGIN_CACHE_ATTR, None)
             _save_web_logins()
             return None
     return login

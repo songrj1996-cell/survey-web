@@ -26,6 +26,7 @@ from app.core.security import _forbidden_response, _is_public_path, _safe_next_p
 from app.core.runtime_logging import configure_runtime_logging
 from app.services.auth import _current_login, _login_allowed
 from app.services.feishu_navigation_auto_update import navigation_lifespan
+from app.services.request_logging import RequestLoggingContextMiddleware
 from app.storage.sessions import _sweep_old_sessions
 
 
@@ -43,6 +44,7 @@ async def app_lifespan(app_instance):
 
 app = FastAPI(title="调研分析平台", lifespan=app_lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(RequestLoggingContextMiddleware)
 _sweep_old_sessions()  # 启动时清理过期 session 文件
 
 static_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "static")

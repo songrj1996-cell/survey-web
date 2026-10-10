@@ -5,16 +5,25 @@
 """
 from __future__ import annotations
 
+from contextvars import ContextVar
 from datetime import datetime
 import logging
 from pathlib import Path
 import re
 import sys
 import threading
+import time
 from urllib.parse import urlsplit
 
 
 _OUTPUT_LOCK = threading.Lock()
+_ACCESS_OPERATOR_LOCK = threading.Lock()
+_ACCESS_OPERATOR_TTL_SECONDS = 120.0
+_ACCESS_OPERATORS: dict[str, tuple[str, float]] = {}
+_RUNTIME_OPERATOR: ContextVar[str] = ContextVar(
+    "runtime_log_operator",
+    default="系统任务",
+)
 
 _LEVEL_LABELS = {
     "success": "成功",
@@ -157,6 +166,79 @@ def _safe_error(value: object) -> str:
     return text[:500]
 
 
+def _safe_operator_text(value: object) -> str:
+    text = re.sub(r"[\x00-\x1f\x7f]", " ", str(value or ""))
+    return re.sub(r"\s+", " ", text).strip()[:80]
+
+
+def runtime_operator_from_login(
+    login: dict | None,
+    *,
+    anonymous_label: str = "未登录访客",
+) -> str:
+    """把登录态转换成可辨认但不过度暴露隐私的操作人名称。"""
+    if not login:
+        return anonymous_label
+    name = _safe_operator_text(login.get("name"))
+    if name:
+        return name
+    return "已登录用户"
+
+
+def bind_runtime_operator(operator: str):
+    """为当前异步请求绑定操作人，并返回稍后恢复上下文所需的 token。"""
+    safe_operator = _safe_operator_text(operator) or "身份无法识别"
+    return _RUNTIME_OPERATOR.set(safe_operator)
+
+
+def reset_runtime_operator(token) -> None:
+    _RUNTIME_OPERATOR.reset(token)
+
+
+def current_runtime_operator() -> str:
+    return _RUNTIME_OPERATOR.get()
+
+
+def _client_key(client: object) -> str:
+    if isinstance(client, (tuple, list)) and len(client) >= 2:
+        return f"{client[0]}:{client[1]}"
+    return str(client or "").strip()
+
+
+def register_access_operator(client: object, operator: str) -> None:
+    """暂存一次 HTTP 访问日志的操作人；formatter 读取后立即删除。"""
+    key = _client_key(client)
+    if not key:
+        return
+    now = time.monotonic()
+    with _ACCESS_OPERATOR_LOCK:
+        if len(_ACCESS_OPERATORS) >= 2000:
+            expired_before = now - _ACCESS_OPERATOR_TTL_SECONDS
+            expired = [
+                item_key for item_key, (_value, created) in _ACCESS_OPERATORS.items()
+                if created < expired_before
+            ]
+            for item_key in expired:
+                _ACCESS_OPERATORS.pop(item_key, None)
+            if len(_ACCESS_OPERATORS) >= 2000:
+                oldest = min(_ACCESS_OPERATORS, key=lambda item_key: _ACCESS_OPERATORS[item_key][1])
+                _ACCESS_OPERATORS.pop(oldest, None)
+        _ACCESS_OPERATORS[key] = (_safe_operator_text(operator), now)
+
+
+def _take_access_operator(client: object) -> str:
+    key = _client_key(client)
+    with _ACCESS_OPERATOR_LOCK:
+        item = _ACCESS_OPERATORS.pop(key, None)
+    if item and time.monotonic() - item[1] <= _ACCESS_OPERATOR_TTL_SECONDS:
+        return item[0] or "身份无法识别"
+    return current_runtime_operator()
+
+
+def _operator_suffix(operator: str | None = None) -> str:
+    return f"｜操作人：{operator or current_runtime_operator()}"
+
+
 def _safe_url(value: object) -> str:
     text = str(value or "").strip()
     try:
@@ -205,11 +287,15 @@ def runtime_log(area: str, level: str, message: str, **fields: object) -> None:
             if value not in (None, "")
         ]
         suffix = f"｜{'｜'.join(parts)}" if parts else ""
-        rendered = f"[{_timestamp()}] [{label}] [{area}] {message}{suffix}"
+        rendered = (
+            f"[{_timestamp()}] [{label}] [{area}] {message}"
+            f"{_operator_suffix()}{suffix}"
+        )
     except Exception as exc:  # pragma: no cover - 最终防线，不能影响业务
         rendered = (
             f"[{_timestamp()}] [提醒] [系统日志] 日志格式化失败，已保留原始说明"
-            f"｜说明：{str(message)[:300]}｜技术信息：{type(exc).__name__}"
+            f"{_operator_suffix()}｜说明：{str(message)[:300]}"
+            f"｜技术信息：{type(exc).__name__}"
         )
     try:
         with _OUTPUT_LOCK:
@@ -241,7 +327,7 @@ def _http_action(method: str, raw_path: str) -> tuple[str, str]:
     if path.startswith("/api/feishu"):
         return "飞书", "处理飞书功能"
     if path.startswith("/api/profile"):
-        return "玩家画像", "读取玩家画像"
+        return "个人中心", "读取当前账号和个人配置"
     if path.startswith("/api/ui-texts"):
         return "页面", "读取页面文案"
     if path.startswith("/api/upload-guide"):
@@ -285,6 +371,12 @@ class HumanAccessFormatter(logging.Formatter):
     """把 Uvicorn 的 method/path/status 访问日志翻译成白话。"""
 
     def format(self, record: logging.LogRecord) -> str:
+        operator = current_runtime_operator()
+        try:
+            if isinstance(record.args, (tuple, list)) and record.args:
+                operator = _take_access_operator(record.args[0])
+        except Exception:
+            pass
         try:
             client, method, path, _http_version, status = record.args[:5]
             status = int(status)
@@ -296,12 +388,12 @@ class HumanAccessFormatter(logging.Formatter):
             label = _LEVEL_LABELS[level]
             return (
                 f"[{_timestamp(record.created)}] [{label}] [{area}] {action}{result}"
-                f"｜HTTP {status}｜请求：{method} {path}"
+                f"{_operator_suffix(operator)}｜HTTP {status}｜请求：{method} {path}"
             )
         except Exception:
             return (
                 f"[{_timestamp(record.created)}] [信息] [接口请求] "
-                f"{_safe_error(record.getMessage())}"
+                f"{_safe_error(record.getMessage())}{_operator_suffix(operator)}"
             )
 
 
@@ -346,7 +438,10 @@ class HumanSystemFormatter(logging.Formatter):
             exc_type, exc, _tb = record.exc_info
             if exc_type is not None:
                 message += f"｜技术信息：{exc_type.__name__}：{_safe_error(exc)}"
-        return f"[{_timestamp(record.created)}] [{_LEVEL_LABELS[level]}] [服务] {message}"
+        return (
+            f"[{_timestamp(record.created)}] [{_LEVEL_LABELS[level]}] [服务] {message}"
+            f"{_operator_suffix()}"
+        )
 
 
 def configure_runtime_logging() -> None:
