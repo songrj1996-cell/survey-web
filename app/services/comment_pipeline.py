@@ -29,6 +29,7 @@ from app.core.config import (
     LLM_COMMENT_REPORT_MODEL,
     LLM_COMMENT_SYNTHESIS_REASONING,
 )
+from app.core.runtime_logging import runtime_log
 from app.integrations.llm_client import collect_chat_completion
 from app.services.glossary_service import (
     normalize_glossary_data,
@@ -352,9 +353,9 @@ async def _select_comment_raw_quotes(sess: dict) -> list[dict]:
                 max_tokens=LLM_COMMENT_MAX_TOKENS,
                 validate=_validate,
             )
-        print(
-            f"[comment quote_select_batch] model={actual_model} repaired={repaired}",
-            flush=True,
+        runtime_log(
+            "评论原文精选", "success", "一批候选原文已完成模型筛选",
+            model=actual_model, repaired=repaired,
         )
         out: list[dict] = []
         for i, item in enumerate(parsed):
@@ -367,22 +368,23 @@ async def _select_comment_raw_quotes(sess: dict) -> list[dict]:
                 normalized["translation"] = str(normalized.get("translation") or "").strip()
                 out.append(normalized)
         if not out and parsed:
-            print(
-                f"[comment quote_select_batch] no valid idx parsed; parsed={len(parsed)} expected={len(expected)}",
-                flush=True,
+            runtime_log(
+                "评论原文精选", "warning",
+                "模型有返回内容，但没有解析出有效的候选编号",
+                parsed=len(parsed), expected=len(expected),
             )
         translated_count = sum(1 for x in out if x.get("translation"))
-        print(
-            f"[comment quote_select_batch] selected={len(out)} translated={translated_count}",
-            flush=True,
+        runtime_log(
+            "评论原文精选", "info", "本批候选原文整理完成",
+            selected=len(out), translated=translated_count,
         )
         if out and translated_count == 0:
             first_raw = parsed[0] if parsed else {}
             first_keys = list(first_raw.keys()) if isinstance(first_raw, dict) else []
-            first_preview = json.dumps(first_raw, ensure_ascii=False)[:500] if isinstance(first_raw, dict) else str(first_raw)[:500]
-            print(
-                f"[comment quote_select_batch] translation missing; first_keys={first_keys}; first_item={first_preview}",
-                flush=True,
+            runtime_log(
+                "评论原文精选", "warning",
+                "本批已选出候选原文，但中文翻译为空",
+                returned_fields=",".join(first_keys),
             )
         return sorted(out, key=lambda x: x.get("score", 0), reverse=True)[:comment_analysis.QUOTE_SELECT_BATCH_KEEP_N]
 
@@ -436,13 +438,12 @@ async def _select_comment_raw_quotes(sess: dict) -> list[dict]:
     batch_candidates = sorted(by_idx.values(), key=lambda x: x.get("score", 0), reverse=True)[
         :comment_analysis.QUOTE_SELECT_FINAL_POOL_N
     ]
-    print(
-        "[comment quote_select] "
-        f"long_candidates={len(long_candidates)} "
-        f"batches={len(quote_batches)} "
-        f"batch_candidates={len(batch_candidates)} "
-        f"batch_translated={sum(1 for x in batch_candidates if x.get('translation'))}",
-        flush=True,
+    runtime_log(
+        "评论原文精选", "info", "候选原文池已经整理完成",
+        long_candidates=len(long_candidates),
+        batches=len(quote_batches),
+        candidates=len(batch_candidates),
+        translated=sum(1 for x in batch_candidates if x.get("translation")),
     )
     if not batch_candidates:
         return []
@@ -482,12 +483,16 @@ async def _select_comment_raw_quotes(sess: dict) -> list[dict]:
                 max_tokens=LLM_COMMENT_MAX_TOKENS,
                 validate=_validate_final,
             )
-        print(
-            f"[comment quote_select_final] model={actual_model} repaired={repaired}",
-            flush=True,
+        runtime_log(
+            "评论原文精选", "success", "最终代表原文筛选的模型调用完成",
+            model=actual_model, repaired=repaired,
         )
     except RuntimeError as exc:
-        print(f"[comment quote_select_final] {exc}; fallback to batch candidates", flush=True)
+        runtime_log(
+            "评论原文精选", "warning",
+            "最终筛选失败，已改用前一阶段的批次候选",
+            error=exc,
+        )
         return _fallback_selected_from_batch_candidates(batch_candidates)
 
     selected: list[dict] = []
@@ -517,21 +522,22 @@ async def _select_comment_raw_quotes(sess: dict) -> list[dict]:
         if len(selected) >= comment_analysis.QUOTE_SELECT_FINAL_N:
             break
     if not selected:
-        print(
-            f"[comment quote_select_final] selected empty from parsed={len(final_parsed)}; fallback to batch candidates",
-            flush=True,
+        runtime_log(
+            "评论原文精选", "warning",
+            "最终筛选没有留下有效原文，已改用前一阶段的批次候选",
+            parsed=len(final_parsed),
         )
         return _fallback_selected_from_batch_candidates(batch_candidates)
     any_translated_candidate = any(x.get("translation") for x in batch_candidates)
     selected_translated = sum(1 for x in selected if x.get("translation"))
-    print(
-        f"[comment quote_select_final] parsed={len(final_parsed)} selected={len(selected)} translated={selected_translated}",
-        flush=True,
+    runtime_log(
+        "评论原文精选", "info", "最终代表原文已经整理",
+        parsed=len(final_parsed), selected=len(selected), translated=selected_translated,
     )
     if selected_translated == 0 and any_translated_candidate:
-        print(
-            "[comment quote_select_final] final returned no translations; fallback to translated batch candidates",
-            flush=True,
+        runtime_log(
+            "评论原文精选", "warning",
+            "最终结果缺少中文翻译，已改用带翻译的批次候选",
         )
         return _fallback_selected_from_batch_candidates(batch_candidates, require_translation=True)
     if any_translated_candidate and selected_translated < len(selected):
@@ -547,9 +553,9 @@ async def _select_comment_raw_quotes(sess: dict) -> list[dict]:
             seen_text.add(key_text)
             if len(selected) >= comment_analysis.QUOTE_SELECT_FINAL_N:
                 break
-        print(
-            f"[comment quote_select_final] filled translated selected={len(selected)}",
-            flush=True,
+        runtime_log(
+            "评论原文精选", "info", "已从批次候选补足带翻译的代表原文",
+            selected=len(selected),
         )
     return selected
 
@@ -671,16 +677,17 @@ async def _comment_analysis_pipeline(sess: dict):
                     max_tokens=LLM_COMMENT_MAX_TOKENS,
                     validate=_validate,
                 )
-            print(
-                f"[comment relevance] model={actual_model} repaired={repaired}",
-                flush=True,
+            runtime_log(
+                "评论相关性判断", "success", "一批评论的相关性判断完成",
+                model=actual_model, repaired=repaired,
             )
         except RuntimeError:
             if len(batch) > 10 and depth < 3:
                 mid = len(batch) // 2
-                print(
-                    f"[comment relevance] 批次校验失败，自动拆分为 {mid}+{len(batch) - mid} 条",
-                    flush=True,
+                runtime_log(
+                    "评论相关性判断", "warning",
+                    "批次结果未通过校验，正在拆成两个小批次重试",
+                    first_batch_rows=mid, second_batch_rows=len(batch) - mid,
                 )
                 left = await _judge_relevance(batch[:mid], depth + 1)
                 right = await _judge_relevance(batch[mid:], depth + 1)
@@ -821,9 +828,9 @@ async def _comment_analysis_pipeline(sess: dict):
                 max_tokens=LLM_COMMENT_MAX_TOKENS,
                 validate=_validate,
             )
-        print(
-            f"[comment extract] model={actual_model} repaired={repaired}",
-            flush=True,
+        runtime_log(
+            "评论主题提取", "success", "一批评论的主题提取完成",
+            model=actual_model, repaired=repaired,
         )
         return parsed
 
@@ -871,9 +878,9 @@ async def _comment_analysis_pipeline(sess: dict):
         max_tokens=LLM_COMMENT_MAX_TOKENS,
         validate=_validate_merged,
     )
-    print(
-        f"[comment merge] model={merge_model} repaired={merge_repaired}",
-        flush=True,
+    runtime_log(
+        "评论主题合并", "success", "评论主题合并完成",
+        model=merge_model, repaired=merge_repaired,
     )
 
     # LLM 契约用 theme_id / theme_name，内部统计用 id / name，转一层。
@@ -981,16 +988,17 @@ async def _comment_analysis_pipeline(sess: dict):
                     max_tokens=LLM_COMMENT_CLASSIFY_MAX_TOKENS,
                     validate=_validate,
                 )
-            print(
-                f"[comment classify] model={actual_model} repaired={repaired}",
-                flush=True,
+            runtime_log(
+                "评论分类", "success", "一批评论的主题和情感分类完成",
+                model=actual_model, repaired=repaired,
             )
         except RuntimeError:
             if len(batch) > 10 and depth < 3:
                 mid = len(batch) // 2
-                print(
-                    f"[comment classify] 批次校验失败，自动拆分为 {mid}+{len(batch) - mid} 条",
-                    flush=True,
+                runtime_log(
+                    "评论分类", "warning",
+                    "批次结果未通过校验，正在拆成两个小批次重试",
+                    first_batch_rows=mid, second_batch_rows=len(batch) - mid,
                 )
                 left = await _classify(batch[:mid], depth + 1)
                 right = await _classify(batch[mid:], depth + 1)
@@ -1075,9 +1083,9 @@ async def _comment_analysis_pipeline(sess: dict):
         max_tokens=LLM_COMMENT_MAX_TOKENS,
         validate=_validate_report,
     )
-    print(
-        f"[comment report] model={report_model} repaired={report_repaired}",
-        flush=True,
+    runtime_log(
+        "评论报告", "success", "舆情报告正文生成完成",
+        model=report_model, repaired=report_repaired,
     )
 
     yield ("result", {

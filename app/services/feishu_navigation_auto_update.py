@@ -3,10 +3,10 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager, suppress
-import logging
 import time
 
 from app.core import config
+from app.core.runtime_logging import runtime_log
 from app.integrations import feishu_client
 from app.services.feishu_evidence_navigation import (
     navigation_document_identity,
@@ -14,7 +14,6 @@ from app.services.feishu_evidence_navigation import (
 )
 from app.storage import feishu_navigation as storage
 
-logger = logging.getLogger(__name__)
 _EVENTS = {"drive.file.read_v1", "drive.file.edit_v1", "drive.file.title_updated_v1"}
 
 
@@ -45,7 +44,11 @@ async def register_exported_navigation(doc_token: str, doc_url: str, *, recipien
             title=title,
         )
     except Exception as exc:
-        logger.error("Feishu navigation registration failed: %s", type(exc).__name__)
+        runtime_log(
+            "飞书链接维护", "warning",
+            "登记自动更新任务失败，本次导出的正文不受影响",
+            error=type(exc).__name__,
+        )
         return False
 
 
@@ -139,7 +142,12 @@ async def process_navigation_job(job: dict) -> None:
             ),
             "last_error": reason,
         }
-        logger.warning("Feishu navigation job %s: %s", result["status"], reason)
+        runtime_log(
+            "飞书链接维护",
+            "warning" if retry else "error",
+            "证据链接自动更新未完成，将自动重试" if retry else "证据链接自动更新最终失败",
+            status=result["status"], error=reason,
+        )
     result.update(subscribed=subscribed, updated_blocks=job["updated_blocks"] + changed)
     await asyncio.to_thread(
         storage.finish_job, token, job["claim_id"], result,
@@ -179,7 +187,11 @@ async def process_navigation_notification(job: dict) -> None:
             error = f"{exc.operation}:{exc.code}"
         elif isinstance(exc, ValueError):
             retryable = False
-        logger.warning("Feishu navigation notification failed: %s", error)
+        runtime_log(
+            "飞书链接维护", "warning",
+            "链接更新结果通知发送失败",
+            error=error,
+        )
     await asyncio.to_thread(
         storage.finish_notification, job, sent=sent, retryable=retryable,
         max_attempts=config.FEISHU_NAVIGATION_NOTIFICATION_MAX_ATTEMPTS,
@@ -202,7 +214,11 @@ async def _notification_worker(stop: asyncio.Event) -> None:
                 await process_navigation_notification(job)
                 continue
         except Exception as exc:
-            logger.warning("Feishu navigation notification worker: %s", type(exc).__name__)
+            runtime_log(
+                "飞书链接维护", "warning",
+                "通知后台任务本轮处理失败，将在下一轮继续",
+                error=type(exc).__name__,
+            )
         try:
             await asyncio.wait_for(stop.wait(), timeout=config.FEISHU_NAVIGATION_WORKER_INTERVAL_SECONDS)
         except TimeoutError:
@@ -214,7 +230,11 @@ async def _worker(stop: asyncio.Event) -> None:
         try:
             await register_existing_document(url)
         except Exception as exc:
-            logger.error("Feishu navigation seed registration failed: %s", type(exc).__name__)
+            runtime_log(
+                "飞书链接维护", "warning",
+                "预设文档登记失败，其他文档仍会继续处理",
+                error=type(exc).__name__,
+            )
     while not stop.is_set():
         try:
             job = await asyncio.to_thread(
@@ -227,7 +247,11 @@ async def _worker(stop: asyncio.Event) -> None:
                 await process_navigation_job(job)
                 continue
         except Exception as exc:
-            logger.error("Feishu navigation worker failed: %s", type(exc).__name__)
+            runtime_log(
+                "飞书链接维护", "warning",
+                "链接更新后台任务本轮失败，将在下一轮继续",
+                error=type(exc).__name__,
+            )
         try:
             await asyncio.wait_for(stop.wait(), timeout=config.FEISHU_NAVIGATION_WORKER_INTERVAL_SECONDS)
         except TimeoutError:
@@ -241,7 +265,10 @@ async def navigation_lifespan(app):
         yield
         return
     if not verification_ready():
-        logger.error("Feishu automatic navigation disabled: event verification is not configured")
+        runtime_log(
+            "飞书链接维护", "warning",
+            "自动更新未启动：飞书事件验证配置不完整",
+        )
         yield
         return
     stop = asyncio.Event()

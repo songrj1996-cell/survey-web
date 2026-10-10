@@ -7,6 +7,7 @@ import comment_analysis
 from fastapi import HTTPException, Request
 
 from app.core.responses import sse_event
+from app.core.runtime_logging import runtime_log
 from app.services.audit import audit_log
 from app.storage.sessions import get_session, save_session
 
@@ -42,7 +43,10 @@ async def comment_preprocess_stream(session_id: str, request: Request):
             return
 
         start = time.time()
-        print(f"[comment-preprocess] start sid={session_id} file={filename}", flush=True)
+        runtime_log(
+            "评论预处理", "progress", "开始读取评论文件",
+            session_id=session_id, filename=filename,
+        )
         yield sse_event({"type": "progress", "message": "上传完成，开始预处理评论文件…"})
         final_result = None
         for item in comment_analysis.preprocess_comment_file(upload_path, filename):
@@ -94,11 +98,13 @@ async def comment_preprocess_stream(session_id: str, request: Request):
             },
         })
         save_session(session_id, sess)
-        print(
-            "[comment-preprocess] done "
-            f"sid={session_id} scan={sess['comment_scan_rows']} valid={sess['comment_valid_count']} "
-            f"sample={sess['comment_sample_count']} elapsed={time.time() - start:.2f}s",
-            flush=True,
+        runtime_log(
+            "评论预处理", "success", "评论文件预处理完成",
+            session_id=session_id,
+            scanned_rows=sess["comment_scan_rows"],
+            valid_rows=sess["comment_valid_count"],
+            sample_rows=sess["comment_sample_count"],
+            elapsed_seconds=time.time() - start,
         )
         await audit_log(
             request, "comment", "预处理评论数据",
@@ -119,5 +125,8 @@ async def comment_preprocess_stream(session_id: str, request: Request):
             "sample_meta": sess["comment_sample_meta"],
         })
     except Exception as e:
-        print(f"[comment-preprocess] failed sid={session_id} error={e!r}", flush=True)
+        runtime_log(
+            "评论预处理", "error", "评论文件预处理失败",
+            session_id=session_id, error=e,
+        )
         yield sse_event({"type": "error", "message": str(e)})

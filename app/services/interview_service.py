@@ -1,7 +1,6 @@
 """访谈报告完整流程：多 Sheet 证据归并、分模块写作、审校、归档与恢复。"""
 import asyncio
 import json
-import logging
 import re
 from pathlib import Path
 
@@ -29,6 +28,7 @@ from app.core.interview_parsing import (
     serialize_interview_workbook,
 )
 from app.core.responses import sse_event
+from app.core.runtime_logging import runtime_log
 from app.core.security import _assign_session_owner, _visible_to_owner
 from app.integrations.llm_client import collect_chat_completion
 from app.services.glossary_service import (
@@ -60,9 +60,6 @@ _GLOSSARY_PROTECTED_DATA_KEYS = {
     "source_refs",
     "text",
 }
-logger = logging.getLogger(__name__)
-
-
 def _normalize_interview_markdown(text: str) -> str:
     """规范化正文，同时保持 `[来源：Sheet!A1]` 引用标记逐字不变。"""
     source_markers = list(re.finditer(r"\[来源[：:][^\]\r\n]+\]", text or ""))
@@ -868,14 +865,15 @@ async def revise_interview_audit_issues_stream(
                 **_session_result(sess),
             })
         except Exception as exc:
-            logger.exception(
-                "interview batch manual review failed session=%s issue_indexes=%s",
-                session_id,
-                sorted(
+            runtime_log(
+                "访谈报告", "error", "保存批量人工复核结果失败",
+                session_id=session_id,
+                issue_indexes=sorted(
                     int(item.get("issue_index", -1))
                     for item in selections
                     if isinstance(item, dict)
                 ),
+                error=exc,
             )
             yield sse_event({
                 "type": "error",
@@ -1163,13 +1161,13 @@ async def interview_report_stream(
                 save_session(session_id, sess)
                 if audit.get("ok") is True and not issues and not local_issues:
                     break
-                logger.warning(
-                    "interview audit needs attention session=%s round=%s "
-                    "issue_count=%s local_issue_count=%s",
-                    session_id,
-                    repair_round + 1,
-                    len(issues),
-                    len(local_issues),
+                runtime_log(
+                    "访谈报告", "warning",
+                    "报告审校仍发现问题，准备继续自动修订",
+                    session_id=session_id,
+                    repair_round=repair_round + 1,
+                    model_issues=len(issues),
+                    local_issues=len(local_issues),
                 )
                 if repair_round >= INTERVIEW_MAX_REPAIR_ROUNDS:
                     if local_issues:
@@ -1306,10 +1304,11 @@ async def interview_report_stream(
             sess["interview_status"] = "failed"
             sess["interview_progress_message"] = str(exc)
             save_session(session_id, sess)
-            logger.exception(
-                "interview report failed session=%s stage=%s",
-                session_id,
-                sess.get("interview_stage", ""),
+            runtime_log(
+                "访谈报告", "error", "访谈报告生成失败",
+                session_id=session_id,
+                stage=sess.get("interview_stage", ""),
+                error=exc,
             )
             yield sse_event(
                 {

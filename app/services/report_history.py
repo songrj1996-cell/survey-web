@@ -12,6 +12,7 @@ from datetime import datetime
 from fastapi import HTTPException
 
 from app.core.config import MAX_REPORT_VERSIONS
+from app.core.runtime_logging import runtime_log
 from app.core.security import (
     _assign_session_owner,
     _find_history_for_login,
@@ -817,9 +818,10 @@ def delete_history_report_version(
     except HTTPException:
         pass
     except OSError as exc:
-        print(
-            "[report-version-delete] WARN history committed but live session sync failed: "
-            f"{type(exc).__name__}"
+        runtime_log(
+            "历史记录", "warning",
+            "历史版本已经删除，但当前页面对应的临时任务状态同步失败",
+            error=type(exc).__name__,
         )
 
     active = resolve_report_version(entry)

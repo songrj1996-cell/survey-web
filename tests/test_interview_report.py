@@ -508,7 +508,7 @@ class InterviewServiceTests(unittest.IsolatedAsyncioTestCase):
                 "collect_chat_completion",
                 new=AsyncMock(side_effect=responses),
             ),
-            patch.object(interview_service.logger, "exception") as log_exception,
+            patch.object(interview_service, "runtime_log") as log_exception,
         ):
             chunks = [
                 chunk
@@ -523,7 +523,11 @@ class InterviewServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('"type": "interview_done"', combined)
         self.assertEqual(sess["interview_status"], "failed")
         save_history.assert_not_called()
-        log_exception.assert_called_once()
+        error_logs = [
+            call for call in log_exception.call_args_list
+            if call.args[:3] == ("访谈报告", "error", "访谈报告生成失败")
+        ]
+        self.assertEqual(len(error_logs), 1)
 
     async def test_manual_review_revises_module_and_reaudits_before_saving(self):
         parsed = parse_interview_workbook("访谈记录.xlsx", _workbook_bytes())
@@ -663,7 +667,7 @@ class InterviewServiceTests(unittest.IsolatedAsyncioTestCase):
                 "collect_chat_completion",
                 new=AsyncMock(return_value=(invalid_repair, "gpt-5.6-sol")),
             ),
-            patch.object(interview_service.logger, "exception"),
+            patch.object(interview_service, "runtime_log"),
         ):
             chunks = [
                 chunk
@@ -928,7 +932,7 @@ class InterviewServiceTests(unittest.IsolatedAsyncioTestCase):
                     (invalid_second, "gpt-5.6-sol"),
                 ]),
             ),
-            patch.object(interview_service.logger, "exception"),
+            patch.object(interview_service, "runtime_log"),
         ):
             chunks = [
                 chunk

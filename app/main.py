@@ -3,6 +3,7 @@
 所有路由均在 app/routers/* 里定义,由本文件 include。
 """
 import os
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,11 +23,25 @@ from app.core.config import (
     RESEARCH_ASSET_STORAGE_DIR,
 )
 from app.core.security import _forbidden_response, _is_public_path, _safe_next_path, _unauthorized_response
+from app.core.runtime_logging import configure_runtime_logging
 from app.services.auth import _current_login, _login_allowed
 from app.services.feishu_navigation_auto_update import navigation_lifespan
 from app.storage.sessions import _sweep_old_sessions
 
-app = FastAPI(title="调研分析平台", lifespan=navigation_lifespan)
+
+configure_runtime_logging()
+
+
+@asynccontextmanager
+async def app_lifespan(app_instance):
+    # 兼容 `python -m uvicorn` 与 `python server.py`：后者会在导入本模块后
+    # 重新配置 Uvicorn logger，因此应用真正启动时再配置一次。
+    configure_runtime_logging()
+    async with navigation_lifespan(app_instance):
+        yield
+
+
+app = FastAPI(title="调研分析平台", lifespan=app_lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 _sweep_old_sessions()  # 启动时清理过期 session 文件
 

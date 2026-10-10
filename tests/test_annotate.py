@@ -18,6 +18,40 @@ from app.services import annotate_workflow
 
 
 class AnnotateRuleTests(unittest.TestCase):
+    def test_annotation_model_log_translates_quality_translation_task(self):
+        with patch.object(annotate_workflow, "runtime_log") as log:
+            annotate_workflow._annotate_ai_log(
+                "direct model done",
+                task="translation-quality-final-primary-12",
+                model="gpt-5.6-terra",
+                attempt=1,
+                answer_len=3669,
+            )
+
+        log.assert_called_once_with(
+            "数据标注",
+            "success",
+            "模型调用完成",
+            task="质量打标结果翻译（首轮，第 12 批）",
+            model="gpt-5.6-terra",
+            attempt=1,
+            response_chars=3669,
+        )
+
+    def test_annotation_model_log_keeps_unknown_task_identifier(self):
+        with patch.object(annotate_workflow, "runtime_log") as log:
+            annotate_workflow._annotate_ai_log(
+                "future event",
+                task="future-task-7",
+            )
+
+        log.assert_called_once_with(
+            "数据标注",
+            "info",
+            "future event",
+            task="future-task-7",
+        )
+
     def test_quality_timing_starts_only_after_quality_is_formally_accepted(self):
         start = datetime.fromisoformat("2026-08-25T10:00:00.000")
         scenarios = (

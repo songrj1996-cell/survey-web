@@ -29,6 +29,7 @@ from app.core.config import (
     QUALITATIVE_DISCLAIMER,
     REPORT_DISCLAIMER,
 )
+from app.core.runtime_logging import runtime_log
 
 
 _RESEARCH_BACKGROUND_FIELDS = (
@@ -457,14 +458,15 @@ def _html_to_pdf_with_weasyprint(doc: str) -> bytes:
     rendered = html_obj.render()
     pages = getattr(rendered, "pages", []) or []
     if len(pages) <= 1:
-        print("[pdf] rendered with WeasyPrint on one page", flush=True)
+        runtime_log("PDF 导出", "success", "PDF 已使用排版引擎生成单页文件")
         return rendered.write_pdf()
 
     total_height_px = sum(float(getattr(page, "height", 14 * 96) or 14 * 96) for page in pages)
     total_height_in = min(max(total_height_px / 96 + 1.0, 14.0), 500.0)
-    print(
-        f"[pdf] WeasyPrint first pass produced {len(pages)} pages; rerendering as {total_height_in:.2f}in single page",
-        flush=True,
+    runtime_log(
+        "PDF 导出", "progress",
+        "首次排版产生多页，正在调整页面高度后重新生成单页文件",
+        pages=len(pages), target_height_inches=f"{total_height_in:.2f}",
     )
     return HTML(string=_set_pdf_page_height(doc, total_height_in)).write_pdf()
 
@@ -527,7 +529,11 @@ def _html_to_pdf_with_browser(doc: str) -> bytes:
             return _html_to_pdf_with_browser_cmd(doc, browser, headless_arg)
         except Exception as exc:
             last_err = exc
-            print(f"[pdf] browser render failed with {headless_arg}: {exc}", flush=True)
+            runtime_log(
+                "PDF 导出", "warning",
+                "浏览器排版方式本次尝试失败，正在尝试其他启动方式",
+                browser_mode=headless_arg, error=exc,
+            )
     raise RuntimeError(f"浏览器 PDF 生成失败：{last_err}")
 
 
@@ -645,17 +651,29 @@ def html_to_pdf_bytes(doc: str) -> bytes:
         try:
             return _html_to_pdf_with_browser(doc)
         except Exception as exc:
-            print(f"[pdf] requested browser renderer failed, falling back to WeasyPrint: {exc}", flush=True)
+            runtime_log(
+                "PDF 导出", "warning",
+                "指定的浏览器排版失败，正在改用备用排版引擎",
+                error=exc,
+            )
 
     try:
         return _html_to_pdf_with_weasyprint(doc)
     except Exception as exc:
-        print(f"[pdf] WeasyPrint renderer failed, retrying browser renderer: {exc}", flush=True)
+        runtime_log(
+            "PDF 导出", "warning",
+            "默认排版引擎失败，正在改用浏览器方式重试",
+            error=exc,
+        )
 
     try:
         return _html_to_pdf_with_browser(doc)
     except Exception as exc:
-        print(f"[pdf] browser renderer failed after WeasyPrint fallback: {exc}", flush=True)
+        runtime_log(
+            "PDF 导出", "error",
+            "备用浏览器排版也失败，PDF 未能生成",
+            error=exc,
+        )
         raise
 
 

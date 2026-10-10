@@ -26,6 +26,8 @@ import uuid
 import httpx
 from dotenv import load_dotenv
 
+from app.core.runtime_logging import runtime_log
+
 # 自包含:确保 .env 已加载后再读取下方环境变量(不依赖被谁先 import)
 load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), ".env"))
 
@@ -86,17 +88,26 @@ async def _get_email_via_contact(open_id: str) -> str:
             )
             data = resp.json()
             if data.get("code") != 0:
-                print(f"[auth] contact API 查邮箱失败 open_id={open_id}: {data}")
+                runtime_log(
+                    "飞书登录", "warning", "通过飞书通讯录补查邮箱失败",
+                    open_id=open_id, code=data.get("code"), status=data.get("msg", ""),
+                )
                 return ""
             user = data.get("data", {}).get("user", {})
             email = (user.get("email") or user.get("enterprise_email") or "").strip().lower()
             if email:
-                print(f"[auth] contact API 成功获取邮箱 open_id={open_id} email={email}")
+                runtime_log(
+                    "飞书登录", "success", "已通过飞书通讯录补齐登录邮箱",
+                    open_id=open_id, email=email,
+                )
             else:
-                print(f"[auth] contact API 未返回邮箱 open_id={open_id} user_fields={list(user.keys())}")
+                runtime_log(
+                    "飞书登录", "warning", "飞书通讯录没有返回邮箱",
+                    open_id=open_id, returned_fields=",".join(user.keys()),
+                )
             return email
     except Exception as e:
-        print(f"[auth] contact API 异常: {e}")
+        runtime_log("飞书登录", "warning", "补查飞书邮箱时发生异常", error=e)
         return ""
 
 
@@ -118,7 +129,10 @@ async def exchange_code(code: str) -> dict:
         info = await _get_user_info(token)
         open_id = info.get("open_id", "")
         email = (info.get("email") or info.get("enterprise_email") or "").strip().lower()
-        print(f"[auth] user_info open_id={open_id} name={info.get('name','')} email_from_authen={email!r}")
+        runtime_log(
+            "飞书登录", "info", "已取得飞书登录用户信息",
+            open_id=open_id, email=email, has_name=bool(info.get("name", "")),
+        )
         # 若 /authen/v1/user_info 未返回邮箱，用 app_access_token + Contact API 补查
         if not email and open_id:
             email = await _get_email_via_contact(open_id)
@@ -282,7 +296,12 @@ async def upload_pdf_via_bot(
             data=fdata,
         )
         res = r.json()
-        print(f"[feishu] upload_pdf response={res}")
+        runtime_log(
+            "飞书导出",
+            "success" if res.get("code") == 0 else "warning",
+            "飞书 PDF 上传接口已返回结果",
+            code=res.get("code"), status=res.get("msg", ""),
+        )
         if res.get("code") != 0:
             raise RuntimeError(
                 f"上传 PDF 失败 code={res.get('code')} {res.get('msg', '')}，请确认应用已开通 drive 文件写入权限"
@@ -307,7 +326,11 @@ async def upload_pdf_via_bot(
                     json={"member_type": "openid", "member_id": open_id},
                 )
         except Exception as e:
-            print(f"[feishu] transfer PDF owner failed: {e}")
+            runtime_log(
+                "飞书导出", "warning",
+                "PDF 已上传，但转移文件所有者失败",
+                error=e,
+            )
 
     return file_url, file_token, "file"
 
@@ -327,7 +350,7 @@ async def send_message_to_user(open_id: str, text: str) -> None:
                       "content": _json.dumps({"text": text}, ensure_ascii=False)},
             )
     except Exception as e:
-        print(f"[feishu] send message failed: {e}")
+        runtime_log("飞书通知", "warning", "发送飞书通知失败", error=e)
 
 
 # ── 用用户身份创建文档（旧方案，保留备用）────────────────────────
@@ -767,12 +790,20 @@ async def apply_block_navigation(
                         headers, {"requests": updates[offset:offset + 100]},
                     )
                     if result.get("code") != 0:
-                        print(f"[feishu] block navigation incomplete: code={result.get('code')}")
+                        runtime_log(
+                            "飞书导出", "warning",
+                            "文档证据链接有部分未能更新",
+                            code=result.get("code"),
+                        )
                         return False
         return True
     except Exception as exc:
         # Do not log source text, API response bodies, URLs or credentials.
-        print(f"[feishu] block navigation skipped: {type(exc).__name__}")
+        runtime_log(
+            "飞书导出", "warning",
+            "文档证据链接更新已跳过，正文内容不受影响",
+            error=type(exc).__name__,
+        )
         return False
 
 
@@ -1107,7 +1138,11 @@ async def apply_callout_sections(doc_token: str, sections: list[dict]) -> bool:
                 ) or changed
         return changed
     except Exception as e:
-        print(f"[feishu] apply callout failed: {e}")
+        runtime_log(
+            "飞书导出", "warning",
+            "文档重点提示样式应用失败，正文内容仍已保留",
+            error=e,
+        )
         return False
 
 
@@ -1152,7 +1187,11 @@ async def apply_report_styles(doc_token: str) -> bool:
         async with httpx.AsyncClient(timeout=20) as client:
             return await _replace_report_divider(client, headers, doc_token)
     except Exception as exc:
-        print(f"[feishu] apply report styles failed: {exc}")
+        runtime_log(
+            "飞书导出", "warning",
+            "报告样式应用失败，正文内容仍已保留",
+            error=exc,
+        )
         return False
 
 

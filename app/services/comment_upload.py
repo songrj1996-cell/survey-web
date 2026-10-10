@@ -4,6 +4,7 @@ from pathlib import Path
 
 from fastapi import HTTPException
 
+from app.core.runtime_logging import runtime_log
 from app.core.security import _assign_session_owner
 from app.services.report_history import _find_comment_duplicate_report
 from app.storage.sessions import _COMMENT_UPLOAD_DIR, get_session, new_session, save_session
@@ -41,9 +42,9 @@ async def handle_comment_upload(
     with open(upload_path, "wb") as f:
         f.write(content)
 
-    print(
-        f"[comment-upload] saved sid={sid} file={filename} size={len(content)} path={upload_path}",
-        flush=True,
+    runtime_log(
+        "评论上传", "success", "评论文件已保存到临时任务区",
+        session_id=sid, filename=filename, bytes=len(content),
     )
 
     sess = get_session(sid)

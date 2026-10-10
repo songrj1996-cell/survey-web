@@ -42,6 +42,7 @@ from app.core.config import (
 )
 from app.core.parsing import _parse_file
 from app.core.responses import sse_event
+from app.core.runtime_logging import runtime_log
 from app.core.security import _assign_session_owner, _find_history_for_login
 from app.integrations.llm_client import collect_chat_completion
 from app.services.audit import audit_log
@@ -520,9 +521,56 @@ async def _publish_annotate_result(sid: str, sess: dict, request: Request) -> st
         return message
 
 
+def _humanize_annotate_task(task: object) -> str:
+    raw = str(task or "").strip()
+    translation_match = re.fullmatch(
+        r"translation-(.+)-(primary|retry)-(\d+)", raw
+    )
+    if translation_match:
+        stage, pass_name, batch = translation_match.groups()
+        stage_name = {
+            "ai-final": "AI 作答识别结果翻译",
+            "quality-final": "质量打标结果翻译",
+        }.get(stage, f"{stage} 翻译")
+        pass_label = "首轮" if pass_name == "primary" else "重试轮"
+        return f"{stage_name}（{pass_label}，第 {batch} 批）"
+    if raw.startswith("translation-header-"):
+        return f"表头翻译（第 {raw.rsplit('-', 1)[-1]} 次）"
+    if raw.startswith("quality-"):
+        detail = raw.removeprefix("quality-")
+        detail = detail.replace("invalid-review", "无效反馈复核")
+        detail = detail.replace("initial", "初次处理").replace("retry", "重试")
+        return f"回答质量打标（{detail}）"
+    if raw.startswith("ai-"):
+        detail = raw.removeprefix("ai-")
+        detail = detail.replace("initial", "初次处理").replace("retry", "重试")
+        return f"AI 作答识别（{detail}）"
+    return raw or "未命名任务"
+
+
 def _annotate_ai_log(message: str, **fields) -> None:
-    payload = " ".join(f"{k}={v!r}" for k, v in fields.items())
-    print(f"[annotate.ai_detect] {message}" + (f" {payload}" if payload else ""), flush=True)
+    message_map = {
+        "direct model done": ("success", "模型调用完成"),
+        "direct model failed": ("warning", "模型调用失败，将尝试备用模型"),
+        "direct model schema invalid": ("warning", "模型返回格式不符合要求，正在自动重试"),
+        "header translation failed": ("warning", "表头翻译本次尝试失败"),
+        "subbatch start": ("progress", "开始处理一个数据批次"),
+        "subbatch failed": ("error", "数据批次处理失败"),
+        "translation repair failed": ("warning", "中文翻译补齐失败"),
+    }
+    level, readable = message_map.get(message, ("info", str(message)))
+    normalized = dict(fields)
+    if "task" in normalized:
+        normalized["task"] = _humanize_annotate_task(normalized["task"])
+    if "sid" in normalized:
+        normalized["session_id"] = normalized.pop("sid")
+    if "answer_len" in normalized:
+        normalized["response_chars"] = normalized.pop("answer_len")
+    if "query_len" in normalized:
+        normalized["input_chars"] = normalized.pop("query_len")
+    if "pass_name" in normalized:
+        normalized["translation_round"] = normalized.pop("pass_name")
+    runtime_log("数据标注", level, readable, **normalized)
 
 
 def get_annotate_session(sid: str) -> dict:

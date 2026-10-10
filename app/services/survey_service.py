@@ -48,6 +48,7 @@ from app.core.config import (
 from app.core.parsing import _parse_file
 from app.core.llm_context import current_llm_api_key
 from app.core.responses import sse_event
+from app.core.runtime_logging import runtime_log
 from app.core.security import (
     _assign_session_owner,
     _find_history_for_login,
@@ -258,8 +259,32 @@ def _report_writer_attempt_callback(
                 key: count(usage.get(key))
                 for key in ("input_tokens", "output_tokens", "total_tokens")
             } if isinstance(usage, dict) else None
-            # 和现有后端日志走同一 stdout；立即刷新，运行中即可排查。
-            print("[report-llm-attempt] " + json.dumps(entry, ensure_ascii=True), flush=True)
+            event_status = entry.get("status")
+            level, message = {
+                "started": ("progress", "模型请求已经发出"),
+                "completed": ("success", "模型请求已经完成"),
+                "failed": ("warning", "模型请求失败，系统将按既定策略重试或降级"),
+            }[event_status]
+            usage_fields = entry.get("usage") or {}
+            runtime_log(
+                "报告模型", level, message,
+                session_id=entry.get("session_id"),
+                run_id=entry.get("run_id"),
+                call_id=entry.get("call_id"),
+                phase=entry.get("phase"),
+                step=entry.get("step"),
+                part_index=entry.get("part_index"),
+                model=entry.get("response_model") or entry.get("model") or entry.get("requested_model"),
+                attempt=entry.get("attempt"),
+                fallback=entry.get("fallback"),
+                http_status=entry.get("http_status"),
+                elapsed_seconds=entry.get("elapsed_seconds"),
+                input_tokens=usage_fields.get("input_tokens"),
+                output_tokens=usage_fields.get("output_tokens"),
+                total_tokens=usage_fields.get("total_tokens"),
+                status=event_status,
+                error=entry.get("error_type") or entry.get("error_category"),
+            )
         except Exception:
             # 日志输出失败也不能导致重写、漏记 usage 或中断报告。
             return
@@ -1029,7 +1054,11 @@ async def columns_stream(session_id: str, request: Request):
             questions, err = survey_plan.parse_columns_from_llm(retry_answer, header_count)
 
         if not questions:
-            print(f"[columns] LLM 解析失败，回退本地启发式：{err}")
+            runtime_log(
+                "问卷识别", "warning",
+                "模型返回的题型结果无法解析，已改用本地规则推断",
+                error=err,
+            )
             questions = _heuristic_questions(rows, groups)
             yield sse_event({"type": "chunk", "content": "\n（题型识别解析失败，已回退本地推断，请仔细核对）\n"})
 
@@ -1056,7 +1085,11 @@ async def columns_stream(session_id: str, request: Request):
         )
         yield sse_event({"type": "columns_ready", "columns": _column_display_metadata(sess, questions)})
     except Exception as e:
-        import traceback; traceback.print_exc()
+        runtime_log(
+            "问卷处理", "error", "识别问卷题型失败",
+            session_id=session_id,
+            error=e,
+        )
         yield sse_event({"type": "error", "message": str(e)})
 
 
@@ -1238,7 +1271,11 @@ def get_analysis_preset_offer_for_session(
             eligible=_is_focus_capable_planning_session(sess),
         )
     except AnalysisPresetStorageError as exc:
-        print(f"[analysis-preset] WARN offer unavailable: {exc}")
+        runtime_log(
+            "分析思路预设", "warning",
+            "暂时无法读取可复用的分析思路，本次方案仍可继续",
+            error=exc,
+        )
         return None
 
 
@@ -1314,7 +1351,11 @@ def confirm_survey_plan(
             eligible=_is_focus_capable_planning_session(sess),
         )
     except AnalysisPresetStorageError as exc:
-        print(f"[analysis-preset] WARN save failed: {exc}")
+        runtime_log(
+            "分析思路预设", "warning",
+            "方案已经确认，但分析思路没有保存成可复用预设",
+            error=exc,
+        )
         return {
             "approved": True,
             "preset_saved": False,
@@ -1699,7 +1740,11 @@ async def plan_stream(session_id: str, request: Request):
         )
         yield sse_event({"type": "plan_ready", "plan": plan, "card_text": card_text, "headers": headers})
     except Exception as e:
-        import traceback; traceback.print_exc()
+        runtime_log(
+            "问卷报告", "error", "生成分析方案失败",
+            session_id=session_id,
+            error=e,
+        )
         yield sse_event({"type": "error", "message": str(e)})
 
 
@@ -1910,7 +1955,11 @@ async def plan_revision_stream(session_id: str, user_text: str, request: Request
         )
         yield sse_event({"type": "plan_ready", "plan": new_plan, "card_text": card_text, "headers": headers})
     except Exception as e:
-        import traceback; traceback.print_exc()
+        runtime_log(
+            "问卷报告", "error", "修订分析方案失败",
+            session_id=session_id,
+            error=e,
+        )
         yield sse_event({"type": "error", "message": str(e)})
 
 
@@ -3170,9 +3219,10 @@ async def _full_report_stream(
                     writer_models_used.append(review_model)
                     selected_core = _resolve_core_coverage_review(core_block, review_text)
                 except Exception as review_error:
-                    print(
-                        "[report] WARN optional core evidence review skipped: "
-                        f"{type(review_error).__name__}"
+                    runtime_log(
+                        "问卷报告", "warning",
+                        "核心结论的附加证据复核未完成，已沿用原核心结论继续生成",
+                        error=type(review_error).__name__,
                     )
                     yield sse_event({
                         "type": "progress",
@@ -3354,7 +3404,11 @@ async def _full_report_stream(
 
         drifted = survey_stats.find_numbers_not_in_stats(full_report, numeric_sources)
         if drifted:
-            print(f"[stats] WARN drifted numbers: {drifted[:20]}")
+            runtime_log(
+                "报告数字校验", "warning",
+                "发现报告中有无法在统计结果中对应的数字，请人工复核相关结论",
+                unmatched_count=len(drifted), examples=drifted[:20],
+            )
 
         full_report = _inject_disclaimer(full_report, mode=sess.get("mode") or "")
         if not concise_insight:
@@ -3367,15 +3421,14 @@ async def _full_report_stream(
         )
         viewpoint_catalog = viewpoint_diagnostics["catalog"]
         viewpoint_output = viewpoint_diagnostics["writer_output"]
-        print(
-            "[viewpoint-diagnostics] "
-            f"session={session_id} "
-            f"catalog_entries={viewpoint_catalog['entry_count']} "
-            f"context_included={writer_context_included} "
-            f"viewpoint_blocks={viewpoint_output['viewpoint_block_count']} "
-            f"mention_blocks={viewpoint_output['mention_block_count']} "
-            f"status={viewpoint_output['status']}",
-            flush=True,
+        runtime_log(
+            "报告观点校验", "info", "观点证据覆盖检查完成",
+            session_id=session_id,
+            catalog_entries=viewpoint_catalog["entry_count"],
+            context_included=writer_context_included,
+            viewpoint_blocks=viewpoint_output["viewpoint_block_count"],
+            mention_blocks=viewpoint_output["mention_block_count"],
+            status=viewpoint_output["status"],
         )
         qa_context_md = _build_qa_context(sess, full_report)
         writer_model = ",".join(dict.fromkeys(writer_models_used))
@@ -3440,9 +3493,10 @@ async def _full_report_stream(
                 save_session(session_id, sess)
             except Exception as save_error:
                 # history 已原子提交，不能为恢复临时 session 而反向覆盖并发 QA。
-                print(
-                    "[report-rerun] WARN history committed but session sync failed: "
-                    f"{type(save_error).__name__}"
+                runtime_log(
+                    "报告重跑", "warning",
+                    "新版本已经写入历史，但当前页面的临时任务状态同步失败",
+                    error=type(save_error).__name__,
                 )
         else:
             committed_version = append_report_version(
@@ -3492,7 +3546,12 @@ async def _full_report_stream(
             **_session_report_version_payload(sess),
         })
     except Exception as e:
-        import traceback; traceback.print_exc()
+        runtime_log(
+            "问卷报告", "error", "生成报告失败",
+            session_id=session_id,
+            stage="report_generation",
+            error=e,
+        )
         report_llm_usage.finalize_open_attempts()
         yield _report_llm_status_event()
         yield sse_event({"type": "error", "message": str(e)})
@@ -3851,10 +3910,10 @@ async def partial_report_rerun_stream(
                     yield event
                 core_block = _resolve_core_coverage_review(core_block, writer_round.out)
             except Exception as review_error:
-                print(
-                    "[partial-rerun] WARN optional core review skipped: "
-                    f"{type(review_error).__name__}",
-                    flush=True,
+                runtime_log(
+                    "局部重跑", "warning",
+                    "核心结论附加复核未完成，已保留本轮生成内容",
+                    error=type(review_error).__name__,
                 )
         patched_report = replace_core_block(patched_report, core_block)
 
@@ -4019,8 +4078,12 @@ async def partial_report_rerun_stream(
             "rerun_details": rerun_details,
         })
     except Exception as exc:
-        import traceback
-        traceback.print_exc()
+        runtime_log(
+            "问卷报告", "error", "局部重做失败",
+            session_id=session_id,
+            stage="partial_rerun",
+            error=exc,
+        )
         message = exc.detail if isinstance(exc, HTTPException) else str(exc)
         yield sse_event({"type": "error", "message": message or "局部重做失败"})
     finally:
@@ -4283,7 +4346,11 @@ async def qa_stream(
             **({"version": selected_version} if selected_version else {}),
         })
     except Exception as e:
-        import traceback; traceback.print_exc()
+        runtime_log(
+            "报告问答", "error", "回答报告追问失败",
+            session_id=session_id,
+            error=e,
+        )
         yield sse_event({"type": "error", "message": str(e)})
     finally:
         if completion_lock is not None:
@@ -4425,7 +4492,11 @@ async def history_qa_stream(
             **({"version": selected_version} if selected_version else {}),
         })
     except Exception as e:
-        import traceback; traceback.print_exc()
+        runtime_log(
+            "报告问答", "error", "回答历史报告追问失败",
+            history_id=history_id,
+            error=e,
+        )
         yield sse_event({"type": "error", "message": str(e)})
     finally:
         if completion_lock is not None:

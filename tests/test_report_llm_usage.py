@@ -14,6 +14,19 @@ def _payloads(events: list[str]) -> list[dict]:
     ]
 
 
+def _attempt_log_entries(log) -> list[dict]:
+    return [
+        {
+            "area": call.args[0],
+            "level": call.args[1],
+            "message": call.args[2],
+            **call.kwargs,
+        }
+        for call in log.call_args_list
+        if call.args and call.args[0] == "报告模型"
+    ]
+
+
 class ReportLLMUsageTrackerTests(unittest.IsolatedAsyncioTestCase):
     def test_writer_attempt_logs_correlate_runs_without_changing_usage(self):
         tracker = survey_service._ReportLLMUsageTracker()
@@ -26,7 +39,7 @@ class ReportLLMUsageTrackerTests(unittest.IsolatedAsyncioTestCase):
             "model": "model-a", "protocol": "messages", "fallback": False,
             "attempt_kind": "initial", "max_output_tokens": 16000,
         }
-        with patch("builtins.print") as log:
+        with patch.object(survey_service, "runtime_log") as log:
             record({"status": "started", **base})
             record({
                 "status": "failed", **base, "elapsed_seconds": 188.25,
@@ -35,16 +48,15 @@ class ReportLLMUsageTrackerTests(unittest.IsolatedAsyncioTestCase):
                 "usage": {"input_tokens": 100, "output_tokens": 16000, "total_tokens": 16100},
                 "usage_complete": True,
             })
-        entries = [json.loads(call.args[0].split(" ", 1)[1]) for call in log.call_args_list]
+        entries = _attempt_log_entries(log)
         self.assertEqual([e["status"] for e in entries], ["started", "failed"])
-        self.assertTrue(all(call.kwargs["flush"] for call in log.call_args_list))
         self.assertEqual(entries[-1]["session_id"], "session-a")
         self.assertEqual(entries[-1]["run_id"], "run-a")
         self.assertEqual(entries[-1]["step"], "part")
         self.assertEqual(entries[-1]["part_index"], 2)
         self.assertEqual(entries[-1]["elapsed_seconds"], 188.25)
-        self.assertEqual(entries[-1]["error_category"], "output_truncated")
-        self.assertEqual(entries[-1]["usage"]["output_tokens"], 16000)
+        self.assertEqual(entries[-1]["error"], "_LLMRequestError")
+        self.assertEqual(entries[-1]["output_tokens"], 16000)
         self.assertEqual(tracker.snapshot()["totals"]["call_count"], 1)
         self.assertEqual(tracker.snapshot()["totals"]["total_tokens"], 16100)
         self.assertNotIn("error_category", json.dumps(tracker.snapshot()))
@@ -57,7 +69,7 @@ class ReportLLMUsageTrackerTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(survey_service, "current_llm_api_key", return_value="user-secret"),
             patch.object(survey_service, "LLM_API_KEY", "service-secret"),
-            patch("builtins.print") as log,
+            patch.object(survey_service, "runtime_log") as log,
         ):
             record({
                 "status": "failed", "call_id": "call-a", "model": "model-a",
@@ -70,13 +82,12 @@ class ReportLLMUsageTrackerTests(unittest.IsolatedAsyncioTestCase):
                 "error": "private prompt", "messages": "private prompt",
                 "answer": "private answer", "headers": {"Authorization": "user-secret"},
             })
-        raw = log.call_args.args[0]
+        entry = _attempt_log_entries(log)[0]
+        raw = json.dumps(entry, ensure_ascii=False)
         for secret in ("user-secret", "service-secret", "private", "Authorization"):
             self.assertNotIn(secret, raw)
-        entry = json.loads(raw.split(" ", 1)[1])
-        self.assertEqual(entry["response_model"], "redacted")
-        self.assertEqual(entry["requested_model"], "redacted")
-        self.assertIsNone(entry["usage"]["input_tokens"])
+        self.assertEqual(entry["model"], "redacted")
+        self.assertIsNone(entry["input_tokens"])
         self.assertIsNone(entry["elapsed_seconds"])
 
     def test_broken_log_sink_does_not_interrupt_usage(self):
@@ -85,7 +96,9 @@ class ReportLLMUsageTrackerTests(unittest.IsolatedAsyncioTestCase):
             tracker.callback("writing"), session_id="session-a", run_id="run-a",
             phase="writing", step="core_review",
         )
-        with patch("builtins.print", side_effect=OSError("log closed")):
+        with patch.object(
+            survey_service, "runtime_log", side_effect=OSError("log closed")
+        ):
             record({"status": "started", "call_id": "call-a", "model": "model-a"})
             record({
                 "status": "completed", "call_id": "call-a", "model": "model-a",
@@ -102,10 +115,10 @@ class ReportLLMUsageTrackerTests(unittest.IsolatedAsyncioTestCase):
             )
             for index in (1, 2)
         ]
-        with patch("builtins.print") as log:
+        with patch.object(survey_service, "runtime_log") as log:
             for index, status in ((0, "started"), (1, "started"), (1, "failed"), (0, "completed")):
                 callbacks[index]({"status": status, "call_id": f"call-{index + 1}"})
-        entries = [json.loads(call.args[0].split(" ", 1)[1]) for call in log.call_args_list]
+        entries = _attempt_log_entries(log)
         self.assertEqual([e["run_id"] for e in entries], ["run-1", "run-2", "run-2", "run-1"])
         for entry in entries:
             index = entry["part_index"]
@@ -286,7 +299,7 @@ class ReportLLMUsageTrackerTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(return_value=None),
             ),
             patch.object(survey_service, "_direct_writer_round", new=fake_writer),
-            patch("builtins.print") as log,
+            patch.object(survey_service, "runtime_log") as log,
             patch.object(survey_service, "save_session"),
             patch.object(survey_service, "save_to_history"),
             patch.object(survey_service, "audit_log", new=AsyncMock()),
@@ -302,11 +315,7 @@ class ReportLLMUsageTrackerTests(unittest.IsolatedAsyncioTestCase):
             ]
 
         payloads = _payloads(events)
-        entries = [
-            json.loads(call.args[0].split(" ", 1)[1])
-            for call in log.call_args_list
-            if str(call.args[0]).startswith("[report-llm-attempt] ")
-        ]
+        entries = _attempt_log_entries(log)
         starts = [e for e in entries if e["status"] == "started"]
         self.assertEqual([e["step"] for e in starts], [
             "title", "part", "bug_check", "core", "core_review", "action",

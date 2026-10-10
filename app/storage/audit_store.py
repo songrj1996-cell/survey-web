@@ -6,6 +6,7 @@ import json
 import os
 
 from app.core.config import AUDIT_LOG_FILE, MAX_AUDIT_LOGS
+from app.core.runtime_logging import runtime_log
 
 
 def _load_audit_logs() -> list[dict]:
@@ -32,4 +33,4 @@ def _append_audit_log(entry: dict) -> None:
         logs.insert(0, entry)
         _save_audit_logs(logs)
     except Exception as exc:
-        print(f"[audit] write failed: {exc}", flush=True)
+        runtime_log("审计记录", "error", "写入审计记录失败", error=exc)

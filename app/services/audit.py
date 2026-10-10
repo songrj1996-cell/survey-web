@@ -8,6 +8,7 @@ from datetime import datetime
 from fastapi import Request
 
 from app.core.audit import AUDIT_FEATURE_LABELS, _audit_user, _client_ip
+from app.core.runtime_logging import runtime_log
 from app.services.auth import _current_login
 from app.storage.audit_store import _append_audit_log
 
@@ -50,4 +51,4 @@ async def audit_log(
         login = await _current_login(request) if request else None
         _audit_log_from_login(request, login, feature, action, detail, status=status, metadata=metadata)
     except Exception as exc:
-        print(f"[audit] collect failed: {exc}", flush=True)
+        runtime_log("审计记录", "warning", "收集操作记录失败，业务操作将继续", error=exc)

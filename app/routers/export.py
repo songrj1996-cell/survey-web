@@ -8,6 +8,7 @@ from typing import Literal
 from fastapi import APIRouter, HTTPException, Request
 
 from app.core.responses import _make_download_response
+from app.core.runtime_logging import runtime_log
 from app.services.audit import audit_log
 from app.services.auth import _current_login
 from app.services.export_download import (
@@ -195,7 +196,7 @@ async def export_feishu(
     try:
         url = await _export_to_feishu(report_md, login, mode=mode)
     except Exception as e:
-        print(f"[feishu-export][ERROR] {e!r}")
+        runtime_log("飞书导出", "error", "导出当前报告失败", error=e)
         raise _feishu_export_error(e)
     await audit_log(
         request,
@@ -228,7 +229,7 @@ async def export_feishu_history(
             title=entry.get("title", history_id),
         )
     except Exception as e:
-        print(f"[feishu-export-history][ERROR] {e!r}")
+        runtime_log("飞书导出", "error", "导出历史报告失败", error=e)
         raise _feishu_export_error(e)
     await audit_log(
         request,

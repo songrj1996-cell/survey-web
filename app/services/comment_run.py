@@ -4,6 +4,7 @@ import asyncio
 from fastapi import HTTPException, Request
 
 from app.core.responses import sse_event
+from app.core.runtime_logging import runtime_log
 from app.services.comment_pipeline import (
     _comment_analysis_pipeline,
     _comment_append_selected_raw_comments,
@@ -77,7 +78,11 @@ async def comment_run_stream(session_id: str, request: Request):
                     "report_md": full_report,
                 })
             except Exception as exc:  # noqa: BLE001 - 精选失败不影响已生成主报告
-                print(f"[comment quote_select] skipped due to error: {exc!r}", flush=True)
+                runtime_log(
+                    "评论分析", "warning",
+                    "玩家原文精选失败，舆情主报告仍已保留",
+                    error=exc,
+                )
                 yield sse_event({
                     "type": "comment_quotes_error",
                     "message": "玩家评论原文精选生成失败，舆情报告已完成",

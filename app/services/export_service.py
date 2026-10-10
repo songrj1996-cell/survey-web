@@ -6,6 +6,7 @@ import re
 
 from fastapi import HTTPException
 
+from app.core.runtime_logging import runtime_log
 from app.integrations import feishu_client as feishu_export
 from app.services.feishu_evidence_navigation import prepare_evidence_navigation
 from app.services.feishu_navigation_auto_update import register_exported_navigation
@@ -42,7 +43,10 @@ async def _export_to_feishu(report_md: str, login: dict, mode: str = "", title: 
     )
     if navigation and doc_type == "docx":
         await register_exported_navigation(doc_token, url, recipient_open_id=open_id or "", title=title)
-    print(f"[feishu-export] created doc title={title!r} url={url}")
+    runtime_log(
+        "飞书导出", "success", "飞书文档已经创建",
+        title=title, url=url,
+    )
     if open_id:
         await feishu_export.send_message_to_user(
             open_id,
