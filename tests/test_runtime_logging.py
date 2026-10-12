@@ -145,6 +145,90 @@ class RuntimeLoggingTests(unittest.TestCase):
         self.assertIn("读取当前账号和个人配置完成", rendered)
         self.assertNotIn("玩家画像", rendered)
 
+    def test_capability_routes_are_described_as_automatic_page_checks(self):
+        formatter = runtime_logging.HumanAccessFormatter()
+        cases = (
+            ("/api/interview/capabilities", "检查访谈功能是否开放完成"),
+            ("/api/questionnaire-sources/capabilities", "检查问卷来源功能是否开放完成"),
+        )
+        with patch.object(runtime_logging, "_timestamp", return_value="TIME"):
+            for path, phrase in cases:
+                with self.subTest(path=path):
+                    record = logging.LogRecord(
+                        "uvicorn.access",
+                        logging.INFO,
+                        "",
+                        0,
+                        '%s - "%s %s HTTP/%s" %d',
+                        ("127.0.0.1:50000", "GET", path, "1.1", 200),
+                        None,
+                    )
+                    rendered = formatter.format(record)
+                    self.assertIn("[页面自动检查]", rendered)
+                    self.assertIn(phrase, rendered)
+                    self.assertNotIn("处理访谈报告任务", rendered)
+
+    def test_admin_routes_describe_real_permission_actions_and_hide_target(self):
+        formatter = runtime_logging.HumanAccessFormatter()
+        cases = (
+            ("GET", "/api/admin/audit-logs?limit=300", "读取操作审计记录完成"),
+            ("GET", "/api/admin/users", "读取成员权限列表完成"),
+            ("POST", "/api/admin/users", "添加成员权限完成"),
+            ("PATCH", "/api/admin/users/member%40example.com", "更新成员权限完成"),
+            ("DELETE", "/api/admin/users/member%40example.com", "删除成员权限完成"),
+        )
+        with patch.object(runtime_logging, "_timestamp", return_value="TIME"):
+            for method, path, phrase in cases:
+                with self.subTest(method=method, path=path):
+                    record = logging.LogRecord(
+                        "uvicorn.access",
+                        logging.INFO,
+                        "",
+                        0,
+                        '%s - "%s %s HTTP/%s" %d',
+                        ("127.0.0.1:50000", method, path, "1.1", 200),
+                        None,
+                    )
+                    rendered = formatter.format(record)
+                    self.assertIn("[权限管理]", rendered)
+                    self.assertIn(phrase, rendered)
+                    if "/api/admin/users/" in path:
+                        self.assertIn("/api/admin/users/<成员>", rendered)
+                        self.assertNotIn("member%40example.com", rendered)
+
+    def test_successful_static_resources_are_hidden_but_failures_remain(self):
+        access_filter = runtime_logging.SuccessfulStaticAccessFilter()
+        for status, expected in ((200, False), (304, False), (404, True), (500, True)):
+            with self.subTest(status=status):
+                record = logging.LogRecord(
+                    "uvicorn.access",
+                    logging.INFO,
+                    "",
+                    0,
+                    '%s - "%s %s HTTP/%s" %d',
+                    ("127.0.0.1:50000", "GET", "/static/style.css?v=59", "1.1", status),
+                    None,
+                )
+                self.assertIs(access_filter.filter(record), expected)
+
+    def test_hidden_static_resource_consumes_its_operator_mapping(self):
+        client = ("127.0.0.1", 50124)
+        runtime_logging.register_access_operator(client, "资源请求用户")
+        record = logging.LogRecord(
+            "uvicorn.access",
+            logging.INFO,
+            "",
+            0,
+            '%s - "%s %s HTTP/%s" %d',
+            ("127.0.0.1:50124", "GET", "/static/app.js", "1.1", 200),
+            None,
+        )
+        self.assertFalse(runtime_logging.SuccessfulStaticAccessFilter().filter(record))
+        with patch.object(runtime_logging, "_timestamp", return_value="TIME"):
+            rendered = runtime_logging.HumanAccessFormatter().format(record)
+        self.assertIn("操作人：系统任务", rendered)
+        self.assertNotIn("资源请求用户", rendered)
+
     def test_access_operator_is_consumed_once_without_leaking_to_next_request(self):
         formatter = runtime_logging.HumanAccessFormatter()
         runtime_logging.register_access_operator(("127.0.0.1", 50123), "请求用户")

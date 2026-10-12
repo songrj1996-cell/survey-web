@@ -318,8 +318,12 @@ def _http_action(method: str, raw_path: str) -> tuple[str, str]:
         return "历史记录", "操作历史记录"
     if path.startswith("/api/annotate"):
         return "数据标注", "处理数据标注任务"
+    if method == "GET" and path == "/api/interview/capabilities":
+        return "页面自动检查", "检查访谈功能是否开放"
     if path.startswith("/api/interview") or path.startswith("/api/v1/interview"):
         return "访谈报告", "处理访谈报告任务"
+    if method == "GET" and path == "/api/questionnaire-sources/capabilities":
+        return "页面自动检查", "检查问卷来源功能是否开放"
     if path.startswith("/api/comment-analysis"):
         return "评论分析", "处理评论分析任务"
     if path.startswith("/api/export"):
@@ -332,11 +336,32 @@ def _http_action(method: str, raw_path: str) -> tuple[str, str]:
         return "页面", "读取页面文案"
     if path.startswith("/api/upload-guide"):
         return "页面", "读取上传说明"
+    if method == "GET" and path == "/api/admin/audit-logs":
+        return "权限管理", "读取操作审计记录"
+    if path == "/api/admin/users":
+        return "权限管理", {
+            "GET": "读取成员权限列表",
+            "POST": "添加成员权限",
+        }.get(method, "管理成员权限")
+    if re.fullmatch(r"/api/admin/users/[^/]+", path):
+        return "权限管理", {
+            "PATCH": "更新成员权限",
+            "DELETE": "删除成员权限",
+        }.get(method, "管理成员权限")
     if path.startswith("/api/report") or path.startswith("/api/qa"):
         return "问卷报告", "处理报告任务"
     if path.startswith("/api/"):
         return "接口请求", "处理系统请求"
     return "页面", "访问系统页面"
+
+
+def _display_request_path(raw_path: str) -> str:
+    """隐藏管理路径中的目标账号，同时保留足够的接口定位信息。"""
+    return re.sub(
+        r"^(/api/admin/users/)[^/?]+",
+        r"\g<1><成员>",
+        raw_path,
+    )
 
 
 def _http_result(status: int, *, history_detail: bool) -> tuple[str, str]:
@@ -386,15 +411,32 @@ class HumanAccessFormatter(logging.Formatter):
             history_detail = bool(re.fullmatch(r"/api/history/[^/?]+", path.split("?", 1)[0]))
             level, result = _http_result(status, history_detail=history_detail)
             label = _LEVEL_LABELS[level]
+            display_path = _display_request_path(path)
             return (
                 f"[{_timestamp(record.created)}] [{label}] [{area}] {action}{result}"
-                f"{_operator_suffix(operator)}｜HTTP {status}｜请求：{method} {path}"
+                f"{_operator_suffix(operator)}｜HTTP {status}｜请求：{method} {display_path}"
             )
         except Exception:
             return (
                 f"[{_timestamp(record.created)}] [信息] [接口请求] "
                 f"{_safe_error(record.getMessage())}{_operator_suffix(operator)}"
             )
+
+
+class SuccessfulStaticAccessFilter(logging.Filter):
+    """隐藏成功的静态资源访问；失败记录仍交给 formatter 输出。"""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            client, _method, raw_path, _http_version, status = record.args[:5]
+            path = str(raw_path).split("?", 1)[0]
+            is_static = path.startswith("/static/") or path == "/favicon.ico"
+            if is_static and 200 <= int(status) < 400:
+                _take_access_operator(client)
+                return False
+        except Exception:
+            pass
+        return True
 
 
 _SYSTEM_MESSAGES = (
@@ -450,6 +492,8 @@ def configure_runtime_logging() -> None:
     system_formatter = HumanSystemFormatter()
     for handler in logging.getLogger("uvicorn.access").handlers:
         handler.setFormatter(access_formatter)
+        if not any(isinstance(item, SuccessfulStaticAccessFilter) for item in handler.filters):
+            handler.addFilter(SuccessfulStaticAccessFilter())
     for logger_name in ("uvicorn", "uvicorn.error"):
         for handler in logging.getLogger(logger_name).handlers:
             handler.setFormatter(system_formatter)
