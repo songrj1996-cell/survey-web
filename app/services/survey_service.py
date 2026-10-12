@@ -171,7 +171,11 @@ from app.services.report_modes import (
     report_source_page, evidence_markdown, quick_qa_context, quick_objective_statistics, quick_report_title,
     source_display_item, source_metadata_needs_backfill, enrich_source_metadata,
 )
-from app.services.insight_report_v3 import generate_insight_report_v3
+from app.services.insight_report_v3 import (
+    generate_insight_report_v3,
+    prepare_insight_regeneration,
+)
+from app.services.insight_report_v3.contracts import build_stage_source_contract
 from app.services.report_quick_pipeline import run_quick_pipeline
 from app.services.report_quick_outline import build_quick_outline
 from app.services.session_access import require_session_access
@@ -2741,6 +2745,11 @@ async def _full_report_stream(
             new_report=resolved_kind == "initial",
             insight_v3_enabled=INSIGHT_REPORT_V3_ENABLED,
         )
+        if report_engine == "insight_v3" and not INSIGHT_REPORT_V3_ENABLED:
+            raise ValueError(
+                "该版本绑定观点洞察 V3 引擎，但当前 V3 开关已关闭；"
+                "已拒绝静默改用旧引擎，请开启 V3 后再重新生成。"
+            )
         if report_engine == "insight_v3" and (
             resolve_report_mode(sess) != "insight" or quantitative_first
         ):
@@ -2754,16 +2763,101 @@ async def _full_report_stream(
                     phase = "writing"
                 report_llm_usage.callback(phase)(event)
 
+            regeneration_diagnostics = {
+                "status": "not_requested",
+                "logical_calls": 0,
+                "models": [],
+            }
+            report_instruction = prompt_instruction
+            planning_instruction = ""
+            baseline_source_contract = None
+            if resolved_kind == "regenerate" and prompt_instruction:
+                baseline_source_contract = build_stage_source_contract(
+                    open_text=open_text,
+                    plan=plan,
+                    headers=list(rows[0]),
+                    file_sha256=str(
+                        sess.get("file_sha256")
+                        or sess.get("questionnaire_sha256")
+                        or ""
+                    ),
+                )
+                regeneration_result = None
+                async for stream_kind, item in _iterate_report_llm_stage(
+                    prepare_insight_regeneration(
+                        instruction=prompt_instruction,
+                        plan=plan,
+                        qualitative_context=qualitative_context,
+                        on_attempt_event=_v3_attempt_event,
+                    )
+                ):
+                    if stream_kind == "llm_status":
+                        yield item
+                        continue
+                    event_type, payload = item
+                    if event_type == "progress":
+                        yield sse_event({"type": "progress", "message": payload})
+                    elif event_type == "heartbeat":
+                        yield sse_event({"type": "heartbeat"})
+                    elif event_type == "result":
+                        regeneration_result = payload
+                if not isinstance(regeneration_result, dict):
+                    raise RuntimeError("V3 重新生成影响范围检查没有返回结果")
+                regeneration_diagnostics = deepcopy(
+                    regeneration_result.get("diagnostics") or {}
+                )
+                # Diagnostics must survive a rejected preflight without saving
+                # its candidate plan or creating a report version.
+                yield sse_event({
+                    "type": "report_regeneration_diagnostics",
+                    "diagnostics": regeneration_diagnostics,
+                })
+                if not regeneration_result.get("supported"):
+                    raise ValueError(
+                        regeneration_result.get("error_message")
+                        or "本次重新生成要求超出 V3 当前能力，未生成新版本。"
+                    )
+                plan = deepcopy(regeneration_result["effective_plan"])
+                analysis_focus = plan.get("analysis_focus")
+                report_instruction = str(
+                    regeneration_result.get("report_instruction") or ""
+                ).strip()
+                planning_instruction = str(
+                    regeneration_result.get("planning_instruction") or ""
+                ).strip()
+                run_input_session = deepcopy(sess)
+                run_input_session["plan"] = deepcopy(plan)
+                run_input_session["open_text"] = deepcopy(open_text)
+                frozen_inputs = freeze_report_inputs(run_input_session)
+                frozen_inputs["v3_regeneration"] = {
+                    "schema_version": regeneration_diagnostics.get("schema_version"),
+                    "prompt_version": regeneration_diagnostics.get("prompt_version"),
+                    "instruction": report_instruction,
+                    "classification": deepcopy(
+                        regeneration_diagnostics.get("classification") or {}
+                    ),
+                    "revised_analysis_focus": deepcopy(
+                        plan.get("analysis_focus") or {}
+                    ),
+                }
+                # 历史精确重跑也必须保存本次显式要求，不能继续沿用准备会话的默认文案。
+                version_instruction = report_instruction
+
             async for stream_kind, item in _iterate_report_llm_stage(
                 generate_insight_report_v3(
                     open_text=open_text,
                     plan=plan,
+                    rows=rows,
                     headers=list(rows[0]),
                     file_sha256=str(sess.get("file_sha256") or sess.get("questionnaire_sha256") or ""),
                     stats_md=stats_md,
                     structured_tables=list(sess.get("stats_blocks") or survey_stats.structured_tables(stats_md)),
                     qualitative_context=qualitative_context,
                     existing_findings=sess.get("insight_v3_findings"),
+                    baseline_source_contract=baseline_source_contract,
+                    report_instruction=report_instruction,
+                    planning_instruction=planning_instruction,
+                    regeneration_diagnostics=regeneration_diagnostics,
                     translation_namespace=f"insight-v3:{session_id}:{report_run_id}",
                     on_attempt_event=_v3_attempt_event,
                 )
@@ -3325,6 +3419,7 @@ async def _full_report_stream(
         if use_insight_v3 or quantitative_first:
             appendix_blocks = list(sess.get("stats_blocks") or [])
             if use_insight_v3:
+                appendix_blocks = list(v3_pipeline_artifacts.get("insight_v3_stats_tables") or appendix_blocks)
                 selected_sample_titles = {
                     str(title or "").strip()
                     for title in (
@@ -3334,6 +3429,10 @@ async def _full_report_stream(
                     )
                     if str(title or "").strip()
                 }
+                selected_sample_keys = set(
+                    (v3_pipeline_artifacts.get("viewpoint_diagnostics") or {})
+                    .get("sample_overview", {}).get("table_keys", [])
+                )
                 per_question_blocks = [
                     block for block in appendix_blocks
                     if str(block.get("part") or "").strip()
@@ -3342,8 +3441,9 @@ async def _full_report_stream(
                     appendix_blocks = per_question_blocks
                 appendix_blocks = [
                     block for block in appendix_blocks
-                    if str(block.get("title") or "").strip()
-                    not in selected_sample_titles
+                    if (block.get("table_key") not in selected_sample_keys
+                        if block.get("table_key") else
+                        str(block.get("title") or "").strip() not in selected_sample_titles)
                 ]
             appendix = render_stats_appendix(
                 appendix_blocks,

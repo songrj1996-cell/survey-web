@@ -255,7 +255,7 @@ function renderQuickReportNavigation(md, ctx) {
   links.className = 'quick-report-nav__links';
   const source = document.createElement('button');
   source.type = 'button';
-  source.textContent = '查看回答原文';
+  source.textContent = '查看全部回答';
   source.addEventListener('click', () => openReportSources('', '全部题目', 'all'));
   links.append(source);
   navigation.append(links);

@@ -25,29 +25,23 @@ from app.core.config import (
     LLM_REPORT_MAX_TOKENS,
     LLM_REPORT_MODEL,
 )
-from app.services.insight_report_v3.chapters import normalize_report_block_text
+from app.services.insight_report_v3.chapters import normalize_report_block_text, validate_action_repair
 from app.services.insight_report_v3.contracts import (
     validate_audit_payload,
     validate_audit_repair_payload,
+    ACTION_REPAIR_TEXT_FIELDS,
+    SOURCE_RELATIONS,
 )
 from app.services.report_engine import _direct_json_call, _run_bounded_calls
+from app.services.insight_report_v3.research_context import (
+    expand_stat_references, bound_statistic_facts, model_statistic_facts, STAT_REF_RE,
+)
 
 
-AUDIT_SCHEMA_VERSION = "insight-audit-v1"
-AUDIT_RULES_VERSION = "audit-rules-v2-full-coverage"
+AUDIT_SCHEMA_VERSION = "insight-audit-v4-clause-bound"
+AUDIT_RULES_VERSION = "audit-rules-v7-clause-bound"
 FREQUENCY_DISCOVERY_RULES_VERSION = "frequency-discovery-v1-review-only"
 
-_AUDIT_CONTRACT = {
-    "issues": [{
-        "claim_id": "c001",
-        "problem_type": (
-            "contradiction|unsupported_detail|unsupported_causality|scope_shift|"
-            "polarity_shift|condition_shift|mistranslation|other"
-        ),
-        "problem": "不复制原文的简短问题说明",
-        "severity": "warning|blocking",
-    }]
-}
 _REPAIR_CONTRACT = {
     "repairs": [{
         "claim_id": "c001",
@@ -75,6 +69,7 @@ _FREQUENCY_DISCOVERY_PATTERNS = (
         rf"(?:一致|普遍|广泛|共同)(?:认为|表示|反馈|提到|提及).{{0,12}}{_FREQUENCY_SUBJECT}"
     )),
 )
+_SENTENCE_BREAK_RE = re.compile(r"(?<=[。！？!?；;])|(?<=[.])\s+|[\r\n]+")
 
 
 def _clean(value) -> str:
@@ -83,6 +78,14 @@ def _clean(value) -> str:
 
 def _safe_json(value) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":")).replace("<", "\\u003c")
+
+
+def _sentence_targets(value) -> list[str]:
+    """Split report prose into deterministic audit targets without changing it."""
+    text = _clean(value)
+    if not text:
+        return []
+    return [part.strip() for part in _SENTENCE_BREAK_RE.split(text) if part.strip()]
 
 
 async def _forward_attempt(
@@ -111,10 +114,13 @@ async def _forward_attempt(
 
 def _finding_summary(finding: dict) -> dict:
     return {
+        "id": _clean(finding.get("id")),
         "claim": _clean(finding.get("claim")),
         "kind": _clean(finding.get("kind")),
         "caveat": _clean(finding.get("caveat")),
         "question": _clean(finding.get("question")),
+        "preserve_reason": _clean(finding.get("preserve_reason")),
+        "source_ids": list(dict.fromkeys(finding.get("response_ids") or [])),
     }
 
 
@@ -133,11 +139,19 @@ def build_audit_units(
     chapters: list[dict],
     findings_by_id: dict[str, dict],
     source_registry: dict[str, dict],
+    actions: list[dict] | None = None,
+    include_source_checks: bool = True,
 ) -> list[dict]:
     """Build code-owned short claim IDs without exposing global source IDs."""
     units: list[dict] = []
     sections = [
         ("core", -1, "核心发现", core_blocks or []),
+        ("action", -1, "行动建议", [
+            {**deepcopy(action), "heading": action.get("title"),
+             "body": _safe_json({k: action.get(k) for k in sorted(ACTION_REPAIR_TEXT_FIELDS)}),
+             "action_text": {k: deepcopy(action.get(k)) for k in sorted(ACTION_REPAIR_TEXT_FIELDS)}}
+            for action in actions or []
+        ]),
         *(
             (
                 "chapter",
@@ -165,7 +179,7 @@ def build_audit_units(
             ]
             units.append({
                 "claim_id": f"c{len(units) + 1:03d}",
-                "kind": "block",
+                "kind": "action" if section_kind == "action" else "sample" if section_title == "样本概况" else "block",
                 "section_kind": section_kind,
                 "chapter_index": chapter_index,
                 "block_index": block_index,
@@ -178,6 +192,12 @@ def build_audit_units(
                 "finding_ids": finding_ids,
                 "findings": [_finding_summary(findings_by_id[item]) for item in finding_ids],
                 "source_ids": source_ids,
+                "objective_facts": bound_statistic_facts(
+                    block.get("objective_facts") or {},
+                    STAT_REF_RE.findall(f"{block.get('heading', '')}\n{block.get('body', '')}"),
+                ),
+                "sample_stats": deepcopy(block.get("sample_stats") or []),
+                **({"action_text": deepcopy(block["action_text"])} if section_kind == "action" else {}),
             })
             for evidence_index, evidence in enumerate(block.get("evidence") or []):
                 summary = _clean(evidence.get("evidence_point"))
@@ -206,10 +226,97 @@ def build_audit_units(
                     "findings": [_finding_summary(findings_by_id[item]) for item in finding_ids],
                     "source_ids": point_sources,
                 })
+    if include_source_checks:
+        consumers = {}
+        for unit in units:
+            for fid in unit["finding_ids"]:
+                consumers.setdefault(fid, []).append(unit["claim_id"])
+        for fid, consumer_ids in consumers.items():
+            finding = findings_by_id[fid]
+            expected = list(dict.fromkeys(finding.get("response_ids") or []))
+            present = [sid for sid in expected if isinstance(source_registry.get(sid), dict)
+                       and _clean(source_registry[sid].get("text"))]
+            units.append({
+                "claim_id": f"c{len(units) + 1:03d}", "kind": "finding_binding",
+                "section_kind": "finding", "chapter_index": -1, "block_index": -1,
+                "evidence_index": None, "section_title": "来源关系核对", "block_id": fid,
+                "heading": _clean(finding.get("claim")), "body": "", "summary": "",
+                "finding_ids": [fid], "findings": [_finding_summary(finding)],
+                "source_ids": present, "missing_source_ids": [sid for sid in expected if sid not in present],
+                "consumer_ids": consumer_ids,
+            })
     return units
 
 
-def _model_payload(units: list[dict], source_registry: dict[str, dict]) -> dict:
+def _audit_targets(unit: dict) -> list[dict]:
+    """Code-owned field references; raw sources and reference context are never targets."""
+    kind = unit["kind"]
+    if kind == "finding_binding":
+        finding = unit["findings"][0]
+        fields = [
+            (key, _clean(finding.get(key)), f"finding_{key}")
+            for key in ("claim", "caveat")
+        ]
+    elif kind == "evidence_point":
+        fields = [("evidence_point", unit["summary"], "evidence_summary")]
+    elif kind == "action":
+        fields = []
+        for key in sorted(ACTION_REPAIR_TEXT_FIELDS):
+            value = (unit.get("action_text") or {}).get(key, "")
+            if key == "design_directions":
+                fields.extend(
+                    (f"action_text.{key}[{index}]", text, "action_design_direction")
+                    for index, text in enumerate(value or [])
+                )
+            else:
+                fields.append((f"action_text.{key}", value, "action_field"))
+    else:
+        facts = unit.get("objective_facts") or {}
+        body_field = "report_scope" if kind == "research_review" else "body"
+        body_role = (
+            "research_scope_sentence" if kind == "research_review"
+            else "sample_interpretation_sentence" if kind == "sample"
+            else "report_sentence"
+        )
+        fields = [("heading", expand_stat_references(unit["heading"], facts), "report_heading")]
+        rendered_body = expand_stat_references(unit["body"], facts)
+        sentences = [rendered_body] if kind == "research_review" else _sentence_targets(rendered_body)
+        fields.extend(
+            (
+                body_field if len(sentences) == 1 else f"{body_field}.sentence[{index}]",
+                sentence,
+                body_role,
+            )
+            for index, sentence in enumerate(sentences, 1)
+        )
+    targets = []
+    for index, (field, text, content_role) in enumerate(fields):
+        suffix = f"t{index + 1:02d}"
+        if kind == "action":
+            # Adding/removing design directions during a repair must not move
+            # the IDs of other fields in diagnostics or the next audit call.
+            name = field.removeprefix("action_text.")
+            if name.startswith("design_directions["):
+                suffix = f"d{int(name.split('[')[1][:-1]) + 1:02d}"
+            else:
+                suffix = f"t{sorted(ACTION_REPAIR_TEXT_FIELDS).index(name) + 1:02d}"
+        targets.append({
+            "target_id": f"{unit['claim_id']}-{suffix}",
+            "field": field,
+            "content_role": content_role,
+            "text": text,
+        })
+    return targets
+
+
+def _expected_issue_targets(units: list[dict]) -> dict[str, set[str]]:
+    return {unit["claim_id"]: {t["target_id"] for t in _audit_targets(unit)}
+            for unit in units if unit["kind"] != "finding_binding"}
+
+
+def _model_payload(units: list[dict], source_registry: dict[str, dict], *, purpose: str = "audit") -> dict:
+    if purpose not in {"audit", "repair"}:
+        raise ValueError("Unknown audit payload purpose")
     ordered_source_ids = list(dict.fromkeys(
         response_id for unit in units for response_id in unit.get("source_ids") or []
     ))
@@ -217,17 +324,66 @@ def _model_payload(units: list[dict], source_registry: dict[str, dict]) -> dict:
         response_id: f"r{index + 1:03d}"
         for index, response_id in enumerate(ordered_source_ids)
     }
+    player_keys = {
+        source_id: (source_id if source_registry[source_id].get("case_link_status") == "ambiguous_rows"
+                    else source_registry[source_id].get("respondent_ref") or source_id)
+        for source_id in ordered_source_ids
+    }
+    players = list(dict.fromkeys(player_keys.values()))
     model_units = []
     for unit in units:
         item = {
             "claim_id": unit["claim_id"],
             "kind": unit["kind"],
             "section": unit["section_title"],
-            "findings": deepcopy(unit["findings"]),
             "source_ids": [source_short[item] for item in unit.get("source_ids") or []],
         }
-        if unit["kind"] == "block":
+        findings = [
+            {**{k: deepcopy(v) for k, v in finding.items() if k != "source_ids"},
+             "source_ids": [source_short[sid] for sid in finding.get("source_ids", []) if sid in source_short]}
+            for finding in unit["findings"]
+        ]
+        if purpose == "audit":
+            item["targets"] = _audit_targets(unit)
+            context = {}
+            if unit["kind"] == "finding_binding":
+                context = {key: deepcopy(findings[0].get(key)) for key in ("question", "kind", "preserve_reason")}
+            elif unit["kind"] == "research_review":
+                # These are coverage hints, not established facts or report text.
+                context["unverified_candidate_findings"] = findings
+            else:
+                # Keep the question needed to understand short replies, without
+                # repeating the model's candidate claim as if it were body text.
+                question_groups = []
+                for finding in findings:
+                    group = {"question": finding.get("question", ""),
+                             "source_ids": [sid for sid in finding["source_ids"] if sid in item["source_ids"]]}
+                    if group["question"] and group not in question_groups:
+                        question_groups.append(group)
+                if question_groups:
+                    context["source_questions"] = question_groups
+            if unit.get("objective_facts"):
+                context["objective_stats"] = model_statistic_facts(unit["objective_facts"])
+            for key in ("sample_stats", "research_context"):
+                if unit.get(key):
+                    context[key] = deepcopy(unit[key])
+            item["reference_context"] = context
+            model_units.append(item)
+            continue
+        # Repair retains its separate text-editing contract, not the audit layout.
+        item["findings"] = findings
+        if unit["kind"] in {"block", "sample", "research_review", "action", "finding_binding"}:
             item.update({"heading": unit["heading"], "body": unit["body"]})
+            item["objective_stats"] = model_statistic_facts(unit.get("objective_facts") or {})
+            item["rendered_body"] = expand_stat_references(unit["body"], unit.get("objective_facts") or {})
+            if unit.get("sample_stats"):
+                item["sample_stats"] = deepcopy(unit["sample_stats"])
+            if unit.get("research_context"):
+                item["research_context"] = deepcopy(unit["research_context"])
+            if unit.get("action_text"):
+                item["action_text"] = deepcopy(unit["action_text"])
+            if unit.get("source_checks"):
+                item["source_checks"] = deepcopy(unit["source_checks"])
         else:
             item.update({"evidence_point": unit["summary"]})
         model_units.append(item)
@@ -236,7 +392,10 @@ def _model_payload(units: list[dict], source_registry: dict[str, dict]) -> dict:
         "sources": [
             {
                 "source_id": source_short[response_id],
+                "role": "original_response",
+                "player_id": f"p{players.index(player_keys[response_id]) + 1:03d}",
                 "text": _clean(source_registry[response_id].get("text")),
+                "case_context": deepcopy(source_registry[response_id].get("case_context") or []),
             }
             for response_id in ordered_source_ids
         ],
@@ -244,9 +403,37 @@ def _model_payload(units: list[dict], source_registry: dict[str, dict]) -> dict:
 
 
 def _audit_query(units: list[dict], source_registry: dict[str, dict]) -> str:
+    payload = _model_payload(units, source_registry)
+    body_units = [u for u in payload["units"] if u["kind"] != "finding_binding"]
+    source_units = [u for u in payload["units"] if u["kind"] == "finding_binding"]
+    contract = {
+        "checked_claim_ids": [u["claim_id"] for u in payload["units"]],
+        "finding_checks": [{
+            "claim_id": source_units[0]["claim_id"], "status": "supported|needs_review|inconclusive",
+            "relations": {key: [] for key in SOURCE_RELATIONS},
+            "problem": "通过时可为空，否则简述归纳与来源的支持方向或条件问题",
+        }] if source_units else [],
+        "issues": [{
+            "claim_id": body_units[0]["claim_id"],
+            "target_ids": [body_units[0]["targets"][0]["target_id"]],
+            "problem_type": (
+                "contradiction|unsupported_detail|unsupported_causality|scope_shift|"
+                "polarity_shift|condition_shift|mistranslation|missing_requirement|"
+                "missing_counterexample|shallow_analysis|statistic_scope|other"
+            ),
+            "problem": "仅概括所选 targets 的问题，不把参考材料当作正文",
+            "severity": "warning|blocking",
+        }] if body_units else [],
+    }
+    scope = {
+        "issue_targets": {u["claim_id"]: [t["target_id"] for t in u["targets"]] for u in body_units},
+        "finding_check_claim_ids": [u["claim_id"] for u in source_units],
+        "rules": "只审 targets，并按 content_role 区分正文句、建议字段、候选归纳与参考材料。issues 无问题可为空；finding_checks 必须恰好覆盖列明编号，无编号必须为空。每个 claim_id 最多一条 issues，可绑定多个字段。示例不是问题判定。",
+    }
     return (
-        "<contract>\n" + _safe_json(_AUDIT_CONTRACT) + "\n</contract>\n"
-        "<audit_input>\n" + _safe_json(_model_payload(units, source_registry)) + "\n</audit_input>"
+        "<contract>\n" + _safe_json(contract) + "\n</contract>\n"
+        "<audit_scope>\n" + _safe_json(scope) + "\n</audit_scope>\n"
+        "<audit_input>\n" + _safe_json(payload) + "\n</audit_input>"
     )
 
 
@@ -255,16 +442,24 @@ def _repair_query(
     source_registry: dict[str, dict],
     issues_by_id: dict[str, dict],
 ) -> str:
-    payload = _model_payload(units, source_registry)
+    payload = _model_payload(units, source_registry, purpose="repair")
+    target_fields = {u["claim_id"]: {t["target_id"]: t["field"] for t in _audit_targets(u)} for u in units}
     for unit in payload["units"]:
         issue = issues_by_id[unit["claim_id"]]
         unit["audit_issue"] = {
             "problem_type": issue["problem_type"],
             "problem": issue["problem"],
             "severity": issue["severity"],
+            "target_fields": {tid: target_fields[unit["claim_id"]][tid]
+                              for tid in issue.get("target_ids") or []},
         }
+    contract = {"repairs": [
+        ({"claim_id": unit["claim_id"], "action_text": unit["action_text"]}
+         if unit["kind"] == "action" else {"claim_id": unit["claim_id"], "heading": "修复后标题", "body": "修复后正文"})
+        for unit in units
+    ]}
     return (
-        "<contract>\n" + _safe_json(_REPAIR_CONTRACT) + "\n</contract>\n"
+        "<contract>\n" + _safe_json(contract) + "\n</contract>\n"
         "<repair_input>\n" + _safe_json(payload) + "\n</repair_input>"
     )
 
@@ -311,7 +506,7 @@ def _block_for_unit(core_blocks: list[dict], chapters: list[dict], unit: dict) -
 
 
 def _delivery_issue(unit: dict, issue: dict, *, reason: str) -> dict:
-    target = "证据要点" if unit.get("kind") == "evidence_point" else "正文结论"
+    target = {"evidence_point": "证据要点", "sample": "样本解释", "research_review": "研究任务覆盖", "action": "建议事实依据", "finding_binding": "来源关系"}.get(unit.get("kind"), "正文结论")
     return {
         "claim_id": unit.get("claim_id"),
         "section": unit.get("section_title"),
@@ -321,6 +516,10 @@ def _delivery_issue(unit: dict, issue: dict, *, reason: str) -> dict:
         "problem": issue.get("problem") or "该项未完成证据审校",
         "severity": issue.get("severity") or "blocking",
         "reason": reason,
+        "audit_target_fields": {
+            t["target_id"]: t["field"] for t in _audit_targets(unit)
+            if t["target_id"] in (issue.get("target_ids") or [])
+        },
     }
 
 
@@ -347,6 +546,7 @@ def _call_diagnostic(
         "step": step,
         "batch_index": batch_index,
         "unit_count": len(units),
+        "target_fields": {u["claim_id"]: {t["target_id"]: t["field"] for t in _audit_targets(u)} for u in units},
         "input_chars": len(query),
         "input_target_exceeded": len(query) > INSIGHT_V3_AUDIT_INPUT_CHARS,
         "model": _clean(result.get("model")),
@@ -405,17 +605,49 @@ async def audit_report_sections(
     source_registry: dict[str, dict],
     profiles: list[dict],
     on_attempt_event=None,
+    sample_overview: dict | None = None,
+    research_tasks: list[dict] | None = None,
+    analysis_focus: dict | None = None,
+    actions: list[dict] | None = None,
 ) -> dict:
     """Audit every model-written claim with bounded concurrency and one repair round."""
     started = time.monotonic()
     audited_core = deepcopy(core_blocks or [])
     audited_chapters = deepcopy(chapters or [])
+    audited_actions = deepcopy(actions or [])
+    sample_chapter_index = len(audited_chapters)
+    if sample_overview:
+        audited_chapters.append({"id": "sample", "title": "样本概况", "blocks": [{
+            **deepcopy(sample_overview), "id": "sample-overview", "finding_ids": [], "evidence": [],
+        }]})
     units = build_audit_units(
         core_blocks=audited_core,
         chapters=audited_chapters,
         findings_by_id=findings_by_id,
         source_registry=source_registry,
+        actions=audited_actions,
     )
+    if research_tasks is not None or analysis_focus is not None:
+        units.append({
+            "claim_id": f"c{len(units) + 1:03d}", "kind": "research_review",
+            "section_kind": "research", "chapter_index": -1, "block_index": -1,
+            "evidence_index": None, "section_title": "研究任务覆盖", "block_id": "research-review",
+            "heading": "已确认研究任务、重要材料与解释深度", "summary": "",
+            "body": _safe_json({
+                "core": [{"heading": b.get("heading"), "body": b.get("body")} for b in audited_core],
+                "chapters": [{"title": c.get("title"), "purpose": c.get("purpose"), "blocks": [
+                    {"heading": b.get("heading"), "body": b.get("body"), "finding_ids": b.get("finding_ids")}
+                    for b in c.get("blocks") or []
+                ]} for c in chapters or []],
+            }),
+            "findings": [_finding_summary(f) for f in findings_by_id.values()],
+            "finding_ids": [], "source_ids": [],
+            "objective_facts": {
+                key: value for section in [audited_core, *(c.get("blocks") or [] for c in audited_chapters)]
+                for block in section for key, value in (block.get("objective_facts") or {}).items()
+            },
+            "research_context": {"analysis_focus": deepcopy(analysis_focus or {}), "task_assignments": deepcopy(research_tasks or [])},
+        })
     unit_by_id = {unit["claim_id"]: unit for unit in units}
     local_attempt_events: list[dict] = []
     calls: list[dict] = []
@@ -448,8 +680,8 @@ async def audit_report_sections(
         unresolved.append(_delivery_issue(unit, issue, reason=reason))
         set_unit_status(unit, status, reason)
 
-    missing_evidence = [unit for unit in units if not unit.get("source_ids")]
-    audit_candidates = [unit for unit in units if unit.get("source_ids")]
+    missing_evidence = [unit for unit in units if unit.get("missing_source_ids") or (not unit.get("source_ids") and unit["kind"] not in {"sample", "research_review"})]
+    audit_candidates = [unit for unit in units if unit not in missing_evidence]
 
     for unit in missing_evidence:
         add_unresolved(
@@ -468,6 +700,7 @@ async def audit_report_sections(
         return {
             "core_blocks": audited_core,
             "chapters": audited_chapters,
+            "actions": audited_actions,
             "unresolved": [],
             "diagnostics": {
                 "schema_version": AUDIT_SCHEMA_VERSION,
@@ -517,6 +750,7 @@ async def audit_report_sections(
 
     async def run_audit_batch(batch_index: int, batch: list[dict], *, step: str):
         query = _audit_query(batch, source_registry)
+        expected = {u["claim_id"]: set(u["source_ids"]) for u in _model_payload(batch, source_registry)["units"] if u["kind"] == "finding_binding"}
         call_events: list[dict] = []
 
         async def attempt(event: dict):
@@ -547,6 +781,8 @@ async def audit_report_sections(
                 validator=lambda data: validate_audit_payload(
                     data,
                     valid_claim_ids={unit["claim_id"] for unit in batch},
+                    expected_source_ids_by_claim=expected,
+                    expected_targets_by_claim=_expected_issue_targets(batch),
                 ),
                 on_attempt_event=attempt,
             )
@@ -578,6 +814,7 @@ async def audit_report_sections(
 
     audited_ids: set[str] = set()
     initial_issues: list[dict] = []
+    source_checks: dict[str, dict] = {}
     for batch, result, _diagnostic in initial_results:
         if result.get("data") is None:
             for unit in batch:
@@ -596,12 +833,62 @@ async def audit_report_sections(
         for unit in batch:
             set_unit_status(unit, "passed", "initial_audit_passed")
         initial_issues.extend(deepcopy(result["data"].get("issues") or []))
+        payload = _model_payload(batch, source_registry)
+        source_order = list(dict.fromkeys(sid for unit in batch for sid in unit.get("source_ids") or []))
+        reverse_sources = {row["source_id"]: sid for row, sid in zip(payload["sources"], source_order)}
+        for check in result["data"].get("finding_checks") or []:
+            unit = unit_by_id[check["claim_id"]]
+            source_checks[unit["finding_ids"][0]] = {
+                **deepcopy(check), "consumer_ids": unit["consumer_ids"],
+                "consumer_locations": [
+                    {"claim_id": cid, "section": unit_by_id[cid]["section_title"], "block_id": unit_by_id[cid]["block_id"], "heading": unit_by_id[cid]["heading"]}
+                    for cid in unit["consumer_ids"]
+                ],
+                "relations": {key: [reverse_sources[sid] for sid in ids] for key, ids in check["relations"].items()},
+            }
 
     issues_by_id = {issue["claim_id"]: issue for issue in initial_issues}
+    for unit in units:
+        if unit["kind"] != "finding_binding":
+            continue
+        fid = unit["finding_ids"][0]
+        check = source_checks.get(fid)
+        if not check:
+            source_checks[fid] = {
+                "claim_id": unit["claim_id"], "status": "incomplete", "relations": {},
+                "problem": "来源关系核对未完成", "consumer_ids": unit["consumer_ids"],
+                "missing_source_ids": unit.get("missing_source_ids") or [],
+                "consumer_locations": [
+                    {"claim_id": cid, "section": unit_by_id[cid]["section_title"], "block_id": unit_by_id[cid]["block_id"], "heading": unit_by_id[cid]["heading"]}
+                    for cid in unit["consumer_ids"]
+                ],
+            }
+        if check and check["status"] == "supported":
+            continue
+        reason = check["problem"] if check else "该发现的来源关系核对未完成，不能视为已通过"
+        if check:
+            set_unit_status(unit, "needs_review", "source_relation_issue")
+        for cid in unit["consumer_ids"]:
+            consumer = unit_by_id[cid]
+            consumer.setdefault("source_checks", []).append({"finding_id": fid, "status": check["status"] if check else "incomplete", "problem": reason})
+            issue = {"claim_id": cid, "problem_type": "contradiction", "problem": reason, "severity": "blocking"}
+            if not check:
+                if unit_statuses[cid]["status"] != "incomplete":
+                    add_unresolved(consumer, issue, reason="source_check_incomplete", status="incomplete")
+                issues_by_id.pop(cid, None)
+            elif unit_statuses[cid]["status"] != "incomplete":
+                # Preserve both the paragraph finding and all source-check reasons.
+                if cid in issues_by_id:
+                    issue["problem"] = issues_by_id[cid]["problem"] + "；来源核对：" + reason
+                    if "target_ids" in issues_by_id[cid]:
+                        issue["target_ids"] = deepcopy(issues_by_id[cid]["target_ids"])
+                issues_by_id[cid] = issue
     body_issues: list[dict] = []
     evidence_fallback_count = 0
     for claim_id, issue in issues_by_id.items():
         unit = unit_by_id[claim_id]
+        if unit_statuses[claim_id]["status"] == "incomplete":
+            continue
         if unit["kind"] == "evidence_point":
             block = _block_for_unit(audited_core, audited_chapters, unit)
             evidence = (block.get("evidence") or [])[unit["evidence_index"]]
@@ -612,6 +899,9 @@ async def audit_report_sections(
                 "resolution": "evidence_point_fallback",
             })
             set_unit_status(unit, "evidence_fallback", "evidence_point_fallback")
+        elif unit["kind"] == "research_review":
+            # A report-level omission cannot be repaired by inventing new bindings.
+            add_unresolved(unit, issue, reason="research_task_needs_review", status="needs_review")
         else:
             body_issues.append(unit)
             set_unit_status(unit, "needs_review", "audit_issue_detected")
@@ -663,6 +953,7 @@ async def audit_report_sections(
                 validator=lambda data: validate_audit_repair_payload(
                     data,
                     expected_claim_ids={unit["claim_id"] for unit in batch},
+                    action_claim_ids={unit["claim_id"] for unit in batch if unit["kind"] == "action"},
                 ),
                 on_attempt_event=repair_attempt,
             )
@@ -704,6 +995,24 @@ async def audit_report_sections(
             }
             for unit in repair_candidates:
                 repair = repairs_by_id[unit["claim_id"]]
+                if unit["kind"] == "action":
+                    old_action = audited_actions[unit["block_index"]]
+                    numeric_sources = _safe_json([unit["findings"], old_action, [source_registry[sid]["text"] for sid in unit["source_ids"]]])
+                    normalized_action, error = validate_action_repair(
+                        original=old_action, action_text=repair["action_text"],
+                        findings_by_id=findings_by_id, chapters=audited_chapters[:sample_chapter_index],
+                        profiles=profiles, numeric_sources=numeric_sources,
+                    )
+                    if error or normalized_action == old_action:
+                        add_unresolved(unit, {**issues_by_id[unit["claim_id"]], "problem": issues_by_id[unit["claim_id"]]["problem"] + "；" + (error or "修复无进展")}, reason="repair_validation_failed" if error else "repair_no_progress", status="needs_review")
+                        continue
+                    audited_actions[unit["block_index"]] = normalized_action
+                    updated_unit = deepcopy(unit)
+                    updated_unit["heading"] = normalized_action["title"]
+                    updated_unit["action_text"] = {k: normalized_action[k] for k in sorted(ACTION_REPAIR_TEXT_FIELDS)}
+                    updated_unit["body"] = _safe_json(updated_unit["action_text"])
+                    valid_repairs.append(updated_unit)
+                    continue
                 numeric_sources = "\n".join([
                     unit["heading"],
                     unit["body"],
@@ -722,7 +1031,10 @@ async def audit_report_sections(
                     findings=[findings_by_id[item] for item in unit["finding_ids"]],
                     profiles=profiles,
                     numeric_sources=numeric_sources,
+                    stat_facts=unit.get("objective_facts") or {},
                 )
+                if unit["kind"] == "sample" and normalized and len(expand_stat_references(normalized["body"], unit.get("objective_facts") or {})) > 500:
+                    validation_error = "样本解读超过500字"
                 if validation_error:
                     add_unresolved(
                         unit,
@@ -751,6 +1063,10 @@ async def audit_report_sections(
                 block = _block_for_unit(audited_core, audited_chapters, unit)
                 block["heading"] = normalized["heading"]
                 block["body"] = normalized["body"]
+                block["objective_facts"] = bound_statistic_facts(
+                    unit.get("objective_facts") or {},
+                    STAT_REF_RE.findall(normalized["heading"] + "\n" + normalized["body"]),
+                )
                 if normalized["frequency_terms"]:
                     frequency_rewrites.append({
                         "claim_id": unit["claim_id"],
@@ -760,6 +1076,7 @@ async def audit_report_sections(
                 updated_unit = deepcopy(unit)
                 updated_unit["heading"] = normalized["heading"]
                 updated_unit["body"] = normalized["body"]
+                updated_unit["objective_facts"] = deepcopy(block["objective_facts"])
                 valid_repairs.append(updated_unit)
 
     reaudit_batches, reaudit_over_target = _pack_units(
@@ -800,6 +1117,8 @@ async def audit_report_sections(
                 validator=lambda data: validate_audit_payload(
                     data,
                     valid_claim_ids={unit["claim_id"] for unit in batch},
+                    expected_source_ids_by_claim={},
+                    expected_targets_by_claim=_expected_issue_targets(batch),
                 ),
                 on_attempt_event=reaudit_attempt,
             )
@@ -859,6 +1178,14 @@ async def audit_report_sections(
                     set_unit_status(unit, "repaired", "targeted_repair_passed_reaudit")
 
     for unit in units:
+        if unit["kind"] == "finding_binding" and unit_statuses[unit["claim_id"]]["reason"] == "source_relation_issue":
+            if all(unit_statuses[cid]["status"] in {"passed", "repaired", "evidence_fallback"} for cid in unit["consumer_ids"]):
+                set_unit_status(unit, "repaired", "consumers_resolved_original_finding_unchanged")
+            else:
+                # Consumer notices identify report locations; the immutable upstream
+                # relation issue remains separately traceable in diagnostics.
+                set_unit_status(unit, "needs_review", "source_issue_consumers_unresolved")
+    for unit in units:
         if unit_statuses[unit["claim_id"]]["status"] != "pending":
             continue
         add_unresolved(
@@ -916,9 +1243,18 @@ async def audit_report_sections(
         for batch, result, _diagnostic in reaudit_results
         if result.get("data") is not None
     )
+    sample_unit = next((unit for unit in units if unit["kind"] == "sample"), None)
+    sample_status = unit_statuses.get((sample_unit or {}).get("claim_id"), {}).get("status")
+    audited_sample = (
+        audited_chapters[sample_chapter_index]["blocks"][0]
+        if sample_overview and sample_status in {"passed", "repaired"}
+        else None
+    )
     return {
         "core_blocks": audited_core,
-        "chapters": audited_chapters,
+        "chapters": audited_chapters[:sample_chapter_index],
+        "actions": audited_actions,
+        "sample_overview": audited_sample,
         "unresolved": unresolved,
         "diagnostics": {
             "schema_version": AUDIT_SCHEMA_VERSION,
@@ -961,6 +1297,13 @@ async def audit_report_sections(
             ),
             "unit_status_counts": unit_status_counts,
             "unit_statuses": [unit_statuses[unit["claim_id"]] for unit in units],
+            "sample_fallback_reason": (
+                "audit_" + (sample_status or "missing")
+                if sample_overview and audited_sample is None else ""
+            ),
+            "source_checks": source_checks,
+            "source_check_unit_count": sum(u["kind"] == "finding_binding" for u in units),
+            "action_unit_count": len(audited_actions),
             "initial_batch_count": len(batches),
             "repair_batch_count": len(repair_batches),
             "reaudit_batch_count": len(reaudit_batches),

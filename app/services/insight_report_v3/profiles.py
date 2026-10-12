@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from app.services.insight_report_v3.research_context import STAT_REF_RE
+
 from collections import Counter, defaultdict
 from copy import deepcopy
 import re
@@ -29,6 +31,32 @@ PROFILE_DIFFERENCE_TERMS = (
 )
 _PERCENT_RE = re.compile(r"(?:\d+(?:\.\d+)?\s*%|百分之[零〇一二两三四五六七八九十百点\d]+)")
 _EXACT_PEOPLE_RE = re.compile(r"\d+\s*(?:名|位|个)?\s*(?:玩家|受访者|用户|人)")
+# This is a narrow grammatical exception, not a product-keyword whitelist.
+# Unclear subjects and mixed player/product sentences retain the original gate.
+_PRODUCT_SUBJECT_RE = re.compile(
+    r"(?:(?:而|但|同时)\s*)?"
+    r"(?:(?:新版|旧版|新的|旧的|当前|改版后的|调整后的)\s*)?"
+    r"(?:界面|页面|面板|菜单|按钮|图标|文字|字体|描边|边框|提示|入口|布局|导航|配色)"
+    r"(?:的(?:信息|布局|文字|图标|按钮|描边|边框|配色|入口|提示))?"
+    r"\s*(?:变得|显得)?\s*"
+)
+_HUMAN_OR_REFERENCE_RE = re.compile(
+    r"玩家|受访者|用户|人群|群体|男性|女性|男生|女生|反馈|评价|偏好|感受|"
+    r"他们|她们|它们|他|她|它|其|这类|这方面|这些|那些|该类"
+)
+
+
+def _is_clear_product_comparison(sentence: str, start: int, end: int, profile_tokens: set[str]) -> bool:
+    """Accept only explicit product-subject predicates, never inferred people."""
+    subject_context = sentence
+    for term in PROFILE_DIFFERENCE_TERMS:
+        subject_context = subject_context.replace(term, "")
+    if _HUMAN_OR_REFERENCE_RE.search(subject_context) or any(token in sentence for token in profile_tokens):
+        return False
+    # Commas delimit clauses, but the guard above covers the entire sentence.
+    prefix = re.split(r"[，,：:]", sentence[:start])[-1].strip()
+    suffix = re.split(r"[，,：:]", sentence[end:])[0].strip()
+    return bool(_PRODUCT_SUBJECT_RE.fullmatch(prefix)) and suffix in {"", "了"}
 
 
 def _clean(value) -> str:
@@ -450,7 +478,9 @@ def validate_profile_language(
     catalog: list[dict],
 ) -> str | None:
     """Reject unverified comparison language and viewpoint-level precision."""
-    content = _clean(text)
+    # Stats tokens contain code-owned objective facts, never estimated viewpoint counts.
+    # Callers must first validate token membership against their selected tables.
+    content = STAT_REF_RE.sub("确定性客观统计", _clean(text))
     profile_tokens = {
         _clean(item.get("profile_name"))
         for item in catalog
@@ -485,10 +515,13 @@ def validate_profile_language(
     if _EXACT_PEOPLE_RE.search(content) or profile_before_count or count_before_profile:
         return "观点级画像表述不得包含精确人数"
 
-    used_difference = next(
-        (term for term in PROFILE_DIFFERENCE_TERMS if term in content),
-        "",
-    )
+    used_difference = next((
+        term
+        for sentence in re.split(r"[。！？!?；;\n]", content)
+        for term in PROFILE_DIFFERENCE_TERMS
+        for match in re.finditer(re.escape(term), sentence)
+        if not _is_clear_product_comparison(sentence, match.start(), match.end(), profile_tokens)
+    ), "")
     if not used_difference:
         return None
     verified = [

@@ -1,3 +1,4 @@
+from copy import deepcopy
 import re
 import unittest
 
@@ -23,6 +24,50 @@ def _table(title, part=""):
 
 
 class InsightV3AssembleTests(unittest.TestCase):
+    def test_sample_distribution_dedup_preserves_distinct_data_and_original_tables(self):
+        profile = _table("MLBB客户端语言")
+        duplicate = _table("MLBB客户端语言", "Part 1 用户语言画像")
+        duplicate["table_markdown"] = duplicate["table_markdown"].replace("取值", "选项").replace(" | ", "|")
+        changed = _table("MLBB客户端语言", "Part 2 后续调查")
+        changed["table_markdown"] = changed["table_markdown"].replace("60", "55").replace("40", "45")
+        blocks = [profile, duplicate, changed, _table("性别")]
+        original = deepcopy(blocks)
+        selected = select_sample_tables(blocks, analysis_focus={"report_organization": "MLBB客户端语言"})
+        self.assertEqual(selected, [profile, blocks[3], changed])
+        self.assertEqual(blocks, original)
+        self.assertEqual(len(select_sample_tables([profile, deepcopy(profile)], analysis_focus=None)), 1)
+
+    def test_sample_dedup_does_not_infer_equal_scopes_or_merge_by_title(self):
+        first = _table("满意度", "Part 1")
+        second = _table("满意度", "Part 2")
+        self.assertEqual(len(select_sample_tables(
+            [first, second], analysis_focus={"report_organization": "满意度"},
+        )), 2)
+        profile = _table("性别")
+        different_scope = {**_table("性别", "Part 1"), "audience": "新玩家"}
+        self.assertEqual(len(select_sample_tables(
+            [profile, different_scope], analysis_focus={"report_organization": "性别"},
+        )), 2)
+
+    def test_action_required_data_prefixes_and_real_profile_dimension(self):
+        for prefix in ("需补充", "需要补充", ""):
+            with self.subTest(prefix=prefix):
+                action = {
+                    "title": "优化配置入口",
+                    "target_group": {"profile_name": "MLBB客户端语言", "profile_value": "英语"},
+                    "evidence_gap": "尚无上线后的行为数据。",
+                    "required_data": prefix + "上线后的使用数据。",
+                }
+                original = deepcopy(action)
+                rendered = render_actions_section(actions=[action], chapter_note="", section_index=5)
+                self.assertIn("仍需补充上线后的使用数据。", rendered)
+                self.assertNotIn("补充需", rendered)
+                self.assertIn("“MLBB客户端语言”为“英语”的群体", rendered)
+                self.assertIn("依据该人群的定性材料", rendered)
+                self.assertNotIn("专章", rendered)
+                self.assertNotIn("母语", rendered)
+                self.assertEqual(action, original)
+
     def test_sample_overview_keeps_profiles_and_only_focus_related_table(self):
         blocks = [
             _table("性别"),
@@ -48,7 +93,7 @@ class InsightV3AssembleTests(unittest.TestCase):
         self.assertNotIn("无关选择题", markdown)
         prose = re.sub(r"(?m)^\|.*$", "", markdown)
         prose = re.sub(r"[#*\s\d.%—-]", "", prose)
-        self.assertGreaterEqual(len(prose), 300)
+        self.assertNotIn("未交给模型", markdown)
         self.assertLessEqual(len(prose), 500)
 
     def test_assembly_uses_evidence_points_narrative_actions_and_deduplicated_appendix(self):
@@ -109,8 +154,8 @@ class InsightV3AssembleTests(unittest.TestCase):
         self.assertLess(report.index("## 二、样本概况"), report.index("## 三、核心发现"))
         self.assertIn("## 四、责任与协作压力", report)
         self.assertIn("## 五、行动建议", report)
-        self.assertIn("**提及情况：** 部分。", report)
-        self.assertIn("**证据要点：** 失败后被归责且缺少队友支援（详见 E-001）", report)
+        self.assertNotIn("**提及情况：**", report)
+        self.assertNotIn("**证据要点：**", report)
         self.assertIn("**建议一：强化协作状态反馈，降低单人归责**", report)
         self.assertIn("可考虑的设计方向：\n1. 补充关键支援状态反馈", report)
         self.assertIn("实施前后可通过结合试用反馈", report)
@@ -154,7 +199,8 @@ class InsightV3AssembleTests(unittest.TestCase):
             actions=[],
             action_note="当前证据不足以形成建议。",
         )
-        self.assertIn("- **证据要点：** 详见 E-001。", report)
+        self.assertNotIn("**证据要点：**", report)
+        self.assertIn("### E-001", report)
         self.assertEqual(report.count("这是一段需要完整保留、不能截短的多句反馈。"), 1)
         self.assertIn("> 第二句仍然属于同一条来源。", report)
 
@@ -192,6 +238,16 @@ class InsightV3AssembleTests(unittest.TestCase):
         self.assertIn("1 项未能由自动审校完整确认", report)
         self.assertIn("核心发现 / 压力来源（正文结论）", report)
         self.assertIn("不代表一定错误", report)
+
+    def test_unmet_research_task_is_visible_before_report_body(self):
+        report = assemble_report(
+            report_title="缺口测试", background_md="## 一、调研背景\n背景",
+            sample_md="## 二、样本概况\n样本", core_blocks=[], chapters=[],
+            findings_by_id={}, actions=[],
+            research_gaps=[{"expected_deliverable": "各偏好选项的原因", "gap": "未向无偏好选项追问原因，不能代为解释"}],
+        )
+        self.assertLess(report.index("研究任务缺口"), report.index("## 一、调研背景"))
+        self.assertIn("未向无偏好选项追问原因，不能代为解释", report)
 
 
 if __name__ == "__main__":

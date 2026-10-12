@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from app.services.insight_report_v3.research_context import expand_stat_references
+
 import json
 import re
 
@@ -80,6 +82,24 @@ def _title_relevance(title: str, focus_text: str) -> int:
     return score
 
 
+def _sample_distribution_key(block: dict) -> str | None:
+    """Compare only plain single-dimensional distributions, never titles alone."""
+    lines = [line.strip() for line in _clean(block.get("table_markdown")).splitlines() if line.strip()]
+    if len(lines) < 3 or any(not line.startswith("|") or not line.endswith("|") for line in lines):
+        return None
+    rows = [[cell.strip() for cell in line.strip("|").split("|")] for line in lines]
+    if rows[0] not in (["取值", "频数", "占比"], ["选项", "频数", "占比"]):
+        return None
+    if len(rows[1]) != 3 or any(not re.fullmatch(r":?-{3,}:?", cell) for cell in rows[1]):
+        return None
+    if any(len(row) != 3 for row in rows[2:]):
+        return None
+    metadata = {key: value for key, value in block.items() if key not in {
+        "part", "chart", "table_markdown", "id", "table_key", "headers", "rows",
+    }}
+    return json.dumps([metadata, rows[2:]], ensure_ascii=False, sort_keys=True)
+
+
 def select_sample_tables(
     structured_tables: list[dict],
     *,
@@ -106,17 +126,29 @@ def select_sample_tables(
     )
 
     selected: list[dict] = []
+    profile_keys = {
+        key for block in profile_tables if (key := _sample_distribution_key(block)) is not None
+    }
+    seen_profile_keys: set[str] = set()
+
+    def append_unique(block: dict) -> None:
+        key = _sample_distribution_key(block)
+        if block in selected or (key in profile_keys and key in seen_profile_keys):
+            return
+        selected.append(block)
+        if key in profile_keys:
+            seen_profile_keys.add(key)
+
     # Single-dimensional profile distributions are the primary sample overview.
     for block in profile_tables:
         if len(selected) >= maximum:
             break
-        selected.append(block)
+        append_unique(block)
     # Only objective tables with an actual analysis-focus match may join them.
     for score, _index, block in focus_ranked:
         if len(selected) >= maximum or score <= 0:
             break
-        if block not in selected:
-            selected.append(block)
+        append_unique(block)
     return selected
 
 
@@ -125,6 +157,7 @@ def render_sample_overview(
     structured_tables: list[dict],
     *,
     analysis_focus: dict | None,
+    interpretation: dict | None = None,
 ) -> tuple[str, list[dict]]:
     selected = select_sample_tables(
         structured_tables,
@@ -141,27 +174,15 @@ def render_sample_overview(
     else:
         opening = "本章沿用已确认统计中的样本口径；原始统计未提供可单独解析的总样本元数据。"
 
-    explanation = (
-        "样本概况只用于说明本次定性材料来自哪些玩家，不把样本结构外推为总体人群结构。"
-        "所有数字和表格均直接取自确定性统计结果，未交给模型重算、改写或补齐。"
-        "为避免概况章节挤占洞察正文，本章仅保留单维画像分布，以及与已确认分析重点直接相关的少量表格；"
-        "逐题客观题明细统一放在报告末尾的完整统计附录。"
-        "样本分布只帮助理解后续观点的材料背景；样本较少的人群观察应视为探索性线索，"
-        "不得据此比较群体高低、推断因果或形成总体结论。"
+    interpretation = interpretation or {}
+    explanation = expand_stat_references(
+        _clean(interpretation.get("body")), interpretation.get("objective_facts") or {},
     )
-    if selected:
-        titles = "、".join(f"“{_clean(block.get('title'))}”" for block in selected)
-        selection_note = (
-            f"本章展示 {len(selected)} 张表，覆盖{titles}。阅读这些表时应关注样本覆盖与构成，"
-            "不能据此推断开放题观点在总体玩家中的精确比例，也不能把代表性引用数量当作观点人数。"
-        )
+    lines = ["## 二、样本概况", "", opening]
+    if explanation:
+        lines.extend(["", explanation])
     else:
-        selection_note = (
-            "当前统计中没有符合本章筛选规则的单维画像或分析重点相关表格，因此不为凑数量复制其它统计表。"
-            "完整逐题数字仍在附录保留。"
-        )
-
-    lines = ["## 二、样本概况", "", opening, "", explanation, "", selection_note]
+        lines.extend(["", "以下分布描述本次受访样本，不代表总体玩家结构。"])
     for block in selected:
         lines.extend([
             "",
@@ -259,23 +280,11 @@ def render_written_section(
     for block in blocks or []:
         finding_ids = list(dict.fromkeys(block.get("finding_ids") or []))
         findings = [findings_by_id[item] for item in finding_ids if item in findings_by_id]
-        heading = _clean(block.get("heading")) or "关键发现"
-        body = _clean(block.get("body"))
-        frequency = finding_frequency_label(findings)
+        heading = expand_stat_references(_clean(block.get("heading")), block.get("objective_facts") or {}) or "关键发现"
+        body = expand_stat_references(_clean(block.get("body")), block.get("objective_facts") or {})
         lines.extend(["", f"**{heading}**"])
-        if frequency:
-            lines.extend(["", f"**提及情况：** {frequency}。"])
         if body:
             lines.extend(["", body])
-        for evidence in block.get("evidence") or []:
-            evidence_id = evidence_ids.get(_clean(evidence.get("response_id")))
-            if not evidence_id:
-                continue
-            point = _clean(evidence.get("evidence_point"))
-            if point:
-                lines.extend(["", f"- **证据要点：** {point}（详见 {evidence_id}）"])
-            else:
-                lines.extend(["", f"- **证据要点：** 详见 {evidence_id}。"])
     return "\n".join(lines).strip()
 
 
@@ -298,7 +307,8 @@ def render_actions_section(
             profile_name = _clean(target_group.get("profile_name"))
             profile_value = _clean(target_group.get("profile_value"))
             if profile_value:
-                lines.extend(["", f"这是一项面向{profile_value}群体的专项建议，依据该人群专章中的定性材料提出。"])
+                group_label = f"“{profile_name}”为“{profile_value}”的群体" if profile_name else f"{profile_value}群体"
+                lines.extend(["", f"这是一项面向{group_label}的专项建议，依据该人群的定性材料提出。"])
             elif profile_name:
                 lines.extend(["", f"这是一项面向{profile_name}相关群体的专项建议。"])
         problem = _clean(action.get("problem"))
@@ -326,7 +336,7 @@ def render_actions_section(
         required_data = _clean(action.get("required_data"))
         if evidence_gap and required_data:
             gap_detail = evidence_gap.rstrip("。.!！?？；;")
-            required_detail = re.sub(r"^需要补充\s*", "", required_data).rstrip("。.!！?？；;")
+            required_detail = re.sub(r"^需(?:要)?补充\s*", "", required_data).rstrip("。.!！?？；;")
             lines.extend(["", f"当前证据边界是{gap_detail}；在进一步决策前仍需补充{required_detail}。"])
     return "\n".join(lines).strip()
 
@@ -337,7 +347,7 @@ def render_evidence_appendix(evidence_index: list[dict]) -> str:
     lines = [
         "## 附录 A：完整证据索引",
         "",
-        "正文只保留一句话证据要点；本附录保存完整中文译文，并列出全部引用位置。",
+        "本附录保存完整中文译文，并按章节与段落列出全部引用位置。原始反馈不等于已核实事实。",
     ]
     for entry in evidence_index:
         lines.extend([
@@ -389,6 +399,7 @@ def assemble_report(
     action_note: str = "",
     evidence_index: list[dict] | None = None,
     audit_unresolved: list[dict] | None = None,
+    research_gaps: list[dict] | None = None,
 ) -> str:
     title = _clean(report_title) or "观点洞察报告"
     index = evidence_index if evidence_index is not None else build_evidence_index(
@@ -410,6 +421,11 @@ def assemble_report(
     rendered = [
         f"# {title}",
         render_unresolved_audit_notice(audit_unresolved),
+        "\n".join(
+            "> **研究任务缺口：** " + _clean(item.get("expected_deliverable") or item.get("title") or "已确认研究要求")
+            + "——" + _clean(item.get("gap") or item.get("reason") or "尚未得到可靠覆盖")
+            for item in research_gaps or []
+        ),
         _clean(background_md),
         _clean(sample_md),
         core,

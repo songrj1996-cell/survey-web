@@ -63,7 +63,7 @@ def _payloads(events):
     ]
 
 
-def _fake_v3_generator(calls):
+def _fake_v3_generator(calls, artifact_overrides=None):
     async def generate(**kwargs):
         calls.append(kwargs)
         yield ("analysis_progress", {
@@ -84,6 +84,7 @@ def _fake_v3_generator(calls):
                 "questions": [],
                 "diagnostics": {"stop_reason": "all_questions_finished"},
             },
+            **(artifact_overrides or {}),
         })
         yield ("analysis_progress", {
             "phase": "writing",
@@ -155,8 +156,35 @@ def _fake_v3_generator(calls):
     return generate
 
 
+def _append_v3_base(sess):
+    frozen = report_modes.freeze_report_inputs(sess)
+    return report_versions.append_report_version(
+        sess,
+        {
+            "report_style": "full",
+            "report_mode": "insight",
+            "report_engine": "insight_v3",
+            "report_status": "complete",
+            "input_snapshot": frozen,
+            "report_md": "# 旧 V3 报告",
+            "title": "旧 V3 报告",
+            "qa_context_md": "<qa_context>旧报告</qa_context>",
+            "qa_messages": [],
+            "qa_provider": "",
+            "qa_model": "",
+            "analyst_conv_id": "",
+            "analyst_app": "insight_v3",
+            "report_writer_provider": "direct_llm",
+            "report_writer_model": "old-v3-model",
+            "viewpoint_diagnostics": {"engine": "insight_v3"},
+            "comparison_validation": {"status": "passed"},
+        },
+        kind="initial",
+    )
+
+
 @contextmanager
-def _isolated_v3_runtime(sess, *, enabled):
+def _isolated_v3_runtime(sess, *, enabled, artifact_overrides=None):
     calls = []
     inject = Mock(side_effect=AssertionError("V3 must not use Part-title stats injection"))
     legacy_writer = AsyncMock(side_effect=AssertionError("V3 must not use legacy writer"))
@@ -175,7 +203,7 @@ def _isolated_v3_runtime(sess, *, enabled):
         pipeline_call = stack.enter_context(patch.object(
             survey_service,
             "generate_insight_report_v3",
-            new=_fake_v3_generator(calls),
+            new=_fake_v3_generator(calls, artifact_overrides),
         ))
         stack.enter_context(patch.object(
             survey_service,
@@ -293,33 +321,22 @@ class InsightV3SurveyIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([block["title"] for block in appendix_blocks], ["体验选择"])
         runtime["legacy_writer"].assert_not_awaited()
         self.assertEqual(len(runtime["calls"]), 1)
+        self.assertEqual(runtime["calls"][0]["rows"], sess["rows"])
 
-    async def test_saved_v3_regenerates_with_v3_when_feature_flag_is_off(self):
+    async def test_complete_v3_stats_artifact_supplies_cross_tables_to_appendix(self):
         sess = _session()
-        frozen = report_modes.freeze_report_inputs(sess)
-        report_versions.append_report_version(
-            sess,
-            {
-                "report_style": "full",
-                "report_mode": "insight",
-                "report_engine": "insight_v3",
-                "report_status": "complete",
-                "input_snapshot": frozen,
-                "report_md": "# 旧 V3 报告",
-                "title": "旧 V3 报告",
-                "qa_context_md": "<qa_context>旧报告</qa_context>",
-                "qa_messages": [],
-                "qa_provider": "",
-                "qa_model": "",
-                "analyst_conv_id": "",
-                "analyst_app": "insight_v3",
-                "report_writer_provider": "direct_llm",
-                "report_writer_model": "old-v3-model",
-                "viewpoint_diagnostics": {"engine": "insight_v3"},
-                "comparison_validation": {"status": "passed"},
-            },
-            kind="initial",
-        )
+        cross = {"title": "评价 / 按偏好交叉", "part": "Part 1", "table_key": "cross-table",
+                 "table_markdown": "| 偏好 | 好玩 | 样本量 |\n|---|---|---|\n| 无偏好 | 2 | 3 |"}
+        with _isolated_v3_runtime(sess, enabled=True, artifact_overrides={
+            "insight_v3_stats_tables": [cross],
+        }) as runtime:
+            events = [event async for event in survey_service.report_stream("v3-cross-stats", object(), generation_kind="initial")]
+        self.assertFalse(any(item.get("type") == "error" for item in _payloads(events)))
+        self.assertEqual(runtime["render_appendix"].call_args.args[0], [cross])
+
+    async def test_saved_v3_regeneration_is_rejected_when_feature_flag_is_off(self):
+        sess = _session()
+        _append_v3_base(sess)
 
         with _isolated_v3_runtime(sess, enabled=False) as runtime:
             events = [
@@ -333,12 +350,157 @@ class InsightV3SurveyIntegrationTests(unittest.IsolatedAsyncioTestCase):
             ]
 
         payloads = _payloads(events)
+        error = next(item for item in payloads if item.get("type") == "error")
+        self.assertIn("V3 开关已关闭", error["message"])
+        self.assertEqual(len(runtime["calls"]), 0)
+        runtime["legacy_writer"].assert_not_awaited()
+        self.assertEqual(len(report_versions.normalize_report_versions(sess)), 1)
+
+    async def test_structural_regeneration_saves_revised_focus_before_pipeline(self):
+        sess = _session()
+        _append_v3_base(sess)
+        revised_focus = {
+            "core_question": "哪些阻力最值得优先处理",
+            "report_organization": "先写关键阻力，再写机会点",
+            "supporting_analyses": ["结合开放题场景"],
+            "evidence_role": "原话支撑判断，统计描述样本",
+            "expected_deliverables": ["关键阻力", "机会点"],
+            "avoid_structures": ["不得按题目逐项罗列"],
+        }
+
+        async def fake_preflight(**kwargs):
+            revised = deepcopy(kwargs["plan"])
+            revised["analysis_focus"] = deepcopy(revised_focus)
+            yield ("result", {
+                "supported": True,
+                "effective_plan": revised,
+                "report_instruction": kwargs["instruction"],
+                "planning_instruction": kwargs["instruction"],
+                "error_message": "",
+                "diagnostics": {
+                    "schema_version": "insight-v3-regeneration-v1",
+                    "prompt_version": "regeneration-prompt-v1-impact-gated",
+                    "status": "plan_revised",
+                    "classification": {
+                        "categories": ["chapter_structure", "analysis_focus"],
+                        "supported": True,
+                        "capability": "supported",
+                        "reason": "结构调整",
+                        "normalized_request": kwargs["instruction"],
+                    },
+                    "logical_calls": 2,
+                    "models": ["mock-classifier", "mock-reviser"],
+                },
+            })
+
+        instruction = "先写关键阻力，再写机会点"
+        with (
+            _isolated_v3_runtime(sess, enabled=True) as runtime,
+            patch.object(
+                survey_service,
+                "prepare_insight_regeneration",
+                new=fake_preflight,
+            ),
+        ):
+            events = [
+                event
+                async for event in survey_service.report_stream(
+                    "v3-structural-regeneration",
+                    object(),
+                    instruction=instruction,
+                    generation_kind="regenerate",
+                    base_version=1,
+                )
+            ]
+
+        payloads = _payloads(events)
         self.assertFalse(any(item.get("type") == "error" for item in payloads))
         self.assertEqual(len(runtime["calls"]), 1)
-        runtime["legacy_writer"].assert_not_awaited()
+        pipeline_kwargs = runtime["calls"][0]
+        self.assertEqual(pipeline_kwargs["plan"]["analysis_focus"], revised_focus)
+        self.assertEqual(pipeline_kwargs["report_instruction"], instruction)
+        self.assertEqual(pipeline_kwargs["planning_instruction"], instruction)
+        self.assertIsNotNone(pipeline_kwargs["baseline_source_contract"])
+
         regenerated = report_versions.resolve_report_version(sess, 2)
-        self.assertEqual(regenerated["report_engine"], "insight_v3")
         self.assertEqual(regenerated["base_version"], 1)
+        self.assertEqual(regenerated["instruction"], instruction)
+        frozen = regenerated["input_snapshot"]
+        self.assertEqual(frozen["plan"]["analysis_focus"], revised_focus)
+        self.assertEqual(frozen["v3_regeneration"]["instruction"], instruction)
+        self.assertEqual(
+            frozen["v3_regeneration"]["classification"]["categories"],
+            ["chapter_structure", "analysis_focus"],
+        )
+
+    async def test_unsupported_data_scope_regeneration_creates_no_version_or_report_body(self):
+        sess = _session()
+        _append_v3_base(sess)
+        before = deepcopy(sess)
+
+        async def fake_preflight(**_kwargs):
+            yield ("result", {
+                "supported": False,
+                "effective_plan": None,
+                "report_instruction": _kwargs["instruction"],
+                "planning_instruction": "",
+                "error_message": "当前不支持修改数据范围；本次未生成新版本。",
+                "diagnostics": {
+                    "status": "rejected",
+                    "logical_calls": 0,
+                    "models": [],
+                },
+            })
+
+        with (
+            _isolated_v3_runtime(sess, enabled=True) as runtime,
+            patch.object(
+                survey_service,
+                "prepare_insight_regeneration",
+                new=fake_preflight,
+            ),
+        ):
+            events = [
+                event
+                async for event in survey_service.report_stream(
+                    "v3-unsupported-regeneration",
+                    object(),
+                    instruction="只分析最近一个月新收集的回答",
+                    generation_kind="regenerate",
+                    base_version=1,
+                )
+            ]
+
+        payloads = _payloads(events)
+        error = next(item for item in payloads if item.get("type") == "error")
+        self.assertIn("本次未生成新版本", error["message"])
+        self.assertEqual(len(runtime["calls"]), 0)
+        self.assertEqual(len(report_versions.normalize_report_versions(sess)), 1)
+        diagnostic_event = next(item for item in payloads if item.get("type") == "report_regeneration_diagnostics")
+        self.assertEqual(diagnostic_event["diagnostics"]["status"], "rejected")
+        self.assertLess(payloads.index(diagnostic_event), payloads.index(error))
+        for key in ("plan", "report_versions", "active_report_version", "next_report_version"):
+            self.assertEqual(sess.get(key), before.get(key))
+        runtime["save_session"].assert_not_called()
+        runtime["save_history"].assert_not_called()
+
+    async def test_missing_native_language_rejects_real_preflight_without_new_version(self):
+        sess = _session()
+        sess["plan"]["columns"].append({
+            "index": 1, "name": "MLBB客户端语言", "role": "single_choice",
+            "use_as_profile": True, "profile_scope": "analysis", "options": ["英语", "印尼语"],
+        })
+        _append_v3_base(sess)
+        with _isolated_v3_runtime(sess, enabled=True) as runtime:
+            events = [event async for event in survey_service.report_stream(
+                "v3-missing-native-language", object(),
+                instruction="每个 part 都区分母语英语和母语印尼语玩家，分别写结论。",
+                generation_kind="regenerate", base_version=1,
+            )]
+        error = next(item for item in _payloads(events) if item.get("type") == "error")
+        self.assertIn("没有母语画像字段", error["message"])
+        self.assertEqual(runtime["calls"], [])
+        self.assertEqual(len(report_versions.normalize_report_versions(sess)), 1)
 
 
 if __name__ == "__main__":

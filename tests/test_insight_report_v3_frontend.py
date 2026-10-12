@@ -9,6 +9,11 @@ REPORT_JS = (ROOT / "static" / "js" / "features" / "report.js").read_text(
 
 
 class InsightV3FrontendContractTests(unittest.TestCase):
+    def test_all_sources_button_is_honestly_named_without_changing_query(self):
+        source = (ROOT / "static/js/features/report-quick.js").read_text(encoding="utf-8")
+        self.assertIn("source.textContent = '查看全部回答'", source)
+        self.assertIn("openReportSources('', '全部题目', 'all')", source)
+
     def test_audit_progress_is_retained_until_report_done(self):
         self.assertIn("let insightAudit = null;", REPORT_JS)
         self.assertIn("if (ev.phase === 'audit') insightAudit = { ...ev };", REPORT_JS)

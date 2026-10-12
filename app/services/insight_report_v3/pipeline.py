@@ -17,17 +17,20 @@ from app.services.insight_report_v3.assemble import (
     build_evidence_index,
     render_research_background,
     render_sample_overview,
+    select_sample_tables,
 )
 from app.services.insight_report_v3.audit import (
     audit_report_sections,
     scan_frequency_review_candidates,
 )
 from app.services.insight_report_v3.chapters import (
+    apply_cross_group_capacity_preflight,
     build_stats_catalog,
     ensure_required_group_chapters,
     extract_group_findings,
     flatten_findings,
     plan_chapters,
+    retained_group_findings,
     verify_suspected_skews,
     write_chapters,
     write_actions,
@@ -43,10 +46,20 @@ from app.services.insight_report_v3.profiles import (
     profile_catalog,
 )
 from app.services.report_engine import _run_bounded_calls
+from app.services.insight_report_v3.research_context import (
+    complete_stats_tables, linked_source_context, coverage_ledger,
+)
 
 
 PIPELINE_SCHEMA_VERSION = "insight-report-v3-stage3-v1"
-DIAGNOSTICS_SCHEMA_VERSION = "insight-v3-diagnostics-v3"
+DIAGNOSTICS_SCHEMA_VERSION = "insight-v3-diagnostics-v5-retained-groups"
+_LEGACY_FINDINGS_BINDING_FIELDS = (
+    "file_sha256",
+    "plan_fingerprint",
+    "source_registry_fingerprint",
+    "frequency_rules_version",
+    "findings_prompt_version",
+)
 
 
 def _analysis_progress(phase: str, status: str, message: str, **extra) -> dict:
@@ -62,15 +75,119 @@ def _analysis_progress(phase: str, status: str, message: str, **extra) -> dict:
     }
 
 
-def _can_reuse_findings(existing: dict | None, source_contract: dict) -> bool:
+def _question_progress_fields(
+    question_result: dict,
+    source_question: dict,
+    plan: dict,
+) -> dict:
+    """Mirror the legacy per-question progress contract for the V3 UI."""
+    part_index = source_question.get("part_index")
+    parts = list((plan or {}).get("parts") or [])
+    part_name = "未分章开放题"
+    if (
+        type(part_index) is int
+        and 1 <= part_index <= len(parts)
+        and isinstance(parts[part_index - 1], dict)
+    ):
+        part_name = str(parts[part_index - 1].get("name") or part_name)
+    question_status = str(question_result.get("status") or "")
+    return {
+        "status": {
+            "complete": "completed",
+            "degraded": "degraded",
+            "skipped": "skipped",
+        }.get(question_status, "completed"),
+        "step": "completed",
+        "question_status": question_status,
+        "scope_key": str(question_result.get("scope_key") or ""),
+        "part_index": part_index,
+        "part_name": part_name,
+        "question_name": source_question.get("question") or "开放题",
+        "audience": source_question.get("audience") or "",
+        "respondent_count": int(source_question.get("respondent_count") or 0),
+        "count_unit": "players",
+    }
+
+
+def _binding_matches(
+    existing_binding: dict,
+    expected_binding: dict,
+    *,
+    include_findings_input: bool,
+) -> bool:
+    if not all(
+        existing_binding.get(field) == expected_binding.get(field)
+        for field in _LEGACY_FINDINGS_BINDING_FIELDS
+    ):
+        return False
+    existing_input = existing_binding.get("findings_input_fingerprint")
     return bool(
+        not include_findings_input
+        or not existing_input
+        or existing_input == expected_binding.get("findings_input_fingerprint")
+    )
+
+
+def _can_reuse_findings(
+    existing: dict | None,
+    source_contract: dict,
+    *,
+    baseline_source_contract: dict | None = None,
+) -> bool:
+    if not (
         isinstance(existing, dict)
         and existing.get("schema_version") == FINDINGS_SCHEMA_VERSION
-        and existing.get("source_binding") == source_contract.get("source_binding")
         and (existing.get("diagnostics") or {}).get("stop_reason") == "all_questions_finished"
         and isinstance(existing.get("source_registry"), dict)
         and isinstance(existing.get("questions"), list)
+    ):
+        return False
+    existing_binding = existing.get("source_binding") or {}
+    current_binding = source_contract.get("source_binding") or {}
+    if _binding_matches(
+        existing_binding,
+        current_binding,
+        include_findings_input=True,
+    ):
+        return True
+    if not isinstance(baseline_source_contract, dict):
+        return False
+    baseline_binding = baseline_source_contract.get("source_binding") or {}
+    return bool(
+        _binding_matches(
+            existing_binding,
+            baseline_binding,
+            include_findings_input=False,
+        )
+        and baseline_binding.get("findings_input_fingerprint")
+        and baseline_binding.get("findings_input_fingerprint")
+        == current_binding.get("findings_input_fingerprint")
     )
+
+
+def _rebind_reused_findings(existing: dict, source_contract: dict) -> dict:
+    """Move a source-compatible artifact onto the run-specific plan binding."""
+    updated = deepcopy(existing)
+    updated["source_binding"] = deepcopy(source_contract["source_binding"])
+    updated["source_registry"] = deepcopy(source_contract["source_registry"])
+    question_by_scope = {
+        str(item.get("scope_key")): item
+        for item in source_contract.get("questions") or []
+    }
+    for result in updated.get("questions") or []:
+        source = question_by_scope.get(str(result.get("scope_key")))
+        if source is None:
+            continue
+        for field in (
+            "question_key",
+            "scope_key",
+            "column_indexes",
+            "question",
+            "audience",
+            "respondent_count",
+        ):
+            result[field] = deepcopy(source[field])
+    return updated
 
 
 def _checkpoint_with_question(checkpoint: dict, question_result: dict) -> dict:
@@ -136,8 +253,13 @@ async def generate_insight_report_v3(
     file_sha256: str,
     stats_md: str,
     structured_tables: list[dict],
+    rows: list | None = None,
     qualitative_context: dict | None = None,
     existing_findings: dict | None = None,
+    baseline_source_contract: dict | None = None,
+    report_instruction: str = "",
+    planning_instruction: str = "",
+    regeneration_diagnostics: dict | None = None,
     question_concurrency: int | None = None,
     chapter_concurrency: int | None = None,
     translation_namespace: str,
@@ -151,7 +273,13 @@ async def generate_insight_report_v3(
         headers=headers,
         file_sha256=file_sha256,
     )
-    item_total = len(source_contract.get("questions") or [])
+    source_questions = source_contract.get("questions") or []
+    item_total = len(source_questions)
+    question_by_scope = {
+        str(item.get("scope_key")): item
+        for item in source_questions
+        if isinstance(item, dict)
+    }
     yield ("analysis_progress", _analysis_progress(
         "themes",
         "active",
@@ -160,8 +288,15 @@ async def generate_insight_report_v3(
         item_index=0,
     ))
 
-    reused_findings = _can_reuse_findings(existing_findings, source_contract)
-    findings_artifact = deepcopy(existing_findings) if reused_findings else None
+    reused_findings = _can_reuse_findings(
+        existing_findings,
+        source_contract,
+        baseline_source_contract=baseline_source_contract,
+    )
+    findings_artifact = (
+        _rebind_reused_findings(existing_findings, source_contract)
+        if reused_findings else None
+    )
     if reused_findings:
         yield ("analysis_progress", _analysis_progress(
             "themes",
@@ -192,14 +327,22 @@ async def generate_insight_report_v3(
                 completed_count += 1
                 checkpoint = _checkpoint_with_question(checkpoint or {}, payload)
                 yield ("artifacts", {"insight_v3_findings": deepcopy(checkpoint)})
+                source_question = question_by_scope.get(
+                    str(payload.get("scope_key")),
+                    payload,
+                )
+                progress_fields = _question_progress_fields(
+                    payload,
+                    source_question,
+                    plan,
+                )
                 yield ("analysis_progress", _analysis_progress(
                     "themes",
-                    "active",
+                    progress_fields.pop("status"),
                     f"逐题提炼 {completed_count}/{item_total}：{payload.get('status')}",
                     item_total=item_total,
                     item_index=completed_count,
-                    question_status=payload.get("status"),
-                    scope_key=payload.get("scope_key"),
+                    **progress_fields,
                 ))
             elif event_type == "warning":
                 yield ("progress", payload.get("message") or "逐题提炼耗时超过告警阈值，继续运行。")
@@ -228,7 +371,12 @@ async def generate_insight_report_v3(
     yield ("artifacts", {"insight_v3_findings": deepcopy(findings_artifact)})
     base_findings = flatten_findings(findings_artifact)
     profiles = profile_catalog(findings_artifact.get("source_registry") or {}, plan)
-    stats_catalog = build_stats_catalog(structured_tables)
+    complete_tables = complete_stats_tables(stats_md, structured_tables)
+    stats_catalog = build_stats_catalog(complete_tables)
+    sample_stats = select_sample_tables(stats_catalog, analysis_focus=(plan or {}).get("analysis_focus"))
+    writer_registry, source_context_diagnostics = linked_source_context(
+        findings_artifact.get("source_registry") or {}, rows=rows, plan=plan,
+    )
 
     yield ("analysis_progress", _analysis_progress(
         "writing",
@@ -238,13 +386,74 @@ async def generate_insight_report_v3(
         item_index=0,
     ))
 
-    if base_findings:
+    cross_chapter_groups = [
+        deepcopy(item)
+        for item in (regeneration_diagnostics or {}).get("cross_chapter_groups") or []
+        if isinstance(item, dict)
+    ]
+    cross_chapter_requested = bool(
+        (regeneration_diagnostics or {}).get("cross_chapter_requested")
+        and cross_chapter_groups
+    )
+    requested_cross_keys = {
+        (str(item.get("profile_name") or ""), str(item.get("profile_value") or ""))
+        for item in cross_chapter_groups
+    }
+    group_diagnostics: dict[str, dict] = {}
+    group_findings: list[dict] = []
+    available_cross_keys: set[tuple[str, str]] = set()
+
+    if cross_chapter_requested:
+        cross_factories = [
+            lambda index=index, group=group: extract_group_findings(
+                chapter={
+                    "id": f"cross-g{index:02d}",
+                    "group_focus": deepcopy(group),
+                },
+                source_registry=findings_artifact.get("source_registry") or {},
+                plan=plan,
+                on_attempt_event=on_attempt_event,
+            )
+            for index, group in enumerate(cross_chapter_groups, 1)
+        ]
+        async for event_type, payload in _run_bounded_calls(
+            cross_factories,
+            min(2, max(1, len(cross_factories))),
+        ):
+            if event_type == "heartbeat":
+                yield ("heartbeat", "")
+            elif event_type == "result":
+                index, (items, item_diagnostics) = payload
+                group = cross_chapter_groups[index]
+                key = (
+                    str(group.get("profile_name") or ""),
+                    str(group.get("profile_value") or ""),
+                )
+                diagnostic_key = f"cross:{key[0]}={key[1]}"
+                group_diagnostics[diagnostic_key] = item_diagnostics
+                if items:
+                    available_cross_keys.add(key)
+                    group_findings.extend(items)
+
+    cross_groups_ready = bool(
+        cross_chapter_requested
+        and len(requested_cross_keys) == 2
+        and available_cross_keys == requested_cross_keys
+    )
+    planning_findings = [
+        *base_findings,
+        *(group_findings if cross_groups_ready else []),
+    ]
+
+    if planning_findings:
         async for kind, payload in _wait_task_with_heartbeats(plan_chapters(
-            findings=base_findings,
+            findings=planning_findings,
             plan=plan,
             qualitative_context=qualitative_context,
             stats_catalog=stats_catalog,
             profiles=profiles,
+            report_instruction=planning_instruction,
+            cross_chapter_groups=(cross_chapter_groups if cross_groups_ready else []),
             on_attempt_event=on_attempt_event,
         )):
             yield (kind, payload)
@@ -263,40 +472,53 @@ async def generate_insight_report_v3(
             "reason": "no_findings",
         }
 
-    chapter_plan, analysis_focus_diagnostics = ensure_required_group_chapters(
-        chapter_plan,
-        plan=plan,
-        profiles=profiles,
-        findings=base_findings,
-    )
-
-    group_diagnostics: dict[str, dict] = {}
-    group_findings: list[dict] = []
-    group_chapters = [
-        chapter for chapter in chapter_plan.get("chapters") or []
-        if isinstance(chapter.get("group_focus"), dict)
-    ]
-    group_factories = [
-        lambda chapter=chapter: extract_group_findings(
-            chapter=chapter,
-            source_registry=findings_artifact.get("source_registry") or {},
+    if cross_chapter_requested:
+        analysis_focus_diagnostics = {
+            "status": "present",
+            "message": "已收到跨章节双人群要求，最终执行结果待逐章预检与写作完成后确认",
+            "required": deepcopy(cross_chapter_groups),
+            "inserted": [],
+            "already_present": [],
+            "unresolved": (
+                [] if cross_groups_ready
+                else [{"reason": "group_findings_unavailable"}]
+            ),
+            "rejected_unrequested_group_chapters": [],
+            "fallback_used": not cross_groups_ready,
+        }
+    else:
+        chapter_plan, analysis_focus_diagnostics = ensure_required_group_chapters(
+            chapter_plan,
             plan=plan,
-            on_attempt_event=on_attempt_event,
+            profiles=profiles,
+            findings=base_findings,
         )
-        for chapter in group_chapters
-    ]
-    async for event_type, payload in _run_bounded_calls(
-        group_factories,
-        min(2, max(1, len(group_factories))),
-    ):
-        if event_type == "heartbeat":
-            yield ("heartbeat", "")
-        elif event_type == "result":
-            index, (items, diagnostics) = payload
-            chapter = group_chapters[index]
-            group_diagnostics[chapter["id"]] = diagnostics
-            group_findings.extend(items)
-            chapter["finding_ids"].extend(item["id"] for item in items)
+
+        group_chapters = [
+            chapter for chapter in chapter_plan.get("chapters") or []
+            if isinstance(chapter.get("group_focus"), dict)
+        ]
+        group_factories = [
+            lambda chapter=chapter: extract_group_findings(
+                chapter=chapter,
+                source_registry=findings_artifact.get("source_registry") or {},
+                plan=plan,
+                on_attempt_event=on_attempt_event,
+            )
+            for chapter in group_chapters
+        ]
+        async for event_type, payload in _run_bounded_calls(
+            group_factories,
+            min(2, max(1, len(group_factories))),
+        ):
+            if event_type == "heartbeat":
+                yield ("heartbeat", "")
+            elif event_type == "result":
+                index, (items, item_diagnostics) = payload
+                chapter = group_chapters[index]
+                group_diagnostics[chapter["id"]] = item_diagnostics
+                group_findings.extend(items)
+                chapter["finding_ids"].extend(item["id"] for item in items)
 
     if base_findings and chapter_plan.get("suspected_skews"):
         async for kind, payload in _wait_task_with_heartbeats(verify_suspected_skews(
@@ -319,14 +541,44 @@ async def generate_insight_report_v3(
         }
 
     findings_artifact = _replace_base_findings(findings_artifact, base_findings)
-    all_findings = [*base_findings, *group_findings]
+    effective_group_findings = (
+        group_findings
+        if not cross_chapter_requested or cross_groups_ready
+        else []
+    )
+    all_findings = [*base_findings, *effective_group_findings]
     findings_by_id = {item["id"]: item for item in all_findings}
+    for chapter in chapter_plan.get("chapters") or []:
+        chapter["analysis_focus"] = deepcopy((plan or {}).get("analysis_focus") or {})
+    if cross_chapter_requested:
+        chapter_plan, cross_chapter_diagnostics = apply_cross_group_capacity_preflight(
+            chapter_plan,
+            requested_groups=cross_chapter_groups,
+            available_groups=available_cross_keys,
+            findings_by_id=findings_by_id,
+            source_registry=writer_registry,
+            stats_catalog=stats_catalog,
+            qualitative_context=qualitative_context,
+            report_instruction=report_instruction,
+            chapter_plan_status=plan_diagnostics.get("status") or "incomplete",
+        )
+    else:
+        cross_chapter_diagnostics = {
+            "status": "not_requested",
+            "requested_groups": [],
+            "available_groups": [],
+            "chapter_count": 0,
+            "enabled_chapter_count": 0,
+            "fallback_chapter_count": 0,
+            "chapters": [],
+        }
     yield ("artifacts", {
         "insight_v3_findings": deepcopy(findings_artifact),
         "insight_v3_chapter_plan": deepcopy(chapter_plan),
     })
 
     written_chapters: list[dict] = []
+    sample_interpretation = None
     if chapter_plan.get("chapters"):
         chapter_total = len(chapter_plan["chapters"])
         yield ("analysis_progress", _analysis_progress(
@@ -339,10 +591,11 @@ async def generate_insight_report_v3(
         async for event_type, payload in write_chapters(
             chapters=chapter_plan["chapters"],
             findings_by_id=findings_by_id,
-            source_registry=findings_artifact.get("source_registry") or {},
+            source_registry=writer_registry,
             stats_catalog=stats_catalog,
             profiles=profiles,
             qualitative_context=qualitative_context,
+            report_instruction=report_instruction,
             translation_namespace=translation_namespace,
             concurrency=chapter_concurrency,
             on_attempt_event=on_attempt_event,
@@ -366,16 +619,21 @@ async def generate_insight_report_v3(
         async for kind, payload in _wait_task_with_heartbeats(write_core_findings(
             chapters=written_chapters,
             findings_by_id=findings_by_id,
-            source_registry=findings_artifact.get("source_registry") or {},
+            source_registry=writer_registry,
             profiles=profiles,
             qualitative_context=qualitative_context,
+            report_instruction=report_instruction,
             translation_namespace=translation_namespace,
             on_attempt_event=on_attempt_event,
+            stats_catalog=stats_catalog,
+            sample_stats=sample_stats,
+            analysis_focus=(plan or {}).get("analysis_focus"),
         )):
             yield (kind, payload)
         core = _wait_task_with_heartbeats.result
         core_blocks = core.get("blocks") or []
         core_diagnostics = core.get("diagnostics") or {}
+        sample_interpretation = core.get("sample_overview")
     else:
         core_blocks = [{
             "id": "no-open-findings",
@@ -398,6 +656,7 @@ async def generate_insight_report_v3(
         findings_by_id=findings_by_id,
         profiles=profiles,
         qualitative_context=qualitative_context,
+        report_instruction=report_instruction,
         on_attempt_event=on_attempt_event,
     )):
         yield (kind, payload)
@@ -415,7 +674,7 @@ async def generate_insight_report_v3(
     yield ("analysis_progress", _analysis_progress(
         "audit",
         "active",
-        "正在逐项核对正文结论、证据要点与绑定原文",
+        "正在核对正文证据、客观统计与研究任务覆盖",
         item_total=0,
         item_index=0,
     ))
@@ -424,16 +683,22 @@ async def generate_insight_report_v3(
         core_blocks=core_blocks,
         chapters=written_chapters,
         findings_by_id=findings_by_id,
-        source_registry=findings_artifact.get("source_registry") or {},
+        source_registry=writer_registry,
         profiles=profiles,
         on_attempt_event=on_attempt_event,
+        sample_overview=sample_interpretation,
+        research_tasks=chapter_plan.get("research_tasks") or [],
+        analysis_focus=(plan or {}).get("analysis_focus") or {},
+        actions=actions,
     )):
         yield (kind, payload)
     audit_result = _wait_task_with_heartbeats.result
+    actions = audit_result.get("actions", actions)
     core_blocks = audit_result.get("core_blocks") or []
     written_chapters = audit_result.get("chapters") or []
     audit_unresolved = audit_result.get("unresolved") or []
     audit_diagnostics = audit_result.get("diagnostics") or {}
+    sample_interpretation = audit_result.get("sample_overview", sample_interpretation)
     audit_status = audit_diagnostics.get("status") or "incomplete"
     audit_progress_status = (
         "degraded" if audit_status in {"needs_review", "incomplete"} else "completed"
@@ -468,9 +733,21 @@ async def generate_insight_report_v3(
     background_md = render_research_background(qualitative_context)
     sample_md, selected_sample_tables = render_sample_overview(
         stats_md,
-        structured_tables,
+        stats_catalog,
         analysis_focus=(plan or {}).get("analysis_focus"),
+        interpretation=sample_interpretation,
     )
+    research_gaps = deepcopy(analysis_focus_diagnostics.get("unresolved") or [])
+    deliverables = ((plan or {}).get("analysis_focus") or {}).get("expected_deliverables") or []
+    task_by_index = {item["deliverable_index"]: item for item in chapter_plan.get("research_tasks") or []}
+    for index, deliverable in enumerate(deliverables):
+        task = task_by_index.get(index)
+        if not task or task.get("gap"):
+            research_gaps.append({"expected_deliverable": deliverable, "gap": (task or {}).get("gap") or "章节规划未能为该要求建立可核查的材料与章节对应关系"})
+    important_coverage = coverage_ledger(all_findings, written_chapters)
+    for item in important_coverage:
+        if item["required"] and not item["locations"]:
+            research_gaps.append({"title": findings_by_id[item["finding_id"]]["claim"], "gap": "该重要材料尚未被正文覆盖，需人工核对"})
     full_report = assemble_report(
         report_title=chapter_plan.get("report_title") or "观点洞察报告",
         background_md=background_md,
@@ -485,6 +762,7 @@ async def generate_insight_report_v3(
             chapters=written_chapters,
         )),
         audit_unresolved=audit_unresolved,
+        research_gaps=research_gaps,
     )
 
     chapter_rows = [
@@ -505,9 +783,81 @@ async def generate_insight_report_v3(
             "frequency_rewrites": deepcopy(
                 (chapter.get("diagnostics") or {}).get("frequency_rewrites") or []
             ),
+            "cross_group_focus": deepcopy(chapter.get("cross_group_focus") or []),
+            "cross_group_preflight": deepcopy(
+                chapter.get("cross_group_preflight") or {}
+            ),
         }
         for chapter in written_chapters
     ]
+    if cross_chapter_requested:
+        # Extraction, allocation/preflight and final writing are separate facts.
+        # In particular, successful extraction must not imply grouped output.
+        written_by_id = {item["id"]: item for item in written_chapters}
+        final_group_rows = []
+        for preflight in cross_chapter_diagnostics["chapters"]:
+            written = written_by_id.get(preflight["chapter_id"], {})
+            written_keys = set(retained_group_findings(written, findings_by_id).values()) & requested_cross_keys
+            enabled = bool(
+                preflight["status"] == "enabled"
+                and written_keys == requested_cross_keys
+            )
+            partial = bool(preflight["status"] == "enabled" and written_keys and not enabled)
+            final_preflight = written.get("cross_group_preflight") or preflight
+            final_group_rows.append({
+                "chapter_id": preflight["chapter_id"],
+                "title": preflight["title"],
+                "status": "enabled" if enabled else "partial" if partial else "ordinary_fallback",
+                "retained_groups": [
+                    {"profile_name": key[0], "profile_value": key[1]} for key in sorted(written_keys)
+                ],
+                "missing_groups": [
+                    {"profile_name": key[0], "profile_value": key[1]} for key in sorted(requested_cross_keys - written_keys)
+                ],
+                "failed_block_ids": [block.get("id") for block in written.get("blocks") or [] if block.get("degraded")],
+                "reason": "" if enabled else (
+                    "group_writing_partial" if partial else final_preflight.get("reason")
+                    or (written.get("diagnostics") or {}).get("reason")
+                    or "group_writing_unavailable"
+                ),
+            })
+        written_count = sum(item["status"] == "enabled" for item in final_group_rows)
+        partial_count = sum(item["status"] == "partial" for item in final_group_rows)
+        chapter_count = len(final_group_rows)
+        fallback_count = chapter_count - written_count - partial_count
+        writing_status = (
+            "complete" if chapter_count and written_count == chapter_count
+            else "partial" if written_count or partial_count else "degraded"
+        )
+        cross_chapter_diagnostics.update({
+            "writing_status": writing_status,
+            "written_group_chapter_count": written_count,
+            "written_partial_group_chapter_count": partial_count,
+            "written_fallback_chapter_count": fallback_count,
+            "written_chapters": final_group_rows,
+        })
+        analysis_focus_diagnostics.update({
+            "message": (
+                f"跨章节人群提炼成功 {len(available_cross_keys)}/{len(requested_cross_keys)} 组；"
+                f"章节规划状态 {plan_diagnostics.get('status') or 'incomplete'}；"
+                f"容量与材料预检启用 {cross_chapter_diagnostics['enabled_chapter_count']}/{chapter_count} 章；"
+                f"最终保留双人群视角 {written_count}/{chapter_count} 章，"
+                f"{partial_count} 章仅保留部分人群视角，"
+                f"{fallback_count} 章退回普通写法"
+            ),
+            "group_extraction_status": "complete" if cross_groups_ready else "degraded",
+            "chapter_plan_status": plan_diagnostics.get("status") or "incomplete",
+            "preflight_enabled_chapter_count": cross_chapter_diagnostics["enabled_chapter_count"],
+            "written_group_chapter_count": written_count,
+            "written_partial_group_chapter_count": partial_count,
+            "written_fallback_chapter_count": fallback_count,
+            "cross_group_status": writing_status,
+            "unresolved": [
+                deepcopy(item) for item in final_group_rows
+                if item["status"] != "enabled"
+            ] or ([] if cross_groups_ready else [{"reason": "group_findings_unavailable"}]),
+            "fallback_used": bool(fallback_count or partial_count or not cross_groups_ready or not chapter_count),
+        })
     models = list(dict.fromkeys(
         model
         for collection in (
@@ -515,6 +865,7 @@ async def generate_insight_report_v3(
             skew_diagnostics.get("models") or [],
             core_diagnostics.get("models") or [],
             action_diagnostics.get("models") or [],
+            (regeneration_diagnostics or {}).get("models") or [],
             *(
                 (diagnostics.get("models") or [])
                 for diagnostics in group_diagnostics.values()
@@ -529,10 +880,16 @@ async def generate_insight_report_v3(
         "engine": "insight_v3",
         "chapter_prompt_version": INSIGHT_V3_CHAPTER_PROMPT_VERSION,
         "findings_reused": reused_findings,
+        "regeneration": deepcopy(regeneration_diagnostics or {
+            "status": "not_requested",
+            "logical_calls": 0,
+            "models": [],
+        }),
         "questions": _diagnostic_question_rows(findings_artifact),
         "chapter_plan": deepcopy(plan_diagnostics),
         "analysis_focus": deepcopy(analysis_focus_diagnostics),
         "group_chapters": deepcopy(group_diagnostics),
+        "cross_chapter_groups": deepcopy(cross_chapter_diagnostics),
         "skew_verification": deepcopy(skew_diagnostics),
         "chapters": chapter_rows,
         "core": deepcopy(core_diagnostics),
@@ -548,6 +905,16 @@ async def generate_insight_report_v3(
         "sample_overview": {
             "table_count": len(selected_sample_tables),
             "table_titles": [item.get("title") for item in selected_sample_tables],
+            "table_keys": [item.get("table_key") for item in selected_sample_tables],
+            "interpretation_status": "complete" if sample_interpretation else "fallback",
+        },
+        "research_quality": {
+            "source_context": source_context_diagnostics,
+            "stats_table_count": len(stats_catalog),
+            "cross_table_count": sum(item.get("kind") == "cross_tab" for item in stats_catalog),
+            "tasks": deepcopy(chapter_plan.get("research_tasks") or []),
+            "gaps": research_gaps,
+            "finding_coverage": important_coverage,
         },
         "audit": deepcopy(audit_diagnostics),
         "frequency_review": deepcopy(frequency_review),
@@ -559,5 +926,6 @@ async def generate_insight_report_v3(
         "insight_v3_chapter_plan": deepcopy(chapter_plan),
         "viewpoint_diagnostics": diagnostics,
         "writer_models_used": models,
+        "insight_v3_stats_tables": deepcopy(complete_tables),
     })
     yield ("result", full_report)

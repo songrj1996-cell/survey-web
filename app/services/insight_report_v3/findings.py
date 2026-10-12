@@ -86,6 +86,18 @@ def build_findings_query(question: dict, qualitative_context: dict | None) -> st
         + "\n\n".join(response_blocks)
         + "\n</responses>\n\n"
         + "请完整阅读本题全部玩家条目，按 system prompt 的 JSON 契约提炼 findings。"
+        + "独立保留影响体验解释的具体异常、反例与关键条件，使用 preserve_reason 标记；"
+        + "不要把可核查问题消融为泛泛的平衡性或体验主题，也不要把孤立反馈写成已确认故障。"
+        + "输出前逐项回看绑定回答：claim 和 caveat 的肯否、时态、主体、触发条件必须与原文一致；"
+        + "不要把并列现象连成因果，不因常识判断而补否定词或修正原文。"
+        + "遇到含混、矛盾或疑似笔误，保留待核实边界，不替玩家确定解释。"
+        + "玩家猜测必须在 claim 内明确归属，不能只在 caveat 补免责声明；"
+        + "一人的疑问不能扩写为人群分歧，事件经历不能扩写为系统裁定。"
+        + "保留能／不能、允许／不允许等模态与完整谓语，不能把有方向的原句压成无方向名词短语。"
+        + "每个代表 ID 要直接支持判断，不能借相近主题凑数。"
+        + "事实性反例独立成 finding，preserve_reason=counterexample，response_ids 只绑定支持反例的来源；"
+        + "不要把相反观点的来源或人数混在一起。caveat 只说明当前发现的证据边界，不夹带另一事实。"
+        + "调用内短 ID 只能写入 response_ids，claim 和 caveat 不得内联来源编号。"
     )
 
 

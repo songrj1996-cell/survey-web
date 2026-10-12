@@ -23,6 +23,7 @@ import asyncio
 from contextlib import nullcontext
 from copy import deepcopy
 import json
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -98,7 +99,7 @@ def _terminal_usage(events: list[dict]) -> dict:
     return {
         "available": available,
         "complete": available and complete,
-        **totals,
+        **{key: value if available else None for key, value in totals.items()},
     }
 
 
@@ -119,14 +120,94 @@ def _attempt_summary(events: list[dict]) -> dict:
             continue
         reason = str(event.get("error_category") or event.get("error_type") or "unknown")
         failures[reason] = failures.get(reason, 0) + 1
+    usage = _terminal_usage(events)
+    if len(started) != len(terminal):
+        usage["complete"] = False
     return {
         "http_attempts": len(started),
         "completed_attempts": sum(event.get("status") == "completed" for event in terminal),
         "failed_attempts": sum(event.get("status") == "failed" for event in terminal),
         "models": models,
         "failures": failures,
-        "usage": _terminal_usage(events),
+        "usage": usage,
     }
+
+
+def _version_state(session: dict) -> dict:
+    """Record version/plan integrity without copying reports or source answers."""
+    payload = {key: session.get(key) for key in (
+        "report_versions", "active_report_version", "next_report_version", "plan",
+    )}
+    return {
+        "versions": [item.get("version") for item in session.get("report_versions") or []],
+        "active_report_version": session.get("active_report_version"),
+        "next_report_version": session.get("next_report_version"),
+        "plan_and_versions_sha256": hashlib.sha256(json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, default=str,
+        ).encode("utf-8")).hexdigest(),
+    }
+
+
+def _diagnostic_attempt(event: dict) -> dict:
+    # Do not persist request headers, credentials, HTTP bodies or player text.
+    fields = (
+        "call_id", "attempt", "attempt_index", "status", "model", "response_model",
+        "phase", "step", "duration_seconds", "elapsed_seconds", "finish_reason",
+        "error_type", "error_category", "usage", "usage_complete", "fallback",
+        "attempt_number", "attempt_kind", "requested_model", "protocol",
+        "started_at", "completed_at", "http_status",
+        "request_id", "previous_call_id", "max_output_tokens",
+    )
+    return {key: deepcopy(event[key]) for key in fields if key in event}
+
+
+class ReplayFailure(RuntimeError):
+    def __init__(self, evidence: dict):
+        super().__init__(evidence["error"])
+        self.evidence = evidence
+
+
+async def _run(args) -> dict:
+    state = {
+        "session_id": args.session_id,
+        "attempt_events": [], "progress": [], "latest_usage": None,
+        "regeneration_diagnostics": None, "version_before": None,
+        "preparation_call_ids": set(), "preparation_http_attempts": 0,
+    }
+    started = time.monotonic()
+    try:
+        return await _run_inner(args, state)
+    except Exception as exc:
+        after = None
+        after_error = None
+        if state["session_id"]:
+            try:
+                from app.storage.sessions import get_session
+                after = _version_state(get_session(state["session_id"]))
+            except Exception as snapshot_exc:
+                after_error = type(snapshot_exc).__name__
+        report_attempts = [event for event in state["attempt_events"]
+                           if str(event.get("call_id") or "") not in state["preparation_call_ids"]]
+        raise ReplayFailure({
+            "status": "failed", "error_type": type(exc).__name__, "error": str(exc)[:500],
+            "elapsed_seconds": round(time.monotonic() - started, 3),
+            "session_id": state["session_id"], "base_version": args.base_version,
+            "regeneration_diagnostics": state["regeneration_diagnostics"],
+            "progress": state["progress"],
+            "version_state": {
+                "before": state["version_before"], "after": after,
+                "unchanged": (state["version_before"] == after
+                              if state["version_before"] is not None and after is not None else None),
+                "after_read_error": after_error,
+            },
+            "metrics": {
+                "preparation_http_attempts": state["preparation_http_attempts"],
+                "report_attempts": _attempt_summary(report_attempts),
+                "all_attempts": _attempt_summary(state["attempt_events"]),
+                "stream_report_llm_usage": state["latest_usage"],
+            },
+            "attempt_events": [_diagnostic_attempt(event) for event in state["attempt_events"]],
+        }) from exc
 
 
 def _section_titles(report_md: str) -> list[str]:
@@ -136,7 +217,21 @@ def _section_titles(report_md: str) -> list[str]:
     ]
 
 
-async def _run(args) -> dict:
+def _report_quality_metrics(report_md: str) -> dict:
+    split = re.search(r"(?m)^##\s+(?:附录|完整统计附录|统计附录)", report_md)
+    body = report_md[:split.start()] if split else report_md
+    appendix = report_md[split.start():] if split else ""
+    core = re.search(r"(?ms)^##\s+三、核心发现\s*\n(.*?)(?=^##\s|\Z)", body)
+    return {
+        "body_characters": len(body.rstrip()), "appendix_characters": len(appendix),
+        "core_characters": len(core[1].strip()) if core else 0,
+        "evidence_point_rows": len(re.findall(r"(?m)^.*\*\*证据要点：\*\*.*$", body)),
+        "unexpanded_stat_tokens": len(re.findall(r"\[S:", report_md)),
+        "research_gap_rows": len(re.findall(r"研究任务缺口", body)),
+    }
+
+
+async def _run_inner(args, state: dict) -> dict:
     from app.core.config import LLM_API_KEY
     from app.core.llm_context import bind_llm_api_key, bind_llm_attempt_observer
     from app.services import report_versions
@@ -146,10 +241,16 @@ async def _run(args) -> dict:
     from app.storage.sessions import get_session
     from scripts.replay_insight_report_v3_findings import _prepare_session
 
-    attempt_events: list[dict] = []
+    attempt_events = state["attempt_events"]
 
     async def observe(event: dict):
         attempt_events.append(deepcopy(event))
+        if event.get("status") in {"completed", "failed"}:
+            print(json.dumps({
+                "event": "model_attempt", **{key: event.get(key) for key in (
+                    "status", "model", "phase", "step", "duration_seconds", "elapsed_seconds", "error_category",
+                )},
+            }, ensure_ascii=False), flush=True)
 
     key_context = bind_llm_api_key(LLM_API_KEY) if LLM_API_KEY else nullcontext()
     with key_context, bind_llm_attempt_observer(observe):
@@ -160,6 +261,7 @@ async def _run(args) -> dict:
                 if args.context_json else {}
             )
             session_id = await _prepare_session(args.xlsx, context)
+        state["session_id"] = session_id
         preparation_attempt_count = sum(
             event.get("status") == "started" for event in attempt_events
         )
@@ -168,8 +270,11 @@ async def _run(args) -> dict:
             for event in attempt_events
             if event.get("status") == "started"
         }
+        state["preparation_call_ids"] = preparation_call_ids
+        state["preparation_http_attempts"] = preparation_attempt_count
 
         session = get_session(session_id)
+        state["version_before"] = _version_state(session)
         required = ("rows", "plan", "open_text", "stats_md", "file_sha256")
         missing = [field for field in required if not session.get(field)]
         if missing:
@@ -179,7 +284,7 @@ async def _run(args) -> dict:
 
         generation_kind = "regenerate" if args.base_version is not None else "initial"
         done = None
-        progress: list[dict] = []
+        progress = state["progress"]
         latest_usage = None
         async for chunk in report_stream(
             session_id,
@@ -203,9 +308,14 @@ async def _run(args) -> dict:
                     "item_index": payload.get("item_index"),
                     "item_total": payload.get("item_total"),
                     "message": payload.get("message"),
+                    "chapter_id": payload.get("chapter_id"),
+                    "chapter_status": payload.get("chapter_status"),
                 }, ensure_ascii=False), flush=True)
             elif event_type == "report_llm_status":
                 latest_usage = deepcopy(payload.get("report_llm_usage"))
+                state["latest_usage"] = latest_usage
+            elif event_type == "report_regeneration_diagnostics":
+                state["regeneration_diagnostics"] = deepcopy(payload.get("diagnostics"))
             elif event_type == "report_done":
                 done = payload
 
@@ -231,6 +341,9 @@ async def _run(args) -> dict:
         "source_filename": str(session.get("filename") or ""),
         "preparation": "manual_session" if args.session_id else "automatic_existing_services",
         "version": done["version"],
+        "regeneration_diagnostics": state["regeneration_diagnostics"],
+        "version_state": {"before": state["version_before"], "after": _version_state(session)},
+        "attempt_events": [_diagnostic_attempt(event) for event in attempt_events],
         "report_engine": version.get("report_engine"),
         "analyst_app": version.get("analyst_app"),
         "report_status": version.get("report_status"),
@@ -242,6 +355,7 @@ async def _run(args) -> dict:
         "progress": progress,
         "report": {
             "character_count": len(report_md),
+            **_report_quality_metrics(report_md),
             "section_titles": _section_titles(report_md),
             "markdown": report_md,
         },
@@ -323,12 +437,13 @@ def main() -> int:
     try:
         evidence = asyncio.run(_run(args))
     except Exception as exc:
-        failure = {
+        failure = exc.evidence if isinstance(exc, ReplayFailure) else {
             "status": "failed",
             "error_type": type(exc).__name__,
             "error": str(exc)[:500],
             "elapsed_seconds": round(time.monotonic() - started, 3),
         }
+        failure["elapsed_seconds"] = round(time.monotonic() - started, 3)
         (evidence_dir / f"full-report-failure{suffix}.json").write_text(
             json.dumps(failure, ensure_ascii=False, indent=2),
             encoding="utf-8",
