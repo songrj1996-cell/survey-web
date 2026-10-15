@@ -11,7 +11,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Roboto+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/style.css?v=59" />
+  <link rel="stylesheet" href="/static/style.css?v=65" />
   <link rel="stylesheet" href="/static/questionnaire-sources.css?v=1" />
   <link rel="stylesheet" href="/static/report-quick.css?v=11" />
   <link rel="stylesheet" href="/static/survey-entry.css?v=8" />
@@ -96,7 +96,7 @@
               <path d="M3.85 8.62a4 4 0 0 1 4.78-4.77 4 4 0 0 1 6.74 0 4 4 0 0 1 4.78 4.78 4 4 0 0 1 0 6.74 4 4 0 0 1-4.77 4.78 4 4 0 0 1-6.75 0 4 4 0 0 1-4.78-4.77 4 4 0 0 1 0-6.76Z" />
               <path d="m9 12 2 2 4-4" />
             </svg>
-            <span>数据标注</span>
+            <span>质量标注</span>
           </div>
         </div>
 
@@ -121,17 +121,7 @@
           </div>
         </div>
 
-        <!-- 设置 -->
-        <div class="nav-item" id="nav-settings">
-          <div class="nav-item__header" id="nav-header-settings">
-            <svg class="nav-item__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-              <circle cx="12" cy="12" r="3" />
-              <path
-                d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06-.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
-            </svg>
-            <span>设置</span>
-          </div>
-        </div>
+        <div class="nav-item" id="nav-roster"><button type="button" class="nav-item__header" id="nav-header-roster"><svg class="nav-item__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 8h8M8 12h8M8 16h5"/></svg><span>名单来源</span></button></div>
       </nav>
 
       <div class="sidebar__footer">
@@ -152,6 +142,18 @@
           <span>历史记录</span>
         </button>
 
+        <!-- 设置 -->
+        <div id="nav-settings" hidden>
+          <button type="button" class="sidebar-action" id="nav-header-settings" title="设置">
+            <svg class="nav-item__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="3" />
+              <path
+                d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06-.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+            </svg>
+            <span>设置</span>
+          </button>
+        </div>
+
         <div class="sidebar__account-divider"></div>
 
         <button class="sidebar-action" id="btn-feishu-login">
@@ -166,6 +168,9 @@
 
     <!-- Main -->
     <main class="main">
+      <section class="panel panel--hidden workflow-panel" id="group-tasks-panel" aria-label="质量标注任务"></section>
+      <section class="panel panel--hidden workflow-panel" id="roster-sources-panel" aria-label="名单来源"></section>
+      <section class="panel panel--hidden workflow-panel" id="reward-batches-panel" aria-label="奖励整理"></section>
 
       <!-- STEP 1: Upload -->
       <section class="panel" id="panel-1">
@@ -1831,7 +1836,7 @@
                 <path d="M23 21v-2a4 4 0 0 0-3-3.87" />
                 <path d="M16 3.13a4 4 0 0 1 0 7.75" />
               </svg>
-              <span>权限配置</span>
+              <span>成员与权限</span>
             </div>
             <div class="settings-nav__item" data-stab="audit" id="stab-audit-nav" style="display:none">
               <svg class="settings-nav__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -2162,18 +2167,22 @@
   <script src="https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js"></script>
   <!-- app.js 已按业务线拆分;顺序固定:core 最先,各 feature 居中(均含原顺序的初始化代码) -->
   <script src="/static/js/core/core.js?v=38"></script>
+  <script src="/static/js/core/feature-permissions.js?v=4"></script>
   <script src="/static/js/features/report-quick.js?v=9"></script>
   <script src="/static/js/features/survey.js?v=40"></script>
   <script src="/static/js/features/survey-entry.js?v=5"></script>
   <script src="/static/js/features/questionnaire-sources.js?v=2"></script>
   <script src="/static/js/features/report.js?v=52"></script>
   <script src="/static/js/features/profile.js?v=2"></script>
-  <script src="/static/js/features/settings.js?v=38"></script>
+  <script src="/static/js/features/settings.js?v=41"></script>
   <script src="/static/js/features/history.js?v=38"></script>
   <script src="/static/js/features/interview.js?v=10"></script>
   <script src="/static/js/features/interview-v2.js?v=7"></script>
   <script src="/static/js/features/reward-roster.js?v=3"></script>
-  <script src="/static/js/features/nav.js?v=39"></script>
+  <script src="/static/js/features/group-tasks.js?v=6"></script>
+  <script src="/static/js/features/roster-sources.js?v=5"></script>
+  <script src="/static/js/features/reward-batches.js?v=4"></script>
+  <script src="/static/js/features/nav.js?v=43"></script>
   <script src="/static/js/features/comment.js?v=29"></script>
 <script src="/static/js/features/annotate.js?v=45"></script>
 <script src="/static/js/features/annotate_review.js?v=3"></script>

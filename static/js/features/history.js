@@ -199,7 +199,7 @@ function renderHistoryCard(h) {
           </svg>
           <span>下载</span>
         </button>`
-    : `<button class="hist-card__edit" type="button" data-hist-edit title="修改报告名称" aria-label="修改报告名称">
+    : h.can_edit === false ? '' : `<button class="hist-card__edit" type="button" data-hist-edit title="修改报告名称" aria-label="修改报告名称">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <path d="M12 20h9"/>
             <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/>
@@ -380,6 +380,7 @@ async function openHistoryEntry(id) {
     state.viewMode = 'history';
     state.historyId = id;
     state.historyReport.id = id;
+    state.historyReport.canEdit = entry.can_edit !== false;
     state.historyReport.reportNo = entry.report_no || '';
     state.historyReport.reportMd = entry.report_md;
     state.historyReport.title = entry.title || reportTitleFromMarkdown(entry.report_md);

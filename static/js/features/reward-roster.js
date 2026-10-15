@@ -366,13 +366,10 @@ async function rrAnalyze() {
       body: JSON.stringify({selected_sheets: selected, reward_dates: [...rrState.selectedDates].sort(), mappings}),
     });
     rrState.analysis = data;
-    rrRenderAnalysis(data);
-    if (data.export_ready && data.result) {
-      rrRenderResult(data.result);
-      rrGoStep(4);
-      showToast('未发现需要人工处理的冲突，已生成奖励名单', 'success');
+    if (data.invalid_rows.length) {
+      rrRenderAnalysis(data); rrGoStep(3);
     } else {
-      rrGoStep(3);
+      await window.RewardBatches.acceptImport(rrState.sessionId, [...rrState.selectedDates]);
     }
   } catch (error) {
     showToast(error.message, 'error', 7000);
@@ -522,7 +519,7 @@ $('rr-btn-back-mapping').addEventListener('click', () => rrGoStep(2));
 $('rr-btn-copy-note').addEventListener('click', rrCopyNote);
 $('rr-btn-download').addEventListener('click', () => {
   if (!rrState.result || !rrState.sessionId) return;
-  window.location.href = `/api/reward-roster/${encodeURIComponent(rrState.sessionId)}/download`;
+  window.RewardBatches.acceptImport(rrState.sessionId, [...rrState.selectedDates]);
 });
 document.querySelectorAll('[data-rr-note]').forEach(button => {
   button.addEventListener('click', () => {

@@ -119,7 +119,11 @@ const rrPanels = [1, 2, 3, 4].map(n => $(`rr-panel-${n}`));
 
 let currentMode = 'survey'; // 'survey' | 'interview' | 'annotate' | 'comment' | 'reward'
 
-function switchMode(mode) {
+async function switchMode(mode) {
+  if (mode !== currentMode && window.rosterHasDraft?.() && !await window.rosterMayLeave()) return;
+  if (mode !== currentMode && window.groupWorkflowHasDraft?.() && !await window.groupWorkflowMayLeave()) return;
+  if (window.membersHasDraft?.() && !await window.membersMayLeave()) return;
+  if (window.PlatformPermissions && state.feishu.feature_catalog && !PlatformPermissions.allowed(mode)) return;
   if (currentMode === 'survey' && mode !== 'survey' && reportInteractionBusy()) {
     showToast('当前报告操作尚未完成，请稍候再切换功能', 'info', 5000);
     return;
@@ -150,16 +154,21 @@ function switchMode(mode) {
   annPanels.forEach(p => p.classList.add('panel--hidden'));
   cmPanels.forEach(p => p && p.classList.add('panel--hidden'));
   rrPanels.forEach(p => p && p.classList.add('panel--hidden'));
+  ['group-tasks-panel','roster-sources-panel','reward-batches-panel'].forEach(id => $(id)?.classList.add('panel--hidden'));
+  $('nav-roster')?.classList.toggle('nav-item--active', mode === 'roster');
+  $('btn-restart').style.display = ['annotate','reward','roster'].includes(mode) ? 'none' : '';
   if (isSurvey) {
     goStep(state.currentStep);
   } else if (isInterview) {
     ivGoStep(ivState.currentStep);
   } else if (isAnnotate) {
-    annGoStep(annState.currentStep);
+    window.GroupTasks.open();
   } else if (isComment) {
     cmGoStep(cmState.currentStep);
-  } else {
-    rrGoStep(rrState.currentStep);
+  } else if (mode === 'reward') {
+    window.RewardBatches.open();
+  } else if (mode === 'roster') {
+    window.RosterSources.open();
   }
 }
 
@@ -169,14 +178,12 @@ $('nav-header-interview').addEventListener('click', () => switchMode('interview'
 $('nav-header-annotate').addEventListener('click', () => switchMode('annotate'));
 $('nav-header-comment').addEventListener('click', () => switchMode('comment'));
 $('nav-header-reward').addEventListener('click', () => switchMode('reward'));
+$('nav-header-roster').addEventListener('click', () => switchMode('roster'));
 
 // 设置入口
-$('nav-header-settings').addEventListener('click', () => {
-  $('nav-settings').classList.add('nav-item--active');
-  $('nav-survey').classList.remove('nav-item--active');
-  $('nav-interview').classList.remove('nav-item--active');
-  $('nav-annotate').classList.remove('nav-item--active');
-  $('nav-reward').classList.remove('nav-item--active');
+$('nav-header-settings').addEventListener('click', async () => {
+  if (!PlatformPermissions.canOpenSettings()) return;
+  if (window.membersHasDraft?.() && !await window.membersMayLeave()) return;
   openDrawer('settings-drawer');
   loadActiveSettingsTab();
 });

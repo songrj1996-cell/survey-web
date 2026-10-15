@@ -943,7 +943,7 @@ function updateReportVersionUi() {
     setReportVersionMenuOpen(false);
   }
   if (manageBtn) {
-    manageBtn.hidden = !(state.viewMode === 'history' && versions.length > 1);
+    manageBtn.hidden = !(state.viewMode === 'history' && versions.length > 1 && ctx?.canEdit !== false && window.PlatformPermissions?.canUse('survey') !== false);
     manageBtn.disabled = reportInteractionBusy();
   }
   updateReportActionAvailability();
@@ -1755,6 +1755,10 @@ function applyQAAvailability() {
   const input = $('qa-input');
   const btn = $('btn-qa-send');
   if (!input || !btn) return;
+  if (window.PlatformPermissions?.canUse('survey') === false || (state.viewMode === 'history' && state.historyReport.canEdit === false)) {
+    input.placeholder = '当前报告仅可查看，不能追加追问';
+    input.disabled = true; btn.disabled = true; return;
+  }
   if (state.reportVersionLoading || state.historyLoading) {
     input.placeholder = state.historyLoading ? '正在加载历史报告，请稍候' : '正在切换报告版本，请稍候';
     input.disabled = true;
@@ -2599,45 +2603,15 @@ state.feishu = {
 };
 
 function applyPermGating() {
-  const perms = state.feishu.perms || [];
-  const hasSurvey = perms.includes('survey');
-  const hasInterview = perms.includes('interview');
-  const hasAnnotate = perms.includes('annotate');
-  const hasComment = perms.includes('comment');
-  const hasReward = perms.includes('reward');
-  // 侧边栏：无权限则隐藏入口
-  const navSurvey = $('nav-survey');
-  const navInterview = $('nav-interview');
-  const navAnnotate = $('nav-annotate');
-  const navComment = $('nav-comment');
-  const navReward = $('nav-reward');
-  if (navSurvey) navSurvey.style.display = hasSurvey ? '' : 'none';
-  if (navInterview) navInterview.style.display = hasInterview ? '' : 'none';
-  if (navAnnotate) navAnnotate.style.display = hasAnnotate ? '' : 'none';
-  if (navComment) navComment.style.display = hasComment ? '' : 'none';
-  if (navReward) navReward.style.display = hasReward ? '' : 'none';
-  // 如果当前模式无权限，切换到第一个有权限的模式
-  const allowedModes = [
-    ['survey', hasSurvey], ['interview', hasInterview],
-    ['annotate', hasAnnotate], ['comment', hasComment], ['reward', hasReward],
-  ].filter(([, ok]) => ok).map(([m]) => m);
-  if (!allowedModes.includes(currentMode) && allowedModes.length) {
-    switchMode(allowedModes[0]);
+  const allowedModes = window.PlatformPermissions.apply(state.feishu);
+  if (!allowedModes.includes(currentMode)) {
+    if (allowedModes.length) switchMode(allowedModes[0]);
+    else {
+      document.querySelectorAll('main > .panel').forEach(panel => panel.classList.add('panel--hidden'));
+      const setting = PlatformPermissions.catalog().flatMap(group => group.children).find(item => item.tab && PlatformPermissions.allowed(item.key));
+      if (setting) { openDrawer('settings-drawer'); switchSettingsTab(setting.tab); }
+    }
   }
-  // 非管理员隐藏整个「设置」入口
-  const navSettings = $('nav-settings');
-  if (navSettings) navSettings.style.display = state.feishu.is_admin ? '' : 'none';
-  // 管理员才显示权限配置 tab
-  const permNav = $('stab-perms-nav');
-  if (permNav) permNav.style.display = state.feishu.is_admin ? '' : 'none';
-  const systemNav = $('stab-system-nav');
-  if (systemNav) systemNav.style.display = state.feishu.is_admin ? '' : 'none';
-  const auditNav = $('stab-audit-nav');
-  if (auditNav) auditNav.style.display = state.feishu.is_admin ? '' : 'none';
-  const adminLabel = $('settings-nav-admin-label');
-  if (adminLabel) adminLabel.style.display = state.feishu.is_admin ? '' : 'none';
-  const adminSep = $('settings-nav-admin-sep');
-  if (adminSep) adminSep.style.display = state.feishu.is_admin ? '' : 'none';
 }
 
 async function refreshFeishuStatus() {

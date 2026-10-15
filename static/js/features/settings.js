@@ -3,21 +3,24 @@
 // ============================================================
 
 function openDrawer(id) { $(id).classList.add('drawer--open'); }
-function closeDrawer(id) {
+async function closeDrawer(id) {
+  if (id === 'settings-drawer' && window.membersHasDraft?.() && !await window.membersMayLeave()) return;
   $(id).classList.remove('drawer--open');
   if (id === 'settings-drawer') closePromptEditor();
 }
 
 document.querySelectorAll('[data-drawer-close]').forEach(el => {
-  el.addEventListener('click', e => {
+  el.addEventListener('click', async e => {
     const drawer = e.target.closest('.drawer');
     if (drawer) {
+      if (drawer.id === 'settings-drawer' && window.membersHasDraft?.() && !await window.membersMayLeave()) return;
       drawer.classList.remove('drawer--open');
       if (drawer.id === 'settings-drawer') closePromptEditor();
     }
   });
 });
-document.addEventListener('keydown', e => {
+document.addEventListener('keydown', async e => {
+  if (document.querySelector('.workflow-dialog[open]')) return;
   if (e.key === 'Tab' && promptEditorState.key) {
     const layer = $('prompt-editor-layer');
     const focusable = layer ? Array.from(layer.querySelectorAll(
@@ -42,6 +45,7 @@ document.addEventListener('keydown', e => {
     closePromptEditor({ rerender: true });
     return;
   }
+  if (window.membersHasDraft?.() && !await window.membersMayLeave()) return;
   document.querySelectorAll('.drawer--open').forEach(d => d.classList.remove('drawer--open'));
 });
 
@@ -58,7 +62,10 @@ const STAB_LOADERS = {
   audit: loadAuditLogsTab,
 };
 
-function switchSettingsTab(name) {
+async function switchSettingsTab(name) {
+  if (window.membersHasDraft?.() && !await window.membersMayLeave()) return;
+  const feature = PlatformPermissions.catalog().flatMap(group => group.children).find(item => item.tab === name);
+  if (feature && !PlatformPermissions.allowed(feature.key)) return;
   document.querySelectorAll('.settings-nav__item').forEach(el => {
     el.classList.toggle('settings-nav__item--active', el.dataset.stab === name);
   });
@@ -102,7 +109,8 @@ document.querySelectorAll('.settings-nav__item[data-stab]').forEach(el => {
 
 function loadActiveSettingsTab() {
   const active = document.querySelector('.settings-nav__item--active');
-  const name = active ? active.dataset.stab : 'texts';
+  const allowedTab = PlatformPermissions.catalog().flatMap(group => group.children).find(item => item.tab && PlatformPermissions.allowed(item.key))?.tab;
+  const name = active && active.style.display !== 'none' ? active.dataset.stab : allowedTab;
   switchSettingsTab(name);
 }
 
@@ -590,6 +598,9 @@ function renderGlossaryTab() {
       ${visibleItems.length ? glossaryTableHtml(visibleItems, languages) : `<div class="glossary-empty">没有符合当前筛选条件的术语。</div>`}
     </section>
   `;
+  if (window.PlatformPermissions && !PlatformPermissions.canUse('glossary')) {
+    body.querySelectorAll('[data-glossary-import],[data-glossary-create],[data-glossary-edit],[data-glossary-delete],[data-glossary-toggle],[data-glossary-save],[data-glossary-commit]').forEach(el=>el.disabled=true);
+  }
 }
 
 async function loadGlossary(force = false) {
@@ -927,188 +938,119 @@ async function downloadGlossaryFile(url, fallbackName) {
 
 // ── 权限配置 ──────────────────────────────────────────────────
 
-const PERMISSION_FEATURES = [
-  { key: 'survey', label: '问卷分析', desc: '问卷上传、分析方案与报告生成' },
-  { key: 'interview', label: '访谈报告', desc: '访谈记录上传与证据型报告生成' },
-  { key: 'annotate', label: '数据标注', desc: '样本质量检测与数据标注' },
-  { key: 'comment', label: '评论分析', desc: '评论主题、情感与舆情分析' },
-  { key: 'reward', label: '奖励整理', desc: 'Excel 奖励汇总、冲突核对与名单导出' },
-];
+const memberUi = {users: [], editing: null, dirty: false, query: '', status: 'all', tab: 'members'};
+window.membersHasDraft = () => memberUi.dirty;
+window.membersMayLeave = async () => {
+  if (!memberUi.dirty) return true;
+  if (!await window.workflowConfirm('成员权限修改尚未保存。放弃只影响这份草稿，已保存的权限保持不变。')) return false;
+  memberUi.dirty = false; memberUi.editing = null; return true;
+};
+window.addEventListener('beforeunload', event => { if (memberUi.dirty) { event.preventDefault(); event.returnValue = ''; } });
 
 async function loadPermsTab() {
+  if (memberUi.dirty) return;
   const body = $('stab-content-perms');
-  body.innerHTML = `<div class="hist-empty"><div class="spinner" style="margin:0 auto"></div></div>`;
+  body.innerHTML = '<div class="hist-empty">正在加载成员…</div>';
   try {
-    const resp = await fetch('/api/admin/users');
-    const data = await resp.json();
-    if (!resp.ok) throw new Error(data.detail || '加载失败');
-    renderPermsTable(data.users || []);
-  } catch (e) {
-    body.innerHTML = `<div class="hist-empty">加载权限配置失败：${esc(e.message)}</div>`;
+    const data = await workflowRequest('/api/admin/users');
+    memberUi.users = data.users || []; renderPermsTable();
+  } catch (error) { body.innerHTML = `<div class="hist-empty">${esc(error.message)}</div>`; }
+}
+function renderPermsTable() {
+  const body = $('stab-content-perms');
+  body.innerHTML = `<div class="workflow-heading"><div><h3>成员与权限</h3><p class="workflow-muted">按平台菜单选择功能，修改后需保存。停用成员保留业务记录和已有配置。</p></div><button class="btn btn--primary" id="member-new">新增成员</button></div>
+    <div class="member-tabs" role="tablist" aria-label="成员权限页签"><button type="button" role="tab" aria-controls="member-content" id="member-tab-list">成员管理</button><button type="button" role="tab" aria-controls="member-content" id="member-tab-history">变更记录</button></div><div id="member-content" role="tabpanel"></div>`;
+  $('member-new').onclick = async () => { if(!await membersMayLeave())return; memberUi.editing={email:'',name:'',perms:[],enabled:true}; memberUi.tab='members'; renderMemberContent(); };
+  $('member-tab-list').onclick = async () => { if(!await membersMayLeave())return;memberUi.tab='members';renderMemberContent(); };
+  $('member-tab-history').onclick = async () => { if(!await membersMayLeave())return;memberUi.tab='history';renderMemberContent(); };
+  renderMemberContent();
+}
+function renderMemberContent() {
+  const target=$('member-content');
+  const history = memberUi.tab === 'history';
+  $('member-new').hidden = history;
+  [['member-tab-list', !history], ['member-tab-history', history]].forEach(([id, active]) => {
+    $(id).setAttribute('aria-selected', String(active));
+    $(id).tabIndex = active ? 0 : -1;
+    $(id).onkeydown = async event => {
+      if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+      event.preventDefault();
+      const next = event.key === 'Home' ? 'member-tab-list' : event.key === 'End' ? 'member-tab-history' : id === 'member-tab-list' ? 'member-tab-history' : 'member-tab-list';
+      await $(next).onclick();
+      if ($(next).getAttribute('aria-selected') === 'true') $(next).focus();
+    };
+  });
+  target.setAttribute('aria-labelledby', history ? 'member-tab-history' : 'member-tab-list');
+  if(memberUi.tab==='history') {
+    const events=memberUi.users.flatMap(user=>(user.permission_history||[]).map(event=>({...event,name:event.after?.name||event.before?.name||user.name}))).sort((a,b)=>(Date.parse(b.at)||0)-(Date.parse(a.at)||0));
+    target.innerHTML=`<div class="member-change-list">${events.map(event=>`<article class="member-change-card"><dl class="member-change-meta"><div><dt>操作人</dt><dd>${esc(event.actor_name||'管理员')}</dd></div><div><dt>操作模块</dt><dd>成员与权限</dd></div><div><dt>变更成员</dt><dd>${esc(event.name||'未记录姓名')}</dd></div><div><dt>操作时间</dt><dd><time>${esc(formatMemberChangeTime(event.at))}</time></dd></div></dl><div class="member-change-content"><strong>操作内容</strong><ul>${memberChangeLines(event).map(line=>`<li>${esc(line)}</li>`).join('')}</ul></div></article>`).join('')||'<div class="workflow-empty">尚无成员权限变更记录。保存修改后可在这里核对；更早操作可在用户日志查看。</div>'}</div>`;
+    return;
   }
+  target.innerHTML=`<div class="member-layout"><aside class="member-list" aria-label="成员列表"><input class="plan-input" id="member-search" aria-label="搜索成员" placeholder="搜索姓名或账号" value="${esc(memberUi.query)}"><select class="plan-input" id="member-status" aria-label="成员状态筛选">${[['all','全部成员'],['on','已启用'],['off','已停用']].map(([value,text])=>`<option value="${value}" ${memberUi.status===value?'selected':''}>${text}</option>`).join('')}</select><div id="member-list"></div></aside><div class="member-editor" id="member-editor"></div></div>`;
+  const renderList=()=>{$('member-list').innerHTML=memberUi.users.filter(user=>`${user.name} ${user.email}`.toLowerCase().includes(memberUi.query.toLowerCase())&&(memberUi.status==='all'||Boolean(user.enabled)===(memberUi.status==='on'))).map((user)=>`<button class="btn btn--ghost" aria-pressed="${memberUi.editing?.email===user.email}" data-member="${esc(user.email)}">${esc(user.name||'待补充姓名')}<small>${user.is_admin?'管理员（受保护）':user.enabled?'已启用':'已停用'}</small></button>`).join('')||'<p class="workflow-muted">没有匹配的成员。</p>';
+    target.querySelectorAll('[data-member]').forEach(button=>button.onclick=async()=>{if(!await membersMayLeave())return;memberUi.editing=structuredClone(memberUi.users.find(user=>user.email===button.dataset.member));renderList();renderMemberEditor();});};
+  $('member-search').oninput=e=>{memberUi.query=e.target.value;renderList();};$('member-status').onchange=e=>{memberUi.status=e.target.value;renderList();};renderList();renderMemberEditor();
 }
 
-function renderPermsTable(users) {
-  const body = $('stab-content-perms');
-  const newFeatureOptions = PERMISSION_FEATURES.map(feature => `
-    <label class="perm-feature-option">
-      <input type="checkbox" class="perm-toggle" data-perm-new="${esc(feature.key)}" checked />
-      <span>
-        <strong>${esc(feature.label)}</strong>
-        <small>${esc(feature.desc)}</small>
-      </span>
-    </label>
-  `).join('');
+function formatMemberChangeTime(value) {
+  return window.workflowTime(value);
+}
 
-  const rows = users.map(u => {
-    const isAdmin = u.is_admin;
-    const userPerms = Array.isArray(u.perms) ? u.perms : [];
-    const adminBadge = isAdmin ? `<span class="perm-badge">管理员</span>` : '';
-    const featureOptions = PERMISSION_FEATURES.map(feature => {
-      const checked = isAdmin || userPerms.includes(feature.key);
-      return `
-        <label class="perm-feature-option${isAdmin ? ' perm-feature-option--locked' : ''}">
-          <input type="checkbox" class="perm-toggle" ${checked ? 'checked' : ''}
-            ${isAdmin ? 'disabled' : ''}
-            data-perm-email="${esc(u.email)}" data-perm-type="${esc(feature.key)}" />
-          <span>
-            <strong>${esc(feature.label)}</strong>
-            <small>${esc(feature.desc)}</small>
-          </span>
-        </label>
-      `;
-    }).join('');
-    const deleteBtn = isAdmin ? ''
-      : `<button class="btn btn--ghost btn--sm" data-perm-delete="${esc(u.email)}">删除</button>`;
-    const enabledToggle = isAdmin
-      ? `<span class="perm-status perm-status--enabled">始终启用</span>`
-      : `<label class="perm-enabled-toggle">
-          <input type="checkbox" class="perm-toggle" ${u.enabled ? 'checked' : ''}
-            data-perm-email="${esc(u.email)}" data-perm-type="enabled" />
-          <span>${u.enabled ? '已启用' : '已停用'}</span>
-        </label>`;
-
-    return `
-      <article class="perm-member-card" data-perm-user="${esc(u.email)}">
-        <div class="perm-member-card__head">
-          <div class="perm-member-card__identity">
-            <strong>${esc(u.email)}</strong>
-            ${adminBadge}
-          </div>
-          <div class="perm-member-card__actions">
-            ${enabledToggle}
-            ${deleteBtn}
-          </div>
-        </div>
-        <div class="perm-feature-grid">${featureOptions}</div>
-      </article>
-    `;
-  }).join('');
-
-  body.innerHTML = `
-    <div class="perm-panel">
-      <div class="perm-panel__intro">
-        <div>
-          <h3>成员与功能权限</h3>
-          <p>按功能模块为成员授权。后续新增模块时会继续在同一区域扩展。</p>
-        </div>
-      </div>
-      <section class="perm-add-card" id="perm-add-row">
-        <div class="perm-add-card__head">
-          <label for="perm-new-email">添加成员</label>
-          <input type="text" id="perm-new-email" class="plan-input"
-            placeholder="飞书邮箱 或 Open ID（ou_xxxxx）" />
-        </div>
-        <div class="perm-feature-grid">${newFeatureOptions}</div>
-        <div class="perm-add-card__actions">
-          <button class="btn btn--primary btn--sm" id="perm-add-btn">添加成员</button>
-        </div>
-      </section>
-      <div class="perm-member-list">
-        <div class="perm-member-list__title">已有成员 <span>${esc(users.length)}</span></div>
-        ${rows || '<div class="hist-empty">暂无成员</div>'}
-      </div>
-    </div>`;
-
-  // 添加成员
-  $('perm-add-btn').addEventListener('click', async () => {
-    const email = ($('perm-new-email').value || '').trim();
-    if (!email) { showToast('请输入邮箱或 Open ID', 'error'); return; }
-    const perms = Array.from(body.querySelectorAll('[data-perm-new]:checked'))
-      .map(el => el.dataset.permNew);
-    if (!perms.length) {
-      showToast('请至少选择一个功能权限', 'error');
-      return;
-    }
-    try {
-      const r = await fetch('/api/admin/users', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, perms }) });
-      const d = await r.json();
-      if (!r.ok) throw new Error(d.detail || '添加失败');
-      showToast(`已添加 ${email}`, 'success');
-      loadPermsTab();
-    } catch (e) { showToast(e.message, 'error'); }
-  });
-
-  // 权限勾选 + 启用状态变更
-  body.querySelectorAll('[data-perm-email][data-perm-type]').forEach(cb => {
-    cb.addEventListener('change', async () => {
-      const email = cb.dataset.permEmail;
-      const type = cb.dataset.permType;
-      const checked = cb.checked;
-      try {
-        let patch = {};
-        if (type === 'enabled') {
-          if (checked) {
-            const card = cb.closest('.perm-member-card');
-            const hasPermission = card.querySelector('[data-perm-type]:checked:not([data-perm-type="enabled"])');
-            if (!hasPermission) {
-              showToast('启用成员至少需要一个功能权限', 'error');
-              cb.checked = false;
-              return;
-            }
-          }
-          patch = { enabled: checked };
-        } else {
-          const card = cb.closest('.perm-member-card');
-          const perms = Array.from(card.querySelectorAll('[data-perm-type]:checked'))
-            .map(el => el.dataset.permType)
-            .filter(key => key !== 'enabled');
-          const enabledEl = card.querySelector('[data-perm-type="enabled"]');
-          if (enabledEl?.checked && !perms.length) {
-            showToast('启用成员至少需要一个功能权限；如需暂停访问，请关闭“已启用”', 'error');
-            cb.checked = true;
-            return;
-          }
-          patch = { perms };
-        }
-        const r = await fetch(`/api/admin/users/${encodeURIComponent(email)}`, {
-          method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch)
-        });
-        const d = await r.json();
-        if (!r.ok) throw new Error(d.detail || '更新失败');
-        if (type === 'enabled') {
-          const label = cb.closest('.perm-enabled-toggle')?.querySelector('span');
-          if (label) label.textContent = checked ? '已启用' : '已停用';
-        }
-        showToast('已保存', 'success', 1500);
-      } catch (e) { showToast(e.message, 'error'); cb.checked = !checked; }
-    });
-  });
-
-  // 删除
-  body.querySelectorAll('[data-perm-delete]').forEach(btn => {
-    btn.addEventListener('click', async () => {
-      const email = btn.dataset.permDelete;
-      if (!confirm(`确认删除 ${email}？`)) return;
-      try {
-        const r = await fetch(`/api/admin/users/${encodeURIComponent(email)}`, { method: 'DELETE' });
-        const d = await r.json();
-        if (!r.ok) throw new Error(d.detail || '删除失败');
-        showToast(`已删除 ${email}`, 'success');
-        loadPermsTab();
-      } catch (e) { showToast(e.message, 'error'); }
-    });
-  });
+function memberChangeLines(event) {
+  const before = event.before, after = event.after || {}, lines = [];
+  const features = PlatformPermissions.catalog().flatMap(group => group.children);
+  const name = key => features.find(item => item.key === key)?.label || key;
+  const grants = value => {
+    const raw = value?.perms || [];
+    const pairs = Array.isArray(raw) ? raw.map(key => [key, 'use']) : Object.entries(raw).filter(([, level]) => level);
+    return Object.fromEntries(pairs.map(([key, level]) => [key, features.find(item => item.key === key)?.view_only || ['read', 'readonly', 'read_only'].includes(value?.permission_levels?.[key] || level) ? 'read' : 'use']));
+  };
+  const previous = grants(before), current = grants(after);
+  const describe = (key, source) => name(key) + (source[key] === 'read' ? '（仅查看）' : '');
+  if (!before) {
+    lines.push(`新增成员：${after.name || event.name || '未记录姓名'}`, `成员状态：${after.enabled ? '启用' : '停用'}`);
+    lines.push('授予权限：' + (Object.keys(current).map(key => describe(key, current)).join('、') || '无'));
+    return lines;
+  }
+  if (before.name !== after.name) lines.push(`显示姓名：${before.name || '未填写'} → ${after.name || '未填写'}`);
+  if (before.enabled !== after.enabled) lines.push(`成员状态：${before.enabled ? '启用' : '停用'} → ${after.enabled ? '启用' : '停用'}`);
+  const added = Object.keys(current).filter(key => !(key in previous)), removed = Object.keys(previous).filter(key => !(key in current));
+  if (added.length) lines.push('新增权限：' + added.map(key => describe(key, current)).join('、'));
+  if (removed.length) lines.push('移除权限：' + removed.map(key => describe(key, previous)).join('、'));
+  Object.keys(current).filter(key => key in previous && current[key] !== previous[key]).forEach(key => lines.push(`${name(key)}：${previous[key] === 'read' ? '仅查看' : '可使用'} → ${current[key] === 'read' ? '仅查看' : '可使用'}`));
+  return lines.length ? lines : ['保存成员配置，姓名、状态和功能权限未变化。'];
+}
+function renderMemberEditor() {
+  const target=$('member-editor'),user=memberUi.editing;
+  if(!user){target.innerHTML='<div class="workflow-empty">选择成员编辑，或新增成员。</div>';return;}
+  const existing=memberUi.users.some(item=>item.email===user.email),locked=user.is_admin;
+  target.innerHTML=`<section class="workflow-card"><h3>${existing?'编辑成员':'新增成员'}</h3><label class="workflow-field">显示姓名<input id="member-name" value="${esc(user.name||'')}" ${locked?'disabled':''}></label><label class="workflow-field">唯一账号（飞书邮箱或 Open ID）<input id="member-email" value="${esc(user.email||'')}" ${existing?'disabled':''} placeholder="邮箱或 ou_…"></label><label><input id="member-enabled" type="checkbox" ${user.enabled?'checked':''} ${locked?'disabled':''}> 启用成员</label>
+    <div id="member-permission-tree"></div>${Object.values(user.permission_levels||{}).includes('read')?'<p class="workflow-notice">历史只读限制继续保留；勾选功能不会将它升级为可修改。</p>':''}<section class="member-effect"><h3>授权效果</h3><div id="member-effect"></div><details id="member-preview"><summary>预览成员菜单</summary><div id="member-preview-menus"></div><p class="workflow-muted">仅预览菜单与操作权限，不切换账号或读取该成员的业务数据。</p></details></section>${locked?'<p class="workflow-muted">管理员身份由平台配置保护，不能在此修改。</p>':'<div class="workflow-toolbar"><span id="member-save-state" class="workflow-muted"></span><button class="btn btn--primary" id="member-save" disabled>保存修改</button><button class="btn btn--ghost" id="member-cancel" disabled>撤销修改</button></div>'}</section>`;
+  PlatformPermissions.tree($('member-permission-tree'),user.perms||[],!!locked);
+  const updateEffect = () => {
+    const draft={...user,name:$('member-name').value.trim(),enabled:$('member-enabled').checked,perms:PlatformPermissions.selected($('member-permission-tree'))};
+    const original=memberUi.users.find(item=>item.email===user.email);
+    const changed=!existing||draft.name!==original.name||draft.enabled!==original.enabled||JSON.stringify([...draft.perms].sort())!==JSON.stringify([...(original.perms||[])].sort());
+    memberUi.dirty=!locked&&changed;
+    const changes=memberChangeLines({before:existing?original:null,after:draft});
+    $('member-effect').innerHTML=`<p>${draft.enabled?`已开放 ${draft.perms.length} 项功能。`:'已停用：保留配置和历史记录，不能使用平台功能。'}</p><p class="workflow-muted">${locked?'管理员可查看全员记录；其他人的业务记录保持只读。':'默认处理自己的业务记录；既有账号的查看范围和只读限制保持原设置。'}</p>${memberUi.dirty?`<details open><summary>待保存变更</summary><ul>${changes.map(line=>`<li>${esc(line)}</li>`).join('')}</ul></details>`:''}`;
+    $('member-preview-menus').innerHTML=draft.enabled?PlatformPermissions.catalog().map(group=>{const allowed=group.children.filter(item=>(locked||!item.admin_only)&&draft.perms.includes(item.key));return allowed.length?`<section><strong>${esc(group.label)}</strong><ul>${allowed.map(item=>`<li>${esc(item.label)}${item.view_only||draft.permission_levels?.[item.key]==='read'?' · 仅查看':''}</li>`).join('')}</ul></section>`:'';}).join('')||'<p>尚未开放任何功能。</p>':'<p>账号已停用，不展示功能菜单。</p>';
+    if(!locked){$('member-save').disabled=!changed;$('member-cancel').disabled=!changed;$('member-save-state').textContent=changed?'修改尚未保存':'当前配置已保存';}
+  };
+  target.oninput=updateEffect;target.onchange=updateEffect;updateEffect();
+  if(locked)return;
+  $('member-cancel').onclick=()=>{memberUi.dirty=false;memberUi.editing=existing?structuredClone(memberUi.users.find(item=>item.email===user.email)):null;renderMemberEditor();};
+  $('member-save').onclick=async()=>{
+    const body={name:$('member-name').value.trim(),email:$('member-email').value.trim(),enabled:$('member-enabled').checked,perms:PlatformPermissions.selected($('member-permission-tree'))};
+    if(!body.name||!body.email){showToast('请填写显示姓名和唯一账号','error');return;}
+    if(body.enabled&&!body.perms.length){showToast('启用成员至少需要一项功能权限','error');return;}
+    const button=$('member-save');button.disabled=true;
+    try{
+      if(existing){delete body.email;body.expected_revision=user.revision;}
+      await workflowRequest('/api/admin/users'+(existing?'/'+encodeURIComponent(user.email):''),{method:existing?'PATCH':'POST',body});
+      memberUi.dirty=false;memberUi.editing=null;showToast('成员资料与权限已保存','success');await loadPermsTab();await refreshFeishuStatus();
+    }catch(error){showToast(error.message,'error',6000);}finally{if(button.isConnected)button.disabled=false;}
+  };
 }
 
 function auditFeatureLabel(features, key) {
@@ -1146,13 +1088,13 @@ function renderAuditLogsTab(data) {
   const features = data.features || [];
   const logs = data.logs || [];
   const userOptions = users.map(u => `
-    <option value="${esc(u.email)}" ${filters.user === u.email ? 'selected' : ''}>${esc(u.email)}</option>
+    <option value="${esc(u.email)}" ${filters.user === u.email ? 'selected' : ''}>${esc(u.name || "未记录姓名")}</option>
   `).join('');
   const featureOptions = features.map(f => `
     <option value="${esc(f.key)}" ${filters.feature === f.key ? 'selected' : ''}>${esc(f.label)}</option>
   `).join('');
   const rows = logs.map((item, idx) => {
-    const userText = item.user_email || item.user_name || item.open_id || '未识别用户';
+    const userText = item.user_name || '未记录姓名';
     const featureText = item.feature_label || auditFeatureLabel(features, item.feature);
     const actionText = item.action || '';
     const detailText = item.detail || '';
@@ -1162,7 +1104,7 @@ function renderAuditLogsTab(data) {
       <td class="audit-time" title="${esc(formatAuditTime(item.ts))}">${esc(formatAuditTime(item.ts))}</td>
       <td>
         <div class="audit-user" title="${esc(userText)}">${esc(userText)}</div>
-        ${item.user_name ? `<div class="audit-sub">${esc(item.user_name)}</div>` : ''}
+
       </td>
       <td title="${esc(featureText)}"><span class="audit-feature">${esc(featureText)}</span></td>
       <td class="audit-action" title="${esc(actionText)}">${esc(actionText)}</td>
@@ -1172,7 +1114,7 @@ function renderAuditLogsTab(data) {
     <tr class="audit-detail-row" data-audit-detail="${idx}" hidden>
       <td colspan="6">
         <div class="audit-detail-card">
-          <div><strong>用户</strong><span>${esc(userText)}${item.user_name ? `（${esc(item.user_name)}）` : ''}</span></div>
+          <div><strong>用户</strong><span>${esc(userText)}</span></div>
           <div><strong>功能</strong><span>${esc(featureText)}</span></div>
           <div><strong>操作</strong><span>${esc(actionText || '无')}</span></div>
           <div><strong>详情</strong><span>${esc(detailText || '无')}</span></div>
@@ -1339,7 +1281,7 @@ function normalizePromptRecord(prompt) {
     current: String(prompt.current || ''),
     revision: String(prompt.revision || ''),
     history: Array.isArray(prompt.history) ? prompt.history : [],
-    editable: !!prompt.editable,
+    editable: !!prompt.editable && window.PlatformPermissions?.canUse('prompts') !== false,
     group: normalizePromptGroupName(prompt.group),
     group_order: toPromptOrderValue(prompt.group_order),
     order: toPromptOrderValue(prompt.order),
@@ -1894,6 +1836,10 @@ async function loadUiTextsSettings() {
         </div>
       </div>
     `).join('');
+    if (!PlatformPermissions.canUse('ui_texts')) {
+      body.querySelectorAll('textarea').forEach(el=>el.readOnly=true);
+      body.querySelectorAll('[data-uitext-save]').forEach(el=>el.disabled=true);
+    }
   } catch (e) {
     body.innerHTML = `<div class="hist-empty">加载失败：${esc(e.message)}</div>`;
   }
@@ -1964,6 +1910,7 @@ async function loadSystemSettings() {
         </label>
       </div>
     `;
+    if (!PlatformPermissions.canUse('platform')) body.querySelectorAll('input').forEach(el=>el.disabled=true);
   } catch (e) {
     body.innerHTML = `<div class="hist-empty">加载平台设置失败：${esc(e.message)}</div>`;
   }
