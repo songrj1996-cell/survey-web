@@ -43,6 +43,12 @@ permissions.tree(editor,[],true);assert.equal(editor.querySelectorAll('[data-per
   vm.createContext(ui);vm.runInContext(fs.readFileSync(path.join(root,'static/js/features/group-tasks.js'),'utf8'),ui);
   const click=async(action,extra={})=>{const button={dataset:{gw:action,...extra},disabled:false,isConnected:true};await panel.listeners.click({target:{closest:()=>button}});};
   await click('view',{id:'task'});
+  assert.match(panel.innerHTML,/data-step="2" disabled aria-disabled="true"/,'unfinished rules lock later tabs');
+  const draftHtml=panel.innerHTML;
+  await click('step',{step:'4'});
+  assert.equal(panel.innerHTML,draftHtml,'a direct later-step action is rejected');
+  assert.doesNotMatch(panel.innerHTML,/版本 1/,'internal concurrency revision is not shown');
+  assert.match(nodes.get('gw-content').innerHTML,/任务归属群组/);
   const name=fields.get('name');name.matches=selector=>selector==='input,textarea,select';
   panel.listeners.input({target:name});
   await click('extract');

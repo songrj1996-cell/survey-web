@@ -38,6 +38,13 @@ def list_sources(login):
     return store.list_records("sources")
 
 
+def group_options(login):
+    """Business labels only; no URLs, credentials or roster data are exposed."""
+    _business_access(login)
+    return [{"id": source["id"], "name": source["name"]}
+            for source in store.list_records("sources") if source.get("enabled")]
+
+
 async def inspect_source(request, login):
     require_permission(login, "roster")
     try:

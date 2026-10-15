@@ -15,6 +15,8 @@ class TaskRules(BaseModel):
     allow_repeat: StrictBool = False
     announcement: str = Field(default="", max_length=30000)
     ai_detect: StrictBool = True
+    group_source_id: str = Field(default="", max_length=128)
+    group_name: str = Field(default="", max_length=200)
 
 
 class TaskCreate(BaseModel):
@@ -70,6 +72,7 @@ class ConfirmAI(BaseModel):
 class RunTask(BaseModel):
     expected_version: StrictInt = Field(ge=1)
     response_ids: list[str] | None = None
+    stage: Literal["auto", "ai", "quality"] = "auto"
 
 
 class VersionRequest(BaseModel):

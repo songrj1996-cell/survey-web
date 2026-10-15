@@ -2552,6 +2552,21 @@ async def _run_one_quality_batch_strict(
     )
 
 
+def group_column_metadata(rows: list) -> dict:
+    """Use the same local question/ID detection as the original annotation flow."""
+    from app.services.question_detect import _heuristic_type, ROLE_LABEL_MAP
+    headers = rows[0]
+    empty = _empty_annotate_column_indexes(rows, headers)
+    id_col = annotate.detect_id_column(headers, rows)
+    questions = _filter_annotate_open_text_cols(rows, headers, _detect_open_text_cols(rows, headers))
+    types = [ROLE_LABEL_MAP.get(_heuristic_type(str(header), [str(row[i]) for row in rows[1:] if i < len(row)]), "其他列") for i, header in enumerate(headers)]
+    if isinstance(id_col, int) and 0 <= id_col < len(types):
+        types[id_col] = "用户ID"
+    return {"headers_zh": list(headers), "column_types": types, "empty_col_idxs": empty,
+            "header_translation_warning": "列名尚未翻译，已保留原文；配置模型凭据后可重试翻译。",
+            "detected_id_col": id_col, "detected_open_text_cols": [i for i in questions if i != id_col and i not in empty]}
+
+
 async def annotate_group_feedback(task: dict, feedback: dict, checkpoint) -> None:
     """Use the existing strict evidence/holistic engine without a browser/SSE session.
 
@@ -2567,6 +2582,9 @@ async def annotate_group_feedback(task: dict, feedback: dict, checkpoint) -> Non
     sid = task["id"]
     background = task["rules"].get("announcement", "")
     current = deepcopy(feedback)
+    stage = (task.get("run") or {}).get("stage", "quality" if not task["rules"]["ai_detect"] or task.get("ai_confirmation_complete") else "ai")
+    if stage == "quality" and task["rules"]["ai_detect"] and not task.get("ai_confirmation_complete"):
+        raise HTTPException(409, "请先确认 AI 作答，再开始质量打标")
     if task["rules"]["ai_detect"] and not current.get("ai_complete"):
         if not _has_open_text(row, columns):
             result = _empty_ai_result(row, id_col, columns, "主观题均为空，无法构成 AI 内容生成证据")
@@ -2587,6 +2605,8 @@ async def annotate_group_feedback(task: dict, feedback: dict, checkpoint) -> Non
                   "model_error": error or ("AI 识别或翻译待补齐" if missing or translation_missing else "")}
         checkpoint(update)
         current.update(update)
+    if stage == "ai" or current.get("confirmed_ai"):
+        return
     if not current.get("quality_complete"):
         if not _has_open_text(row, columns):
             result, missing, error = _empty_quality_result(row, id_col, columns), set(), ""

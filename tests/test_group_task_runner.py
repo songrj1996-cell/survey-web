@@ -10,24 +10,19 @@ from app.storage import group_workflow as store
 
 
 class RunnerTests(unittest.IsolatedAsyncioTestCase, WorkflowCase):
-    async def test_admission_reads_latest_roster_and_failure_never_queues(self):
+    async def test_admission_never_reads_roster_and_repeated_start_is_idempotent(self):
         from fastapi import HTTPException
         from unittest.mock import AsyncMock
         from app.services import roster_sources
         task=self.make_task(labels=(None,))
         request=RunTask(expected_version=task['version'])
-        with patch.object(roster_sources,'read_roster_snapshot',AsyncMock(side_effect=HTTPException(409,'测试来源不可读'))),patch.object(runner,'require_background_llm_api_key') as key:
-            with self.assertRaises(HTTPException):await runner.prepare_run(task['id'],request,LOGIN)
-            key.assert_not_called()
-        saved=store.read('tasks',task['id'])
-        self.assertIsNone(saved['run']);self.assertEqual(saved['roster_snapshot'],task['roster_snapshot'])
-        fresh=snapshot([entry(ori='818043064(6389)')])
-        with patch.object(roster_sources,'read_roster_snapshot',AsyncMock(return_value=fresh)) as read,patch.object(runner,'require_background_llm_api_key',return_value='test-key'):
+        with patch.object(roster_sources,'read_roster_snapshot',AsyncMock(side_effect=HTTPException(409,'测试来源不可读'))) as read,patch.object(runner,'require_background_llm_api_key',return_value='test-key'):
             result=await runner.prepare_run(task['id'],request,LOGIN)
-            repeated=await runner.prepare_run(task['id'],RunTask(expected_version=result['version']),LOGIN)
-            self.assertEqual(result['run']['id'],repeated['run']['id']);self.assertEqual(read.await_count,1)
-        self.assertEqual(result['version'],task['version']+1)
-        self.assertEqual(result['players'][0]['ori'],'818043064(6389)')
+            repeated=await runner.prepare_run(task['id'],request,LOGIN)
+            self.assertEqual(result['run']['id'],repeated['run']['id'])
+            read.assert_not_awaited()
+        self.assertEqual(result['version'],task['version'])
+        self.assertEqual(result['roster_snapshot']['id'],task['roster_snapshot']['id'])
 
     async def test_below_count_gate_never_reaches_model_adapter(self):
         task=self.make_task(labels=(None,None),requires_count=True,counts=[2,3])
@@ -177,6 +172,9 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase, WorkflowCase):
             kwargs['on_progress']([{'id':row['id'],'q_labels':{'col_1':'有效反馈'}}])
             raise RuntimeError('simulated upstream failure')
         with patch.object(annotate,'_run_ai_batch_checked',AsyncMock(return_value=(1,[ai],set(),set(),''))),patch.object(annotate,'_run_one_quality_batch_strict',quality):
+            await annotate.annotate_group_feedback(task,row,checkpoints.append)
+            self.assertEqual(len(checkpoints),1)  # AI run must not start quality.
+            row.update(checkpoints[0]);task['ai_confirmation_complete']=True
             with self.assertRaises(RuntimeError):await annotate.annotate_group_feedback(task,row,checkpoints.append)
         self.assertTrue(checkpoints[0]['ai_complete'])
         self.assertFalse(checkpoints[1]['quality_complete'])
