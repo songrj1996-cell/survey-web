@@ -342,8 +342,11 @@ def _build_conflicts(rows: list[dict]) -> tuple[list[dict], set[str]]:
     return conflicts, conflict_row_ids
 
 
-def analyze_reward_session(session_id: str, request: RewardAnalyzeRequest, *, latest_roster=False) -> dict:
+def analyze_reward_session(session_id: str, request: RewardAnalyzeRequest, *, latest_roster=False, preview_only=False) -> dict:
     session = get_reward_session(session_id)
+    if preview_only:
+        from copy import deepcopy
+        session = deepcopy(session)
     selected = list(dict.fromkeys(name.strip() for name in request.selected_sheets if name.strip()))
     if len(selected) != len(request.selected_sheets):
         raise HTTPException(status_code=400, detail="参与统计的 sheet 不能重复或为空")
@@ -490,8 +493,16 @@ def analyze_reward_session(session_id: str, request: RewardAnalyzeRequest, *, la
     if not latest_roster and not conflicts and not invalid_rows:
         session["result"] = _build_result(analysis, eligible_rows)
 
+    if preview_only:
+        return analysis
     _persist_import(session)
     return _analysis_response(session)
+
+
+def import_is_ready(session: dict) -> bool:
+    """Only checked rows are reward sources; uploaded drafts stay private sessions."""
+    analysis = session.get("analysis") or {}
+    return bool(session.get("analysis_request") and analysis.get("eligible_rows") and not analysis.get("invalid_rows"))
 
 
 def _analysis_response(session: dict) -> dict:

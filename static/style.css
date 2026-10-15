@@ -13598,3 +13598,6 @@ body {
 .reward-checklist summary small{display:block;font-size:12px;font-weight:400;color:var(--text-2);margin-top:5px}
 @media(max-width:1000px){.workflow-review{grid-template-columns:1fr}.workflow-response-list{display:flex;max-height:220px}.workflow-response{flex:0 0 240px}}
 @media(max-width:900px){.workflow-form-grid,.workflow-source-grid,.member-layout{grid-template-columns:1fr}.workflow-card,.workflow-panel{padding:18px}.workflow-summary{gap:18px}.member-list{max-height:200px;overflow:auto}}
+/* Required mapping labels remain visible before the user can continue. */
+.rr-required { display: inline-block; margin-left: 8px; color: var(--accent); font-size: 12px; font-weight: 600; }
+#rr-validation-hint ul { margin: 8px 0 0; padding-left: 20px; }

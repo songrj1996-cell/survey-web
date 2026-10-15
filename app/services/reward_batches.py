@@ -8,7 +8,7 @@ from fastapi import HTTPException
 from app.schemas.reward_roster import RewardAnalyzeRequest
 from app.services import group_tasks as tasks
 from app.services.feature_access import can_read, owner_identity, require_permission, require_record
-from app.services.reward_roster import _build_conflicts, _build_result, _parse_account, analyze_reward_session, get_reward_session, delete_import
+from app.services.reward_roster import _build_conflicts, _build_result, _parse_account, analyze_reward_session, get_reward_session, delete_import, import_is_ready
 from app.services.auth import _get_user_permission_levels
 from app.core import config
 from app.services.roster_sources import read_roster_snapshot
@@ -41,7 +41,7 @@ def choices(login):
     may_write = not config.FEISHU_LOGIN_REQUIRED or _get_user_permission_levels(login).get("reward") == "use"
     imports = [{**{key: record.get(key) for key in ("id", "filename", "owner_name", "analysis_request", "created_at")},
                 "can_delete": may_write, "selectable": may_write and record["owner_key"] == owner_identity(login)["owner_key"]}
-               for record in store.list_records("imports") if not record.get("deleted_at") and can_read(record, login)]
+               for record in store.list_records("imports") if not record.get("deleted_at") and can_read(record, login) and import_is_ready(record)]
     groups = [{"id": source["id"], "name": source["name"]} for source in store.list_records("sources") if source["enabled"]]
     return {"tasks": available, "other_rewards": others, "imports": imports, "groups": groups,
             "batches": [{key: batch.get(key) for key in ("id", "created_at", "owner_name", "dates", "total_diamonds", "unique_accounts")}
@@ -96,16 +96,15 @@ def _collect_sources(selection, login):
                      "other_reward": record["amount"], "total_reward": record["amount"], "other_record": record})
     for identifier in dict.fromkeys(selection["imported_session_ids"]):
         session = require_record(get_reward_session(identifier), login, write=True)
-        if not session.get("analysis_request"):
-            raise HTTPException(409, "请先完成导入表格的字段映射和日期选择")
+        if not import_is_ready(session):
+            raise HTTPException(409, "请先完成导入表格的字段映射和奖励检查；未通过检查的上传不能用于奖励批次")
         # Re-parse all selected dates regardless of stale spreadsheet status/ori.
-        available_dates = {day for sheet in session["sheets"] for day in sheet.get("date_counts", {})}
+        available_dates = set(session["analysis_request"]["reward_dates"])
         imported_dates = [day for day in dates if day in available_dates]
         if not imported_dates:
             raise HTTPException(422, "选定导入文件没有本次选择日期的记录")
         imported_request = RewardAnalyzeRequest(**{**session["analysis_request"], "reward_dates": imported_dates})
-        analyze_reward_session(identifier, imported_request, latest_roster=True)
-        analysis = session["analysis"]
+        analysis = analyze_reward_session(identifier, imported_request, latest_roster=True, preview_only=True)
         if analysis["invalid_rows"]:
             raise HTTPException(409, {"message": "导入文件仍有异常，请修正后重新上传", "issues": analysis["invalid_rows"]})
         content_hash = tasks.fingerprint(session["content"].hex())
