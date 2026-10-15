@@ -6,6 +6,7 @@
 的函数已移至 services/auth。
 """
 from urllib.parse import quote
+from contextvars import ContextVar
 
 from fastapi import Request
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -18,7 +19,9 @@ from app.core.config import (
 )
 
 # 权限项全集（顺序即管理页展示顺序）
-ALL_PERMS = ["survey", "interview", "annotate", "comment", "reward"]
+from app.core.feature_permissions import ALL_PERMS
+
+admin_history_read_scope = ContextVar("admin_history_read_scope", default=False)
 
 
 def _email(login: dict | None) -> str:
@@ -162,7 +165,7 @@ def _assign_session_owner(sess: dict, login: dict | None) -> None:
 
 def _find_history_for_login(history: list, hist_id: str, login: dict | None) -> dict | None:
     entry = next((h for h in history if h.get("id") == hist_id), None)
-    if not entry or not _visible_to_owner(entry, login):
+    if not entry or not (_visible_to_owner(entry, login) or (admin_history_read_scope.get() and _is_admin(login))):
         return None
     return entry
 

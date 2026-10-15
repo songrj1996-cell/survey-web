@@ -70,5 +70,11 @@ async def require_session_request_access(
     if not config.FEISHU_LOGIN_REQUIRED:
         return None
     login = await login_resolver(request)
-    require_session_access(session_id, login, loader=loader)
+    from app.services.feature_access import history_feature, legacy_request_is_read, require_permission, require_record
+    sess = (loader or get_session)(session_id)
+    read_only = legacy_request_is_read(request)
+    require_record(sess, login, write=not read_only)
+    path = request.url.path
+    feature = "annotate" if path.startswith("/api/annotate") else "reward" if path.startswith("/api/reward-roster") else history_feature(sess)
+    require_permission(login, feature, write=not read_only)
     return login

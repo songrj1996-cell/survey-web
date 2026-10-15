@@ -50,3 +50,28 @@ def _parse_file(filename: str, content: bytes) -> list[list]:
     elif name_lower.endswith(".xlsx"):
         return _parse_excel(content)
     raise ValueError("不支持的文件格式，请上传 .csv 或 .xlsx 文件")
+
+
+def parse_file_with_cell_metadata(filename: str, content: bytes) -> tuple[list[list], dict]:
+    """Opt-in identity safety metadata; existing survey parsing is unchanged."""
+    rows = _parse_file(filename, content)
+    issues: dict[str, str] = {}
+    if filename.lower().endswith(".xlsx"):
+        workbook = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=False)
+        try:
+            for row_index, cells in enumerate(workbook.active.iter_rows()):
+                for column_index, cell in enumerate(cells):
+                    value = cell.value
+                    issue = ""
+                    if cell.data_type == "f":
+                        issue = "身份单元格是公式，请改用原始文本 ID"
+                    elif isinstance(value, (int, float)) and not isinstance(value, bool):
+                        if isinstance(value, float) and (not value.is_integer() or abs(value) >= 10 ** 15):
+                            issue = "数字身份可能已失去精度，请从原始来源补填文本 ID"
+                        elif abs(value) >= 10 ** 15:
+                            issue = "长 ID 保存为 Excel 数字，无法证明精度完整，请补填文本 ID"
+                    if issue:
+                        issues[f"{row_index}:{column_index}"] = issue
+        finally:
+            workbook.close()
+    return rows, issues

@@ -1,6 +1,6 @@
 """奖励整理 HTTP 接口。"""
 
-from fastapi import APIRouter, File, Request, UploadFile
+from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 
 from app.core.responses import _make_download_response
 from app.schemas.reward_roster import RewardAnalyzeRequest, RewardResolveRequest
@@ -51,7 +51,7 @@ async def analyze_reward_workbook(
     request: Request,
 ):
     await _require_reward_session(request, session_id)
-    result = analyze_reward_session(session_id, body)
+    result = analyze_reward_session(session_id, body, latest_roster=True)
     await audit_log(
         request,
         "reward",
@@ -81,6 +81,4 @@ async def resolve_reward_workbook(
 @router.get("/api/reward-roster/{session_id}/download")
 async def download_reward_txt(session_id: str, request: Request):
     await _require_reward_session(request, session_id)
-    content, filename = reward_download(session_id)
-    await audit_log(request, "reward", "导出奖励名单", filename)
-    return _make_download_response(content, "text/plain; charset=utf-8", filename)
+    raise HTTPException(409, "请将已导入的 Excel 纳入奖励整理，核对最新名单并生成批次后下载；此旧地址不再绕过批次防重")

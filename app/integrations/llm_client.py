@@ -857,7 +857,7 @@ async def collect_chat_completion(
         return event
 
     async with httpx.AsyncClient(timeout=timeout) as client:
-        async def _run_http_attempt(
+        async def _run_http_attempt_unlimited(
             model: str,
             model_index: int,
             protocol: _Protocol,
@@ -937,6 +937,11 @@ async def collect_chat_completion(
                 ),
             )
             return result
+
+        async def _run_http_attempt(*args, **kwargs):
+            from app.core.llm_limits import llm_attempt_slot
+            async with llm_attempt_slot():
+                return await _run_http_attempt_unlimited(*args, **kwargs)
 
         async def _request_with_chat_compatibility(
             model: str,

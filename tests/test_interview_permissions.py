@@ -10,7 +10,10 @@ class InterviewPermissionMigrationTests(unittest.TestCase):
     def test_interview_is_an_independent_permission(self):
         self.assertEqual(
             ALL_PERMS,
-            ["survey", "interview", "annotate", "comment", "reward"],
+            [
+                "survey", "interview", "comment", "annotate", "reward", "roster",
+                "ui_texts", "prompts", "glossary", "platform", "members", "audit",
+            ],
         )
 
     def test_v2_survey_user_receives_interview_once(self):

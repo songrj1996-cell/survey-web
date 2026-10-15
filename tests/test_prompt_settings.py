@@ -25,6 +25,7 @@ from app.storage import ui_texts as ui_text_storage
 
 
 EXPECTED_PROMPT_KEYS = {
+    "task_announcement_system",
     "questionnaire_translation_system",
     "column_detect_system",
     "survey_planner_system",
@@ -84,11 +85,11 @@ def _sha256(path: str) -> str:
 
 
 class PromptCatalogTests(unittest.TestCase):
-    def test_catalog_has_40_current_non_dify_entries_in_six_groups(self):
+    def test_catalog_has_41_current_non_dify_entries_in_six_groups(self):
         catalog = prompt_storage.DEFAULT_PROMPTS
 
         self.assertEqual(set(catalog), EXPECTED_PROMPT_KEYS)
-        self.assertEqual(len(catalog), 40)
+        self.assertEqual(len(catalog), 41)
         self.assertNotIn("upload_guide", catalog)
         self.assertNotIn("quick_writer_requirements", catalog)
         self.assertEqual(
@@ -568,11 +569,11 @@ class InterviewV2ReportReviewContractTests(unittest.TestCase):
 
 
 class PromptApiAuthorizationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_prompt_get_and_put_require_admin(self):
+    async def test_prompt_get_and_put_require_feature_access(self):
         request = object()
         require_admin = AsyncMock(return_value={"email": "admin@example.com"})
         with (
-            patch.object(settings_api, "_require_admin", new=require_admin),
+            patch.object(settings_api, "_require_settings_access", new=require_admin),
             patch.object(settings_api, "get_all_prompts", return_value={"ok": {}}),
         ):
             result = await settings_api.get_prompts(request)
@@ -581,7 +582,7 @@ class PromptApiAuthorizationTests(unittest.IsolatedAsyncioTestCase):
 
         require_admin.reset_mock()
         with (
-            patch.object(settings_api, "_require_admin", new=require_admin),
+            patch.object(settings_api, "_require_settings_access", new=require_admin),
             patch.object(settings_api, "update_prompt") as update_prompt,
             patch.object(settings_api, "audit_log", new=AsyncMock()) as audit_log,
         ):
@@ -601,11 +602,11 @@ class PromptApiAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         )
         audit_log.assert_awaited_once()
 
-    async def test_ui_text_put_requires_admin(self):
+    async def test_ui_text_put_requires_feature_access(self):
         request = object()
         require_admin = AsyncMock(return_value={"email": "admin@example.com"})
         with (
-            patch.object(settings_api, "_require_admin", new=require_admin),
+            patch.object(settings_api, "_require_settings_access", new=require_admin),
             patch.object(settings_api, "update_ui_text") as update_ui_text,
             patch.object(settings_api, "audit_log", new=AsyncMock()),
         ):
@@ -620,7 +621,7 @@ class PromptApiAuthorizationTests(unittest.IsolatedAsyncioTestCase):
     async def test_prompt_get_stops_before_storage_when_admin_check_fails(self):
         denied = HTTPException(status_code=403, detail="需要管理员权限")
         with (
-            patch.object(settings_api, "_require_admin", new=AsyncMock(side_effect=denied)),
+            patch.object(settings_api, "_require_settings_access", new=AsyncMock(side_effect=denied)),
             patch.object(settings_api, "get_all_prompts") as get_all_prompts,
         ):
             with self.assertRaises(HTTPException) as caught:

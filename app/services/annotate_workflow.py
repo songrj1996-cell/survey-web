@@ -1961,7 +1961,16 @@ async def build_and_save_annotate_download(sid: str, request: Request) -> tuple[
     excel_bytes, download_name = await loop.run_in_executor(
         None, _build_annotate_excel_from_session, sess
     )
-    await _publish_annotate_result(sid, sess, request)
+    from app.core import config
+    from app.services.auth import _current_login, _get_user_permission_levels
+    from app.services.feature_access import owner_identity
+    login = await _current_login(request) if config.FEISHU_LOGIN_REQUIRED else None
+    may_save = not config.FEISHU_LOGIN_REQUIRED or (
+        sess.get("owner_key") == owner_identity(login)["owner_key"]
+        and _get_user_permission_levels(login).get("annotate") == "use"
+    )
+    if may_save:
+        await _publish_annotate_result(sid, sess, request)
     return excel_bytes, download_name
 
 
@@ -2393,6 +2402,7 @@ async def _run_one_quality_batch_strict(
     *,
     existing_results: list[dict] | None = None,
     background: str = "",
+    on_progress=None,
 ) -> tuple[int, list[dict], set[str], str]:
     """Retain trusted fields and fill gaps using complete, untruncated player text."""
     rows_by_id = {_row_id(row, id_col): row for row in batch}
@@ -2524,6 +2534,8 @@ async def _run_one_quality_batch_strict(
                 if normalized:
                     shared_result.clear()
                     shared_result.update(normalized[0])
+                    if on_progress:
+                        on_progress(list(by_id.values()))
     call_errors.extend(await _run_invalid_quality_review_stage(
         by_id, rows_by_id, headers, open_text_cols, id_col, batch_num, background,
     ))
@@ -2538,6 +2550,59 @@ async def _run_one_quality_batch_strict(
     return batch_num, retained, missing, (
         budget_errors[0] if budget_errors else _validation_error_summary(errors)
     )
+
+
+async def annotate_group_feedback(task: dict, feedback: dict, checkpoint) -> None:
+    """Use the existing strict evidence/holistic engine without a browser/SSE session.
+
+    Internal response IDs distinguish legal repeated submissions. Individual successful
+    stages are checkpointed before another upstream call; retries retain trusted fields.
+    """
+    columns = task["mapping"]["open_text_cols"]
+    headers = list(task["headers"]) + ["内部反馈编号"]
+    id_col = len(headers) - 1
+    row = list(feedback["cells"][:id_col])
+    row.extend([""] * (id_col - len(row)))
+    row.append(feedback["id"])
+    sid = task["id"]
+    background = task["rules"].get("announcement", "")
+    current = deepcopy(feedback)
+    if task["rules"]["ai_detect"] and not current.get("ai_complete"):
+        if not _has_open_text(row, columns):
+            result = _empty_ai_result(row, id_col, columns, "主观题均为空，无法构成 AI 内容生成证据")
+            missing, translation_missing, error = set(), set(), ""
+        elif current.get("ai"):
+            result = deepcopy(current["ai"])
+            valid, missing, errors = _validated_ai_results([result], [row], id_col, columns)
+            if valid and not missing:
+                translation_missing, error = await _repair_missing_translations(sid, valid, [row], id_col, columns, "group-ai-repair")
+                result = valid[0]
+            else:
+                _, valid, missing, translation_missing, error = await _run_ai_batch_checked(sid, 1, [row], headers, columns, id_col, background)
+                result = valid[0] if valid else None
+        else:
+            _, valid, missing, translation_missing, error = await _run_ai_batch_checked(sid, 1, [row], headers, columns, id_col, background)
+            result = valid[0] if valid else None
+        update = {"ai": result, "ai_complete": bool(result) and not missing and not translation_missing,
+                  "model_error": error or ("AI 识别或翻译待补齐" if missing or translation_missing else "")}
+        checkpoint(update)
+        current.update(update)
+    if not current.get("quality_complete"):
+        if not _has_open_text(row, columns):
+            result, missing, error = _empty_quality_result(row, id_col, columns), set(), ""
+        else:
+            seed = deepcopy(current.get("quality") or {})
+            seed.setdefault("id", feedback["id"])
+            if current.get("ai"):
+                seed["translations"] = {**current["ai"].get("translations", {}), **seed.get("translations", {})}
+            _, retained, missing, error = await _run_one_quality_batch_strict(
+                sid, 1, [row], headers, columns, id_col, not task["rules"]["ai_detect"],
+                existing_results=[seed], background=background,
+                on_progress=lambda results: checkpoint({"quality": deepcopy(results[0]), "quality_complete": False}),
+            )
+            result = retained[0] if retained else seed
+        checkpoint({"quality": result, "quality_complete": bool(result) and not missing,
+                    "model_error": error or current.get("model_error", "")})
 
 
 async def quality_stream(sid: str, request: Request, retry_ids: set[str] | None = None):

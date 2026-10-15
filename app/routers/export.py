@@ -5,7 +5,7 @@
 """
 from typing import Literal
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from app.core.responses import _make_download_response
 from app.core.runtime_logging import runtime_log
@@ -27,7 +27,9 @@ from app.services.export_service import _export_to_feishu, _feishu_export_error
 from app.services.feishu_auth import require_feishu_configured
 from app.services.session_access import require_session_request_access
 
-router = APIRouter()
+from app.services.feature_access import legacy_route_access
+
+router = APIRouter(dependencies=[Depends(legacy_route_access)])
 
 
 @router.get("/api/export/word/{session_id}")

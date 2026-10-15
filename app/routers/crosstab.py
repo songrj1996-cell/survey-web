@@ -3,13 +3,15 @@
 文件解析、列结构生成、session 创建全部在 services/crosstab_service。
 后续方案/统计/报告复用 survey 的共享流程，仅上传入口在此。
 """
-from fastapi import APIRouter, File, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Request, UploadFile
 
 from app.services.audit import audit_log
 from app.services.auth import _current_login
 from app.services.crosstab_service import handle_crosstab_upload
 
-router = APIRouter()
+from app.services.feature_access import legacy_route_access
+
+router = APIRouter(dependencies=[Depends(legacy_route_access)])
 
 
 @router.post("/api/upload/crosstab")

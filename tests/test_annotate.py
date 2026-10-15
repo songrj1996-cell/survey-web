@@ -1403,14 +1403,14 @@ class AnnotateReviewTests(unittest.IsolatedAsyncioTestCase):
             patch.object(auth, "_get_user_perms", return_value=["report"]),
         ):
             with self.assertRaises(HTTPException) as ctx:
-                await auth._require_feature(object(), "annotate")
+                await auth._require_feature(object(), "annotate", action="use")
         self.assertEqual(ctx.exception.status_code, 403)
 
         with (
             patch.object(auth, "_current_login", new=AsyncMock(return_value={"email": "u@test"})),
             patch.object(auth, "_get_user_perms", return_value=["annotate"]),
         ):
-            login = await auth._require_feature(object(), "annotate")
+            login = await auth._require_feature(object(), "annotate", action="use")
         self.assertEqual(login["email"], "u@test")
 
     async def test_quality_stream_does_not_report_translation_gap_as_label_gap(self):

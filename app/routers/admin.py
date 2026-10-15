@@ -8,7 +8,8 @@ from app.schemas.requests import AdminUserPatch, AdminUserRequest
 from app.services.admin_audit import query_audit_logs
 from app.services.admin_users import add_whitelist_user, delete_whitelist_user, update_whitelist_user
 from app.services.audit import audit_log
-from app.services.auth import _admin_user_rows, _require_admin
+from app.services.auth import _admin_user_rows, _require_admin, _require_feature
+from app.core.feature_permissions import feature_catalog
 
 router = APIRouter()
 
@@ -16,7 +17,7 @@ router = APIRouter()
 @router.get("/api/admin/users")
 async def admin_list_users(request: Request):
     await _require_admin(request)
-    return {"users": _admin_user_rows()}
+    return {"users": _admin_user_rows(), "feature_catalog": feature_catalog()}
 
 
 @router.get("/api/admin/audit-logs")
@@ -28,22 +29,22 @@ async def admin_audit_logs(
     feature: str = "",
     limit: int = 300,
 ):
-    await _require_admin(request)
+    await _require_feature(request, "audit", action="read")
     return query_audit_logs(start, end, user, feature, limit)
 
 
 @router.post("/api/admin/users")
 async def admin_add_user(req: AdminUserRequest, request: Request):
-    await _require_admin(request)
-    detail = add_whitelist_user(req.email.strip().lower(), req.perms, req.enabled)
+    login = await _require_admin(request)
+    detail = add_whitelist_user(req.email.strip().lower(), req.perms, req.enabled, req.name, login)
     await audit_log(request, "admin", "添加用户", detail)
     return {"ok": True}
 
 
 @router.patch("/api/admin/users/{email}")
 async def admin_update_user(email: str, req: AdminUserPatch, request: Request):
-    await _require_admin(request)
-    detail = update_whitelist_user(email.strip().lower(), req.perms, req.enabled)
+    login = await _require_admin(request)
+    detail = update_whitelist_user(email.strip().lower(), req.perms, req.enabled, req.name, req.expected_revision, login)
     await audit_log(request, "admin", "更新用户", detail)
     return {"ok": True}
 

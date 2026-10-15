@@ -26,6 +26,7 @@ from app.core.security import _forbidden_response, _is_public_path, _safe_next_p
 from app.core.runtime_logging import configure_runtime_logging
 from app.services.auth import _current_login, _login_allowed
 from app.services.feishu_navigation_auto_update import navigation_lifespan
+from app.services.group_task_runner import group_workflow_lifespan
 from app.services.request_logging import RequestLoggingContextMiddleware
 from app.storage.sessions import _sweep_old_sessions
 
@@ -38,7 +39,7 @@ async def app_lifespan(app_instance):
     # 兼容 `python -m uvicorn` 与 `python server.py`：后者会在导入本模块后
     # 重新配置 Uvicorn logger，因此应用真正启动时再配置一次。
     configure_runtime_logging()
-    async with navigation_lifespan(app_instance):
+    async with navigation_lifespan(app_instance), group_workflow_lifespan(app_instance):
         yield
 
 
@@ -102,7 +103,14 @@ from app.routers import (
     reward_roster,
     settings_api,
     survey,
+    group_tasks,
+    roster_sources,
+    reward_batches,
 )
+
+app.include_router(group_tasks.router)
+app.include_router(roster_sources.router)
+app.include_router(reward_batches.router)
 
 if GOOGLE_FORMS_QUALITATIVE_ENABLED:
     if not GOOGLE_FORMS_SERVICE_ACCOUNT_ENABLED:

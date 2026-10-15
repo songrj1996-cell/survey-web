@@ -3,7 +3,7 @@
 业务编排、SSE 流程、session 推进、历史落库全部在:
   services/comment_upload / comment_preprocess / comment_run
 """
-from fastapi import APIRouter, File, Form, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
 from fastapi.responses import StreamingResponse
 
 from app.services.audit import audit_log
@@ -20,7 +20,9 @@ from app.services.llm_credentials import (
     stream_with_llm_api_key,
 )
 
-router = APIRouter()
+from app.services.feature_access import legacy_route_access
+
+router = APIRouter(dependencies=[Depends(legacy_route_access)])
 
 
 @router.post("/api/comment-analysis/upload")

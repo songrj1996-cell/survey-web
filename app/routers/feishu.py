@@ -8,7 +8,8 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from app.core.config import COOKIE_NAME, FEISHU_LOGIN_REQUIRED, FEISHU_SESSION_SECONDS, FEISHU_EVENT_MAX_BYTES
 from app.core.security import _is_admin, _login_denied_reason, _login_url, _safe_next_path
 from app.services.audit import _audit_log_from_login
-from app.services.auth import _current_login, _get_user_perms, _login_allowed
+from app.services.auth import _current_login, _get_user_perms, _get_user_permission_levels, _login_allowed
+from app.core.feature_permissions import feature_catalog
 from app.services.feishu_auth import (
     do_logout,
     get_feishu_authorize_url,
@@ -76,6 +77,8 @@ async def feishu_me(request: Request):
         "login_url": _login_url("/"),
         "error": "" if (not login or allowed) else _login_denied_reason(login),
         "perms": _get_user_perms(login),
+        "permission_levels": _get_user_permission_levels(login),
+        "feature_catalog": feature_catalog(),
         "is_admin": _is_admin(login),
     }
 

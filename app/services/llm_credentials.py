@@ -105,8 +105,8 @@ def get_user_llm_api_key(login: dict | None) -> str:
     return api_key
 
 
-async def require_request_llm_api_key(request: Request) -> str:
-    login = await _current_login(request)
+def require_background_llm_api_key(login: dict | None) -> str:
+    """Resolve the owner's current credential without persisting any secret in a job."""
     if not FEISHU_LOGIN_REQUIRED:
         if login:
             owner_id = _owner_id(login)
@@ -119,6 +119,10 @@ async def require_request_llm_api_key(request: Request) -> str:
             return LLM_API_KEY
         raise HTTPException(status_code=500, detail="本地开发环境未配置 LLM_API_KEY")
     return get_user_llm_api_key(login)
+
+
+async def require_request_llm_api_key(request: Request) -> str:
+    return require_background_llm_api_key(await _current_login(request))
 
 
 async def validate_and_save_user_llm_api_key(

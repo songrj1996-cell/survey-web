@@ -2,7 +2,7 @@
 
 列表查询与详情在 services/history_service，改名在 services/report_history。
 """
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from app.schemas.requests import (
@@ -19,7 +19,9 @@ from app.services.survey_service import (
     partial_report_rerun_stream,
 )
 
-router = APIRouter()
+from app.services.feature_access import legacy_route_access
+
+router = APIRouter(dependencies=[Depends(legacy_route_access)])
 
 
 @router.get("/api/history")

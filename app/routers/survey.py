@@ -3,7 +3,7 @@
 业务编排、SSE 流程、session 推进、历史落库全部在 services/survey_service。
 跑数表(crosstab)模式复用本组的 plan/stats/report/qa 流程，仅上传入口在 routers/crosstab。
 """
-from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile, Query
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, Query
 from fastapi.responses import JSONResponse, StreamingResponse
 from app.core.llm_context import bind_llm_api_key
 
@@ -64,7 +64,9 @@ from app.services.survey_service import (
     validate_report_ready,
 )
 
-router = APIRouter()
+from app.services.feature_access import legacy_route_access
+
+router = APIRouter(dependencies=[Depends(legacy_route_access)])
 
 
 @router.post("/api/analysis-settings/{session_id}")

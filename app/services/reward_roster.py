@@ -25,6 +25,7 @@ from app.core.config import (
 )
 from app.core.security import _assign_session_owner
 from app.schemas.reward_roster import RewardAnalyzeRequest, RewardResolveRequest
+from app.storage import group_workflow as workflow_store
 
 
 _ACCOUNT_RE = re.compile(r"^\s*(\d+)\s*\(\s*(\d+)\s*\)\s*$")
@@ -51,6 +52,13 @@ def get_reward_session(session_id: str) -> dict:
     with _SESSION_LOCK:
         session = _SESSIONS.get(session_id)
         if not session:
+            session = workflow_store.read("imports", session_id)
+            if session:
+                session["content"] = workflow_store.read_blob(session_id)
+                if session.get("analysis"):
+                    session["analysis"]["conflict_row_ids"] = set(session["analysis"]["conflict_row_ids"])
+                _SESSIONS[session_id] = session
+        if not session:
             raise HTTPException(status_code=404, detail="奖励整理任务不存在或已过期，请重新上传 Excel")
         session["touched_at"] = _now()
         return session
@@ -64,6 +72,18 @@ def _display_value(value: object) -> str:
     if isinstance(value, date):
         return value.isoformat()
     return str(value).strip()
+
+
+def _persist_import(session: dict) -> None:
+    from copy import deepcopy
+    record = deepcopy({key: value for key, value in session.items() if key not in ("content", "touched_at")})
+    if record.get("analysis"):
+        record["analysis"]["conflict_row_ids"] = sorted(record["analysis"]["conflict_row_ids"])
+    record["content_hash"] = workflow_store.save_blob(session["id"], session["content"])
+    def save(current):
+        current.clear()
+        current.update(record)
+    workflow_store.mutate("imports", session["id"], save, default={})
 
 
 def _normalize_header(value: object) -> str:
@@ -172,6 +192,9 @@ def create_reward_session(filename: str, content: bytes, login: dict | None) -> 
         "result": None,
     }
     _assign_session_owner(session, login)
+    from app.services.feature_access import owner_identity
+    session.update(owner_identity(login))
+    _persist_import(session)
     _sweep_sessions()
     with _SESSION_LOCK:
         _SESSIONS[session_id] = session
@@ -272,8 +295,9 @@ def _build_conflicts(rows: list[dict]) -> tuple[list[dict], set[str]]:
         same_task_groups: dict[tuple[str, str, str], list[dict]] = defaultdict(list)
         task_groups: dict[tuple[str, str], list[dict]] = defaultdict(list)
         for row in account_rows:
-            same_task_groups[(row["sheet"], row["date"], row["task"])].append(row)
-            task_groups[(row["date"], row["task"])].append(row)
+            task_key = row.get("reward_event_key") or row["task"]
+            same_task_groups[(row["sheet"], row["date"], task_key)].append(row)
+            task_groups[(row["date"], task_key)].append(row)
         reasons = []
         if len(sheets) > 1:
             reasons.append("cross_sheet_account")
@@ -298,7 +322,7 @@ def _build_conflicts(rows: list[dict]) -> tuple[list[dict], set[str]]:
     return conflicts, conflict_row_ids
 
 
-def analyze_reward_session(session_id: str, request: RewardAnalyzeRequest) -> dict:
+def analyze_reward_session(session_id: str, request: RewardAnalyzeRequest, *, latest_roster=False) -> dict:
     session = get_reward_session(session_id)
     selected = list(dict.fromkeys(name.strip() for name in request.selected_sheets if name.strip()))
     if len(selected) != len(request.selected_sheets):
@@ -356,7 +380,7 @@ def analyze_reward_session(session_id: str, request: RewardAnalyzeRequest) -> di
                     ignored["blank"] += 1
                     continue
                 status = _display_value(values[mapping.status_col] if mapping.status_col < len(values) else None)
-                if status != REWARD_ROSTER_ELIGIBLE_STATUS:
+                if not latest_roster and status != REWARD_ROSTER_ELIGIBLE_STATUS:
                     ignored["ineligible_status"] += 1
                     continue
                 date_value = values[mapping.date_col] if mapping.date_col < len(values) else None
@@ -386,11 +410,18 @@ def analyze_reward_session(session_id: str, request: RewardAnalyzeRequest) -> di
                     if total == 0:
                         ignored["zero_reward"] += 1
                         continue
-                    uid, zoneid, account = _parse_account(values[mapping.account_id_col])
+                    if latest_roster:
+                        uid, zoneid, account = "", "", _display_value(values[mapping.account_id_col])
+                    else:
+                        uid, zoneid, account = _parse_account(values[mapping.account_id_col])
                     task = _display_value(values[mapping.task_col])
                     if not task:
                         raise ValueError("任务名称不能为空")
                     player_id = _display_value(values[mapping.player_id_col])
+                    if latest_roster:
+                        raw_player = values[mapping.player_id_col]
+                        if not player_id or player_id.startswith("=") or (isinstance(raw_player, (int, float)) and abs(raw_player) >= 10**15):
+                            raise ValueError("playerid 为空、公式或存在长数字精度风险，请恢复为原始文本")
                 except (IndexError, ValueError) as exc:
                     invalid_rows.append({
                         "sheet": sheet_name,
@@ -427,13 +458,16 @@ def analyze_reward_session(session_id: str, request: RewardAnalyzeRequest) -> di
         "conflicts": conflicts,
         "conflict_row_ids": conflict_row_ids,
         "ignored": ignored,
+        "requires_live_roster": latest_roster,
     }
     session["analysis"] = analysis
+    session["analysis_request"] = request.model_dump()
     session["result"] = None
 
-    if not conflicts and not invalid_rows:
+    if not latest_roster and not conflicts and not invalid_rows:
         session["result"] = _build_result(analysis, eligible_rows)
 
+    _persist_import(session)
     return _analysis_response(session)
 
 
@@ -459,6 +493,8 @@ def resolve_reward_conflicts(session_id: str, request: RewardResolveRequest) -> 
     analysis = session.get("analysis")
     if not analysis:
         raise HTTPException(status_code=409, detail="请先完成字段映射和数据分析")
+    if analysis.get("requires_live_roster"):
+        raise HTTPException(409, "导入映射已保存，请在奖励整理中核对最新名单和奖励冲突，再生成正式批次")
     if analysis["invalid_rows"]:
         raise HTTPException(status_code=409, detail="Excel 中仍有无效数据，请修正后重新上传")
 
@@ -492,6 +528,7 @@ def resolve_reward_conflicts(session_id: str, request: RewardResolveRequest) -> 
         selected_rows.extend(retained)
 
     session["result"] = _build_result(analysis, selected_rows)
+    _persist_import(session)
     return {
         "session_id": session_id,
         "export_ready": True,

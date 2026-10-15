@@ -14,6 +14,7 @@ from app.core.config import (
     FEISHU_LOGIN_REQUIRED,
 )
 from app.core.security import ALL_PERMS, _is_admin, _whitelist_match
+from app.core.feature_permissions import permission_levels
 from app.integrations import feishu_client
 from app.storage.logins import _save_web_logins, _sync_web_logins_from_disk, web_logins
 from app.storage.whitelist import _load_whitelist
@@ -95,15 +96,34 @@ def _get_user_perms(login: dict | None) -> list[str]:
         return list(ALL_PERMS)
     for u in _load_whitelist():
         if _whitelist_match(u, login):
-            return list(u.get("perms", list(ALL_PERMS)))
+            return list(permission_levels(u))
     return []
 
 
-async def _require_feature(request: Request, feature: str) -> dict | None:
+def _get_user_permission_levels(login: dict | None) -> dict[str, str]:
+    if not FEISHU_LOGIN_REQUIRED or _is_admin(login):
+        return {key: ("read" if key == "audit" else "use") for key in ALL_PERMS}
+    if not login:
+        return {}
+    for user in _load_whitelist():
+        if _whitelist_match(user, login):
+            return permission_levels(user)
+    return {}
+
+
+async def _require_feature(request: Request, feature: str, *, action: str | None = None) -> dict | None:
     """Require one backend feature permission; UI visibility is not an auth boundary."""
     login = await _current_login(request)
+    if action is None:
+        path = request.url.path
+        runs_model = any(part in path for part in ("/run", "/preprocess"))
+        action = "read" if request.method == "GET" and not runs_model else "use"
     if feature not in _get_user_perms(login):
         raise HTTPException(status_code=403, detail="当前账号没有此功能权限")
+    if action != "read" and _get_user_permission_levels(login).get(feature) != "use":
+        raise HTTPException(status_code=403, detail="当前功能保留了历史只读限制，不能执行此操作")
+    if feature == "members" and not _is_admin(login):
+        raise HTTPException(status_code=403, detail="成员权限管理需要管理员身份")
     return login
 
 
@@ -121,7 +141,11 @@ def _admin_user_rows() -> list[dict]:
         e = u.get("email", "").lower()
         result.append({
             "email": e,
-            "perms": u.get("perms", list(ALL_PERMS)),
+            "name": u.get("name", "待补充姓名"),
+            "perms": list(permission_levels(u)),
+            "permission_levels": permission_levels(u),
+            "revision": u.get("revision", 1),
+            "permission_history": u.get("permission_history", []),
             "enabled": u.get("enabled", True),
             "is_admin": False,
         })
@@ -129,7 +153,7 @@ def _admin_user_rows() -> list[dict]:
     existing = {u["email"] for u in result}
     for e in sorted(admin_emails):
         if e not in existing:
-            result.insert(0, {"email": e, "perms": list(ALL_PERMS), "enabled": True, "is_admin": True})
+            result.insert(0, {"email": e, "name": "平台管理员", "perms": list(ALL_PERMS), "enabled": True, "is_admin": True})
         else:
             for u in result:
                 if u["email"] == e:

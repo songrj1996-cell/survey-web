@@ -1,5 +1,7 @@
 """storage/whitelist:白名单(whitelist.json)读写 + 旧权限结构迁移。"""
 import json
+from pathlib import Path
+from app.storage.group_workflow import locked, _write
 
 from app.core.config import WHITELIST_FILE
 
@@ -16,6 +18,12 @@ def _migrate_whitelist_perms(users: list[dict]) -> bool:
     for u in users:
         version = u.get("perms_v", 1)
         if version < _PERMS_SCHEMA_VERSION:
+            if isinstance(u.get("perms"), dict):
+                # Some legacy deployments encode read-only restrictions in values.
+                # Keep those values; converting the keys to a list would grant use.
+                u["perms_v"] = _PERMS_SCHEMA_VERSION
+                changed = True
+                continue
             perms = list(u.get("perms", ["survey", "annotate"]))
             if version < 2 and perms and "comment" not in perms:
                 perms.append("comment")
@@ -34,11 +42,20 @@ def _load_whitelist() -> list[dict]:
         users = data.get("users", []) if isinstance(data, dict) else []
     except (FileNotFoundError, json.JSONDecodeError):
         return []
-    if _migrate_whitelist_perms(users):
-        _save_whitelist(users)
+    # Preserve previously effective legacy access in memory. Reading a member
+    # record must not migrate live files or grant newly introduced permissions.
+    _migrate_whitelist_perms(users)
     return users
 
 
 def _save_whitelist(users: list[dict]) -> None:
-    with open(WHITELIST_FILE, "w", encoding="utf-8") as f:
-        json.dump({"users": users}, f, ensure_ascii=False, indent=2)
+    with locked():
+        _write(Path(WHITELIST_FILE), {"users": users})
+
+
+def mutate_whitelist(change):
+    with locked():
+        users = _load_whitelist()
+        result = change(users)
+        _save_whitelist(users)
+        return result

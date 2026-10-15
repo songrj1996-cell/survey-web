@@ -22,6 +22,8 @@ from app.services.report_modes import MODE_SNAPSHOT_FIELDS
 from app.services.report_quick_outline import build_quick_outline
 from app.storage.history import _load_history_with_report_numbers
 from app.storage.sessions import get_session  # kept as a stable patch seam for integrations
+from app.services.feature_access import can_read, history_feature, require_permission
+from app.services.auth import _get_user_permission_levels
 
 
 _SELECTED_VERSION_FIELDS = (
@@ -93,7 +95,8 @@ def _history_version_metadata(entry: dict, login: dict | None) -> dict:
 def get_history_list(login: dict | None, mode: str = "") -> list[dict]:
     """返回对当前用户可见的历史列表（列表视图格式，不含完整 report_md）。"""
     history = _load_history_with_report_numbers()
-    visible = [h for h in history if _visible_to_owner(h, login)]
+    levels = _get_user_permission_levels(login)
+    visible = [h for h in history if (_visible_to_owner(h, login) or can_read(h, login)) and history_feature(h) in levels]
     if mode:
         visible = [h for h in visible if (h.get("mode") or "") == mode]
     result = []
@@ -105,6 +108,7 @@ def get_history_list(login: dict | None, mode: str = "") -> list[dict]:
         )
         result.append({
             "id": h["id"],
+            "can_edit": _visible_to_owner(h, login) and levels.get(history_feature(h)) == "use",
             "report_no": h.get("report_no", ""),
             "filename": h["filename"],
             "title": h["title"],
@@ -148,11 +152,14 @@ def get_history_entry(
 ) -> dict | None:
     """返回指定历史记录（含完整内容），找不到或无权限返回 None。"""
     history = _load_history_with_report_numbers()
-    entry = _find_history_for_login(history, hist_id, login)
+    entry = next((h for h in history if h.get("id") == hist_id and (_visible_to_owner(h, login) or can_read(h, login))), None)
     if not entry:
         return None
 
+    require_permission(login, history_feature(entry))
+
     result = deepcopy(entry)
+    result["can_edit"] = _visible_to_owner(entry, login) and _get_user_permission_levels(login).get(history_feature(entry)) == "use"
     result.pop("partial_rerun_source", None)
     for field in (
         "questionnaire_family_input_kind",

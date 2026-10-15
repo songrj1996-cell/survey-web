@@ -38,7 +38,7 @@ def query_audit_logs(
 
     return {
         "logs": filtered[:limit],
-        "users": _admin_user_rows(),
+        "users": [{"email": user["email"], "name": user["name"]} for user in _admin_user_rows()],
         "features": AUDIT_FEATURES,
         "total": len(filtered),
         "limit": limit,

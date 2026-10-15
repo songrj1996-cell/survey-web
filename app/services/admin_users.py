@@ -1,63 +1,85 @@
-"""services/admin_users:白名单用户 CRUD 业务逻辑。"""
+"""Explicit member edits with protected administrators and preserved read restrictions."""
+from copy import deepcopy
+from datetime import datetime, timezone
+import re
+
 from fastapi import HTTPException
 
 from app.core.config import FEISHU_ADMIN_EMAILS, FEISHU_ALLOWED_EMAILS
-from app.core.security import ALL_PERMS
-from app.storage.whitelist import _PERMS_SCHEMA_VERSION, _load_whitelist, _save_whitelist
+from app.core.feature_permissions import ALL_PERMS, permission_levels
+from app.storage.whitelist import _PERMS_SCHEMA_VERSION, mutate_whitelist
 
 
-def add_whitelist_user(identifier: str, perms: list[str], enabled: bool) -> str:
-    """添加白名单用户。返回审计详情字符串，已存在则 raise 409。"""
-    users = _load_whitelist()
-    if any(u.get("email", "").lower() == identifier for u in users):
-        raise HTTPException(status_code=409, detail="该账号已存在")
-    valid_perms = [p for p in perms if p in ALL_PERMS]
-    if enabled and not valid_perms:
-        raise HTTPException(status_code=400, detail="启用成员至少需要一个功能权限")
-    users.append({
-        "email": identifier,
-        "perms": valid_perms,
-        "enabled": enabled,
-        "perms_v": _PERMS_SCHEMA_VERSION,
+def _identifier(value):
+    value = str(value).strip().lower()
+    if not re.fullmatch(r"(?:[^\s@]+@[^\s@]+\.[^\s@]+|ou_[a-z0-9_-]+)", value):
+        raise HTTPException(422, "请填写飞书邮箱或可靠的 Open ID；姓名不能作为唯一账号")
+    return value
+
+
+def _protected(identifier):
+    if identifier in FEISHU_ADMIN_EMAILS or identifier in FEISHU_ALLOWED_EMAILS:
+        raise HTTPException(403, "管理员身份由平台配置保护，不能通过成员编辑修改或停用")
+
+
+def _perms(values, enabled):
+    if any(p not in ALL_PERMS or p == "members" for p in values):
+        raise HTTPException(422, "包含无效权限；成员与权限仅限既有管理员，不能通过普通成员授权提权")
+    valid = list(dict.fromkeys(values))
+    if enabled and not valid:
+        raise HTTPException(422, "启用成员至少需要一项功能权限")
+    return valid
+
+
+def _history(member, before, actor):
+    member.setdefault("permission_history", []).append({
+        "at": datetime.now(timezone.utc).isoformat(), "actor_name": (actor or {}).get("name") or "管理员",
+        "before": before, "after": {key: deepcopy(member.get(key)) for key in ("name", "perms", "enabled", "permission_levels")},
+        "revision": member["revision"],
     })
-    _save_whitelist(users)
-    return f"{identifier}，权限：{', '.join(valid_perms)}，状态：{'启用' if enabled else '禁用'}"
 
 
-def update_whitelist_user(email: str, perms: list[str] | None, enabled: bool | None) -> str:
-    """更新白名单用户权限或启用状态。返回审计详情，不存在则 raise 404。"""
-    users = _load_whitelist()
-    for u in users:
-        if u.get("email", "").lower() == email:
-            next_perms = (
-                [p for p in perms if p in ALL_PERMS]
-                if perms is not None
-                else list(u.get("perms", []))
-            )
-            next_enabled = enabled if enabled is not None else u.get("enabled", True)
-            if next_enabled and not next_perms:
-                raise HTTPException(status_code=400, detail="启用成员至少需要一个功能权限")
-            if perms is not None:
-                u["perms"] = next_perms
-                u["perms_v"] = _PERMS_SCHEMA_VERSION
-            if enabled is not None:
-                u["enabled"] = enabled
-            _save_whitelist(users)
-            parts = []
-            if perms is not None:
-                parts.append(f"权限：{', '.join(u.get('perms', []))}")
-            if enabled is not None:
-                parts.append(f"状态：{'启用' if enabled else '禁用'}")
-            return f"{email}；" + "；".join(parts)
-    raise HTTPException(status_code=404, detail="用户不存在")
+def add_whitelist_user(identifier, perms, enabled, name="", actor=None):
+    identifier = _identifier(identifier)
+    _protected(identifier)
+    if not name.strip():
+        raise HTTPException(422, "请填写显示姓名")
+    valid = _perms(perms, enabled)
+    def add(users):
+        if any(u.get("email", "").lower() == identifier for u in users):
+            raise HTTPException(409, "该账号已存在，请编辑现有成员")
+        member = {"email": identifier, "name": name.strip(), "perms": valid, "enabled": enabled,
+                  "perms_v": _PERMS_SCHEMA_VERSION, "revision": 1}
+        _history(member, None, actor)
+        users.append(member)
+        return f"{name.strip()}；权限：{', '.join(valid)}；状态：{'启用' if enabled else '停用'}"
+    return mutate_whitelist(add)
 
 
-def delete_whitelist_user(email: str) -> None:
-    """删除白名单用户，不允许删除管理员账号，不存在则 raise 404。"""
-    if email in FEISHU_ADMIN_EMAILS or email in FEISHU_ALLOWED_EMAILS:
-        raise HTTPException(status_code=403, detail="管理员账号不可删除")
-    users = _load_whitelist()
-    new_users = [u for u in users if u.get("email", "").lower() != email]
-    if len(new_users) == len(users):
-        raise HTTPException(status_code=404, detail="用户不存在")
-    _save_whitelist(new_users)
+def update_whitelist_user(email, perms, enabled, name=None, expected_revision=None, actor=None):
+    email = _identifier(email)
+    _protected(email)
+    def update(users):
+        member = next((u for u in users if u.get("email", "").lower() == email), None)
+        if not member:
+            raise HTTPException(404, "成员不存在")
+        if expected_revision is None or expected_revision != member.get("revision", 1):
+            raise HTTPException(409, "成员资料已变化，请刷新后重新保存")
+        before = {key: deepcopy(member.get(key)) for key in ("name", "perms", "enabled", "permission_levels")}
+        old_levels = permission_levels(member)
+        next_enabled = member.get("enabled", True) if enabled is None else enabled
+        next_perms = _perms(list(old_levels) if perms is None else perms, next_enabled)
+        next_name = member.get("name", "") if name is None else name.strip()
+        if not next_name:
+            raise HTTPException(422, "请补齐显示姓名后保存")
+        saved_read = {key: "read" for key, level in member.get("permission_levels", {}).items() if level == "read"}
+        saved_read.update({key: "read" for key, level in old_levels.items() if level == "read"})
+        member.update(name=next_name, perms=next_perms, enabled=next_enabled, permission_levels=saved_read,
+                      perms_v=_PERMS_SCHEMA_VERSION, revision=member.get("revision", 1) + 1)
+        _history(member, before, actor)
+        return f"{next_name}；权限：{', '.join(next_perms)}；状态：{'启用' if next_enabled else '停用'}"
+    return mutate_whitelist(update)
+
+
+def delete_whitelist_user(email):
+    raise HTTPException(409, "成员记录需要保留，请在成员编辑中停用并保存")

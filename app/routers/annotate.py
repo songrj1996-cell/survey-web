@@ -38,7 +38,9 @@ async def _require_annotate_access(request: Request):
     return await _require_feature(request, "annotate")
 
 
-router = APIRouter(dependencies=[Depends(_require_annotate_access)])
+from app.services.feature_access import legacy_route_access
+
+router = APIRouter(dependencies=[Depends(_require_annotate_access), Depends(legacy_route_access)])
 _ANNOTATE_SSE_HEADERS = {
     "Cache-Control": "no-cache",
     "X-Accel-Buffering": "no",

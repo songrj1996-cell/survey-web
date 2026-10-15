@@ -85,11 +85,14 @@ class InterviewBatchReviewRequest(BaseModel):
 # ── 管理后台 ────────────────────────────────────────────────
 class AdminUserRequest(BaseModel):
     email: str
-    perms: list[str] = ["survey", "annotate"]
+    name: str = Field(min_length=1, max_length=100)
+    perms: list[str] = Field(default_factory=list)
     enabled: bool = True
 
 
 class AdminUserPatch(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=100)
+    expected_revision: int = Field(ge=1)
     perms: list[str] | None = None
     enabled: bool | None = None
 

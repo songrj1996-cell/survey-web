@@ -16,7 +16,7 @@ from app.schemas.requests import (
     UiTextUpdateRequest,
 )
 from app.services.audit import audit_log
-from app.services.auth import _require_admin
+from app.services.auth import _require_feature
 from app.services.glossary_service import (
     build_glossary_template_xlsx,
     commit_glossary_import,
@@ -37,6 +37,13 @@ from app.services.settings_service import (
     update_prompt,
     update_ui_text,
 )
+
+async def _require_settings_access(request: Request):
+    path = request.url.path
+    feature = ('glossary' if path.startswith('/api/glossary') else 'prompts' if path.startswith('/api/prompts')
+               else 'ui_texts' if path.startswith('/api/ui-texts') else 'platform')
+    return await _require_feature(request, feature, action='read' if request.method == 'GET' else 'use')
+
 
 router = APIRouter()
 _MAX_GLOSSARY_UPLOAD_BYTES = 10 * 1024 * 1024
@@ -66,7 +73,7 @@ async def get_upload_guide_endpoint():
 
 @router.get("/api/prompts")
 async def get_prompts(request: Request):
-    await _require_admin(request)
+    await _require_settings_access(request)
     return get_all_prompts()
 
 
@@ -77,7 +84,7 @@ async def update_prompt_endpoint(
     request: Request,
     expected_revision: str,
 ):
-    await _require_admin(request)
+    await _require_settings_access(request)
     update_prompt(
         key,
         req.content,
@@ -95,7 +102,7 @@ async def get_ui_texts():
 
 @router.put("/api/ui-texts/{key}")
 async def update_ui_text_endpoint(key: str, req: UiTextUpdateRequest, request: Request):
-    await _require_admin(request)
+    await _require_settings_access(request)
     update_ui_text(key, req.content)
     await audit_log(request, "settings", "修改页面文案", f"{key}；内容：{_short_text(req.content)}")
     return {"ok": True, "key": key}
@@ -103,13 +110,13 @@ async def update_ui_text_endpoint(key: str, req: UiTextUpdateRequest, request: R
 
 @router.get("/api/app-settings")
 async def get_app_settings_endpoint(request: Request):
-    await _require_admin(request)
+    await _require_settings_access(request)
     return get_app_settings()
 
 
 @router.patch("/api/app-settings")
 async def update_app_settings_endpoint(req: AppSettingsPatch, request: Request):
-    await _require_admin(request)
+    await _require_settings_access(request)
     settings, detail = update_app_settings(req)
     await audit_log(request, "settings", "修改平台设置", detail)
     return settings
@@ -117,7 +124,7 @@ async def update_app_settings_endpoint(req: AppSettingsPatch, request: Request):
 
 @router.get("/api/glossary")
 async def get_glossary_endpoint(request: Request):
-    await _require_admin(request)
+    await _require_settings_access(request)
     return get_glossary_catalog()
 
 
@@ -127,7 +134,7 @@ async def create_glossary_endpoint(
     request: Request,
     expected_revision: int | None = None,
 ):
-    await _require_admin(request)
+    await _require_settings_access(request)
     revision = resolve_expected_revision(expected_revision, req.expected_revision)
     result = create_glossary_item(
         _request_payload(req, exclude={"expected_revision"}),
@@ -144,7 +151,7 @@ async def update_glossary_endpoint(
     request: Request,
     expected_revision: int | None = None,
 ):
-    await _require_admin(request)
+    await _require_settings_access(request)
     revision = resolve_expected_revision(expected_revision, req.expected_revision)
     result = update_glossary_item(
         item_id,
@@ -161,7 +168,7 @@ async def delete_glossary_endpoint(
     request: Request,
     expected_revision: int | None = None,
 ):
-    await _require_admin(request)
+    await _require_settings_access(request)
     revision = resolve_expected_revision(expected_revision, None)
     result = delete_glossary_item(item_id, revision)
     await audit_log(request, "settings", "删除术语", item_id)
@@ -170,7 +177,7 @@ async def delete_glossary_endpoint(
 
 @router.get("/api/glossary/template")
 async def download_glossary_template(request: Request):
-    await _require_admin(request)
+    await _require_settings_access(request)
     content = build_glossary_template_xlsx()
     await audit_log(request, "settings", "下载术语模板", "glossary-template.xlsx")
     return _make_download_response(
@@ -182,7 +189,7 @@ async def download_glossary_template(request: Request):
 
 @router.get("/api/glossary/export")
 async def export_glossary_endpoint(request: Request):
-    await _require_admin(request)
+    await _require_settings_access(request)
     content = export_glossary_xlsx()
     filename = f"glossary-export-{datetime.now():%Y%m%d-%H%M%S}.xlsx"
     await audit_log(request, "settings", "导出术语库", filename)
@@ -195,7 +202,7 @@ async def export_glossary_endpoint(request: Request):
 
 @router.post("/api/glossary/import/preview")
 async def preview_glossary_import_endpoint(request: Request, file: UploadFile = File(...)):
-    await _require_admin(request)
+    await _require_settings_access(request)
     content = await _read_glossary_upload(file)
     result = preview_glossary_import(content)
     await audit_log(
@@ -214,7 +221,7 @@ async def commit_glossary_import_endpoint(
     file_hash: str = Form(...),
     base_revision: int = Form(...),
 ):
-    await _require_admin(request)
+    await _require_settings_access(request)
     content = await _read_glossary_upload(file)
     result = commit_glossary_import(content, file_hash, base_revision)
     stats = result["stats"]

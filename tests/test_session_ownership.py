@@ -212,11 +212,11 @@ class SessionRouteBarrierTests(unittest.IsolatedAsyncioTestCase):
     async def test_report_and_qa_recheck_owner_before_writer_or_session_write(self):
         for stream_factory, llm_name in (
             (
-                lambda: survey_service.report_stream("sid", object()),
+                lambda: survey_service.report_stream("sid", SimpleNamespace(method="GET", url=SimpleNamespace(path="/api/report/sid/versions"))),
                 "_direct_writer_round",
             ),
             (
-                lambda: survey_service.qa_stream("sid", "question", object()),
+                lambda: survey_service.qa_stream("sid", "question", SimpleNamespace(method="GET", url=SimpleNamespace(path="/api/report/sid/versions"))),
                 "_answer_qa_direct",
             ),
         ):
@@ -258,7 +258,7 @@ class SessionRouteBarrierTests(unittest.IsolatedAsyncioTestCase):
                 return_value=payload,
             ) as read_versions,
         ):
-            result = await survey_router.list_report_versions("sid", object())
+            result = await survey_router.list_report_versions("sid", SimpleNamespace(method="GET", url=SimpleNamespace(path="/api/report/sid/versions")))
         self.assertIs(result, payload)
         read_versions.assert_called_once_with("sid")
 
@@ -267,7 +267,7 @@ class SessionRouteBarrierTests(unittest.IsolatedAsyncioTestCase):
         session_loader = Mock(return_value={"owner_key": OWNER_A})
         with patch.object(session_access.config, "FEISHU_LOGIN_REQUIRED", False):
             login = await session_access.require_session_request_access(
-                object(),
+                SimpleNamespace(method="GET", url=SimpleNamespace(path="/api/report/sid/versions")),
                 "sid",
                 login_resolver=login_resolver,
                 loader=session_loader,
@@ -281,7 +281,7 @@ class SessionRouteBarrierTests(unittest.IsolatedAsyncioTestCase):
         session_loader = Mock(return_value={"owner_key": OWNER_A})
         with patch.object(session_access.config, "FEISHU_LOGIN_REQUIRED", True):
             login = await session_access.require_session_request_access(
-                object(),
+                SimpleNamespace(method="GET", url=SimpleNamespace(path="/api/report/sid/versions")),
                 "sid",
                 login_resolver=login_resolver,
                 loader=session_loader,
@@ -330,7 +330,7 @@ class SessionRouteBarrierTests(unittest.IsolatedAsyncioTestCase):
                 mocked.assert_not_called()
 
     async def test_all_survey_session_routes_block_before_read_write_or_sse(self):
-        request = object()
+        request = SimpleNamespace(method="GET", url=SimpleNamespace(path="/api/report/sid/versions"))
         cases = [
             (
                 "columns",
@@ -406,7 +406,7 @@ class SessionRouteBarrierTests(unittest.IsolatedAsyncioTestCase):
             (
                 "report-create-version-disabled",
                 lambda: survey_router.generate_report_version(
-                    "sid", SimpleNamespace(), request,
+                    "sid", SimpleNamespace(history_id=None), request,
                 ),
                 [],
             ),
@@ -433,7 +433,7 @@ class SessionRouteBarrierTests(unittest.IsolatedAsyncioTestCase):
                 )
 
     async def test_all_session_exports_block_before_render_or_external_call(self):
-        request = object()
+        request = SimpleNamespace(method="GET", url=SimpleNamespace(path="/api/report/sid/versions"))
         cases = [
             (
                 "word",
@@ -470,7 +470,7 @@ class SessionRouteBarrierTests(unittest.IsolatedAsyncioTestCase):
                 )
 
     async def test_comment_sse_routes_block_before_validation_or_pipeline(self):
-        request = object()
+        request = SimpleNamespace(method="GET", url=SimpleNamespace(path="/api/report/sid/versions"))
         cases = [
             (
                 lambda: comment_router.comment_analysis_preprocess("sid", request),
@@ -489,7 +489,7 @@ class SessionRouteBarrierTests(unittest.IsolatedAsyncioTestCase):
             )
 
     async def test_annotate_routes_block_before_mutation_llm_or_download(self):
-        request = object()
+        request = SimpleNamespace(method="GET", url=SimpleNamespace(path="/api/report/sid/versions"))
         cases = [
             (
                 lambda: annotate_router.annotate_confirm_columns(

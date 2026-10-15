@@ -8,6 +8,7 @@ import threading
 
 from app.core.config import (
     DEFAULT_ANNOTATE_AI_SYSTEM_PROMPT,
+    DEFAULT_TASK_ANNOUNCEMENT_SYSTEM_PROMPT,
     DEFAULT_ANNOTATE_QUALITY_SYSTEM_PROMPT,
     DEFAULT_ANNOTATE_TRANSLATION_SYSTEM_PROMPT,
     DEFAULT_COLUMN_DETECT_SYSTEM_PROMPT,
@@ -92,6 +93,12 @@ def _prompt(
 
 
 DEFAULT_PROMPTS: dict = {
+    "task_announcement_system": _prompt(
+        "task_announcement_system", "任务公告识别 System Prompt",
+        "区分数据门槛与体验建议，抽取有据规则；发奖日期始终由操作者确认。",
+        group="数据标注", group_order=60, order=5, kind="system",
+        current=DEFAULT_TASK_ANNOUNCEMENT_SYSTEM_PROMPT,
+    ),
     "questionnaire_translation_system": _prompt(
         "questionnaire_translation_system",
         "原问卷中文翻译 System Prompt",
