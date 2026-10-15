@@ -17,6 +17,11 @@ async def other_rewards(body: OtherRewardCreate, request: Request):
     return await service.create_other_reward(body, await _current_login(request))
 
 
+@router.delete("/imports/{import_id}")
+async def delete_import(import_id: str, request: Request):
+    return service.delete_import(import_id, await _current_login(request))
+
+
 @router.post("/previews")
 async def create_preview(body: RewardSelection, request: Request):
     return await service.create_preview(body, await _current_login(request))

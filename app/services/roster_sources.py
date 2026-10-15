@@ -68,6 +68,18 @@ def _cell(row, index):
     return str(value).strip()
 
 
+def status_eligibility(status, source):
+    """Honor explicit mappings first, then the two equivalent in-group labels."""
+    if status in source["eligible_statuses"]:
+        return True
+    if status in source["ineligible_statuses"]:
+        return False
+    synonyms = {"群内人员", "群内成员"}
+    if status in synonyms and synonyms.intersection(source["eligible_statuses"]):
+        return True
+    return None
+
+
 async def _read_source(source: dict, login) -> dict:
     token = await _token(source["auth_mode"], login)
     columns = [source[key] for key in ("player_col", "ori_col", "status_col", "nickname_col") if source.get(key) is not None]
@@ -94,7 +106,7 @@ async def _read_source(source: dict, login) -> dict:
             error = (error + "；" if error else "") + "ori 为空或格式错误，应为 uid(zoneid)"
         else:
             ori = f"{match[1]}({match[2]})"
-        eligible = True if status in source["eligible_statuses"] else False if status in source["ineligible_statuses"] else None
+        eligible = status_eligibility(status, source)
         entries.append({"key": f"{source['id']}_{row_number}", "source_id": source["id"], "group_name": source["name"],
                         "source_revision": source["revision"], "row_number": row_number,
                         "player_id": player, "ori": ori, "status": status, "eligible": eligible,

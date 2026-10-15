@@ -13579,5 +13579,22 @@ body {
 .workflow-field[hidden]{display:none}
 .workflow-panel>.workflow-steps{margin:0}.workflow-panel #gw-content{display:grid;gap:20px}.workflow-panel #gw-content>.workflow-card{margin:0}.workflow-review-overview .workflow-summary{padding:6px 0}.workflow-review-overview .workflow-heading{margin-bottom:8px}.workflow-review-overview .workflow-toolbar{margin-bottom:0}
 .workflow-dialog{position:fixed;inset:0;margin:auto;width:min(760px,calc(100vw - 48px));max-height:85vh;overflow:auto;border:1px solid var(--border);border-radius:var(--radius);padding:24px;background:var(--surface);color:var(--text);box-shadow:var(--shadow-lg)}.workflow-dialog::backdrop{background:rgba(20,24,36,.45);backdrop-filter:blur(3px)}.workflow-dialog h2{margin:0 0 12px;font-size:18px}.workflow-dialog textarea{width:100%;box-sizing:border-box}.workflow-dialog>p{font-size:13px;line-height:1.7}
+#reward-batches-panel .workflow-toolbar,.panel[id^="rr-panel-"] .panel-actions,body:has(#reward-batches-panel:not(.panel--hidden))>.workflow-confirm .workflow-toolbar{justify-content:flex-end}
+#reward-batches-panel .workflow-toolbar>.workflow-muted{margin-right:auto;order:-1}
+#reward-batches-panel .workflow-heading>.workflow-toolbar{margin:0}
+#reward-batches-panel details:not(.rr-date-branch)>summary{cursor:pointer;font-size:17px;font-weight:600;padding:16px 0;color:var(--text)}
+.workflow-import-label{display:flex;align-items:center;gap:12px;flex:1;min-width:0;cursor:pointer}
+.reward-disclosure{border-bottom:1px solid var(--border);margin:10px 0}
+.reward-checklist{margin-top:24px;padding-top:8px;border-top:1px solid var(--border)}
+.workflow-card .reward-checklist h3{font-size:18px}
+.reward-checklist-scroll{max-height:420px;overflow:auto;overscroll-behavior:contain;border:1px solid var(--border);border-radius:10px;padding:0 16px}
+.reward-detail-scroll{max-height:320px;overflow:auto;overscroll-behavior:contain;padding:0 12px 12px}
+.reward-detail-row{padding:12px 0;border-top:1px solid var(--border);font-size:13px}
+.reward-detail-row p{margin:6px 0}
+.reward-checklist .reward-disclosure{margin:0}.reward-checklist .reward-disclosure:last-child{border-bottom:0}
+.reward-checklist summary{display:flex;align-items:center;gap:12px;list-style:none}.reward-checklist summary::-webkit-details-marker{display:none}
+.reward-checklist summary::before{content:'▸';flex:none;color:var(--text-2)}.reward-checklist details[open]>summary::before{content:'▾'}
+.reward-checklist summary>span{flex:1;min-width:0;overflow-wrap:anywhere}.reward-checklist summary>strong{white-space:nowrap;font-size:16px}
+.reward-checklist summary small{display:block;font-size:12px;font-weight:400;color:var(--text-2);margin-top:5px}
 @media(max-width:1000px){.workflow-review{grid-template-columns:1fr}.workflow-response-list{display:flex;max-height:220px}.workflow-response{flex:0 0 240px}}
 @media(max-width:900px){.workflow-form-grid,.workflow-source-grid,.member-layout{grid-template-columns:1fr}.workflow-card,.workflow-panel{padding:18px}.workflow-summary{gap:18px}.member-list{max-height:200px;overflow:auto}}

@@ -106,4 +106,8 @@ assert.match(mappingHtml, /工具字段[\s\S]*UE群[\s\S]*玩家群[\s\S]*用途
 assert.match(mappingHtml, /奖励发放日期[\s\S]*筛选本次批次/, 'field rows explain how each mapping is used');
 assert.doesNotMatch(mappingHtml, /rr-mapping-card/, 'mapping no longer renders one card per sheet');
 
-console.log('reward roster UI checks passed');
+vm.runInContext(`rrState.mappings.A = {date_col:0,task_col:1,player_id_col:2,account_id_col:3,normal_reward_col:4,status_col:null,excellent_reward_col:null,other_reward_col:null}`, context);
+assert.equal(vm.runInContext(`rrMappingComplete('A')`, context), true, 'live roster import permits no Excel status column');
+assert.equal(vm.runInContext(`rrAutoColumn(['日期','任务','playerid','ori','普通奖励'], RR_FIELDS.find(f=>f.key==='status_col'))`, context), null);
+assert.match(mappingHtml, /不提供（以最新名单为准）/);
+console.log('reward roster UI checks passed, including optional legacy status');

@@ -8,7 +8,9 @@ from fastapi import HTTPException
 from app.schemas.reward_roster import RewardAnalyzeRequest
 from app.services import group_tasks as tasks
 from app.services.feature_access import can_read, owner_identity, require_permission, require_record
-from app.services.reward_roster import _build_conflicts, _build_result, _parse_account, analyze_reward_session, get_reward_session
+from app.services.reward_roster import _build_conflicts, _build_result, _parse_account, analyze_reward_session, get_reward_session, delete_import
+from app.services.auth import _get_user_permission_levels
+from app.core import config
 from app.services.roster_sources import read_roster_snapshot
 from app.services.task_records import aggregate_players
 from app.storage import group_workflow as store
@@ -36,8 +38,10 @@ def choices(login):
             item["consumed"] = ledger["claims"].get("other:" + item["id"])
             item["selectable"] = item["owner_key"] == owner_identity(login)["owner_key"] and not item["consumed"]
             others.append(item)
-    imports = [{key: record.get(key) for key in ("id", "filename", "owner_name", "analysis_request", "created_at")}
-               for record in store.list_records("imports") if can_read(record, login)]
+    may_write = not config.FEISHU_LOGIN_REQUIRED or _get_user_permission_levels(login).get("reward") == "use"
+    imports = [{**{key: record.get(key) for key in ("id", "filename", "owner_name", "analysis_request", "created_at")},
+                "can_delete": may_write, "selectable": may_write and record["owner_key"] == owner_identity(login)["owner_key"]}
+               for record in store.list_records("imports") if not record.get("deleted_at") and can_read(record, login)]
     groups = [{"id": source["id"], "name": source["name"]} for source in store.list_records("sources") if source["enabled"]]
     return {"tasks": available, "other_rewards": others, "imports": imports, "groups": groups,
             "batches": [{key: batch.get(key) for key in ("id", "created_at", "owner_name", "dates", "total_diamonds", "unique_accounts")}
@@ -109,7 +113,8 @@ def _collect_sources(selection, login):
             key = "import:" + tasks.fingerprint([content_hash, imported["sheet"], imported["row_number"]])
             claims.append(key)
             rows.append({**deepcopy(imported), "row_id": key, "source_kind": "import", "source_key": key,
-                         "source_id": "", "import_id": identifier, "previous_account": imported["account"]})
+                         "source_id": "", "import_id": identifier, "previous_account": imported["account"],
+                         "source_filename": session["filename"], "import_sheet": imported["sheet"]})
     if not rows:
         raise HTTPException(422, "请明确选择至少一项有记录的奖励来源")
     ledger = _ledger()
@@ -127,19 +132,41 @@ def _reconcile(rows, snapshot, identity_choices):
     for original in rows:
         row = deepcopy(original)
         candidates = [entry for entry in by_player[row["player_id"]] if not row.get("source_id") or entry["source_id"] == row["source_id"]]
+        # Retired memberships cannot compete with an active identity. Unknown states
+        # remain candidates so that missing configuration never silently pays a player.
+        current_candidates = [entry for entry in candidates if entry.get("eligible") is not False]
+        if candidates and not current_candidates:
+            row.update(exclusion_reason="最新名单中的匹配身份均不在群内", matching_identities=candidates)
+            excluded.append(row)
+            continue
+        candidates = current_candidates
         selected = identity_choices.get(row["row_id"])
-        chosen = [entry for entry in candidates if entry["key"] == selected] if selected else candidates
+        chosen = [entry for entry in candidates if entry["key"] == selected] if selected and len(candidates) > 1 else candidates
         if len(chosen) != 1 or chosen[0].get("identity_error") or chosen[0].get("eligible") is None:
             issues.append({"row_id": row["row_id"], "player_id": row["player_id"], "task": row["task"],
                            "message": "最新名单中无此身份" if not candidates else "身份有多个匹配，请选择" if len(chosen) != 1 else chosen[0].get("identity_error") or chosen[0].get("status_error"),
-                           "candidates": candidates})
+                           "candidates": candidates, "selected_key": selected or ""})
             continue
         identity = chosen[0]
         uid, zoneid, ori = _parse_account(identity["ori"])
         row.update(identity=identity, account=ori, uid=uid, zoneid=zoneid, sheet=identity["group_name"])
-        before = row.get("previous_identity") or {"ori": row.get("previous_account", ""), "status": "导入表格中的旧状态"}
-        if before.get("ori") != ori or before.get("status") != identity["status"]:
-            changes.append({"row_id": row["row_id"], "player_id": row["player_id"], "before": before, "after": identity})
+        before = row.get("previous_identity") or {"ori": row.get("previous_account", ""), "status": row.get("previous_status", "")}
+        def comparable_status(value):
+            if value in ("群内人员", "群内成员"):
+                return "in_group"
+            if value in ("已退群", "退群", "不在群内"):
+                return "out_of_group"
+            return value
+        changed_fields = []
+        if before.get("ori") != ori:
+            changed_fields.append("account")
+        if before.get("status") and comparable_status(before["status"]) != comparable_status(identity["status"]):
+            changed_fields.append("status")
+        if changed_fields:
+            changes.append({"row_id": row["row_id"], "player_id": row["player_id"], "before": before, "after": identity,
+                            "fields": changed_fields, "task": row["task"], "date": row["date"], "source_kind": row["source_kind"],
+                            "filename": row.get("source_filename", ""), "sheet": row.get("import_sheet", original["sheet"]),
+                            "row_number": row["row_number"]})
         if not identity["eligible"] or row["total_reward"] == 0:
             row["exclusion_reason"] = "当前不在群内" if not identity["eligible"] else "计算金额为 0"
             excluded.append(row)
@@ -257,6 +284,10 @@ async def generate_batch(identifier, request, login):
         revisions = {s["id"]: s["revision"] for s in store.list_records("sources") if s["enabled"]}
         if revisions != {s["id"]: s["revision"] for s in snapshot["sources"]}:
             raise HTTPException(409, "名单来源配置刚刚变化，请重新预览")
+        for import_id in current["selection"]["imported_session_ids"]:
+            imported = store.read("imports", import_id)
+            if not imported or imported.get("deleted_at"):
+                raise HTTPException(409, "此预览使用的表格导入已删除，请重新选择来源")
         for task_id, version in current["selection"]["task_versions"].items():
             task = tasks.load_task(task_id, login, write=True, feature="reward")
             if task["version"] != version or task.get("confirmed_version") != version or tasks.readiness_issues(task, settlement=True):

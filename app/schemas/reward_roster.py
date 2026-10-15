@@ -8,7 +8,7 @@ class RewardSheetMapping(BaseModel):
     task_col: int = Field(ge=0)
     player_id_col: int = Field(ge=0)
     account_id_col: int = Field(ge=0)
-    status_col: int = Field(ge=0)
+    status_col: int | None = Field(default=None, ge=0)
     normal_reward_col: int = Field(ge=0)
     excellent_reward_col: int | None = Field(default=None, ge=0)
     other_reward_col: int | None = Field(default=None, ge=0)

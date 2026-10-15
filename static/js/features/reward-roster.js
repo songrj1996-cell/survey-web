@@ -20,7 +20,7 @@ const RR_FIELDS = [
   {key: 'task_col', label: '任务', purpose: '按任务统计', aliases: ['任务', '任务名称', 'task']},
   {key: 'player_id_col', label: 'playerid', purpose: '保留原始群身份', aliases: ['playerid', 'player id', 'discordid', 'whatsappid', 'discord', 'whatsapp']},
   {key: 'account_id_col', label: 'MLBBaccountid', purpose: '账号去重与 TXT 拆分', aliases: ['mlbbaccountid', 'mlbb account id', 'ori', '游戏账号']},
-  {key: 'status_col', label: '当前状态', purpose: '仅纳入“群内人员”', aliases: ['当前状态', '状态', 'status']},
+  {key: 'status_col', label: 'Excel 原状态（选填）', purpose: '仅作前后对照；是否在群以最新名单为准', aliases: ['当前状态', '状态', 'status'], optional: true, emptyLabel: '不提供（以最新名单为准）'},
   {key: 'normal_reward_col', label: '普通奖励', purpose: '奖励加总项', aliases: ['普通奖励', '基础奖励', 'normal reward']},
   {key: 'excellent_reward_col', label: '优秀追加奖励', purpose: '奖励加总项', aliases: ['优秀额外奖励', '优秀追加奖励', '优秀奖励', 'excellent reward'], optional: true},
   {key: 'other_reward_col', label: '其他奖励', purpose: '奖励加总项', aliases: ['其他奖励', 'other reward'], optional: true},
@@ -252,7 +252,7 @@ function rrMappingSelect(sheet, field, selected) {
     <select class="plan-input rr-mapping-select" aria-label="${esc(field.label)}映射到${esc(sheet.name)}"
       data-rr-map-sheet="${esc(sheet.name)}" data-rr-map-field="${field.key}">
       <option value="" ${selected === -1 ? 'selected' : ''}>请选择</option>
-      ${field.optional ? `<option value="none" ${selected === null ? 'selected' : ''}>此项为 0（无对应列）</option>` : ''}${options}
+      ${field.optional ? `<option value="none" ${selected === null ? 'selected' : ''}>${esc(field.emptyLabel || '此项为 0（无对应列）')}</option>` : ''}${options}
     </select>`;
 }
 
@@ -354,7 +354,7 @@ async function rrAnalyze() {
   if (rrState.busy || !rrState.selectedDates.size) return;
   const selected = [...rrState.selectedSheets];
   if (!selected.length || !selected.every(rrMappingComplete)) {
-    showToast('请先选择 sheet，并确保八个字段没有重复映射', 'error');
+    showToast('请先选择 sheet、补齐必填字段，并确保所选列没有重复映射', 'error');
     return;
   }
   const mappings = Object.fromEntries(selected.map(name => [name, rrState.mappings[name]]));

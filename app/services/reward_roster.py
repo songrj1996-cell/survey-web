@@ -8,7 +8,7 @@ import threading
 import time
 import uuid
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from io import BytesIO
 from pathlib import Path
 
@@ -50,9 +50,13 @@ def _sweep_sessions() -> None:
 def get_reward_session(session_id: str) -> dict:
     _sweep_sessions()
     with _SESSION_LOCK:
+        record = workflow_store.read("imports", session_id)
+        if record and record.get("deleted_at"):
+            _SESSIONS.pop(session_id, None)
+            raise HTTPException(404, "此表格导入已删除，不能再用于奖励整理")
         session = _SESSIONS.get(session_id)
         if not session:
-            session = workflow_store.read("imports", session_id)
+            session = record
             if session:
                 session["content"] = workflow_store.read_blob(session_id)
                 if session.get("analysis"):
@@ -79,11 +83,27 @@ def _persist_import(session: dict) -> None:
     record = deepcopy({key: value for key, value in session.items() if key not in ("content", "touched_at")})
     if record.get("analysis"):
         record["analysis"]["conflict_row_ids"] = sorted(record["analysis"]["conflict_row_ids"])
-    record["content_hash"] = workflow_store.save_blob(session["id"], session["content"])
     def save(current):
+        if current.get("deleted_at"):
+            raise HTTPException(409, "此表格导入已删除，请重新选择来源")
+        record["content_hash"] = workflow_store.save_blob(session["id"], session["content"])
         current.clear()
         current.update(record)
     workflow_store.mutate("imports", session["id"], save, default={})
+
+
+def delete_import(session_id: str, login) -> dict:
+    from app.services.feature_access import require_permission, require_record, owner_identity
+    require_permission(login, "reward", write=True)
+    # Read access is owner-or-admin; this exception applies only to removing imports.
+    require_record(workflow_store.read("imports", session_id), login)
+    def remove(current):
+        require_record(current, login)
+        if not current.get("deleted_at"):
+            current.update(deleted_at=datetime.now(timezone.utc).isoformat(), deleted_by=owner_identity(login))
+        return {"id": session_id, "deleted": True}
+    # Keep the original upload, frozen batches and claims for audit and duplicate protection.
+    return workflow_store.mutate("imports", session_id, remove)
 
 
 def _normalize_header(value: object) -> str:
@@ -186,7 +206,7 @@ def create_reward_session(filename: str, content: bytes, login: dict | None) -> 
         "filename": Path(filename).name,
         "content": content,
         "sheets": sheets,
-        "created_at": _now(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
         "touched_at": _now(),
         "analysis": None,
         "result": None,
@@ -364,6 +384,8 @@ def analyze_reward_session(session_id: str, request: RewardAnalyzeRequest, *, la
             if not info["usable"]:
                 raise HTTPException(status_code=400, detail=f"sheet“{sheet_name}”没有可识别的表头")
             mapping = request.mappings[sheet_name]
+            if not latest_roster and mapping.status_col is None:
+                raise HTTPException(400, "未读取最新名单时必须指定状态列")
             indexes = _mapping_indexes(mapping)
             if len(set(indexes)) != len(indexes):
                 raise HTTPException(status_code=400, detail=f"sheet“{sheet_name}”的八个字段不能映射到同一列")
@@ -379,7 +401,7 @@ def analyze_reward_session(session_id: str, request: RewardAnalyzeRequest, *, la
                 if not any(_display_value(value) for value in values):
                     ignored["blank"] += 1
                     continue
-                status = _display_value(values[mapping.status_col] if mapping.status_col < len(values) else None)
+                status = _display_value(values[mapping.status_col] if mapping.status_col is not None and mapping.status_col < len(values) else None)
                 if not latest_roster and status != REWARD_ROSTER_ELIGIBLE_STATUS:
                     ignored["ineligible_status"] += 1
                     continue
@@ -439,6 +461,7 @@ def analyze_reward_session(session_id: str, request: RewardAnalyzeRequest, *, la
                     "task": task,
                     "player_id": player_id,
                     "account": account,
+                    "previous_status": status,
                     "uid": uid,
                     "zoneid": zoneid,
                     "normal_reward": normal,

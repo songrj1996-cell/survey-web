@@ -11,7 +11,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Roboto+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/style.css?v=65" />
+  <link rel="stylesheet" href="/static/style.css?v=66" />
   <link rel="stylesheet" href="/static/questionnaire-sources.css?v=1" />
   <link rel="stylesheet" href="/static/report-quick.css?v=11" />
   <link rel="stylesheet" href="/static/survey-entry.css?v=8" />
@@ -1574,7 +1574,7 @@
             <span class="rr-selection-count" id="rr-date-selected-count">未选择</span>
           </div>
           <div class="rr-date-tree" id="rr-date-tree"></div>
-          <div class="rr-field-help">只统计所选日期且状态为“<span id="rr-eligible-status">群内人员</span>”的记录</div>
+          <div class="rr-field-help">只纳入所选日期的奖励；下一步会读取“名单来源”的最新状态，仅发放给在群人员。Excel 原状态仅供对照。<span id="rr-eligible-status" hidden>群内人员</span></div>
         </section>
         <section class="rr-surface rr-config-module">
           <div class="rr-config-module__head">
@@ -1585,7 +1585,7 @@
         </section>
         <section class="rr-surface rr-config-module">
           <div class="rr-config-module__head">
-            <div><h2>3. 字段映射</h2><p>逐个确认所选 sheet 中的日期、任务、账号、状态和奖励列。</p></div>
+            <div><h2>3. 字段映射</h2><p>确认日期、任务、玩家身份、原账号和奖励列；Excel 原状态可不提供，发放时以最新名单为准。</p></div>
           </div>
           <div class="rr-mapping-list" id="rr-mapping-list"><div class="rr-empty">选择 sheet 后显示字段映射</div></div>
         </section>
@@ -2178,10 +2178,10 @@
   <script src="/static/js/features/history.js?v=38"></script>
   <script src="/static/js/features/interview.js?v=10"></script>
   <script src="/static/js/features/interview-v2.js?v=7"></script>
-  <script src="/static/js/features/reward-roster.js?v=3"></script>
+  <script src="/static/js/features/reward-roster.js?v=4"></script>
   <script src="/static/js/features/group-tasks.js?v=6"></script>
   <script src="/static/js/features/roster-sources.js?v=5"></script>
-  <script src="/static/js/features/reward-batches.js?v=4"></script>
+  <script src="/static/js/features/reward-batches.js?v=5"></script>
   <script src="/static/js/features/nav.js?v=43"></script>
   <script src="/static/js/features/comment.js?v=29"></script>
 <script src="/static/js/features/annotate.js?v=45"></script>
