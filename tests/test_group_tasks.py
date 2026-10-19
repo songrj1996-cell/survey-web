@@ -100,12 +100,13 @@ class GroupTaskTests(WorkflowCase):
         self.assertFalse(result["ok"])
         saved=store.read("tasks",task["id"])
         self.assertEqual(saved["roster_snapshot"],task["roster_snapshot"])
-        self.assertTrue(tasks.readiness_issues(saved))
+        self.assertFalse(tasks.readiness_issues(saved))
+        self.assertTrue(tasks.readiness_issues(saved, settlement=True))
 
     def test_long_excel_number_rejected_but_original_text_kept(self):
         book=Workbook();sheet=book.active;sheet.append(["playerid","回答"]);sheet.append([1234567890123456789,"示例完整回答"])
         content=BytesIO();book.save(content)
-        task=tasks.create_task(TaskRules(),LOGIN)
+        task=tasks.create_task(TaskRules(name="精度检查",payout_date="2026-10-15",base_reward=0,excellent_reward=0),LOGIN)
         task=tasks.upload_feedback(task["id"],task["version"],"precision.xlsx",content.getvalue(),LOGIN)
         self.assertIn("0",task["feedback"][0]["cell_issues"])
         self.assertEqual(store.read_blob(task["uploads"][0]["id"]),content.getvalue())

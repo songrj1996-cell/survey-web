@@ -13598,3 +13598,18 @@ body {
 .reward-checklist summary small{display:block;font-size:12px;font-weight:400;color:var(--text-2);margin-top:5px}
 @media(max-width:1000px){.workflow-review{grid-template-columns:1fr}.workflow-response-list{display:flex;max-height:220px}.workflow-response{flex:0 0 240px}}
 @media(max-width:900px){.workflow-form-grid,.workflow-source-grid,.member-layout{grid-template-columns:1fr}.workflow-card,.workflow-panel{padding:18px}.workflow-summary{gap:18px}.member-list{max-height:200px;overflow:auto}}
+.workflow-steps button:disabled { opacity: .45; cursor: not-allowed; }
+.workflow-upload { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin: 20px 0; }
+.workflow-upload input[type="file"] { width: 100%; min-width: 0; }
+.workflow-file-name { flex: 1; min-width: 200px; overflow-wrap: anywhere; line-height: 1.6; }
+.workflow-question-list { display: grid; gap: 10px; margin: 16px 0; }
+.workflow-question-choice { display: grid; grid-template-columns: 18px 24px minmax(0,1fr) auto; gap: 12px; align-items: start; padding: 16px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); cursor: pointer; }
+.workflow-question-choice:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
+.workflow-question-choice small { display: block; margin-top: 8px; line-height: 1.6; color: var(--text-2); }
+.workflow-question-choice strong { overflow-wrap: anywhere; line-height: 1.6; }
+@media(max-width:700px) { .workflow-question-choice { grid-template-columns:18px 20px minmax(0,1fr); } .workflow-question-choice>.workflow-badge { grid-column:3; justify-self:start; } }
+
+.rr-required { display: inline-block; margin-left: 8px; color: var(--accent); font-size: 12px; font-weight: 600; }
+#rr-validation-hint ul { margin: 8px 0 0; padding-left: 20px; }
+
+#group-tasks-panel .workflow-card > .workflow-toolbar, #gw-content > .workflow-toolbar { justify-content: flex-end; }

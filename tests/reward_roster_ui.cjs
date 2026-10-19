@@ -110,4 +110,16 @@ vm.runInContext(`rrState.mappings.A = {date_col:0,task_col:1,player_id_col:2,acc
 assert.equal(vm.runInContext(`rrMappingComplete('A')`, context), true, 'live roster import permits no Excel status column');
 assert.equal(vm.runInContext(`rrAutoColumn(['日期','任务','playerid','ori','普通奖励'], RR_FIELDS.find(f=>f.key==='status_col'))`, context), null);
 assert.match(mappingHtml, /不提供（以最新名单为准）/);
+assert.match(mappingHtml, /rr-required">必填/);
+assert.match(mappingHtml, /disabled[^>]*>[^<]*已用于其他字段/);
+vm.runInContext(`rrState.selectedSheets=new Set(['A']); rrState.selectedDates=new Set(); rrUpdateAnalyzeButton()`, context);
+assert.equal(nodes.get('rr-btn-analyze').disabled, true);
+assert.match(nodes.get('rr-validation-hint').innerHTML, /请选择至少一个奖励发放日期/);
+vm.runInContext(`rrState.selectedDates.add('2026-10-15'); rrState.mappings.A.normal_reward_col=3; rrUpdateAnalyzeButton()`, context);
+assert.match(nodes.get('rr-validation-hint').innerHTML, /不能使用同一列/);
+vm.runInContext(`rrState.mappings.A.normal_reward_col=4; rrUpdateAnalyzeButton()`, context);
+assert.equal(nodes.get('rr-btn-analyze').disabled, false);
+assert.equal(nodes.get('rr-validation-hint').hidden, true);
+const batchesSource=fs.readFileSync(path.join(root,'static/js/features/reward-batches.js'),'utf8');
+assert.match(batchesSource,/data.imports.filter\(i=>\(i.analysis_request\?\.reward_dates\|\|\[\]\).some\(date=>dates.has\(date\)\)\)/);
 console.log('reward roster UI checks passed, including optional legacy status');

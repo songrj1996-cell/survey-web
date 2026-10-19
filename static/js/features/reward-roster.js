@@ -246,8 +246,9 @@ function rrSyncSheetSelection() {
 function rrMappingSelect(sheet, field, selected) {
   const headerCounts = new Map();
   sheet.headers.forEach(header => headerCounts.set(header, (headerCounts.get(header) || 0) + 1));
+  const used = new Set(RR_FIELDS.filter(item => item.key !== field.key).map(item => rrState.mappings[sheet.name]?.[item.key]).filter(value => Number.isInteger(value) && value >= 0));
   const options = sheet.headers.map((header, index) => `
-    <option value="${index}" ${index === selected ? 'selected' : ''}>${esc(header)}${headerCounts.get(header) > 1 ? `（第 ${index + 1} 列）` : ''}</option>`).join('');
+    <option value="${index}" ${index === selected ? 'selected' : ''} ${used.has(index) ? 'disabled' : ''}>${esc(header)}${headerCounts.get(header) > 1 ? `（第 ${index + 1} 列）` : ''}${used.has(index) ? '（已用于其他字段）' : ''}</option>`).join('');
   return `
     <select class="plan-input rr-mapping-select" aria-label="${esc(field.label)}映射到${esc(sheet.name)}"
       data-rr-map-sheet="${esc(sheet.name)}" data-rr-map-field="${field.key}">
@@ -266,7 +267,11 @@ function rrRenderMappings() {
   selected.forEach(sheet => {
     const mapping = rrState.mappings[sheet.name] || {};
     RR_FIELDS.forEach(field => {
-      if (mapping[field.key] === undefined) mapping[field.key] = rrAutoColumn(sheet.headers, field);
+      if (mapping[field.key] === undefined) {
+        const guessed = rrAutoColumn(sheet.headers, field);
+        mapping[field.key] = Number.isInteger(guessed) && guessed >= 0 && Object.values(mapping).includes(guessed)
+          ? (field.optional ? null : -1) : guessed;
+      }
     });
     rrState.mappings[sheet.name] = mapping;
   });
@@ -284,7 +289,7 @@ function rrRenderMappings() {
         ${rrMappingSelect(sheet, field, rrState.mappings[sheet.name][field.key])}
       </div>`).join('');
     return `
-      <div class="rr-mapping-cell rr-mapping-field-name${lastClass}"><strong>${esc(field.label)}</strong></div>
+      <div class="rr-mapping-cell rr-mapping-field-name${lastClass}"><strong>${esc(field.label)}</strong>${field.optional ? '' : '<span class="rr-required">必填</span>'}</div>
       ${sheetCells}
       <div class="rr-mapping-cell rr-mapping-purpose${lastClass}">${esc(field.purpose)}</div>`;
   }).join('');
@@ -301,7 +306,7 @@ function rrRenderMappings() {
     select.addEventListener('change', () => {
       const value = select.value === '' ? -1 : (select.value === 'none' ? null : Number(select.value));
       rrState.mappings[select.dataset.rrMapSheet][select.dataset.rrMapField] = value;
-      rrUpdateAnalyzeButton();
+      rrRenderMappings();
     });
   });
   rrUpdateAnalyzeButton();
@@ -319,10 +324,25 @@ function rrMappingComplete(sheetName) {
 
 function rrUpdateAnalyzeButton() {
   const selected = [...rrState.selectedSheets];
-  $('rr-btn-analyze').disabled = rrState.busy
-    || !selected.length
-    || !rrState.selectedDates.size
-    || !selected.every(rrMappingComplete);
+  const issues = [];
+  if (!rrState.selectedDates.size) issues.push('请选择至少一个奖励发放日期');
+  if (!selected.length) issues.push('请选择至少一个需要统计的 Sheet');
+  selected.forEach(name => {
+    const mapping = rrState.mappings[name] || {}, used = new Map();
+    RR_FIELDS.forEach(field => {
+      const value = mapping[field.key];
+      if (field.optional && value === null) return;
+      if (!Number.isInteger(value) || value < 0) issues.push(`${name}：请选择${field.label}${field.optional ? '的对应列，或选择不提供' : '（必填）'}`);
+      else if (used.has(value)) issues.push(`${name}：${used.get(value)}与${field.label}不能使用同一列`);
+      else used.set(value, field.label);
+    });
+  });
+  $('rr-btn-analyze').disabled = rrState.busy || issues.length > 0;
+  const hint = $('rr-validation-hint');
+  if (hint) {
+    hint.hidden = !issues.length && !rrState.busy;
+    hint.innerHTML = rrState.busy ? '正在检查，请稍候…' : `<strong>完成以下内容后才能继续：</strong><ul>${issues.map(message => `<li>${esc(message)}</li>`).join('')}</ul>`;
+  }
 }
 
 async function rrUpload() {
@@ -347,6 +367,7 @@ async function rrUpload() {
     showToast(error.message, 'error', 6000);
   } finally {
     rrSetBusy(button, false, '');
+    rrUpdateAnalyzeButton();
   }
 }
 
@@ -368,6 +389,8 @@ async function rrAnalyze() {
     rrState.analysis = data;
     if (data.invalid_rows.length) {
       rrRenderAnalysis(data); rrGoStep(3);
+    } else if (!data.eligible_row_count) {
+      throw new Error('所选日期和 Sheet 中没有可用的奖励记录，请核对日期、Sheet 和字段映射。此次上传尚未列入奖励来源。');
     } else {
       await window.RewardBatches.acceptImport(rrState.sessionId, [...rrState.selectedDates]);
     }

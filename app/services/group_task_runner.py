@@ -21,38 +21,8 @@ from app.storage import group_workflow as store
 
 
 async def prepare_run(task_id, request, login):
-    """Read a fresh roster at admission, including retries, before any model work."""
-    from app.services.roster_sources import read_roster_snapshot
-    task = tasks.load_task(task_id, login, write=True)
-    tasks._ensure_version(task, request.expected_version, allow_busy=True)
-    if (task.get("run") or {}).get("status") in tasks.ACTIVE_RUNS:
-        return tasks.task_view(task, login)
-    try:
-        snapshot = await read_roster_snapshot(login)
-    except HTTPException as exc:
-        def fail(current):
-            tasks._ensure_version(current, request.expected_version)
-            current["roster_error"] = str(exc.detail)
-            current["updated_at"] = tasks.now()
-            tasks._refresh_checks(current)
-        store.mutate("tasks", task_id, fail)
-        raise HTTPException(409, "标注尚未启动：最新名单读取失败。" + str(exc.detail)) from None
-
-    def admit(current):
-        require_record(current, login, write=True)
-        tasks._ensure_version(current, request.expected_version, allow_busy=True)
-        if (current.get("run") or {}).get("status") in tasks.ACTIVE_RUNS:
-            return current["version"]
-        changed = snapshot["fingerprint"] != (current.get("roster_snapshot") or {}).get("fingerprint")
-        current.update(roster_snapshot=snapshot, roster_error="", updated_at=tasks.now())
-        if changed:
-            current["version"] += 1
-            current["confirmed_version"] = None
-            tasks._event(current, login, "标注前刷新名单", {"snapshot_id": snapshot["id"]})
-        tasks._refresh_checks(current)
-        return current["version"]
-    version = store.mutate("tasks", task_id, admit)
-    return start_run(task_id, request.model_copy(update={"expected_version": version}), login)
+    """Annotation admission never reads rosters; identity settlement is a later step."""
+    return start_run(task_id, request, login)
 
 
 def start_run(task_id, request, login):
@@ -67,7 +37,15 @@ def start_run(task_id, request, login):
         issues = tasks.readiness_issues(task)
         if issues:
             raise HTTPException(409, {"message": "请先处理必要输入", "issues": issues})
-        targets = [row["id"] for row in task["feedback"] if not tasks.effective_result(task, row)["complete"]]
+        stage = request.stage
+        if stage == "auto":
+            stage = "ai" if task["rules"]["ai_detect"] and not task.get("ai_confirmation_complete") else "quality"
+        if stage == "ai" and not task["rules"]["ai_detect"]:
+            raise HTTPException(409, "本任务未启用 AI 作答识别，请进行质量打标")
+        eligible = [row for row in task["feedback"] if not row.get("excluded") and row.get("gate", {}).get("status") in ("pass", "not_applicable")]
+        if stage == "quality" and task["rules"]["ai_detect"] and eligible and (not task.get("ai_confirmation_complete") or any(not row.get("ai_complete") for row in eligible)):
+            raise HTTPException(409, "请先完成 AI 作答识别并人工确认，再开始质量打标")
+        targets = [row["id"] for row in eligible if not tasks.stage_complete(task, row, stage)]
         if request.response_ids is not None:
             requested = set(request.response_ids)
             if not requested <= {row["id"] for row in task["feedback"]}:
@@ -78,7 +56,7 @@ def start_run(task_id, request, login):
         require_background_llm_api_key(login)
         if task.get("run"):
             task["runs"].append(deepcopy(task["run"]))
-        task["run"] = {"id": uuid.uuid4().hex, "version": task["version"], "status": "queued",
+        task["run"] = {"id": uuid.uuid4().hex, "version": task["version"], "stage": stage, "status": "queued",
                        "queued_at": tasks.now(), "schedule_at": tasks.now(), "started_at": None,
                        "target_ids": targets, "attempted_ids": [], "inflight_ids": [], "completed_ids": [],
                        "http_attempts": 0, "attempt_events": [], "error": "",
@@ -203,7 +181,7 @@ async def _run_slice_impl(task_id, slots):
                     for field in ("quality", "quality_complete", "ai", "ai_complete", "model_error"):
                         if field in update:
                             saved[field] = deepcopy(update[field])
-                    if tasks.effective_result(current, saved)["complete"] and row["id"] not in active["completed_ids"]:
+                    if tasks.stage_complete(current, saved, active.get("stage", "quality")) and row["id"] not in active["completed_ids"]:
                         active["completed_ids"].append(row["id"])
                     current["updated_at"] = tasks.now()
                 measured_mutate("tasks", task_id, save)

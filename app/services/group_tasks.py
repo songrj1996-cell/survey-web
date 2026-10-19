@@ -66,7 +66,7 @@ def create_task(rules: TaskRules, login: dict | None) -> dict:
     identifier = uuid.uuid4().hex
     task = {
         "id": identifier, **owner_identity(login), "created_at": now(), "updated_at": now(),
-        "version": 1, "rules": rules.model_dump(mode="json"), "confirmed_version": None,
+        "version": 1, "rules": _rules_metadata(rules), "confirmed_version": None,
         "feedback": [], "uploads": [], "mapping": None, "headers": [],
         "duplicate_decisions": {}, "player_adv": {}, "events": [], "runs": [], "run": None,
         "roster_snapshot": None, "roster_error": "", "ai_confirmation_complete": False,
@@ -104,10 +104,26 @@ def _invalidate_model(row: dict) -> None:
         row.pop(key, None)
 
 
+def _rules_metadata(rules, previous=None):
+    updated = rules.model_dump(mode="json")
+    identifier = updated.get("group_source_id")
+    if identifier:
+        source = store.read("sources", identifier)
+        if source and source.get("enabled"):
+            updated["group_name"] = source["name"]
+        elif identifier == (previous or {}).get("group_source_id"):
+            updated["group_name"] = previous.get("group_name", "")
+        else:
+            raise HTTPException(422, "任务归属群组已停用或不存在，请重新选择")
+    else:
+        updated["group_name"] = ""
+    return updated
+
+
 def update_rules(task_id, version, rules: TaskRules, login):
     def mutate(task):
         previous = task["rules"]
-        updated = rules.model_dump(mode="json")
+        updated = _rules_metadata(rules, previous)
         semantic_change = any(previous.get(key) != updated.get(key) for key in ("announcement", "ai_detect"))
         if semantic_change:
             for row in task["feedback"]:
@@ -130,7 +146,10 @@ def _mapping_guess(headers: list[str]) -> dict:
 
 
 def upload_feedback(task_id, version, filename: str, content: bytes, login):
-    load_task(task_id, login, write=True)
+    current = load_task(task_id, login, write=True)
+    _ensure_version(current, version)
+    if rule_issues(current):
+        raise HTTPException(409, {"message": "请先完成任务规则，再上传反馈", "issues": rule_issues(current)})
     if len(content) > config.REWARD_ROSTER_MAX_UPLOAD_BYTES:
         raise HTTPException(413, "上传反馈超过大小限制")
     try:
@@ -149,9 +168,13 @@ def upload_feedback(task_id, version, filename: str, content: bytes, login):
                 "version": task["version"], "headers": task["headers"], "mapping": task["mapping"],
                 "feedback": task["feedback"],
             })
-        task["headers"] = [str(item) for item in rows[0]]
+        task["headers"] = [str(item) if item is not None else "" for item in rows[0]]
         task["mapping"] = None
         task["mapping_suggestion"] = _mapping_guess(task["headers"])
+        from app.services.annotate_workflow import group_column_metadata
+        task.update(group_column_metadata([task["headers"], *rows[1:]]))
+        task["roster_snapshot"] = None
+        task["roster_error"] = ""
         task["feedback"] = [
             {"id": uuid.uuid4().hex, "source_row": index + 1, "upload_id": upload_id,
              "cells": [str(value) if value is not None else "" for value in row],
@@ -170,9 +193,26 @@ def upload_feedback(task_id, version, filename: str, content: bytes, login):
     return _change(task_id, login, version, "上传反馈", mutate)
 
 
+async def translate_upload_headers(task_id, version, login):
+    from app.services.annotate_workflow import _translate_headers
+    current = load_task(task_id, login, write=True)
+    _ensure_version(current, version)
+    translated, warning = await _translate_headers(current["headers"])
+    def save(task):
+        require_record(task, login, write=True)
+        _ensure_version(task, version)
+        task.update(headers_zh=translated, header_translation_warning=warning)
+        return task_view(task, login)
+    return store.mutate("tasks", task_id, save)
+
+
 def set_mapping(task_id, version, mapping: FeedbackMapping, login):
     def mutate(task):
+        if rule_issues(task) or not task["feedback"]:
+            raise HTTPException(409, "请先完成任务规则并上传反馈")
         values = mapping.model_dump()
+        if task["rules"]["requires_count"] and values["count_col"] is None:
+            raise HTTPException(422, "本任务要求校验次数，请选择数据校验列")
         indexes = [values["id_col"], *values["open_text_cols"]]
         indexes.extend(values[key] for key in ("count_col", "adv_col") if values[key] is not None)
         if len(indexes) != len(set(indexes)) or any(i < 0 or i >= len(task["headers"]) for i in indexes):
@@ -183,6 +223,8 @@ def set_mapping(task_id, version, mapping: FeedbackMapping, login):
                 row["corrections"] = {}
             task["duplicate_decisions"] = {}
             task["ai_confirmation_complete"] = False
+            task["roster_snapshot"] = None
+            task["roster_error"] = ""
         task["mapping"] = values
         return values
     return _change(task_id, login, version, "确认上传列映射", mutate)
@@ -239,9 +281,9 @@ def _refresh_checks(task: dict) -> None:
         row["identity_candidates"] = deepcopy(candidates)
         row["identity"] = deepcopy(chosen[0] if len(chosen) == 1 else candidates[0] if len(candidates) == 1 else None)
         if snapshot and row["player_id"] and not row["identity"]:
-            row["issues"].append({"kind": "identity", "message": "身份匹配多个名单条目，请明确选择" if candidates else "名单中找不到 playerid，请修正身份或维护名单后重新读取"})
+            row["issues"].append({"kind": "roster_identity", "message": "身份匹配多个名单条目，请明确选择" if candidates else "名单中找不到 playerid，请修正身份或维护名单后重新读取"})
         if row["identity"] and row["identity"].get("identity_error"):
-            row["issues"].append({"kind": "identity", "message": row["identity"]["identity_error"]})
+            row["issues"].append({"kind": "roster_identity", "message": row["identity"]["identity_error"]})
         raw_count = edits.get("count", _cell(row, mapping.get("count_col")))
         count = _parse_count(raw_count)
         row["count"] = count
@@ -257,37 +299,34 @@ def _refresh_checks(task: dict) -> None:
         else:
             row["gate"] = {"status": "pass", "reason": f"实际完成 {count} 场，达到至少 {task['rules']['min_count']} 场要求"}
     if not task["rules"]["allow_repeat"]:
-        parent = {row["id"]: row["id"] for row in task["feedback"]}
-        def find(item):
-            while parent[item] != item:
-                parent[item] = parent[parent[item]]
-                item = parent[item]
-            return item
-        seen = {}
-        for row in task["feedback"]:
-            identity = row.get("identity") or {}
-            for kind, value in (("playerid", row["player_id"]), ("ori", identity.get("ori", ""))):
-                if not value:
-                    continue
-                key = (kind, value)
-                if key in seen:
-                    parent[find(row["id"])] = find(seen[key])
-                seen[key] = row["id"]
-        groups = defaultdict(list)
-        for row in task["feedback"]:
-            groups[find(row["id"])].append(row)
-        for members in groups.values():
+        def check_group(members, *, roster_only):
             if len(members) < 2:
-                continue
+                return
             ids = sorted(item["id"] for item in members)
             key = fingerprint(ids)[:24]
             retained = task["duplicate_decisions"].get(key)
             resolved = retained in ids
-            task["duplicate_groups"].append({"id": key, "response_ids": ids, "keep_response_id": retained if resolved else None})
+            task["duplicate_groups"].append({"id": key, "response_ids": ids, "keep_response_id": retained if resolved else None, "roster_only": roster_only})
             for row in members:
                 row["excluded"] = resolved and row["id"] != retained
             if not resolved:
-                task["input_issues"].append({"kind": "duplicate", "group_id": key, "message": "身份重复，请查看完整反馈并选择保留一份"})
+                task["input_issues"].append({"kind": "roster_duplicate" if roster_only else "duplicate", "group_id": key, "message": "身份重复，请查看完整反馈并选择保留一份"})
+        # Keep upload duplicate choices stable when a later roster read reveals
+        # that different player IDs share one payout account.
+        player_groups = defaultdict(list)
+        for row in task["feedback"]:
+            if row["player_id"]:
+                player_groups[row["player_id"]].append(row)
+        for members in player_groups.values():
+            check_group(members, roster_only=False)
+        account_groups = defaultdict(list)
+        for row in task["feedback"]:
+            ori = (row.get("identity") or {}).get("ori")
+            if ori and not row["excluded"]:
+                account_groups[ori].append(row)
+        for members in account_groups.values():
+            if len({row["player_id"] for row in members}) > 1:
+                check_group(members, roster_only=True)
     for row in task["feedback"]:
         if not row["excluded"]:
             task["input_issues"].extend({**issue, "response_id": row["id"], "source_row": row["source_row"]} for issue in row["issues"])
@@ -297,6 +336,9 @@ async def refresh_roster(task_id, version, login):
     from app.services.roster_sources import read_roster_snapshot
     task = load_task(task_id, login, write=True)
     _ensure_version(task, version)
+    _refresh_checks(task)
+    if readiness_issues(task) or not annotation_complete(task):
+        raise HTTPException(409, "请先完成质量标注和 AI 作答确认，再核对玩家名单")
     try:
         snapshot = await read_roster_snapshot(login)
     except Exception as exc:
@@ -351,7 +393,7 @@ def effective_result(task: dict, row: dict) -> dict:
         label, reason, source = "无效反馈", gate["reason"], "rule"
     elif row.get("confirmed_ai"):
         label, reason, source = "无效反馈", "操作者已确认 AI 作答，按无效反馈处理", "human_ai"
-    elif not row.get("issues") and gate.get("status") in ("pass", "not_applicable"):
+    elif not any(issue["kind"] not in ("roster_identity", "adv") for issue in row.get("issues", [])) and gate.get("status") in ("pass", "not_applicable"):
         if row.get("quality_complete") and (not task["rules"]["ai_detect"] or row.get("ai_complete")):
             judgment = row.get("manual_quality") or row.get("quality") or {}
             label = judgment.get("label") or judgment.get("overall")
@@ -387,6 +429,8 @@ def override_quality(task_id, response_id, request, login):
 
 def confirm_ai(task_id, request, login):
     def mutate(task):
+        if readiness_issues(task) or not task["rules"]["ai_detect"]:
+            raise HTTPException(409, "请先完成输入检查，并开启 AI 作答识别")
         eligible = [row for row in task["feedback"] if not row.get("excluded") and row.get("gate", {}).get("status") in ("pass", "not_applicable")]
         ids = {row["id"] for row in eligible}
         selected = set(request.response_ids)
@@ -413,13 +457,49 @@ def set_player_adv(task_id, request, login):
     return _change(task_id, login, request.expected_version, "确认玩家 ADV", mutate)
 
 
-def readiness_issues(task: dict, *, settlement=False) -> list[dict]:
+def rule_issues(task: dict) -> list[dict]:
     rules = task["rules"]
-    issues = deepcopy(task.get("input_issues") or [])
+    issues = []
     if not rules["name"].strip() or not rules["payout_date"] or rules["base_reward"] is None or rules["excellent_reward"] is None:
         issues.append({"kind": "rules", "message": "请确认任务名称、发奖日期和两项奖励金额（允许 0）"})
     if rules["requires_count"] and not rules.get("min_count"):
         issues.append({"kind": "rules", "message": "请配置实际次数门槛"})
+    return issues
+
+
+def annotation_complete(task: dict) -> bool:
+    retained = [row for row in task["feedback"] if not row.get("excluded")]
+    needs_ai = task["rules"]["ai_detect"] and any(row.get("gate", {}).get("status") in ("pass", "not_applicable") for row in retained)
+    return bool(retained) and all(effective_result(task, row)["complete"] for row in retained) and (not needs_ai or task.get("ai_confirmation_complete", False))
+
+
+def stage_complete(task: dict, row: dict, stage: str) -> bool:
+    if row.get("excluded") or row.get("gate", {}).get("status") == "fail":
+        return True
+    return bool(row.get("ai_complete")) if stage == "ai" else effective_result(task, row)["complete"]
+
+
+def workflow_state(task: dict) -> dict:
+    maximum = 1
+    if not rule_issues(task):
+        maximum = 2
+        if not readiness_issues(task):
+            maximum = 3
+            eligible = [row for row in task["feedback"] if not row.get("excluded") and row.get("gate", {}).get("status") in ("pass", "not_applicable")]
+            ai_reviewed = task.get("ai_confirmation_complete") and all(row.get("ai_complete") for row in eligible)
+            if not task["rules"]["ai_detect"] or not eligible or ai_reviewed:
+                maximum = 4
+            if annotation_complete(task):
+                maximum = 5
+                if task.get("confirmed_version") == task["version"] and not readiness_issues(task, settlement=True):
+                    maximum = 6
+    return {"max_step": maximum, "ai_enabled": task["rules"]["ai_detect"], "annotation_complete": annotation_complete(task)}
+
+
+def readiness_issues(task: dict, *, settlement=False) -> list[dict]:
+    rules = task["rules"]
+    issues = rule_issues(task) + deepcopy([issue for issue in task.get("input_issues", [])
+                                       if settlement or issue["kind"] not in ("roster", "roster_identity", "roster_duplicate", "adv")])
     if not task["feedback"] or not task["mapping"]:
         issues.append({"kind": "upload", "message": "请上传反馈并确认完整列映射"})
     if settlement:
@@ -454,7 +534,14 @@ def confirm_task(task_id, version, login):
 
 def task_view(task: dict, login, *, summary=False) -> dict:
     from app.services.task_records import aggregate_players
+    # Re-evaluate legacy saved checks under the current workflow without rewriting history.
+    task = deepcopy(task)
+    _refresh_checks(task)
     result = deepcopy(task)
+    if not summary and task.get("headers") and "column_types" not in task:
+        from app.services.annotate_workflow import group_column_metadata
+        metadata = group_column_metadata([task["headers"], *[row["cells"] for row in task["feedback"]]])
+        result.update({key: value for key, value in metadata.items() if key not in result})
     result["can_edit"] = task["owner_key"] == owner_identity(login)["owner_key"]
     from app.services.auth import _get_user_permission_levels
     result["can_edit"] = result["can_edit"] and _get_user_permission_levels(login).get("annotate") == "use"
@@ -477,13 +564,17 @@ def task_view(task: dict, login, *, summary=False) -> dict:
         status = "draft"
     elif readiness_issues(task):
         status = "input_issues"
+    elif task["rules"]["ai_detect"] and not task.get("ai_confirmation_complete") and all(stage_complete(task, row, "ai") for row in retained) and any(row.get("gate", {}).get("status") in ("pass", "not_applicable") for row in retained):
+        status = "awaiting_ai_confirmation"
     elif result["summary"]["pending_count"]:
-        status = "incomplete" if task.get("runs") or run else "ready"
+        status = "incomplete" if (run and run.get("stage") != "ai") or any(row.get("quality") for row in retained) else "ready"
     elif task.get("confirmed_version") == task["version"]:
         status = "confirmed"
     else:
         status = "awaiting_confirmation"
     result["status"] = status
+    result["workflow"] = workflow_state(task)
+    result["annotation_issues"] = readiness_issues(task)
     result["confirmation_issues"] = readiness_issues(task, settlement=True)
     if result.get("roster_snapshot"):
         result["roster_snapshot"].pop("entries", None)
@@ -494,7 +585,7 @@ def task_view(task: dict, login, *, summary=False) -> dict:
     result.pop("feedback_versions", None)
     for row in result["feedback"]:
         row["outcome"] = effective_result(task, row)
-        row["answers"] = [{"column": index, "question": task["headers"][index], "answer": _cell(row, index)}
+        row["answers"] = [{"column": index, "question": task["headers"][index], "question_zh": (task.get("headers_zh") or task["headers"])[index], "answer": _cell(row, index)}
                           for index in (task.get("mapping") or {}).get("open_text_cols", [])]
     result["players"] = aggregate_players(task)
     return result

@@ -1,5 +1,5 @@
 """HTTP boundary for the persistent quality workflow."""
-from fastapi import APIRouter, File, Form, Request, UploadFile
+from fastapi import APIRouter, File, Form, Request, UploadFile, HTTPException
 
 from app.schemas.group_tasks import (AnnouncementRequest, ConfirmAI, DuplicateDecision, FeedbackCorrection, MappingUpdate,
                                     PlayerADVDecision, QualityOverride, RunTask, TaskCreate, TaskRulesUpdate, VersionRequest)
@@ -8,6 +8,7 @@ from app.services import group_tasks as service
 from app.services.group_task_runner import prepare_run
 from app.services.task_announcement import extract_announcement
 from app.services.task_records import clipboard_records
+from app.services.llm_credentials import require_request_llm_api_key, run_with_llm_api_key
 
 router = APIRouter(prefix="/api/group-tasks")
 
@@ -27,6 +28,12 @@ async def announcement(body: AnnouncementRequest, request: Request):
     return await extract_announcement(body.announcement, await _current_login(request))
 
 
+@router.get("/groups")
+async def groups(request: Request):
+    from app.services.roster_sources import group_options
+    return {"groups": group_options(await _current_login(request))}
+
+
 @router.get("/{task_id}")
 async def detail(task_id: str, request: Request):
     login = await _current_login(request)
@@ -40,7 +47,28 @@ async def rules(task_id: str, body: TaskRulesUpdate, request: Request):
 
 @router.post("/{task_id}/upload")
 async def upload(task_id: str, request: Request, expected_version: int = Form(...), file: UploadFile = File(...)):
-    return service.upload_feedback(task_id, expected_version, file.filename or "feedback.csv", await file.read(), await _current_login(request))
+    login = await _current_login(request)
+    result = service.upload_feedback(task_id, expected_version, file.filename or "feedback.csv", await file.read(), login)
+    return await _translate_columns(request, task_id, result["version"], login, result)
+
+
+async def _translate_columns(request, task_id, version, login, fallback=None):
+    try:
+        key = await require_request_llm_api_key(request)
+    except HTTPException:
+        if fallback is not None:
+            return fallback
+        raise
+    return await run_with_llm_api_key(service.translate_upload_headers(task_id, version, login), key,
+                                     request=request, category="annotate", action="上传列名翻译", reference_id=task_id)
+
+
+@router.post("/{task_id}/translate-headers")
+async def translate_headers(task_id: str, body: VersionRequest, request: Request):
+    login = await _current_login(request)
+    task = service.load_task(task_id, login, write=True)
+    service._ensure_version(task, body.expected_version)
+    return await _translate_columns(request, task_id, body.expected_version, login)
 
 
 @router.put("/{task_id}/mapping")

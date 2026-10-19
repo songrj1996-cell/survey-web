@@ -18,6 +18,26 @@ from app.storage import group_workflow as store
 
 
 class RewardImportReviewTests(WorkflowCase):
+    def test_preview_does_not_rewrite_checked_import_dates(self):
+        sid, request = self.upload()
+        before = deepcopy(store.read('imports', sid))
+        preview = imports.analyze_reward_session(sid, request, latest_roster=True, preview_only=True)
+        self.assertEqual(len(preview['eligible_rows']), 2)
+        self.assertEqual(store.read('imports', sid), before)
+        self.assertEqual(imports.get_reward_session(sid)['analysis_request'], before['analysis_request'])
+
+    def test_only_successfully_checked_imports_are_choices_and_sources(self):
+        sid, _ = self.upload()
+        self.assertEqual([item['id'] for item in rewards.choices(LOGIN)['imports']], [sid])
+        saved = deepcopy(store.read('imports', sid))
+        for analysis in (None, {**saved['analysis'], 'invalid_rows': [{'reason': '金额错误'}]}):
+            store.mutate('imports', sid, lambda item: item.update(analysis=analysis))
+            imports._SESSIONS.pop(sid, None)
+            self.assertEqual(rewards.choices(LOGIN)['imports'], [])
+            with self.assertRaises(HTTPException) as blocked:
+                self.preview(sid)
+            self.assertIn('未通过检查', str(blocked.exception.detail))
+
     def upload(self, with_status=False, old_status='群内人员', old_account=None):
         wb = Workbook(); ws = wb.active; ws.title = '任务完成记录'
         ws.append(['奖励发放日期', '任务', 'playerid', 'ori', '普通奖励'] + (['当前状态'] if with_status else []))
