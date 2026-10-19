@@ -37,7 +37,7 @@ from app.services.survey_service import (
     cancel_report_run,
     get_report_sources,
     translate_report_sources,
-    prepare_quick_history_session,
+    prepare_report_history_session,
     confirm_survey_plan,
     compute_survey_stats,
     delete_session_report_version,
@@ -339,7 +339,7 @@ async def generate_report_version(
 async def _report_rerun_response(session_id, req, request, *, retry_failed):
     if req.history_id:
         login = await _current_login(request)
-        session_id = prepare_quick_history_session(req.history_id, login, req.base_version)
+        session_id = prepare_report_history_session(req.history_id, login, req.base_version)
     else:
         await require_session_request_access(request, session_id, login_resolver=_current_login)
     api_key = await require_request_llm_api_key(request)

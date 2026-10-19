@@ -196,6 +196,8 @@ def partial_rerun_capability(entry: dict, snapshot: dict) -> dict:
         "parts": [],
         "questions": [],
     }
+    if (snapshot.get("input_snapshot") or {}).get("report_engine") == "postwrite-v1":
+        return {**unavailable, "reason": "此版本采用先写作后核验，可整份重写或继续未完成核验；暂不支持旧版按章节或题目重做。"}
     if snapshot.get("report_style") == "quick":
         return {**unavailable, "reason": "快速总结可使用失败题目重试或整份重新生成。"}
     if (entry.get("mode") or "") in {"comment", "interview", "annotate", "crosstab"}:

@@ -12,8 +12,8 @@ from app.services.branch_logic import branch_rule_for_column, branch_rule_label
 
 
 REPORT_MODES = {"quick", "insight", "statistics"}
-MODE_SNAPSHOT_FIELDS = ("report_mode", "report_status", "input_snapshot", "quick_summary", "quick_checkpoint")
-MODE_OBJECT_FIELDS = ("input_snapshot", "quick_summary", "quick_checkpoint")
+MODE_SNAPSHOT_FIELDS = ("report_mode", "report_status", "input_snapshot", "quick_summary", "quick_checkpoint", "report_audit")
+MODE_OBJECT_FIELDS = ("input_snapshot", "quick_summary", "quick_checkpoint", "report_audit")
 _SUPPORT_ROLES = {"id", "mlbbid", "ignore"}
 _OBJECTIVE_ROLES = {"single_choice", "multi_choice", "scale", "matrix_scale", "matrix_single", "matrix_multi"}
 
@@ -330,6 +330,29 @@ def prepare_report_markdown(snapshot: dict, scope: str = "body") -> str:
         body = group_quick_markdown(body)
         body = outline_quick_markdown(snapshot, body)
     annex = evidence_markdown(snapshot) if scope == "evidence" else ""
+    audit = snapshot.get("report_audit") or {}
+    if audit:
+        status = ("核验已完成，含歧义待人工确认" if audit.get("has_ambiguity") else "已完成三项核验，仍需人工审阅") if audit.get("status") == "complete" else "核验未完成，以下为保留的初稿"
+        body = f"> {status}。核验提示不代表正文已自动修正。\n\n" + body
+        if scope == "evidence":
+            notes = ["## 核验提示"]
+            for check in audit.get("checks") or []:
+                if check.get("verdict") in {"issue", "uncertain"} or check.get("citation_issues") or check.get("errors"):
+                    notes.append(str(check.get("original", "")) + "\n\n" + str(check.get("reason", "")))
+            for count in audit.get("counts") or []:
+                reviewed = count.get("reviewed", count.get("complete", False))
+                if not reviewed:
+                    notes.append(f"{count.get('id', '')}：尚未核验")
+                elif count.get("review_status") == "ambiguous":
+                    notes.append(f"{count.get('id', '')}：已核验但有歧义；明确{count['count_min']}人，可能{count['count_min']}—{count['count_max']}/{count['denominator']}人；待人工确认。")
+                    for member in count.get("members") or []:
+                        if member.get("count") is not None:
+                            continue
+                        notes.append(f"{member['player']}：是否计入有歧义")
+                        for source in member.get("sources") or []:
+                            notes.append(f"{source['ref']} 原文：{source.get('source', {}).get('original', '')}\n核验释义：{source.get('meaning', '')}")
+                notes.extend(str(x) for x in count.get("issues", []))
+            annex = "\n\n".join(notes) + ("\n\n" + annex if annex else "")
     return body + ("\n\n" + annex if annex else "")
 
 

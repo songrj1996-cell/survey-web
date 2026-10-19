@@ -56,6 +56,10 @@ from app.core.security import (
 )
 from app.core.text import _short_text
 from app.integrations.llm_client import collect_chat_completion
+from app.core import config as postwrite_config
+from app.services.report_postwrite_inputs import is_postwrite, freeze_inputs as freeze_postwrite_inputs, validate_frozen, qa_context as postwrite_qa_context
+from app.services.report_postwrite_pipeline import run_pipeline as run_postwrite_pipeline
+from app.storage.report_postwrite_runs import RunStore as PostwriteRunStore
 from app.schemas.requests import QualitativeContextRequest
 from app.services.audit import audit_log
 from app.services.analysis_preferences import (
@@ -2153,6 +2157,34 @@ def prepare_quick_history_session(history_id: str, login, base_version=None) -> 
     return sid
 
 
+def prepare_report_history_session(history_id: str, login, base_version=None) -> str:
+    entry = _find_history_for_login(_load_history(), history_id, login)
+    if not entry:
+        raise HTTPException(status_code=404, detail="历史报告不存在或无权访问")
+    base = resolve_report_version(entry, base_version)
+    if not is_postwrite(base):
+        return prepare_quick_history_session(history_id, login, base_version)
+    validate_frozen(base["input_snapshot"])
+    if not postwrite_config.REPORT_POSTWRITE_ENABLED:
+        raise HTTPException(status_code=409, detail="先写作后核验功能未启用；仍可查看和导出已有版本")
+    sess = deepcopy(entry)
+    sess.update(mode_fields("insight"))
+    sess.update({"mode": "standard", "analysis_mode": "qualitative", "postwrite_history_rerun": True,
+                 "rerun_target_history_id": history_id, "rerun_base_version": base["version"]})
+    _assign_session_owner(sess, login)
+    sid = new_session()
+    save_session(sid, sess)
+    return sid
+
+
+def _use_postwrite_engine(selected):
+    if is_postwrite(selected):
+        return True
+    return (postwrite_config.REPORT_POSTWRITE_ENABLED and resolve_report_mode(selected) == "insight"
+            and selected.get("mode") not in {"crosstab", "quantitative", "comment", "interview"}
+            and not normalize_report_versions(selected))
+
+
 async def report_stream(session_id: str, request: Request, *, instruction: str = "",
                         base_version: int | None = None, generation_kind: str | None = None,
                         retry_failed: bool = False):
@@ -2191,8 +2223,8 @@ async def report_stream(session_id: str, request: Request, *, instruction: str =
     _REPORT_CANCEL_EVENTS[session_id] = cancel
     yield sse_event({"type": "session_ready", "session_id": session_id})
     queue = asyncio.Queue()
-    engine = _quick_report_stream if resolve_report_mode(selected) == "quick" else _full_report_stream
-    if retry_failed and engine is not _quick_report_stream:
+    engine = _postwrite_report_stream if _use_postwrite_engine(selected) else (_quick_report_stream if resolve_report_mode(selected) == "quick" else _full_report_stream)
+    if retry_failed and engine not in {_quick_report_stream, _postwrite_report_stream}:
         _REPORT_CANCEL_EVENTS.pop(session_id, None)
         yield sse_event({"type": "error", "message": "失败题目重试仅适用于快速总结"})
         return
@@ -2200,7 +2232,7 @@ async def report_stream(session_id: str, request: Request, *, instruction: str =
     async def pump():
         try:
             options = {"instruction": instruction, "base_version": base_version, "generation_kind": generation_kind}
-            if engine is _quick_report_stream:
+            if engine in {_quick_report_stream, _postwrite_report_stream}:
                 options["retry_failed"] = retry_failed
             async for event in engine(session_id, request, **options):
                 await queue.put(event)
@@ -2249,6 +2281,134 @@ async def report_stream(session_id: str, request: Request, *, instruction: str =
                 with suppress(asyncio.CancelledError):
                     await child
         _REPORT_CANCEL_EVENTS.pop(session_id, None)
+
+
+async def _postwrite_report_stream(session_id, request, *, instruction="", base_version=None, generation_kind=None, retry_failed=False):
+    started = time.perf_counter()
+    if not postwrite_config.REPORT_POSTWRITE_ENABLED:
+        raise ValueError("先写作后核验功能未启用；不会切换到另一套引擎")
+    login = await _current_login(request)
+    lock = _report_generation_lock(session_id)
+    if lock.locked():
+        raise ValueError("当前任务正在生成报告")
+    await lock.acquire()
+    target_lock = None
+    job = None
+    try:
+        sess = deepcopy(require_session_access(session_id, login, loader=get_session))
+        _assign_session_owner(sess, login)
+        target_id = str(sess.get("rerun_target_history_id") or "")
+        owner = sess
+        if target_id:
+            target_lock = _report_rerun_target_lock(target_id)
+            if target_lock.locked():
+                target_lock = None
+                raise ValueError("原报告正在生成或核验")
+            await target_lock.acquire()
+            owner = _find_history_for_login(_load_history(), target_id, login)
+            if not owner:
+                raise ValueError("原报告不存在或无权访问")
+            if not sess.get("postwrite_history_rerun") and not find_exact_survey_duplicate_entry(sess, login, target_id):
+                raise ValueError("原报告与当前上传数据不一致")
+        versions = normalize_report_versions(owner)
+        if len(versions) >= MAX_REPORT_VERSIONS:
+            raise ValueError(f"报告版本已达上限（{MAX_REPORT_VERSIONS} 个）")
+        base = resolve_report_version(owner, base_version or sess.get("rerun_base_version")) if versions else None
+        if base and not (generation_kind == "regenerate" or retry_failed or target_id):
+            raise ValueError("当前任务已有报告，请选择重新生成")
+        if base and not is_postwrite(base):
+            raise ValueError("已有版本必须沿用其原始引擎")
+        frozen = deepcopy(base["input_snapshot"]) if base else await asyncio.to_thread(freeze_postwrite_inputs, sess)
+        validate_frozen(frozen)
+        previous = None
+        prompts = {name: _get_prompt_text("postwrite_" + key + "_system") for name, key in
+                   (("writer", "writer"), ("registry", "registry"), ("audit", "auditor"))}
+        if retry_failed:
+            audit = (base or {}).get("report_audit") or {}
+            if audit.get("status") != "partial" or not audit.get("checkpoint"):
+                raise ValueError("所选版本没有可继续的未完成核验")
+            previous = deepcopy(audit["checkpoint"])
+            if previous.get("draft") != base["report_md"]:
+                raise ValueError("初稿与核验检查点不一致")
+            prompts = deepcopy(previous["prompts"])
+            instruction = previous.get("instruction", "")
+        store = PostwriteRunStore()
+        inputs = {"frozen": frozen, "prompts": prompts, "instruction": instruction,
+                  "base_version": base["version"] if base else None, "owner_key": _history_owner_key(owner)}
+        run_id = store.create(inputs, previous)
+        latest = deepcopy(require_session_access(session_id, login, loader=get_session))
+        latest["postwrite_run_id"] = run_id
+        save_session(session_id, latest)
+        progress = asyncio.Queue()
+        tracker = _ReportLLMUsageTracker()
+        async def on_progress(event):
+            await progress.put(event)
+        async def on_checkpoint(state):
+            store.save(run_id, {"inputs": inputs, "state": state})
+        job = asyncio.create_task(run_postwrite_pipeline(frozen, prompts=prompts, instruction=instruction, previous=previous,
+            collect=collect_chat_completion, on_progress=on_progress, on_checkpoint=on_checkpoint,
+            on_event=tracker.callback("writing")))
+        try:
+            while not job.done():
+                try:
+                    event = await asyncio.wait_for(progress.get(), 1)
+                    yield sse_event({"type": "analysis_progress", **event})
+                except TimeoutError:
+                    yield sse_event({"type": "heartbeat"})
+            result = job.result()
+        except asyncio.CancelledError:
+            job.cancel()
+            with suppress(asyncio.CancelledError):
+                await job
+            result = store.load(run_id)["state"]
+        while not progress.empty():
+            yield sse_event({"type": "analysis_progress", **progress.get_nowait()})
+        if not result.get("draft"):
+            yield sse_event({"type": "error", "message": "初稿未完成，运行记录已保留：" + str(result.get("stop_reason", ""))})
+            return
+        audit = {**result["audit"], "usage": result["usage"], "run_id": run_id, "checkpoint": result}
+        tracker.finalize_open_attempts()
+        snapshot = {"report_mode": "insight", "report_style": "full", "report_status": audit["status"],
+                    "report_md": result["draft"], "input_snapshot": frozen, "report_audit": audit,
+                    "title": result["draft"].splitlines()[0].lstrip("# ")[:150],
+                    "qa_context_md": postwrite_qa_context(result["draft"], frozen, result["audit"]), "qa_messages": [],
+                    "report_writer_provider": "direct_llm", "report_writer_model": postwrite_config.LLM_POSTWRITE_MODEL,
+                    "report_duration_seconds": round(time.perf_counter() - started, 3),
+                    "report_completed_at": datetime.now().isoformat(timespec="seconds"), "report_llm_usage": tracker.snapshot()}
+        latest = deepcopy(require_session_access(session_id, login, loader=get_session))
+        precommit = deepcopy(latest)
+        latest.update(mode_fields("insight"))
+        if target_id:
+            from app.storage.history import mutate_history
+            def persist(history):
+                entry = _find_history_for_login(history, target_id, login)
+                if not entry or resolve_report_version(entry, base["version"]).get("input_snapshot") != base["input_snapshot"]:
+                    raise ValueError("原版本的来源已变化，本次结果保留在运行记录中")
+                version = append_report_version(entry, snapshot, kind="regenerate", base_version=base["version"], instruction=instruction)
+                return deepcopy(entry), deepcopy(version)
+            committed, version = mutate_history(persist)
+            _copy_report_version_state(latest, committed)
+            latest["rerun_completed_at"] = datetime.now().isoformat(timespec="seconds")
+            save_session(session_id, latest)
+        else:
+            version = append_report_version(latest, snapshot, kind="regenerate" if base else "initial",
+                base_version=base["version"] if base else None, instruction=instruction)
+            try:
+                save_session(session_id, latest)
+                save_to_history(session_id, latest)
+            except Exception:
+                save_session(session_id, precommit)
+                raise
+        yield sse_event({"type": "report_done", **_session_report_version_payload(latest), **version,
+                         **({"history_id": target_id} if target_id else {})})
+    finally:
+        if job and not job.done():
+            job.cancel()
+            with suppress(asyncio.CancelledError):
+                await job
+        if target_lock is not None:
+            target_lock.release()
+        lock.release()
 
 
 async def _quick_report_stream(session_id: str, request: Request, *, instruction: str = "",

@@ -155,6 +155,10 @@ def _snapshot_from(
     result["comparison_validation"] = deepcopy(comparison_validation)
 
     for field in _OPTIONAL_OBJECT_SNAPSHOT_FIELDS:
+        # Audit belongs to the exact snapshot; never borrow a newer version's result.
+        if field == "report_audit" and field not in snapshot and snapshot.get("report_md"):
+            result.pop(field, None)
+            continue
         if field in snapshot:
             value = snapshot[field]
         elif field in fallback:
