@@ -118,6 +118,85 @@ def events(raw):
 
 
 class PipelineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_business_entry_loads_selected_writer_and_keeps_r_case_sources(self):
+        from pathlib import Path
+        from app.storage import prompts as prompt_storage
+
+        narrative = "# 合成案例报告\n\nR2玩家认为卡牌有趣，同时希望模式常驻。"
+        for selected_writer in (config.DEFAULT_POSTWRITE_WRITER, "CUSTOM_WRITER_KEPT_BY_SETTINGS"):
+            with self.subTest(custom=selected_writer != config.DEFAULT_POSTWRITE_WRITER):
+                sess = session()
+                writer_requests = []
+
+                async def collect(messages, **kwargs):
+                    payload = json.loads(messages[-1]["content"])
+                    raw, model = await fake_collect(messages, **kwargs)
+                    if "blocks" in payload:
+                        return json.dumps({"claims": [{"id": "C1", "original": narrative.split("\n\n")[1],
+                            "block_ids": ["B0002"], "kind": "fact", "review_refs": ["q1/r2", "q2/r2"]}],
+                            "coverage": [{"block_id": "B0001", "no_claim": True},
+                                         {"block_id": "B0002", "claim_ids": ["C1"]}], "tasks": []}, ensure_ascii=False), model
+                    if "targets" not in payload and "task" not in payload:
+                        writer_requests.append(deepcopy(messages))
+                        return narrative, model
+                    return raw, model
+
+                with tempfile.TemporaryDirectory(prefix="postwrite-entry-prompts-") as folder:
+                    prompt_file = Path(folder) / "prompts.json"
+                    stored = deepcopy(DEFAULT_PROMPTS)
+                    stored["postwrite_writer_system"]["current"] = selected_writer
+                    prompt_file.write_text(json.dumps(stored, ensure_ascii=False), encoding="utf-8")
+                    with runtime(sess, collect), patch.object(prompt_storage, "PROMPTS_FILE", str(prompt_file)), patch.object(
+                        survey_service, "_get_prompt_text", side_effect=prompt_storage._get_prompt_text
+                    ):
+                        output = events([e async for e in survey_service.report_stream("writer-entry", None)])
+                self.assertTrue(any(e["type"] == "report_done" for e in output), output)
+                saved = report_versions.resolve_report_version(sess, 1)
+                self.assertEqual(saved["report_md"], narrative)
+                self.assertEqual(len(writer_requests), 1)
+                self.assertEqual(writer_requests[0][0], {"role": "system", "content": selected_writer})
+                self.assertEqual(json.loads(writer_requests[0][-1]["content"]), {
+                    **saved["input_snapshot"]["postwrite_packet"], "instruction": ""})
+                state = saved["report_audit"]["checkpoint"]
+                self.assertEqual(state["prompts"], {**PROMPTS, "writer": selected_writer})
+                sources = [item["source"] for check in saved["report_audit"]["checks"] for item in check["sources"]]
+                self.assertEqual([(s["ref"], s["source_row"], s["original"]) for s in sources],
+                                 [("q1/r2", 2, "卡牌有趣"), ("q2/r2", 2, "希望常驻")])
+                self.assertTrue(all(s["player"] == "P00002" for s in sources))
+
+    async def test_old_checkpoint_keeps_writer_when_catalog_has_upgraded(self):
+        sess = session()
+
+        async def partial(messages, **kwargs):
+            raw, model = await fake_collect(messages, **kwargs)
+            return ('{"checks":[]}', model) if "targets" in json.loads(messages[-1]["content"]) else (raw, model)
+
+        def old_catalog(key):
+            return config.DEFAULT_POSTWRITE_WRITER_V1 if key == "postwrite_writer_system" else DEFAULT_PROMPTS[key]["current"]
+
+        with runtime(sess, partial), patch.object(survey_service, "_get_prompt_text", side_effect=old_catalog):
+            _ = [e async for e in survey_service.report_stream("old-writer", None)]
+        before = deepcopy(report_versions.resolve_report_version(sess, 1))
+        self.assertEqual(before["report_audit"]["checkpoint"]["prompts"]["writer"], config.DEFAULT_POSTWRITE_WRITER_V1)
+        self.assertEqual(before["report_audit"]["status"], "partial")
+        requests = []
+
+        async def resume(messages, **kwargs):
+            requests.append(deepcopy(messages))
+            self.assertIn("targets", json.loads(messages[-1]["content"]))
+            return await fake_collect(messages, **kwargs)
+
+        with runtime(sess, resume):
+            output = events([e async for e in survey_service.report_stream("old-writer", None, retry_failed=True, base_version=1)])
+        self.assertTrue(any(e["type"] == "report_done" for e in output), output)
+        after = report_versions.resolve_report_version(sess, 2)
+        self.assertTrue(requests)
+        self.assertEqual(after["report_audit"]["status"], "complete")
+        self.assertEqual(after["report_audit"]["checkpoint"]["prompts"], before["report_audit"]["checkpoint"]["prompts"])
+        self.assertEqual(after["report_md"], before["report_md"])
+        self.assertEqual(after["input_snapshot"], before["input_snapshot"])
+        self.assertEqual(report_versions.resolve_report_version(sess, 1), before)
+
     async def test_list_alias_resume_reuses_meanings_and_reviewed_members(self):
         from app.services.report_postwrite_audit import bind_members
         from app.services.report_postwrite_inputs import fingerprint
