@@ -374,4 +374,6 @@ class SaveReplayTests(unittest.IsolatedAsyncioTestCase):
                 checks = await persist_full_result(output, frozen, PROMPTS, result)
             self.assertTrue(checks["original_version_unchanged"])
             self.assertEqual(checks["extra_model_requests"], 0)
-            self.assertIn("核验未完成", (output / "export-body.md").read_text(encoding="utf-8"))
+            self.assertEqual((output / "export-body.md").read_text(encoding="utf-8"), REPORT)
+            self.assertNotIn("核验未完成", (output / "export-body.md").read_text(encoding="utf-8"))
+            self.assertEqual(json.loads((output / "saved-snapshot.json").read_text(encoding="utf-8"))["report_audit"]["status"], "partial")
