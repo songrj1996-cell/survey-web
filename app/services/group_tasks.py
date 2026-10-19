@@ -19,7 +19,7 @@ from app.storage import group_workflow as store
 
 LABELS = ("优秀反馈", "有效反馈", "无效反馈")
 ACTIVE_RUNS = {"queued", "running"}
-EDITABLE_SETTINGS = {"name", "payout_date", "base_reward", "excellent_reward", "group_source_id", "group_name"}
+EDITABLE_SETTINGS = {"name", "payout_date", "base_reward", "excellent_reward", "group_source_id", "group_name", "group_source_ids", "group_names"}
 
 
 def now() -> str:
@@ -109,17 +109,26 @@ def _invalidate_model(row: dict) -> None:
 
 def _rules_metadata(rules, previous=None):
     updated = rules.model_dump(mode="json")
-    identifier = updated.get("group_source_id")
-    if identifier:
+    previous = previous or {}
+    identifiers = updated.get("group_source_ids")
+    if identifiers is None:
+        identifiers = [updated["group_source_id"]] if updated.get("group_source_id") else []
+    identifiers = list(dict.fromkeys(identifiers))
+    previous_ids = previous.get("group_source_ids")
+    if previous_ids is None:
+        previous_ids = [previous["group_source_id"]] if previous.get("group_source_id") else []
+    previous_names = dict(zip(previous_ids, previous.get("group_names") or [previous.get("group_name", "")]))
+    names = []
+    for identifier in identifiers:
         source = store.read("sources", identifier)
         if source and source.get("enabled"):
-            updated["group_name"] = source["name"]
-        elif identifier == (previous or {}).get("group_source_id"):
-            updated["group_name"] = previous.get("group_name", "")
+            names.append(source["name"])
+        elif identifier in previous_ids:
+            names.append(previous_names.get(identifier, identifier))
         else:
             raise HTTPException(422, "任务归属群组已停用或不存在，请重新选择")
-    else:
-        updated["group_name"] = ""
+    updated.update(group_source_ids=identifiers, group_names=names,
+                   group_source_id=next(iter(identifiers), ""), group_name="、".join(names))
     return updated
 
 
@@ -145,7 +154,9 @@ def annotation_inputs_locked(task):
 
 def update_settings(task_id, request, login):
     current = load_task(task_id, login, write=True)
-    values = request.model_dump(mode="json", exclude={"expected_version"})
+    values = request.model_dump(mode="json", exclude={"expected_version"}, exclude_unset=True)
+    if "group_source_id" in values and "group_source_ids" not in values:
+        values["group_source_ids"] = None  # Legacy callers still send a single group.
     if not values["name"].strip():
         raise HTTPException(422, "请填写任务名称")
     return update_rules(task_id, request.expected_version, TaskRules(**{**current["rules"], **values}), login)

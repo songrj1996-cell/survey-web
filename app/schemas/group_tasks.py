@@ -1,7 +1,10 @@
 """Group task input contracts; domain decisions live in services."""
 from datetime import date
-from typing import Literal
+from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt
+
+GroupSourceId = Annotated[str, Field(min_length=1, max_length=128)]
+GroupName = Annotated[str, Field(max_length=200)]
 
 
 class TaskRules(BaseModel):
@@ -16,7 +19,9 @@ class TaskRules(BaseModel):
     announcement: str = Field(default="", max_length=30000)
     ai_detect: StrictBool = True
     group_source_id: str = Field(default="", max_length=128)
-    group_name: str = Field(default="", max_length=200)
+    group_name: str = Field(default="", max_length=30000)
+    group_source_ids: list[GroupSourceId] | None = Field(default=None, max_length=100)
+    group_names: list[GroupName] = Field(default_factory=list, max_length=100)
 
 
 class TaskCreate(BaseModel):
@@ -36,6 +41,7 @@ class TaskSettingsUpdate(BaseModel):
     base_reward: StrictInt = Field(ge=0, le=2147483647)
     excellent_reward: StrictInt = Field(ge=0, le=2147483647)
     group_source_id: str = Field(default="", max_length=128)
+    group_source_ids: list[GroupSourceId] | None = Field(default=None, max_length=100)
 
 
 class FeedbackMapping(BaseModel):

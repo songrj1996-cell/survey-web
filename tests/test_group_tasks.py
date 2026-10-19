@@ -56,6 +56,79 @@ class WorkflowCase(unittest.TestCase):
 
 
 class GroupTaskTests(WorkflowCase):
+    def test_multiple_group_settings_preserve_annotation_identity_and_rewards(self):
+        from app.schemas.group_tasks import TaskSettingsUpdate
+        task = self.make_task(labels=('有效反馈',))
+        task = tasks.override_quality(task['id'], task['feedback'][0]['id'],
+            QualityOverride(expected_version=task['version'], label='优秀反馈', note='人工复核'), LOGIN)
+        for identifier, name in [('note_a', '备注群甲'), ('note_b', '备注群乙')]:
+            store.create('sources', identifier, {'id': identifier, 'name': name, 'enabled': True})
+        request = dict(name=task['rules']['name'], payout_date=task['rules']['payout_date'],
+                       base_reward=100, excellent_reward=100)
+        updated = tasks.update_settings(task['id'], TaskSettingsUpdate(expected_version=task['version'],
+            group_source_ids=['note_a', 'note_b', 'note_a'], **request), LOGIN)
+        self.assertEqual(updated['rules']['group_source_ids'], ['note_a', 'note_b'])
+        self.assertEqual(updated['rules']['group_names'], ['备注群甲', '备注群乙'])
+        self.assertEqual(updated['rules']['group_name'], '备注群甲、备注群乙')
+        self.assertEqual(updated['rules']['group_source_id'], 'note_a')
+        self.assertEqual(updated['feedback'], task['feedback'])
+        self.assertEqual(updated['players'], task['players'])
+        self.assertEqual(tasks.load_task(task['id'], LOGIN)['rules'], updated['rules'])
+        # Omitting the optional group field must preserve the full selection.
+        unchanged = tasks.update_settings(task['id'], TaskSettingsUpdate(expected_version=updated['version'], **request), LOGIN)
+        self.assertEqual(unchanged['rules']['group_source_ids'], ['note_a', 'note_b'])
+        cleared = tasks.update_settings(task['id'], TaskSettingsUpdate(expected_version=unchanged['version'],
+            group_source_ids=[], **request), LOGIN)
+        self.assertEqual(cleared['rules']['group_source_ids'], [])
+        self.assertEqual(cleared['rules']['group_names'], [])
+        self.assertEqual(cleared['rules']['group_source_id'], '')
+        self.assertEqual(cleared['rules']['group_name'], '')
+
+    def test_group_multiselect_legacy_and_inactive_sources(self):
+        from app.schemas.group_tasks import TaskSettingsUpdate
+        task = self.make_task(labels=('有效反馈',))
+        # Simulate an old record without changing it during reads.
+        def legacy(record):
+            record['rules'].pop('group_source_ids', None)
+            record['rules'].pop('group_names', None)
+            record['rules'].update(group_source_id='old_group', group_name='历史归属群')
+        store.mutate('tasks', task['id'], legacy)
+        before = store.read('tasks', task['id'])
+        tasks.task_view(before, LOGIN)
+        self.assertEqual(store.read('tasks', task['id']), before)
+        store.create('sources', 'new_group', {'id': 'new_group', 'name': '新群', 'enabled': True})
+        request = dict(name=task['rules']['name'], payout_date=task['rules']['payout_date'], base_reward=100, excellent_reward=100)
+        updated = tasks.update_settings(task['id'], TaskSettingsUpdate(expected_version=before['version'],
+            group_source_ids=['old_group', 'new_group'], **request), LOGIN)
+        self.assertEqual(updated['rules']['group_names'], ['历史归属群', '新群'])
+        store.mutate('sources', 'new_group', lambda record: record.update(enabled=False))
+        kept = tasks.update_settings(task['id'], TaskSettingsUpdate(expected_version=updated['version'],
+            group_source_ids=['old_group', 'new_group'], **request), LOGIN)
+        self.assertEqual(kept['rules']['group_names'], ['历史归属群', '新群'])
+        for identifiers in (['unknown_group'], ['new_group']):
+            with self.assertRaises(HTTPException) as caught:
+                tasks.create_task(TaskRules(group_source_ids=identifiers), LOGIN)
+            self.assertEqual(caught.exception.status_code, 422)
+        # Old clients can still clear or replace the single-group field.
+        legacy_update = tasks.update_settings(task['id'], TaskSettingsUpdate(expected_version=kept['version'],
+            group_source_id='', **request), LOGIN)
+        self.assertEqual(legacy_update['rules']['group_source_ids'], [])
+
+    def test_group_multiselect_creation_derives_names_and_accepts_long_display(self):
+        names = ['群甲' * 70, '群乙' * 70]
+        for identifier, name in zip(['group_1', 'group_2'], names):
+            store.create('sources', identifier, {'id': identifier, 'name': name, 'enabled': True})
+        task = tasks.create_task(TaskRules(group_source_ids=['group_1', 'group_2'],
+                                         group_names=['伪造名称'], group_name='伪造合并名称'), LOGIN)
+        self.assertEqual(task['rules']['group_names'], names)
+        self.assertGreater(len(task['rules']['group_name']), 200)
+        roundtrip = tasks.update_rules(task['id'], task['version'], TaskRules(**task['rules']), LOGIN)
+        self.assertEqual(roundtrip['rules']['group_names'], names)
+        from pydantic import ValidationError
+        for identifiers in ([''], ['x' * 129]):
+            with self.assertRaises(ValidationError):
+                TaskRules(group_source_ids=identifiers)
+
     def test_settings_preserve_annotations_and_lock_analysis_rules(self):
         from app.schemas.group_tasks import TaskSettingsUpdate
         task=self.make_task(labels=('有效反馈',))

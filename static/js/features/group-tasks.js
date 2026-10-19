@@ -77,7 +77,16 @@ window.GroupTasks = (() => {
     const missing=field.value.trim()==='';label.classList.toggle('gw-field--missing',missing);label.classList.toggle('gw-field--filled',!missing);
   }
   function groupSetting() {
-    return `<label class="workflow-field">任务归属群组<select data-rule="group_source_id" ${disabled()}><option value="">未填写</option>${configuredGroups.map(g=>`<option value="${h(g.id)}" ${task.rules.group_source_id===g.id?'selected':''}>${h(g.name)}</option>`).join('')}${task.rules.group_source_id&&!configuredGroups.some(g=>g.id===task.rules.group_source_id)?`<option value="${h(task.rules.group_source_id)}" selected>${h(task.rules.group_name)}（已停用）</option>`:''}</select><small class="workflow-muted">仅用于记录任务归属</small></label>`;
+    const selected=task.rules.group_source_ids??(task.rules.group_source_id?[task.rules.group_source_id]:[]);
+    const names=task.rules.group_names?.length?task.rules.group_names:[task.rules.group_name];
+    const options=[...configuredGroups,...selected.filter(id=>!configuredGroups.some(g=>g.id===id)).map(id=>({id,name:names[selected.indexOf(id)]||id,inactive:true}))];
+    const selectedNames=selected.map(id=>options.find(g=>g.id===id)?.name||id).join('、');
+    return `<fieldset class="workflow-field gw-task-groups"><legend>任务归属群组（可多选）</legend><details class="gw-task-group-select"><summary data-group-summary aria-label="任务归属群组（可多选）" ${editable()?'':'aria-disabled="true" tabindex="-1"'}><span data-group-summary-text>${h(selectedNames||'请选择群组')}</span><span class="gw-task-group-caret" aria-hidden="true"></span></summary><div class="gw-task-group-options">${options.map(g=>`<label><input type="checkbox" data-task-group value="${h(g.id)}" data-group-name="${h(g.name)}" ${selected.includes(g.id)?'checked':''} ${disabled()}><span>${h(g.name)}${g.inactive?'（已停用）':''}</span></label>`).join('')||'<span class="workflow-muted">暂无已配置的群组</span>'}</div></details><small class="workflow-muted">仅用于记录任务归属，可不选</small></fieldset>`;
+  }
+  function selectedGroupIds() { return [...root.querySelectorAll('[data-task-group]:checked')].map(input=>input.value); }
+  function updateGroupSummary(input) {
+    const control=input.closest('.gw-task-group-select');
+    control.querySelector('[data-group-summary-text]').textContent=[...control.querySelectorAll('[data-task-group]:checked')].map(item=>item.dataset.groupName).join('、')||'请选择群组';
   }
   function renderSettings() {
     $('gw-content').innerHTML=`<section class="workflow-card"><h2>任务设置</h2><div class="workflow-form-grid">${ruleField('name','任务名称')}${ruleField('payout_date','奖励发放日期','date','请手动确认发奖日期')}${ruleField('base_reward','每份基础奖励（钻石）','number')}${ruleField('excellent_reward','每份优秀额外奖励（钻石）','number','额外追加，不包含基础奖励')}${groupSetting()}</div><p class="workflow-muted">标注依据和原始反馈已固定。反馈有变化时，请新建任务。</p><div class="workflow-toolbar">${btn('save-settings','保存设置',true,!editable())}</div></section><section class="workflow-card gw-delete-card"><h2>删除任务</h2><p>删除整条任务及标注记录，已生成的历史发奖批次保留。</p>${busy()?'<p class="workflow-muted">正在排队或标注，请等待处理结束后再删除。</p>':''}${btn('delete-task','删除任务',false,!editable())}</section>`;
@@ -89,7 +98,7 @@ window.GroupTasks = (() => {
       </section><section class="workflow-card"><h2>确认任务规则</h2><p class="workflow-muted">奖励按每份保留的完整反馈计算；发奖日期请明确确认。</p><div class="workflow-form-grid">${ruleField('name','任务名称')}${ruleField('payout_date','奖励发放日期','date','需手动填写，公告截止时间不会代入')}${ruleField('base_reward','每份基础奖励（钻石）','number')}${ruleField('excellent_reward','每份优秀额外奖励（钻石）','number','额外追加，不包含基础奖励')}</div>
       <div class="workflow-form-grid"><label class="workflow-field">数据校验<select ${disabled()} data-rule="requires_count"><option value="false" ${!task.rules.requires_count?'selected':''}>不要求实际次数</option><option value="true" ${task.rules.requires_count?'selected':''}>要求实际完成次数</option></select><small data-suggestion="requires_count"></small></label>${ruleField('min_count','最低实际次数','number','不要求数据校验时不适用')}
       <label class="workflow-field">重复提交<select ${disabled()} data-rule="allow_repeat"><option value="false" ${!task.rules.allow_repeat?'selected':''}>不允许，重复组保留一份</option><option value="true" ${task.rules.allow_repeat?'selected':''}>允许，每份独立判断并计奖</option></select><small data-suggestion="allow_repeat"></small></label>
-      <label class="workflow-field">任务归属群组<select data-rule="group_source_id" ${disabled()}><option value="">未填写</option>${configuredGroups.map(g=>`<option value="${h(g.id)}" ${task.rules.group_source_id===g.id?'selected':''}>${h(g.name)}</option>`).join('')}${task.rules.group_source_id&&!configuredGroups.some(g=>g.id===task.rules.group_source_id)?`<option value="${h(task.rules.group_source_id)}" selected>${h(task.rules.group_name)}（已停用）</option>`:''}</select><small class="workflow-muted">仅用于记录任务归属</small></label></div>
+      ${groupSetting()}</div>
       <p id="gw-count-rule" class="workflow-notice"></p><div class="workflow-toolbar">${btn('save-rules','保存并进入上传核查 →',true,!editable())}</div></section>`;
     const updateRuleHints=()=>{
       const requires=root.querySelector('[data-rule="requires_count"]').value==='true', repeat=root.querySelector('[data-rule="allow_repeat"]').value==='true';
@@ -883,6 +892,7 @@ for (const filterId of [
     }
     if(name==='save-settings'){
       const body={};root.querySelectorAll('[data-rule]').forEach(el=>{body[el.dataset.rule]=['base_reward','excellent_reward'].includes(el.dataset.rule)?el.value===''?null:Number(el.value):el.value;});
+      body.group_source_ids=selectedGroupIds();
       if(!body.name.trim()||!body.payout_date||body.base_reward===null||body.excellent_reward===null)throw new Error('请补齐任务名称、发奖日期和两项奖励金额（允许 0）');
       await mutate('settings',body,'PUT');showToast('任务设置已保存，标注结果保持不变','success');return;
     }
@@ -905,6 +915,7 @@ for (const filterId of [
     if(name==='reload'){if(await mayLeave())await load(task.id);return;}
     if(name==='save-rules') {
       const rules={...task.rules};root.querySelectorAll('[data-rule]').forEach(el=>{const key=el.dataset.rule;rules[key]=['requires_count','allow_repeat','ai_detect'].includes(key)?el.value==='true':['base_reward','excellent_reward','min_count'].includes(key)?el.value===''?null:Number(el.value):key==='payout_date'?el.value||null:el.value;});
+      rules.group_source_ids=selectedGroupIds();
       await mutate('rules',{rules},'PUT');step=Math.min(2,maxStep());render();showToast(maxStep()<2?'规则已保存，请补齐任务名称、日期、奖励和次数要求':'任务规则已保存',maxStep()<2?'error':'success');return;
     }
     if(name==='extract') {
@@ -960,8 +971,17 @@ for (const filterId of [
     const el=e.target;
     if(!task||!el.matches('input,textarea,select')||el.matches('[data-filter],#gw-show-all,[id^=ga-quality-]'))return;
     dirty=true;if(el.dataset.rule){changedFields.add(el.dataset.rule);updateFieldState(el);}
+    if(el.matches('[data-task-group]'))updateGroupSummary(el);
+  });
+  window.addEventListener('click',event=>{
+    root.querySelectorAll('.gw-task-group-select[open]').forEach(control=>{if(!control.contains(event.target))control.open=false;});
+  });
+  root.addEventListener('keydown',event=>{
+    const control=event.target.closest('.gw-task-group-select');
+    if(event.key==='Escape'&&control?.open){control.open=false;control.querySelector('summary').focus();event.preventDefault();}
   });
   root.addEventListener('click',async e=>{
+    if(e.target.closest('[data-group-summary]')&&!editable()){e.preventDefault();return;}
     const date=e.target;
     if(date.matches?.('input[type="date"][data-rule="payout_date"]')){
       if(!date.disabled&&!date.readOnly&&typeof date.showPicker==='function'){
