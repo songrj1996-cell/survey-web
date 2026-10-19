@@ -143,6 +143,35 @@ def read_blob(identifier: str) -> bytes:
         return (_root() / "uploads" / f"{_identifier(identifier)}.bin").read_bytes()
 
 
+def archive_task(identifier: str, validate: Callable, metadata: dict) -> None:
+    """Verify an independent recovery copy before making a task inaccessible."""
+    with locked():
+        path = _path("tasks", identifier)
+        document = _read(path)
+        if document is None:
+            raise FileNotFoundError(identifier)
+        validate(document)
+        archive = _root() / "deleted_tasks" / f"{_identifier(identifier)}-v{document['version']}"
+        archive.mkdir(parents=True, exist_ok=True)
+        for upload in document.get("uploads", []):
+            blob_id = _identifier(upload["id"])
+            content = read_blob(blob_id)
+            digest = hashlib.sha256(content).hexdigest()
+            if digest != upload["sha256"]:
+                raise ValueError("原始文件校验失败，任务未删除")
+            backup = archive / f"{blob_id}.bin"
+            with backup.open("wb") as output:
+                output.write(content)
+                output.flush()
+                os.fsync(output.fileno())
+            if hashlib.sha256(backup.read_bytes()).hexdigest() != digest:
+                raise OSError("备份校验失败，任务未删除")
+        _write(archive / "task.json", document)
+        if _read(archive / "task.json") != document:
+            raise OSError("任务备份校验失败，任务未删除")
+        _write(path, {**document, **metadata, "version": document["version"] + 1})
+
+
 @contextmanager
 def runner_lease():
     """Exactly one scheduler process per data directory; never hold the document lock."""

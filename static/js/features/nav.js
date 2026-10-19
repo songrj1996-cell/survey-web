@@ -119,9 +119,10 @@ const rrPanels = [1, 2, 3, 4].map(n => $(`rr-panel-${n}`));
 
 let currentMode = 'survey'; // 'survey' | 'interview' | 'annotate' | 'comment' | 'reward'
 
-async function switchMode(mode) {
-  if (mode !== currentMode && window.rosterHasDraft?.() && !await window.rosterMayLeave()) return;
-  if (mode !== currentMode && window.groupWorkflowHasDraft?.() && !await window.groupWorkflowMayLeave()) return;
+async function switchMode(mode, {home=false}={}) {
+  const leavingPage=mode!==currentMode||home;
+  if (leavingPage && window.rosterHasDraft?.() && !await window.rosterMayLeave()) return;
+  if (leavingPage && window.groupWorkflowHasDraft?.() && !await window.groupWorkflowMayLeave()) return;
   if (window.membersHasDraft?.() && !await window.membersMayLeave()) return;
   if (window.PlatformPermissions && state.feishu.feature_catalog && !PlatformPermissions.allowed(mode)) return;
   if (currentMode === 'survey' && mode !== 'survey' && reportInteractionBusy()) {
@@ -162,23 +163,24 @@ async function switchMode(mode) {
   } else if (isInterview) {
     ivGoStep(ivState.currentStep);
   } else if (isAnnotate) {
-    window.GroupTasks.open();
+    await window.GroupTasks.open({home});
   } else if (isComment) {
     cmGoStep(cmState.currentStep);
   } else if (mode === 'reward') {
-    window.RewardBatches.open();
+    await window.RewardBatches.open({home});
   } else if (mode === 'roster') {
-    window.RosterSources.open();
+    await window.RosterSources.open({home});
   }
+  if(home)document.querySelector('.main').scrollTop=0;
 }
 
 // 一级导航点击
 $('nav-header-survey').addEventListener('click', () => switchMode('survey'));
 $('nav-header-interview').addEventListener('click', () => switchMode('interview'));
-$('nav-header-annotate').addEventListener('click', () => switchMode('annotate'));
+$('nav-header-annotate').addEventListener('click', () => switchMode('annotate',{home:true}));
 $('nav-header-comment').addEventListener('click', () => switchMode('comment'));
-$('nav-header-reward').addEventListener('click', () => switchMode('reward'));
-$('nav-header-roster').addEventListener('click', () => switchMode('roster'));
+$('nav-header-reward').addEventListener('click', () => switchMode('reward',{home:true}));
+$('nav-header-roster').addEventListener('click', () => switchMode('roster',{home:true}));
 
 // 设置入口
 $('nav-header-settings').addEventListener('click', async () => {

@@ -19,6 +19,7 @@ from app.storage import group_workflow as store
 
 LABELS = ("优秀反馈", "有效反馈", "无效反馈")
 ACTIVE_RUNS = {"queued", "running"}
+EDITABLE_SETTINGS = {"name", "payout_date", "base_reward", "excellent_reward", "group_source_id", "group_name"}
 
 
 def now() -> str:
@@ -51,14 +52,16 @@ def load_task(task_id: str, login: dict | None, *, write=False, feature="annotat
         value = store.read("tasks", task_id)
     except ValueError:
         raise HTTPException(404, "任务不存在或无权访问") from None
-    return require_record(value, login, write=write)
+    return require_record(None if value and value.get("deleted_at") else value, login, write=write)
 
 
 def _ensure_version(task: dict, version: int, *, allow_busy=False) -> None:
+    if task.get("deleted_at"):
+        raise HTTPException(404, "任务已删除")
     if task["version"] != version:
         raise HTTPException(409, "任务已更新，请刷新后核对新版本再操作")
     if not allow_busy and (task.get("run") or {}).get("status") in ACTIVE_RUNS:
-        raise HTTPException(409, "本任务正在排队或标注，影响结果的输入已锁定；其他任务仍可操作")
+        raise HTTPException(409, "本任务正在排队或标注，暂时不能修改或删除；其他任务仍可操作")
 
 
 def create_task(rules: TaskRules, login: dict | None) -> dict:
@@ -100,7 +103,7 @@ def _invalidate_model(row: dict) -> None:
             "at": now(), "ai": deepcopy(row.get("ai")), "quality": deepcopy(row.get("quality")),
             "manual_quality": deepcopy(row.get("manual_quality")),
         })
-    for key in ("ai", "quality", "manual_quality", "model_error", "quality_complete", "ai_complete", "confirmed_ai"):
+    for key in ("ai", "quality", "manual_quality", "model_error", "quality_complete", "ai_complete", "confirmed_ai", "ai_reviewed", "ai_decision"):
         row.pop(key, None)
 
 
@@ -124,16 +127,42 @@ def update_rules(task_id, version, rules: TaskRules, login):
     def mutate(task):
         previous = task["rules"]
         updated = _rules_metadata(rules, previous)
-        semantic_change = any(previous.get(key) != updated.get(key) for key in ("announcement", "ai_detect"))
-        if semantic_change:
-            for row in task["feedback"]:
-                _invalidate_model(row)
-            task["ai_confirmation_complete"] = False
+        if rules_locked(task) and any(previous.get(key) != value for key, value in updated.items() if key not in EDITABLE_SETTINGS):
+            raise HTTPException(409, "新建配置已完成，数据校验、重复提交和标注依据不能修改；请新建任务")
         task["rules"] = updated
-        if previous["allow_repeat"] != updated["allow_repeat"]:
-            task["duplicate_decisions"] = {}
-        return {"before": previous, "after": updated, "model_context_changed": semantic_change}
+        task["rules_initialized"] = not rule_issues(task)
+        return {"before": previous, "after": updated, "model_context_changed": False}
     return _change(task_id, login, version, "修改任务规则", mutate)
+
+
+def rules_locked(task):
+    return bool(task.get("rules_initialized") or task.get("uploads") or not rule_issues(task))
+
+
+def annotation_inputs_locked(task):
+    return bool(task.get("run") or task.get("runs") or any(row.get("ai") or row.get("quality") for row in task.get("feedback", [])))
+
+
+def update_settings(task_id, request, login):
+    current = load_task(task_id, login, write=True)
+    values = request.model_dump(mode="json", exclude={"expected_version"})
+    if not values["name"].strip():
+        raise HTTPException(422, "请填写任务名称")
+    return update_rules(task_id, request.expected_version, TaskRules(**{**current["rules"], **values}), login)
+
+
+def delete_task(task_id, version, login):
+    load_task(task_id, login, write=True)
+    def validate(task):
+        require_record(task, login, write=True)
+        _ensure_version(task, version)
+    try:
+        store.archive_task(task_id, validate, {"deleted_at": now(), "deleted_by": owner_identity(login)})
+    except FileNotFoundError:
+        raise HTTPException(409, "任务或原始文件缺失，无法建立完整恢复备份；任务未删除") from None
+    except (ValueError, OSError):
+        raise HTTPException(409, "恢复备份校验未通过，任务未删除，请联系管理员检查存储") from None
+    return {"id": task_id, "deleted": True}
 
 
 def _mapping_guess(headers: list[str]) -> dict:
@@ -148,6 +177,8 @@ def _mapping_guess(headers: list[str]) -> dict:
 def upload_feedback(task_id, version, filename: str, content: bytes, login):
     current = load_task(task_id, login, write=True)
     _ensure_version(current, version)
+    if current.get("uploads"):
+        raise HTTPException(409, "该任务已上传反馈，不能替换原始文件；反馈变动请新建任务")
     if rule_issues(current):
         raise HTTPException(409, {"message": "请先完成任务规则，再上传反馈", "issues": rule_issues(current)})
     if len(content) > config.REWARD_ROSTER_MAX_UPLOAD_BYTES:
@@ -162,6 +193,8 @@ def upload_feedback(task_id, version, filename: str, content: bytes, login):
         raise HTTPException(413, f"反馈数量超过配置上限 {config.GROUP_FEEDBACK_MAX_ROWS}")
     upload_id = uuid.uuid4().hex
     def mutate(task):
+        if task.get("uploads"):
+            raise HTTPException(409, "该任务已上传反馈，反馈变动请新建任务")
         digest = store.save_blob(upload_id, content)
         if task["feedback"]:
             task.setdefault("feedback_versions", []).append({
@@ -206,7 +239,7 @@ async def translate_upload_headers(task_id, version, login):
     return store.mutate("tasks", task_id, save)
 
 
-def set_mapping(task_id, version, mapping: FeedbackMapping, login):
+def set_mapping(task_id, version, mapping: FeedbackMapping, login, annotation_options=None):
     def mutate(task):
         if rule_issues(task) or not task["feedback"]:
             raise HTTPException(409, "请先完成任务规则并上传反馈")
@@ -217,7 +250,13 @@ def set_mapping(task_id, version, mapping: FeedbackMapping, login):
         indexes.extend(values[key] for key in ("count_col", "adv_col") if values[key] is not None)
         if len(indexes) != len(set(indexes)) or any(i < 0 or i >= len(task["headers"]) for i in indexes):
             raise HTTPException(422, "身份、回答、次数和 ADV 列不能重叠，且必须在表头范围内")
-        if task["mapping"] != values:
+        options = annotation_options.model_dump() if annotation_options is not None else None
+        if options is not None and not (options["ai_detect"] or options["quality"]):
+            raise HTTPException(422, "请至少选择一项标注任务")
+        options_changed = options is not None and options != annotation_settings(task)
+        if annotation_inputs_locked(task) and (task["mapping"] != values or options_changed):
+            raise HTTPException(409, "标注已开始，题目列、标注任务和调研背景不能修改；请新建任务")
+        if task["mapping"] != values or options_changed:
             for row in task["feedback"]:
                 _invalidate_model(row)
                 row["corrections"] = {}
@@ -226,6 +265,9 @@ def set_mapping(task_id, version, mapping: FeedbackMapping, login):
             task["roster_snapshot"] = None
             task["roster_error"] = ""
         task["mapping"] = values
+        if options is not None:
+            task["annotation_options"] = options
+            task["rules"]["ai_detect"] = options["ai_detect"]
         return values
     return _change(task_id, login, version, "确认上传列映射", mutate)
 
@@ -361,6 +403,8 @@ def correct_feedback(task_id, response_id, request, login):
     def mutate(task):
         row = _row(task, response_id)
         updates = request.model_dump(exclude_unset=True, exclude={"expected_version", "note"})
+        if {"player_id", "count"} & updates.keys():
+            raise HTTPException(409, "原始反馈和数据校验值不能修改；请修正文件后新建任务")
         updates = {key: value for key, value in updates.items() if value is not None or key == "count"}
         previous = deepcopy(row["corrections"])
         row["corrections"].update(updates)
@@ -384,6 +428,18 @@ def resolve_duplicate(task_id, request, login):
     return _change(task_id, login, request.expected_version, "处理重复反馈", mutate)
 
 
+def quality_result_complete(task: dict, row: dict) -> bool:
+    """A cached done flag cannot stand in for labels on the selected questions."""
+    import annotate
+    result = row.get("quality") or {}
+    columns = (task.get("mapping") or {}).get("open_text_cols") or []
+    labels = result.get("q_labels") or {}
+    return bool(row.get("quality_complete") and columns
+                and annotate.canonical_quality_label(result.get("overall"), overall=True) in LABELS
+                and all(not _cell(row, col) or annotate.canonical_quality_label(labels.get(f"col_{col}")) in LABELS
+                        for col in columns))
+
+
 def effective_result(task: dict, row: dict) -> dict:
     if row.get("excluded"):
         return {"complete": True, "source": "excluded", "label": None, "reason": "重复记录已排除，保留原文供追溯", "base": 0, "excellent": 0}
@@ -394,7 +450,7 @@ def effective_result(task: dict, row: dict) -> dict:
     elif row.get("confirmed_ai"):
         label, reason, source = "无效反馈", "操作者已确认 AI 作答，按无效反馈处理", "human_ai"
     elif not any(issue["kind"] not in ("roster_identity", "adv") for issue in row.get("issues", [])) and gate.get("status") in ("pass", "not_applicable"):
-        if row.get("quality_complete") and (not task["rules"]["ai_detect"] or row.get("ai_complete")):
+        if quality_result_complete(task, row) and (not task["rules"]["ai_detect"] or row.get("ai_complete")):
             judgment = row.get("manual_quality") or row.get("quality") or {}
             label = judgment.get("label") or judgment.get("overall")
             reason = judgment.get("note") or judgment.get("overall_reason") or ""
@@ -412,8 +468,10 @@ def override_quality(task_id, response_id, request, login):
         row = _row(task, response_id)
         if row.get("excluded") or row.get("confirmed_ai") or (row.get("gate") or {}).get("status") == "fail":
             raise HTTPException(409, "请先处理排除、AI 作答确认或数据门槛；不能用质量标签绕过规则")
-        if not row.get("quality_complete"):
+        if not quality_result_complete(task, row):
             raise HTTPException(409, "质量结果尚未完整，请先补齐")
+        if request.column_index is not None:
+            return _review_question(task, row, request, login)
         before = deepcopy(row.get("manual_quality"))
         if request.restore:
             row.pop("manual_quality", None)
@@ -427,6 +485,55 @@ def override_quality(task_id, response_id, request, login):
     return _change(task_id, login, request.expected_version, "人工调整整体质量", mutate)
 
 
+def _review_question(task, row, request, login):
+    """The historical per-question interaction, retaining independent overall judgments."""
+    import annotate
+    column = request.column_index
+    if column not in task["mapping"]["open_text_cols"] or not _cell(row, column):
+        raise HTTPException(422, "只能修改已作答的主观题；未作答题固定为 N/A")
+    result = row["quality"]
+    key = f"col_{column}"
+    labels, reasons = result.setdefault("q_labels", {}), result.setdefault("q_reasons", {})
+    original = labels.get(key)
+    if original not in LABELS:
+        raise HTTPException(409, "当前题标签不完整，请先补齐质量打标")
+    baseline = result.setdefault("quality_review_baseline", {}).setdefault(key, {"label": original, "reason": reasons.get(key, "")})
+    label = baseline["label"] if request.restore else request.label
+    if label not in LABELS:
+        raise HTTPException(422, "请选择有效的逐题质量标签")
+    reviews = result.setdefault("human_reviews", {})
+    labels[key] = label
+    if label == baseline["label"]:
+        reasons[key] = baseline["reason"]
+        reviews.pop(key, None)
+    else:
+        reasons[key] = f"人工复核调整：{baseline['label']} → {label}；AI 原判断：{baseline['reason'] or '未提供判断依据'}"
+        reviews[key] = {"from_label": baseline["label"], "to_label": label, "reviewed_at": now(), **owner_identity(login)}
+    from app.services.annotate_workflow import _is_holistic_quality
+    if _is_holistic_quality(result):
+        if reviews:
+            result["overall_review_note"] = f"人工复核调整{len(reviews)}道题；整体质量保留模型对完整作答的原判断，未重新评估"
+        else:
+            result.pop("overall_review_note", None)
+    else:
+        signals = annotate.detect_low_effort_signals(row["cells"], task["headers"], task["mapping"]["open_text_cols"], task["mapping"]["id_col"], labels, headers_zh=task.get("headers_zh", []))
+        result["overall"], result["overall_reason"] = annotate.calculate_overall_quality(labels, task["mapping"]["open_text_cols"], low_effort=signals)
+    row["reviews"].append({"kind": "question_quality", "column_index": column, "before": original, "after": label, "at": now(), **owner_identity(login)})
+    return {"response_id": row["id"], "column_index": column, "before": original, "after": label}
+
+
+def review_ai(task_id, response_id, request, login):
+    def mutate(task):
+        state = annotation_status(task)
+        if not state["ai_complete"] or response_id not in state["review_ids"]:
+            raise HTTPException(409, "请先补齐 AI 识别结果，再复核候选玩家")
+        row = _row(task, response_id)
+        row["ai_reviewed"], row["ai_decision"] = True, request.is_ai
+        task["ai_confirmation_complete"] = False
+        return {"response_id": response_id, "is_ai": request.is_ai}
+    return _change(task_id, login, request.expected_version, "人工复核 AI 作答", mutate)
+
+
 def confirm_ai(task_id, request, login):
     def mutate(task):
         if readiness_issues(task) or not task["rules"]["ai_detect"]:
@@ -436,6 +543,12 @@ def confirm_ai(task_id, request, login):
         selected = set(request.response_ids)
         if not selected <= ids or any(not row.get("ai_complete") for row in eligible):
             raise HTTPException(409, "AI 作答识别尚有缺项或选择已失效，请先补齐")
+        if task.get("annotation_options"):
+            review_ids = set(annotation_status(task)["review_ids"])
+            if any(not row.get("ai_reviewed") for row in eligible if row["id"] in review_ids):
+                raise HTTPException(409, "请逐位完成人工确认")
+            if selected != {row["id"] for row in eligible if row["id"] in review_ids and row.get("ai_decision")}:
+                raise HTTPException(409, "选择与已保存的人工复核不一致，请刷新后核对")
         for row in eligible:
             before = bool(row.get("confirmed_ai"))
             row["confirmed_ai"] = row["id"] in selected
@@ -471,6 +584,113 @@ def annotation_complete(task: dict) -> bool:
     retained = [row for row in task["feedback"] if not row.get("excluded")]
     needs_ai = task["rules"]["ai_detect"] and any(row.get("gate", {}).get("status") in ("pass", "not_applicable") for row in retained)
     return bool(retained) and all(effective_result(task, row)["complete"] for row in retained) and (not needs_ai or task.get("ai_confirmation_complete", False))
+
+
+def annotation_settings(task):
+    return deepcopy(task.get("annotation_options") or {"ai_detect": task["rules"]["ai_detect"], "quality": True, "background": ""})
+
+
+def reward_source_task(task):
+    """Payout matching belongs to the batch; ignore earlier per-task roster caches."""
+    current = deepcopy(task)
+    current["roster_snapshot"] = None
+    current["roster_error"] = ""
+    _refresh_checks(current)
+    return current
+
+
+def reward_ready(task):
+    current = reward_source_task(task)
+    return (not current.get("deleted_at") and (current.get("run") or {}).get("status") not in ACTIVE_RUNS
+            and annotation_settings(current)["quality"] and not readiness_issues(current) and annotation_complete(current))
+
+
+def annotation_status(task):
+    options = annotation_settings(task)
+    eligible = [row for row in task["feedback"] if not row.get("excluded") and row.get("gate", {}).get("status") in ("pass", "not_applicable")]
+    ai_complete = all(row.get("ai_complete") for row in eligible)
+    review_ids = [row["id"] for row in eligible if row.get("ai_complete") and float((row.get("ai") or {}).get("ai_prob", 0)) >= config.ANNOTATE_AI_REVIEW_THRESHOLD]
+    reviewed_ids = [row["id"] for row in eligible if row["id"] in review_ids and (row.get("ai_reviewed") or task.get("ai_confirmation_complete"))]
+    quality_complete = all(row.get("confirmed_ai") or quality_result_complete(task, row) for row in eligible)
+    ai_confirmed = not eligible or task.get("ai_confirmation_complete", False)
+    complete = not readiness_issues(task) and (not options["ai_detect"] or ai_complete and ai_confirmed) and (not options["quality"] or quality_complete)
+    phase = "columns"
+    if not readiness_issues(task):
+        if options["ai_detect"] and not ai_complete:
+            phase = "ai_progress"
+        elif options["ai_detect"] and not ai_confirmed:
+            phase = "ai_review"
+        elif options["quality"] and not quality_complete:
+            phase = "quality_progress"
+        else:
+            phase = "results"
+    return {"options": options, "phase": phase, "complete": bool(complete), "ai_complete": ai_complete,
+            "quality_complete": quality_complete, "review_ids": review_ids, "reviewed_ids": reviewed_ids,
+            "review_threshold": config.ANNOTATE_AI_REVIEW_THRESHOLD, "high_threshold": config.ANNOTATE_AI_HIGH_THRESHOLD,
+            "total": len(eligible), "ai_done": sum(bool(row.get("ai_complete")) for row in eligible),
+            "quality_total": sum(not row.get("confirmed_ai") for row in eligible),
+            "quality_done": sum(quality_result_complete(task, row) for row in eligible if not row.get("confirmed_ai"))}
+
+
+def annotation_download(task_id, login):
+    """Reuse the annotation exporter with stable response IDs (including repeated players)."""
+    import annotate
+    task = load_task(task_id, login)
+    _refresh_checks(task)
+    status = annotation_status(task)
+    if not status["complete"]:
+        raise HTTPException(409, "结果不完整，下载已被阻断。请返回对应任务重试。")
+    headers = task["headers"]
+    rows = [headers]
+    ai, quality, confirmed = [], [], set()
+    # An additional lookup cell is not part of headers, so it is never exported.
+    for row in task["feedback"]:
+        if row.get("excluded"):
+            continue
+        cells = list(row["cells"][:len(headers)])
+        cells.extend([""] * (len(headers) - len(cells)))
+        rows.append([*cells, row["id"]])
+        if row.get("ai"):
+            ai.append({**deepcopy(row["ai"]), "id": row["id"]})
+        result = deepcopy(row.get("quality") or {})
+        if row.get("manual_quality"):
+            result.update(overall=row["manual_quality"]["label"], overall_reason=row["manual_quality"]["note"])
+        if row.get("gate", {}).get("status") == "fail":
+            result.update(overall="无效反馈", overall_reason=row["gate"]["reason"], q_labels={f"col_{c}": "无效反馈" if _cell(row,c) else "N/A" for c in task["mapping"]["open_text_cols"]})
+        quality.append({**result, "id": row["id"]})
+        if row.get("confirmed_ai"):
+            confirmed.add(row["id"])
+    content = annotate.generate_annotated_excel(rows, headers, ai, confirmed, quality, task["mapping"]["open_text_cols"], len(headers), status["options"])
+    skipped = {index: row for index, row in enumerate((r for r in task["feedback"] if not r.get("excluded")), 2)
+               if row.get("gate", {}).get("status") == "fail"}
+    if skipped:
+        # The legacy exporter has no count-gate concept. Keep originals and explicitly
+        # distinguish rule-skipped cells from missing model output; never invent scores.
+        from io import BytesIO
+        from openpyxl import load_workbook
+        book = load_workbook(BytesIO(content))
+        sheet = book.active
+        columns = {cell.value: cell.column for cell in sheet[1]}
+        for index, row in skipped.items():
+            reason = row["gate"]["reason"]
+            if status["options"]["ai_detect"]:
+                sheet.cell(index, columns["AI作答标签"], "未执行（数据校验未通过）")
+                sheet.cell(index, columns["AI判断原因"], reason)
+                for name in ("AI内容生成概率", "AI润色概率", "AI原文证据", "AI反向证据"):
+                    sheet.cell(index, columns[name]).value = None
+            for column in task["mapping"]["open_text_cols"]:
+                if not _cell(row, column):
+                    continue
+                title = headers[column]
+                sheet.cell(index, columns[f"[{title}]中文翻译"], "未执行（数据校验未通过）")
+                if status["options"]["quality"]:
+                    sheet.cell(index, columns[f"[{title}]质量原因"], reason)
+        output = BytesIO()
+        book.save(output)
+        book.close()
+        content = output.getvalue()
+    from app.services.annotate_workflow import _annotate_download_filename
+    return content, _annotate_download_filename(task["uploads"][-1]["filename"])
 
 
 def stage_complete(task: dict, row: dict, stage: str) -> bool:
@@ -545,6 +765,9 @@ def task_view(task: dict, login, *, summary=False) -> dict:
     result["can_edit"] = task["owner_key"] == owner_identity(login)["owner_key"]
     from app.services.auth import _get_user_permission_levels
     result["can_edit"] = result["can_edit"] and _get_user_permission_levels(login).get("annotate") == "use"
+    result["rules_locked"] = rules_locked(task)
+    result["annotation_inputs_locked"] = annotation_inputs_locked(task)
+    result["reward_ready"] = reward_ready(task)
     for saved_run in [result.get("run"), *result.get("runs", [])]:
         if saved_run:
             saved_run.pop("owner_login", None)
@@ -564,16 +787,24 @@ def task_view(task: dict, login, *, summary=False) -> dict:
         status = "draft"
     elif readiness_issues(task):
         status = "input_issues"
+    elif not annotation_settings(task)["quality"] and annotation_status(task)["complete"]:
+        status = "annotation_done"
     elif task["rules"]["ai_detect"] and not task.get("ai_confirmation_complete") and all(stage_complete(task, row, "ai") for row in retained) and any(row.get("gate", {}).get("status") in ("pass", "not_applicable") for row in retained):
         status = "awaiting_ai_confirmation"
     elif result["summary"]["pending_count"]:
         status = "incomplete" if (run and run.get("stage") != "ai") or any(row.get("quality") for row in retained) else "ready"
-    elif task.get("confirmed_version") == task["version"]:
+    elif result["reward_ready"]:
         status = "confirmed"
     else:
         status = "awaiting_confirmation"
     result["status"] = status
     result["workflow"] = workflow_state(task)
+    result["annotation"] = annotation_status(task)
+    if (result.get("run") or {}).get("stage") == "quality":
+        # Recheck cached progress for display only; never rewrite a saved run on read.
+        complete_ids = {row["id"] for row in task["feedback"] if stage_complete(task, row, "quality")}
+        result["run"]["completed_ids"] = [identifier for identifier in result["run"].get("completed_ids", [])
+                                            if identifier in complete_ids]
     result["annotation_issues"] = readiness_issues(task)
     result["confirmation_issues"] = readiness_issues(task, settlement=True)
     if result.get("roster_snapshot"):
@@ -593,7 +824,7 @@ def task_view(task: dict, login, *, summary=False) -> dict:
 
 def list_tasks(login, *, feature="annotate") -> list[dict]:
     require_permission(login, feature)
-    result = [task_view(task, login, summary=True) for task in store.list_records("tasks") if can_read(task, login)]
+    result = [task_view(task, login, summary=True) for task in store.list_records("tasks") if not task.get("deleted_at") and can_read(task, login)]
     result.sort(key=lambda item: item["created_at"], reverse=True)
     queue = sorted((item for item in store.list_records("tasks") if (item.get("run") or {}).get("status") == "queued"),
                    key=lambda item: (item["run"].get("schedule_at", item["run"]["queued_at"]), item["run"]["id"]))

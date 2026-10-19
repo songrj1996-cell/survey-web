@@ -42,6 +42,8 @@ def start_run(task_id, request, login):
             stage = "ai" if task["rules"]["ai_detect"] and not task.get("ai_confirmation_complete") else "quality"
         if stage == "ai" and not task["rules"]["ai_detect"]:
             raise HTTPException(409, "本任务未启用 AI 作答识别，请进行质量打标")
+        if stage == "quality" and not tasks.annotation_settings(task)["quality"]:
+            raise HTTPException(409, "本任务未选择回答质量打标")
         eligible = [row for row in task["feedback"] if not row.get("excluded") and row.get("gate", {}).get("status") in ("pass", "not_applicable")]
         if stage == "quality" and task["rules"]["ai_detect"] and eligible and (not task.get("ai_confirmation_complete") or any(not row.get("ai_complete") for row in eligible)):
             raise HTTPException(409, "请先完成 AI 作答识别并人工确认，再开始质量打标")
@@ -54,6 +56,7 @@ def start_run(task_id, request, login):
         if not targets:
             raise HTTPException(409, "没有待补齐反馈，已完成结果和人工结论保持不变")
         require_background_llm_api_key(login)
+        task.pop("annotation_auto_error", None)
         if task.get("run"):
             task["runs"].append(deepcopy(task["run"]))
         task["run"] = {"id": uuid.uuid4().hex, "version": task["version"], "stage": stage, "status": "queued",
@@ -241,6 +244,26 @@ async def _run_slice_impl(task_id, slots):
             active["completed_slices"] = active.get("completed_slices", 0) + 1
         # Exclude this diagnostics-only write from save_seconds to avoid recursion.
         store.mutate("tasks", task_id, save_timing)
+        # Match the historical flow: no AI candidates means no manual review step.
+        # Continue a selected quality stage in the durable queue, even if the page closed.
+        latest = store.read("tasks", task_id)
+        if latest.get("annotation_options") and latest["version"] == version and latest["run"]["id"] == run_id and latest["run"]["status"] == "completed" and latest["run"]["stage"] == "ai":
+            state = tasks.annotation_status(latest)
+            if state["ai_complete"] and not state["review_ids"]:
+                def auto_confirm(current):
+                    if current["version"] == version and current["run"]["id"] == run_id:
+                        current["ai_confirmation_complete"] = True
+                        current["updated_at"] = tasks.now()
+                store.mutate("tasks", task_id, auto_confirm)
+                if state["options"]["quality"] and not state["quality_complete"]:
+                    from app.schemas.group_tasks import RunTask
+                    try:
+                        start_run(task_id, RunTask(expected_version=version, stage="quality"), login)
+                    except HTTPException as exc:
+                        def save_next_error(current):
+                            if current["version"] == version:
+                                current["annotation_auto_error"] = str(exc.detail)
+                        store.mutate("tasks", task_id, save_next_error)
 
 
 async def _scheduler():

@@ -28,6 +28,16 @@ class TaskRulesUpdate(BaseModel):
     rules: TaskRules
 
 
+class TaskSettingsUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_version: StrictInt = Field(ge=1)
+    name: str = Field(min_length=1, max_length=200)
+    payout_date: date
+    base_reward: StrictInt = Field(ge=0, le=2147483647)
+    excellent_reward: StrictInt = Field(ge=0, le=2147483647)
+    group_source_id: str = Field(default="", max_length=128)
+
+
 class FeedbackMapping(BaseModel):
     model_config = ConfigDict(extra="forbid")
     id_col: StrictInt = Field(ge=0)
@@ -36,9 +46,17 @@ class FeedbackMapping(BaseModel):
     adv_col: StrictInt | None = Field(default=None, ge=0)
 
 
+class AnnotationOptions(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    ai_detect: StrictBool = True
+    quality: StrictBool = True
+    background: str = Field(default="", max_length=30000)
+
+
 class MappingUpdate(BaseModel):
     expected_version: StrictInt = Field(ge=1)
     mapping: FeedbackMapping
+    annotation_options: AnnotationOptions | None = None
 
 
 class FeedbackCorrection(BaseModel):
@@ -62,6 +80,12 @@ class QualityOverride(BaseModel):
     label: Literal["优秀反馈", "有效反馈", "无效反馈"] | None = None
     restore: StrictBool = False
     note: str = Field(min_length=1, max_length=2000)
+    column_index: StrictInt | None = Field(default=None, ge=0)
+
+
+class AIReviewDecision(BaseModel):
+    expected_version: StrictInt = Field(ge=1)
+    is_ai: StrictBool
 
 
 class ConfirmAI(BaseModel):

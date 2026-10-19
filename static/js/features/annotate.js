@@ -28,13 +28,11 @@ const annState = {
   aiReviewedIds: new Set(),
   aiReviewIndex: 0,
   aiQuestionIndex: 0,
-  aiConfirmLayout: 'split',
   qualityResults: [],
   qualityCount: 0,
   qualityDurationSeconds: null,
   qualityReviewPlayerId: null,
   qualityQuestionIndex: 0,
-  qualityReviewLayout: 'split',
   qualityReviewSaving: false,
   qualityReviewRunning: false,
   reviewFilename: '',
@@ -287,7 +285,6 @@ async function annStartAnnotation() {
     annState.aiReviewedIds = new Set();
     annState.aiReviewIndex = 0;
     annState.aiQuestionIndex = 0;
-    annState.aiConfirmLayout = 'split';
     annState.qualityResults = [];
     annState.qualityCount = 0;
     annState.qualityDurationSeconds = null;
@@ -445,7 +442,6 @@ function annRenderAiConfirm(reviewResults) {
   annState.aiReviewedIds = new Set();
   annState.aiReviewIndex = 0;
   annState.aiQuestionIndex = 0;
-  annSetAiConfirmLayout('split');
   annRenderAiCandidateList();
   annRenderAiProfile();
   annUpdateAiReviewProgress();
@@ -593,14 +589,6 @@ function annGoToAiPlayer(index) {
   annRenderAiProfile();
 }
 
-function annSetAiConfirmLayout(layout) {
-  annState.aiConfirmLayout = layout === 'focus' ? 'focus' : 'split';
-  $('ann-ai-confirm-workspace').classList.toggle('ann-ai-confirm-workspace--focus', annState.aiConfirmLayout === 'focus');
-  $('ann-ai-layout-split').classList.toggle('ann-ai-layout-btn--active', annState.aiConfirmLayout === 'split');
-  $('ann-ai-layout-split').setAttribute('aria-pressed', String(annState.aiConfirmLayout === 'split'));
-  $('ann-ai-layout-focus').classList.toggle('ann-ai-layout-btn--active', annState.aiConfirmLayout === 'focus');
-  $('ann-ai-layout-focus').setAttribute('aria-pressed', String(annState.aiConfirmLayout === 'focus'));
-}
 
 $('ann-ai-candidate-list').addEventListener('click', event => {
   const card = event.target.closest('[data-ann-ai-player-index]');
@@ -629,8 +617,6 @@ $('ann-ai-next-question').addEventListener('click', () => {
 });
 $('ann-ai-mark-normal').addEventListener('click', () => annSetAiDecision('normal'));
 $('ann-ai-mark-ai').addEventListener('click', () => annSetAiDecision('ai'));
-$('ann-ai-layout-split').addEventListener('click', () => annSetAiConfirmLayout('split'));
-$('ann-ai-layout-focus').addEventListener('click', () => annSetAiConfirmLayout('focus'));
 
 $('ann-btn-confirm-ai').addEventListener('click', async () => {
   if (annState.aiReviewedIds.size !== annState.reviewAiResults.length) {
@@ -756,7 +742,6 @@ async function annRunQuality(options = {}) {
         if (!preserveReview) {
           annState.qualityReviewPlayerId = null;
           annState.qualityQuestionIndex = 0;
-          annState.qualityReviewLayout = 'split';
         }
         annState.qualityReviewSaving = false;
         annState.missingQualityIds = missingQIds;
@@ -1182,17 +1167,6 @@ function annRenderQualityProfile(results) {
     </div>`;
 }
 
-function annSetQualityReviewLayout(layout) {
-  annState.qualityReviewLayout = layout === 'focus' ? 'focus' : 'split';
-  $('ann-quality-review-workspace').classList.toggle(
-    'ann-ai-confirm-workspace--focus',
-    annState.qualityReviewLayout === 'focus'
-  );
-  $('ann-quality-layout-split').classList.toggle('ann-ai-layout-btn--active', annState.qualityReviewLayout === 'split');
-  $('ann-quality-layout-split').setAttribute('aria-pressed', String(annState.qualityReviewLayout === 'split'));
-  $('ann-quality-layout-focus').classList.toggle('ann-ai-layout-btn--active', annState.qualityReviewLayout === 'focus');
-  $('ann-quality-layout-focus').setAttribute('aria-pressed', String(annState.qualityReviewLayout === 'focus'));
-}
 
 function annRenderQualityPreview() {
   if (window.AnnotateReview?.render()) return;
@@ -1208,7 +1182,6 @@ function annRenderQualityPreview() {
   annRenderQualitySummary();
   annRenderQualityPlayerList(results);
   annRenderQualityProfile(results);
-  annSetQualityReviewLayout(annState.qualityReviewLayout);
 }
 
 function annGoToQualityPlayer(playerId) {
@@ -1301,8 +1274,6 @@ for (const filterId of [
   });
 }
 
-$('ann-quality-layout-split').addEventListener('click', () => annSetQualityReviewLayout('split'));
-$('ann-quality-layout-focus').addEventListener('click', () => annSetQualityReviewLayout('focus'));
 
 $('ann-btn-quality-complete').addEventListener('click', () => {
   if (annState.qualityReviewRunning || annState.qualityReviewSaving || window.AnnotateReview?.busy()) return;
@@ -1347,13 +1318,11 @@ $('ann-btn-restart').addEventListener('click', () => {
   annState.aiReviewedIds = new Set();
   annState.aiReviewIndex = 0;
   annState.aiQuestionIndex = 0;
-  annState.aiConfirmLayout = 'split';
   annState.qualityResults = [];
   annState.qualityCount = 0;
   annState.qualityDurationSeconds = null;
   annState.qualityReviewPlayerId = null;
   annState.qualityQuestionIndex = 0;
-  annState.qualityReviewLayout = 'split';
   annState.qualityReviewSaving = false;
   annState.missingAiIds = [];
   annState.missingQualityIds = [];

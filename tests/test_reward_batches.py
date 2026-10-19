@@ -11,9 +11,46 @@ from app.storage import group_workflow as store
 
 
 class RewardBatchTests(WorkflowCase):
+    def test_multiple_completed_tasks_settle_together_without_task_roster_confirmation(self):
+        first=self.make_task();second=self.make_task(labels=('有效反馈',))
+        tasks.update_rules(second['id'],second['version'],__import__('app.schemas.group_tasks',fromlist=['TaskRules']).TaskRules(**{**second['rules'],'name':'第二项任务'}),LOGIN)
+        for item in (first,second):
+            store.mutate('tasks',item['id'],lambda t:t.update(roster_snapshot=None,confirmed_version=None))
+        selected={item['id']:store.read('tasks',item['id'])['version'] for item in (first,second)}
+        self.assertTrue(all(item['selectable'] for item in rewards.choices(LOGIN)['tasks']))
+        store.create('sources','group_a',{'id':'group_a','revision':1,'enabled':True})
+        with patch.object(rewards,'read_roster_snapshot',AsyncMock(return_value=snapshot())) as read:
+            preview=asyncio.run(rewards.create_preview(RewardSelection(dates=['2026-10-14'],task_versions=selected),LOGIN))
+            self.assertEqual(read.await_count,1)
+        self.assertTrue(preview['ready']);self.assertEqual(preview['result']['total_diamonds'],600)
+        self.assertEqual(preview['result']['unique_accounts'],1)
+        self.assertEqual(self.generate(preview)['total_diamonds'],600)
+
+    def test_deleted_task_blocks_old_preview_but_keeps_historical_batch_and_claims(self):
+        task,preview,_=self.prepare()
+        tasks.delete_task(task['id'],task['version'],LOGIN)
+        self.assertEqual(rewards.choices(LOGIN)['tasks'],[])
+        with self.assertRaises(HTTPException):self.generate(preview)
+        other,preview,_=self.prepare();batch=self.generate(preview,'history-preservation')
+        tasks.delete_task(other['id'],other['version'],LOGIN)
+        self.assertEqual(rewards.get_batch(batch['id'],LOGIN)['total_diamonds'],500)
+        self.assertEqual(rewards.download_batch(batch['id'],LOGIN)[0],batch['txt_preview'].encode())
+        self.assertIn('task:'+other['id'],rewards._ledger()['claims'])
+
+    def test_note_group_never_limits_final_roster_identity(self):
+        task=self.make_task(labels=('有效反馈',))
+        store.create('sources','notes',{'id':'notes','name':'归属备注','enabled':True})
+        from app.schemas.group_tasks import TaskSettingsUpdate
+        task=tasks.update_settings(task['id'],TaskSettingsUpdate(expected_version=task['version'],name=task['rules']['name'],payout_date='2026-10-14',base_reward=100,excellent_reward=100,group_source_id='notes'),LOGIN)
+        with patch.object(rewards,'read_roster_snapshot',AsyncMock(return_value=snapshot())):
+            preview=asyncio.run(rewards.create_preview(RewardSelection(dates=['2026-10-14'],task_versions={task['id']:task['version']}),LOGIN))
+        self.assertTrue(preview['ready'])
+        self.assertEqual(preview['selected_rows'][0]['identity']['source_id'],'group_a')
+
     def prepare(self):
         task=self.make_task();task=tasks.confirm_task(task["id"],task["version"],LOGIN)
-        store.create("sources","group_a",{"id":"group_a","revision":1,"enabled":True})
+        if not store.read("sources","group_a"):
+            store.create("sources","group_a",{"id":"group_a","name":"实际名单群","revision":1,"enabled":True})
         selection=RewardSelection(dates=["2026-10-14"],task_versions={task["id"]:task["version"]})
         with patch.object(rewards,"read_roster_snapshot",AsyncMock(return_value=snapshot())):
             preview=asyncio.run(rewards.create_preview(selection,LOGIN))

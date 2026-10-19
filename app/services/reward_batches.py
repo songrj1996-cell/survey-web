@@ -25,10 +25,10 @@ def choices(login):
     ledger = _ledger()
     available = []
     for task in store.list_records("tasks"):
-        if can_read(task, login):
+        if not task.get("deleted_at") and can_read(task, login):
             item = tasks.task_view(task, login, summary=True)
             item["consumed"] = ledger["claims"].get("task:" + task["id"])
-            item["selectable"] = (task.get("confirmed_version") == task["version"] and not tasks.readiness_issues(task, settlement=True)
+            item["selectable"] = (tasks.reward_ready(task)
                                   and task["owner_key"] == owner_identity(login)["owner_key"] and not item["consumed"])
             available.append(item)
     others = []
@@ -69,16 +69,17 @@ def _collect_sources(selection, login):
     rows, versions, claims = [], {}, []
     for task_id, version in selection["task_versions"].items():
         task = tasks.load_task(task_id, login, write=True, feature="reward")
-        if task["version"] != version or task.get("confirmed_version") != version or tasks.readiness_issues(task, settlement=True):
-            raise HTTPException(409, "选定任务已更新或尚未确认，请重新选择当前完整版本")
+        if task["version"] != version or not tasks.reward_ready(task):
+            raise HTTPException(409, "选定任务已更新或标注尚未完整，请重新选择当前完整版本")
+        task = tasks.reward_source_task(task)
         if task["rules"]["payout_date"] not in dates:
             raise HTTPException(422, "选定任务的发奖日期不在本次明确选择范围")
-        versions[task_id] = {"version": version, "rules": task["rules"], "confirmed_at": task["confirmed_at"]}
+        versions[task_id] = {"version": version, "rules": task["rules"], "confirmed_at": task.get("confirmed_at")}
         claims.append("task:" + task_id)
         for index, player in enumerate(aggregate_players(task), 1):
             rows.append({"row_id": f"task-{task_id}-{tasks.fingerprint(player['player_id'])[:16]}",
                          "source_kind": "task", "source_key": "task:" + task_id, "task_id": task_id,
-                         "sheet": player["group_name"], "source_id": player["source_id"], "row_number": index,
+                         "sheet": "", "source_id": "", "row_number": index,
                          "date": task["rules"]["payout_date"], "task": task["rules"]["name"], "player_id": player["player_id"],
                          "previous_identity": player["identity"], "response_ids": player["response_ids"],
                          "normal_reward": player["base"], "excellent_reward": player["excellent"], "other_reward": 0,
@@ -157,7 +158,7 @@ def _reconcile(rows, snapshot, identity_choices):
                 return "out_of_group"
             return value
         changed_fields = []
-        if before.get("ori") != ori:
+        if before.get("ori") and before["ori"] != ori:
             changed_fields.append("account")
         if before.get("status") and comparable_status(before["status"]) != comparable_status(identity["status"]):
             changed_fields.append("status")
@@ -289,8 +290,8 @@ async def generate_batch(identifier, request, login):
                 raise HTTPException(409, "此预览使用的表格导入已删除，请重新选择来源")
         for task_id, version in current["selection"]["task_versions"].items():
             task = tasks.load_task(task_id, login, write=True, feature="reward")
-            if task["version"] != version or task.get("confirmed_version") != version or tasks.readiness_issues(task, settlement=True):
-                raise HTTPException(409, "任务确认状态已变化，请重新预览当前版本")
+            if task["version"] != version or not tasks.reward_ready(task):
+                raise HTTPException(409, "任务设置或标注结果已变化，请重新预览当前版本")
         resolved = _resolved({**current, "roster_snapshot": snapshot})
         if not resolved["ready"]:
             raise HTTPException(409, "仍有身份、群内状态或奖励冲突待处理，或本次没有可发放奖励")
@@ -321,7 +322,7 @@ def get_batch(identifier, login):
     differences = []
     for task_id, frozen in batch["task_versions"].items():
         current = store.read("tasks", task_id)
-        if not current or not can_read(current, login) or current["version"] == frozen["version"]:
+        if not current or current.get("deleted_at") or not can_read(current, login) or current["version"] == frozen["version"]:
             continue
         players = aggregate_players(current)
         old_rows = [row for row in batch["source_rows"] if row.get("task_id") == task_id]

@@ -48,13 +48,77 @@ class WorkflowCase(unittest.TestCase):
             task["roster_snapshot"]=snapshot()
             for row,label in zip(task["feedback"],labels):
                 if label:
-                    row.update(quality={"overall":label,"overall_reason":"合成测试的完整判断依据"},quality_complete=True)
+                    row.update(quality={"overall":label,"overall_reason":"合成测试的完整判断依据",
+                                        "q_labels":{"col_1":label}},quality_complete=True)
             tasks._refresh_checks(task)
         store.mutate("tasks",created["id"],seed)
         return store.read("tasks",created["id"])
 
 
 class GroupTaskTests(WorkflowCase):
+    def test_settings_preserve_annotations_and_lock_analysis_rules(self):
+        from app.schemas.group_tasks import TaskSettingsUpdate
+        task=self.make_task(labels=('有效反馈',))
+        task=tasks.override_quality(task['id'],task['feedback'][0]['id'],QualityOverride(expected_version=task['version'],label='优秀反馈',note='人工复核'),LOGIN)
+        store.create('sources','note_only',{'id':'note_only','name':'仅备注群','enabled':True})
+        updated=tasks.update_settings(task['id'],TaskSettingsUpdate(expected_version=task['version'],name='改名',payout_date='2026-11-01',base_reward=150,excellent_reward=80,group_source_id='note_only'),LOGIN)
+        self.assertEqual(updated['feedback'][0]['quality'],task['feedback'][0]['quality'])
+        self.assertEqual(updated['feedback'][0]['manual_quality'],task['feedback'][0]['manual_quality'])
+        self.assertEqual(updated['players'][0]['total'],230)
+        self.assertEqual(updated['players'][0]['source_id'],'group_a')
+        for key,value in [('requires_count',True),('allow_repeat',False),('announcement','改变标注依据'),('ai_detect',True)]:
+            with self.assertRaises(HTTPException):
+                tasks.update_rules(task['id'],updated['version'],TaskRules(**{**updated['rules'],key:value}),LOGIN)
+
+    def test_upload_is_immutable_even_before_model_runs(self):
+        task=self.make_task(labels=(None,))
+        with self.assertRaises(HTTPException):
+            tasks.upload_feedback(task['id'],task['version'],'replacement.csv',b'playerid,answer\np1,new',LOGIN)
+        self.assertEqual(store.read('tasks',task['id']),task)
+        self.assertEqual(len(list((Path(self.tmp.name)/'workflow/uploads').glob('*.bin'))),1)
+
+    def test_delete_backups_are_complete_and_access_is_revoked(self):
+        task=self.make_task()
+        tasks.delete_task(task['id'],task['version'],LOGIN)
+        self.assertNotIn(task['id'],[item['id'] for item in tasks.list_tasks(LOGIN)])
+        with self.assertRaises(HTTPException):tasks.load_task(task['id'],LOGIN)
+        archive=Path(config.GROUP_WORKFLOW_DATA_DIR)/'deleted_tasks'/f"{task['id']}-v{task['version']}"
+        import json
+        self.assertEqual(json.loads((archive/'task.json').read_text(encoding='utf-8')),task)
+        self.assertEqual((archive/f"{task['uploads'][0]['id']}.bin").read_bytes(),store.read_blob(task['uploads'][0]['id']))
+        with self.assertRaises(HTTPException):tasks.update_rules(task['id'],task['version'],TaskRules(**task['rules']),LOGIN)
+
+    def test_delete_refuses_other_owner_busy_stale_and_failed_backup(self):
+        task=self.make_task()
+        for version,login in [(1,LOGIN),(task['version'],{'email':'other@example.test'})]:
+            with self.assertRaises(HTTPException):tasks.delete_task(task['id'],version,login)
+        store.mutate('tasks',task['id'],lambda t:t.update(run={'status':'running'}))
+        with self.assertRaises(HTTPException):tasks.delete_task(task['id'],task['version'],LOGIN)
+        store.mutate('tasks',task['id'],lambda t:t.update(run=None))
+        before=store.read('tasks',task['id'])
+        with patch.object(store,'read_blob',return_value=b'corrupt'):
+            with self.assertRaises(HTTPException):tasks.delete_task(task['id'],task['version'],LOGIN)
+        self.assertEqual(store.read('tasks',task['id']),before)
+
+    def test_settings_http_contract_rejects_extra_fields_and_deletes(self):
+        import httpx
+        from fastapi import FastAPI
+        from app.routers import group_tasks as routes
+        task=self.make_task()
+        app=FastAPI();app.include_router(routes.router)
+        payload={'expected_version':task['version'],'name':'API 设置','payout_date':'2026-10-20','base_reward':50,'excellent_reward':10,'group_source_id':''}
+        async def check():
+            with patch.object(routes,'_current_login',AsyncMock(return_value=LOGIN)):
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://test') as client:
+                    response=await client.put(f"/api/group-tasks/{task['id']}/settings",json={**payload,'requires_count':True})
+                    self.assertEqual(response.status_code,422)
+                    response=await client.put(f"/api/group-tasks/{task['id']}/settings",json=payload)
+                    self.assertEqual(response.status_code,200)
+                    response=await client.request('DELETE',f"/api/group-tasks/{task['id']}",json={'expected_version':response.json()['version']})
+                    self.assertEqual(response.status_code,200)
+                    self.assertEqual((await client.get(f"/api/group-tasks/{task['id']}")).status_code,404)
+        asyncio.run(check())
+
     def test_four_feedback_500_and_version_invalidation(self):
         task=self.make_task()
         view=tasks.confirm_task(task["id"],task["version"],LOGIN)
@@ -128,12 +192,11 @@ class GroupTaskTests(WorkflowCase):
         task=store.read("tasks",task["id"])
         self.assertEqual(len(task["duplicate_groups"]),1)
 
-    def test_count_can_be_cleared_without_becoming_zero(self):
+    def test_original_count_cannot_be_changed_in_existing_task(self):
         task=self.make_task(labels=('有效反馈',),requires_count=True)
-        result=tasks.correct_feedback(task['id'],task['feedback'][0]['id'],FeedbackCorrection(expected_version=task['version'],count=None,note='原始次数无法核实'),LOGIN)
-        self.assertIsNone(result['feedback'][0]['count'])
-        self.assertIsNone(result['feedback'][0]['outcome']['base'])
-        self.assertTrue(result['input_issues'])
+        with self.assertRaises(HTTPException):
+            tasks.correct_feedback(task['id'],task['feedback'][0]['id'],FeedbackCorrection(expected_version=task['version'],count=None,note='原始次数无法核实'),LOGIN)
+        self.assertEqual(store.read('tasks',task['id']),task)
 
     def test_announcement_only_keeps_typed_evidenced_suggestions(self):
         from app.services import task_announcement as announcement
