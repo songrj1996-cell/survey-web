@@ -3,7 +3,7 @@ const assert=require('node:assert/strict');
 const fs=require('node:fs'),path=require('node:path'),vm=require('node:vm');
 const root=path.resolve(__dirname,'..');
 class Element {
-  constructor(tag='div'){this.tag=tag;this.children=[];this.dataset={};this.checked=false;this.indeterminate=false;this.disabled=false;this.style={};this.listeners={};this.value='';this.classList={add(){},remove(){},contains(){return false;}};}
+  constructor(tag='div'){this.tag=tag;this.isConnected=true;this.children=[];this.dataset={};this.checked=false;this.indeterminate=false;this.disabled=false;this.style={};this.listeners={};this.value='';this.classList={add(){},remove(){},toggle(){},contains(){return false;}};}
   append(...items){this.children.push(...items.filter(item=>typeof item!=='string'));}
   replaceChildren(...items){this.children=items;}
   querySelectorAll(selector){const out=[];const walk=node=>{for(const item of node.children){if(selector==='[data-permission]'&&item.dataset.permission||selector==='[data-permission]:checked'&&item.dataset.permission&&item.checked)out.push(item);walk(item);}};walk(this);return out;}
@@ -38,12 +38,12 @@ permissions.tree(editor,[],true);assert.equal(editor.querySelectorAll('[data-per
   panel.querySelector=selector=>{const rule=selector.match(/data-rule="([^"]+)"/);if(rule)return fields.get(rule[1]);const suggestion=selector.match(/data-suggestion="([^"]+)"/);if(suggestion){if(!hints.has(suggestion[1]))hints.set(suggestion[1],new Element());return hints.get(suggestion[1]);}return null;};
   panel.querySelectorAll=()=>[];
   const task={id:'task',rules:{name:'已存名称'},summary:{complete_count:0,feedback_count:0},owner_name:'合成操作者',version:1,status:'draft',can_edit:true};
-  let poll;const requests=[];
-  const ui={window:{addEventListener(){},workflowConfirm:async()=>false,workflowRequest:async(url,options)=>{requests.push({url,options});if(url.endsWith('/announcement'))return{suggestions:{name:{value:'识别名称',evidence:'公告'},base_reward:{value:100,evidence:'100'}},warnings:[]};return task;}},document:{hidden:false,createElement:tag=>new Element(tag)},$,esc:x=>String(x??''),showToast(){},confirm:()=>false,setInterval:fn=>{poll=fn;},PlatformPermissions:permissions,console};
+  let poll;const requests=[];let fetchedTask=task;
+  const ui={window:{addEventListener(){},workflowConfirm:async()=>false,workflowRequest:async(url,options)=>{requests.push({url,options});if(url.endsWith('/announcement'))return{suggestions:{name:{value:'识别名称',evidence:'公告'},base_reward:{value:100,evidence:'100'}},warnings:[]};return fetchedTask;}},document:{hidden:false,createElement:tag=>new Element(tag)},$,esc:x=>String(x??''),showToast(){},confirm:()=>false,setInterval:fn=>{poll=fn;},PlatformPermissions:permissions,console};
   vm.createContext(ui);vm.runInContext(fs.readFileSync(path.join(root,'static/js/features/group-tasks.js'),'utf8'),ui);
   const click=async(action,extra={})=>{const button={dataset:{gw:action,...extra},disabled:false,isConnected:true};await panel.listeners.click({target:{closest:()=>button}});};
   await click('view',{id:'task'});
-  assert.match(panel.innerHTML,/data-step="2" disabled aria-disabled="true"/,'unfinished rules lock later tabs');
+  assert.doesNotMatch(panel.innerHTML,/data-step="[2-6]"/,'unfinished rules expose no later-stage action');
   const draftHtml=panel.innerHTML;
   await click('step',{step:'4'});
   assert.equal(panel.innerHTML,draftHtml,'a direct later-step action is rejected');
@@ -56,6 +56,10 @@ permissions.tree(editor,[],true);assert.equal(editor.querySelectorAll('[data-per
   assert.equal(fields.get('base_reward').value,'100','unchanged fields receive suggestions');
   assert.equal(hints.get('name').children[0].textContent,'采用识别值','manual adoption remains explicit');
   const before=panel.innerHTML;await poll();assert.equal(panel.innerHTML,before,'polling never replaces an unsaved form');
+  fetchedTask={...task,updated_at:'2026-10-16T08:00:00Z'};
+  $('gw-update-hint').hidden=true;
+  await poll();assert.equal($('gw-update-hint').hidden,true,'same-version background updates do not raise a false result banner');
+  assert.equal(panel.innerHTML,before,'background timestamps do not replace unsaved inputs');
   assert.equal(await ui.window.groupWorkflowMayLeave(),false,'declining leave keeps the current draft');
   hints.get('name').children[0].onclick();assert.equal(name.value,'识别名称');
   console.log('Group workflow UI contracts passed: permissions, parent tri-state, empty defaults, structured errors, announcement draft protection, polling and leave protection.');

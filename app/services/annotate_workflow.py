@@ -5,6 +5,8 @@
 纯标注算法在 annotate 模块;HTTP 参数解析与响应包装在 routers/annotate。
 """
 import asyncio
+from contextlib import contextmanager
+from contextvars import ContextVar
 from copy import deepcopy
 import json
 import re
@@ -60,6 +62,20 @@ from app.storage.prompts import (
 # 标注会话用内存(生命周期短,不跨请求长期保活)
 annotate_sessions: dict[str, dict] = {}
 _ANNOTATE_SSE_HEARTBEAT_SECONDS = 15
+_ANNOTATE_LOG_AREA: ContextVar[str] = ContextVar(
+    "annotate_log_area",
+    default="数据标注",
+)
+
+
+@contextmanager
+def bind_annotate_log_area(area: str):
+    """Temporarily identify which user-facing workflow owns annotation logs."""
+    token = _ANNOTATE_LOG_AREA.set(str(area or "数据标注"))
+    try:
+        yield
+    finally:
+        _ANNOTATE_LOG_AREA.reset(token)
 
 
 def _annotate_model_chain(
@@ -570,7 +586,7 @@ def _annotate_ai_log(message: str, **fields) -> None:
         normalized["input_chars"] = normalized.pop("query_len")
     if "pass_name" in normalized:
         normalized["translation_round"] = normalized.pop("pass_name")
-    runtime_log("数据标注", level, readable, **normalized)
+    runtime_log(_ANNOTATE_LOG_AREA.get(), level, readable, **normalized)
 
 
 def get_annotate_session(sid: str) -> dict:
@@ -2580,7 +2596,10 @@ async def annotate_group_feedback(task: dict, feedback: dict, checkpoint) -> Non
     row.extend([""] * (id_col - len(row)))
     row.append(feedback["id"])
     sid = task["id"]
-    background = task["rules"].get("announcement", "")
+    # The optional research context belongs only to AI authorship detection.
+    # Legacy tasks retain their original announcement context.
+    background = (task.get("annotation_options") or {}).get("background", task["rules"].get("announcement", ""))
+    quality_background = task["rules"].get("announcement", "")
     current = deepcopy(feedback)
     stage = (task.get("run") or {}).get("stage", "quality" if not task["rules"]["ai_detect"] or task.get("ai_confirmation_complete") else "ai")
     if stage == "quality" and task["rules"]["ai_detect"] and not task.get("ai_confirmation_complete"):
@@ -2607,7 +2626,8 @@ async def annotate_group_feedback(task: dict, feedback: dict, checkpoint) -> Non
         current.update(update)
     if stage == "ai" or current.get("confirmed_ai"):
         return
-    if not current.get("quality_complete"):
+    from app.services.group_tasks import quality_result_complete
+    if not quality_result_complete(task, current):
         if not _has_open_text(row, columns):
             result, missing, error = _empty_quality_result(row, id_col, columns), set(), ""
         else:
@@ -2617,7 +2637,7 @@ async def annotate_group_feedback(task: dict, feedback: dict, checkpoint) -> Non
                 seed["translations"] = {**current["ai"].get("translations", {}), **seed.get("translations", {})}
             _, retained, missing, error = await _run_one_quality_batch_strict(
                 sid, 1, [row], headers, columns, id_col, not task["rules"]["ai_detect"],
-                existing_results=[seed], background=background,
+                existing_results=[seed], background=quality_background,
                 on_progress=lambda results: checkpoint({"quality": deepcopy(results[0]), "quality_complete": False}),
             )
             result = retained[0] if retained else seed

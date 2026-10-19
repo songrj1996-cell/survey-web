@@ -11,7 +11,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Roboto+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/style.css?v=68" />
+  <link rel="stylesheet" href="/static/style.css?v=73" />
   <link rel="stylesheet" href="/static/questionnaire-sources.css?v=1" />
   <link rel="stylesheet" href="/static/report-quick.css?v=11" />
   <link rel="stylesheet" href="/static/survey-entry.css?v=8" />
@@ -1308,10 +1308,6 @@
             <h1 class="panel__title">AI 作答识别结果确认</h1>
             <p class="panel__desc" id="ann-confirm-desc">先看候选人风险概览，再进入玩家档案逐题确认</p>
           </div>
-          <div class="ann-ai-layout-switch" role="group" aria-label="审阅布局">
-            <button class="ann-ai-layout-btn ann-ai-layout-btn--active" id="ann-ai-layout-split" type="button">分栏档案</button>
-            <button class="ann-ai-layout-btn" id="ann-ai-layout-focus" type="button">专注审阅</button>
-          </div>
         </div>
         <div class="ann-ai-confirm-summary">
           <div class="ann-ai-summary-stat"><span>待复核</span><strong id="ann-ai-review-total">0 位玩家</strong></div>
@@ -1495,10 +1491,6 @@
                   </select>
                 </label>
                 <span class="ann-quality-filter-count" id="ann-quality-filter-count"></span>
-              </div>
-              <div class="ann-ai-layout-switch" role="group" aria-label="质量结果审阅布局">
-                <button class="ann-ai-layout-btn ann-ai-layout-btn--active" id="ann-quality-layout-split" type="button">分栏档案</button>
-                <button class="ann-ai-layout-btn" id="ann-quality-layout-focus" type="button">专注审阅</button>
               </div>
             </div>
             <div class="ann-quality-summary-grid" id="ann-quality-summary-grid" aria-live="polite"></div>
@@ -2197,12 +2189,12 @@
   <script src="/static/js/features/interview.js?v=10"></script>
   <script src="/static/js/features/interview-v2.js?v=7"></script>
   <script src="/static/js/features/reward-roster.js?v=4"></script>
-  <script src="/static/js/features/group-tasks.js?v=6"></script>
-  <script src="/static/js/features/roster-sources.js?v=5"></script>
-  <script src="/static/js/features/reward-batches.js?v=5"></script>
-  <script src="/static/js/features/nav.js?v=43"></script>
+  <script src="/static/js/features/group-tasks.js?v=13"></script>
+  <script src="/static/js/features/roster-sources.js?v=7"></script>
+  <script src="/static/js/features/reward-batches.js?v=8"></script>
+  <script src="/static/js/features/nav.js?v=44"></script>
   <script src="/static/js/features/comment.js?v=29"></script>
-<script src="/static/js/features/annotate.js?v=45"></script>
+<script src="/static/js/features/annotate.js?v=46"></script>
 <script src="/static/js/features/annotate_review.js?v=3"></script>
 </body>
 

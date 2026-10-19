@@ -196,6 +196,58 @@ class RuntimeLoggingTests(unittest.TestCase):
                         self.assertIn("/api/admin/users/<成员>", rendered)
                         self.assertNotIn("member%40example.com", rendered)
 
+    def test_quality_and_reward_routes_describe_real_actions(self):
+        formatter = runtime_logging.HumanAccessFormatter()
+        cases = (
+            ("GET", "/api/group-tasks", "[群组质量标注]", "读取质量标注任务列表完成"),
+            ("POST", "/api/group-tasks", "[群组质量标注]", "新建质量标注任务完成"),
+            ("POST", "/api/group-tasks/announcement", "[群组质量标注]", "识别任务公告完成"),
+            ("GET", "/api/group-tasks/groups", "[群组质量标注]", "读取可选群组完成"),
+            ("GET", "/api/group-tasks/task-1", "[群组质量标注]", "读取质量标注任务状态完成"),
+            ("PUT", "/api/group-tasks/task-1/rules", "[群组质量标注]", "保存任务规则完成"),
+            ("POST", "/api/group-tasks/task-1/upload", "[群组质量标注]", "上传反馈数据完成"),
+            ("PUT", "/api/group-tasks/task-1/settings", "[群组质量标注]", "保存任务设置完成"),
+            ("DELETE", "/api/group-tasks/task-1", "[群组质量标注]", "删除质量标注任务完成"),
+            ("POST", "/api/group-tasks/task-1/translate-headers", "[群组质量标注]", "翻译反馈表头完成"),
+            ("PUT", "/api/group-tasks/task-1/mapping", "[群组质量标注]", "确认反馈列与标注设置完成"),
+            ("POST", "/api/group-tasks/task-1/roster", "[群组质量标注]", "读取最新玩家名单完成"),
+            ("PUT", "/api/group-tasks/task-1/feedback/row-1", "[群组质量标注]", "修正一条反馈完成"),
+            ("POST", "/api/group-tasks/task-1/duplicates", "[群组质量标注]", "处理重复反馈完成"),
+            ("POST", "/api/group-tasks/task-1/run", "[群组质量标注]", "启动后台质量标注完成"),
+            ("PUT", "/api/group-tasks/task-1/feedback/row-1/quality", "[群组质量标注]", "保存人工质量复核完成"),
+            ("POST", "/api/group-tasks/task-1/confirm-ai", "[群组质量标注]", "确认 AI 作答识别结果完成"),
+            ("PUT", "/api/group-tasks/task-1/feedback/row-1/ai-review", "[群组质量标注]", "保存 AI 作答人工复核完成"),
+            ("GET", "/api/group-tasks/task-1/annotation-download", "[群组质量标注]", "下载质量标注结果完成"),
+            ("PUT", "/api/group-tasks/task-1/player-adv", "[群组质量标注]", "保存玩家 ADV 信息完成"),
+            ("POST", "/api/group-tasks/task-1/confirm", "[群组质量标注]", "确认任务结果并允许结算完成"),
+            ("GET", "/api/group-tasks/task-1/clipboard?version=7", "[群组质量标注]", "生成任务记录复制内容完成"),
+            ("GET", "/api/reward-batches/choices", "[奖励整理]", "读取可发奖来源完成"),
+            ("POST", "/api/reward-batches/other-rewards", "[奖励整理]", "新增其他奖励完成"),
+            ("DELETE", "/api/reward-batches/imports/import-1", "[奖励整理]", "删除导入的奖励来源完成"),
+            ("POST", "/api/reward-batches/previews", "[奖励整理]", "生成奖励核对预览完成"),
+            ("GET", "/api/reward-batches/previews/preview-1", "[奖励整理]", "读取奖励核对预览完成"),
+            ("PUT", "/api/reward-batches/previews/preview-1", "[奖励整理]", "保存奖励冲突处理结果完成"),
+            ("POST", "/api/reward-batches/previews/preview-1/generate", "[奖励整理]", "确认并保存发奖批次完成"),
+            ("GET", "/api/reward-batches/batch-1", "[奖励整理]", "查看已保存的发奖批次完成"),
+            ("GET", "/api/reward-batches/batch-1/download", "[奖励整理]", "导出发奖 TXT 文件完成"),
+        )
+        with patch.object(runtime_logging, "_timestamp", return_value="TIME"):
+            for method, path, area, phrase in cases:
+                with self.subTest(method=method, path=path):
+                    record = logging.LogRecord(
+                        "uvicorn.access",
+                        logging.INFO,
+                        "",
+                        0,
+                        '%s - "%s %s HTTP/%s" %d',
+                        ("127.0.0.1:50000", method, path, "1.1", 200),
+                        None,
+                    )
+                    rendered = formatter.format(record)
+                    self.assertIn(area, rendered)
+                    self.assertIn(phrase, rendered)
+                    self.assertNotIn("处理系统请求", rendered)
+
     def test_successful_static_resources_are_hidden_but_failures_remain(self):
         access_filter = runtime_logging.SuccessfulStaticAccessFilter()
         for status, expected in ((200, False), (304, False), (404, True), (500, True)):
@@ -207,6 +259,29 @@ class RuntimeLoggingTests(unittest.TestCase):
                     0,
                     '%s - "%s %s HTTP/%s" %d',
                     ("127.0.0.1:50000", "GET", "/static/style.css?v=59", "1.1", status),
+                    None,
+                )
+                self.assertIs(access_filter.filter(record), expected)
+
+    def test_successful_group_task_polling_is_hidden_but_failures_and_writes_remain(self):
+        access_filter = runtime_logging.SuccessfulStaticAccessFilter()
+        task_id = "3eff1a085dcb480dae6b555c9a9b92fc"
+        cases = (
+            ("GET", "/api/group-tasks", 200, False),
+            ("GET", f"/api/group-tasks/{task_id}", 200, False),
+            ("GET", f"/api/group-tasks/{task_id}", 500, True),
+            ("GET", "/api/group-tasks/groups", 200, True),
+            ("PUT", "/api/group-tasks/task-1/settings", 200, True),
+        )
+        for method, path, status, expected in cases:
+            with self.subTest(method=method, path=path, status=status):
+                record = logging.LogRecord(
+                    "uvicorn.access",
+                    logging.INFO,
+                    "",
+                    0,
+                    '%s - "%s %s HTTP/%s" %d',
+                    ("127.0.0.1:50000", method, path, "1.1", status),
                     None,
                 )
                 self.assertIs(access_filter.filter(record), expected)

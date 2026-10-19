@@ -1,8 +1,9 @@
 """HTTP boundary for the persistent quality workflow."""
-from fastapi import APIRouter, File, Form, Request, UploadFile, HTTPException
+from fastapi import APIRouter, File, Form, Request, UploadFile, HTTPException, Response
+from urllib.parse import quote
 
-from app.schemas.group_tasks import (AnnouncementRequest, ConfirmAI, DuplicateDecision, FeedbackCorrection, MappingUpdate,
-                                    PlayerADVDecision, QualityOverride, RunTask, TaskCreate, TaskRulesUpdate, VersionRequest)
+from app.schemas.group_tasks import (AIReviewDecision, AnnouncementRequest, ConfirmAI, DuplicateDecision, FeedbackCorrection, MappingUpdate,
+                                    PlayerADVDecision, QualityOverride, RunTask, TaskCreate, TaskRulesUpdate, TaskSettingsUpdate, VersionRequest)
 from app.services.auth import _current_login
 from app.services import group_tasks as service
 from app.services.group_task_runner import prepare_run
@@ -52,6 +53,16 @@ async def upload(task_id: str, request: Request, expected_version: int = Form(..
     return await _translate_columns(request, task_id, result["version"], login, result)
 
 
+@router.put("/{task_id}/settings")
+async def settings(task_id: str, body: TaskSettingsUpdate, request: Request):
+    return service.update_settings(task_id, body, await _current_login(request))
+
+
+@router.delete("/{task_id}")
+async def delete_task(task_id: str, body: VersionRequest, request: Request):
+    return service.delete_task(task_id, body.expected_version, await _current_login(request))
+
+
 async def _translate_columns(request, task_id, version, login, fallback=None):
     try:
         key = await require_request_llm_api_key(request)
@@ -73,7 +84,7 @@ async def translate_headers(task_id: str, body: VersionRequest, request: Request
 
 @router.put("/{task_id}/mapping")
 async def mapping(task_id: str, body: MappingUpdate, request: Request):
-    return service.set_mapping(task_id, body.expected_version, body.mapping, await _current_login(request))
+    return service.set_mapping(task_id, body.expected_version, body.mapping, await _current_login(request), body.annotation_options)
 
 
 @router.post("/{task_id}/roster")
@@ -104,6 +115,18 @@ async def quality(task_id: str, response_id: str, body: QualityOverride, request
 @router.post("/{task_id}/confirm-ai")
 async def confirm_ai(task_id: str, body: ConfirmAI, request: Request):
     return service.confirm_ai(task_id, body, await _current_login(request))
+
+
+@router.put("/{task_id}/feedback/{response_id}/ai-review")
+async def ai_review(task_id: str, response_id: str, body: AIReviewDecision, request: Request):
+    return service.review_ai(task_id, response_id, body, await _current_login(request))
+
+
+@router.get("/{task_id}/annotation-download")
+async def annotation_download(task_id: str, request: Request):
+    content, filename = service.annotation_download(task_id, await _current_login(request))
+    return Response(content, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": "attachment; filename*=UTF-8''" + quote(filename)})
 
 
 @router.put("/{task_id}/player-adv")

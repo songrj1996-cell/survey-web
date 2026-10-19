@@ -318,6 +318,60 @@ def _http_action(method: str, raw_path: str) -> tuple[str, str]:
         return "历史记录", "操作历史记录"
     if path.startswith("/api/annotate"):
         return "数据标注", "处理数据标注任务"
+    if path == "/api/group-tasks":
+        return "群组质量标注", {
+            "GET": "读取质量标注任务列表",
+            "POST": "新建质量标注任务",
+        }.get(method, "管理质量标注任务")
+    if path == "/api/group-tasks/announcement":
+        return "群组质量标注", "识别任务公告"
+    if path == "/api/group-tasks/groups":
+        return "群组质量标注", "读取可选群组"
+    if re.fullmatch(r"/api/group-tasks/[^/]+", path):
+        return "群组质量标注", {
+            "GET": "读取质量标注任务状态",
+            "DELETE": "删除质量标注任务",
+        }.get(method, "管理质量标注任务")
+    group_task_actions = (
+        (r"/api/group-tasks/[^/]+/rules", "保存任务规则"),
+        (r"/api/group-tasks/[^/]+/upload", "上传反馈数据"),
+        (r"/api/group-tasks/[^/]+/settings", "保存任务设置"),
+        (r"/api/group-tasks/[^/]+/translate-headers", "翻译反馈表头"),
+        (r"/api/group-tasks/[^/]+/mapping", "确认反馈列与标注设置"),
+        (r"/api/group-tasks/[^/]+/roster", "读取最新玩家名单"),
+        (r"/api/group-tasks/[^/]+/feedback/[^/]+", "修正一条反馈"),
+        (r"/api/group-tasks/[^/]+/duplicates", "处理重复反馈"),
+        (r"/api/group-tasks/[^/]+/run", "启动后台质量标注"),
+        (r"/api/group-tasks/[^/]+/feedback/[^/]+/quality", "保存人工质量复核"),
+        (r"/api/group-tasks/[^/]+/confirm-ai", "确认 AI 作答识别结果"),
+        (r"/api/group-tasks/[^/]+/feedback/[^/]+/ai-review", "保存 AI 作答人工复核"),
+        (r"/api/group-tasks/[^/]+/annotation-download", "下载质量标注结果"),
+        (r"/api/group-tasks/[^/]+/player-adv", "保存玩家 ADV 信息"),
+        (r"/api/group-tasks/[^/]+/confirm", "确认任务结果并允许结算"),
+        (r"/api/group-tasks/[^/]+/clipboard", "生成任务记录复制内容"),
+    )
+    for pattern, action in group_task_actions:
+        if re.fullmatch(pattern, path):
+            return "群组质量标注", action
+    if path == "/api/reward-batches/choices":
+        return "奖励整理", "读取可发奖来源"
+    if path == "/api/reward-batches/other-rewards":
+        return "奖励整理", "新增其他奖励"
+    if re.fullmatch(r"/api/reward-batches/imports/[^/]+", path):
+        return "奖励整理", "删除导入的奖励来源"
+    if path == "/api/reward-batches/previews":
+        return "奖励整理", "生成奖励核对预览"
+    if re.fullmatch(r"/api/reward-batches/previews/[^/]+", path):
+        return "奖励整理", {
+            "GET": "读取奖励核对预览",
+            "PUT": "保存奖励冲突处理结果",
+        }.get(method, "处理奖励核对预览")
+    if re.fullmatch(r"/api/reward-batches/previews/[^/]+/generate", path):
+        return "奖励整理", "确认并保存发奖批次"
+    if re.fullmatch(r"/api/reward-batches/[^/]+/download", path):
+        return "奖励整理", "导出发奖 TXT 文件"
+    if re.fullmatch(r"/api/reward-batches/[^/]+", path):
+        return "奖励整理", "查看已保存的发奖批次"
     if method == "GET" and path == "/api/interview/capabilities":
         return "页面自动检查", "检查访谈功能是否开放"
     if path.startswith("/api/interview") or path.startswith("/api/v1/interview"):
@@ -424,14 +478,18 @@ class HumanAccessFormatter(logging.Formatter):
 
 
 class SuccessfulStaticAccessFilter(logging.Filter):
-    """隐藏成功的静态资源访问；失败记录仍交给 formatter 输出。"""
+    """隐藏成功的静态资源和频繁只读轮询；失败记录仍交给 formatter 输出。"""
 
     def filter(self, record: logging.LogRecord) -> bool:
         try:
-            client, _method, raw_path, _http_version, status = record.args[:5]
+            client, method, raw_path, _http_version, status = record.args[:5]
             path = str(raw_path).split("?", 1)[0]
             is_static = path.startswith("/static/") or path == "/favicon.ico"
-            if is_static and 200 <= int(status) < 400:
+            is_group_task_poll = str(method).upper() == "GET" and (
+                path == "/api/group-tasks"
+                or bool(re.fullmatch(r"/api/group-tasks/[0-9a-f]{32}", path))
+            )
+            if (is_static or is_group_task_poll) and 200 <= int(status) < 400:
                 _take_access_operator(client)
                 return False
         except Exception:

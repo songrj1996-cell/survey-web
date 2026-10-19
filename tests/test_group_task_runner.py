@@ -29,7 +29,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase, WorkflowCase):
         called=[]
         async def annotate(current,row,checkpoint):
             called.append(row['id'])
-            checkpoint({'quality':{'overall':'有效反馈','overall_reason':'达到次数门槛'},'quality_complete':True})
+            checkpoint({'quality':{'overall':'有效反馈','overall_reason':'达到次数门槛','q_labels':{'col_1':'有效反馈'}},'quality_complete':True})
         with patch.object(runner,'require_background_llm_api_key',return_value='test-key'),patch.object(runner,'start_llm_usage_task',return_value=None),patch.object(runner,'annotate_group_feedback',annotate):
             runner.start_run(task['id'],RunTask(expected_version=task['version']),LOGIN)
             await runner._run_slice(task['id'],asyncio.Semaphore(2))
@@ -37,6 +37,43 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase, WorkflowCase):
         saved=store.read('tasks',task['id'])
         self.assertEqual(saved['run']['status'],'completed')
         self.assertEqual(saved['run']['target_ids'],called)
+
+    async def test_background_annotation_logs_use_group_workflow_area_only_during_run(self):
+        from app.services import annotate_workflow as annotate
+
+        task = self.make_task(labels=(None,))
+        areas = []
+
+        async def annotate_one(current, row, checkpoint):
+            annotate._annotate_ai_log(
+                "direct model done",
+                task="quality-1-initial",
+                model="test-model",
+                attempt=1,
+            )
+            checkpoint({
+                "quality": {
+                    "overall": "有效反馈",
+                    "overall_reason": "合成验证",
+                    "q_labels": {"col_1": "有效反馈"},
+                },
+                "quality_complete": True,
+            })
+
+        def capture(area, _level, _message, **_fields):
+            areas.append(area)
+
+        with (
+            patch.object(runner, "require_background_llm_api_key", return_value="test-key"),
+            patch.object(runner, "start_llm_usage_task", return_value=None),
+            patch.object(runner, "annotate_group_feedback", annotate_one),
+            patch.object(annotate, "runtime_log", side_effect=capture),
+        ):
+            runner.start_run(task["id"], RunTask(expected_version=task["version"]), LOGIN)
+            await runner._run_slice(task["id"], asyncio.Semaphore(2))
+            annotate._annotate_ai_log("direct model done", task="quality-1-initial")
+
+        self.assertEqual(areas, ["群组质量标注", "数据标注"])
 
     async def test_two_tasks_run_third_queues_and_closing_client_does_not_cancel(self):
         import httpx
@@ -52,7 +89,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase, WorkflowCase):
             started.append(task['id'])
             if len(started)==2:both_running.set()
             await release.wait()
-            checkpoint({'quality':{'overall':'有效反馈','overall_reason':'并行隔离验证'},'quality_complete':True})
+            checkpoint({'quality':{'overall':'有效反馈','overall_reason':'并行隔离验证','q_labels':{'col_1':'有效反馈'}},'quality_complete':True})
         app=FastAPI();app.include_router(routes.router)
         with patch.object(routes,'_current_login',AsyncMock(return_value=LOGIN)),patch.object(roster_sources,'read_roster_snapshot',AsyncMock(return_value=snapshot())),patch.object(runner,'require_background_llm_api_key',return_value='test-key'),patch.object(runner,'start_llm_usage_task',return_value=None),patch.object(runner,'annotate_group_feedback',annotate),patch.object(config,'GROUP_TASK_CONCURRENCY',2):
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://isolated.test') as client:
@@ -79,7 +116,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase, WorkflowCase):
         async def annotate(task,row,checkpoint):
             order.append(task["id"])
             await asyncio.sleep(.005)
-            checkpoint({"quality":{"overall":"有效反馈","overall_reason":"合成验证"},"quality_complete":True})
+            checkpoint({"quality":{"overall":"有效反馈","overall_reason":"合成验证","q_labels":{"col_1":"有效反馈"}},"quality_complete":True})
         tasks=[self.make_task(labels=(None,None)) for _ in range(3)]
         with patch.object(runner,"require_background_llm_api_key",return_value="test-key"),patch.object(runner,"start_llm_usage_task",return_value=None),patch.object(runner,"annotate_group_feedback",annotate),patch.object(config,"GROUP_TASK_CONCURRENCY",1),patch.object(config,"GROUP_TASK_REQUEST_CONCURRENCY",1):
             for task in tasks:
@@ -112,7 +149,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase, WorkflowCase):
         store.mutate("tasks",task["id"],lambda current:current.update(task))
         processed=[]
         async def annotate(t,row,checkpoint):
-            processed.append(row["id"]);checkpoint({"quality":{"overall":"有效反馈","overall_reason":"补齐"},"quality_complete":True})
+            processed.append(row["id"]);checkpoint({"quality":{"overall":"有效反馈","overall_reason":"补齐","q_labels":{"col_1":"有效反馈"}},"quality_complete":True})
         with patch.object(runner,"require_background_llm_api_key",return_value="test-key"),patch.object(runner,"start_llm_usage_task",return_value=None),patch.object(runner,"annotate_group_feedback",annotate):
             runner.start_run(task["id"],RunTask(expected_version=task["version"]),LOGIN)
             await runner._run_slice(task["id"],asyncio.Semaphore(2))

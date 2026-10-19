@@ -13,7 +13,7 @@ from app.core.llm_context import bind_llm_api_key, bind_llm_attempt_observer
 from app.core.llm_limits import AttemptGate, bind_attempt_gate
 from app.core.runtime_logging import bind_runtime_operator, reset_runtime_operator, runtime_operator_from_login
 from app.services import group_tasks as tasks
-from app.services.annotate_workflow import annotate_group_feedback
+from app.services.annotate_workflow import annotate_group_feedback, bind_annotate_log_area
 from app.services.feature_access import require_permission, require_record
 from app.services.llm_credentials import require_background_llm_api_key
 from app.services.llm_usage import start_llm_usage_task
@@ -42,6 +42,8 @@ def start_run(task_id, request, login):
             stage = "ai" if task["rules"]["ai_detect"] and not task.get("ai_confirmation_complete") else "quality"
         if stage == "ai" and not task["rules"]["ai_detect"]:
             raise HTTPException(409, "本任务未启用 AI 作答识别，请进行质量打标")
+        if stage == "quality" and not tasks.annotation_settings(task)["quality"]:
+            raise HTTPException(409, "本任务未选择回答质量打标")
         eligible = [row for row in task["feedback"] if not row.get("excluded") and row.get("gate", {}).get("status") in ("pass", "not_applicable")]
         if stage == "quality" and task["rules"]["ai_detect"] and eligible and (not task.get("ai_confirmation_complete") or any(not row.get("ai_complete") for row in eligible)):
             raise HTTPException(409, "请先完成 AI 作答识别并人工确认，再开始质量打标")
@@ -54,6 +56,7 @@ def start_run(task_id, request, login):
         if not targets:
             raise HTTPException(409, "没有待补齐反馈，已完成结果和人工结论保持不变")
         require_background_llm_api_key(login)
+        task.pop("annotation_auto_error", None)
         if task.get("run"):
             task["runs"].append(deepcopy(task["run"]))
         task["run"] = {"id": uuid.uuid4().hex, "version": task["version"], "stage": stage, "status": "queued",
@@ -200,7 +203,12 @@ async def _run_slice_impl(task_id, slots):
                     if row["id"] not in active["attempted_ids"]:
                         active["attempted_ids"].append(row["id"])
                 measured_mutate("tasks", task_id, finish_row)
-        with bind_llm_api_key(key), bind_llm_attempt_observer(observe), bind_attempt_gate(gate):
+        with (
+            bind_llm_api_key(key),
+            bind_llm_attempt_observer(observe),
+            bind_attempt_gate(gate),
+            bind_annotate_log_area("群组质量标注"),
+        ):
             await asyncio.gather(*(one(row) for row in task["feedback"] if row["id"] in run["inflight_ids"]))
     except asyncio.CancelledError:
         failure = "服务已停止；成功结果已保存，未完成的远端调用状态不确定，重试可能产生重复模型费用"
@@ -241,6 +249,26 @@ async def _run_slice_impl(task_id, slots):
             active["completed_slices"] = active.get("completed_slices", 0) + 1
         # Exclude this diagnostics-only write from save_seconds to avoid recursion.
         store.mutate("tasks", task_id, save_timing)
+        # Match the historical flow: no AI candidates means no manual review step.
+        # Continue a selected quality stage in the durable queue, even if the page closed.
+        latest = store.read("tasks", task_id)
+        if latest.get("annotation_options") and latest["version"] == version and latest["run"]["id"] == run_id and latest["run"]["status"] == "completed" and latest["run"]["stage"] == "ai":
+            state = tasks.annotation_status(latest)
+            if state["ai_complete"] and not state["review_ids"]:
+                def auto_confirm(current):
+                    if current["version"] == version and current["run"]["id"] == run_id:
+                        current["ai_confirmation_complete"] = True
+                        current["updated_at"] = tasks.now()
+                store.mutate("tasks", task_id, auto_confirm)
+                if state["options"]["quality"] and not state["quality_complete"]:
+                    from app.schemas.group_tasks import RunTask
+                    try:
+                        start_run(task_id, RunTask(expected_version=version, stage="quality"), login)
+                    except HTTPException as exc:
+                        def save_next_error(current):
+                            if current["version"] == version:
+                                current["annotation_auto_error"] = str(exc.detail)
+                        store.mutate("tasks", task_id, save_next_error)
 
 
 async def _scheduler():
