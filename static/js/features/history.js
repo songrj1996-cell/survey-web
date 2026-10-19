@@ -60,6 +60,10 @@ async function refreshHistoryEntryAfterGeneration(historyId) {
       && activeVersionNumber(state.historyReport) === selectedVersion
     ) {
       syncReportVersionMeta(state.historyReport, {
+        report_audit: detail.report_audit || null,
+        input_snapshot: detail.input_snapshot || null,
+        report_mode: detail.report_mode,
+        report_status: detail.report_status,
         versions: detail.report_versions || summary?.report_versions || [],
         active_version: detail.active_report_version || detail.active_version || summary?.active_report_version,
         selected_version: selectedVersion,
@@ -392,6 +396,10 @@ async function openHistoryEntry(id) {
     state.historyReport.analystConvId = entry.analyst_conv_id || null;
     state.historyReport.planData = entry.plan || null;
     syncReportVersionMeta(state.historyReport, {
+      report_audit: entry.report_audit || null,
+      input_snapshot: entry.input_snapshot || null,
+      report_mode: entry.report_mode,
+      report_status: entry.report_status,
       versions: entry.report_versions || [],
       active_version: entry.active_report_version || entry.version,
       version: entry.active_report_version || entry.version,

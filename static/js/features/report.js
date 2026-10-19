@@ -436,6 +436,7 @@ function _applyAnalysisProgress(progressState, event) {
   }
 
   const phaseIndex = Number(event.phase_index) || 1;
+  if (event.phase === 'postwrite') return;
   for (const [phase, index] of Object.keys(REPORT_PHASE_LABELS).map((phase, index) => [phase, index + 1])) {
     if (index < phaseIndex && !progressState.phases[phase]) {
       progressState.phases[phase] = 'completed';
@@ -445,6 +446,7 @@ function _applyAnalysisProgress(progressState, event) {
 
 function _reportProgressPercent(progressState) {
   const current = progressState.current || {};
+  if (current.phase === 'postwrite') return ({writer:10, registry:35, meaning:60, quantity:85})[current.stage] || 5;
   if (current.phase === 'quick_statistics') return current.status === 'completed' ? 20 : 5;
   if (current.phase === 'quick_questions') return Math.min(99, 20 + Math.round((Number(current.completed) || 0) / Math.max(1, Number(current.total) || 1) * 79));
   const phaseIndex = Math.max(1, Number(current.phase_index) || 1);
@@ -466,6 +468,7 @@ function _reportProgressPercent(progressState) {
 }
 
 function _renderReportPhaseTrack(progressState) {
+  if (progressState.current?.phase === 'postwrite' && $('report-phase-track')) $('report-phase-track').hidden = true;
   document.querySelectorAll('[data-report-phase]').forEach(element => {
     const phase = element.dataset.reportPhase;
     const status = progressState.phases[phase] || 'pending';
@@ -479,6 +482,7 @@ function _renderReportPhaseTrack(progressState) {
 
 function _reportRemainingText(progressState) {
   const current = progressState.current || {};
+  if (current.phase === 'postwrite') return ({writer:'初稿完成后，登记观点并核对原意与人数。', registry:'登记完成后，核对原意与人数；提示将与初稿一起保存。', meaning:'正在逐批核对原意；随后汇总人数并保存人工复核提示。', quantity:'正在核对人数范围；完成后保存正文和提示。'})[current.stage] || '正在保存核验进度';
   if (current.phase === 'quick_statistics') return '客观题统计完成后，继续总结已选主观题（如有）并保存报告。';
   if (current.phase === 'quick_questions') return '逐题完成后保存；已完成题目会保留，失败题目可单独重试。';
   if (current.phase === 'themes') {
@@ -505,6 +509,12 @@ function _renderReportPreparationSteps(element, progressState) {
   if (remaining) remaining.textContent = _reportRemainingText(progressState);
 
   const current = progressState.current;
+  if (current?.phase === 'postwrite') {
+    const message = document.createElement('p');
+    message.textContent = current.message || '正在处理报告';
+    element.append(message);
+    return;
+  }
   if (current?.scope_key != null && !['completed', 'skipped'].includes(current.status)) {
     const currentCard = document.createElement('section');
     currentCard.className = `report-current-task report-current-task--${current.status || 'active'}`;
@@ -715,13 +725,15 @@ function updateReportActionAvailability() {
   if (regenerateBtn) regenerateBtn.disabled = !activeReportId() || busy;
   document.querySelectorAll('[data-report-export], [data-export-format-trigger]').forEach(button => { button.disabled = busy; });
   document.querySelectorAll('[data-quick-retry-failed]').forEach(button => { button.disabled = reportInteractionBusy(); });
+  document.querySelectorAll('[data-postwrite-action]').forEach(button => { button.disabled = busy || activeReportCtx()?.canEdit === false; });
   const exportDropdown = $('btn-export-dropdown');
   if (exportDropdown) exportDropdown.disabled = busy;
   const partialRerunBtn = $('btn-report-partial-rerun');
   if (partialRerunBtn) {
     const quick = activeReportCtx()?.reportStyle === 'quick';
-    partialRerunBtn.disabled = !activeReportId() || busy || quick;
-    partialRerunBtn.title = quick ? '快速报告暂不支持按 Part 局部重做' : '';
+    const postwrite = !!activeReportCtx()?.reportAudit;
+    partialRerunBtn.disabled = !activeReportId() || busy || quick || postwrite;
+    partialRerunBtn.title = postwrite ? '此版本可整份重写或继续未完成核验，暂不支持按章节重做' : (quick ? '快速报告暂不支持按 Part 局部重做' : '');
   }
   const validationBtn = $('btn-comparison-validation');
   if (validationBtn) validationBtn.disabled = !activeReportId() || busy;
@@ -769,6 +781,7 @@ function syncReportVersionMeta(target, meta = {}) {
   const snapshotMetaKey = `${target.id || state.sessionId}:${target.selectedVersion}`;
   const sameSnapshot = target.snapshotMetaKey === snapshotMetaKey;
   target.quickSummary = Object.prototype.hasOwnProperty.call(meta, 'quick_summary') ? meta.quick_summary : (sameSnapshot ? target.quickSummary : null);
+  target.reportAudit = Object.prototype.hasOwnProperty.call(meta, 'report_audit') ? meta.report_audit : (sameSnapshot ? target.reportAudit : null);
   target.inputSnapshot = Object.prototype.hasOwnProperty.call(meta, 'input_snapshot') ? meta.input_snapshot : (sameSnapshot ? target.inputSnapshot : null);
   target.quickOutline = Object.prototype.hasOwnProperty.call(meta, 'quick_outline') ? meta.quick_outline : (sameSnapshot ? target.quickOutline : null);
   target.snapshotMetaKey = snapshotMetaKey;
@@ -950,12 +963,12 @@ function updateReportVersionUi() {
 }
 
 async function runStats(options = {}) {
-  if (options.retryFailed && typeof retryFailedQuickReport === 'function') return retryFailedQuickReport();
+  if (options.retryFailed && !activeReportCtx()?.reportAudit && typeof retryFailedQuickReport === 'function') return retryFailedQuickReport();
   if (typeof isQuickRetryRunning === 'function' && isQuickRetryRunning()) return;
   if (state.sessionReport.running) return;
   const viewedReport = activeReportCtx();
   if (options.regenerate && viewedReport.reportMode === 'quick' && !await ensureQuickRegenerationAllowed()) return false;
-  const returnToReport = options.regenerate && viewedReport.reportMode === 'quick'
+  const returnToReport = (options.regenerate || options.retryFailed) && (viewedReport.reportMode === 'quick' || viewedReport.reportAudit)
     ? {viewMode:state.viewMode, historyId:state.historyId, sessionId:state.sessionId, reportMode:state.reportMode,
        sessionReport:JSON.parse(JSON.stringify(state.sessionReport)), historyReport:state.historyReport} : null;
   const generationMode = options.quick ? 'quick' : ((options.regenerate || options.retryFailed) ? viewedReport.reportMode : state.reportMode);
@@ -1979,12 +1992,91 @@ function renderComparisonValidation(validation) {
   }
 }
 
+function renderPostwriteAudit(ctx = activeReportCtx()) {
+  const panel = $('report-postwrite-audit');
+  if (!panel) return;
+  panel.replaceChildren();
+  const audit = ctx?.reportAudit;
+  panel.hidden = !audit;
+  if (!audit) return;
+  const node = (tag, text, parent = panel) => {
+    const el = document.createElement(tag);
+    el.textContent = text;
+    parent.appendChild(el);
+    return el;
+  };
+  node('h3', audit.status === 'complete' ? (audit.has_ambiguity ? '核验已完成 · 含歧义待人工确认' : '三项核验已完成 · 待人工审阅') : '核验尚未完成 · 初稿已保留');
+  if (audit.registration_status) node('p', audit.registration_status === 'complete'
+    ? '观点登记已完成；登记完成不代表原意和人数核验通过。' : '观点登记尚未完成。');
+  node('p', `已核验 ${audit.checked_claims || 0}/${audit.registered_claims || 0} 条登记观点。仅核来源、原意及人数范围，提示不会自动改写正文。`);
+  if (audit.counts_reviewed != null) node('p', `人数任务：已检查 ${audit.counts_reviewed}/${(audit.counts || []).length} 项 · 人数确定 ${audit.counts_exact || 0} 项 · 有歧义 ${audit.counts_ambiguous || 0} 项 · 尚未核验 ${audit.counts_unreviewed || 0} 项。`);
+  if (audit.stop_reason) node('p', `停止原因：${audit.stop_reason}`);
+  (audit.registration_errors || []).forEach(message => node('p', `登记缺项：${message}`));
+  (audit.verification_notes || []).forEach(message => node('p', `登记时待核验提示：${message}`));
+  (audit.registration_notes || []).forEach(message => node('p', `登记说明：${message}`));
+  const usage = audit.usage;
+  if (usage) node('p', `${usage.requests || 0} 次调用 · ${usage.tokens || 0} tokens${usage.usage_complete ? '' : '（用量记录不完整）'} · 模型等待 ${usage.model_seconds || 0} 秒`);
+  if (ctx.canEdit !== false && window.PlatformPermissions?.canUse('survey') !== false) {
+    const addAction = (text, retryFailed) => {
+      const button = node('button', text);
+      button.type = 'button';
+      button.className = 'btn btn--ghost';
+      button.dataset.postwriteAction = retryFailed ? 'resume' : 'regenerate';
+      button.disabled = reportInteractionBusy() || ctx.versions?.length >= ctx.maxVersions;
+      button.onclick = () => {
+        if (reportInteractionBusy()) return;
+        return runStats({retryFailed, regenerate: !retryFailed, baseVersion: activeVersionNumber(ctx),
+          ...(state.viewMode === 'history' ? {historyId: ctx.id} : {})});
+      };
+    };
+    if (audit.status !== 'complete') addAction('继续未完成核验（生成新版本）', true);
+    addAction('重新生成整份报告', false);
+  }
+  const labels = {supported: '原文支持', inference: '合理解释', advice: '建议', issue: '请人工复核', uncertain: '存在歧义'};
+  for (const check of audit.checks || []) {
+    const detail = node('details', '');
+    node('summary', `${check.id} · ${labels[check.verdict] || '尚未完成'} · ${check.original || ''}`, detail);
+    node('p', check.reason || '', detail);
+    for (const source of check.sources || []) {
+      const original = source.source || {};
+      const question = typeof original.question === 'object' ? (original.question.translation || original.question.original) : original.question;
+      node('strong', `${source.ref} · ${original.player || ''} · ${question || ''}`, detail);
+      node('blockquote', original.original || '', detail);
+      node('p', `核验释义：${source.meaning || '客观统计无需逐人解释'}；${source.part || ''}`, detail);
+    }
+    for (const issue of check.citation_issues || []) node('p', `引用提示：${issue.reason || ''}`, detail);
+    for (const error of check.errors || []) node('p', `未完成：${error}`, detail);
+    if (check.repair) node('p', `供人工参考的修改：${check.repair}`, detail);
+  }
+  for (const count of audit.counts || []) {
+    const detail = node('details', '');
+    const reviewed = count.reviewed ?? count.complete;
+    const ambiguous = reviewed && count.review_status === 'ambiguous';
+    const label = !reviewed ? '尚未核验' : (ambiguous
+      ? `已核验但有歧义 · 明确 ${count.count_min} 人，可能 ${count.count_min}—${count.count_max}/${count.denominator} 人`
+      : `人数确定 · ${count.count}/${count.denominator}`);
+    node('summary', `${count.id || '人数核验'} · ${label}`, detail);
+    node('p', count.task?.predicate || '', detail);
+    for (const issue of [...(count.issues || []), ...(count.errors || [])]) node('p', issue, detail);
+    for (const member of count.members || []) {
+      if (member.count === false) continue;
+      if (member.count === null) node('p', `${member.player} · 是否计入有歧义，待人工确认`, detail);
+      for (const source of member.sources || []) {
+        node('p', `${member.player} · ${source.ref} · ${source.source?.question?.translation || source.source?.question?.original || ''}`, detail);
+        node('blockquote', source.source?.original || '', detail);
+        node('p', source.meaning || '', detail);
+      }
+    }
+  }
+}
+
 function renderReportWorkspace(md, { preserveQa = true } = {}) {
   state.reportMd = md;
   if (state.viewMode === 'history') showReportPanelPreservingProgress();
   else goStep(5);
 
   const ctx = activeReportCtx();
+  renderPostwriteAudit(ctx);
   renderComparisonValidation(ctx.comparisonValidation);
   const title = ctx.title || reportTitleFromMarkdown(md);
   $('report-title-display').textContent = title;
