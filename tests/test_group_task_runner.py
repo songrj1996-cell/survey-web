@@ -38,6 +38,43 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase, WorkflowCase):
         self.assertEqual(saved['run']['status'],'completed')
         self.assertEqual(saved['run']['target_ids'],called)
 
+    async def test_background_annotation_logs_use_group_workflow_area_only_during_run(self):
+        from app.services import annotate_workflow as annotate
+
+        task = self.make_task(labels=(None,))
+        areas = []
+
+        async def annotate_one(current, row, checkpoint):
+            annotate._annotate_ai_log(
+                "direct model done",
+                task="quality-1-initial",
+                model="test-model",
+                attempt=1,
+            )
+            checkpoint({
+                "quality": {
+                    "overall": "有效反馈",
+                    "overall_reason": "合成验证",
+                    "q_labels": {"col_1": "有效反馈"},
+                },
+                "quality_complete": True,
+            })
+
+        def capture(area, _level, _message, **_fields):
+            areas.append(area)
+
+        with (
+            patch.object(runner, "require_background_llm_api_key", return_value="test-key"),
+            patch.object(runner, "start_llm_usage_task", return_value=None),
+            patch.object(runner, "annotate_group_feedback", annotate_one),
+            patch.object(annotate, "runtime_log", side_effect=capture),
+        ):
+            runner.start_run(task["id"], RunTask(expected_version=task["version"]), LOGIN)
+            await runner._run_slice(task["id"], asyncio.Semaphore(2))
+            annotate._annotate_ai_log("direct model done", task="quality-1-initial")
+
+        self.assertEqual(areas, ["群组质量标注", "数据标注"])
+
     async def test_two_tasks_run_third_queues_and_closing_client_does_not_cancel(self):
         import httpx
         from fastapi import FastAPI

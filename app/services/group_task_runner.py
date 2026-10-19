@@ -13,7 +13,7 @@ from app.core.llm_context import bind_llm_api_key, bind_llm_attempt_observer
 from app.core.llm_limits import AttemptGate, bind_attempt_gate
 from app.core.runtime_logging import bind_runtime_operator, reset_runtime_operator, runtime_operator_from_login
 from app.services import group_tasks as tasks
-from app.services.annotate_workflow import annotate_group_feedback
+from app.services.annotate_workflow import annotate_group_feedback, bind_annotate_log_area
 from app.services.feature_access import require_permission, require_record
 from app.services.llm_credentials import require_background_llm_api_key
 from app.services.llm_usage import start_llm_usage_task
@@ -203,7 +203,12 @@ async def _run_slice_impl(task_id, slots):
                     if row["id"] not in active["attempted_ids"]:
                         active["attempted_ids"].append(row["id"])
                 measured_mutate("tasks", task_id, finish_row)
-        with bind_llm_api_key(key), bind_llm_attempt_observer(observe), bind_attempt_gate(gate):
+        with (
+            bind_llm_api_key(key),
+            bind_llm_attempt_observer(observe),
+            bind_attempt_gate(gate),
+            bind_annotate_log_area("群组质量标注"),
+        ):
             await asyncio.gather(*(one(row) for row in task["feedback"] if row["id"] in run["inflight_ids"]))
     except asyncio.CancelledError:
         failure = "服务已停止；成功结果已保存，未完成的远端调用状态不确定，重试可能产生重复模型费用"
