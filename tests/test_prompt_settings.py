@@ -25,6 +25,9 @@ from app.storage import ui_texts as ui_text_storage
 
 
 EXPECTED_PROMPT_KEYS = {
+    "postwrite_writer_system",
+    "postwrite_registry_system",
+    "postwrite_auditor_system",
     "task_announcement_system",
     "questionnaire_translation_system",
     "column_detect_system",
@@ -85,11 +88,11 @@ def _sha256(path: str) -> str:
 
 
 class PromptCatalogTests(unittest.TestCase):
-    def test_catalog_has_41_current_non_dify_entries_in_six_groups(self):
+    def test_catalog_has_44_current_non_dify_entries_in_seven_groups(self):
         catalog = prompt_storage.DEFAULT_PROMPTS
 
         self.assertEqual(set(catalog), EXPECTED_PROMPT_KEYS)
-        self.assertEqual(len(catalog), 41)
+        self.assertEqual(len(catalog), 44)
         self.assertNotIn("upload_guide", catalog)
         self.assertNotIn("quick_writer_requirements", catalog)
         self.assertEqual(
@@ -101,6 +104,7 @@ class PromptCatalogTests(unittest.TestCase):
                 "评论分析",
                 "数据标注",
                 "访谈报告",
+                "报告写作与核验",
             },
         )
         for key, entry in catalog.items():

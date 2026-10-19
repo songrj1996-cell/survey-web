@@ -7,6 +7,9 @@ import tempfile
 import threading
 
 from app.core.config import (
+    DEFAULT_POSTWRITE_WRITER,
+    DEFAULT_POSTWRITE_REGISTRY,
+    DEFAULT_POSTWRITE_AUDITOR,
     DEFAULT_ANNOTATE_AI_SYSTEM_PROMPT,
     DEFAULT_TASK_ANNOUNCEMENT_SYSTEM_PROMPT,
     DEFAULT_ANNOTATE_QUALITY_SYSTEM_PROMPT,
@@ -93,6 +96,12 @@ def _prompt(
 
 
 DEFAULT_PROMPTS: dict = {
+    "postwrite_writer_system": _prompt("postwrite_writer_system", "自由写作", "基于完整研究背景、问卷及Python统计写作初稿",
+        group="报告写作与核验", group_order=30, order=1, kind="system", current=DEFAULT_POSTWRITE_WRITER),
+    "postwrite_registry_system": _prompt("postwrite_registry_system", "初稿观点登记", "登记观点、引用和限定题目的计数任务",
+        group="报告写作与核验", group_order=30, order=2, kind="system", current=DEFAULT_POSTWRITE_REGISTRY),
+    "postwrite_auditor_system": _prompt("postwrite_auditor_system", "三项职责核验", "仅核来源真实性、原意支持、人数范围；不自动修改报告",
+        group="报告写作与核验", group_order=30, order=3, kind="system", current=DEFAULT_POSTWRITE_AUDITOR),
     "task_announcement_system": _prompt(
         "task_announcement_system", "任务公告识别 System Prompt",
         "区分数据门槛与体验建议，抽取有据规则；发奖日期始终由操作者确认。",
