@@ -8,6 +8,7 @@ import threading
 
 from app.core.config import (
     DEFAULT_POSTWRITE_WRITER,
+    DEFAULT_POSTWRITE_WRITER_V1,
     DEFAULT_POSTWRITE_REGISTRY,
     DEFAULT_POSTWRITE_AUDITOR,
     DEFAULT_ANNOTATE_AI_SYSTEM_PROMPT,
@@ -97,7 +98,7 @@ def _prompt(
 
 DEFAULT_PROMPTS: dict = {
     "postwrite_writer_system": _prompt("postwrite_writer_system", "自由写作", "基于完整研究背景、问卷及Python统计写作初稿",
-        group="报告写作与核验", group_order=30, order=1, kind="system", current=DEFAULT_POSTWRITE_WRITER),
+        group="报告写作与核验", group_order=30, order=1, kind="system", current=DEFAULT_POSTWRITE_WRITER, version=2),
     "postwrite_registry_system": _prompt("postwrite_registry_system", "初稿观点登记", "登记观点、引用和限定题目的计数任务",
         group="报告写作与核验", group_order=30, order=2, kind="system", current=DEFAULT_POSTWRITE_REGISTRY),
     "postwrite_auditor_system": _prompt("postwrite_auditor_system", "三项职责核验", "仅核来源真实性、原意支持、人数范围；不自动修改报告",
@@ -544,7 +545,10 @@ def _sync_entry(entry: dict, default: dict) -> bool:
     stored_version = _version_number(entry.get("version"))
     default_version = _version_number(default.get("version"))
     if stored_version < default_version:
-        if not entry.get("history"):
+        # The writer upgrade must not replace custom text, even without history.
+        known_writer_default = (default["key"] != "postwrite_writer_system"
+                                or entry["current"] == DEFAULT_POSTWRITE_WRITER_V1)
+        if not entry.get("history") and known_writer_default:
             entry["current"] = default["current"]
         entry["version"] = default_version
         dirty = True

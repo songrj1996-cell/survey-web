@@ -88,6 +88,63 @@ def _sha256(path: str) -> str:
 
 
 class PromptCatalogTests(unittest.TestCase):
+    def test_new_prompt_file_uses_versioned_postwrite_writer(self):
+        with tempfile.TemporaryDirectory(prefix="postwrite-writer-fresh-") as temp_dir:
+            prompt_file = os.path.join(temp_dir, "prompts.json")
+            with patch.object(prompt_storage, "PROMPTS_FILE", prompt_file):
+                current = prompt_storage._get_prompt_text("postwrite_writer_system")
+            persisted = _read_json(prompt_file)
+        self.assertEqual(current, prompt_storage.DEFAULT_POSTWRITE_WRITER)
+        self.assertEqual(persisted["postwrite_writer_system"]["version"], 2)
+
+    def test_postwrite_writer_default_upgrade_is_scoped_and_idempotent(self):
+        for has_version in (True, False):
+            with self.subTest(has_version=has_version):
+                stored = deepcopy(prompt_storage.DEFAULT_PROMPTS)
+                writer = stored["postwrite_writer_system"]
+                writer.update(current=prompt_storage.DEFAULT_POSTWRITE_WRITER_V1, version=1)
+                if not has_version:
+                    writer.pop("version")
+                stored["future_prompt"] = {"current": "leave this custom entry alone"}
+                untouched = {key: value for key, value in stored.items() if key != "postwrite_writer_system"}
+                with tempfile.TemporaryDirectory(prefix="postwrite-writer-upgrade-") as temp_dir:
+                    prompt_file = os.path.join(temp_dir, "prompts.json")
+                    _write_json(prompt_file, stored)
+                    with patch.object(prompt_storage, "PROMPTS_FILE", prompt_file):
+                        first = prompt_storage._load_prompts()
+                        first_hash = _sha256(prompt_file)
+                        second = prompt_storage._load_prompts()
+                    self.assertEqual(first_hash, _sha256(prompt_file))
+                self.assertEqual(first, second)
+                self.assertEqual(first["postwrite_writer_system"]["current"], prompt_storage.DEFAULT_POSTWRITE_WRITER)
+                self.assertEqual(first["postwrite_writer_system"]["version"], 2)
+                self.assertEqual(first["postwrite_writer_system"]["history"], [])
+                self.assertEqual({key: first[key] for key in untouched}, untouched)
+
+    def test_postwrite_writer_upgrade_preserves_custom_or_explicit_history(self):
+        history = [{"ts": "2026-10-01", "content": "previous selection", "note": "manual choice"}]
+        for current, prior_history in (
+            ("CUSTOM_WRITER_WITHOUT_HISTORY", []),
+            ("CUSTOM_WRITER_WITH_HISTORY", history),
+            (prompt_storage.DEFAULT_POSTWRITE_WRITER_V1, history),
+        ):
+            with self.subTest(current=current, history=bool(prior_history)):
+                entry = deepcopy(prompt_storage.DEFAULT_PROMPTS["postwrite_writer_system"])
+                entry.update(current=current, history=deepcopy(prior_history), version=1)
+                with tempfile.TemporaryDirectory(prefix="postwrite-writer-custom-") as temp_dir:
+                    prompt_file = os.path.join(temp_dir, "prompts.json")
+                    _write_json(prompt_file, {"postwrite_writer_system": entry})
+                    with patch.object(prompt_storage, "PROMPTS_FILE", prompt_file):
+                        selected = prompt_storage._get_prompt_text("postwrite_writer_system")
+                        first_hash = _sha256(prompt_file)
+                        again = prompt_storage._get_prompt_text("postwrite_writer_system")
+                    saved = _read_json(prompt_file)["postwrite_writer_system"]
+                    self.assertEqual(first_hash, _sha256(prompt_file))
+                self.assertEqual(selected, current)
+                self.assertEqual(again, current)
+                self.assertEqual(saved["history"], prior_history)
+                self.assertEqual(saved["version"], 2)
+
     def test_catalog_has_44_current_non_dify_entries_in_seven_groups(self):
         catalog = prompt_storage.DEFAULT_PROMPTS
 
