@@ -2,6 +2,13 @@ window.RewardBatches = (() => {
   const root=$('reward-batches-panel'),api=window.workflowRequest,h=value=>esc(String(value??''));
   let data={tasks:[],other_rewards:[],imports:[],groups:[],batches:[]},dates=new Set(),selectedTasks=new Set(),selectedOthers=new Set(),selectedImports=new Set(),preview=null,batch=null,generationKey=null;
   const button=(action,label,primary=false,disabled=false,extra='')=>`<button type="button" class="btn ${primary?'btn--primary':'btn--ghost'}" data-rb="${action}" ${disabled?'disabled':''} ${extra}>${label}</button>`;
+  function createGenerationKey(){
+    if(typeof window.crypto.randomUUID==='function')return window.crypto.randomUUID();
+    // getRandomValues also works on HTTP pages where randomUUID is unavailable.
+    const bytes=new Uint8Array(16);
+    window.crypto.getRandomValues(bytes);
+    return Array.from(bytes,byte=>byte.toString(16).padStart(2,'0')).join('');
+  }
   async function open({home=false}={}){
     if(home){dates.clear();selectedTasks.clear();selectedOthers.clear();selectedImports.clear();preview=null;batch=null;generationKey=null;}
     root.classList.remove('panel--hidden');try{data=await api('/api/reward-batches/choices');render();}catch(e){showToast(e.message,'error');}
@@ -111,7 +118,7 @@ window.RewardBatches = (() => {
         await open();showToast('已删除该表格导入','success');
       }
       if(action==='refresh-preview'){
-        preview=await api('/api/reward-batches/previews',{method:'POST',body:preview.selection});generationKey=crypto.randomUUID();render();
+        preview=await api('/api/reward-batches/previews',{method:'POST',body:preview.selection});generationKey=createGenerationKey();render();
       }
       if(action==='choices'){preview=null;batch=null;generationKey=null;await open();}
       if(action==='import'){root.classList.add('panel--hidden');rrGoStep(rrState.sessionId?2:1);}
@@ -123,18 +130,18 @@ window.RewardBatches = (() => {
       }
       if(action==='preview'){
         const selection={dates:[...dates].sort(),task_versions:Object.fromEntries(data.tasks.filter(t=>t.selectable&&selectedTasks.has(t.id)&&dates.has(t.rules.payout_date)).map(t=>[t.id,t.version])),other_reward_ids:data.other_rewards.filter(r=>r.selectable&&selectedOthers.has(r.id)&&dates.has(r.payout_date)).map(r=>r.id),imported_session_ids:data.imports.filter(i=>selectedImports.has(i.id)&&(i.analysis_request?.reward_dates||[]).some(date=>dates.has(date))).map(i=>i.id)};
-        preview=await api('/api/reward-batches/previews',{method:'POST',body:selection});generationKey=crypto.randomUUID();batch=null;render();
+        preview=await api('/api/reward-batches/previews',{method:'POST',body:selection});generationKey=createGenerationKey();batch=null;render();
       }
       if(action==='resolve'){
         const selections={},identity_choices={...preview.identity_choices};root.querySelectorAll('[data-rb-identity]').forEach(el=>{if(el.value)identity_choices[el.dataset.rbIdentity]=el.value;});
         root.querySelectorAll('[data-conflict]').forEach(group=>{if(group.querySelector('[data-conflict-reviewed]').checked)selections[group.dataset.conflict]=[...group.querySelectorAll('[data-conflict-row]:checked')].map(el=>el.dataset.conflictRow);});
-        preview=await api(`/api/reward-batches/previews/${preview.id}`,{method:'PUT',body:{expected_revision:preview.revision,selections,identity_choices}});generationKey=crypto.randomUUID();render();
+        preview=await api(`/api/reward-batches/previews/${preview.id}`,{method:'PUT',body:{expected_revision:preview.revision,selections,identity_choices}});generationKey=createGenerationKey();render();
       }
-      if(action==='generate'){generationKey ||= crypto.randomUUID();batch=await api(`/api/reward-batches/previews/${preview.id}/generate`,{method:'POST',body:{expected_revision:preview.revision,idempotency_key:generationKey}});preview=null;render();showToast('批次已保存，可下载 TXT','success');}
+      if(action==='generate'){generationKey ||= createGenerationKey();batch=await api(`/api/reward-batches/previews/${preview.id}/generate`,{method:'POST',body:{expected_revision:preview.revision,idempotency_key:generationKey}});preview=null;render();showToast('批次已保存，可下载 TXT','success');}
       if(action==='history'){$('rb-body').innerHTML=`<section class="workflow-card"><h2>发奖批次记录</h2>${data.batches.slice().reverse().map(item=>`<div class="workflow-source-choice"><span>${item.dates.join('、')} · ${item.total_diamonds} 钻<small>${h(item.owner_name)} · ${h(workflowTime(item.created_at))} · ${item.unique_accounts} 个账号</small></span>${button('batch','查看与下载',false,false,`data-id="${item.id}"`)}</div>`).join('')||'<p class="workflow-muted">尚未生成批次。</p>'}<div class="workflow-toolbar">${button('choices','返回来源选择')}</div></section>`;}
       if(action==='batch'){batch=await api(`/api/reward-batches/${b.dataset.id}`);preview=null;render();}
     }catch(err){
-      if(err.detail?.preview){preview=err.detail.preview;generationKey=crypto.randomUUID();render();}
+      if(err.detail?.preview){preview=err.detail.preview;generationKey=createGenerationKey();render();}
       if(err.detail?.candidates?.length&&$('rb-other-identity'))$('rb-other-identity').innerHTML=`<label class="workflow-field">选择匹配身份<select id="rb-other-candidate"><option value="">请选择</option>${err.detail.candidates.map(c=>`<option value="${c.key}">${h(c.group_name)} · ${h(c.ori)} · 第 ${c.row_number} 行</option>`).join('')}</select></label>`;
       showToast(err.message,'error',7000);
     }finally{if(b.isConnected)b.disabled=false;}
