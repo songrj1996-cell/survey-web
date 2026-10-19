@@ -6,21 +6,75 @@ const vm = require('node:vm');
 const source = fs.readFileSync(path.join(__dirname, '../static/js/features/report.js'), 'utf8');
 function section(from, to) { return source.slice(source.indexOf(from), source.indexOf(to, source.indexOf(from))); }
 class Element {
-  constructor(tag) { this.tagName = tag; this.children = []; this.dataset = {}; this.textContent = ''; this.hidden = false; }
+  constructor(tag) {
+    this.tagName = tag; this.children = []; this.dataset = {}; this.textContent = ''; this.hidden = false;
+    this.attrs = {}; this.classes = new Set();
+    this.classList = {toggle:(name, on)=>on ? this.classes.add(name) : this.classes.delete(name)};
+  }
+  setAttribute(name, value) { this.attrs[name] = value; }
+  focus() { this.focused = true; }
   appendChild(child) { this.children.push(child); return child; }
   replaceChildren() { this.children = []; }
   text() { return this.textContent + this.children.map(c => c.text()).join('\n'); }
 }
 function fixture(audit, canEdit = true) {
   const panel = new Element('section'), calls = [];
+  const drawer = new Element('div'), trigger = new Element('button'), title = new Element('div'), close = new Element('button');
+  drawer.hidden = true;
+  const nodes = {'report-postwrite-audit':panel, 'postwrite-review-drawer':drawer,
+    'btn-report-postwrite-review':trigger, 'postwrite-review-title':title, 'btn-postwrite-review-close':close};
   const ctx = {id:'history-id', selectedVersion:2, reportAudit:audit, canEdit, versions:[{}, {}], maxVersions:5};
-  const sandbox = vm.createContext({document:{createElement: tag => new Element(tag)}, $:()=>panel,
-    activeReportCtx:()=>ctx, activeVersionNumber:()=>2, reportInteractionBusy:()=>false,
+  const doc = {createElement: tag => new Element(tag), activeElement:null};
+  close.focus = ()=>{doc.activeElement=close;};
+  trigger.focus = ()=>{doc.activeElement=trigger;};
+  drawer.querySelectorAll = ()=>[close];
+  close.getClientRects = ()=>[{}];
+  const sandbox = vm.createContext({document:doc, $:id=>nodes[id],
+    activeReportCtx:()=>ctx, activeVersionNumber:()=>ctx.selectedVersion, reportInteractionBusy:()=>false,
     state:{viewMode:'history'}, window:{}, runStats: args => calls.push(args)});
-  vm.runInContext(section('function renderPostwriteAudit(', 'function renderReportWorkspace('), sandbox);
+  vm.runInContext(section('function setPostwriteReviewOpen(', 'function renderReportWorkspace('), sandbox);
   vm.runInContext('renderPostwriteAudit()', sandbox);
-  return {panel, calls, ctx, render:()=>vm.runInContext('renderPostwriteAudit()', sandbox)};
+  return {panel, calls, ctx, drawer, trigger, title, doc, close,
+    render:()=>vm.runInContext('renderPostwriteAudit()', sandbox),
+    open:()=>vm.runInContext('setPostwriteReviewOpen(true)', sandbox),
+    key:event=>sandbox.handlePostwriteReviewKeydown(event)};
 }
+test('review lives outside report layout, with a closed dialog and print exclusion', () => {
+  const html = fs.readFileSync(path.join(__dirname, '../static/index.html'), 'utf8');
+  const layout = html.slice(html.indexOf('<div class="report-layout">'), html.indexOf('<aside class="qa-side"'));
+  assert.doesNotMatch(layout, /report-postwrite-audit/);
+  assert.match(html, /id="postwrite-review-drawer" hidden inert aria-hidden="true"/);
+  assert.match(html, /role="dialog" aria-modal="true" aria-labelledby="postwrite-review-title"/);
+  const css = fs.readFileSync(path.join(__dirname, '../static/style.css'), 'utf8');
+  assert.match(css, /@media print\s*\{\s*#postwrite-review-drawer, #btn-report-postwrite-review/);
+});
+test('review stays closed until opened, escapes with focus return and closes on version change', () => {
+  const f = fixture({status:'complete', checks:[]});
+  assert.equal(f.drawer.hidden, true);
+  assert.equal(f.trigger.hidden, false);
+  f.open();
+  assert.equal(f.drawer.hidden, false);
+  assert.equal(f.drawer.inert, false);
+  assert.equal(f.trigger.attrs['aria-expanded'], 'true');
+  assert.equal(f.doc.activeElement, f.close);
+  let prevented = false;
+  f.key({key:'Escape', preventDefault:()=>{prevented=true;}, stopPropagation:()=>{}});
+  assert.equal(prevented, true);
+  assert.equal(f.drawer.hidden, true);
+  assert.equal(f.doc.activeElement, f.trigger);
+  f.open(); f.ctx.selectedVersion=1; f.render();
+  assert.equal(f.drawer.hidden, true);
+  assert.match(f.title.text(), /V1/);
+  f.open(); f.ctx.reportAudit=null; f.render();
+  assert.equal(f.drawer.hidden, true);
+  assert.equal(f.trigger.hidden, true);
+});
+test('keyboard tab stays inside the independent review panel', () => {
+  const f=fixture({status:'complete'}); f.open();
+  let prevented=false;
+  f.key({key:'Tab',preventDefault:()=>{prevented=true;},stopPropagation:()=>{}});
+  assert.equal(prevented,true); assert.equal(f.doc.activeElement,f.close);
+});
 test('issue advisory preserves original and escapes model text through textContent', () => {
   const {panel} = fixture({status:'complete', checked_claims:1, registered_claims:1, checks:[{
     id:'C1', verdict:'issue', original:'合理解释', reason:'待人工看', sources:[{ref:'q1/r2', meaning:'释义',

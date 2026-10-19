@@ -178,9 +178,10 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(again["audit"]["counts"], result["audit"]["counts"])
         snapshot = {"report_md": REPORT, "report_mode": "insight", "report_audit": again["audit"]}
         exported = prepare_report_markdown(snapshot, "evidence")
-        self.assertIn("含歧义待人工确认", exported)
-        self.assertIn("可能1—2/3人", exported)
-        self.assertIn("规则熟悉", exported)
+        self.assertEqual(exported, REPORT)
+        self.assertNotIn("含歧义待人工确认", exported)
+        self.assertNotIn("可能1—2/3人", exported)
+        self.assertEqual(again["audit"]["counts_ambiguous"], 1)
         from app.services.report_postwrite_pipeline import audit_summary
         del again["steps"]["count:T1"]
         incomplete = audit_summary(again)
@@ -658,7 +659,8 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second["input_snapshot"], base["input_snapshot"])
         self.assertIn("待人工", second["report_audit"]["notice"].replace("供人工审阅", "待人工"))
         self.assertFalse(partial_rerun_capability(sess, second)["available"])
-        self.assertIn("核验提示", prepare_report_markdown(second, "evidence"))
+        self.assertNotIn("## 核验提示", prepare_report_markdown(second, "evidence"))
+        self.assertEqual(prepare_report_markdown(second, "body"), second["report_md"])
         self.assertIn("原文", second["qa_context_md"])
 
     async def test_old_versions_do_not_switch_when_flag_enabled(self):

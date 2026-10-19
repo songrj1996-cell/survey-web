@@ -742,5 +742,54 @@ class HistoryRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(caught.exception.status_code, 404)
 
 
+class PostwriteReviewExportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_all_export_inputs_exclude_review_metadata_and_preserve_sources(self):
+        from app.services.report_modes import prepare_report_markdown, evidence_markdown
+        snapshot = {"report_md": "# 合成报告\n\n卡牌带来变化。", "report_mode": "insight", "mode": "standard",
+                    "title": "合成报告", "input_snapshot": {"source_questions": [
+                        {"question_key": "1", "question": "体验", "sources": [
+                            {"response_id": "q1/r2", "text": "SOURCEONLY 原文反馈"}]}]},
+                    "report_audit": {"status": "complete", "has_ambiguity": True,
+                        "verification_notes": ["REVIEWONLY 登记备注"],
+                        "checks": [{"verdict": "issue", "original": "REVIEWONLY 问题", "reason": "REVIEWONLY 原因"}],
+                        "counts": [{"id": "T1", "reviewed": True, "review_status": "ambiguous",
+                            "count_min": 1, "count_max": 2, "denominator": 3, "issues": ["REVIEWONLY 人数提示"],
+                            "members": [{"player": "p", "count": None, "sources": [
+                                {"ref": "q1/r2", "meaning": "REVIEWONLY 释义", "source": {"original": "审阅专用来源"}}]}]}]}}
+        original = deepcopy(snapshot)
+        for status in ("complete", "partial"):
+            snapshot["report_audit"]["status"] = status
+            for scope in ("body", "evidence"):
+                with (
+                    self.subTest(status=status, scope=scope),
+                    patch.object(export_download, "_get_session_report_source", return_value=snapshot),
+                    patch.object(export_history, "get_history_entry", return_value=snapshot),
+                    patch.object(export_download, "markdown_to_docx", side_effect=lambda md: md.encode()),
+                    patch.object(export_download, "report_markdown_to_pdf", side_effect=lambda md, mode: md.encode()),
+                    patch.object(export_history, "markdown_to_docx", side_effect=lambda md: md.encode()),
+                    patch.object(export_history, "report_markdown_to_pdf", side_effect=lambda md, mode: md.encode()),
+                ):
+                    expected = snapshot["report_md"] + ("\n\n" + evidence_markdown(snapshot) if scope == "evidence" else "")
+                    self.assertEqual(prepare_report_markdown(snapshot, scope), expected)
+                    outputs = [(await export_download.prepare_markdown_download("s", 2, scope))[0],
+                               (await export_download.prepare_word_download("s", 2, scope))[0],
+                               (await export_download.prepare_pdf_download("s", 2, scope))[0],
+                               export_download.get_session_export_data("s", 2, scope)[0].encode(),
+                               (await export_history.prepare_markdown_history_download("h", None, 2, scope))[0],
+                               (await export_history.prepare_word_history_download("h", None, 2, scope))[0],
+                               (await export_history.prepare_pdf_history_download("h", None, 2, scope))[0],
+                               export_history.get_history_export_entry("h", None, 2, scope)["report_md"].encode()]
+                    for output in outputs:
+                        text = output.decode()
+                        self.assertNotIn("REVIEWONLY", text)
+                        self.assertNotIn("核验已完成", text)
+                        self.assertNotIn("核验未完成", text)
+                        self.assertNotIn("## 核验提示", text)
+                        self.assertIn("卡牌带来变化。", text)
+                        self.assertEqual("SOURCEONLY" in text, scope == "evidence")
+        snapshot["report_audit"]["status"] = "complete"
+        self.assertEqual(snapshot, original)
+
+
 if __name__ == "__main__":
     unittest.main()

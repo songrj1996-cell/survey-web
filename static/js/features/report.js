@@ -1992,11 +1992,58 @@ function renderComparisonValidation(validation) {
   }
 }
 
+function setPostwriteReviewOpen(open, { restoreFocus = true } = {}) {
+  const drawer = $('postwrite-review-drawer');
+  const trigger = $('btn-report-postwrite-review');
+  if (!drawer) return;
+  open = !!open && !!activeReportCtx()?.reportAudit;
+  if (open && reportInteractionBusy()) return;
+  const wasOpen = !drawer.hidden;
+  drawer.hidden = !open;
+  drawer.inert = !open;
+  drawer.classList.toggle('drawer--open', open);
+  drawer.setAttribute('aria-hidden', String(!open));
+  trigger?.setAttribute('aria-expanded', String(open));
+  if (open) $('btn-postwrite-review-close')?.focus();
+  else if (wasOpen && restoreFocus && trigger && !trigger.hidden) trigger.focus();
+}
+
+function handlePostwriteReviewKeydown(event) {
+  const drawer = $('postwrite-review-drawer');
+  if (!drawer || drawer.hidden) return;
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    event.stopPropagation();
+    setPostwriteReviewOpen(false);
+  } else if (event.key === 'Tab') {
+    const items = Array.from(drawer.querySelectorAll('button:not([disabled]), summary, a[href], [tabindex="0"]'))
+      .filter(el => !el.hidden && el.getClientRects().length > 0);
+    event.preventDefault();
+    event.stopPropagation();
+    if (items.length) {
+      const index = items.indexOf(document.activeElement);
+      const next = index < 0 ? (event.shiftKey ? items.length - 1 : 0)
+        : (index + (event.shiftKey ? -1 : 1) + items.length) % items.length;
+      items[next].focus();
+    }
+  }
+}
+
 function renderPostwriteAudit(ctx = activeReportCtx()) {
   const panel = $('report-postwrite-audit');
   if (!panel) return;
   panel.replaceChildren();
   const audit = ctx?.reportAudit;
+  const trigger = $('btn-report-postwrite-review');
+  if (trigger) trigger.hidden = !audit;
+  const drawer = $('postwrite-review-drawer');
+  const reviewKey = `${state.viewMode}:${ctx?.id || state.sessionId || ''}:${activeVersionNumber(ctx) || ''}`;
+  if (!audit || (drawer && drawer.dataset.reviewKey !== reviewKey)) {
+    setPostwriteReviewOpen(false, { restoreFocus: false });
+  }
+  if (drawer) drawer.dataset.reviewKey = reviewKey;
+  const title = $('postwrite-review-title');
+  if (title) title.textContent = `核验审阅 · ${activeVersionNumber(ctx) ? `V${activeVersionNumber(ctx)}` : '当前版本'}`;
   panel.hidden = !audit;
   if (!audit) return;
   const node = (tag, text, parent = panel) => {
@@ -2025,6 +2072,7 @@ function renderPostwriteAudit(ctx = activeReportCtx()) {
       button.disabled = reportInteractionBusy() || ctx.versions?.length >= ctx.maxVersions;
       button.onclick = () => {
         if (reportInteractionBusy()) return;
+        setPostwriteReviewOpen(false, { restoreFocus: false });
         return runStats({retryFailed, regenerate: !retryFailed, baseVersion: activeVersionNumber(ctx),
           ...(state.viewMode === 'history' ? {historyId: ctx.id} : {})});
       };
@@ -2118,6 +2166,7 @@ function renderReportWorkspace(md, { preserveQa = true } = {}) {
   removeLegacyStatsChartPayloads();
   enhanceReportTables();
   renderQuickReportNavigation(md, ctx);
+  if (ctx.reportAudit) $('report-evidence-tools')?.querySelector('.quick-partial-notice')?.remove();
   buildTOC();
   if (typeof renderQuickRetryStatus === 'function') renderQuickRetryStatus();
   switchReportTab('report');
@@ -2670,6 +2719,11 @@ function startReportTitleEdit() {
 }
 
 $('btn-report-rename')?.addEventListener('click', startReportTitleEdit);
+$('btn-report-postwrite-review')?.addEventListener('click', () => setPostwriteReviewOpen(true));
+document.querySelectorAll('[data-postwrite-review-close]').forEach(el => {
+  el.addEventListener('click', () => setPostwriteReviewOpen(false));
+});
+document.addEventListener('keydown', handlePostwriteReviewKeydown, true);
 
 // ============================================================
 // STEP 5: Export + QA

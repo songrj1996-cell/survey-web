@@ -11,7 +11,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Roboto+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/style.css?v=66" />
+  <link rel="stylesheet" href="/static/style.css?v=68" />
   <link rel="stylesheet" href="/static/questionnaire-sources.css?v=1" />
   <link rel="stylesheet" href="/static/report-quick.css?v=11" />
   <link rel="stylesheet" href="/static/survey-entry.css?v=8" />
@@ -555,6 +555,8 @@
             </div>
           </div>
           <div class="report-toolbar__actions">
+            <button class="btn btn--ghost" id="btn-report-postwrite-review" type="button" hidden
+              aria-haspopup="dialog" aria-expanded="false" aria-controls="postwrite-review-drawer">核验审阅</button>
             <button class="btn btn--ghost" id="btn-report-regenerate" type="button">重新生成整份报告</button>
             <button class="btn btn--ghost" id="btn-report-partial-rerun" type="button">
               局部重做
@@ -654,7 +656,6 @@
                 </div>
                 <section id="quick-retry-status" class="quick-retry-status" aria-label="题目重试进度" hidden></section>
                 <section id="report-evidence-tools" aria-label="报告来源与处理状态"></section>
-                <section id="report-postwrite-audit" class="card" aria-label="报告核验提示" hidden></section>
                 <div class="report-content markdown-body" id="report-content"></div>
               </div>
             </div>
@@ -1889,6 +1890,21 @@
     </div>
   </div>
 
+  <!-- Report audit review: independent from report content and exports. -->
+  <div class="drawer postwrite-review-drawer" id="postwrite-review-drawer" hidden inert aria-hidden="true">
+    <div class="drawer__overlay" data-postwrite-review-close aria-hidden="true"></div>
+    <div class="drawer__panel" role="dialog" aria-modal="true" aria-labelledby="postwrite-review-title">
+      <div class="drawer__header">
+        <div class="drawer__title" id="postwrite-review-title">核验审阅</div>
+        <button class="drawer__close" id="btn-postwrite-review-close" type="button"
+          data-postwrite-review-close aria-label="关闭核验审阅">×</button>
+      </div>
+      <div class="drawer__body">
+        <section id="report-postwrite-audit" class="postwrite-review-content" aria-label="报告核验提示" hidden></section>
+      </div>
+    </div>
+  </div>
+
   <!-- History drawer -->
   <div class="drawer" id="history-drawer">
     <div class="drawer__overlay" data-drawer-close></div>
@@ -2174,7 +2190,7 @@
   <script src="/static/js/features/survey.js?v=40"></script>
   <script src="/static/js/features/survey-entry.js?v=5"></script>
   <script src="/static/js/features/questionnaire-sources.js?v=2"></script>
-  <script src="/static/js/features/report.js?v=53"></script>
+  <script src="/static/js/features/report.js?v=55"></script>
   <script src="/static/js/features/profile.js?v=2"></script>
   <script src="/static/js/features/settings.js?v=41"></script>
   <script src="/static/js/features/history.js?v=39"></script>
