@@ -897,11 +897,135 @@ class WriterOutputLimitTests(unittest.IsolatedAsyncioTestCase):
         previous = await run_pipeline(frozen, prompts=PROMPTS, collect=failed)
         self.assertIn("failure", previous)
         forbidden = AsyncMock(side_effect=AssertionError("no automatic retry"))
-        result = await run_pipeline(frozen, prompts=PROMPTS, previous=previous, collect=forbidden)
+        result = await run_pipeline(frozen, prompts=PROMPTS, previous=previous, collect=forbidden,
+                                    caller_options={"max_calls": 10})
         self.assertIn("上次请求用量不完整", result["stop_reason"])
         self.assertNotIn("failure", result)
         self.assertEqual(len(result["calls"]), 1)
         forbidden.assert_not_called()
+
+
+class RuntimeBudgetPolicyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_default_continues_beyond_old_limits_and_unknown_usage(self):
+        history = [{"stage": "meaning:old", "state": "complete", "usage_complete": True,
+                    "usage": {"total_tokens": 200000}, "charged_or_reserved_tokens": 200000,
+                    "elapsed_seconds": 300} for _ in range(18)]
+        history.append({"stage": "registry", "state": "failed", "usage_complete": False,
+                        "charged_or_reserved_tokens": 64000, "elapsed_seconds": 480})
+        async def collect(messages, **kwargs):
+            await asyncio.sleep(0)
+            await kwargs["on_attempt_event"]({"status": "completed", "usage_complete": True,
+                                             "usage": {"total_tokens": 140}})
+            return "finished", "fake"
+        with patch("app.services.report_postwrite_pipeline.time") as clock, patch(
+            "app.services.report_postwrite_pipeline.asyncio.wait_for",
+            side_effect=AssertionError("production must not impose an elapsed-call deadline")
+        ):
+            clock.monotonic.side_effect = [100, 100, 1000]
+            caller = BoundedCaller(collect=collect, ledger=deepcopy(history))
+            self.assertEqual((caller.max_calls, caller.max_tokens, caller.max_seconds, caller.call_seconds),
+                             (0, 0, 0, 0))
+            self.assertEqual(await caller.call("registry", [{"content": "small"}]), "finished")
+        self.assertEqual(len(caller.ledger), 20)
+        self.assertEqual(caller.ledger[:-1], history)
+        self.assertEqual(caller.ledger[-1]["elapsed_seconds"], 900)
+        self.assertGreater(caller.summary()["tokens"], 3000000)
+        self.assertFalse(caller.summary()["usage_complete"])
+
+    async def test_explicit_zero_disables_configured_test_limits(self):
+        with patch.multiple(config, POSTWRITE_MAX_CALLS=14, POSTWRITE_MAX_TOKENS=2800000,
+                            POSTWRITE_MAX_SECONDS=3300, POSTWRITE_CALL_SECONDS=480):
+            caller = BoundedCaller(max_calls=0, max_tokens=0, max_seconds=0, call_seconds=0)
+        self.assertEqual((caller.max_calls, caller.max_tokens, caller.max_seconds, caller.call_seconds),
+                         (0, 0, 0, 0))
+
+    async def test_explicit_time_budgets_still_cancel_a_slow_test_call(self):
+        for options in ({"call_seconds": 0.01}, {"max_seconds": 0.01}):
+            with self.subTest(options=options):
+                cancelled = asyncio.Event()
+                async def collect(messages, **kwargs):
+                    try:
+                        await asyncio.Event().wait()
+                    finally:
+                        cancelled.set()
+                caller = BoundedCaller(collect=collect, **options)
+                with self.assertRaises(TimeoutError):
+                    await caller.call("registry", [{"content": "small"}])
+                self.assertTrue(cancelled.is_set())
+                self.assertEqual(caller.ledger[-1]["state"], "failed")
+                self.assertFalse(caller.summary()["usage_complete"])
+
+    async def test_expired_explicit_test_budget_stops_before_network(self):
+        collect = AsyncMock()
+        caller = BoundedCaller(collect=collect, max_seconds=1)
+        caller.previous_seconds = 2
+        with self.assertRaises(BudgetStop):
+            await caller.call("registry", [{"content": "small"}])
+        collect.assert_not_called()
+        self.assertEqual(caller.ledger, [])
+
+    async def test_service_resumes_unknown_usage_registry_failure_without_rewriting(self):
+        sess = session()
+        async def first(messages, **kwargs):
+            if "blocks" in json.loads(messages[-1]["content"]):
+                await kwargs["on_attempt_event"]({"status": "failed", "http_status": 200,
+                    "usage": {"input_tokens": 86886, "output_tokens": 8, "total_tokens": 86894},
+                    "usage_complete": False, "error_category": "cancelled"})
+                raise TimeoutError("private-timeout-detail")
+            return await fake_collect(messages, **kwargs)
+        with runtime(sess, first):
+            first_output = events([e async for e in survey_service.report_stream("resume-usage", None)])
+        self.assertTrue(any(e["type"] == "report_done" for e in first_output), first_output)
+        original = deepcopy(report_versions.resolve_report_version(sess, 1))
+        checkpoint = original["report_audit"]["checkpoint"]
+        self.assertEqual(len(checkpoint["calls"]), 2)
+        self.assertIsNone(checkpoint["registry"])
+        self.assertFalse(checkpoint["usage"]["usage_complete"])
+        resumed_requests = []
+        async def resume(messages, **kwargs):
+            payload = json.loads(messages[-1]["content"])
+            self.assertTrue("blocks" in payload or "targets" in payload, "must not rewrite the draft")
+            resumed_requests.append(deepcopy(messages))
+            return await fake_collect(messages, **kwargs)
+        with runtime(sess, resume):
+            output = events([e async for e in survey_service.report_stream(
+                "resume-usage", None, retry_failed=True, base_version=1)])
+        self.assertTrue(any(e["type"] == "report_done" for e in output), output)
+        second = report_versions.resolve_report_version(sess, 2)
+        self.assertEqual(second["report_audit"]["status"], "complete")
+        self.assertEqual(second["report_md"], original["report_md"])
+        self.assertEqual(second["input_snapshot"], original["input_snapshot"])
+        saved = second["report_audit"]["checkpoint"]
+        self.assertEqual(saved["calls"][:2], checkpoint["calls"])
+        self.assertEqual(saved["prompts"], checkpoint["prompts"])
+        self.assertEqual(len(resumed_requests), 2)
+        self.assertEqual(len(saved["calls"]), 4)
+        self.assertEqual(saved["stop_reason"], "")
+        self.assertNotIn("failure", saved)
+        self.assertFalse(saved["usage"]["usage_complete"])
+        self.assertEqual(saved["usage"]["tokens"], 87314)
+        self.assertEqual(report_versions.resolve_report_version(sess, 1), original)
+        self.assertNotIn("private-timeout-detail", json.dumps(output, ensure_ascii=False))
+
+    async def test_unknown_usage_does_not_start_automatic_retry_loop(self):
+        reached = []
+        async def collect(messages, **kwargs):
+            if "blocks" in json.loads(messages[-1]["content"]):
+                reached.append("registry")
+                raise TimeoutError("private-timeout-detail")
+            return await fake_collect(messages, **kwargs)
+        frozen = freeze_inputs(session())
+        first = await run_pipeline(frozen, prompts=PROMPTS, collect=collect)
+        self.assertEqual(reached, ["registry"])
+        self.assertEqual(first["draft"], REPORT)
+        self.assertEqual(len(first["calls"]), 2)
+        self.assertEqual(first["audit"]["status"], "partial")
+        again = await run_pipeline(frozen, prompts=PROMPTS, previous=first, collect=collect)
+        self.assertEqual(reached, ["registry", "registry"])
+        self.assertEqual(len(again["calls"]), 3)
+        self.assertEqual(again["audit"]["status"], "partial")
+        self.assertFalse(again["usage"]["usage_complete"])
+        self.assertEqual(again["draft"], first["draft"])
 
 
 class StorageTests(unittest.TestCase):
@@ -912,9 +1036,10 @@ class StorageTests(unittest.TestCase):
             self.assertEqual((caller.max_calls, caller.max_tokens, caller.max_seconds, caller.output_tokens),
                              (14, 2800000, 3300, 64000))
         source = (__import__("pathlib").Path(config.__file__)).read_text(encoding="utf-8")
-        for declaration in ('_env_int("POSTWRITE_MAX_CALLS", 10)',
-                            '_env_int("POSTWRITE_MAX_TOKENS", 800000)',
-                            '_env_int("POSTWRITE_MAX_SECONDS", 2700)',
+        for declaration in ('_env_int("POSTWRITE_MAX_CALLS", 0)',
+                            '_env_int("POSTWRITE_MAX_TOKENS", 0)',
+                            '_env_int("POSTWRITE_MAX_SECONDS", 0)',
+                            '_env_int("POSTWRITE_CALL_SECONDS", 0)',
                             '_env_int("POSTWRITE_OUTPUT_TOKENS", 16000)'):
             self.assertIn(declaration, source)
 
