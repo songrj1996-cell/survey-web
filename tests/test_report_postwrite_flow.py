@@ -1028,6 +1028,41 @@ class RuntimeBudgetPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(again["draft"], first["draft"])
 
 
+class FailureDiagnosticTests(unittest.IsolatedAsyncioTestCase):
+    async def test_real_http_stream_error_preserves_safe_attempt_identifiers_and_subtype(self):
+        from app.integrations import llm_client
+        class BrokenStream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                start = {"type": "message_start", "message": {"usage": {"input_tokens": 100, "output_tokens": 5}}}
+                yield ("data: " + json.dumps(start) + "\n\n").encode()
+                raise httpx.RemoteProtocolError("vendor-private-body sk-PRIVATE")
+        real_client = httpx.AsyncClient
+        requests = []
+        def respond(request):
+            requests.append(request)
+            return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=BrokenStream())
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(llm_client, "LLM_API_BASE", "https://model.invalid/v1"))
+            stack.enter_context(patch.object(llm_client, "LLM_API_KEY", "sk-PRIVATE"))
+            stack.enter_context(patch.object(llm_client, "FEISHU_LOGIN_REQUIRED", False))
+            stack.enter_context(patch.object(llm_client, "_protocol_order", return_value=["messages"]))
+            stack.enter_context(patch.object(httpx, "AsyncClient", side_effect=lambda **kw: real_client(
+                transport=httpx.MockTransport(respond), **kw)))
+            caller = BoundedCaller(collect=llm_client.collect_chat_completion)
+            with self.assertRaises(RuntimeError):
+                await caller.call("registry", [{"role": "user", "content": "synthetic"}])
+        self.assertEqual(len(requests), 1)
+        failure = caller.ledger[0]["failure"]
+        self.assertEqual(failure["http_status"], 200)
+        self.assertEqual(failure["error_type"], "RemoteProtocolError")
+        self.assertEqual(failure["wrapper_error_type"], "RuntimeError")
+        self.assertRegex(failure["request_id"], r"^[0-9a-f]{32}$")
+        self.assertRegex(failure["call_id"], r"^[0-9a-f]{32}$")
+        self.assertFalse(caller.summary()["usage_complete"])
+        self.assertEqual(caller.summary()["tokens"], 105)
+        self.assertNotIn("PRIVATE", json.dumps(caller.ledger, ensure_ascii=False))
+
+
 class StorageTests(unittest.TestCase):
     def test_explicit_acceptance_budget_reaches_caller_without_changing_defaults(self):
         with patch.multiple(config, POSTWRITE_MAX_CALLS=14, POSTWRITE_MAX_TOKENS=2800000,

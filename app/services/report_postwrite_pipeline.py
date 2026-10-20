@@ -3,6 +3,7 @@ import asyncio
 from copy import deepcopy
 import hashlib
 import json
+import re
 import time
 from app.core import config
 from app.integrations.llm_client import collect_chat_completion
@@ -32,6 +33,12 @@ _ERROR_CATEGORIES = {
     "incomplete_output", "refusal", "http_error", "cancelled",
 }
 _TRUNCATED_REASONS = {"length", "max_tokens", "max_output_tokens"}
+_ERROR_TYPES = {
+    "RuntimeError", "ValueError", "TimeoutError", "CancelledError", "_LLMRequestError",
+    "ConnectTimeout", "ReadTimeout", "WriteTimeout", "PoolTimeout", "TimeoutException",
+    "TransportError", "ConnectError", "ReadError", "WriteError", "CloseError", "ProxyError",
+    "ProtocolError", "LocalProtocolError", "RemoteProtocolError", "DecodingError", "TooManyRedirects",
+}
 
 
 def _call_failure(entry, error, model):
@@ -40,11 +47,23 @@ def _call_failure(entry, error, model):
     truncated = any(e.get("finish_reason") in _TRUNCATED_REASONS
                     or e.get("error_category") == "output_truncated" for e in entry["events"])
     category = "output_truncated" if truncated else terminal.get("error_category", "unknown_error")
+    error_type = terminal.get("error_type") or type(error).__name__
     stage = "初稿" if entry["stage"] == "writer" else "本批"
+    explanations = {
+        "transport_error": "与模型服务通信时发生传输错误，未取得完整结果，具体断开原因尚未确认。",
+        "read_timeout": "等待模型后续响应超时，未取得完整结果。",
+        "connect_timeout": "连接模型服务超时，未取得完整结果。",
+        "write_timeout": "向模型服务发送请求超时，未取得完整结果。",
+        "pool_timeout": "等待可用连接超时，未取得完整结果。",
+        "upstream_stream_error": "模型服务在返回响应的过程中报错，未取得完整结果。",
+    }
     message = (f"{stage}输出达到本次上限（{entry['output_cap']:,} tokens），内容被截断，尚未完成。"
                "本次已停止，没有自动重试。") if truncated else (
-                   f"模型调用失败（{type(error).__name__}），具体原因尚未确认。")
-    return {"stage": entry["stage"], "model": model, "error_type": type(error).__name__,
+                   explanations[category] + "本次已停止，没有自动重试。" if category in explanations else
+                   f"模型调用失败（{error_type}），具体原因尚未确认。")
+    return {"stage": entry["stage"], "model": model, "error_type": error_type,
+            "wrapper_error_type": type(error).__name__, "call_id": terminal.get("call_id"),
+            "request_id": terminal.get("request_id"),
             "error_category": category, "http_status": terminal.get("http_status"),
             "finish_reason": next((e["finish_reason"] for e in reversed(entry["events"])
                                    if e.get("finish_reason") in _TRUNCATED_REASONS), None),
@@ -103,6 +122,11 @@ class BoundedCaller:
                 safe["http_status"] = item["http_status"]
             if item.get("error_category") in _ERROR_CATEGORIES:
                 safe["error_category"] = item["error_category"]
+            if item.get("error_type") in _ERROR_TYPES:
+                safe["error_type"] = item["error_type"]
+            for key in ("call_id", "request_id"):
+                if isinstance(item.get(key), str) and re.fullmatch(r"[0-9a-f]{32}", item[key]):
+                    safe[key] = item[key]
             entry["events"].append(safe)
             if item.get("usage"):
                 entry["usage"] = deepcopy(item["usage"])
