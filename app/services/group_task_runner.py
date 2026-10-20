@@ -14,7 +14,8 @@ from app.core.llm_limits import AttemptGate, bind_attempt_gate
 from app.core.runtime_logging import bind_runtime_operator, reset_runtime_operator, runtime_operator_from_login
 from app.services import group_tasks as tasks
 from app.services.annotate_workflow import annotate_group_feedback, bind_annotate_log_area
-from app.services.feature_access import require_permission, require_record
+from app.services.feature_access import require_permission
+from app.services.group_access import continue_authorized_run, require_record
 from app.services.llm_credentials import require_background_llm_api_key
 from app.services.llm_usage import start_llm_usage_task
 from app.storage import group_workflow as store
@@ -263,7 +264,8 @@ async def _run_slice_impl(task_id, slots):
                 if state["options"]["quality"] and not state["quality_complete"]:
                     from app.schemas.group_tasks import RunTask
                     try:
-                        start_run(task_id, RunTask(expected_version=version, stage="quality"), login)
+                        with continue_authorized_run():
+                            start_run(task_id, RunTask(expected_version=version, stage="quality"), login)
                     except HTTPException as exc:
                         def save_next_error(current):
                             if current["version"] == version:

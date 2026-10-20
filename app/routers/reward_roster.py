@@ -13,7 +13,7 @@ from app.services.reward_roster import (
     resolve_reward_conflicts,
     reward_download,
 )
-from app.services.session_access import require_session_request_access
+from app.services.group_access import require_record
 
 
 router = APIRouter()
@@ -21,12 +21,7 @@ router = APIRouter()
 
 async def _require_reward_session(request: Request, session_id: str) -> dict | None:
     login = await _require_feature(request, "reward")
-    await require_session_request_access(
-        request,
-        session_id,
-        login_resolver=_current_login,
-        loader=get_reward_session,
-    )
+    require_record(get_reward_session(session_id), login, write=request.method != "GET")
     return login
 
 

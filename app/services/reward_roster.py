@@ -93,7 +93,8 @@ def _persist_import(session: dict) -> None:
 
 
 def delete_import(session_id: str, login) -> dict:
-    from app.services.feature_access import require_permission, require_record, owner_identity
+    from app.services.feature_access import require_permission, owner_identity
+    from app.services.group_access import require_record
     require_permission(login, "reward", write=True)
     # Read access is owner-or-admin; this exception applies only to removing imports.
     require_record(workflow_store.read("imports", session_id), login)

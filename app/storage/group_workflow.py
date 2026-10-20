@@ -17,7 +17,7 @@ from app.core.file_lock import acquire_exclusive_file_lock, release_file_lock
 
 _LOCK = threading.RLock()
 _LOCAL = threading.local()
-_KINDS = {"tasks", "sources", "snapshots", "previews", "other_rewards", "ledger", "members", "imports"}
+_KINDS = {"tasks", "sources", "snapshots", "previews", "other_rewards", "ledger", "members", "imports", "preferences"}
 
 
 def _root() -> Path:

@@ -13,6 +13,7 @@ from app.storage.prompts import (
 )
 from app.storage.settings import _load_app_settings, _save_app_settings
 from app.storage.ui_texts import _load_ui_texts, _save_ui_texts
+from app.services.group_access import admin_preferences, save_admin_preferences
 
 _MAX_PROMPT_LENGTH = 100_000
 
@@ -92,10 +93,20 @@ def _postwrite_setting(settings: dict) -> bool:
     return settings.get("report_postwrite_enabled", config.REPORT_POSTWRITE_ENABLED) is True
 
 
-def get_app_settings_for_display() -> dict:
+def get_app_settings_for_display(login=None) -> dict:
     """Expose the effective switch without persisting a new key on reads."""
     settings = get_app_settings()
-    return {**settings, "report_postwrite_enabled": _postwrite_setting(settings)}
+    result = {**settings, "report_postwrite_enabled": _postwrite_setting(settings)}
+    preferences = admin_preferences(login)
+    if preferences is not None:
+        result["group_management_preferences"] = preferences
+    return result
+
+
+def update_group_management_preferences(login, request):
+    result = save_admin_preferences(login, request)
+    detail = "群组管理查看范围：" + ("仅看自己" if result["only_self"] else "查看全部")
+    return result, detail
 
 
 def is_postwrite_report_enabled() -> bool:

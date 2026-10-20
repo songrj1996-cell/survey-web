@@ -1871,6 +1871,13 @@ $('stab-content-texts').addEventListener('click', async e => {
   }
 });
 
+window.addEventListener('storage', event => {
+  if (event.key === 'group-management-scope-updated') {
+    window.dispatchEvent(new Event('group-management-scope-changed'));
+    if ($('setting-group-only-self')) loadSystemSettings();
+  }
+});
+
 async function loadSystemSettings() {
   const body = $('stab-content-system');
   body.innerHTML = `<div class="hist-empty"><div class="spinner" style="margin:0 auto"></div></div>`;
@@ -1917,6 +1924,15 @@ async function loadSystemSettings() {
           <span>先写作后核验</span>
         </label>
       </div>
+      ${data.group_management_preferences ? `
+      <div class="uitext-card">
+        <div class="uitext-card__label">群组管理 · 个人查看范围</div>
+        <div class="prompt-card__desc">仅对当前管理员账号生效。勾选后，质量标注、奖励导入、其他奖励和奖励批次仅显示自己创建的记录；取消后可查看并操作全部记录。共享名单配置仍可使用，已启动的后台标注继续执行。</div>
+        <label class="setting-toggle">
+          <input type="checkbox" id="setting-group-only-self" data-revision="${data.group_management_preferences.revision}" ${data.group_management_preferences.only_self ? 'checked' : ''} />
+          <span>仅看自己</span>
+        </label>
+      </div>` : ''}
     `;
     if (!PlatformPermissions.canUse('platform')) body.querySelectorAll('input').forEach(el=>el.disabled=true);
   } catch (e) {
@@ -1924,7 +1940,39 @@ async function loadSystemSettings() {
   }
 }
 
+async function saveGroupManagementScope(input) {
+  const requested = input.checked;
+  input.disabled = true;
+  try {
+    if (window.groupWorkflowMayLeave && !await window.groupWorkflowMayLeave()) {
+      input.checked = !requested;
+      return;
+    }
+    const resp = await fetch('/api/group-management/preferences', {
+      method: 'PATCH', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({only_self: requested, expected_revision: Number(input.dataset.revision)}),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || `保存查看范围失败（HTTP ${resp.status}）`);
+    input.checked = data.only_self;
+    input.dataset.revision = String(data.revision);
+    window.dispatchEvent(new Event('group-management-scope-changed'));
+    // Notify other tabs without storing identity or business records in the browser.
+    try { localStorage.setItem('group-management-scope-updated', String(Date.now())); } catch {}
+    showToast(data.only_self ? '已保存：群组管理仅看自己' : '已保存：群组管理查看全部', 'success');
+  } catch (e) {
+    input.checked = !requested;
+    // A lost response does not prove that the server rejected the save.
+    window.dispatchEvent(new Event('group-management-scope-changed'));
+    showToast(`保存群组管理查看范围失败：${e.message}；请重新打开设置核对已保存范围`, 'error');
+  } finally { input.disabled = false; }
+}
+
 $('stab-content-system')?.addEventListener('change', async e => {
+  if (e.target.id === 'setting-group-only-self') {
+    await saveGroupManagementScope(e.target);
+    return;
+  }
   const input = e.target.closest('#setting-comment-duplicate, #setting-survey-duplicate, #setting-google-forms-entry, #setting-report-quick-mode, #setting-report-postwrite');
   if (!input) return;
   const settingKey = {

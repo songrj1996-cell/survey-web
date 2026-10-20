@@ -1,6 +1,19 @@
 // Persistent quality tasks. Timers only fetch server state; they never advance progress.
 window.GroupTasks = (() => {
-  const root = $('group-tasks-panel'), api = window.workflowRequest;
+  const root = $('group-tasks-panel');
+  let scopeEpoch = 0;
+  const request = window.workflowRequest;
+  const api = async (...args) => {
+    const epoch = scopeEpoch;
+    try {
+      const value = await request(...args);
+      if (epoch !== scopeEpoch) throw Object.assign(new Error('查看范围已变更，已忽略旧请求结果'), {scopeChanged:true});
+      return value;
+    } catch(e) {
+      if (epoch !== scopeEpoch) throw Object.assign(new Error('查看范围已变更，已忽略旧请求结果'), {scopeChanged:true});
+      throw e;
+    }
+  };
   const statusNames = {awaiting_ai_confirmation:'待确认 AI 作答',draft:'待配置',input_issues:'输入待处理',ready:'待标注',queued:'排队中',running:'标注中',incomplete:'待补齐',annotation_done:'标注完成',awaiting_confirmation:'待确认',confirmed:'可结算'};
   let task = null, step = 1, dirty = false, listFilter = '', groupFilter = '', qualityFilter = '', showAllInputs = false, pollBusy = false;
   let uploadView=false, settingsView=false, requestBusy=0;
@@ -14,7 +27,7 @@ window.GroupTasks = (() => {
   const busy = () => task && ['queued','running'].includes(task.status);
   const editable = () => task?.can_edit && !busy();
   const disabled = () => editable() ? '' : 'disabled';
-  const error = e => showToast(e.message, 'error', 6500);
+  const error = e => { if (!e.scopeChanged) showToast(e.message, 'error', 6500); };
   async function mayLeave() { if (!dirty) return true; if (!await window.workflowConfirm('当前任务有未保存的填写。继续编辑会保留原文；放弃后才会切换页面。')) return false; dirty=false; aiChoices=null; changedFields.clear(); return true; }
   window.groupWorkflowMayLeave = mayLeave;
   window.groupWorkflowHasDraft = () => dirty;
@@ -713,7 +726,7 @@ async function uploadAnnotationFile(file) {
     zone.querySelector('.upload-zone__primary').textContent='正在读取：'+file.name;
     const form=new FormData();form.append('file',file);form.append('expected_version',String(task.version));
     task=await api(`/api/group-tasks/${task.id}/upload`,{method:'POST',body:form});dirty=false;uploadView=false;step=2;render();
-  }catch(e){error(e);renderUpload();}finally{requestBusy--;}
+  }catch(e){if(!e.scopeChanged){error(e);renderUpload();}}finally{requestBusy--;}
 }
 function renderInputs() {
   if(!task.headers.length||uploadView){renderUpload();return;}
@@ -801,7 +814,7 @@ async function annApplyQualityLabel(label) {
     task=await api(`/api/group-tasks/${task.id}/feedback/${result.id}/quality`,{method:'PUT',body:{expected_version:task.version,column_index:column,label,note:'逐题人工复核'}});
     annState.qualityReviewSaving=false;dirty=false;syncAnnotation();annElement('ann-done-text').innerHTML=annBuildDoneSummary();annRenderQualityPreview();
     showToast('人工标签已保存','success');
-  }catch(e){annState.qualityReviewSaving=false;annRenderQualityPreview();error(e);}
+  }catch(e){annState.qualityReviewSaving=false;if(!e.scopeChanged){annRenderQualityPreview();error(e);}}
 }
 function bindAIReview(){
 annElement('ann-ai-candidate-list').addEventListener('click', event => {
@@ -1008,5 +1021,14 @@ for (const filterId of [
       }
     }catch{}finally{pollBusy=false;}
   },3000);
+  window.addEventListener('group-management-scope-changed', () => {
+    scopeEpoch++; task=null; dirty=false; settingsView=false; aiChoices=null; clipboardPreview=null;
+    changedFields.clear(); latestList=[]; step=1;
+    Object.assign(annState, {headers:[], headersZh:[], openTextCols:[], aiResults:[], reviewAiResults:[],
+      qualityResults:[], qualityCount:0, aiReviewedIds:new Set(), confirmedAiIds:new Set(),
+      qualityReviewPlayerId:null, qualityReviewSaving:false, aiReviewSaving:false});
+    root.innerHTML='';
+    if (!root.classList.contains('panel--hidden')) list().catch(error);
+  });
   return {open,list};
 })();
