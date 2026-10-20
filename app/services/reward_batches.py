@@ -7,7 +7,8 @@ from fastapi import HTTPException
 
 from app.schemas.reward_roster import RewardAnalyzeRequest
 from app.services import group_tasks as tasks
-from app.services.feature_access import can_read, owner_identity, require_permission, require_record
+from app.services.feature_access import owner_identity, require_permission
+from app.services.group_access import can_read, record_scope, require_record
 from app.services.reward_roster import _build_conflicts, _build_result, _parse_account, analyze_reward_session, get_reward_session, delete_import, import_is_ready
 from app.services.auth import _get_user_permission_levels
 from app.core import config
@@ -22,30 +23,31 @@ def _ledger():
 
 def choices(login):
     require_permission(login, "reward")
+    access = record_scope(login)
+    may_write = not config.FEISHU_LOGIN_REQUIRED or _get_user_permission_levels(login).get("reward") == "use"
     ledger = _ledger()
     available = []
     for task in store.list_records("tasks"):
-        if not task.get("deleted_at") and can_read(task, login):
-            item = tasks.task_view(task, login, summary=True)
+        if not task.get("deleted_at") and access.can_read(task):
+            item = tasks.task_view(task, login, summary=True, access=access)
             item["consumed"] = ledger["claims"].get("task:" + task["id"])
             item["selectable"] = (tasks.reward_ready(task)
-                                  and task["owner_key"] == owner_identity(login)["owner_key"] and not item["consumed"])
+                                  and may_write and not item["consumed"])
             available.append(item)
     others = []
     for record in store.list_records("other_rewards"):
-        if can_read(record, login):
+        if access.can_read(record):
             item = deepcopy(record)
             item["consumed"] = ledger["claims"].get("other:" + item["id"])
-            item["selectable"] = item["owner_key"] == owner_identity(login)["owner_key"] and not item["consumed"]
+            item["selectable"] = may_write and not item["consumed"]
             others.append(item)
-    may_write = not config.FEISHU_LOGIN_REQUIRED or _get_user_permission_levels(login).get("reward") == "use"
     imports = [{**{key: record.get(key) for key in ("id", "filename", "owner_name", "analysis_request", "created_at")},
-                "can_delete": may_write, "selectable": may_write and record["owner_key"] == owner_identity(login)["owner_key"]}
-               for record in store.list_records("imports") if not record.get("deleted_at") and can_read(record, login) and import_is_ready(record)]
+                "can_delete": may_write, "selectable": may_write}
+               for record in store.list_records("imports") if not record.get("deleted_at") and access.can_read(record) and import_is_ready(record)]
     groups = [{"id": source["id"], "name": source["name"]} for source in store.list_records("sources") if source["enabled"]]
     return {"tasks": available, "other_rewards": others, "imports": imports, "groups": groups,
             "batches": [{key: batch.get(key) for key in ("id", "created_at", "owner_name", "dates", "total_diamonds", "unique_accounts")}
-                        for batch in ledger["batches"].values() if can_read(batch, login)]}
+                        for batch in ledger["batches"].values() if access.can_read(batch)]}
 
 
 async def create_other_reward(request, login):

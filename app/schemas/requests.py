@@ -1,5 +1,5 @@
 """所有 FastAPI 请求体模型(Pydantic)。由各 router 共用,只定义数据结构,不含业务逻辑。"""
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictBool
 from typing import Literal
 
 
@@ -105,6 +105,11 @@ class PromptUpdateRequest(BaseModel):
 
 class UiTextUpdateRequest(BaseModel):
     content: str
+
+
+class GroupManagementPreferencesPatch(BaseModel):
+    only_self: StrictBool
+    expected_revision: int = Field(ge=0)
 
 
 class AppSettingsPatch(BaseModel):

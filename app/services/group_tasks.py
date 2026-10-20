@@ -14,7 +14,8 @@ from fastapi import HTTPException
 from app.core import config
 from app.core.parsing import parse_file_with_cell_metadata
 from app.schemas.group_tasks import FeedbackMapping, TaskRules
-from app.services.feature_access import can_read, owner_identity, require_permission, require_record
+from app.services.feature_access import owner_identity, require_permission
+from app.services.group_access import record_scope, require_record
 from app.storage import group_workflow as store
 
 LABELS = ("优秀反馈", "有效反馈", "无效反馈")
@@ -763,7 +764,7 @@ def confirm_task(task_id, version, login):
     return store.mutate("tasks", task_id, apply)
 
 
-def task_view(task: dict, login, *, summary=False) -> dict:
+def task_view(task: dict, login, *, summary=False, access=None) -> dict:
     from app.services.task_records import aggregate_players
     # Re-evaluate legacy saved checks under the current workflow without rewriting history.
     task = deepcopy(task)
@@ -773,7 +774,7 @@ def task_view(task: dict, login, *, summary=False) -> dict:
         from app.services.annotate_workflow import group_column_metadata
         metadata = group_column_metadata([task["headers"], *[row["cells"] for row in task["feedback"]]])
         result.update({key: value for key, value in metadata.items() if key not in result})
-    result["can_edit"] = task["owner_key"] == owner_identity(login)["owner_key"]
+    result["can_edit"] = (access or record_scope(login)).can_read(task)
     from app.services.auth import _get_user_permission_levels
     result["can_edit"] = result["can_edit"] and _get_user_permission_levels(login).get("annotate") == "use"
     result["rules_locked"] = rules_locked(task)
@@ -835,7 +836,8 @@ def task_view(task: dict, login, *, summary=False) -> dict:
 
 def list_tasks(login, *, feature="annotate") -> list[dict]:
     require_permission(login, feature)
-    result = [task_view(task, login, summary=True) for task in store.list_records("tasks") if not task.get("deleted_at") and can_read(task, login)]
+    access = record_scope(login)
+    result = [task_view(task, login, summary=True, access=access) for task in store.list_records("tasks") if not task.get("deleted_at") and access.can_read(task)]
     result.sort(key=lambda item: item["created_at"], reverse=True)
     queue = sorted((item for item in store.list_records("tasks") if (item.get("run") or {}).get("status") == "queued"),
                    key=lambda item: (item["run"].get("schedule_at", item["run"]["queued_at"]), item["run"]["id"]))

@@ -167,7 +167,7 @@ class RewardImportReviewTests(WorkflowCase):
             self.assertFalse(store.read('imports', sid).get('deleted_at'))
             self.assertEqual(rewards.choices(other)['imports'], [])
             self.assertTrue(rewards.choices(admin)['imports'][0]['can_delete'])
-            self.assertFalse(rewards.choices(admin)['imports'][0]['selectable'])
+            self.assertTrue(rewards.choices(admin)['imports'][0]['selectable'])
             self.assertEqual(asyncio.run(request(admin)).status_code, 200)
             sid, _ = self.upload()
             with patch.object(auth, '_load_whitelist', return_value=[{'email': LOGIN['email'], 'enabled': True, 'perms_v': 4, 'perms': {'reward': 'read'}}]):

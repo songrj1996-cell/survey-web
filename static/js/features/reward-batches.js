@@ -1,5 +1,18 @@
 window.RewardBatches = (() => {
-  const root=$('reward-batches-panel'),api=window.workflowRequest,h=value=>esc(String(value??''));
+  const root=$('reward-batches-panel'),h=value=>esc(String(value??''));
+  let scopeEpoch=0;
+  const request=window.workflowRequest;
+  const api=async(...args)=>{
+    const epoch=scopeEpoch;
+    try{
+      const value=await request(...args);
+      if(epoch!==scopeEpoch)throw Object.assign(new Error('查看范围已变更，已忽略旧请求结果'),{scopeChanged:true});
+      return value;
+    }catch(e){
+      if(epoch!==scopeEpoch)throw Object.assign(new Error('查看范围已变更，已忽略旧请求结果'),{scopeChanged:true});
+      throw e;
+    }
+  };
   let data={tasks:[],other_rewards:[],imports:[],groups:[],batches:[]},dates=new Set(),selectedTasks=new Set(),selectedOthers=new Set(),selectedImports=new Set(),preview=null,batch=null,generationKey=null;
   const button=(action,label,primary=false,disabled=false,extra='')=>`<button type="button" class="btn ${primary?'btn--primary':'btn--ghost'}" data-rb="${action}" ${disabled?'disabled':''} ${extra}>${label}</button>`;
   function createGenerationKey(){
@@ -11,7 +24,7 @@ window.RewardBatches = (() => {
   }
   async function open({home=false}={}){
     if(home){dates.clear();selectedTasks.clear();selectedOthers.clear();selectedImports.clear();preview=null;batch=null;generationKey=null;}
-    root.classList.remove('panel--hidden');try{data=await api('/api/reward-batches/choices');render();}catch(e){showToast(e.message,'error');}
+    root.classList.remove('panel--hidden');try{data=await api('/api/reward-batches/choices');render();}catch(e){if(!e.scopeChanged)showToast(e.message,'error');}
   }
   function render(){
     root.innerHTML=`<div class="workflow-heading"><div><h1 class="panel__title">奖励整理</h1><p class="panel__desc">明确选择日期与来源，核对最新名单，再保存发奖 TXT 批次。</p></div>${button('refresh','刷新奖励列表',false,false,'title="更新任务、其他奖励与导入记录；核对名单请点击读取最新名单并预览"')}</div><div class="workflow-toolbar">${button('import','导入已有奖励 Excel',false,!PlatformPermissions.canUse('reward'))}${button('other','录入其他奖励',false,!PlatformPermissions.canUse('reward'))}${button('history','查看批次记录')}</div><div id="rb-other"></div><div id="rb-body"></div>`;
@@ -61,7 +74,7 @@ window.RewardBatches = (() => {
   function renderSources(){
     $('rb-sources').innerHTML=`<section class="workflow-card"><h2>2. 选择奖励来源</h2><h3>质量标注任务</h3>${data.tasks.filter(t=>dates.has(t.rules.payout_date)).map(t=>`<label class="workflow-source-choice"><input type="checkbox" data-rb-task="${t.id}" ${selectedTasks.has(t.id)?'checked':''} ${!t.selectable?'disabled':''}><span><strong>${h(t.rules.name)}</strong><small>${t.rules.group_name?h(t.rules.group_name)+' · ':''}${t.rules.payout_date} · ${h(t.owner_name)} · ${t.summary.base+t.summary.excellent} 钻${t.consumed?' · 已进入历史批次':!t.selectable?' · 标注未完成或无操作权限':''}</small></span>${t.consumed?button('batch','查看原批次',false,false,`data-id="${t.consumed}"`):''}</label>`).join('')||'<p class="workflow-muted">所选日期没有任务。完成所选标注和必要人工确认后即可选择，名单在此统一核对。</p>'}
       <h3>其他奖励</h3>${data.other_rewards.filter(r=>dates.has(r.payout_date)).map(r=>`<label class="workflow-source-choice"><input type="checkbox" data-rb-other="${r.id}" ${selectedOthers.has(r.id)?'checked':''} ${!r.selectable?'disabled':''}><span>${h(r.player_id)} · ${r.amount} 钻<small>${h(r.reason)} · ${h(r.identity.group_name)} · ${r.payout_date}${r.consumed?' · 已进入批次':''}</small></span></label>`).join('')||'<p class="workflow-muted">所选日期没有其他奖励。</p>'}
-      <h3>已有表格导入</h3>${data.imports.filter(i=>(i.analysis_request?.reward_dates||[]).some(date=>dates.has(date))).map(i=>`<div class="workflow-source-choice"><label class="workflow-import-label"><input type="checkbox" data-rb-import="${i.id}" ${selectedImports.has(i.id)?'checked':''} ${i.selectable===false||!(i.analysis_request?.reward_dates||[]).some(date=>dates.has(date))?'disabled':''}><span>${h(i.filename)}<small>上传人：${h(i.owner_name)} · 导入时间：${typeof i.created_at==='string'?h(workflowTime(i.created_at)):'旧记录未记录时间'}</small><small>发奖日期：${h((i.analysis_request?.reward_dates||[]).join('、'))}${i.selectable===false?' · 仅上传者可使用':''}</small></span></label>${i.can_delete?button('delete-import','删除',false,false,`data-id="${i.id}" aria-label="删除导入 ${h(i.filename)}"`):''}</div>`).join('')||'<p class="workflow-muted">所选日期没有已检查通过的导入记录。</p>'}</section>
+      <h3>已有表格导入</h3>${data.imports.filter(i=>(i.analysis_request?.reward_dates||[]).some(date=>dates.has(date))).map(i=>`<div class="workflow-source-choice"><label class="workflow-import-label"><input type="checkbox" data-rb-import="${i.id}" ${selectedImports.has(i.id)?'checked':''} ${i.selectable===false||!(i.analysis_request?.reward_dates||[]).some(date=>dates.has(date))?'disabled':''}><span>${h(i.filename)}<small>上传人：${h(i.owner_name)} · 导入时间：${typeof i.created_at==='string'?h(workflowTime(i.created_at)):'旧记录未记录时间'}</small><small>发奖日期：${h((i.analysis_request?.reward_dates||[]).join('、'))}${i.selectable===false?' · 当前仅可查看':''}</small></span></label>${i.can_delete?button('delete-import','删除',false,false,`data-id="${i.id}" aria-label="删除导入 ${h(i.filename)}"`):''}</div>`).join('')||'<p class="workflow-muted">所选日期没有已检查通过的导入记录。</p>'}</section>
       <div class="workflow-toolbar">${button('preview','读取最新名单并预览',true,!dates.size||!PlatformPermissions.canUse('reward'))}<span class="workflow-muted">预览不占用奖励来源，生成批次时才保存来源使用记录。</span></div>`;
     [['task',selectedTasks],['other',selectedOthers],['import',selectedImports]].forEach(([name,set])=>root.querySelectorAll(`[data-rb-${name}]`).forEach(input=>input.onchange=()=>{input.checked?set.add(input.dataset['rb'+name[0].toUpperCase()+name.slice(1)]):set.delete(input.dataset['rb'+name[0].toUpperCase()+name.slice(1)]);}));
   }
@@ -99,8 +112,10 @@ window.RewardBatches = (() => {
     $('rb-other-dialog').showModal();
   }
   async function acceptImport(identifier,explicitDates){
+    const epoch=scopeEpoch;
     dates=new Set(explicitDates);selectedImports.add(identifier);preview=null;batch=null;
     [1,2,3,4].forEach(i=>$(`rr-panel-${i}`).classList.add('panel--hidden'));await open();
+    if(epoch!==scopeEpoch)return;
     showToast('已保留导入映射和所选日期，请核对奖励来源后预览最新名单','success');
   }
   root.addEventListener('click',async e=>{
@@ -143,8 +158,14 @@ window.RewardBatches = (() => {
     }catch(err){
       if(err.detail?.preview){preview=err.detail.preview;generationKey=createGenerationKey();render();}
       if(err.detail?.candidates?.length&&$('rb-other-identity'))$('rb-other-identity').innerHTML=`<label class="workflow-field">选择匹配身份<select id="rb-other-candidate"><option value="">请选择</option>${err.detail.candidates.map(c=>`<option value="${c.key}">${h(c.group_name)} · ${h(c.ori)} · 第 ${c.row_number} 行</option>`).join('')}</select></label>`;
-      showToast(err.message,'error',7000);
+      if(!err.scopeChanged)showToast(err.message,'error',7000);
     }finally{if(b.isConnected)b.disabled=false;}
+  });
+  window.addEventListener?.('group-management-scope-changed',()=>{
+    scopeEpoch++;data={tasks:[],other_rewards:[],imports:[],groups:[],batches:[]};
+    dates.clear();selectedTasks.clear();selectedOthers.clear();selectedImports.clear();
+    preview=null;batch=null;generationKey=null;root.innerHTML='';
+    if(!root.classList.contains('panel--hidden'))open();
   });
   return {open,acceptImport};
 })();

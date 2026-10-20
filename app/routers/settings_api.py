@@ -10,6 +10,7 @@ from app.core.responses import _make_download_response
 from app.core.text import _short_text
 from app.schemas.requests import (
     AppSettingsPatch,
+    GroupManagementPreferencesPatch,
     GlossaryCreateRequest,
     GlossaryUpdateRequest,
     PromptUpdateRequest,
@@ -34,6 +35,7 @@ from app.services.settings_service import (
     get_app_settings_for_display as get_app_settings,
     get_upload_guide,
     update_app_settings,
+    update_group_management_preferences,
     update_prompt,
     update_ui_text,
 )
@@ -110,8 +112,16 @@ async def update_ui_text_endpoint(key: str, req: UiTextUpdateRequest, request: R
 
 @router.get("/api/app-settings")
 async def get_app_settings_endpoint(request: Request):
-    await _require_settings_access(request)
-    return get_app_settings()
+    login = await _require_settings_access(request)
+    return get_app_settings(login)
+
+
+@router.patch("/api/group-management/preferences")
+async def update_group_management_preferences_endpoint(req: GroupManagementPreferencesPatch, request: Request):
+    login = await _require_settings_access(request)
+    preferences, detail = update_group_management_preferences(login, req)
+    await audit_log(request, "settings", "修改群组管理个人查看范围", detail)
+    return preferences
 
 
 @router.patch("/api/app-settings")
