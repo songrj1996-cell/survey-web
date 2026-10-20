@@ -178,7 +178,7 @@ from app.services.report_modes import (
 from app.services.report_quick_pipeline import run_quick_pipeline
 from app.services.report_quick_outline import build_quick_outline
 from app.services.session_access import require_session_access
-from app.services.settings_service import get_app_settings, is_quick_report_enabled
+from app.services.settings_service import get_app_settings, is_quick_report_enabled, is_postwrite_report_enabled
 from app.services.report_quick_mode import (
     supports_quick_report, normalize_report_style, render_quick_report,
 )
@@ -2165,7 +2165,7 @@ def prepare_report_history_session(history_id: str, login, base_version=None) ->
     if not is_postwrite(base):
         return prepare_quick_history_session(history_id, login, base_version)
     validate_frozen(base["input_snapshot"])
-    if not postwrite_config.REPORT_POSTWRITE_ENABLED:
+    if not is_postwrite_report_enabled():
         raise HTTPException(status_code=409, detail="先写作后核验功能未启用；仍可查看和导出已有版本")
     sess = deepcopy(entry)
     sess.update(mode_fields("insight"))
@@ -2180,7 +2180,7 @@ def prepare_report_history_session(history_id: str, login, base_version=None) ->
 def _use_postwrite_engine(selected):
     if is_postwrite(selected):
         return True
-    return (postwrite_config.REPORT_POSTWRITE_ENABLED and resolve_report_mode(selected) == "insight"
+    return (is_postwrite_report_enabled() and resolve_report_mode(selected) == "insight"
             and selected.get("mode") not in {"crosstab", "quantitative", "comment", "interview"}
             and not normalize_report_versions(selected))
 
@@ -2285,7 +2285,7 @@ async def report_stream(session_id: str, request: Request, *, instruction: str =
 
 async def _postwrite_report_stream(session_id, request, *, instruction="", base_version=None, generation_kind=None, retry_failed=False):
     started = time.perf_counter()
-    if not postwrite_config.REPORT_POSTWRITE_ENABLED:
+    if not is_postwrite_report_enabled():
         raise ValueError("先写作后核验功能未启用；不会切换到另一套引擎")
     login = await _current_login(request)
     lock = _report_generation_lock(session_id)

@@ -4,6 +4,7 @@ from datetime import datetime
 
 from fastapi import HTTPException
 
+from app.core import config
 from app.schemas.requests import AppSettingsPatch
 from app.storage.prompts import (
     DEFAULT_PROMPTS,
@@ -87,6 +88,21 @@ def get_app_settings() -> dict:
     return _load_app_settings()
 
 
+def _postwrite_setting(settings: dict) -> bool:
+    return settings.get("report_postwrite_enabled", config.REPORT_POSTWRITE_ENABLED) is True
+
+
+def get_app_settings_for_display() -> dict:
+    """Expose the effective switch without persisting a new key on reads."""
+    settings = get_app_settings()
+    return {**settings, "report_postwrite_enabled": _postwrite_setting(settings)}
+
+
+def is_postwrite_report_enabled() -> bool:
+    """Read each new operation; a saved choice overrides the legacy environment default."""
+    return _postwrite_setting(get_app_settings())
+
+
 def is_quick_report_enabled() -> bool:
     """每次读取管理员开关；不依赖进程启动时的环境变量或缓存。"""
     return get_app_settings().get("report_quick_mode_enabled") is True
@@ -116,6 +132,11 @@ def update_app_settings(patch: AppSettingsPatch) -> tuple[dict, str]:
         details.append(
             f"快速报告模式：{'开启' if settings['report_quick_mode_enabled'] else '关闭'}"
         )
+    if patch.report_postwrite_enabled is not None:
+        settings["report_postwrite_enabled"] = bool(patch.report_postwrite_enabled)
+        details.append(
+            f"先写作后核验：{'开启' if settings['report_postwrite_enabled'] else '关闭'}"
+        )
     _save_app_settings(settings)
     detail = "；".join(details) or "平台设置未变更"
-    return settings, detail
+    return {**settings, "report_postwrite_enabled": _postwrite_setting(settings)}, detail

@@ -112,6 +112,7 @@ class AppSettingsPatch(BaseModel):
     survey_duplicate_reminder_enabled: bool | None = None
     google_forms_entry_enabled: bool | None = None
     report_quick_mode_enabled: bool | None = None
+    report_postwrite_enabled: bool | None = None
 
 
 class UserLlmKeyUpdateRequest(BaseModel):

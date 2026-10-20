@@ -97,6 +97,7 @@ async def fake_collect(messages, **kwargs):
 def runtime(sess, collect=fake_collect):
     with tempfile.TemporaryDirectory() as folder, ExitStack() as stack:
         stack.enter_context(patch.object(config, "REPORT_POSTWRITE_ENABLED", True))
+        stack.enter_context(patch.object(survey_service, "is_postwrite_report_enabled", return_value=True))
         stack.enter_context(patch.object(survey_service, "PostwriteRunStore", side_effect=lambda: RunStore(folder)))
         stack.enter_context(patch.object(survey_service, "get_session", side_effect=lambda sid: deepcopy(sess)))
         stack.enter_context(patch.object(survey_service, "_current_login", new=AsyncMock(return_value=None)))
@@ -743,7 +744,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("原文", second["qa_context_md"])
 
     async def test_old_versions_do_not_switch_when_flag_enabled(self):
-        with patch.object(config, "REPORT_POSTWRITE_ENABLED", True):
+        with patch.object(survey_service, "is_postwrite_report_enabled", return_value=True):
             self.assertFalse(survey_service._use_postwrite_engine({"report_md": "old", "report_mode": "insight"}))
             self.assertFalse(survey_service._use_postwrite_engine({"report_mode": "quick"}))
             self.assertFalse(survey_service._use_postwrite_engine({"report_mode": "statistics"}))
@@ -753,7 +754,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         sess = session()
         with runtime(sess):
             _ = [e async for e in survey_service.report_stream("flag-test", None)]
-        with runtime(sess), patch.object(config, "REPORT_POSTWRITE_ENABLED", False), patch.object(survey_service, "_full_report_stream") as old:
+        with runtime(sess), patch.object(survey_service, "is_postwrite_report_enabled", return_value=False), patch.object(survey_service, "_full_report_stream") as old:
             result = events([e async for e in survey_service.report_stream("flag-test", None, generation_kind="regenerate", base_version=1)])
         self.assertTrue(any(e["type"] == "error" for e in result))
         old.assert_not_called()

@@ -31,7 +31,7 @@ from app.services.glossary_service import (
 from app.services.settings_service import (
     get_all_prompts,
     get_all_ui_texts,
-    get_app_settings,
+    get_app_settings_for_display as get_app_settings,
     get_upload_guide,
     update_app_settings,
     update_prompt,

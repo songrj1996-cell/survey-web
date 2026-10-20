@@ -1909,6 +1909,14 @@ async function loadSystemSettings() {
           <span>开放快速总结</span>
         </label>
       </div>
+      <div class="uitext-card">
+        <div class="uitext-card__label">问卷分析·先写作后核验</div>
+        <div class="prompt-card__desc">开启后，新建的观点洞察报告先写作，再核验来源、原意和人数范围；核验结果在独立审阅面板查看。关闭后，新建报告使用原流程。保存后立即生效，无需重启；不会打断正在运行的任务，也不会重写已有报告。已有新流程报告需重新生成或继续核验时，请先开启。此设置对使用当前工作台的所有用户生效。</div>
+        <label class="setting-toggle">
+          <input type="checkbox" id="setting-report-postwrite" ${data.report_postwrite_enabled ? 'checked' : ''} />
+          <span>先写作后核验</span>
+        </label>
+      </div>
     `;
     if (!PlatformPermissions.canUse('platform')) body.querySelectorAll('input').forEach(el=>el.disabled=true);
   } catch (e) {
@@ -1917,13 +1925,14 @@ async function loadSystemSettings() {
 }
 
 $('stab-content-system')?.addEventListener('change', async e => {
-  const input = e.target.closest('#setting-comment-duplicate, #setting-survey-duplicate, #setting-google-forms-entry, #setting-report-quick-mode');
+  const input = e.target.closest('#setting-comment-duplicate, #setting-survey-duplicate, #setting-google-forms-entry, #setting-report-quick-mode, #setting-report-postwrite');
   if (!input) return;
   const settingKey = {
     'setting-comment-duplicate': 'comment_duplicate_reminder_enabled',
     'setting-survey-duplicate': 'survey_duplicate_reminder_enabled',
     'setting-google-forms-entry': 'google_forms_entry_enabled',
     'setting-report-quick-mode': 'report_quick_mode_enabled',
+    'setting-report-postwrite': 'report_postwrite_enabled',
   }[input.id];
   input.disabled = true;
   try {
@@ -1935,7 +1944,8 @@ $('stab-content-system')?.addEventListener('change', async e => {
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.detail || '保存失败');
     input.checked = !!data[settingKey];
-    showToast('平台设置已保存', 'success');
+    showToast(settingKey === 'report_postwrite_enabled'
+      ? `先写作后核验已${input.checked ? '开启' : '关闭'}，对后续操作立即生效` : '平台设置已保存', 'success');
     if (settingKey === 'report_quick_mode_enabled'
         && state.currentStep === 2 && state.sessionId
         && !state.reportStyleSelection?.locked
