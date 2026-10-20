@@ -1,11 +1,13 @@
 """Offline lifecycle tests; synthetic data and mock collectors only."""
 import asyncio
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, redirect_stdout
 from copy import deepcopy
+import io
 import json
 import tempfile
 import unittest
 from unittest.mock import AsyncMock, patch
+import httpx
 from app.core import config
 from app.services import survey_service, report_versions
 from app.services.report_modes import prepare_report_markdown
@@ -763,6 +765,31 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
 
 
 class WriterOutputLimitTests(unittest.IsolatedAsyncioTestCase):
+    @contextmanager
+    def truncated_messages(self):
+        from app.integrations import llm_client
+        requests = []
+        real_client = httpx.AsyncClient
+        wire = [
+            {"type": "message_start", "message": {"model": "claude-opus-5-5", "usage": {"input_tokens": 415768, "output_tokens": 0}}},
+            {"type": "content_block_delta", "delta": {"text": "PRIVATE_PARTIAL_DO_NOT_SAVE"}},
+            {"type": "message_delta", "delta": {"stop_reason": "max_tokens"}, "usage": {"output_tokens": 16000}},
+            {"type": "message_stop"},
+        ]
+        def respond(request):
+            requests.append(json.loads(request.content))
+            return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                content="".join("data: " + json.dumps(item) + "\n\n" for item in wire))
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(llm_client, "LLM_API_BASE", "https://model.invalid/v1"))
+            stack.enter_context(patch.object(llm_client, "LLM_API_KEY", "sk-PRIVATE_DO_NOT_LOG"))
+            stack.enter_context(patch.object(llm_client, "FEISHU_LOGIN_REQUIRED", False))
+            stack.enter_context(patch.object(llm_client, "LLM_REPORT_MAX_ATTEMPTS", 1))
+            stack.enter_context(patch.object(llm_client, "_protocol_order", return_value=["messages"]))
+            stack.enter_context(patch.object(httpx, "AsyncClient", side_effect=lambda **kw: real_client(
+                transport=httpx.MockTransport(respond), **kw)))
+            yield llm_client.collect_chat_completion, requests
+
     async def test_writer_64k_is_independent_of_registry_and_audit_limits(self):
         seen = []
         async def collect(messages, **kwargs):
@@ -778,7 +805,6 @@ class WriterOutputLimitTests(unittest.IsolatedAsyncioTestCase):
         # Explicit acceptance callers retain their existing output-token override.
         self.assertEqual(BoundedCaller(output_tokens=12000).writer_output_tokens, 12000)
 
-
     async def test_writer_reserves_the_full_cap_without_raising_total_budget(self):
         collect = AsyncMock()
         caller = BoundedCaller(collect=collect, max_tokens=50000)
@@ -788,6 +814,69 @@ class WriterOutputLimitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(caller.ledger, [])
         self.assertEqual(caller.max_tokens, 50000)
 
+    async def test_real_messages_truncation_keeps_diagnostic_and_usage_but_not_partial_text(self):
+        checkpoints = []
+        async def save(state):
+            checkpoints.append(deepcopy(state))
+        with self.truncated_messages() as (collect, requests):
+            result = await run_pipeline(freeze_inputs(session()), prompts=PROMPTS, collect=collect,
+                on_checkpoint=save, caller_options={"writer_output_tokens": 16000})
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0]["max_tokens"], 16000)
+        self.assertEqual(result["draft"], "")
+        self.assertEqual(result["steps"], {})
+        self.assertEqual(result["audit"]["checked_claims"], 0)
+        self.assertEqual(result["usage"]["tokens"], 431768)
+        self.assertTrue(result["usage"]["usage_complete"])
+        self.assertEqual(result["failure"]["error_category"], "output_truncated")
+        self.assertEqual(result["failure"]["http_status"], 200)
+        self.assertEqual(result["failure"]["output_cap"], 16000)
+        self.assertIn("截断", result["stop_reason"])
+        self.assertIn("16,000", result["stop_reason"])
+        self.assertEqual(checkpoints[-1], result)
+        rendered = json.dumps(result, ensure_ascii=False)
+        for secret in ("PRIVATE_PARTIAL_DO_NOT_SAVE", "PRIVATE_DO_NOT_LOG", "model.invalid"):
+            self.assertNotIn(secret, rendered)
+
+    async def test_service_emits_chinese_failure_usage_and_timestamped_log(self):
+        sess, terminal = session(), io.StringIO()
+        with tempfile.TemporaryDirectory() as folder:
+            store = RunStore(folder)
+            with self.truncated_messages() as (collect, requests), runtime(sess, collect), \
+                 patch.object(config, "POSTWRITE_WRITER_OUTPUT_TOKENS", 16000, create=True), \
+                 patch.object(survey_service, "PostwriteRunStore", return_value=store), redirect_stdout(terminal):
+                output = events([e async for e in survey_service.report_stream("synthetic-limit", None)])
+            saved = store.load(sess["postwrite_run_id"])["state"]
+        self.assertEqual(len(requests), 1)
+        self.assertFalse(any(e["type"] == "report_done" for e in output))
+        self.assertNotIn("report_versions", sess)
+        error = next(e for e in output if e["type"] == "error")
+        for text in ("截断", "16,000", "431,768"):
+            self.assertIn(text, error["message"])
+        status = next(e for e in output if e["type"] == "report_llm_status")
+        self.assertEqual(status["report_llm_usage"]["totals"]["total_tokens"], 431768)
+        self.assertEqual(status["report_llm_usage"]["totals"]["active_calls"], 0)
+        self.assertLess(output.index(status), output.index(error))
+        self.assertEqual(error["failure"], saved["failure"])
+        log = terminal.getvalue()
+        self.assertRegex(log, r"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}\+08:00\]")
+        for text in ("[失败]", "[问卷报告]", "初稿", "截断", "HTTP 状态：200", "431768"):
+            self.assertIn(text, log)
+        for secret in ("PRIVATE_PARTIAL_DO_NOT_SAVE", "PRIVATE_DO_NOT_LOG", "model.invalid"):
+            self.assertNotIn(secret, log + json.dumps(output, ensure_ascii=False))
+
+    async def test_unclassified_error_is_safe_and_unknown_usage_is_not_claimed_zero(self):
+        async def collect(messages, **kwargs):
+            raise RuntimeError("sk-PRIVATE_CREDENTIAL vendor-private-body")
+        sess, terminal = session(), io.StringIO()
+        with runtime(sess, collect), redirect_stdout(terminal):
+            output = events([e async for e in survey_service.report_stream("synthetic-unknown", None)])
+        error = next(e for e in output if e["type"] == "error")
+        self.assertIn("用量尚未完整返回", error["message"])
+        self.assertEqual(error["failure"]["error_category"], "unknown_error")
+        self.assertIsNone(error["failure"]["http_status"])
+        self.assertNotIn("PRIVATE_CREDENTIAL", terminal.getvalue() + json.dumps(output))
+        self.assertNotIn("vendor-private-body", terminal.getvalue() + json.dumps(output))
 
     async def test_successful_report_has_no_failure_and_unchanged_prompts_and_audit(self):
         seen = []
@@ -801,6 +890,18 @@ class WriterOutputLimitTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("failure", result)
         self.assertEqual(result["audit"]["status"], "complete")
 
+    async def test_retry_budget_stop_is_not_replaced_by_an_older_failure(self):
+        async def failed(messages, **kwargs):
+            raise RuntimeError("private-upstream-body")
+        frozen = freeze_inputs(session())
+        previous = await run_pipeline(frozen, prompts=PROMPTS, collect=failed)
+        self.assertIn("failure", previous)
+        forbidden = AsyncMock(side_effect=AssertionError("no automatic retry"))
+        result = await run_pipeline(frozen, prompts=PROMPTS, previous=previous, collect=forbidden)
+        self.assertIn("上次请求用量不完整", result["stop_reason"])
+        self.assertNotIn("failure", result)
+        self.assertEqual(len(result["calls"]), 1)
+        forbidden.assert_not_called()
 
 
 class StorageTests(unittest.TestCase):

@@ -24,6 +24,33 @@ def estimate_tokens(request):
     return int(sum(1.5 if ord(c) > 127 else 0.4 for c in text)) + 2048
 
 
+_ERROR_CATEGORIES = {
+    "output_truncated", "authentication_error", "rate_limited", "server_error",
+    "connect_timeout", "read_timeout", "write_timeout", "pool_timeout", "timeout",
+    "transport_error", "empty_output", "upstream_stream_error", "unexpected_error",
+    "protocol_incompatible", "usage_option_incompatible", "content_filtered",
+    "incomplete_output", "refusal", "http_error", "cancelled",
+}
+_TRUNCATED_REASONS = {"length", "max_tokens", "max_output_tokens"}
+
+
+def _call_failure(entry, error, model):
+    """Use structured upstream facts only; never persist exception bodies or text."""
+    terminal = next((e for e in reversed(entry["events"]) if e.get("status") in {"failed", "completed"}), {})
+    truncated = any(e.get("finish_reason") in _TRUNCATED_REASONS
+                    or e.get("error_category") == "output_truncated" for e in entry["events"])
+    category = "output_truncated" if truncated else terminal.get("error_category", "unknown_error")
+    stage = "初稿" if entry["stage"] == "writer" else "本批"
+    message = (f"{stage}输出达到本次上限（{entry['output_cap']:,} tokens），内容被截断，尚未完成。"
+               "本次已停止，没有自动重试。") if truncated else (
+                   f"模型调用失败（{type(error).__name__}），具体原因尚未确认。")
+    return {"stage": entry["stage"], "model": model, "error_type": type(error).__name__,
+            "error_category": category, "http_status": terminal.get("http_status"),
+            "finish_reason": next((e["finish_reason"] for e in reversed(entry["events"])
+                                   if e.get("finish_reason") in _TRUNCATED_REASONS), None),
+            "output_cap": entry["output_cap"], "message": message}
+
+
 class BoundedCaller:
     def __init__(self, *, collect=None, model=None, reasoning=None, max_calls=None, max_tokens=None,
                  max_seconds=None, call_seconds=None, output_tokens=None, registry_output_tokens=None,
@@ -65,6 +92,10 @@ class BoundedCaller:
         self.reserved += reserve
         async def event(item):
             safe = {k: deepcopy(item[k]) for k in ("event", "status", "attempt", "model", "protocol", "usage", "usage_complete", "finish_reason", "fallback") if k in item}
+            if type(item.get("http_status")) is int and 100 <= item["http_status"] <= 599:
+                safe["http_status"] = item["http_status"]
+            if item.get("error_category") in _ERROR_CATEGORIES:
+                safe["error_category"] = item["error_category"]
             entry["events"].append(safe)
             if item.get("usage"):
                 entry["usage"] = deepcopy(item["usage"])
@@ -86,6 +117,7 @@ class BoundedCaller:
             raise
         except Exception as exc:
             entry.update(state="failed", error_type=type(exc).__name__)
+            entry["failure"] = _call_failure(entry, exc, self.model)
             raise
         finally:
             entry["elapsed_seconds"] = round(time.monotonic() - started, 3)
@@ -237,6 +269,7 @@ async def run_pipeline(frozen, *, prompts, instruction="", previous=None, collec
         raise ValueError("来源、规则或模型配置与原核验不同，不能混用检查点")
     state = deepcopy(previous or {"identity": identity, "draft": "", "registry": None, "steps": {}, "calls": []})
     state.pop("registration_only", None)
+    state.pop("failure", None)
     state["stop_reason"] = ""
     state["prompts"] = deepcopy(prompts)
     state["instruction"] = instruction
@@ -379,7 +412,13 @@ async def run_pipeline(frozen, *, prompts, instruction="", previous=None, collec
         state["stop_reason"] = "cancelled"
     except Exception as exc:
         # Never expose vendor error bodies or credentials in persistent UI data.
-        state["stop_reason"] = str(exc) if isinstance(exc, (ValueError, BudgetStop)) else type(exc).__name__
+        failure = (state["calls"][-1].get("failure") if not isinstance(exc, BudgetStop) and state["calls"]
+                   and state["calls"][-1].get("state") == "failed" else None)
+        if failure:
+            state["failure"] = deepcopy(failure)
+            state["stop_reason"] = failure["message"]
+        else:
+            state["stop_reason"] = str(exc) if isinstance(exc, (ValueError, BudgetStop)) else type(exc).__name__
     finally:
         state["audit"] = audit_summary(state)
         if stop_after == "registry":

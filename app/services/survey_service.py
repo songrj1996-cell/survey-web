@@ -2369,7 +2369,27 @@ async def _postwrite_report_stream(session_id, request, *, instruction="", base_
         while not progress.empty():
             yield sse_event({"type": "analysis_progress", **progress.get_nowait()})
         if not result.get("draft"):
-            yield sse_event({"type": "error", "message": "初稿未完成，运行记录已保留：" + str(result.get("stop_reason", ""))})
+            tracker.finalize_open_attempts()
+            usage = result.get("usage") or {}
+            failure = result.get("failure") or {}
+            reason = result.get("stop_reason") or "尚未取得完整初稿，具体原因尚未确认。"
+            if not usage.get("requests"):
+                usage_note = "本轮未发起模型调用。"
+            elif usage.get("usage_complete"):
+                usage_note = f"本轮已记录用量：{int(usage.get('tokens', 0)):,} tokens。"
+            else:
+                usage_note = "本轮用量尚未完整返回，不能视为零用量。"
+            runtime_log(
+                "问卷报告", "error", "初稿生成失败",
+                session_id=session_id, run_id=run_id, stage="初稿写作",
+                model=failure.get("model") or postwrite_config.LLM_POSTWRITE_MODEL,
+                http_status=failure.get("http_status"), error=reason,
+                elapsed_seconds=result.get("elapsed_seconds"),
+                total_tokens=usage.get("tokens") if usage.get("usage_complete") else "尚未完整返回",
+            )
+            yield sse_event({"type": "report_llm_status", "report_llm_usage": tracker.snapshot()})
+            yield sse_event({"type": "error", "message": f"初稿未完成：{reason} {usage_note}运行记录已保留。",
+                             "run_id": run_id, "failure": failure, "usage": usage})
             return
         audit = {**result["audit"], "usage": result["usage"], "run_id": run_id, "checkpoint": result}
         tracker.finalize_open_attempts()
