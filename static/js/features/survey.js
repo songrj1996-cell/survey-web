@@ -368,10 +368,12 @@ function columnRowHTML(c, i) {
     <label class="qe-question-select"><input type="checkbox" data-question-select="${i}" ${selected?'checked':''} ${isSelectableColumn(c)?'':'disabled'} aria-label="选择 ${esc(name)}" /></label>
     <span class="col-row__num qe-question-number">${esc(columnSourceLabel(c,i,state.columns))}</span>
     <div class="qe-question-main"><strong>${esc(name)}</strong><div class="qe-question-preview">${preview.slice(0,3).map(v=>`<span>${esc(v)}</span>`).join('')}${preview.length>3?`<span>+${preview.length-3}</span>`:''}</div>${c.low_confidence?'<small class="qe-pending">待确认题型</small>':''}${isIdentityColumn(c)?'<small>身份字段 · 保留用于对应回答，不计入分析题数</small>':''}${isSubjectiveColumn(c)&&c.role!=='open_text'?'<small>包含已启用的其他填空</small>':''}${c.use_as_profile&&c.role==='open_text'?'<small class="qe-profile-notice">该题型不支持进入画像分析，已按仅标注处理</small>':''}</div>
+    <div class="qe-question-controls">
     <span class="qe-response-count">${Number.isFinite(Number(responseCount))&&responseCount!=null?`${Number(responseCount)} 份回复`:''}</span>
-    <select class="type-select" data-question-type="${i}" aria-label="${esc(name)}的题型">${options}</select>
+    <label class="qe-type-toggle"><span>题型</span><select class="type-select" data-question-type="${i}" aria-label="${esc(name)}的题型">${options}</select></label>
     <label class="qe-profile-toggle"><span>画像用途</span><select data-question-profile="${i}" ${PROFILE_LABEL_ROLES.includes(c.role)?'':'disabled'} aria-label="${esc(name)}的画像用途">${profileModeOptions(c)}</select></label>
     <button class="btn btn--ghost btn--sm" type="button" data-question-edit="${i}">编辑</button>
+    </div>
   </article>`;
 }
 function visibleQuestionIndexes() {
