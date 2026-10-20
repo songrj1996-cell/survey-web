@@ -7,7 +7,7 @@ import re
 import time
 from app.core import config
 from app.integrations.llm_client import collect_chat_completion
-from app.services.report_postwrite_inputs import fingerprint, validate_frozen
+from app.services.report_postwrite_inputs import fingerprint, validate_frozen, check_comparisons
 from app.services.report_postwrite_audit import (
     messages, parse_json, registry_payload, validate_registry, REGISTRY_FORMAT,
     meaning_payload, bind_meanings, count_scope, COUNT_FORMAT, bind_members, aggregate_count,
@@ -344,6 +344,12 @@ async def run_pipeline(frozen, *, prompts, instruction="", previous=None, collec
             await checkpoint()
         elif state.get("draft_fingerprint") != fingerprint(state["draft"]):
             raise ValueError("初稿指纹不一致")
+        comparison = state.get("comparison_validation") or {}
+        if (comparison.get("status") not in {"passed", "needs_review", "not_applicable"}
+                or comparison.get("draft_fingerprint") != state["draft_fingerprint"]
+                or comparison.get("input_fingerprint") != fingerprint(frozen)):
+            state["comparison_validation"] = check_comparisons(frozen, state["draft"])
+            await checkpoint()
         if state.get("registry_reuse"):
             raw = state.get("registry_raw", "")
             if hashlib.sha256(raw.encode("utf-8")).hexdigest() != state["registry_reuse"]["source_response_sha256"]:

@@ -2,6 +2,8 @@
 from copy import deepcopy
 import hashlib
 import json
+import re
+import time
 
 import survey_plan
 import survey_stats
@@ -9,6 +11,7 @@ from app.core.column_roles import question_type
 from app.services.report_modes import analysis_columns, freeze_report_inputs, question_key
 
 ENGINE = "postwrite-v1"
+COMPARISON_COVERAGE = "量表均值的最高/最低、两两关系、排序、名次和并列关系"
 
 
 def fingerprint(value):
@@ -61,6 +64,15 @@ def freeze_inputs(source):
               "research_task": deepcopy(source.get("qualitative_context") or {}), "plan": deepcopy(source.get("plan") or {}),
               "branches": deepcopy(source.get("branch_rules") or [])}
     frozen.update(report_engine=ENGINE, postwrite_packet=packet, packet_fingerprint=fingerprint(packet))
+    # Keep deterministic review data outside the writer/auditor packets. A review
+    # preparation failure must not prevent the unchanged writing flow from running.
+    comparison_source = {"source_fingerprint": frozen["source_fingerprint"]}
+    try:
+        comparison_source.update(status="ready", catalog=survey_stats.build_comparison_fact_catalog(rows, plan))
+    except Exception as exc:
+        comparison_source.update(status="failed", error_type=type(exc).__name__)
+    comparison_source["fingerprint"] = fingerprint(comparison_source)
+    frozen["comparison_source"] = comparison_source
     return frozen
 
 
@@ -69,6 +81,59 @@ def validate_frozen(frozen):
     if frozen.get("report_engine") != ENGINE or not isinstance(packet, dict) or fingerprint(packet) != frozen.get("packet_fingerprint"):
         raise ValueError("所选版本的冻结来源不完整或已变化，未发起模型调用")
     return deepcopy(packet)
+
+
+def check_comparisons(frozen, report):
+    """Run only the existing Python comparison rules; never repair the report."""
+    started = time.perf_counter()
+    result = {"status": "not_run", "coverage": COMPARISON_COVERAGE, "checked_claim_count": 0,
+              "catalog_group_count": 0, "detected_count": 0, "applied_count": 0,
+              "unresolved_count": 0, "changes": [], "unresolved": [], "auto_repair_attempted": False,
+              "draft_fingerprint": fingerprint(report), "input_fingerprint": fingerprint(frozen)}
+    try:
+        source = frozen.get("comparison_source")
+        if source is None:
+            # Old checkpoints have no comparison catalog. Absence of scale
+            # questions is provable from their frozen packet; missing scale
+            # evidence cannot be replaced by current session data or guessed.
+            questions = frozen.get("postwrite_packet", {}).get("questions", [])
+            if any(q.get("selected") and q.get("type") in {"scale", "matrix_scale"} for q in questions):
+                result["error"] = "此版本未保存量表比较依据，尚未执行比较校验；未使用其他版本或当前编辑的数据代替。"
+                return result
+            catalog = []
+        else:
+            payload = {k: v for k, v in source.items() if k != "fingerprint"}
+            if (source.get("fingerprint") != fingerprint(payload)
+                    or source.get("source_fingerprint") != frozen.get("source_fingerprint")):
+                raise ValueError("统计比较依据不一致")
+            if source.get("status") != "ready" or not isinstance(source.get("catalog"), list):
+                raise ValueError("统计比较依据未准备完成")
+            catalog = source["catalog"]
+        result["catalog_group_count"] = len(catalog)
+        if not catalog:
+            result.update(status="not_applicable", note="本版没有至少两个可按同一口径比较的量表项目；此状态不代表其他人数和比例已核验。")
+            return result
+        checked = survey_stats.analyze_comparison_claims(report, catalog)
+        for issue in checked.get("issues") or []:
+            headings = list(re.finditer(r"^#{1,6}\s+(.+?)\s*$", report[:int(issue.get("start") or 0)], re.MULTILINE))
+            result["unresolved"].append({
+                "claim_id": issue.get("claim_id"),
+                "section": headings[-1].group(1).strip() if headings else "报告正文",
+                "original": issue.get("original_sentence", ""), "reasons": deepcopy(issue.get("reasons") or []),
+                "factual_basis": " > ".join(f"{item['entity']} {float(item['value']):.2f}"
+                    for item in issue.get("expected_order") or []
+                    if item.get("entity") is not None and item.get("value") is not None),
+                "risk": "本次仅核对统计比较，未自动改写正文；请人工确认。",
+            })
+        result.update(status="needs_review" if result["unresolved"] else "passed",
+                      checked_claim_count=int(checked.get("checked_claim_count") or 0),
+                      detected_count=len(result["unresolved"]), unresolved_count=len(result["unresolved"]))
+    except Exception as exc:
+        result.update(status="failed", error_type=type(exc).__name__,
+                      error="本版统计比较校验执行失败，未据此判定正文正确；正文保持原样。")
+    finally:
+        result["elapsed_seconds"] = round(time.perf_counter() - started, 6)
+    return result
 
 
 def report_blocks(report):

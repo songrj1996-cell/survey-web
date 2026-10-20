@@ -1842,8 +1842,8 @@ function openComparisonValidationModal() {
 }
 
 function normalizedComparisonValidationStatus(validation = activeReportCtx()?.comparisonValidation) {
-  const status = String(validation?.status || 'legacy');
-  return ['passed', 'repaired', 'needs_review', 'incomplete', 'legacy'].includes(status)
+  const status = String(validation?.status || (activeReportCtx()?.reportAudit ? 'not_run' : 'legacy'));
+  return ['passed', 'repaired', 'needs_review', 'incomplete', 'legacy', 'not_applicable', 'not_run', 'failed'].includes(status)
     ? status
     : 'incomplete';
 }
@@ -1890,6 +1890,9 @@ function renderComparisonValidation(validation) {
     needs_review: '统计比较校验发现待确认风险',
     incomplete: '统计比较校验未完整执行',
     legacy: '此版本无统计比较校验记录',
+    not_applicable: '无适用的量表比较',
+    not_run: '统计比较校验尚未执行',
+    failed: '统计比较校验执行失败',
   };
   const detected = Number(audit.detected_count || 0);
   const applied = Number(audit.applied_count || 0);
@@ -1900,6 +1903,9 @@ function renderComparisonValidation(validation) {
     needs_review: unresolved ? `待确认 ${unresolved}` : '待确认',
     incomplete: '校验异常',
     legacy: '未校验',
+    not_applicable: '无适用项',
+    not_run: '未执行',
+    failed: '执行失败',
   };
 
   panel.dataset.status = status;
@@ -1913,7 +1919,7 @@ function renderComparisonValidation(validation) {
   );
   body.replaceChildren();
 
-  const needsAttention = status === 'needs_review' || status === 'incomplete';
+  const needsAttention = status === 'needs_review' || status === 'incomplete' || status === 'failed';
   alert.hidden = !needsAttention;
   alert.dataset.status = status;
   if (status === 'needs_review') {
@@ -1922,13 +1928,22 @@ function renderComparisonValidation(validation) {
   } else if (status === 'incomplete') {
     alertTitle.textContent = '统计比较校验未完整执行';
     alertText.textContent = '请人工检查报告中的量表比较结论，再决定是否导出使用。';
+  } else if (status === 'failed') {
+    alertTitle.textContent = '统计比较校验执行失败';
+    alertText.textContent = '本版没有完成统计比较复核，不能据此判断比较结论正确；报告正文保持原样。';
   }
 
-  if (status === 'legacy') {
+  if (['legacy', 'not_run', 'not_applicable', 'failed'].includes(status)) {
     countsNode.textContent = '';
+    const explanation = {
+      legacy: '此版本没有保存统计比较校验记录，不能据此判断是否执行过复核。',
+      not_run: '此版本尚未执行统计比较校验，不能据此判断比较结论已经通过复核。',
+      not_applicable: '本版没有至少两个可按同一口径比较的量表项目；此状态不代表其他人数和比例已核验。',
+      failed: '本版统计比较校验执行失败，未据此判定正文正确；报告正文保持原样。',
+    }[status];
     body.append(comparisonAuditRow(
       '说明',
-      '该版本生成于本校验功能上线之前，不能据此判断正文中的比较结论已经通过复核。',
+      audit.error || audit.note || explanation,
     ));
     return;
   }

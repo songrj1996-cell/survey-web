@@ -2362,6 +2362,19 @@ async def _postwrite_report_stream(session_id, request, *, instruction="", base_
             result = store.load(run_id)["state"]
         while not progress.empty():
             yield sse_event({"type": "analysis_progress", **progress.get_nowait()})
+        comparison = result.get("comparison_validation") or {}
+        if comparison:
+            status = comparison.get("status")
+            level, text = {
+                "passed": ("success", "本版可识别的量表比较已完成Python核对；其他人数和比例以各自核验结果为准"),
+                "needs_review": ("warning", "Python统计比较发现待人工确认项，报告正文保持原样"),
+                "not_applicable": ("info", "本版没有可按同一口径比较的量表项目，不代表其他人数和比例已核验"),
+                "not_run": ("warning", "本版缺少冻结的量表比较依据，未执行该项校验；报告正文保持原样"),
+            }.get(status, ("error", "本版Python统计比较校验执行失败，报告正文保持原样；请查看本轮记录"))
+            runtime_log("统计比较校验", level, text, session_id=session_id, run_id=run_id,
+                        status=status, checked_claim_count=comparison.get("checked_claim_count"),
+                        unresolved_count=comparison.get("unresolved_count"),
+                        elapsed_seconds=comparison.get("elapsed_seconds"))
         if not result.get("draft"):
             tracker.finalize_open_attempts()
             usage = result.get("usage") or {}
@@ -2388,6 +2401,7 @@ async def _postwrite_report_stream(session_id, request, *, instruction="", base_
         tracker.finalize_open_attempts()
         snapshot = {"report_mode": "insight", "report_style": "full", "report_status": audit["status"],
                     "report_md": result["draft"], "input_snapshot": frozen, "report_audit": audit,
+                    "comparison_validation": deepcopy(result.get("comparison_validation") or {"status": "not_run"}),
                     "title": result["draft"].splitlines()[0].lstrip("# ")[:150],
                     "qa_context_md": postwrite_qa_context(result["draft"], frozen, result["audit"]), "qa_messages": [],
                     "report_writer_provider": "direct_llm", "report_writer_model": postwrite_config.LLM_POSTWRITE_MODEL,

@@ -1028,7 +1028,179 @@ class RuntimeBudgetPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(again["draft"], first["draft"])
 
 
-class FailureDiagnosticTests(unittest.IsolatedAsyncioTestCase):
+def comparison_session():
+    from tests.test_report_comparison_consistency import _fixture
+    rows, plan = _fixture()
+    return {"rows": rows, "plan": plan, "report_mode": "insight", "mode": "standard",
+            "confirmed_columns": [{**c, "column_indexes": [c["index"]]} for c in plan["columns"]]}
+
+
+class ComparisonReviewTests(unittest.IsolatedAsyncioTestCase):
+    def test_no_scales_and_old_no_scale_checkpoints_are_not_applicable(self):
+        from app.services.report_postwrite_inputs import check_comparisons
+        frozen = freeze_inputs(session())
+        original = deepcopy(frozen)
+        result = check_comparisons(frozen, REPORT)
+        self.assertEqual(result["status"], "not_applicable")
+        self.assertEqual(result["checked_claim_count"], 0)
+        self.assertIn("不代表其他人数和比例已核验", result["note"])
+        self.assertEqual(frozen, original)
+        frozen.pop("comparison_source")
+        self.assertEqual(check_comparisons(frozen, REPORT)["status"], "not_applicable")
+
+    def test_existing_python_rules_detect_wrong_highest_without_repair(self):
+        from app.services.report_postwrite_inputs import check_comparisons
+        frozen = freeze_inputs(comparison_session())
+        wrong = "# 合成报告\n\n概念1的满意度均值为3.84，是三个概念中均值最高的一个。"
+        right = "# 合成报告\n\n概念3整体满意度均值3.92，是三个概念中均值最高的一个。"
+        original = deepcopy(frozen)
+        bad, good = check_comparisons(frozen, wrong), check_comparisons(frozen, right)
+        self.assertEqual(bad["status"], "needs_review")
+        self.assertEqual(bad["unresolved_count"], 1)
+        self.assertEqual(bad["unresolved"][0]["original"], wrong.split("\n\n")[1])
+        self.assertIn("概念3 3.92", bad["unresolved"][0]["factual_basis"])
+        self.assertEqual(bad["applied_count"], 0)
+        self.assertFalse(bad["auto_repair_attempted"])
+        self.assertEqual(good["status"], "passed")
+        self.assertEqual(good["checked_claim_count"], 1)
+        self.assertEqual(frozen, original)
+
+    def test_frozen_comparison_catalog_preserves_part_filter_scope(self):
+        source = comparison_session()
+        source["rows"] = [["分组", "整体", "整体", "整体"], ["A", "5", "1", "4"], ["B", "1", "4", "4"]]
+        source["confirmed_columns"].insert(0, {"column_indexes": [0], "role": "single_choice", "name": "分组"})
+        source["plan"]["parts"] = [
+            {"name": "A组", "column_indexes": [1], "filter": {"column_index": 0, "allowed_options": ["A"]}},
+            {"name": "B组", "column_indexes": [2], "filter": {"column_index": 0, "allowed_options": ["B"]}},
+            {"name": "全体", "column_indexes": [3]}]
+        frozen = freeze_inputs(source)
+        self.assertEqual(frozen["comparison_source"]["catalog"][0]["descending"], ["概念1", "概念2", "概念3"])
+
+    async def test_legacy_scale_checkpoint_stays_resumable_without_guessing_statistics(self):
+        frozen = freeze_inputs(comparison_session())
+        frozen.pop("comparison_source")
+        original_frozen = deepcopy(frozen)
+        seed = initial_draft_state(frozen, prompts=PROMPTS, draft=REPORT)
+        requests = []
+        async def collect(messages, **kwargs):
+            payload = json.loads(messages[-1]["content"])
+            self.assertTrue("blocks" in payload or "targets" in payload)
+            requests.append(messages)
+            return await fake_collect(messages, **kwargs)
+        result = await run_pipeline(frozen, prompts=PROMPTS, previous=seed, collect=collect)
+        self.assertEqual(result["comparison_validation"]["status"], "not_run")
+        self.assertIn("未保存量表比较依据", result["comparison_validation"]["error"])
+        self.assertEqual(result["audit"]["status"], "complete")
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(result["draft"], REPORT)
+        self.assertEqual(frozen, original_frozen)
+        self.assertNotIn("comparison_validation", seed)
+
+    async def test_comparison_preparation_failure_does_not_change_writer_request(self):
+        with patch("app.services.report_postwrite_inputs.survey_stats.build_comparison_fact_catalog",
+                   side_effect=RuntimeError("sk-PRIVATE vendor-body")):
+            frozen = freeze_inputs(session())
+        requests = []
+        async def collect(messages, **kwargs):
+            requests.append((deepcopy(messages), kwargs["max_tokens"], kwargs["models"], kwargs["max_http_attempts"]))
+            return await fake_collect(messages, **kwargs)
+        result = await run_pipeline(frozen, prompts=PROMPTS, instruction="保持原写作要求", collect=collect)
+        self.assertEqual(requests[0][0], [
+            {"role": "system", "content": PROMPTS["writer"]},
+            {"role": "user", "content": json.dumps({**frozen["postwrite_packet"], "instruction": "保持原写作要求"}, ensure_ascii=False)}])
+        self.assertNotIn("comparison_source", json.loads(requests[0][0][-1]["content"]))
+        self.assertEqual([r[1] for r in requests], [64000, 64000, 16000])
+        self.assertTrue(all(r[3] == 1 and r[2] == [config.LLM_POSTWRITE_MODEL] for r in requests))
+        self.assertEqual(result["draft"], REPORT)
+        self.assertEqual(result["prompts"], PROMPTS)
+        self.assertEqual(result["audit"]["status"], "complete")
+        self.assertEqual(result["comparison_validation"]["status"], "failed")
+        self.assertNotIn("PRIVATE", json.dumps(result, ensure_ascii=False))
+
+    async def test_check_runs_before_registry_and_completed_result_is_reused(self):
+        from app.services.report_postwrite_inputs import check_comparisons
+        checkpoints = []
+        async def save(state):
+            checkpoints.append(deepcopy(state))
+        async def collect(messages, **kwargs):
+            if "blocks" in json.loads(messages[-1]["content"]):
+                self.assertEqual(checkpoints[-1]["comparison_validation"]["status"], "not_applicable")
+            return await fake_collect(messages, **kwargs)
+        frozen = freeze_inputs(session())
+        with patch("app.services.report_postwrite_pipeline.check_comparisons", wraps=check_comparisons) as check:
+            first = await run_pipeline(frozen, prompts=PROMPTS, collect=collect, on_checkpoint=save)
+            forbidden = AsyncMock(side_effect=AssertionError("completed work must not run again"))
+            second = await run_pipeline(frozen, prompts=PROMPTS, previous=first, collect=forbidden)
+        self.assertEqual(check.call_count, 1)
+        forbidden.assert_not_called()
+        self.assertEqual(first["comparison_validation"], second["comparison_validation"])
+        self.assertEqual(first["draft"], second["draft"])
+
+    async def test_cached_result_for_a_different_draft_is_rechecked_without_model(self):
+        from app.services.report_postwrite_inputs import check_comparisons
+        frozen = freeze_inputs(session())
+        first = await run_pipeline(frozen, prompts=PROMPTS, collect=fake_collect)
+        first["comparison_validation"]["draft_fingerprint"] = "not-this-report"
+        with patch("app.services.report_postwrite_pipeline.check_comparisons", wraps=check_comparisons) as check:
+            second = await run_pipeline(frozen, prompts=PROMPTS, previous=first,
+                collect=AsyncMock(side_effect=AssertionError("must reuse complete model results")))
+        self.assertEqual(check.call_count, 1)
+        self.assertEqual(second["comparison_validation"]["draft_fingerprint"], second["draft_fingerprint"])
+        self.assertEqual(second["draft"], first["draft"])
+
+    async def test_comparison_error_is_safe_and_does_not_stop_the_audit(self):
+        frozen = freeze_inputs(comparison_session())
+        with patch("app.services.report_postwrite_inputs.survey_stats.analyze_comparison_claims",
+                   side_effect=ValueError("sk-PRIVATE vendor-body")):
+            result = await run_pipeline(frozen, prompts=PROMPTS, collect=fake_collect)
+        self.assertEqual(result["comparison_validation"]["status"], "failed")
+        self.assertEqual(result["draft"], REPORT)
+        self.assertEqual(result["audit"]["status"], "complete")
+        self.assertNotIn("PRIVATE", json.dumps(result, ensure_ascii=False))
+
+    def test_changed_comparison_evidence_is_not_reported_as_passed(self):
+        from app.services.report_postwrite_inputs import check_comparisons
+        frozen = freeze_inputs(comparison_session())
+        frozen["comparison_source"]["catalog"][0]["members"][0]["value"] = 99
+        result = check_comparisons(frozen, REPORT)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["error_type"], "ValueError")
+
+    async def test_service_keeps_statistics_result_when_registry_transport_fails(self):
+        sess = comparison_session()
+        draft = "# 合成报告\n\n概念1的满意度均值为3.84，是三个概念中均值最高的一个。"
+        terminal = io.StringIO()
+        async def collect(messages, **kwargs):
+            if "blocks" in json.loads(messages[-1]["content"]):
+                await kwargs["on_attempt_event"]({"status": "failed", "http_status": 200,
+                    "error_category": "transport_error", "error_type": "RemoteProtocolError",
+                    "request_id": "a" * 32, "call_id": "b" * 32,
+                    "usage": {"input_tokens": 100, "output_tokens": 5, "total_tokens": 105}, "usage_complete": False})
+                raise RuntimeError("vendor-private-body sk-PRIVATE")
+            await kwargs["on_attempt_event"]({"status": "completed", "usage_complete": True,
+                "usage": {"input_tokens": 100, "output_tokens": 40, "total_tokens": 140}})
+            return draft, "fake"
+        with runtime(sess, collect), redirect_stdout(terminal):
+            output = events([e async for e in survey_service.report_stream("comparison-retained", None)])
+        saved = report_versions.resolve_report_version(sess, 1)
+        self.assertEqual(saved["report_md"], draft)
+        self.assertEqual(saved["comparison_validation"]["status"], "needs_review")
+        self.assertEqual(saved["report_audit"]["status"], "partial")
+        self.assertEqual(prepare_report_markdown(saved), draft)
+        failure = saved["report_audit"]["checkpoint"]["failure"]
+        self.assertEqual(failure["error_type"], "RemoteProtocolError")
+        self.assertEqual(failure["wrapper_error_type"], "RuntimeError")
+        self.assertEqual(failure["call_id"], "b" * 32)
+        self.assertIn("传输错误", saved["report_audit"]["stop_reason"])
+        self.assertNotIn("超时", saved["report_audit"]["stop_reason"])
+        self.assertEqual(saved["report_audit"]["usage"]["requests"], 2)
+        log = terminal.getvalue()
+        self.assertEqual(log.count("[统计比较校验]"), 1)
+        self.assertIn("待人工确认", log)
+        self.assertLess(log.index("正在撰写初稿"), log.index("[统计比较校验]"))
+        self.assertRegex(log, r"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}\+08:00\]")
+        self.assertNotIn("PRIVATE", log + json.dumps(output, ensure_ascii=False))
+
     async def test_real_http_stream_error_preserves_safe_attempt_identifiers_and_subtype(self):
         from app.integrations import llm_client
         class BrokenStream(httpx.AsyncByteStream):
