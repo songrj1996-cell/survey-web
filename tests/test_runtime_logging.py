@@ -10,6 +10,51 @@ from app.core import runtime_logging
 
 
 class RuntimeLoggingTests(unittest.TestCase):
+    def access(self, method, path, status=200, *, streaming=None):
+        runtime_logging.register_access_operator(("127.0.0.1", 50401), "日志测试员", streaming=streaming)
+        record = logging.LogRecord(
+            "uvicorn.access", logging.INFO, "", 0, '%s - "%s %s HTTP/%s" %d',
+            ("127.0.0.1:50401", method, path, "1.1", status), None,
+        )
+        return runtime_logging.HumanAccessFormatter().format(record)
+
+    def test_survey_access_logs_name_each_real_step(self):
+        cases = (
+            ("POST", "/api/upload", "读取上传的问卷数据"),
+            ("POST", "/api/analysis-settings/sid", "保存报告模式和分析设置"),
+            ("POST", "/api/columns/sid/confirm", "确认问卷数据列"),
+            ("POST", "/api/survey-context/sid", "保存调研背景"),
+            ("POST", "/api/stats/sid", "计算问卷统计结果"),
+            ("GET", "/api/report/sid/options", "读取报告生成选项"),
+            ("GET", "/api/report/sid?version=1", "读取已保存的报告版本"),
+            ("GET", "/api/report/sid/versions", "读取报告版本列表"),
+            ("POST", "/api/report/sid/versions", "重新生成报告"),
+            ("POST", "/api/report/sid/retry-failed", "补全报告未完成项"),
+            ("POST", "/api/report/sid/cancel", "提交停止生成请求"),
+        )
+        for method, path, phrase in cases:
+            with self.subTest(path=path):
+                rendered = self.access(method, path, streaming=False)
+                self.assertIn(phrase, rendered)
+                self.assertNotIn("处理系统请求", rendered)
+
+    def test_streaming_success_never_claims_task_completed(self):
+        for path in ("/api/report/sid", "/api/columns/sid", "/api/plan/sid", "/api/plan/confirm"):
+            with self.subTest(path=path):
+                rendered = self.access("GET", path, streaming=True)
+                self.assertIn("[进行中]", rendered)
+                self.assertIn("连接已建立", rendered)
+                self.assertNotIn("处理报告任务完成", rendered)
+                self.assertNotIn("生成问卷报告完成", rendered)
+        self.assertIn("确认分析方案完成", self.access("POST", "/api/plan/confirm", streaming=False))
+        self.assertIn("调整分析方案", self.access("POST", "/api/plan/confirm", streaming=True))
+
+    def test_missing_response_metadata_is_conservative_and_consumed_once(self):
+        self.assertIn("不能确认任务完成", self.access("GET", "/api/report/sid"))
+        self.assertIn("读取已保存的报告版本完成", self.access("GET", "/api/report/sid?version=1"))
+        self.assertIn("当前账号没有操作权限", self.access("GET", "/api/report/sid", 403, streaming=True))
+        self.assertIn("服务器处理时出错", self.access("GET", "/api/report/sid", 500, streaming=True))
+
     def test_runtime_log_is_timestamped_and_plain_language(self):
         output = io.StringIO()
         with patch.object(

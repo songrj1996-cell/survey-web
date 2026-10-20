@@ -13,13 +13,13 @@ import re
 import sys
 import threading
 import time
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 
 _OUTPUT_LOCK = threading.Lock()
 _ACCESS_OPERATOR_LOCK = threading.Lock()
 _ACCESS_OPERATOR_TTL_SECONDS = 120.0
-_ACCESS_OPERATORS: dict[str, tuple[str, float]] = {}
+_ACCESS_OPERATORS: dict[str, tuple[str, float, bool | None]] = {}
 _RUNTIME_OPERATOR: ContextVar[str] = ContextVar(
     "runtime_log_operator",
     default="系统任务",
@@ -48,6 +48,7 @@ _FIELD_LABELS = {
     "elapsed_seconds": "耗时",
     "email": "邮箱",
     "error": "原因",
+    "error_type": "异常类型",
     "examples": "示例",
     "expected": "预期数",
     "fallback": "使用备用方案",
@@ -66,6 +67,7 @@ _FIELD_LABELS = {
     "model_issues": "模型审校问题数",
     "open_id": "飞书用户标识",
     "output_tokens": "输出 Token",
+    "output_limit": "本次输出长度上限（Token）",
     "parsed": "解析数",
     "pages": "页数",
     "part_index": "章节序号",
@@ -94,15 +96,29 @@ _FIELD_LABELS = {
     "unmatched_count": "无法对应的数字数",
     "url": "地址",
     "valid_rows": "有效行数",
+    "version": "报告版本",
     "viewpoint_blocks": "观点块数",
 }
 
 _FIELD_VALUE_LABELS = {
     "phase": {
         "planning": "制定分析方案",
+        "themes": "整理回答主题",
+        "synthesis": "综合分析各项发现",
         "writing": "撰写报告",
         "review": "审校报告",
         "finalize": "整理最终结果",
+    },
+    "step": {
+        "large_sample_report": "撰写大样本报告",
+        "title": "撰写报告开头",
+        "part": "撰写报告章节",
+        "bug_check": "复核问题清单",
+        "core": "撰写核心发现",
+        "core_review": "复核核心发现",
+        "action": "撰写建议",
+        "action_repair": "修订建议",
+        "comparison_repair": "修订数字比较表述",
     },
     "stage": {
         "extract": "提取访谈材料",
@@ -205,7 +221,7 @@ def _client_key(client: object) -> str:
     return str(client or "").strip()
 
 
-def register_access_operator(client: object, operator: str) -> None:
+def register_access_operator(client: object, operator: str, *, streaming: bool | None = None) -> None:
     """暂存一次 HTTP 访问日志的操作人；formatter 读取后立即删除。"""
     key = _client_key(client)
     if not key:
@@ -215,24 +231,28 @@ def register_access_operator(client: object, operator: str) -> None:
         if len(_ACCESS_OPERATORS) >= 2000:
             expired_before = now - _ACCESS_OPERATOR_TTL_SECONDS
             expired = [
-                item_key for item_key, (_value, created) in _ACCESS_OPERATORS.items()
-                if created < expired_before
+                item_key for item_key, item in _ACCESS_OPERATORS.items()
+                if item[1] < expired_before
             ]
             for item_key in expired:
                 _ACCESS_OPERATORS.pop(item_key, None)
             if len(_ACCESS_OPERATORS) >= 2000:
                 oldest = min(_ACCESS_OPERATORS, key=lambda item_key: _ACCESS_OPERATORS[item_key][1])
                 _ACCESS_OPERATORS.pop(oldest, None)
-        _ACCESS_OPERATORS[key] = (_safe_operator_text(operator), now)
+        _ACCESS_OPERATORS[key] = (_safe_operator_text(operator), now, streaming)
 
 
 def _take_access_operator(client: object) -> str:
+    return _take_access_context(client)[0]
+
+
+def _take_access_context(client: object) -> tuple[str, bool | None]:
     key = _client_key(client)
     with _ACCESS_OPERATOR_LOCK:
         item = _ACCESS_OPERATORS.pop(key, None)
     if item and time.monotonic() - item[1] <= _ACCESS_OPERATOR_TTL_SECONDS:
-        return item[0] or "身份无法识别"
-    return current_runtime_operator()
+        return item[0] or "身份无法识别", item[2]
+    return current_runtime_operator(), None
 
 
 def _operator_suffix(operator: str | None = None) -> str:
@@ -306,6 +326,29 @@ def runtime_log(area: str, level: str, message: str, **fields: object) -> None:
 
 def _http_action(method: str, raw_path: str) -> tuple[str, str]:
     path = raw_path.split("?", 1)[0]
+    survey_actions = (
+        (r"/api/upload", "读取上传的问卷数据"),
+        (r"/api/analysis-settings/[^/]+", "保存报告模式和分析设置"),
+        (r"/api/columns/[^/]+/confirm", "确认问卷数据列"),
+        (r"/api/columns/[^/]+", "识别问卷题型"),
+        (r"/api/survey-context/[^/]+", "保存调研背景"),
+        (r"/api/analysis-presets/[^/]+/apply", "应用已保存的分析思路"),
+        (r"/api/plan/confirm", "确认或调整分析方案"),
+        (r"/api/plan/[^/]+", "制定分析方案"),
+        (r"/api/stats/[^/]+", "计算问卷统计结果"),
+        (r"/api/report/[^/]+/options", "读取报告生成选项"),
+        (r"/api/report/[^/]+/prepare-rerun", "准备重新生成报告"),
+        (r"/api/report/[^/]+/retry-failed", "补全报告未完成项"),
+        (r"/api/report/[^/]+/cancel", "提交停止生成请求"),
+        (r"/api/report/[^/]+/versions/[^/]+", "删除报告版本"),
+        (r"/api/report/[^/]+/versions", "读取报告版本列表" if method == "GET" else "重新生成报告"),
+        (r"/api/report/[^/]+/sources/translate", "翻译报告引用原文"),
+        (r"/api/report/[^/]+/sources", "读取报告引用原文"),
+        (r"/api/report/[^/]+", "读取已保存的报告版本" if "version" in parse_qs(urlsplit(raw_path).query) else "生成问卷报告"),
+    )
+    for pattern, action in survey_actions:
+        if re.fullmatch(pattern, path):
+            return "问卷报告", action
     if path == "/":
         return "页面", "打开调研分析平台"
     if path.startswith("/static/") or path == "/favicon.ico":
@@ -451,9 +494,10 @@ class HumanAccessFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         operator = current_runtime_operator()
+        streaming = None
         try:
             if isinstance(record.args, (tuple, list)) and record.args:
-                operator = _take_access_operator(record.args[0])
+                operator, streaming = _take_access_context(record.args[0])
         except Exception:
             pass
         try:
@@ -464,6 +508,17 @@ class HumanAccessFormatter(logging.Formatter):
             area, action = _http_action(method, path)
             history_detail = bool(re.fullmatch(r"/api/history/[^/?]+", path.split("?", 1)[0]))
             level, result = _http_result(status, history_detail=history_detail)
+            if 200 <= status < 300:
+                if streaming:
+                    level = "progress"
+                    result = "：结果传输连接已建立；任务是否完成请看后续处理日志"
+                elif streaming is None and re.fullmatch(
+                    r"/api/(?:columns/[^/]+|plan/[^/]+|report/[^/]+(?:/versions|/retry-failed)?)", path.split("?", 1)[0]
+                ) and "version" not in parse_qs(urlsplit(path).query):
+                    level = "info"
+                    result = "：请求已接收；仅凭 HTTP 状态不能确认任务完成"
+                if path.split("?", 1)[0] == "/api/plan/confirm" and streaming is not None:
+                    action = "调整分析方案" if streaming else "确认分析方案"
             label = _LEVEL_LABELS[level]
             display_path = _display_request_path(path)
             return (

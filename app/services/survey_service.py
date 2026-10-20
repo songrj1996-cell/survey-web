@@ -49,6 +49,7 @@ from app.core.parsing import _parse_file
 from app.core.llm_context import current_llm_api_key
 from app.core.responses import sse_event
 from app.core.runtime_logging import runtime_log
+from app.services.report_runtime_logging import log_survey_stream, report_log_phase, report_log_failure, report_log_run
 from app.core.security import (
     _assign_session_owner,
     _find_history_for_login,
@@ -267,7 +268,7 @@ def _report_writer_attempt_callback(
             level, message = {
                 "started": ("progress", "模型请求已经发出"),
                 "completed": ("success", "模型请求已经完成"),
-                "failed": ("warning", "模型请求失败，系统将按既定策略重试或降级"),
+                "failed": ("warning", "本次模型请求失败；是否重试或使用备用模型请看后续处理记录"),
             }[event_status]
             usage_fields = entry.get("usage") or {}
             runtime_log(
@@ -895,6 +896,7 @@ def _json_repair_messages(
     ]
 
 
+@log_survey_stream("columns")
 async def columns_stream(session_id: str, request: Request):
     """LLM 列题型识别 SSE 流程（async generator）。"""
     sess = get_session(session_id)
@@ -1089,11 +1091,7 @@ async def columns_stream(session_id: str, request: Request):
         )
         yield sse_event({"type": "columns_ready", "columns": _column_display_metadata(sess, questions)})
     except Exception as e:
-        runtime_log(
-            "问卷处理", "error", "识别问卷题型失败",
-            session_id=session_id,
-            error=e,
-        )
+        report_log_failure(session_id, error=e, prefix="识别问卷题型失败")
         yield sse_event({"type": "error", "message": str(e)})
 
 
@@ -1525,6 +1523,7 @@ def prepare_duplicate_report_rerun(
 # ── 方案生成 SSE ────────────────────────────────────────────────
 
 
+@log_survey_stream("plan")
 async def plan_stream(session_id: str, request: Request):
     """分析方案生成 SSE 流程（async generator）。"""
     sess = get_session(session_id)
@@ -1747,11 +1746,7 @@ async def plan_stream(session_id: str, request: Request):
         )
         yield sse_event({"type": "plan_ready", "plan": plan, "card_text": card_text, "headers": headers})
     except Exception as e:
-        runtime_log(
-            "问卷报告", "error", "生成分析方案失败",
-            session_id=session_id,
-            error=e,
-        )
+        report_log_failure(session_id, error=e, prefix="生成分析方案失败")
         yield sse_event({"type": "error", "message": str(e)})
 
 
@@ -1784,6 +1779,7 @@ def _record_successful_plan_revision(sess: dict, user_text: str) -> None:
         sess["analysis_preference_fingerprint"] = fingerprint
 
 
+@log_survey_stream("plan_revision")
 async def plan_revision_stream(session_id: str, user_text: str, request: Request):
     """方案修订 SSE 流程（async generator）。"""
     sess = get_session(session_id)
@@ -1962,11 +1958,7 @@ async def plan_revision_stream(session_id: str, user_text: str, request: Request
         )
         yield sse_event({"type": "plan_ready", "plan": new_plan, "card_text": card_text, "headers": headers})
     except Exception as e:
-        runtime_log(
-            "问卷报告", "error", "修订分析方案失败",
-            session_id=session_id,
-            error=e,
-        )
+        report_log_failure(session_id, error=e, prefix="修订分析方案失败")
         yield sse_event({"type": "error", "message": str(e)})
 
 
@@ -2188,6 +2180,7 @@ def _use_postwrite_engine(selected):
             and not normalize_report_versions(selected))
 
 
+@log_survey_stream("report")
 async def report_stream(session_id: str, request: Request, *, instruction: str = "",
                         base_version: int | None = None, generation_kind: str | None = None,
                         retry_failed: bool = False):
@@ -2341,6 +2334,7 @@ async def _postwrite_report_stream(session_id, request, *, instruction="", base_
         inputs = {"frozen": frozen, "prompts": prompts, "instruction": instruction,
                   "base_version": base["version"] if base else None, "owner_key": _history_owner_key(owner)}
         run_id = store.create(inputs, previous)
+        report_log_run(run_id)
         latest = deepcopy(require_session_access(session_id, login, loader=get_session))
         latest["postwrite_run_id"] = run_id
         save_session(session_id, latest)
@@ -2379,12 +2373,11 @@ async def _postwrite_report_stream(session_id, request, *, instruction="", base_
                 usage_note = f"本轮已记录用量：{int(usage.get('tokens', 0)):,} tokens。"
             else:
                 usage_note = "本轮用量尚未完整返回，不能视为零用量。"
-            runtime_log(
-                "问卷报告", "error", "初稿生成失败",
-                session_id=session_id, run_id=run_id, stage="初稿写作",
+            report_log_phase("writer")
+            report_log_failure(
+                session_id, prefix="初稿生成失败", failure=failure,
                 model=failure.get("model") or postwrite_config.LLM_POSTWRITE_MODEL,
-                http_status=failure.get("http_status"), error=reason,
-                elapsed_seconds=result.get("elapsed_seconds"),
+                http_status=failure.get("http_status"),
                 total_tokens=usage.get("tokens") if usage.get("usage_complete") else "尚未完整返回",
             )
             yield sse_event({"type": "report_llm_status", "report_llm_usage": tracker.snapshot()})
@@ -2403,6 +2396,7 @@ async def _postwrite_report_stream(session_id, request, *, instruction="", base_
         latest = deepcopy(require_session_access(session_id, login, loader=get_session))
         precommit = deepcopy(latest)
         latest.update(mode_fields("insight"))
+        report_log_phase("saving")
         if target_id:
             from app.storage.history import mutate_history
             def persist(history):
@@ -2623,6 +2617,7 @@ async def _quick_report_stream(session_id: str, request: Request, *, instruction
         precommit = deepcopy(latest)
         latest.update(mode_fields("quick"))
         latest.update(timing)
+        report_log_phase("saving")
         if retry_failed:
             history_id = target_id or session_id
             history_entry = _find_history_for_login(_load_history(), history_id, login)
@@ -2688,6 +2683,7 @@ async def _full_report_stream(
     writer_models_used: list[str] = []
     report_llm_usage = _ReportLLMUsageTracker()
     report_run_id = uuid.uuid4().hex
+    report_log_run(report_run_id)
 
     def _new_writer_messages() -> list[dict]:
         return [{"role": "system", "content": _get_report_writer_system_prompt()}]
@@ -3659,6 +3655,7 @@ async def _full_report_stream(
             "comparison_validation": comparison_validation,
             **completion_timing,
         }
+        report_log_phase("saving")
         if rerun_history_id:
             if str(sess.get("rerun_target_history_id") or "").strip() != rerun_history_id:
                 raise ValueError("历史重跑目标已变化，本次结果未保存")
@@ -3731,12 +3728,7 @@ async def _full_report_stream(
             **_session_report_version_payload(sess),
         })
     except Exception as e:
-        runtime_log(
-            "问卷报告", "error", "生成报告失败",
-            session_id=session_id,
-            stage="report_generation",
-            error=e,
-        )
+        report_log_failure(session_id, error=e, prefix="生成报告失败")
         report_llm_usage.finalize_open_attempts()
         yield _report_llm_status_event()
         yield sse_event({"type": "error", "message": str(e)})

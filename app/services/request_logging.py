@@ -41,7 +41,19 @@ class RequestLoggingContextMiddleware:
 
         token = bind_runtime_operator(operator)
         register_access_operator(scope.get("client"), operator)
+        async def send_with_log_context(message):
+            if message.get("type") == "http.response.start":
+                try:
+                    headers = dict(message.get("headers") or [])
+                    content_type = headers.get(b"content-type", b"").split(b";", 1)[0].strip().lower()
+                    register_access_operator(
+                        scope.get("client"), operator,
+                        streaming=content_type == b"text/event-stream",
+                    )
+                except Exception:
+                    pass  # Logging metadata must never affect the HTTP response.
+            await send(message)
         try:
-            await self.app(scope, receive, send)
+            await self.app(scope, receive, send_with_log_context)
         finally:
             reset_runtime_operator(token)

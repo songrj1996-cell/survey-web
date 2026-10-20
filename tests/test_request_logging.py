@@ -40,6 +40,48 @@ async def _receive():
 
 
 class RequestLoggingContextTests(unittest.IsolatedAsyncioTestCase):
+    async def test_access_log_at_response_headers_distinguishes_mixed_plan_endpoint(self):
+        for content_type in (b"application/json", b"text/event-stream; charset=utf-8"):
+            with self.subTest(content_type=content_type):
+                scope = _scope()
+                scope.update(path="/api/plan/confirm", method="POST")
+                messages, lines = [], []
+
+                async def app(_scope, _receive, send):
+                    await send({"type": "http.response.start", "status": 200,
+                                "headers": [(b"content-type", content_type)]})
+                    await send({"type": "http.response.body", "body": b"unchanged"})
+
+                async def capture(message):
+                    messages.append(message)
+                    if message["type"] == "http.response.start":
+                        record = logging.LogRecord("uvicorn.access", logging.INFO, "", 0,
+                            '%s - "%s %s HTTP/%s" %d',
+                            ("127.0.0.1:50000", "POST", "/api/plan/confirm", "1.1", 200), None)
+                        lines.append(HumanAccessFormatter().format(record))
+
+                with patch.object(request_logging, "_login_for_request_logging",
+                                  return_value={"name": "合成用户", "email": "private@example.test"}):
+                    await request_logging.RequestLoggingContextMiddleware(app)(scope, _receive, capture)
+                self.assertEqual(messages[-1]["body"], b"unchanged")
+                self.assertIn("操作人：合成用户", lines[0])
+                self.assertNotIn("private@example.test", lines[0])
+                self.assertIn("调整分析方案：结果传输连接已建立" if content_type.startswith(b"text/event-stream")
+                              else "确认分析方案完成", lines[0])
+
+    async def test_metadata_failure_does_not_change_http_response(self):
+        sent = []
+        async def app(_scope, _receive, send):
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b"original"})
+        async def capture(message):
+            sent.append(message)
+        with patch.object(request_logging, "_login_for_request_logging", return_value=None), \
+             patch.object(request_logging, "register_access_operator", side_effect=[None, RuntimeError("output failed")]):
+            await request_logging.RequestLoggingContextMiddleware(app)(_scope(), _receive, capture)
+        self.assertEqual([item["type"] for item in sent], ["http.response.start", "http.response.body"])
+        self.assertEqual(sent[-1]["body"], b"original")
+
     def test_request_logging_wraps_authentication_guard(self):
         from app.main import app
 
