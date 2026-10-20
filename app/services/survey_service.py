@@ -1314,7 +1314,10 @@ def report_style_options(session_id: str) -> dict:
     allowed = (not external and sess.get("mode") in {None, "", "qualitative", "standard", "survey", "quantitative"}
                and is_quick_report_enabled())
     return {"quick_enabled": allowed, "report_style": "quick" if resolve_report_mode(sess) == "quick" else "full",
-            "report_mode": resolve_report_mode(sess), "fixed_mode": "statistics" if external else None}
+            "report_mode": resolve_report_mode(sess), "fixed_mode": "statistics" if external else None,
+            "postwrite_opening_sections": list(postwrite_config.POSTWRITE_OPENING_SECTIONS)
+                if (not normalize_report_versions(sess) and is_postwrite_report_enabled()
+                    and _use_postwrite_engine(sess)) else []}
 
 
 def _validate_report_style(sess: dict, value) -> str:
@@ -2332,6 +2335,8 @@ async def _postwrite_report_stream(session_id, request, *, instruction="", base_
                 raise ValueError("初稿与核验检查点不一致")
             prompts = deepcopy(previous["prompts"])
             instruction = previous.get("instruction", "")
+        elif not prompts["writer"].endswith(postwrite_config.POSTWRITE_OPENING_REQUIREMENTS):
+            prompts["writer"] += "\n\n" + postwrite_config.POSTWRITE_OPENING_REQUIREMENTS
         store = PostwriteRunStore()
         inputs = {"frozen": frozen, "prompts": prompts, "instruction": instruction,
                   "base_version": base["version"] if base else None, "owner_key": _history_owner_key(owner)}

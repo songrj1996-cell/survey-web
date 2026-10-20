@@ -155,11 +155,12 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                 saved = report_versions.resolve_report_version(sess, 1)
                 self.assertEqual(saved["report_md"], narrative)
                 self.assertEqual(len(writer_requests), 1)
-                self.assertEqual(writer_requests[0][0], {"role": "system", "content": selected_writer})
+                effective_writer = selected_writer + "\n\n" + config.POSTWRITE_OPENING_REQUIREMENTS
+                self.assertEqual(writer_requests[0][0], {"role": "system", "content": effective_writer})
                 self.assertEqual(json.loads(writer_requests[0][-1]["content"]), {
                     **saved["input_snapshot"]["postwrite_packet"], "instruction": ""})
                 state = saved["report_audit"]["checkpoint"]
-                self.assertEqual(state["prompts"], {**PROMPTS, "writer": selected_writer})
+                self.assertEqual(state["prompts"], {**PROMPTS, "writer": effective_writer})
                 sources = [item["source"] for check in saved["report_audit"]["checks"] for item in check["sources"]]
                 self.assertEqual([(s["ref"], s["source_row"], s["original"]) for s in sources],
                                  [("q1/r2", 2, "卡牌有趣"), ("q2/r2", 2, "希望常驻")])
@@ -175,7 +176,8 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         def old_catalog(key):
             return config.DEFAULT_POSTWRITE_WRITER_V1 if key == "postwrite_writer_system" else DEFAULT_PROMPTS[key]["current"]
 
-        with runtime(sess, partial), patch.object(survey_service, "_get_prompt_text", side_effect=old_catalog):
+        with runtime(sess, partial), patch.object(survey_service, "_get_prompt_text", side_effect=old_catalog), \
+             patch.object(config, "POSTWRITE_OPENING_REQUIREMENTS", ""):
             _ = [e async for e in survey_service.report_stream("old-writer", None)]
         before = deepcopy(report_versions.resolve_report_version(sess, 1))
         self.assertEqual(before["report_audit"]["checkpoint"]["prompts"]["writer"], config.DEFAULT_POSTWRITE_WRITER_V1)
