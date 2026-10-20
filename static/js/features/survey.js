@@ -678,8 +678,11 @@ async function startPlan() {
 // STEP 3: Plan card
 // ============================================================
 
+let planOpeningRequestSerial = 0;
 function showPlanCard(plan, headers) {
-  loadReportStyleOptions();
+  const openingSerial = ++planOpeningRequestSerial;
+  const openingSessionId = state.sessionId;
+  const openingOptions = loadReportStyleOptions();
   $('plan-thinking').style.display = 'none';
   $('plan-card').style.display = 'block';
   $('plan-card-content').innerHTML = buildPlanHTML(plan, headers);
@@ -688,10 +691,15 @@ function showPlanCard(plan, headers) {
   // 确保按钮状态与输入框同步（修订后面板可能处于 disabled 残留）
   $('btn-plan-ok').disabled = false;
   $('btn-plan-revise').disabled = true;
+  Promise.resolve(openingOptions).then(options => {
+    if (!options || openingSerial !== planOpeningRequestSerial || openingSessionId !== state.sessionId) return;
+    $('plan-card-content').innerHTML = buildPlanHTML(plan, headers, options.postwrite_opening_sections);
+  });
 }
 
-function buildPlanHTML(plan, headers) {
+function buildPlanHTML(plan, headers, openingSections = []) {
   let html = '';
+  const fixedOpeningSections = Array.isArray(openingSections) ? openingSections : [];
 
   const colMap = {};
   for (const c of plan.columns) colMap[c.index] = c;
@@ -873,8 +881,28 @@ function buildPlanHTML(plan, headers) {
     </div>
     <div class="plan-outline">`;
 
+  const openingDescriptions = {
+    '调研背景': '根据已填写的背景与问卷主题，说明本次调研关注的问题和目标。',
+    '样本说明': '结合已有样本信息与统计结果，说明样本范围和构成。',
+    '核心结论': '集中呈现主要发现，回答本次调研关注的核心问题。',
+  };
+  fixedOpeningSections.forEach((title, index) => {
+    html += `<details class="plan-outline__part" open>
+      <summary class="plan-outline__part-summary">
+        <span class="plan-outline__part-num">Part ${index + 1}</span>
+        <span class="plan-outline__part-title">${esc(title)}</span>
+        <span class="plan-outline__part-meta">固定开篇</span>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+      </summary>
+      <div class="plan-outline__part-body">
+        <div class="plan-outline__scope">${esc(openingDescriptions[title] || '根据已有材料整理本章节内容。')}</div>
+      </div>
+    </details>`;
+  });
+
   for (let i = 0; i < plan.parts.length; i++) {
     const p = plan.parts[i];
+    const displayPartNumber = fixedOpeningSections.length + i + 1;
     const indexes = Array.isArray(p.column_indexes) ? p.column_indexes : [];
     const partFilter = p.filter && typeof p.filter === 'object' ? p.filter : null;
     const partFilterOptions = Array.isArray(partFilter?.allowed_options) ? partFilter.allowed_options : [];
@@ -893,7 +921,7 @@ function buildPlanHTML(plan, headers) {
 
     html += `<details class="plan-outline__part" open>
       <summary class="plan-outline__part-summary">
-        <span class="plan-outline__part-num">Part ${i + 1}</span>
+        <span class="plan-outline__part-num">Part ${displayPartNumber}</span>
         <span class="plan-outline__part-title">${esc(p.name)}</span>
         <span class="plan-outline__part-meta">${esc(summaryParts.join(' · '))}</span>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
@@ -925,13 +953,13 @@ function buildPlanHTML(plan, headers) {
       indexes.forEach(idx => {
         if (nestedIndexes.has(idx) || visited.has(idx)) return;
         rootCounter += 1;
-        html += renderQuestion(idx, `${i + 1}.${rootCounter}`, partSet, visited, false, partFilter);
+        html += renderQuestion(idx, `${displayPartNumber}.${rootCounter}`, partSet, visited, false, partFilter);
       });
       // 容错：若父题在其他 Part，仍展示未渲染的问题及其适用条件。
       indexes.forEach(idx => {
         if (visited.has(idx)) return;
         rootCounter += 1;
-        html += renderQuestion(idx, `${i + 1}.${rootCounter}`, partSet, visited, false, partFilter);
+        html += renderQuestion(idx, `${displayPartNumber}.${rootCounter}`, partSet, visited, false, partFilter);
       });
     }
 

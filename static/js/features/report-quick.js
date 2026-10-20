@@ -7,6 +7,7 @@ async function loadReportStyleOptions() {
   const sessionId=state.sessionId, serial=++reportStyleRequestSerial;
   if(!sessionId)return;
   if(state.reportStyleSelection.sessionId!==sessionId) state.reportStyleSelection={sessionId,value:'full',enabled:false,locked:false};
+  let currentOptions = null;
   try {
     const response=await fetch(`/api/report/${sessionId}/options`);
     const options=await response.json();
@@ -14,11 +15,13 @@ async function loadReportStyleOptions() {
     if(serial!==reportStyleRequestSerial||sessionId!==state.sessionId)return;
     state.reportStyleSelection.enabled=options.quick_enabled===true;
     state.reportStyleSelection.value=selectedReportStyle();
+    currentOptions = options;
   } catch(error) {
     if(serial!==reportStyleRequestSerial||sessionId!==state.sessionId)return;
     state.reportStyleSelection.enabled=false;
   }
   if(typeof renderSurveyFocus==='function')renderSurveyFocus();
+  return currentOptions;
 }
 function revealQuickTarget(target) {
   for(let ancestor=target?.parentElement;ancestor;ancestor=ancestor.parentElement)if(ancestor.tagName==='DETAILS')ancestor.open=true;
