@@ -349,7 +349,6 @@ function annRenderAiProfile() {
   const result = annCurrentAiReviewResult();
   const rowId = String(result.id);
   const decision = annAiReviewDecision(result);
-  const selectedAsAi = annState.confirmedAiIds.has(rowId);
 
   annElement('ann-ai-player-index').textContent = `玩家 ${annState.aiReviewIndex + 1} / ${total}`;
   annElement('ann-ai-player-id').textContent = result.player_id || rowId;
@@ -365,10 +364,10 @@ function annRenderAiProfile() {
   annElement('ann-ai-counter-evidence').textContent = result.counter_evidence || '暂无明确反向证据';
   annElement('ann-ai-prev-player').disabled = annState.aiReviewIndex === 0;
   annElement('ann-ai-next-player').disabled = annState.aiReviewIndex === total - 1;
-  annElement('ann-ai-mark-normal').classList.toggle('ann-ai-decision-btn--active', !selectedAsAi);
-  annElement('ann-ai-mark-normal').setAttribute('aria-pressed', String(!selectedAsAi));
-  annElement('ann-ai-mark-ai').classList.toggle('ann-ai-decision-btn--active', selectedAsAi);
-  annElement('ann-ai-mark-ai').setAttribute('aria-pressed', String(selectedAsAi));
+  annElement('ann-ai-mark-normal').classList.toggle('ann-ai-decision-btn--active', decision === 'normal');
+  annElement('ann-ai-mark-normal').setAttribute('aria-pressed', String(decision === 'normal'));
+  annElement('ann-ai-mark-ai').classList.toggle('ann-ai-decision-btn--active', decision === 'ai');
+  annElement('ann-ai-mark-ai').setAttribute('aria-pressed', String(decision === 'ai'));
   annRenderAiQuestion(result);
 }
 function annUpdateAiReviewProgress() {
