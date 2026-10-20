@@ -762,6 +762,47 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         old.assert_not_called()
 
 
+class WriterOutputLimitTests(unittest.IsolatedAsyncioTestCase):
+    async def test_writer_64k_is_independent_of_registry_and_audit_limits(self):
+        seen = []
+        async def collect(messages, **kwargs):
+            seen.append(kwargs["max_tokens"])
+            return "ok", "fake"
+        with patch.multiple(config, POSTWRITE_OUTPUT_TOKENS=16000, POSTWRITE_REGISTRY_OUTPUT_TOKENS=64000):
+            caller = BoundedCaller(collect=collect)
+            for stage in ("writer", "registry", "meaning:1", "members:1"):
+                await caller.call(stage, [{"content": "small"}])
+        self.assertEqual(seen, [64000, 64000, 16000, 16000])
+        custom = BoundedCaller(writer_output_tokens=24000)
+        self.assertEqual((custom.writer_output_tokens, custom.output_tokens), (24000, 16000))
+        # Explicit acceptance callers retain their existing output-token override.
+        self.assertEqual(BoundedCaller(output_tokens=12000).writer_output_tokens, 12000)
+
+
+    async def test_writer_reserves_the_full_cap_without_raising_total_budget(self):
+        collect = AsyncMock()
+        caller = BoundedCaller(collect=collect, max_tokens=50000)
+        with self.assertRaises(BudgetStop):
+            await caller.call("writer", [{"content": "small"}])
+        collect.assert_not_called()
+        self.assertEqual(caller.ledger, [])
+        self.assertEqual(caller.max_tokens, 50000)
+
+
+    async def test_successful_report_has_no_failure_and_unchanged_prompts_and_audit(self):
+        seen = []
+        async def collect(messages, **kwargs):
+            seen.append(kwargs["max_tokens"])
+            return await fake_collect(messages, **kwargs)
+        result = await run_pipeline(freeze_inputs(session()), prompts=PROMPTS, collect=collect)
+        self.assertEqual(seen, [64000, 64000, 16000])
+        self.assertEqual(result["draft"], REPORT)
+        self.assertEqual(result["prompts"], PROMPTS)
+        self.assertNotIn("failure", result)
+        self.assertEqual(result["audit"]["status"], "complete")
+
+
+
 class StorageTests(unittest.TestCase):
     def test_explicit_acceptance_budget_reaches_caller_without_changing_defaults(self):
         with patch.multiple(config, POSTWRITE_MAX_CALLS=14, POSTWRITE_MAX_TOKENS=2800000,

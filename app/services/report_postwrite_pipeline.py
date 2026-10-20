@@ -27,6 +27,7 @@ def estimate_tokens(request):
 class BoundedCaller:
     def __init__(self, *, collect=None, model=None, reasoning=None, max_calls=None, max_tokens=None,
                  max_seconds=None, call_seconds=None, output_tokens=None, registry_output_tokens=None,
+                 writer_output_tokens=None,
                  on_event=None, ledger=None):
         self.collect = collect or collect_chat_completion
         self.model = model or config.LLM_POSTWRITE_MODEL
@@ -36,6 +37,10 @@ class BoundedCaller:
         self.max_seconds = max_seconds or config.POSTWRITE_MAX_SECONDS
         self.call_seconds = call_seconds or config.POSTWRITE_CALL_SECONDS
         self.output_tokens = output_tokens or config.POSTWRITE_OUTPUT_TOKENS
+        # Explicit acceptance overrides remain compatible; production gets a writer-only cap.
+        self.writer_output_tokens = min(64000, max(1024, int(
+            writer_output_tokens if writer_output_tokens is not None else
+            output_tokens if output_tokens is not None else config.POSTWRITE_WRITER_OUTPUT_TOKENS)))
         self.registry_output_tokens = min(64000, max(1024, int(
             registry_output_tokens if registry_output_tokens is not None else config.POSTWRITE_REGISTRY_OUTPUT_TOKENS)))
         self.ledger = ledger if ledger is not None else []
@@ -45,7 +50,8 @@ class BoundedCaller:
         self.previous_seconds = sum(c.get("elapsed_seconds", 0) for c in self.ledger)
 
     async def call(self, stage, request):
-        output_tokens = self.registry_output_tokens if stage == "registry" else self.output_tokens
+        output_tokens = (self.writer_output_tokens if stage == "writer" else
+                         self.registry_output_tokens if stage == "registry" else self.output_tokens)
         reserve = estimate_tokens(request) + output_tokens
         remaining = self.max_seconds - self.previous_seconds - (time.monotonic() - self.started)
         if len(self.ledger) >= self.max_calls or self.reserved + reserve > self.max_tokens or remaining <= 0:
