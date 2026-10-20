@@ -1,4 +1,4 @@
-"""Free draft -> registration -> one audit pass, with bounded resumable checkpoints."""
+"""Free draft -> registration -> one audit pass, with resumable checkpoints and opt-in trial budgets."""
 import asyncio
 from copy import deepcopy
 import hashlib
@@ -59,10 +59,10 @@ class BoundedCaller:
         self.collect = collect or collect_chat_completion
         self.model = model or config.LLM_POSTWRITE_MODEL
         self.reasoning = reasoning or config.LLM_POSTWRITE_REASONING
-        self.max_calls = max_calls or config.POSTWRITE_MAX_CALLS
-        self.max_tokens = max_tokens or config.POSTWRITE_MAX_TOKENS
-        self.max_seconds = max_seconds or config.POSTWRITE_MAX_SECONDS
-        self.call_seconds = call_seconds or config.POSTWRITE_CALL_SECONDS
+        self.max_calls = config.POSTWRITE_MAX_CALLS if max_calls is None else max_calls
+        self.max_tokens = config.POSTWRITE_MAX_TOKENS if max_tokens is None else max_tokens
+        self.max_seconds = config.POSTWRITE_MAX_SECONDS if max_seconds is None else max_seconds
+        self.call_seconds = config.POSTWRITE_CALL_SECONDS if call_seconds is None else call_seconds
         self.output_tokens = output_tokens or config.POSTWRITE_OUTPUT_TOKENS
         # Explicit acceptance overrides remain compatible; production gets a writer-only cap.
         self.writer_output_tokens = min(64000, max(1024, int(
@@ -80,10 +80,17 @@ class BoundedCaller:
         output_tokens = (self.writer_output_tokens if stage == "writer" else
                          self.registry_output_tokens if stage == "registry" else self.output_tokens)
         reserve = estimate_tokens(request) + output_tokens
-        remaining = self.max_seconds - self.previous_seconds - (time.monotonic() - self.started)
-        if len(self.ledger) >= self.max_calls or self.reserved + reserve > self.max_tokens or remaining <= 0:
+        remaining = (self.max_seconds - self.previous_seconds - (time.monotonic() - self.started)
+                     if self.max_seconds > 0 else None)
+        if (self.max_calls > 0 and len(self.ledger) >= self.max_calls
+                or self.max_tokens > 0 and self.reserved + reserve > self.max_tokens
+                or remaining is not None and remaining <= 0):
             raise BudgetStop("已达调用、tokens或时间预算，保留初稿及已完成核验")
-        if any(c.get("state") in {"started", "cancelled", "failed"} and not c.get("usage_complete") for c in self.ledger):
+        # Only budgeted trials fail closed on unknown spend; production keeps the
+        # incomplete usage record but may resume the unfinished stage.
+        budgeted = any(limit > 0 for limit in (self.max_calls, self.max_tokens, self.max_seconds, self.call_seconds))
+        if budgeted and any(c.get("state") in {"started", "cancelled", "failed"}
+                            and not c.get("usage_complete") for c in self.ledger):
             raise BudgetStop("上次请求用量不完整，停止继续付费调用")
         entry = {"stage": stage, "state": "started", "input_estimate": reserve - output_tokens,
                  "output_cap": output_tokens,
@@ -106,8 +113,10 @@ class BoundedCaller:
                     await result
         started = time.monotonic()
         try:
-            text, model = await asyncio.wait_for(self.collect(request, models=[self.model], max_tokens=output_tokens,
-                reasoning_effort=self.reasoning or None, max_http_attempts=1, on_attempt_event=event), timeout=min(self.call_seconds, remaining))
+            deadlines = [limit for limit in (self.call_seconds, remaining) if limit is not None and limit > 0]
+            pending = self.collect(request, models=[self.model], max_tokens=output_tokens,
+                reasoning_effort=self.reasoning or None, max_http_attempts=1, on_attempt_event=event)
+            text, model = await asyncio.wait_for(pending, timeout=min(deadlines)) if deadlines else await pending
             if any(e.get("finish_reason") in {"length", "max_tokens", "max_output_tokens"} for e in entry["events"]):
                 raise ValueError("模型输出被截断，本批未完成")
             entry.update(state="complete", actual_model=model, output_chars=len(text))
