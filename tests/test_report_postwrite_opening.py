@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from app.core import config
 from app.routers import survey as survey_router
 from app.services import survey_service, report_versions
+from app.services.report_postwrite_inputs import freeze_inputs
 from app.storage.prompts import DEFAULT_PROMPTS
 from tests.test_report_postwrite_audit import session
 from tests.test_report_postwrite_flow import REPORT, PROMPTS, events, fake_collect, runtime
@@ -79,6 +80,60 @@ class OpeningContractTests(unittest.TestCase):
 
 
 class OpeningWriterDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_sample_dimensions_keep_python_counts_denominators_and_call_stages(self):
+        source = session()
+        dimensions = (
+            ("年龄段", ["18–24", "25–34", ""]),
+            ("地区", ["A地区", "A地区", "A地区"]),
+            ("语言", ["中文", "中文", ""]),
+            ("设备", ["", "", ""]),
+        )
+        for name, values in dimensions:
+            index = len(source["rows"][0])
+            source["rows"][0].append(name)
+            for row, value in zip(source["rows"][1:], values):
+                row.append(value)
+            source["confirmed_columns"].append(
+                {"column_indexes": [index], "role": "profile_dim", "name": name})
+        before = deepcopy(source)
+        expected_packet = freeze_inputs(source)["postwrite_packet"]
+        # Real Python statistics: sparse dimensions use two respondents,
+        # while the complete, uniform dimension uses all three respondents.
+        markdown = expected_packet["statistics_markdown"]
+        for text in ("| 18–24 | 1 | 50.0% |", "| 25–34 | 1 | 50.0% |",
+                     "| A地区 | 3 | 100.0% |", "| 中文 | 2 | 100.0% |",
+                     "共 2 份非空回答", "共 3 份非空回答", "该画像维度无有效数据"):
+            self.assertIn(text, markdown)
+        self.assertEqual(source, before)
+
+        # Compare the prior opening contract with the new one using the same
+        # inputs and mock model responses; no new statistics or model stage.
+        prefix, sample = config.POSTWRITE_OPENING_REQUIREMENTS.split("样本说明：", 1)
+        _, suffix = sample.split("核心结论：", 1)
+        previous = (prefix + "样本说明：沿用已提供的样本信息及Python统计口径；"
+                    "不补写未提供的抽样方式或调研时间。\n核心结论：" + suffix)
+        call_sequences = []
+        for supplement in (previous, config.POSTWRITE_OPENING_REQUIREMENTS):
+            with self.subTest(updated=supplement != previous):
+                sess = deepcopy(source)
+                requests = []
+
+                async def collect(messages, **kwargs):
+                    requests.append(deepcopy(messages))
+                    return await fake_collect(messages, **kwargs)
+
+                with runtime(sess, collect), patch.object(config, "POSTWRITE_OPENING_REQUIREMENTS", supplement):
+                    output = events([e async for e in survey_service.report_stream("sample-dimensions", None)])
+                self.assertTrue(any(e["type"] == "report_done" for e in output), output)
+                saved = report_versions.resolve_report_version(sess, 1)
+                self.assertEqual(json.loads(requests[0][-1]["content"]), {**expected_packet, "instruction": ""})
+                self.assertEqual(requests[0][0]["content"], config.DEFAULT_POSTWRITE_WRITER + "\n\n" + supplement)
+                self.assertEqual(saved["input_snapshot"]["postwrite_packet"], expected_packet)
+                self.assertEqual(saved["report_md"], REPORT)
+                call_sequences.append([sorted(json.loads(request[-1]["content"])) for request in requests])
+        self.assertEqual(call_sequences[0], call_sequences[1])
+        self.assertEqual(len(call_sequences[1]), 3)  # writer, registry, meaning audit
+
     async def test_writer_gets_only_the_appendix_and_keeps_all_inputs_and_other_prompts(self):
         candidates = (config.DEFAULT_POSTWRITE_WRITER_V1, config.DEFAULT_POSTWRITE_WRITER,
                       "CUSTOM_TEXT_STAYS_VERBATIM", "CUSTOM_TEXT_STAYS_VERBATIM\n\n" + config.POSTWRITE_OPENING_REQUIREMENTS)
