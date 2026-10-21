@@ -134,13 +134,14 @@ class OpeningWriterDeliveryTests(unittest.IsolatedAsyncioTestCase):
         with runtime(sess, resume):
             output = events([e async for e in survey_service.report_stream("opening-legacy", None, retry_failed=True, base_version=1)])
         self.assertTrue(any(e["type"] == "report_done" for e in output), output)
-        after = report_versions.resolve_report_version(sess, 2)
+        after = report_versions.resolve_report_version(sess, 1)
         self.assertTrue(requests)
         self.assertEqual(after["report_audit"]["status"], "complete")
         self.assertEqual(after["report_audit"]["checkpoint"]["prompts"], before["report_audit"]["checkpoint"]["prompts"])
         self.assertEqual(after["report_md"], before["report_md"])
         self.assertEqual(after["input_snapshot"], before["input_snapshot"])
-        self.assertEqual(report_versions.resolve_report_version(sess, 1), before)
+        self.assertEqual(len(sess["report_versions"]), 1)
+        self.assertEqual(sess["next_report_version"], 2)
 
 
 if __name__ == "__main__":

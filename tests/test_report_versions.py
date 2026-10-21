@@ -536,5 +536,78 @@ class HistoryStorageTransactionTests(unittest.TestCase):
         self.assertNotIn("report_llm_usage", target)
 
 
+def postwrite_completion_fixture():
+    initial = _snapshot("核验合成报告", created_at="2026-10-01T10:00:00")
+    initial.update(report_mode="insight", report_status="partial", input_snapshot={"synthetic": True},
+                   report_completed_at="2026-10-01T10:01:00", report_duration_seconds=60,
+                   report_llm_usage=_usage("synthetic", total_tokens=30))
+    initial["report_audit"] = {"status": "partial", "usage": {"requests": 1, "tokens": 30, "usage_complete": False},
+        "checkpoint": {"draft": initial["report_md"], "steps": {}, "prompts": {"writer": "unchanged", "audit": "unchanged"}}}
+    entry = {"id": "postwrite-completion", "owner_key": "email:owner@example.com", "mode": "standard", "filename": "synthetic.csv"}
+    report_versions.append_report_version(entry, initial)
+    base = report_versions.resolve_report_version(entry, 1)
+    for n in range(2, 6):
+        report_versions.append_report_version(entry, {**deepcopy(initial), "report_md": f"# 其他版本{n}\n\n不同的正文"}, base_version=1)
+    result = deepcopy(base)
+    result.update(report_status="complete", report_completed_at="2026-10-02T10:03:00", report_duration_seconds=5,
+                  report_llm_usage=_usage("synthetic", total_tokens=17), qa_messages=[])
+    result["report_audit"].update(status="complete", run_id="synthetic-new-run", usage={"requests": 2, "tokens": 47, "usage_complete": False})
+    result["report_audit"]["checkpoint"]["steps"] = {"meaning:synthetic": {"complete": True}}
+    return entry, base, result
+
+
+class PostwriteAuditVersionTests(unittest.TestCase):
+    def test_updates_selected_version_at_limit_preserving_every_other_field(self):
+        entry, base, result = postwrite_completion_fixture()
+        before = deepcopy(entry)
+        updated = report_versions.complete_postwrite_audit_version(entry, result, expected_base=base)
+        self.assertEqual((len(entry["report_versions"]), entry["active_report_version"], entry["next_report_version"]), (5, 5, 6))
+        self.assertEqual(entry["report_versions"][1:], before["report_versions"][1:])
+        for key in ("version", "kind", "base_version", "created_at", "report_md", "input_snapshot", "title", "qa_messages", "qa_provider", "qa_model", "report_duration_seconds", "report_completed_at"):
+            self.assertEqual(updated.get(key), base.get(key), key)
+        self.assertEqual(updated["report_audit"]["status"], "complete")
+        self.assertEqual(updated["report_audit"]["usage"]["tokens"], 47)
+        self.assertEqual(updated["report_llm_usage"]["totals"]["total_tokens"], 47)
+        self.assertEqual(len(updated["report_audit"]["resume_attempts"]), 1)
+        self.assertFalse(updated["report_audit"]["usage"]["usage_complete"])
+        self.assertEqual(entry["report_status"], before["report_status"])
+
+    def test_rejects_stale_or_body_input_changes_without_any_mutation(self):
+        for field, value in (("report_md", "changed"), ("input_snapshot", {}), ("report_audit", {"status": "partial"})):
+            entry, base, result = postwrite_completion_fixture()
+            report_versions.update_report_version(entry, 1, **{field: value})
+            before = deepcopy(entry)
+            with self.assertRaises(ValueError):
+                report_versions.complete_postwrite_audit_version(entry, result, expected_base=base)
+            self.assertEqual(entry, before)
+        for corrupt in ("body", "source", "checkpoint"):
+            entry, base, result = postwrite_completion_fixture()
+            if corrupt == "body": result["report_md"] += "changed"
+            elif corrupt == "source": result["input_snapshot"] = {}
+            else: result["report_audit"]["checkpoint"]["draft"] += "changed"
+            before = deepcopy(entry)
+            with self.assertRaises(ValueError):
+                report_versions.complete_postwrite_audit_version(entry, result, expected_base=base)
+            self.assertEqual(entry, before)
+
+    def test_partial_retry_preserves_newer_followups_and_cumulative_usage_once(self):
+        entry, base, result = postwrite_completion_fixture()
+        messages = [{"role": "user", "content": "运行期间的新追问"}]
+        report_versions.update_report_version(entry, 1, qa_messages=messages)
+        result["report_audit"]["status"] = "partial"
+        first = report_versions.complete_postwrite_audit_version(entry, result, expected_base=base)
+        self.assertEqual(first["qa_messages"], messages)
+        stale = deepcopy(entry)
+        with self.assertRaises(ValueError):
+            report_versions.complete_postwrite_audit_version(entry, result, expected_base=base)
+        self.assertEqual(entry, stale)
+        result["report_audit"]["run_id"] = "synthetic-next-run"
+        result["report_audit"]["usage"].update(requests=3, tokens=64)
+        second = report_versions.complete_postwrite_audit_version(entry, result, expected_base=first)
+        self.assertEqual(len(second["report_audit"]["resume_attempts"]), 2)
+        self.assertEqual(second["report_audit"]["usage"]["tokens"], 64)
+        self.assertEqual(second["report_llm_usage"]["totals"]["total_tokens"], 64)
+
+
 if __name__ == "__main__":
     unittest.main()

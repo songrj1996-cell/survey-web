@@ -139,6 +139,8 @@ from app.services.report_history import (
     append_exact_rerun_to_history,
     append_quick_rerun_to_history,
     complete_quick_report_in_history,
+    complete_postwrite_audit_in_history,
+    postwrite_session_version_source,
     append_partial_rerun_to_history,
     delete_history_report_version as _delete_history_report_version,
     find_exact_survey_duplicate_entry,
@@ -162,6 +164,7 @@ from app.services.report_partial_rerun import (
 from app.services.report_versions import (
     append_report_version,
     complete_quick_report_version,
+    complete_postwrite_audit_version,
     validate_quick_completion_base,
     delete_report_version,
     normalize_report_versions,
@@ -2306,8 +2309,15 @@ async def _postwrite_report_stream(session_id, request, *, instruction="", base_
                 raise ValueError("原报告不存在或无权访问")
             if not sess.get("postwrite_history_rerun") and not find_exact_survey_duplicate_entry(sess, login, target_id):
                 raise ValueError("原报告与当前上传数据不一致")
+        if retry_failed and not target_id:
+            target_lock = _report_rerun_target_lock(session_id)
+            if target_lock.locked():
+                target_lock = None
+                raise ValueError("当前版本正在核验，请等待本次处理完成")
+            await target_lock.acquire()
+            owner = postwrite_session_version_source(session_id, sess, history_loader=_load_history)
         versions = normalize_report_versions(owner)
-        if len(versions) >= MAX_REPORT_VERSIONS:
+        if not retry_failed and len(versions) >= MAX_REPORT_VERSIONS:
             raise ValueError(f"报告版本已达上限（{MAX_REPORT_VERSIONS} 个）")
         base = resolve_report_version(owner, base_version or sess.get("rerun_base_version")) if versions else None
         if base and not (generation_kind == "regenerate" or retry_failed or target_id):
@@ -2411,7 +2421,19 @@ async def _postwrite_report_stream(session_id, request, *, instruction="", base_
         precommit = deepcopy(latest)
         latest.update(mode_fields("insight"))
         report_log_phase("saving")
-        if target_id:
+        if retry_failed:
+            history_id = target_id or session_id
+            archived = _find_history_for_login(_load_history(), history_id, login)
+            if target_id or archived:
+                committed, version = complete_postwrite_audit_in_history(
+                    history_id, snapshot, expected_base=base, login=login)
+                _copy_report_version_state(latest, committed)
+            else:
+                version = complete_postwrite_audit_version(latest, snapshot, expected_base=base)
+            if target_id:
+                latest["rerun_completed_at"] = datetime.now().isoformat(timespec="seconds")
+            save_session(session_id, latest)
+        elif target_id:
             from app.storage.history import mutate_history
             def persist(history):
                 entry = _find_history_for_login(history, target_id, login)
@@ -2433,6 +2455,7 @@ async def _postwrite_report_stream(session_id, request, *, instruction="", base_
                 save_session(session_id, precommit)
                 raise
         yield sse_event({"type": "report_done", **_session_report_version_payload(latest), **version,
+                         **({"audit_updated": True} if retry_failed else {}),
                          **({"history_id": target_id} if target_id else {})})
     finally:
         if job and not job.done():
@@ -4311,7 +4334,8 @@ def _session_report_version_payload(sess: dict) -> dict:
 
 def _quick_session_version_source(session_id: str, sess: dict) -> dict:
     """Read the authoritative archive, including recovery after session save failure."""
-    return quick_session_version_source(session_id, sess, history_loader=_load_history)
+    source = quick_session_version_source(session_id, sess, history_loader=_load_history)
+    return postwrite_session_version_source(session_id, source, history_loader=_load_history)
 
 
 def get_session_report_versions(session_id: str) -> dict:

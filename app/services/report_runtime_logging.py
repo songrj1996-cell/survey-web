@@ -23,7 +23,7 @@ _STAGES = {
     "synthesis": "综合分析各项发现",
     "writing": "撰写报告",
     "writer": "撰写初稿",
-    "registry": "登记初稿观点和人数表述",
+    "registry": "整理报告中需要核对的内容",
     "meaning": "核对原意和引用",
     "quantity": "核对人数范围",
     "quick_statistics": "整理客观题统计",
@@ -187,7 +187,11 @@ class SurveyProgressLog:
             else:
                 audit = payload.get("report_audit") or {}
                 status = payload.get("report_status") or audit.get("status")
-                if status == "partial":
+                if payload.get("audit_updated"):
+                    text = ("原版本核验结果已更新，尚有部分核验未完成；正文已保留，未新增报告版本"
+                            if status == "partial" else "原版本核验结果已更新；未新增报告版本，提示仍需人工审阅")
+                    self.emit("warning" if status == "partial" else "success", text, version=payload.get("version"))
+                elif status == "partial":
                     text = "报告已保存，但部分核验或题目尚未完成；请在页面查看未完成项，并使用页面提供的补全操作"
                     self.emit("warning", text, version=payload.get("version"))
                 else:

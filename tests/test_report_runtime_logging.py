@@ -269,3 +269,20 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual("retry_failed" in called[0][2], mode != "full")
                 self.assertIn("报告结果已生成并保存", output.getvalue())
                 self.assertNotIn("dispatch-test", service._REPORT_CANCEL_EVENTS)
+
+
+class PostwriteAuditCopyLogTests(unittest.TestCase):
+    def test_resume_logs_original_version_and_preserves_event(self):
+        stream = logs.SurveyProgressLog("synthetic",retry_failed=True)
+        output = io.StringIO()
+        raw = sse_event({"type":"report_done","audit_updated":True,"version":4,"report_status":"partial"})
+        with redirect_stdout(output):
+            stream.start()
+            stream.observe(sse_event({"type":"analysis_progress","phase":"postwrite","stage":"registry"}))
+            stream.observe(raw)
+        text = output.getvalue()
+        self.assertIn("整理报告中需要核对的内容",text)
+        self.assertIn("原版本核验结果已更新",text)
+        self.assertIn("未新增报告版本",text)
+        self.assertNotIn("登记初稿",text)
+        self.assertIn('"audit_updated": true',raw)

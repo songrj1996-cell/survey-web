@@ -103,6 +103,7 @@ def runtime(sess, collect=fake_collect):
         stack.enter_context(patch.object(survey_service, "PostwriteRunStore", side_effect=lambda: RunStore(folder)))
         stack.enter_context(patch.object(survey_service, "get_session", side_effect=lambda sid: deepcopy(sess)))
         stack.enter_context(patch.object(survey_service, "_current_login", new=AsyncMock(return_value=None)))
+        stack.enter_context(patch.object(survey_service, "_load_history", return_value=[]))
         stack.enter_context(patch.object(survey_service, "require_session_access", side_effect=lambda sid, login, loader: deepcopy(sess)))
         stack.enter_context(patch.object(survey_service, "_assign_session_owner"))
         stack.enter_context(patch.object(survey_service, "_get_prompt_text", side_effect=lambda k: DEFAULT_PROMPTS[k]["current"]))
@@ -194,13 +195,14 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         with runtime(sess, resume):
             output = events([e async for e in survey_service.report_stream("old-writer", None, retry_failed=True, base_version=1)])
         self.assertTrue(any(e["type"] == "report_done" for e in output), output)
-        after = report_versions.resolve_report_version(sess, 2)
+        after = report_versions.resolve_report_version(sess, 1)
         self.assertTrue(requests)
         self.assertEqual(after["report_audit"]["status"], "complete")
         self.assertEqual(after["report_audit"]["checkpoint"]["prompts"], before["report_audit"]["checkpoint"]["prompts"])
         self.assertEqual(after["report_md"], before["report_md"])
         self.assertEqual(after["input_snapshot"], before["input_snapshot"])
-        self.assertEqual(report_versions.resolve_report_version(sess, 1), before)
+        self.assertEqual(len(sess["report_versions"]), 1)
+        self.assertEqual(after["report_audit"]["checkpoint"]["prompts"], before["report_audit"]["checkpoint"]["prompts"])
 
     async def test_list_alias_resume_reuses_meanings_and_reviewed_members(self):
         from app.services.report_postwrite_audit import bind_members
@@ -636,11 +638,13 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         sess.update(rerun_target_history_id="archive-one", postwrite_history_rerun=True)
         def mutate(callback):
             return callback([archive])
-        with runtime(sess), patch.object(survey_service, "_load_history", return_value=[archive]), patch.object(survey_service, "_find_history_for_login", side_effect=lambda history, ident, login: next((x for x in history if x.get("id") == ident), None)), patch("app.storage.history.mutate_history", side_effect=mutate):
+        with runtime(sess), patch.object(survey_service, "_load_history", return_value=[archive]), patch.object(survey_service, "_find_history_for_login", side_effect=lambda history, ident, login: next((x for x in history if x.get("id") == ident), None)), patch("app.services.report_history.mutate_history", side_effect=mutate):
             result = events([e async for e in survey_service.report_stream("restore", None, retry_failed=True, base_version=1)])
         self.assertTrue(any(e["type"] == "report_done" and e.get("history_id") == "archive-one" for e in result), result)
-        self.assertEqual(report_versions.resolve_report_version(archive, 1), base)
-        self.assertEqual(report_versions.resolve_report_version(archive, 2)["report_audit"]["status"], "complete")
+        self.assertEqual(len(archive["report_versions"]), 1)
+        updated = report_versions.resolve_report_version(archive, 1)
+        self.assertEqual(updated["report_audit"]["status"], "complete")
+        self.assertEqual(updated["report_md"], base["report_md"])
 
     async def test_truncated_response_not_certified_and_raw_diagnostic_retained(self):
         async def collect(messages, **kwargs):
@@ -723,7 +727,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["audit"]["status"], "partial")
         self.assertEqual(result["stop_reason"], "cancelled")
 
-    async def test_sse_save_new_version_resume_and_original_immutable(self):
+    async def test_sse_resume_updates_original_version_without_rewriting(self):
         sess = session()
         async def partial(messages, **kwargs):
             result = await fake_collect(messages, **kwargs)
@@ -736,8 +740,10 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         with runtime(sess):
             output = events([e async for e in survey_service.report_stream("postwrite-test", None, retry_failed=True, base_version=1)])
         self.assertTrue(any(e["type"] == "report_done" for e in output), output)
-        self.assertEqual(report_versions.resolve_report_version(sess, 1), base)
-        second = report_versions.resolve_report_version(sess, 2)
+        self.assertEqual(len(sess["report_versions"]), 1)
+        self.assertEqual(sess["next_report_version"], 2)
+        self.assertTrue(next(e for e in output if e["type"] == "report_done")["audit_updated"])
+        second = report_versions.resolve_report_version(sess, 1)
         self.assertEqual(second["report_audit"]["status"], "complete")
         self.assertEqual(second["report_md"], base["report_md"])
         self.assertEqual(second["input_snapshot"], base["input_snapshot"])
@@ -746,6 +752,83 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("## 核验提示", prepare_report_markdown(second, "evidence"))
         self.assertEqual(prepare_report_markdown(second, "body"), second["report_md"])
         self.assertIn("原文", second["qa_context_md"])
+
+    async def test_resume_at_version_limit_reuses_draft_and_keeps_followups(self):
+        sess = session()
+        async def partial(messages, **kwargs):
+            raw, model = await fake_collect(messages, **kwargs)
+            return ('{"checks":[]}', model) if "targets" in json.loads(messages[-1]["content"]) else (raw, model)
+        with runtime(sess, partial):
+            initial = events([e async for e in survey_service.report_stream("audit-limit", None)])
+        self.assertTrue(any(e["type"] == "report_done" for e in initial), initial)
+        base = report_versions.resolve_report_version(sess, 1)
+        report_versions.update_report_version(sess, 1, qa_messages=[{"role": "user", "content": "保留追问"}])
+        base = report_versions.resolve_report_version(sess, 1)
+        for _ in range(4):
+            report_versions.append_report_version(sess, {**base, "report_md": "# 另一个版本\n\n其他正文"}, kind="regenerate", base_version=1)
+        before = deepcopy(sess)
+        calls = []
+        async def remaining(messages, **kwargs):
+            payload = json.loads(messages[-1]["content"])
+            self.assertIn("targets", payload)
+            calls.append(payload)
+            return await fake_collect(messages, **kwargs)
+        with runtime(sess, remaining):
+            output = events([e async for e in survey_service.report_stream("audit-limit", None, retry_failed=True, base_version=1)])
+        done = next(e for e in output if e["type"] == "report_done")
+        self.assertEqual((done["version"], done["audit_updated"]), (1, True))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual((len(sess["report_versions"]), sess["next_report_version"], sess["active_report_version"]), (5, 6, 5))
+        updated = report_versions.resolve_report_version(sess, 1)
+        self.assertEqual(updated["qa_messages"], base["qa_messages"])
+        self.assertEqual(updated["report_md"], base["report_md"])
+        self.assertEqual(sess["report_versions"][1:], before["report_versions"][1:])
+
+    async def test_resume_failure_saves_partial_in_same_version_and_preserves_checkpoints(self):
+        sess = session()
+        async def fail(messages, **kwargs):
+            if "targets" in json.loads(messages[-1]["content"]):
+                raise RuntimeError("PRIVATE_MUST_NOT_LEAK")
+            return await fake_collect(messages, **kwargs)
+        with runtime(sess, fail):
+            _ = [e async for e in survey_service.report_stream("audit-failure", None)]
+        first = report_versions.resolve_report_version(sess, 1)
+        with runtime(sess, fail):
+            output = events([e async for e in survey_service.report_stream("audit-failure", None, retry_failed=True, base_version=1)])
+        done = next(e for e in output if e["type"] == "report_done")
+        self.assertEqual((done["version"], done["report_status"], len(sess["report_versions"])), (1, "partial", 1))
+        self.assertTrue(done["audit_updated"])
+        self.assertEqual(done["report_md"], first["report_md"])
+        self.assertEqual(done["report_audit"]["checkpoint"]["registry"], first["report_audit"]["checkpoint"]["registry"])
+        self.assertEqual(done["report_audit"]["checkpoint"]["calls"][:3], first["report_audit"]["checkpoint"]["calls"])
+        self.assertNotIn("PRIVATE_MUST_NOT_LEAK", json.dumps(done))
+
+    async def test_manual_stop_during_resume_saves_same_version_and_existing_results(self):
+        sess = session()
+        async def partial(messages, **kwargs):
+            raw, model = await fake_collect(messages, **kwargs)
+            return ('{"checks":[]}', model) if "targets" in json.loads(messages[-1]["content"]) else (raw, model)
+        with runtime(sess, partial):
+            _ = [e async for e in survey_service.report_stream("audit-stop", None)]
+        before = report_versions.resolve_report_version(sess, 1)
+        reached = asyncio.Event()
+        async def waiting(messages, **kwargs):
+            self.assertIn("targets", json.loads(messages[-1]["content"]))
+            reached.set()
+            await asyncio.Event().wait()
+        async def consume():
+            return events([e async for e in survey_service.report_stream("audit-stop", None, retry_failed=True, base_version=1)])
+        with runtime(sess, waiting):
+            task = asyncio.create_task(consume())
+            await asyncio.wait_for(reached.wait(), 3)
+            self.assertTrue(survey_service.cancel_report_run("audit-stop")["cancelled"])
+            output = await asyncio.wait_for(task, 3)
+        done = next(e for e in output if e["type"] == "report_done")
+        self.assertEqual((done["version"],done["report_status"],len(sess["report_versions"])),(1,"partial",1))
+        self.assertTrue(done["audit_updated"])
+        self.assertEqual(done["report_md"],before["report_md"])
+        self.assertEqual(done["report_audit"]["checkpoint"]["registry"],before["report_audit"]["checkpoint"]["registry"])
+        self.assertEqual(done["report_audit"]["checkpoint"]["stop_reason"],"cancelled")
 
     async def test_old_versions_do_not_switch_when_flag_enabled(self):
         with patch.object(survey_service, "is_postwrite_report_enabled", return_value=True):
@@ -991,7 +1074,7 @@ class RuntimeBudgetPolicyTests(unittest.IsolatedAsyncioTestCase):
             output = events([e async for e in survey_service.report_stream(
                 "resume-usage", None, retry_failed=True, base_version=1)])
         self.assertTrue(any(e["type"] == "report_done" for e in output), output)
-        second = report_versions.resolve_report_version(sess, 2)
+        second = report_versions.resolve_report_version(sess, 1)
         self.assertEqual(second["report_audit"]["status"], "complete")
         self.assertEqual(second["report_md"], original["report_md"])
         self.assertEqual(second["input_snapshot"], original["input_snapshot"])
@@ -1004,7 +1087,8 @@ class RuntimeBudgetPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("failure", saved)
         self.assertFalse(saved["usage"]["usage_complete"])
         self.assertEqual(saved["usage"]["tokens"], 87314)
-        self.assertEqual(report_versions.resolve_report_version(sess, 1), original)
+        self.assertEqual(report_versions.resolve_report_version(sess, 1)["report_md"], original["report_md"])
+        self.assertEqual(len(sess["report_versions"]), 1)
         self.assertNotIn("private-timeout-detail", json.dumps(output, ensure_ascii=False))
 
     async def test_unknown_usage_does_not_start_automatic_retry_loop(self):

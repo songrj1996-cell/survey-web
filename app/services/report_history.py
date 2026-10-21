@@ -28,6 +28,7 @@ from app.services.questionnaire_family_history import (
 from app.services.report_versions import (
     append_report_version,
     complete_quick_report_version,
+    complete_postwrite_audit_version,
     delete_report_version,
     normalize_report_versions,
     report_version_summaries,
@@ -159,6 +160,12 @@ def _history_version_source(
         persisted = merged_by_version.get(version, {})
         if int(persisted.get("quick_completion_revision") or 0) > int(item.get("quick_completion_revision") or 0):
             continue  # An old reader/QA session must not undo a saved completion.
+        if len((persisted.get("report_audit") or {}).get("resume_attempts") or []) > len((item.get("report_audit") or {}).get("resume_attempts") or []):
+            # Keep newer audit metadata while allowing an independent follow-up
+            # or explicit title update from this session to be saved normally.
+            for field in ("report_audit", "report_status", "comparison_validation", "report_llm_usage", "qa_context_md"):
+                if field in persisted:
+                    item[field] = deepcopy(persisted[field])
         if version in history_numbers or version >= history_next_version:
             merged_by_version[version] = deepcopy(item)
     history_source["report_versions"] = [
@@ -585,6 +592,32 @@ def quick_session_version_source(session_id: str, sess: dict, *, history_loader=
     result = deepcopy(sess)
     _copy_report_version_state(result, entry)
     return result
+
+
+def postwrite_session_version_source(session_id: str, sess: dict, *, history_loader=None) -> dict:
+    """Read an audit's authoritative archive, including session-save recovery."""
+    if not any(v.get("report_audit", {}).get("checkpoint") for v in normalize_report_versions(sess)):
+        return sess
+    history_id = str(sess.get("rerun_target_history_id") or session_id)
+    load = history_loader if history_loader is not None else _load_history
+    entry = next((h for h in load() if h.get("id") == history_id
+                  and _history_owner_key(h) == _history_owner_key(sess)), None)
+    if not entry:
+        return sess
+    result = deepcopy(sess)
+    _copy_report_version_state(result, entry)
+    return result
+
+
+def complete_postwrite_audit_in_history(history_id: str, snapshot: dict, *, expected_base: dict, login) -> tuple[dict, dict]:
+    """Publish audit metadata atomically without adding a report version."""
+    def persist(history):
+        entry = _find_history_for_login(history, history_id, login)
+        if not entry:
+            raise HTTPException(status_code=404, detail="历史报告不存在或无权访问")
+        version = complete_postwrite_audit_version(entry, snapshot, expected_base=expected_base)
+        return deepcopy(entry), deepcopy(version)
+    return mutate_history(persist)
 
 
 def complete_quick_report_in_history(history_id: str, snapshot: dict, *, expected_base: dict, login) -> tuple[dict, dict]:

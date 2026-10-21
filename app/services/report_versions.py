@@ -506,6 +506,37 @@ def complete_quick_report_version(source: dict, snapshot: dict, *, expected_base
     return update_report_version(source, current["version"], **fields)
 
 
+def complete_postwrite_audit_version(source: dict, snapshot: dict, *, expected_base: dict) -> dict:
+    """Update the selected audit only; never append or rewrite a report."""
+    current = resolve_report_version(source, expected_base["version"])
+    for field in ("report_md", "input_snapshot", "report_audit"):
+        if current.get(field) != expected_base.get(field):
+            raise ValueError("该版本的正文、来源或核验进度已更新，本次结果未覆盖新进度，请刷新报告")
+    old_audit = current.get("report_audit") or {}
+    if old_audit.get("status") != "partial" or not old_audit.get("checkpoint"):
+        raise ValueError("所选版本没有可继续的未完成核验")
+    audit = deepcopy(snapshot.get("report_audit") or {})
+    if (snapshot.get("report_md") != current["report_md"]
+            or snapshot.get("input_snapshot") != current.get("input_snapshot")
+            or (audit.get("checkpoint") or {}).get("draft") != current["report_md"]):
+        raise ValueError("续核验结果与原版本正文或来源不一致，本次结果未保存")
+    if audit.get("status") not in {"partial", "complete"}:
+        raise ValueError("续核验结果缺少有效状态，本次结果未保存")
+    attempts = deepcopy(old_audit.get("resume_attempts") or [])
+    attempts.append({"run_id": audit.get("run_id"), "completed_at": snapshot.get("report_completed_at"),
+                     "duration_seconds": snapshot.get("report_duration_seconds"),
+                     "status": audit["status"], "usage": deepcopy(snapshot.get("report_llm_usage") or {})})
+    audit.update(updated_at=snapshot.get("report_completed_at"), resume_attempts=attempts)
+    fields = {"report_audit": audit, "report_status": audit["status"],
+              # This tracker contains only this request's calls. audit.usage already
+              # contains the cumulative ledger and must not be added a second time.
+              "report_llm_usage": _merge_completion_usage(current.get("report_llm_usage"), snapshot.get("report_llm_usage"))}
+    for field in ("comparison_validation", "qa_context_md"):
+        if field in snapshot:
+            fields[field] = deepcopy(snapshot[field])
+    return update_report_version(source, current["version"], **fields)
+
+
 def update_report_version(source: dict, version, **fields) -> dict:
     """Update one snapshot, materializing a legacy V1 only on this write path."""
     _require_source(source)

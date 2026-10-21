@@ -318,7 +318,7 @@ async def run_pipeline(frozen, *, prompts, instruction="", previous=None, collec
         if on_progress:
             await on_progress({"phase": "postwrite", "stage": stage.split(":")[0], "status": "running", "message": message})
     async def invoke(stage, request):
-        await progress(stage, {"writer": "正在依据研究目标撰写初稿", "registry": "正在登记初稿观点和人数表述"}.get(stage, "正在核对原意、引用和人数范围"))
+        await progress(stage, {"writer": "正在依据研究目标撰写初稿", "registry": "正在整理报告中需要核对的内容"}.get(stage, "正在核对原意、引用和人数范围"))
         # Persist pending reservation before the network request as well as after it.
         task = asyncio.create_task(caller.call(stage, request))
         try:
@@ -365,7 +365,7 @@ async def run_pipeline(frozen, *, prompts, instruction="", previous=None, collec
             await checkpoint()
         registry = state["registry"]
         if not registry["complete"]:
-            raise ValueError("观点登记未完成，初稿已保留")
+            raise ValueError("核对清单尚未整理完成，报告正文已保留")
         if stop_after == "registry":
             state["stop_reason"] = "登记阶段已完成，按复测范围停止；原意和人数尚未核验"
             return state

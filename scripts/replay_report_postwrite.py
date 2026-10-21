@@ -466,6 +466,9 @@ async def persist_full_result(output, frozen, prompts, result):
         "report_audit": {"status": "partial", "checkpoint": seed}})
     base_before = deepcopy(base)
     save_session(sid, session)
+    # The business flow archives the initial report before a later audit resume.
+    # Prepare that synthetic archive too; do not rely on creating a second version.
+    survey_service.save_to_history(sid, session)
     async def saved_pipeline(*args, **kwargs):
         await kwargs["on_checkpoint"](deepcopy(result))
         return deepcopy(result)
@@ -481,8 +484,11 @@ async def persist_full_result(output, frozen, prompts, result):
     events = [json.loads(x[6:].strip()) for x in raw if x.startswith("data: ")]
     write_json(output / "save-events.json", events)
     saved = get_session(sid)
-    snapshot = resolve_report_version(saved, 2)
-    checks = {"version_saved": snapshot["version"] == 2, "original_version_unchanged": resolve_report_version(saved, 1) == base_before,
+    snapshot = resolve_report_version(saved, 1)
+    checks = {"version_saved": snapshot["version"] == 1,
+              "original_report_unchanged": all(snapshot.get(key) == base_before.get(key) for key in
+                  ("report_md", "input_snapshot", "created_at", "version", "kind", "base_version", "qa_messages")),
+              "version_count_unchanged": len(saved["report_versions"]) == 1 and saved["next_report_version"] == 2,
               "draft_unchanged": snapshot["report_md"] == result["draft"], "audit_matches": snapshot["report_audit"]["status"] == result["audit"]["status"],
               "history_saved": any(x.get("session_id") == sid or x.get("id") == sid for x in _load_history()),
               "source_count": report_source_page(snapshot)["total"], "extra_model_requests": 0}
@@ -490,7 +496,7 @@ async def persist_full_result(output, frozen, prompts, result):
         (output / f"export-{scope}.md").write_text(prepare_report_markdown(snapshot, scope), encoding="utf-8")
     write_json(output / "saved-snapshot.json", snapshot)
     write_json(output / "save-validation.json", checks)
-    if not all(checks[k] for k in ("version_saved", "original_version_unchanged", "draft_unchanged", "audit_matches", "history_saved")):
+    if not all(checks[k] for k in ("version_saved", "original_report_unchanged", "version_count_unchanged", "draft_unchanged", "audit_matches", "history_saved")):
         raise ValueError("保存回放未通过，详见save-validation.json")
     return checks
 

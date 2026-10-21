@@ -791,5 +791,54 @@ class PostwriteReviewExportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot, original)
 
 
+class PostwriteAuditPersistenceTests(unittest.TestCase):
+    def test_atomic_failure_concurrent_save_stale_reader_and_export(self):
+        from pathlib import Path
+        from tests.test_report_versions import postwrite_completion_fixture
+        from app.services.report_versions import resolve_report_version
+        from app.services import survey_service
+        entry, base, result = postwrite_completion_fixture()
+        login = {"email": "owner@example.com"}
+        with tempfile.TemporaryDirectory(prefix="postwrite-audit-history-") as folder, patch.object(history_storage, "HISTORY_FILE", os.path.join(folder, "history.json")):
+            history_storage._save_history([entry])
+            original = Path(history_storage.HISTORY_FILE).read_bytes()
+            with patch.object(history_storage.os, "replace", side_effect=OSError("synthetic disk failure")):
+                with self.assertRaises(OSError):
+                    report_history.complete_postwrite_audit_in_history(entry["id"], result, expected_base=base, login=login)
+            self.assertEqual(Path(history_storage.HISTORY_FILE).read_bytes(), original)
+            def finish():
+                try:
+                    report_history.complete_postwrite_audit_in_history(entry["id"], result, expected_base=base, login=login)
+                    return True
+                except ValueError:
+                    return False
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                self.assertEqual(sorted(pool.map(lambda _: finish(), range(2))), [False, True])
+            saved = history_storage._load_history()[0]
+            completed = resolve_report_version(saved, 1)
+            self.assertEqual((len(saved["report_versions"]),saved["active_report_version"],saved["next_report_version"]),(5,5,6))
+            self.assertEqual(completed["report_md"], base["report_md"])
+            self.assertEqual(saved["report_versions"][1:],entry["report_versions"][1:])
+            merged = report_history._history_version_source(entry, saved, title=entry["title"], created_at=entry.get("created_at",""))
+            self.assertEqual(resolve_report_version(merged,1)["report_audit"],completed["report_audit"])
+            with patch.object(survey_service,"get_session",return_value=entry):
+                view = survey_service.get_session_report_version(entry["id"],1)
+            self.assertEqual(view["report_status"],"complete")
+            exported = export_history.get_history_export_entry(entry["id"],login,1)
+            self.assertEqual(exported["report_md"],base["report_md"])
+            self.assertNotIn("核验提示",exported["report_md"])
+
+    def test_non_owner_cannot_update_audit(self):
+        from tests.test_report_versions import postwrite_completion_fixture
+        entry, base, result = postwrite_completion_fixture()
+        with tempfile.TemporaryDirectory() as folder, patch.object(history_storage,"HISTORY_FILE",os.path.join(folder,"history.json")), patch.object(security,"FEISHU_LOGIN_REQUIRED",True):
+            history_storage._save_history([entry])
+            before = history_storage._load_history()
+            with self.assertRaises(HTTPException) as raised:
+                report_history.complete_postwrite_audit_in_history(entry["id"],result,expected_base=base,login={"email":"other@example.com"})
+            self.assertEqual(raised.exception.status_code,404)
+            self.assertEqual(history_storage._load_history(),before)
+
+
 if __name__ == "__main__":
     unittest.main()

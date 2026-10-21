@@ -372,7 +372,8 @@ class SaveReplayTests(unittest.IsolatedAsyncioTestCase):
                  patch.object(history, "HISTORY_FILE", str(output / "history.json")), \
                  patch.object(survey_service, "PostwriteRunStore", side_effect=lambda: __import__('app.storage.report_postwrite_runs', fromlist=['RunStore']).RunStore(output / "runs")):
                 checks = await persist_full_result(output, frozen, PROMPTS, result)
-            self.assertTrue(checks["original_version_unchanged"])
+            self.assertTrue(checks["original_report_unchanged"])
+            self.assertTrue(checks["version_count_unchanged"])
             self.assertEqual(checks["extra_model_requests"], 0)
             self.assertEqual((output / "export-body.md").read_text(encoding="utf-8"), REPORT)
             self.assertNotIn("核验未完成", (output / "export-body.md").read_text(encoding="utf-8"))
