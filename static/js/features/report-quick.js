@@ -218,18 +218,6 @@ function renderQuickReportNavigation(md, ctx) {
   host.replaceChildren();
   if (!ctx) return;
   if (quick && !ctx.quickSummary) hydrateQuickReportDetails(ctx);
-  const navigation = document.createElement('nav');
-  navigation.className = 'quick-report-nav';
-  navigation.setAttribute('aria-label', '报告方式与原文');
-  const intro = document.createElement('div');
-  intro.className = 'quick-report-nav__intro';
-  const badge = document.createElement('span');
-  badge.className = 'quick-report-badge';
-  badge.textContent = reportModeLabel(ctx.reportMode || (quick ? 'quick' : 'insight'));
-  const copy = document.createElement('span');
-  copy.textContent = quick ? '客观题统计 · 主观题逐题总结 · 原文按需查看' : '重点发现与决策含义 · 原文按需查看';
-  intro.append(badge, copy);
-  navigation.append(intro);
   const questions = ctx.quickSummary?.questions || [];
   const failedCount = questions.filter(question => question.status === 'failed').length;
   if (ctx.reportStatus === 'partial' || failedCount) {
@@ -247,22 +235,8 @@ function renderQuickReportNavigation(md, ctx) {
     retry.disabled = reportInteractionBusy();
     retry.addEventListener('click', retryFailedQuickReport);
     partial.append(text, retry);
-    navigation.append(partial);
+    host.append(partial);
   }
-  if (quick) {
-    const partial = navigation.querySelector('.quick-partial-notice');
-    if (partial) host.append(partial);
-    return;
-  }
-  const links = document.createElement('div');
-  links.className = 'quick-report-nav__links';
-  const source = document.createElement('button');
-  source.type = 'button';
-  source.textContent = '查看回答原文';
-  source.addEventListener('click', () => openReportSources('', '全部题目', 'all'));
-  links.append(source);
-  navigation.append(links);
-  host.append(navigation);
 }
 function reportExportUrl(url, version, scope = 'body') {
   const target = new URL(url, window.location.origin);
