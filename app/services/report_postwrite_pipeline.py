@@ -8,6 +8,7 @@ import time
 from app.core import config
 from app.integrations.llm_client import collect_chat_completion
 from app.services.report_postwrite_inputs import fingerprint, validate_frozen, check_comparisons
+from app.services.report_writer_capacity import estimate_writer_capacity, unknown_capacity
 from app.services.report_postwrite_audit import (
     messages, parse_json, registry_payload, validate_registry, REGISTRY_FORMAT,
     meaning_payload, bind_meanings, count_scope, COUNT_FORMAT, bind_members, aggregate_count,
@@ -314,9 +315,9 @@ async def run_pipeline(frozen, *, prompts, instruction="", previous=None, collec
         state["usage"] = caller.summary()
         if on_checkpoint:
             await on_checkpoint(deepcopy(state))
-    async def progress(stage, message):
+    async def progress(stage, message, **extra):
         if on_progress:
-            await on_progress({"phase": "postwrite", "stage": stage.split(":")[0], "status": "running", "message": message})
+            await on_progress({"phase": "postwrite", "stage": stage.split(":")[0], "status": "running", "message": message, **extra})
     async def invoke(stage, request):
         await progress(stage, {"writer": "正在依据研究目标撰写初稿", "registry": "正在整理报告中需要核对的内容"}.get(stage, "正在核对原意、引用和人数范围"))
         # Persist pending reservation before the network request as well as after it.
@@ -337,7 +338,19 @@ async def run_pipeline(frozen, *, prompts, instruction="", previous=None, collec
             await checkpoint()
     try:
         if not state["draft"]:
-            state["draft"] = await invoke("writer", messages(prompts["writer"], {**packet, "instruction": instruction}, ""))
+            writer_request = messages(prompts["writer"], {**packet, "instruction": instruction}, "")
+            await progress("writer_capacity", "正在检查写作容量", writer_capacity={
+                "status": "checking", "message": "容量检查：正在估算本次输入及输出预留…", "impact": ""})
+            await asyncio.sleep(0)
+            try:
+                state["writer_capacity"] = estimate_writer_capacity(writer_request, model=caller.model,
+                    output_tokens=caller.writer_output_tokens, estimate_input=estimate_tokens)
+            except Exception:
+                state["writer_capacity"] = unknown_capacity()
+            await progress("writer_capacity", "容量预估已结束，报告继续生成", status="completed",
+                           writer_capacity=deepcopy(state["writer_capacity"]))
+            # Advisory only: every result uses the same complete, original A request.
+            state["draft"] = await invoke("writer", writer_request)
             if not state["draft"].strip():
                 raise ValueError("写作未返回初稿")
             state["draft_fingerprint"] = fingerprint(state["draft"])
@@ -490,4 +503,5 @@ def audit_summary(state):
             "registered_claims": len(registry.get("claims", [])), "checked_claims": sum(c.get("complete", False) for c in checks.values()),
             "missing_claims": missing, "registration_errors": registry.get("errors", []),
             "stop_reason": state.get("stop_reason", ""), "usage": deepcopy(state.get("usage") or {}),
+            **({"writer_capacity": deepcopy(state["writer_capacity"])} if state.get("writer_capacity") else {}),
             "notice": "仅核对来源、原意和人数范围；提示供人工审阅，不自动改写正文。"}

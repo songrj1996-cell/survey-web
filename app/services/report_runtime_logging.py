@@ -5,6 +5,7 @@ import asyncio
 from contextvars import ContextVar
 from functools import wraps
 import json
+import math
 import re
 import time
 
@@ -23,6 +24,7 @@ _STAGES = {
     "synthesis": "综合分析各项发现",
     "writing": "撰写报告",
     "writer": "撰写初稿",
+    "writer_capacity": "检查写作容量",
     "registry": "整理报告中需要核对的内容",
     "meaning": "核对原意和引用",
     "quantity": "核对人数范围",
@@ -171,6 +173,21 @@ class SurveyProgressLog:
             if key != self.last_progress:
                 self.last_progress = key
                 self.enter(stage)
+                if stage == "writer_capacity" and payload.get("status") == "completed":
+                    capacity = payload.get("writer_capacity") or {}
+                    status = capacity.get("status")
+                    descriptions = {
+                        "sufficient": "预估容量充足，预计可一次完成写作；预估值仅供参考",
+                        "near_limit": "预估接近上限，可能发生截断或生成失败",
+                        "over_limit": "预估达到或超出上限，可能发生截断或生成失败",
+                        "unknown": "暂未取得可用的容量预估，容量风险尚不明确",
+                    }
+                    if status in descriptions:
+                        percent = capacity.get("occupancy_percent")
+                        prefix = (f"预估占用 {percent:g}%（含输出预留）；"
+                                  if type(percent) in (int, float) and math.isfinite(percent) and percent >= 0 else "")
+                        self.emit("info" if status == "sufficient" else "warning",
+                                  prefix + descriptions[status] + "。报告继续生成。")
             if stage == "quick_questions":
                 completed, total = payload.get("run_completed"), payload.get("run_total")
                 counts = (completed, total)
