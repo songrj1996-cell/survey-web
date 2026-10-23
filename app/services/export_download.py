@@ -9,6 +9,7 @@ from app.services.report_render import _prep_export_md, markdown_to_docx, report
 from app.services.report_modes import MODE_SNAPSHOT_FIELDS, prepare_report_markdown
 from app.services.report_versions import normalize_report_versions, resolve_report_version
 from app.storage.sessions import get_session
+from app.services.export_service import prepare_feishu_export_data
 
 
 def _extract_title(report_md: str) -> tuple[str, str]:
@@ -91,3 +92,10 @@ def get_session_export_data(session_id: str, version=None, scope="body") -> tupl
     if not report_md:
         raise HTTPException(status_code=400, detail="还没有生成报告")
     return report_md, sess.get("mode") or ""
+
+
+def get_session_feishu_export_data(session_id: str, version=None, scope="body") -> dict:
+    source = _get_session_report_source(session_id, version)
+    if not source.get("report_md"):
+        raise HTTPException(status_code=400, detail="还没有生成报告")
+    return prepare_feishu_export_data(source, scope)

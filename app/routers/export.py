@@ -12,13 +12,13 @@ from app.core.runtime_logging import runtime_log
 from app.services.audit import audit_log
 from app.services.auth import _current_login
 from app.services.export_download import (
-    get_session_export_data,
+    get_session_feishu_export_data,
     prepare_markdown_download,
     prepare_pdf_download,
     prepare_word_download,
 )
 from app.services.export_history import (
-    get_history_export_entry,
+    get_history_feishu_export_data,
     prepare_markdown_history_download,
     prepare_pdf_history_download,
     prepare_word_history_download,
@@ -194,9 +194,9 @@ async def export_feishu(
     require_feishu_configured()
     if not login:
         raise HTTPException(status_code=401, detail="请先登录飞书")
-    report_md, mode = get_session_export_data(session_id, version, scope=scope)
+    payload = get_session_feishu_export_data(session_id, version, scope=scope)
     try:
-        url = await _export_to_feishu(report_md, login, mode=mode)
+        url = await _export_to_feishu(login=login, **payload)
     except Exception as e:
         runtime_log("飞书导出", "error", "导出当前报告失败", error=e)
         raise _feishu_export_error(e)
@@ -221,15 +221,9 @@ async def export_feishu_history(
     login = await _current_login(request)
     if not login:
         raise HTTPException(status_code=401, detail="请先登录飞书")
-    entry = get_history_export_entry(history_id, login, version, scope=scope)
-    entry_mode = entry.get("mode") or entry.get("plan", {}).get("mode", "")
+    payload = get_history_feishu_export_data(history_id, login, version, scope=scope)
     try:
-        url = await _export_to_feishu(
-            entry.get("report_md", ""),
-            login,
-            mode=entry_mode,
-            title=entry.get("title", history_id),
-        )
+        url = await _export_to_feishu(login=login, **payload)
     except Exception as e:
         runtime_log("飞书导出", "error", "导出历史报告失败", error=e)
         raise _feishu_export_error(e)
@@ -237,7 +231,7 @@ async def export_feishu_history(
         request,
         "report",
         "导出历史飞书文档",
-        f"报告：{entry.get('title', history_id)}",
+        f"报告：{payload.get('title') or history_id}",
         metadata={"history_id": history_id, "version": version},
     )
     return {"url": url, "type": "doc"}

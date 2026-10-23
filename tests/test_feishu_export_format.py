@@ -16,6 +16,7 @@ from app.integrations.feishu_client import (
 from app.services.report_render import (
     _extract_feishu_callout_sections,
     _prep_feishu_export_md,
+    _player_case_markdown,
 )
 
 
@@ -196,6 +197,163 @@ class FeishuCalloutApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(create_callout["children"][0]["callout"]["background_color"], 2)
         delete_payload = next(payload for method, _, payload in requests if method == "DELETE")
         self.assertEqual(delete_payload, {"start_index": 3, "end_index": 5})
+
+
+class PlayerCaseFormattingTests(unittest.TestCase):
+    def test_inline_case_is_bounded_and_keeps_ids_links_and_words(self):
+        md = "## 体验\n\n典型玩家案例｜R73：**合成案例**，见[证据](https://example.invalid/source)。\n\n普通分析仍在外面。"
+        formatted, texts = _player_case_markdown(md)
+        self.assertEqual(texts, ["典型玩家案例｜\nR73：合成案例，见证据 (https://example.invalid/source)。"])
+        self.assertIn("```\n\n普通分析仍在外面。", formatted)
+        self.assertEqual(_player_case_markdown(formatted), (formatted, []))
+
+    def test_standalone_labels_collect_only_explicit_player_paragraphs_and_lists(self):
+        for label in ["**典型玩家案例**", "#### 典型玩家案例", "典型玩家案例：", "典型玩家案例\n---"]:
+            md = label + "\n\nR73：合成经历。\n\n1. R74：另一位玩家。\n2. R75 玩家选择放弃。\n\n分析边界。\n\nR90：未标记，不属于案例。"
+            formatted, texts = _player_case_markdown(md)
+            self.assertEqual(len(texts), 1, label)
+            for player in ["R73", "R74", "R75"]:
+                self.assertIn(player, texts[0])
+            self.assertNotIn("分析边界", texts[0])
+            self.assertNotIn("R90", texts[0])
+            self.assertIn("分析边界", formatted)
+
+    def test_negative_controls_do_not_become_cases(self):
+        samples = [
+            "下面通过典型玩家案例说明差异。\n\nR73：原文。",
+            "R73：没有标签的玩家段落。",
+            "典型玩家案例\n\n总体而言需要改进。\n\nR73：不跨越分析段落。",
+            "典型玩家案例\n\n- R73：案例。\n- 这是分析，不是玩家。",
+            "典型玩家案例\n\n## 下个章节\n\nR73：原文。",
+            "```text\n典型玩家案例｜R73：已存在的代码块。\n```",
+            "> 典型玩家案例｜R73：证据引用中的标签。",
+            "    典型玩家案例｜R73：缩进代码。",
+            "| 典型玩家案例 | 其他 |\n| --- | --- |\n| R73 | 表格 |",
+        ]
+        for md in samples:
+            with self.subTest(md=md):
+                self.assertEqual(_player_case_markdown(md), (md, []))
+
+    def test_separate_cases_line_breaks_and_safe_fences(self):
+        md = "典型玩家案例\nR73：第一位。\n\n普通结论。\n\n典型玩家案例：R74：第二位含 `代码`。"
+        formatted, texts = _player_case_markdown(md)
+        self.assertEqual(len(texts), 2)
+        self.assertIn("R73", texts[0])
+        self.assertIn("R74", texts[1])
+        self.assertIn("代码", texts[1])
+        self.assertIn("普通结论", formatted)
+
+    def test_core_rebuild_creates_plain_code_only_when_opted_in(self):
+        md = f"{CORE_START}\n## 核心结论\n\n### 主题\n\n典型玩家案例\n\nR73：合成案例。\n\n普通结论。\n{CORE_END}"
+        original = _extract_feishu_callout_sections(md)
+        self.assertNotIn("code_blocks", original[0])
+        section = _extract_feishu_callout_sections(md, player_cases=True)[0]
+        children = _core_callout_children(section["lines"], code_blocks=section["code_blocks"])
+        codes = [b["code"] for b in children if b.get("block_type") == 14]
+        self.assertEqual(len(codes), 1)
+        self.assertEqual(codes[0]["style"], {"language": 1, "wrap": True})
+        self.assertIn("R73：合成案例。", codes[0]["elements"][0]["text_run"]["content"])
+        self.assertNotIn("普通结论", codes[0]["elements"][0]["text_run"]["content"])
+
+    def test_case_support_does_not_reformat_other_core_code(self):
+        md = f"{CORE_START}\n## 核心结论\n\n```text\n普通代码块\n```\n\n典型玩家案例｜R73：合成案例。\n{CORE_END}"
+        section = _extract_feishu_callout_sections(md, player_cases=True)[0]
+        children = _core_callout_children(section["lines"], code_blocks=section["code_blocks"])
+        codes = [block for block in children if block.get("block_type") == 14]
+        self.assertEqual(len(codes), 1)
+        self.assertNotIn("普通代码块", repr(codes))
+        original = _core_callout_children(["```text", "普通代码块", "```"])
+        self.assertEqual(children[:len(original)], original)
+
+
+class PlayerCaseExportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_export_transforms_body_only_and_never_exports_audit_prompts(self):
+        from app.services import export_service as service
+        md = "# 合成报告\n\n典型玩家案例｜R73：报告案例。"
+        annex = "\n\n## 原文附录\n\n典型玩家案例｜R90：原始证据，不转换。"
+        for enabled in [False, True]:
+            with self.subTest(enabled=enabled), patch.object(service.feishu_export, "create_doc_via_bot", new=AsyncMock(return_value=("synthetic-url", "doc", "docx"))) as create:
+                await service._export_to_feishu(md, {}, player_cases=enabled, evidence_md=annex)
+                args, options = create.call_args
+                self.assertTrue(args[1].endswith(annex))
+                self.assertEqual("player_case_texts" in options, enabled)
+                self.assertEqual("```text" in args[1], enabled)
+                self.assertNotIn("R90", " ".join(options.get("player_case_texts", [])))
+
+    async def test_case_preparation_failure_retains_body_and_logs_no_source(self):
+        from app.services import export_service as service
+        md = "# 合成报告\n\n典型玩家案例｜R73：敏感合成内容。"
+        with patch.object(service, "_player_case_markdown", side_effect=ValueError("secret-source")), patch.object(service, "runtime_log") as log, patch.object(service.feishu_export, "create_doc_via_bot", new=AsyncMock(return_value=("synthetic-url", "doc", "docx"))) as create:
+            await service._export_to_feishu(md, {}, player_cases=True)
+        self.assertEqual(create.call_args.args[1], _prep_feishu_export_md(md))
+        self.assertNotIn("player_case_texts", create.call_args.kwargs)
+        warnings = [call for call in log.call_args_list if "warning" in call.args]
+        self.assertEqual(len(warnings), 1)
+        self.assertNotIn("secret-source", repr(warnings))
+        self.assertNotIn("敏感合成内容", repr(warnings))
+
+    async def test_exact_code_updates_are_batched_and_do_not_rewrite_content(self):
+        from app.integrations import feishu_client as client_module
+        text = "典型玩家案例\nR73：合成内容。"
+        blocks = [{"block_id": "case", "code": {"elements": [{"text_run": {"content": text}}]}},
+                  {"block_id": "unrelated", "code": {"elements": [{"text_run": {"content": "unrelated"}}]}}]
+        with patch.object(client_module, "_list_doc_blocks", new=AsyncMock(return_value=blocks)), patch.object(client_module, "_doc_edit", new=AsyncMock(return_value={"code": 0})) as edit:
+            self.assertTrue(await client_module._apply_player_case_styles(AsyncMock(), {}, "doc", [text]))
+        request = edit.call_args.args[4]["requests"]
+        self.assertEqual(request, [{"block_id": "case", "update_text_style": {"style": {"language": 1, "wrap": True}}}])
+        self.assertNotIn("elements", repr(request))
+
+    async def test_missing_or_rejected_code_keeps_original_text_and_warns(self):
+        from app.integrations import feishu_client as client_module
+        text = "典型玩家案例\nR73：秘密合成原文。"
+        block = {"block_id": "case", "code": {"elements": [{"text_run": {"content": text}}]}}
+        for blocks, response in [([], {"code": 0}), ([block], {"code": 403})]:
+            with patch.object(client_module, "_list_doc_blocks", new=AsyncMock(return_value=blocks)), patch.object(client_module, "_doc_edit", new=AsyncMock(return_value=response)), patch.object(client_module, "runtime_log") as log:
+                self.assertFalse(await client_module._apply_player_case_styles(AsyncMock(), {}, "doc", [text]))
+                self.assertTrue(any("warning" in c.args for c in log.call_args_list))
+                self.assertNotIn("秘密合成原文", repr(log.call_args_list))
+
+    async def test_large_case_lists_use_batches_and_already_wrapped_codes_need_no_write(self):
+        from app.integrations import feishu_client as client_module
+        text = "典型玩家案例\nR73：合成案例。"
+        blocks = [{"block_id": f"case-{i}", "code": {"elements": [{"text_run": {"content": text}}]}} for i in range(101)]
+        with patch.object(client_module, "_list_doc_blocks", new=AsyncMock(return_value=blocks)), patch.object(client_module, "_doc_edit", new=AsyncMock(return_value={"code": 0})) as edit:
+            self.assertTrue(await client_module._apply_player_case_styles(AsyncMock(), {}, "doc", [text]))
+            self.assertEqual([len(c.args[4]["requests"]) for c in edit.call_args_list], [50, 50, 1])
+        blocks[0]["code"]["style"] = {"language": 1, "wrap": True}
+        with patch.object(client_module, "_list_doc_blocks", new=AsyncMock(return_value=blocks[:1])), patch.object(client_module, "_doc_edit", new=AsyncMock()) as edit:
+            self.assertTrue(await client_module._apply_player_case_styles(AsyncMock(), {}, "doc", [text]))
+            edit.assert_not_called()
+
+    async def test_import_passes_case_styles_before_navigation_and_ownership(self):
+        from app.integrations import feishu_client as client_module
+        calls = []
+        client = AsyncMock()
+        client.__aenter__.return_value = client
+        async def post(url, **kwargs):
+            if url.endswith('/files/upload_all'):
+                return _FakeResponse({"code": 0, "data": {"file_token": "file"}})
+            if url.endswith('/import_tasks'):
+                return _FakeResponse({"code": 0, "data": {"ticket": "ticket"}})
+            calls.append('owner')
+            return _FakeResponse({"code": 0})
+        client.post.side_effect = post
+        client.get.return_value = _FakeResponse({"code": 0, "data": {"result": {"job_status": 0, "token": "doc", "type": "docx", "url": "synthetic-url"}}})
+        async def styles(*args, **kwargs):
+            calls.append('styles')
+            self.assertEqual(kwargs['player_case_texts'], ['case'])
+        async def navigation(*args):
+            calls.append('navigation')
+        with patch.object(client_module, "_app_access_token", new=AsyncMock(return_value="synthetic")), patch.object(client_module.httpx, "AsyncClient", return_value=client), patch.object(client_module, "apply_report_styles", new=styles), patch.object(client_module, "apply_block_navigation", new=navigation):
+            await client_module.create_doc_via_bot('合成报告', '正文', 'synthetic-owner', apply_report_format=True, player_case_texts=['case'], block_navigation={"nodes": []})
+        self.assertEqual(calls, ['styles', 'navigation', 'owner'])
+
+    async def test_style_timeout_is_best_effort_and_does_not_retry_per_case(self):
+        from app.integrations import feishu_client as client_module
+        with patch.object(client_module, "_app_access_token", new=AsyncMock(return_value="synthetic")), patch.object(client_module, "_apply_player_case_styles", new=AsyncMock(side_effect=TimeoutError("secret"))) as apply, patch.object(client_module, "_replace_report_divider", new=AsyncMock(return_value=True)), patch.object(client_module, "runtime_log") as log:
+            self.assertFalse(await client_module.apply_report_styles("doc", player_case_texts=["case"]))
+        apply.assert_awaited_once()
+        self.assertNotIn("secret", repr(log.call_args_list))
 
 
 if __name__ == "__main__":

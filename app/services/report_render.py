@@ -14,6 +14,7 @@ import socket
 import subprocess
 import tempfile
 import time
+from html.parser import HTMLParser
 from pathlib import Path
 from urllib.request import urlopen
 
@@ -214,7 +215,152 @@ def _drop_all_h1(md: str) -> str:
     return "\n".join(kept).lstrip()
 
 
-def _prep_feishu_export_md(md: str, mode: str = "") -> str:
+class _CasePlainText(HTMLParser):
+    """Flatten case formatting only; retain visible text and link destinations."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+        self.links = []
+        self.lists = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag in {"p", "blockquote", "li", "br", *{f"h{i}" for i in range(1, 7)}}:
+            self.parts.append("\n")
+        if tag in {"ol", "ul"}:
+            self.lists.append([tag, int(attrs.get("start", "1"))])
+        if tag == "li" and self.lists:
+            kind, number = self.lists[-1]
+            self.parts.append(f"{number}. " if kind == "ol" else "- ")
+            self.lists[-1][1] += 1
+        if tag == "a":
+            self.links.append((attrs.get("href", ""), len(self.parts)))
+        if tag == "img":
+            self.parts.append(attrs.get("alt", ""))
+            if attrs.get("src"):
+                self.parts.append(f" ({attrs['src']})")
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self.links:
+            href, start = self.links.pop()
+            if href and href != "".join(self.parts[start:]):
+                self.parts.append(f" ({href})")
+        if tag in {"ol", "ul"} and self.lists:
+            self.lists.pop()
+        if tag in {"p", "li", "blockquote", *{f"h{i}" for i in range(1, 7)}}:
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        self.parts.append(data)
+
+
+def _case_plain_text(md: str) -> str:
+    parser = _CasePlainText()
+    parser.feed(markdown_lib.markdown(md, extensions=["fenced_code", "tables"]))
+    return re.sub(r"\n{3,}", "\n\n", "".join(parser.parts)).strip()
+
+
+def _case_label_kind(text: str) -> str:
+    if re.fullmatch(r"典型玩家案例\s*[:：]?", text.strip()):
+        return "label"
+    if re.match(r"^典型玩家案例\s*(?:[:：｜|]\s*\S|\n\s*R\d+)", text.strip()):
+        return "inline"
+    return ""
+
+
+def _player_case_markdown(md: str) -> tuple[str, list[str]]:
+    """Wrap only explicit, bounded case blocks; never infer cases from IDs alone.
+
+    Label-only blocks consume adjacent R-number paragraphs or all-player lists.
+    Ordinary analysis, headings, fences, quotes and tables terminate a case.
+    """
+    lines = md.splitlines(keepends=True)
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line))
+    heading = re.compile(r"^ {0,3}#{1,6}\s+")
+    item = re.compile(r"^(?:[-+*]|\d+[.)])\s+")
+    fence = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+    blocks = []
+    i = 0
+    while i < len(lines):
+        if not lines[i].strip():
+            i += 1
+            continue
+        start = i
+        opening = fence.match(lines[i])
+        kind = "paragraph"
+        if opening:
+            kind = "code"
+            i += 1
+            closing = re.compile(r"^ {0,3}" + re.escape(opening[1][0]) + "{" + str(len(opening[1])) + r",}\s*$")
+            while i < len(lines):
+                current = lines[i]
+                i += 1
+                if closing.match(current):
+                    break
+        elif i + 1 < len(lines) and re.fullmatch(r" {0,3}(?:=+|-+)\s*", lines[i + 1]):
+            kind = "heading"
+            i += 2
+        elif heading.match(lines[i]):
+            kind = "heading"
+            i += 1
+        elif item.match(lines[i]):
+            kind = "list"
+            i += 1
+            while i < len(lines):
+                if item.match(lines[i]) or re.match(r"^[ \t]+\S", lines[i]):
+                    i += 1
+                elif not lines[i].strip() and i + 1 < len(lines) and (item.match(lines[i + 1]) or re.match(r"^[ \t]+\S", lines[i + 1])):
+                    i += 1
+                else:
+                    break
+        else:
+            i += 1
+            while i < len(lines) and lines[i].strip() and not (heading.match(lines[i]) or item.match(lines[i]) or fence.match(lines[i])):
+                i += 1
+        raw = "".join(lines[start:i]).rstrip("\r\n")
+        if kind == "paragraph" and raw.startswith(("    ", "\t", ">", "|", "<!--")):
+            kind = "other"
+        blocks.append((offsets[start], offsets[i], kind, raw))
+
+    def player_body(block):
+        _, _, kind, raw = block
+        if kind == "paragraph":
+            return bool(re.match(r"^R\d+(?:\s*[:：]|\s*玩家|\s+)", _case_plain_text(raw)))
+        if kind == "list":
+            entries = [item.sub("", line) for line in raw.splitlines() if item.match(line)]
+            return bool(entries) and all(re.match(r"^R\d+(?:\s*[:：]|\s*玩家|\s+)", _case_plain_text(entry)) for entry in entries)
+        return False
+
+    output, texts, cursor = [], [], 0
+    i = 0
+    while i < len(blocks):
+        start, end, kind, raw = blocks[i]
+        label = _case_label_kind(_case_plain_text(raw)) if kind in {"paragraph", "heading"} and "典型玩家案例" in raw else ""
+        if not label:
+            i += 1
+            continue
+        j = i + 1
+        while j < len(blocks) and player_body(blocks[j]):
+            end = blocks[j][1]
+            j += 1
+        if label == "label" and j == i + 1:
+            i += 1
+            continue
+        text = _case_plain_text(md[start:end])
+        text = re.sub(r"^(典型玩家案例[ \t]*[:：｜|])[ \t]*(?=\S)", r"\1\n", text)
+        delimiter = "`" * max(3, 1 + max((len(m[0]) for m in re.finditer(r"`+", text)), default=0))
+        output.extend((md[cursor:start], f"{delimiter}text\n{text}\n{delimiter}\n"))
+        texts.append(text)
+        cursor = end
+        i = j
+    output.append(md[cursor:])
+    return "".join(output), texts
+
+
+def _prep_feishu_export_md(md: str, mode: str = "", *, include_disclaimer: bool = True) -> str:
     """准备飞书专用 Markdown，不影响网页、Word、PDF 或 Markdown 下载。
 
     飞书文档标题栏已经展示 H1，因此正文移除所有 H1；免责声明使用斜体引用，
@@ -224,7 +370,7 @@ def _prep_feishu_export_md(md: str, mode: str = "") -> str:
     if not md:
         return md
 
-    prepared = _inject_disclaimer(md, mode=mode)
+    prepared = _inject_disclaimer(md, mode=mode) if include_disclaimer else md
     has_core_markers = CORE_START in prepared and CORE_END in prepared
     in_core = False
     output: list[str] = []
@@ -296,13 +442,15 @@ def _clean_core_group_title(title: str) -> str:
     return clean.strip() or str(title or "").strip()
 
 
-def _extract_feishu_callout_sections(md: str) -> list[dict]:
+def _extract_feishu_callout_sections(md: str, *, player_cases: bool = False) -> list[dict]:
     """提取核心结论正文，供导入后替换为飞书高亮块。
 
     样本量保留在高亮块外，因此这里不返回核心标题和样本量行；章节内的普通
     ``本节总结`` 不属于用户要求的核心结论高亮范围，也不会被转换。
     """
     core_lines = _extract_core_lines(md)
+    if player_cases and CORE_START in md and CORE_END in md:
+        core_lines = md.split(CORE_START, 1)[1].split(CORE_END, 1)[0].splitlines()
     if not core_lines:
         lines = md.splitlines()
         start = next(
@@ -315,7 +463,7 @@ def _extract_feishu_callout_sections(md: str) -> list[dict]:
                 if re.match(r"^##\s+", lines[i].strip()):
                     end = i
                     break
-            core_lines = [line for line in lines[start:end] if line.strip()]
+            core_lines = [line for line in lines[start:end] if player_cases or line.strip()]
     if not core_lines:
         return []
 
@@ -328,6 +476,10 @@ def _extract_feishu_callout_sections(md: str) -> list[dict]:
     ]
     if not any(line.strip() and line.strip() != "---" for line in body):
         return []
+    if player_cases:
+        formatted, texts = _player_case_markdown("\n".join(body))
+        if texts:
+            return [{"title": "核心结论", "lines": formatted.splitlines(), "occurrence": 1, "code_blocks": texts}]
     return [{"title": "核心结论", "lines": body, "occurrence": 1}]
 
 

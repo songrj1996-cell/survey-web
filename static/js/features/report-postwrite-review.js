@@ -242,6 +242,7 @@
         if (issue.canLocate) {
           const locate = node('button', 'btn btn--ghost', '定位到报告原句', body);
           locate.type = 'button'; locate.disabled = !!actions.busy;
+          locate.dataset.postwriteLocate = 'true';
           locate.onclick = () => actions.onLocate?.(issue);
         }
         cards.push({detail, risk: issue.risk});

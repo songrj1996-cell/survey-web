@@ -3,6 +3,7 @@
 把报告补好免责声明后上传为飞书文档(归登录用户),并经机器人通知;统一映射飞书权限错误。
 """
 import re
+import time
 
 from fastapi import HTTPException
 
@@ -10,10 +11,12 @@ from app.core.runtime_logging import runtime_log
 from app.integrations import feishu_client as feishu_export
 from app.services.feishu_evidence_navigation import prepare_evidence_navigation
 from app.services.feishu_navigation_auto_update import register_exported_navigation
+from app.services.report_modes import prepare_report_markdown
 from app.services.report_render import (
     _extract_feishu_callout_sections,
     _prep_export_md,
     _prep_feishu_export_md,
+    _player_case_markdown,
 )
 
 
@@ -24,14 +27,50 @@ def _clean_feishu_title(title: str | None) -> str:
     return clean[:120] or "调研报告"
 
 
-async def _export_to_feishu(report_md: str, login: dict, mode: str = "", title: str | None = None) -> str:
+def prepare_feishu_export_data(snapshot: dict, scope: str = "body") -> dict:
+    """Read exact-version metadata; keep the source appendix outside case formatting."""
+    body = prepare_report_markdown(snapshot, "body")
+    full = body if scope == "body" else prepare_report_markdown(snapshot, scope)
+    audit = snapshot.get("report_audit")
+    plan = snapshot.get("plan") or {}
+    return {
+        "report_md": body,
+        "evidence_md": full[len(body):],
+        "player_cases": isinstance(audit, dict) and bool(audit),
+        "mode": snapshot.get("mode") or plan.get("mode", ""),
+        "title": snapshot.get("title") or None,
+    }
+
+
+async def _export_to_feishu(
+    report_md: str, login: dict, mode: str = "", title: str | None = None,
+    *, player_cases: bool = False, evidence_md: str = "",
+) -> str:
     """将报告上传为飞书文档（docx），文档归登录用户所有，并通过机器人发消息通知。"""
     full = _prep_export_md(report_md, mode=mode)  # 补免责声明 + 去掉 CORE_START/END 标记
     title_m = re.search(r"^#\s+(.+?)$", full, re.MULTILINE)
     title = _clean_feishu_title(title or (title_m.group(1).strip() if title_m else "调研报告"))
     body = _prep_feishu_export_md(report_md, mode=mode)
-    body, navigation = prepare_evidence_navigation(body)
     callout_sections = _extract_feishu_callout_sections(report_md)
+    case_texts = []
+    if player_cases:
+        started = time.monotonic()
+        try:
+            formatted, texts = _player_case_markdown(body)
+            sections = _extract_feishu_callout_sections(report_md, player_cases=True)
+            body, case_texts, callout_sections = formatted, texts, sections
+            runtime_log("飞书导出", "info", f"已准备 {len(texts)} 处典型玩家案例格式",
+                        elapsed_seconds=round(time.monotonic() - started, 3))
+        except Exception as exc:
+            runtime_log("飞书导出", "warning", "典型玩家案例格式准备失败，已保留普通正文",
+                        error_type=type(exc).__name__)
+    # Keep legacy Feishu heading preparation, without applying case formatting
+    # or injecting a second disclaimer into the source appendix.
+    appendix = _prep_feishu_export_md(evidence_md, mode=mode, include_disclaimer=False) if evidence_md else ""
+    # splitlines() in heading preparation consumes one terminal line break;
+    # retain that break when it was internal to the original combined export.
+    separator = "\n\n" + ("\n" if report_md.endswith(("\n", "\r")) else "")
+    body, navigation = prepare_evidence_navigation(body + (separator + appendix if appendix else ""))
     open_id = login.get("open_id", "") or None
     url, doc_token, doc_type = await feishu_export.create_doc_via_bot(
         title,
@@ -39,6 +78,7 @@ async def _export_to_feishu(report_md: str, login: dict, mode: str = "", title: 
         open_id,
         callout_sections=callout_sections,
         apply_report_format=True,
+        **({"player_case_texts": case_texts} if case_texts else {}),
         **({"block_navigation": navigation} if navigation else {}),
     )
     if navigation and doc_type == "docx":

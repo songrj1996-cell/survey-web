@@ -189,6 +189,7 @@ async def create_doc_via_bot(
     callout_sections: list[dict] | None = None,
     apply_report_format: bool = False,
     block_navigation: dict | None = None,
+    player_case_texts: list[str] | None = None,
 ) -> tuple[str, str, str]:
     """用 tenant_access_token 创建文档，返回 (URL, doc_token, doc_type)。
     若提供 open_id，文档创建后转移所有权给该用户（文档移入用户我的空间）。
@@ -253,7 +254,7 @@ async def create_doc_via_bot(
     if callout_sections:
         await apply_callout_sections(doc_token, callout_sections)
     if apply_report_format:
-        await apply_report_styles(doc_token)
+        await apply_report_styles(doc_token, **({"player_case_texts": player_case_texts} if player_case_texts else {}))
     if block_navigation:
         # Resolve final block IDs after structural formatting and before handing
         # ownership to the user, while the bot still has edit permission.
@@ -447,6 +448,7 @@ _BT_TEXT = 2
 _BT_HEADING2 = 4
 _BT_BULLET = 12
 _BT_ORDERED = 13
+_BT_CODE = 14
 _BT_QUOTE = 15
 _BT_CALLOUT = 19
 _FONT_ORANGE = 2
@@ -541,12 +543,30 @@ def _clean_core_group_title(title: str) -> str:
     return clean.strip() or str(title or "").strip()
 
 
-def _core_callout_children(lines: list[str]) -> list[dict]:
+def _core_callout_children(lines: list[str], *, code_blocks: list[str] | None = None) -> list[dict]:
     """核心结论不进入目录；用富文本标题、引用和视觉缩进保留阅读层级。"""
     children: list[dict] = []
-    for raw in lines:
+    remaining = iter(lines)
+    for raw in remaining:
         raw_text = str(raw or "").rstrip()
         text = raw_text.strip()
+        opening = re.fullmatch(r"(`{3,})text", text) if code_blocks else None
+        if opening:
+            content = []
+            closing = []
+            for code_line in remaining:
+                if code_line.strip() == opening[1]:
+                    closing = [code_line]
+                    break
+                content.append(code_line)
+            if "\n".join(content) in code_blocks:
+                children.append({"block_type": _BT_CODE, "code": {
+                    "elements": [_text_element("\n".join(content))],
+                    "style": {"language": 1, "wrap": True},
+                }})
+            else:
+                children.extend(_core_callout_children([raw, *content, *closing]))
+            continue
         if not text or text == "---" or text.startswith("<!--"):
             continue
         if re.match(r"^##\s+核心结论\s*$", text):
@@ -1025,6 +1045,7 @@ async def _replace_section_with_callout(
     title: str,
     lines: list[str],
     occurrence: int = 1,
+    code_blocks: list[str] | None = None,
 ) -> bool:
     all_blocks = await _list_doc_blocks(client, headers, doc_token)
     blocks = _root_doc_blocks(all_blocks, doc_token)
@@ -1088,7 +1109,7 @@ async def _replace_section_with_callout(
         return False
     callout_id = result["data"]["children"][0]["block_id"]
 
-    children = _core_callout_children(lines)
+    children = _core_callout_children(lines, code_blocks=code_blocks)
     if not children:
         return False
     created = 0
@@ -1135,6 +1156,7 @@ async def apply_callout_sections(doc_token: str, sections: list[dict]) -> bool:
                     section.get("title", ""),
                     section.get("lines", []),
                     max(1, int(section.get("occurrence") or 1)),
+                    **({"code_blocks": section["code_blocks"]} if section.get("code_blocks") else {}),
                 ) or changed
         return changed
     except Exception as e:
@@ -1176,7 +1198,39 @@ async def _replace_report_divider(
     return False
 
 
-async def apply_report_styles(doc_token: str) -> bool:
+async def _apply_player_case_styles(client, headers: dict, doc_token: str, texts: list[str]) -> bool:
+    """Style exact imported code contents only; batch updates never rewrite text."""
+    started = time.monotonic()
+    expected = set(texts)
+    blocks = await _list_doc_blocks(client, headers, doc_token)
+    found = []
+    matched = set()
+    for block in blocks:
+        code = block.get("code")
+        if not isinstance(code, dict):
+            continue
+        content = "".join(e.get("text_run", {}).get("content", "") for e in code.get("elements", []))
+        if content.rstrip("\r\n") in expected:
+            matched.add(content.rstrip("\r\n"))
+            if code.get("style", {}).get("wrap") is not True or code.get("style", {}).get("language") != 1:
+                found.append({"block_id": block["block_id"], "update_text_style": {
+                    "style": {"language": 1, "wrap": True},
+                }})
+    if matched != expected:
+        runtime_log("飞书导出", "warning", f"典型玩家案例代码块已匹配 {len(matched)}/{len(expected)} 组，正文已保留，请检查文档格式")
+    for start in range(0, len(found), 50):
+        result = await _doc_edit(client, "PATCH", f"{FEISHU_BASE}/docx/v1/documents/{doc_token}/blocks/batch_update",
+                                 headers, {"requests": found[start:start + 50]})
+        if result.get("code") != 0:
+            runtime_log("飞书导出", "warning", "典型玩家案例自动换行设置失败，正文已保留，请检查文档格式",
+                        code=result.get("code"))
+            return False
+    runtime_log("飞书导出", "success" if matched == expected else "info", f"典型玩家案例格式处理结束，共更新 {len(found)} 处",
+                elapsed_seconds=round(time.monotonic() - started, 3))
+    return matched == expected
+
+
+async def apply_report_styles(doc_token: str, *, player_case_texts: list[str] | None = None) -> bool:
     """补齐 Markdown 导入无法直接表达的飞书报告样式。"""
     try:
         app_token = await _app_access_token()
@@ -1185,7 +1239,16 @@ async def apply_report_styles(doc_token: str) -> bool:
             "Content-Type": "application/json; charset=utf-8",
         }
         async with httpx.AsyncClient(timeout=20) as client:
-            return await _replace_report_divider(client, headers, doc_token)
+            cases = True
+            if player_case_texts:
+                try:
+                    cases = await _apply_player_case_styles(client, headers, doc_token, player_case_texts)
+                except Exception as exc:
+                    runtime_log("飞书导出", "warning", "典型玩家案例格式设置失败，正文已保留，请检查文档格式",
+                                error_type=type(exc).__name__)
+                    cases = False
+            divider = await _replace_report_divider(client, headers, doc_token)
+            return cases if player_case_texts else divider
     except Exception as exc:
         runtime_log(
             "飞书导出", "warning",

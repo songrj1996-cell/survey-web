@@ -7,6 +7,7 @@ from fastapi import HTTPException
 from app.services.report_modes import prepare_report_markdown
 from app.services.history_service import get_history_entry
 from app.services.report_render import _prep_export_md, markdown_to_docx, report_markdown_to_pdf
+from app.services.export_service import prepare_feishu_export_data
 
 
 def get_history_export_entry(
@@ -23,6 +24,18 @@ def get_history_export_entry(
     if not entry:
         raise HTTPException(status_code=404, detail="历史记录不存在")
     return {**entry, "report_md": prepare_report_markdown(entry, scope)}
+
+
+def get_history_feishu_export_data(history_id: str, login: dict | None, version=None, scope="body") -> dict:
+    try:
+        entry = get_history_entry(history_id, login, version)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if not entry:
+        raise HTTPException(status_code=404, detail="历史记录不存在")
+    if not entry.get("report_md"):
+        raise HTTPException(status_code=400, detail="该历史记录没有报告内容")
+    return prepare_feishu_export_data(entry, scope)
 
 
 async def prepare_word_history_download(

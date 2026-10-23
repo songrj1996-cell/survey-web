@@ -1,0 +1,18 @@
+{
+  "scope": "观点洞察 → 先写作再核验",
+  "session": {
+    "mode": "standard",
+    "report_mode": "insight",
+    "rows": [["id", "体验", "建议"], ["synthetic-73", "单排挫败后暂时停玩", "希望组队更稳定"], ["synthetic-54", "英雄版本变化后减少游戏", "希望说明改动原因"]],
+    "confirmed_columns": [{"column_indexes": [0], "role": "id", "name": "id"}, {"column_indexes": [1], "role": "open_text", "name": "体验"}, {"column_indexes": [2], "role": "open_text", "name": "建议"}],
+    "plan": {"parts": []},
+    "qualitative_context": {"goal": "合成样本：检查案例展示与核验交互，不用于研究结论"}
+  },
+  "v1": "# 合成观点洞察 V1\n\n## 核心结论\n\n单排体验可能影响参与意愿。\n\n**典型玩家案例**\n\nR73：**单排受挫**后暂停游戏，查看[合成说明](/#synthetic-reference)。\n\n这是分析正文，不应纳入案例框。\n\n## 详细发现\n\n### 版本变化\n\n典型玩家案例\n\nR54：版本变化后减少游戏时间。\n\n此段为案例之外的分析。\n\n## 对照章节\n\nR73：**单排受挫**后暂停游戏，查看[合成说明](/#synthetic-reference)。\n\n这里故意重复原句，用于检查章节定位。",
+  "v2": "# 合成观点洞察 V2\n\n## 核心结论\n\nV2专属分析内容。\n\n典型玩家案例｜R88：**只属于V2**的合成案例。\n\n## 详细发现\n\n### V2版本变化\n\n典型玩家案例\n\nR99：只属于V2的第二个案例。\n\nV2案例外的分析。",
+  "claims": {
+    "v1": ["R73：**单排受挫**后暂停游戏，查看[合成说明](/#synthetic-reference)。", "R54：版本变化后减少游戏时间。"],
+    "v2": ["典型玩家案例｜R88：**只属于V2**的合成案例。", "R99：只属于V2的第二个案例。"]
+  },
+  "response": {"verdict": "issue", "reason": "合成核验问题：用于检查定位和刷新，不能作为真实研究结论。", "citation_issues": [], "repair": "请人工核对该句与原始回答。", "relation": "unrelated", "meaning": "固定合成释义，不代表真实模型判断。"}
+}

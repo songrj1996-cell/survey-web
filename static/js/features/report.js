@@ -726,6 +726,7 @@ function updateReportActionAvailability() {
   document.querySelectorAll('[data-report-export], [data-export-format-trigger]').forEach(button => { button.disabled = busy; });
   document.querySelectorAll('[data-quick-retry-failed]').forEach(button => { button.disabled = reportInteractionBusy(); });
   document.querySelectorAll('[data-postwrite-action]').forEach(button => { button.disabled = busy || activeReportCtx()?.canEdit === false; });
+  document.querySelectorAll('[data-postwrite-locate]').forEach(button => { button.disabled = reportInteractionBusy(); });
   const exportDropdown = $('btn-export-dropdown');
   if (exportDropdown) exportDropdown.disabled = busy;
   const partialRerunBtn = $('btn-report-partial-rerun');
@@ -1436,6 +1437,97 @@ function applyCoreHighlight() {
     wrapElements(items, 'chapter-summary-box');
   });
 }
+
+// POSTWRITE_PLAYER_CASES_START
+function playerCaseText(element) {
+  if (!element.childNodes?.length) return element.textContent || '';
+  return Array.from(element.childNodes, node => node.nodeType === 3 ? node.textContent
+    : node.tagName === 'BR' ? '\n' : playerCaseText(node)).join('');
+}
+
+function playerCaseLabelKind(text) {
+  text = text.trim();
+  if (/^典型玩家案例\s*[:：]?$/.test(text)) return 'label';
+  return /^典型玩家案例\s*(?:[:：｜|]\s*\S|\n\s*R\d+)/.test(text) ? 'inline' : '';
+}
+
+function playerCaseBody(element) {
+  const player = /^R\d+(?:\s*[:：]|\s*玩家|\s+)/;
+  if (element.tagName === 'P') return player.test(playerCaseText(element).trim());
+  if (['UL', 'OL'].includes(element.tagName)) {
+    const items = Array.from(element.children).filter(item => item.tagName === 'LI');
+    return items.length > 0 && items.every(item => player.test(playerCaseText(item).trim()));
+  }
+  return false;
+}
+
+function playerCaseGroups(elements) {
+  const groups = [];
+  for (let i = 0; i < elements.length; i++) {
+    const first = elements[i];
+    if (!/^(P|H[1-6])$/.test(first.tagName)) continue;
+    const kind = playerCaseLabelKind(playerCaseText(first));
+    if (!kind) continue;
+    const items = [first];
+    while (i + 1 < elements.length && playerCaseBody(elements[i + 1])) items.push(elements[++i]);
+    if (kind === 'inline' || items.length > 1) groups.push(items);
+  }
+  return groups;
+}
+
+function stylePlayerCaseLabel(element) {
+  // Keep real headings and visible text intact for PostwriteReview.locate().
+  const doc = element.ownerDocument;
+  const prefix = element.textContent.match(/^\s*典型玩家案例(?:\s*[:：｜|])?/);
+  if (!prefix) return;
+  const walker = doc.createTreeWalker(element, 4);
+  let node, remaining = prefix[0].length, start = null;
+  while ((node = walker.nextNode())) {
+    if (!start) start = node;
+    if (remaining <= node.textContent.length) {
+      const range = doc.createRange();
+      range.setStart(start, 0); range.setEnd(node, remaining);
+      const label = doc.createElement('span'); label.className = 'report-player-case__label';
+      label.appendChild(range.extractContents()); range.insertNode(label);
+      return;
+    }
+    remaining -= node.textContent.length;
+  }
+}
+
+function applyPostwritePlayerCases(content, ctx) {
+  if (!content) return;
+  const audit = ctx?.reportAudit;
+  const enabled = !!audit && typeof audit === 'object' && !Array.isArray(audit) && Object.keys(audit).length > 0;
+  const previouslyEnabled = content.classList.contains('report-postwrite-cases');
+  content.classList.toggle('report-postwrite-cases', enabled);
+  if (!enabled) {
+    if (!previouslyEnabled && !content.querySelector('.report-player-case')) return;
+    content.querySelectorAll('.report-player-case__label').forEach(label => label.replaceWith(...label.childNodes));
+    content.querySelectorAll('.report-player-case').forEach(box => box.replaceWith(...box.childNodes));
+    content.normalize();
+    return;
+  }
+  const parents = [content, ...content.querySelectorAll('.core-summary-box, .core-highlight-box, .chapter-summary-box')];
+  for (const parent of parents) {
+    for (const items of playerCaseGroups(Array.from(parent.children))) {
+      const box = content.ownerDocument.createElement('section');
+      box.className = 'report-player-case';
+      box.setAttribute('aria-label', '典型玩家案例');
+      parent.insertBefore(box, items[0]);
+      const after = items.at(-1).nextSibling;
+      let node = items[0];
+      // Move intervening whitespace too, preserving the complete text sequence.
+      while (node !== after) {
+        const next = node.nextSibling;
+        box.appendChild(node);
+        node = next;
+      }
+      stylePlayerCaseLabel(items[0]);
+    }
+  }
+}
+// POSTWRITE_PLAYER_CASES_END
 
 function prepareReportMarkdownForPreview(md) {
   return String(md || '').replace(/(\d)~(?=\d)/g, (_, digit) => `${digit}\\~`);
@@ -2167,6 +2259,7 @@ function renderReportWorkspace(md, { preserveQa = true } = {}) {
   updateReportVersionUi();
   renderReportLlmUsage({ running: state.viewMode === 'session' && state.sessionReport.running });
   applyCoreHighlight();
+  applyPostwritePlayerCases(reportContent, ctx);
   removeLegacyStatsChartPayloads();
   enhanceReportTables();
   renderQuickReportNavigation(md, ctx);

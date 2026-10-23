@@ -612,17 +612,18 @@ class VersionExportTests(TemporaryHistoryMixin, unittest.IsolatedAsyncioTestCase
             ),
             patch.object(
                 export_router,
-                "get_session_export_data",
-                return_value=("# 第一版", ""),
+                "get_session_feishu_export_data",
+                return_value={"report_md": "# 第一版", "mode": "", "player_cases": True, "evidence_md": ""},
             ) as session_data,
             patch.object(
                 export_router,
-                "get_history_export_entry",
+                "get_history_feishu_export_data",
                 return_value={
                     "report_md": "# 历史第一版",
                     "title": "历史第一版",
                     "mode": "",
-                    "plan": {},
+                    "player_cases": False,
+                    "evidence_md": "",
                 },
             ) as history_data,
             patch.object(
@@ -647,8 +648,10 @@ class VersionExportTests(TemporaryHistoryMixin, unittest.IsolatedAsyncioTestCase
         self.assertEqual(history_result["url"], "https://doc/2")
         session_data.assert_called_once_with("session-id", "1", scope="body")
         history_data.assert_called_once_with("history-id", login, "2", scope="body")
-        self.assertEqual(export_to_feishu.await_args_list[0].args[0], "# 第一版")
-        self.assertEqual(export_to_feishu.await_args_list[1].args[0], "# 历史第一版")
+        self.assertEqual(export_to_feishu.await_args_list[0].kwargs["report_md"], "# 第一版")
+        self.assertEqual(export_to_feishu.await_args_list[1].kwargs["report_md"], "# 历史第一版")
+        self.assertTrue(export_to_feishu.await_args_list[0].kwargs["player_cases"])
+        self.assertFalse(export_to_feishu.await_args_list[1].kwargs["player_cases"])
 
     async def test_download_routers_forward_version_query(self):
         request = object()
@@ -838,6 +841,83 @@ class PostwriteAuditPersistenceTests(unittest.TestCase):
                 report_history.complete_postwrite_audit_in_history(entry["id"],result,expected_base=base,login={"email":"other@example.com"})
             self.assertEqual(raised.exception.status_code,404)
             self.assertEqual(history_storage._load_history(),before)
+
+
+class PlayerCaseVersionExportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_session_and_history_take_case_flag_and_body_from_the_same_version(self):
+        from app.services.report_versions import resolve_report_version
+        from app.services import export_service
+        source = _versioned_session()
+        source["report_audit"] = {"status": "complete", "checks": ["must not leak from mirror"]}
+        source["report_versions"][0]["report_audit"] = {"status": "partial", "checks": ["review-only"]}
+        source["report_versions"][0]["report_md"] += "\n\n典型玩家案例｜R73：第一版案例。"
+        source["report_versions"][1].pop("report_audit", None)
+        source["report_versions"][1]["report_md"] += "\n\n典型玩家案例｜R90：另一流程，普通展示。"
+        frozen = {"source_questions": [{"question_key": "1", "question": "合成题", "sources": [
+            {"response_id": "1/r1", "text": "典型玩家案例｜R99：证据原话。"}]}]}
+        for version in source["report_versions"]:
+            version["input_snapshot"] = deepcopy(frozen)
+        before = deepcopy(source)
+        for version in (1, 2):
+            selected = {**source, **resolve_report_version(source, version)}
+            # The authoritative history loader removes snapshot fields absent from this version.
+            if version == 2:
+                selected.pop("report_audit", None)
+            for scope in ("body", "evidence"):
+                with patch.object(export_download, "get_session", return_value=source), patch.object(export_history, "get_history_entry", return_value=selected):
+                    current = export_download.get_session_feishu_export_data(source["id"], version, scope)
+                    history = export_history.get_history_feishu_export_data("history", None, version, scope)
+                self.assertEqual(current, history)
+                self.assertEqual(current["player_cases"], version == 1)
+                self.assertEqual(current["report_md"], selected["report_md"])
+                self.assertNotIn("review-only", repr(current))
+                self.assertEqual("R99" in current["evidence_md"], scope == "evidence")
+                self.assertNotIn("R99", current["report_md"])
+                with patch.object(export_service.feishu_export, "create_doc_via_bot", new=AsyncMock(return_value=("url", "doc", "docx"))) as create:
+                    await export_service._export_to_feishu(login={}, **current)
+                self.assertEqual("player_case_texts" in create.call_args.kwargs, version == 1)
+                self.assertTrue(create.call_args.args[1].endswith(current["evidence_md"]))
+        self.assertEqual(source, before)
+
+    def test_marker_validation_and_ordinary_exports_keep_existing_preparation(self):
+        from app.services.export_service import prepare_feishu_export_data
+        from app.services.report_modes import prepare_report_markdown
+        from app.services.report_render import _prep_feishu_export_md
+        for marker in [None, {}, [], "complete", False]:
+            source = {"report_md": "# 合成报告\n\n典型玩家案例｜R73：原文。", "report_audit": marker}
+            for scope in ("body", "evidence"):
+                prepared = prepare_feishu_export_data(source, scope)
+                self.assertFalse(prepared["player_cases"])
+                self.assertEqual(_prep_feishu_export_md(prepared["report_md"]) + prepared["evidence_md"],
+                                 _prep_feishu_export_md(prepare_report_markdown(source, scope)))
+
+    async def test_other_modes_and_appendix_keep_the_existing_feishu_format(self):
+        from tests.test_report_quick_outline import outline_fixture
+        from app.services import export_service
+        from app.services.report_modes import prepare_report_markdown
+        from app.services.report_render import _prep_feishu_export_md
+        ordinary = {"report_md": "# 合成报告\n\n典型玩家案例｜R73：不启用案例样式。", "report_mode": "statistics", "mode": "quantitative",
+                    "input_snapshot": {"source_questions": [{"question": "Part 1 合成题", "sources": [{"response_id": "1/r1", "text": "典型玩家案例｜R99：原话。"}]}]}}
+        for source in [ordinary, outline_fixture()]:
+            for scope in ("body", "evidence"):
+                payload = export_service.prepare_feishu_export_data(source, scope)
+                with patch.object(export_service.feishu_export, "create_doc_via_bot", new=AsyncMock(return_value=("url", "doc", "docx"))) as create:
+                    await export_service._export_to_feishu(login={}, **payload)
+                self.assertEqual(create.call_args.args[1], _prep_feishu_export_md(prepare_report_markdown(source, scope), mode=payload["mode"]))
+                self.assertNotIn("player_case_texts", create.call_args.kwargs)
+
+    def test_invalid_scope_empty_body_and_missing_version_keep_errors(self):
+        from app.services.export_service import prepare_feishu_export_data
+        with self.assertRaises(ValueError):
+            prepare_feishu_export_data({"report_md": "# 合成报告"}, "other")
+        with patch.object(export_download, "get_session", return_value={"report_md": ""}):
+            with self.assertRaises(HTTPException) as error:
+                export_download.get_session_feishu_export_data("synthetic")
+            self.assertEqual(error.exception.status_code, 400)
+        with patch.object(export_download, "get_session", return_value=_versioned_session()):
+            with self.assertRaises(HTTPException) as error:
+                export_download.get_session_feishu_export_data("synthetic", 99)
+            self.assertEqual(error.exception.status_code, 404)
 
 
 if __name__ == "__main__":

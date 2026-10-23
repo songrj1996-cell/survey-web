@@ -3014,6 +3014,85 @@ body {
   color: var(--text-2);
 }
 
+.report-postwrite-cases .report-player-case {
+  margin: 18px 0;
+  padding: 16px 20px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  color: var(--text-2);
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
+.report-postwrite-cases .report-player-case > :first-child {
+  margin-top: 0;
+}
+
+.report-postwrite-cases .report-player-case > :last-child {
+  margin-bottom: 0;
+}
+
+.report-postwrite-cases .report-player-case a,
+.report-postwrite-cases .report-player-case a:visited {
+  color: #93c5fd;
+}
+
+.report-postwrite-cases .report-player-case a:hover,
+.report-postwrite-cases .report-player-case a:focus-visible {
+  color: #bfdbfe;
+}
+
+[data-theme="light"] .report-postwrite-cases .report-player-case a,
+[data-theme="light"] .report-postwrite-cases .report-player-case a:visited {
+  color: #1d4ed8;
+}
+
+[data-theme="light"] .report-postwrite-cases .report-player-case a:hover,
+[data-theme="light"] .report-postwrite-cases .report-player-case a:focus-visible {
+  color: #1e40af;
+}
+
+.report-postwrite-cases .report-player-case .report-player-case__label {
+  display: block;
+  margin: 0 0 10px;
+  color: var(--text-2);
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 1.5;
+}
+
+.report-postwrite-cases .report-player-case__label strong {
+  color: inherit;
+  font-weight: inherit;
+}
+
+.report-postwrite-cases .report-player-case > h1,
+.report-postwrite-cases .report-player-case > h2,
+.report-postwrite-cases .report-player-case > h3,
+.report-postwrite-cases .report-player-case > h4,
+.report-postwrite-cases .report-player-case > h5,
+.report-postwrite-cases .report-player-case > h6 {
+  padding: 0;
+  border: 0;
+  font-size: inherit;
+  line-height: inherit;
+  letter-spacing: normal;
+  background: none;
+  -webkit-text-fill-color: currentColor;
+}
+
+[data-theme="light"] .report-postwrite-cases .report-player-case {
+  background: #f5f6f7;
+  border-color: #dfe2e6;
+}
+
+[data-theme="light"] .report-postwrite-cases .report-player-case__label { color: #626d7b; }
+
+@media (max-width: 480px) {
+  .report-postwrite-cases .report-player-case { padding: 14px; margin: 14px 0; }
+}
+
 .markdown-body table {
   border-collapse: collapse;
   width: 100%;
