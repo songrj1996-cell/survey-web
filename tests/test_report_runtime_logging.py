@@ -15,6 +15,31 @@ from app.services import survey_service as service
 
 
 class ProgressTests(unittest.TestCase):
+    def test_capacity_result_logs_are_advisory_private_and_deduplicated(self):
+        for status in ("sufficient", "near_limit", "over_limit", "unknown"):
+            with self.subTest(status=status):
+                output = io.StringIO()
+                event = sse_event({"type": "analysis_progress", "phase": "postwrite", "stage": "writer_capacity",
+                    "status": "completed", "message": "PRIVATE_RAW_INPUT", "writer_capacity": {
+                        "status": status, "occupancy_percent": None if status == "unknown" else 108,
+                        "message": "PRIVATE_RAW_INPUT", "impact": "PRIVATE_VENDOR_BODY"}})
+                with redirect_stdout(output):
+                    progress = logs.SurveyProgressLog("synthetic")
+                    progress.observe(sse_event({"type": "analysis_progress", "phase": "postwrite",
+                                              "stage": "writer_capacity", "status": "running"}))
+                    progress.observe(event)
+                    progress.observe(event)
+                    progress.observe(sse_event({"type": "analysis_progress", "phase": "postwrite",
+                                              "stage": "writer", "status": "running"}))
+                text = output.getvalue()
+                self.assertIn("正在检查写作容量", text)
+                self.assertEqual(text.count("报告继续生成"), 1)
+                self.assertIn("正在撰写初稿", text)
+                self.assertNotIn("PRIVATE", text)
+                self.assertNotIn("已停止", text)
+                self.assertNotIn("占用 0%", text)
+                self.assertRegex(text, r"\d{4}-\d\d-\d\d")
+
     def test_structured_exception_cause_explains_failure_without_private_body(self):
         from app.integrations.llm_client import _LLMRequestError
         root = _LLMRequestError("PRIVATE_VENDOR_ERROR", status_code=401)

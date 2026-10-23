@@ -19,6 +19,83 @@ class Element {
   text() { return this.textContent + this.children.map(c => c.text()).join('\n'); }
 }
 function descendants(node) { return node.children.flatMap(child => [child, ...descendants(child)]); }
+function capacityFixture() {
+  const summary = new Element('div');
+  const nodes = {'report-llm-summary':summary};
+  const parent = {children:[summary]};
+  summary.insertAdjacentElement = (position, node) => {
+    assert.equal(position, 'afterend');
+    nodes[node.id] = node;
+    parent.children.splice(1, 0, node);
+  };
+  const sandbox = vm.createContext({$:id=>nodes[id], document:{createElement:tag=>{
+    const node = new Element(tag); node.style = {}; return node;
+  }}});
+  vm.runInContext(section('function _renderWriterCapacity(', 'function _createReportTaskProgress('), sandbox);
+  return {nodes, parent, render:notice=>sandbox._renderWriterCapacity(notice)};
+}
+
+test('capacity advice stays directly under token usage, with one or two plain text lines', () => {
+  const f = capacityFixture();
+  f.render({status:'checking', message:'容量检查：正在估算本次输入及输出预留…'});
+  const box = f.nodes['report-writer-capacity'];
+  assert.equal(f.parent.children[1], box);
+  assert.equal(box.children.length, 1);
+  assert.equal(box.attrs.role, 'status');
+  assert.equal(box.attrs['aria-live'], 'polite');
+  f.render({status:'sufficient', message:'容量预估：80%（含输出预留） · 容量充足',
+    impact:'预计可一次完成写作；预估值仅供参考。'});
+  assert.equal(f.parent.children[1], box);
+  assert.equal(f.parent.children.length, 2);
+  assert.equal(box.children.length, 2);
+  assert.match(box.text(), /80%/);
+  assert.match(box.className, /report-progress-remaining/);
+  assert.ok(descendants(box).every(node=>node.tagName === 'p'));
+});
+
+test('over-limit and unknown advice have no actions and never invent zero percent', () => {
+  const f = capacityFixture();
+  for (const notice of [{status:'over_limit', message:'容量预估：108%（含输出预留） · 已达到或超出上限',
+    impact:'可能发生截断或生成失败，报告仍继续生成。'},
+    {status:'unknown', message:'容量检查：暂时无法估算容量占用', impact:'容量风险尚不明确，报告继续生成。'}]) {
+    f.render(notice);
+    const box = f.nodes['report-writer-capacity'];
+    assert.match(box.text(), /继续生成/);
+    assert.doesNotMatch(box.text(), /占用.*0%|确认|暂停/);
+    assert.ok(descendants(box).every(node=>node.tagName !== 'button'));
+    assert.equal(box.children.length, 2);
+  }
+});
+
+test('capacity notice escapes source text and clears between generations', () => {
+  const f = capacityFixture();
+  f.render({status:'unknown', message:'<img src=x onerror=alert(1)>', impact:'<script>bad()</script>'});
+  const box = f.nodes['report-writer-capacity'];
+  assert.match(box.text(), /<img/);
+  assert.equal(descendants(box).length, 2);
+  f.render(null);
+  assert.equal(box.hidden, true);
+  assert.equal(box.children.length, 0);
+  assert.match(section('async function runStats(', 'function prepareReportMarkdownForPreview('), /_renderWriterCapacity\(null\)/);
+});
+
+test('later writer and audit progress cannot replace the capacity notice', () => {
+  const handler = section("if (ev.type === 'analysis_progress')", "if (ev.type === 'report_llm_status')");
+  assert.match(handler, /ev\.phase === 'postwrite' && ev\.stage === 'writer_capacity'/);
+  assert.match(handler, /_renderWriterCapacity\(ev\.writer_capacity\)/);
+  const f = capacityFixture();
+  f.render({status:'over_limit', message:'容量预估：108%', impact:'报告继续生成。'});
+  const before = f.nodes['report-writer-capacity'].text();
+  const sandbox = vm.createContext({REPORT_PHASE_LABELS:{themes:'主题', writing:'写作'}});
+  vm.runInContext(section('function _createReportTaskProgress(', 'function _reportProgressPercent('), sandbox);
+  for (const stage of ['writer', 'registry', 'meaning', 'quantity']) {
+    sandbox.progress = sandbox._createReportTaskProgress();
+    sandbox.event = {phase:'postwrite', stage, status:'running', message:'正在处理'};
+    vm.runInContext('_applyAnalysisProgress(progress, event)', sandbox);
+    assert.equal(f.nodes['report-writer-capacity'].text(), before);
+  }
+});
+
 function fixture(audit, canEdit = true) {
   const panel = new Element('section'), calls = [];
   const drawer = new Element('div'), trigger = new Element('button'), title = new Element('div'), close = new Element('button');

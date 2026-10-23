@@ -121,6 +121,88 @@ def events(raw):
     return [json.loads(e[6:].strip()) for e in raw if e.startswith("data: ")]
 
 
+class WriterCapacityFlowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_all_advice_results_keep_the_same_complete_writer_request_and_calls(self):
+        from app.services.report_postwrite_audit import messages
+        from app.services.report_postwrite_pipeline import estimate_tokens
+        frozen = freeze_inputs(session())
+        instruction = "保留所有玩家和跨题原文"
+        expected = messages(PROMPTS["writer"], {**frozen["postwrite_packet"], "instruction": instruction}, "")
+        required = estimate_tokens(expected) + config.POSTWRITE_WRITER_OUTPUT_TOKENS
+        cases = [("sufficient", 1000000), ("near_limit", int(required / .92)),
+                 ("over_limit", 100), ("unknown", None)]
+        counts = []
+        for status, limit in cases:
+            with self.subTest(status=status):
+                seen, timeline = [], []
+                async def collect(request, **kwargs):
+                    seen.append(deepcopy(request))
+                    timeline.append("model")
+                    return await fake_collect(request, **kwargs)
+                async def progress(event):
+                    timeline.append((event["stage"], event["status"]))
+                limits = {} if limit is None else {config.LLM_POSTWRITE_MODEL: limit}
+                with patch.object(config, "POSTWRITE_WRITER_CONTEXT_LIMITS", json.dumps(limits)):
+                    result = await run_pipeline(frozen, prompts=PROMPTS, instruction=instruction,
+                                                collect=collect, on_progress=progress)
+                self.assertEqual(result["draft"], REPORT)
+                self.assertEqual(result["writer_capacity"]["status"], status)
+                self.assertEqual(result["audit"]["writer_capacity"], result["writer_capacity"])
+                self.assertEqual(seen[0], expected)
+                self.assertLess(timeline.index(("writer_capacity", "completed")), timeline.index("model"))
+                self.assertEqual(result["calls"][0]["output_cap"], 64000)
+                self.assertEqual(sum(c["stage"] == "writer" for c in result["calls"]), 1)
+                counts.append(len(seen))
+        self.assertTrue(all(count == counts[0] for count in counts))
+
+    async def test_unexpected_capacity_error_still_writes_without_private_error(self):
+        with patch("app.services.report_postwrite_pipeline.estimate_writer_capacity",
+                   side_effect=RuntimeError("PRIVATE_COUNTER_DETAILS")):
+            result = await run_pipeline(freeze_inputs(session()), prompts=PROMPTS, collect=fake_collect)
+        self.assertEqual(result["draft"], REPORT)
+        self.assertEqual(result["writer_capacity"]["status"], "unknown")
+        self.assertNotIn("PRIVATE", json.dumps(result, ensure_ascii=False))
+
+    async def test_resume_keeps_previous_advice_and_never_rechecks_or_rewrites(self):
+        frozen = freeze_inputs(session())
+        previous = await run_pipeline(frozen, prompts=PROMPTS, collect=fake_collect)
+        events_seen = []
+        async def progress(event):
+            events_seen.append(event)
+        with patch("app.services.report_postwrite_pipeline.estimate_writer_capacity",
+                   side_effect=AssertionError("must not recheck an existing draft")) as checker:
+            result = await run_pipeline(frozen, prompts=PROMPTS, previous=previous,
+                                        collect=AsyncMock(side_effect=AssertionError("no calls")), on_progress=progress)
+        checker.assert_not_called()
+        self.assertEqual(result["writer_capacity"], previous["writer_capacity"])
+        self.assertEqual(result["calls"], previous["calls"])
+        self.assertFalse(any(e["stage"] == "writer_capacity" for e in events_seen))
+
+    async def test_legacy_draft_does_not_get_a_fabricated_capacity_result(self):
+        frozen = freeze_inputs(session())
+        seed = initial_draft_state(frozen, prompts=PROMPTS, draft=REPORT)
+        with patch("app.services.report_postwrite_pipeline.estimate_writer_capacity") as checker:
+            result = await run_pipeline(frozen, prompts=PROMPTS, previous=seed, collect=fake_collect)
+        checker.assert_not_called()
+        self.assertNotIn("writer_capacity", result)
+        self.assertNotIn("writer_capacity", result["audit"])
+        self.assertFalse(any(c["stage"] == "writer" for c in result["calls"]))
+
+    async def test_business_stream_saves_over_limit_advice_without_changing_body(self):
+        sess = session()
+        with runtime(sess), patch.object(config, "POSTWRITE_WRITER_CONTEXT_LIMITS",
+                                         json.dumps({config.LLM_POSTWRITE_MODEL: 100})):
+            output = events([e async for e in survey_service.report_stream("capacity-advisory", None)])
+        done = next(e for e in output if e["type"] == "report_done")
+        saved = report_versions.resolve_report_version(sess, 1)
+        self.assertEqual(done["report_md"], REPORT)
+        self.assertEqual(saved["report_md"], REPORT)
+        self.assertEqual(saved["report_audit"]["writer_capacity"]["status"], "over_limit")
+        checking = [e for e in output if e.get("stage") == "writer_capacity"]
+        self.assertEqual([e["writer_capacity"]["status"] for e in checking], ["checking", "over_limit"])
+        self.assertFalse(any(e["type"] == "error" for e in output))
+
+
 class PipelineTests(unittest.IsolatedAsyncioTestCase):
     async def test_business_entry_loads_selected_writer_and_keeps_r_case_sources(self):
         from pathlib import Path

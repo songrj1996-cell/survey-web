@@ -387,6 +387,43 @@ function renderReportLlmUsage({ progressState = null, running = false } = {}) {
   }).join('');
 }
 
+function _renderWriterCapacity(notice = null) {
+  const summary = $('report-llm-summary');
+  if (!summary) return;
+  let box = $('report-writer-capacity');
+  if (!box && !notice) return;
+  if (!box) {
+    box = document.createElement('div');
+    box.id = 'report-writer-capacity';
+    box.className = 'report-progress-remaining';
+    box.setAttribute('role', 'status');
+    box.setAttribute('aria-live', 'polite');
+    summary.insertAdjacentElement('afterend', box);
+  }
+  box.replaceChildren();
+  box.hidden = !notice;
+  if (!notice) return;
+  const line = document.createElement('p');
+  line.style.margin = '0';
+  line.style.overflowWrap = 'anywhere';
+  line.style.color = ({
+    checking: 'var(--accent)',
+    sufficient: 'color-mix(in srgb, var(--green) 55%, var(--text))',
+    near_limit: 'color-mix(in srgb, var(--amber) 50%, var(--text))',
+    over_limit: 'color-mix(in srgb, var(--amber) 50%, var(--text))',
+  })[notice.status] || 'var(--text-2)';
+  line.textContent = '● ' + String(notice.message || '容量检查：暂时无法估算容量占用');
+  box.appendChild(line);
+  if (notice.impact) {
+    const impact = document.createElement('p');
+    impact.style.margin = '0';
+    impact.style.color = 'var(--text-2)';
+    impact.style.overflowWrap = 'anywhere';
+    impact.textContent = String(notice.impact);
+    box.appendChild(impact);
+  }
+}
+
 function _createReportTaskProgress() {
   return {
     structured: false,
@@ -446,7 +483,7 @@ function _applyAnalysisProgress(progressState, event) {
 
 function _reportProgressPercent(progressState) {
   const current = progressState.current || {};
-  if (current.phase === 'postwrite') return ({writer:10, registry:35, meaning:60, quantity:85})[current.stage] || 5;
+  if (current.phase === 'postwrite') return ({writer_capacity:5, writer:10, registry:35, meaning:60, quantity:85})[current.stage] || 5;
   if (current.phase === 'quick_statistics') return current.status === 'completed' ? 20 : 5;
   if (current.phase === 'quick_questions') return Math.min(99, 20 + Math.round((Number(current.completed) || 0) / Math.max(1, Number(current.total) || 1) * 79));
   const phaseIndex = Math.max(1, Number(current.phase_index) || 1);
@@ -482,7 +519,7 @@ function _renderReportPhaseTrack(progressState) {
 
 function _reportRemainingText(progressState) {
   const current = progressState.current || {};
-  if (current.phase === 'postwrite') return ({writer:'初稿完成后，整理核对清单并核对原意与人数。', registry:'核对清单整理完成后，检查原意与人数；提示将单独保存。', meaning:'正在逐批核对原意；随后汇总人数并保存人工复核提示。', quantity:'正在核对人数范围；完成后保存正文和提示。'})[current.stage] || '正在保存核验进度';
+  if (current.phase === 'postwrite') return ({writer_capacity:'容量检查仅作提示，随后自动开始写作。', writer:'初稿完成后，整理核对清单并核对原意与人数。', registry:'核对清单整理完成后，检查原意与人数；提示将单独保存。', meaning:'正在逐批核对原意；随后汇总人数并保存人工复核提示。', quantity:'正在核对人数范围；完成后保存正文和提示。'})[current.stage] || '正在保存核验进度';
   if (current.phase === 'quick_statistics') return '客观题统计完成后，继续总结已选主观题（如有）并保存报告。';
   if (current.phase === 'quick_questions') return '逐题完成后保存；已完成题目会保留，失败题目可单独重试。';
   if (current.phase === 'themes') {
@@ -1065,6 +1102,7 @@ async function runStats(options = {}) {
   $('ps-writing').classList.remove('progress-step--active', 'progress-step--done', 'progress-step--failed');
   $('report-stream-container').style.display = 'none';
   $('report-stream-content').textContent = '';
+  _renderWriterCapacity(null);
   updateReportVersionUi();
   applyQAAvailability();
 
@@ -1161,6 +1199,9 @@ async function runStats(options = {}) {
       lastSignalAt = Date.now();
       if (ev.type === 'analysis_progress') {
         _applyAnalysisProgress(taskProgress, ev);
+        if (ev.phase === 'postwrite' && ev.stage === 'writer_capacity') {
+          _renderWriterCapacity(ev.writer_capacity);
+        }
         _renderReportPhaseTrack(taskProgress);
         const remaining = $('report-progress-remaining');
         if (remaining) remaining.textContent = _reportRemainingText(taskProgress);
