@@ -5,10 +5,27 @@ SSE 任务及其派生的并发子任务共享同一位用户的 API Key。
 """
 from contextlib import contextmanager
 from contextvars import ContextVar
+from copy import deepcopy
 from typing import Any, Callable, Iterator
 
 
 LLMAttemptObserver = Callable[[dict[str, Any]], Any]
+
+# A/B only provides snapshot infrastructure. Business callers opt in during C.
+_model_snapshot: ContextVar[dict | None] = ContextVar("llm_model_snapshot", default=None)
+
+
+def current_llm_model_snapshot() -> dict | None:
+    return deepcopy(_model_snapshot.get())
+
+
+@contextmanager
+def bind_llm_model_snapshot(snapshot: dict) -> Iterator[None]:
+    token = _model_snapshot.set(deepcopy(snapshot))
+    try:
+        yield
+    finally:
+        _model_snapshot.reset(token)
 
 
 _request_llm_api_key: ContextVar[str] = ContextVar(

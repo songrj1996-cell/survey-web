@@ -1,3 +1,68 @@
+/* Model settings: uses the platform theme and the existing settings drawer. */
+.model-settings-nav{width:100%;border:0;background:transparent;font:inherit;text-align:left}
+.model-settings{min-width:0;color:var(--text)}
+.model-settings [hidden]{display:none!important}
+.model-settings h2{font-size:22px;margin:0 0 6px}
+.model-settings h3{font-size:16px;margin:0 0 8px}
+.model-settings h4{font-size:14px;margin:0}
+.model-settings p{margin:6px 0}
+.model-settings-title,.model-settings-footer,.model-settings-business{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.model-settings-title>div{min-width:0}
+.model-settings-title>span{font-size:12px;color:var(--accent);white-space:nowrap}
+.model-settings-muted,.model-settings-loading{font-size:12px;color:var(--text-2)}
+.model-settings-notice{padding:12px;border-radius:var(--radius-sm);background:var(--accent-soft);font-size:12px;color:var(--text-2);overflow-wrap:anywhere}
+.model-settings-tabs{display:flex;gap:22px;border-bottom:1px solid var(--border);margin:18px 0;flex-wrap:wrap}
+.model-settings-tabs button{font:inherit;background:transparent;border:0;border-bottom:2px solid transparent;color:var(--text-2);padding:9px 0;cursor:pointer}
+.model-settings-tabs button[aria-selected=true]{color:var(--accent);border-bottom-color:var(--accent)}
+.model-settings-business{justify-content:flex-start;margin-bottom:14px;font-size:12px}
+.model-settings-business select{flex:1;max-width:360px}
+.model-settings-workspace{display:grid;grid-template-columns:190px minmax(0,1fr);gap:16px;align-items:start}
+.model-settings-stages{display:grid;gap:5px;min-width:0}
+.model-settings-stages button{font:inherit;text-align:left;border:1px solid transparent;background:transparent;padding:11px 10px;border-radius:var(--radius-sm);color:var(--text-2);cursor:pointer;min-width:0}
+.model-settings-stages button[aria-pressed=true]{background:var(--surface-2);border-color:var(--border-act);color:var(--accent)}
+.model-settings-stages strong{font-size:13px;font-weight:500;display:block}
+.model-settings-stages small{font-size:11px;display:block;margin-top:4px;color:var(--text-2);overflow-wrap:anywhere}
+.model-settings-editor,.model-settings-review,.model-settings-history,.model-settings-catalog article,.model-settings-conflict{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-sm);padding:18px;min-width:0}
+.model-settings-editor>label,.model-settings-review>label{margin:12px 0}
+.model-settings-fields{display:grid;grid-template-columns:minmax(0,1.3fr) minmax(0,1fr);gap:12px;margin:14px 0}
+.model-settings label{display:grid;gap:6px;font-size:12px;color:var(--text-2);min-width:0}
+.model-settings input:not([type=checkbox]),.model-settings select,.model-settings textarea{font:inherit;display:block;background:var(--input-bg);border:1px solid var(--border);border-radius:6px;padding:9px;color:var(--text);width:100%;min-width:0;min-height:38px}
+.model-settings input:focus-visible,.model-settings select:focus-visible,.model-settings textarea:focus-visible,.model-settings button:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+.model-settings textarea{min-height:72px;resize:vertical}
+.model-settings .model-settings-checkbox{display:flex;align-items:center;gap:8px}
+.model-settings-checkbox input{accent-color:var(--accent)}
+.model-settings details{margin:12px 0;font-size:12px;color:var(--text-2)}
+.model-settings summary{cursor:pointer}
+.model-settings-section{border-top:1px solid var(--border);margin-top:18px;padding-top:16px}
+.model-settings-actions{display:flex;gap:6px;flex-wrap:wrap}
+.model-settings .btn{white-space:normal;min-height:36px}
+.model-settings-fallback{border-bottom:1px solid var(--border);padding:14px 0}
+.model-settings-fallback:last-child{border-bottom:0}
+.model-settings-fallback .model-settings-title{font-size:12px}
+.model-settings-fallback .btn{font-size:12px;padding:5px 8px}
+.model-settings-cap{max-width:240px}
+.model-settings-footer{margin-top:20px;padding-top:16px;border-top:1px solid var(--border)}
+.model-settings-footer strong{font-weight:500;font-size:13px}
+.model-settings-status{color:var(--text-2);font-size:12px;overflow-wrap:anywhere}
+.model-settings-error{color:var(--red);white-space:pre-wrap;font-size:13px;overflow-wrap:anywhere;margin:14px 0}
+.model-settings-catalog{display:grid;gap:10px;margin:14px 0}
+.model-settings-catalog article{display:flex;justify-content:space-between;align-items:center;gap:12px}
+.model-settings-catalog article>div{min-width:0;overflow-wrap:anywhere}
+.model-settings-catalog .btn{flex-shrink:0}
+.model-settings-verified{color:var(--text);font-size:12px}
+.model-settings-unknown{color:var(--text-2);font-size:12px}
+.model-settings-history{margin:12px 0}
+.model-settings-history p{font-size:12px;color:var(--text-2);overflow-wrap:anywhere}
+.model-settings-review{margin-top:18px}
+.model-settings-review ul{padding-left:20px}
+.model-settings-diff{padding:12px 0;border-bottom:1px solid var(--border);overflow-wrap:anywhere;font-size:12px}
+.model-settings-diff div{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:6px}
+.model-settings-diff div p:first-child{color:var(--text-2)}
+.model-settings-conflict{border-color:var(--amber);margin:12px 0;font-size:12px;overflow-wrap:anywhere}
+@media(max-width:900px){.model-settings-workspace{grid-template-columns:155px minmax(0,1fr)}.model-settings-fields{grid-template-columns:1fr}.model-settings-editor{padding:14px}}
+@media(max-width:620px){.model-settings-workspace{grid-template-columns:minmax(0,1fr)}.model-settings-stages{grid-template-columns:repeat(2,minmax(0,1fr))}.model-settings-stages small{display:none}.model-settings-stages button{padding:9px}.model-settings-diff div{grid-template-columns:1fr}.model-settings-business select{max-width:none;min-width:0}.model-settings-footer>.model-settings-actions{width:100%}.model-settings-footer>.model-settings-actions>.btn--primary{flex:1}}
+@media(pointer:coarse){.model-settings .btn,.model-settings-tabs button,.model-settings-stages button{min-height:44px}.model-settings input,.model-settings textarea,.model-settings select{font-size:16px!important}}
+
 /* ============================================================
    Survey Analyst v2 — Global Styles
    支持深色/浅色双主题、Step 2 题目卡片、Drawer 面板

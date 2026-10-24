@@ -17,7 +17,13 @@ from app.schemas.requests import (
     UiTextUpdateRequest,
 )
 from app.services.audit import audit_log
-from app.services.auth import _require_feature
+from app.services.auth import _require_feature, _require_admin
+from app.schemas.llm_model_settings import (
+    CheckModelSettingsRequest, PublishModelSettingsRequest, RestoreModelSettingsRequest,
+)
+from app.services.llm_model_settings import (
+    get_model_settings, check_model_settings, publish_model_settings, restore_model_settings,
+)
 from app.services.glossary_service import (
     build_glossary_template_xlsx,
     commit_glossary_import,
@@ -49,6 +55,32 @@ async def _require_settings_access(request: Request):
 
 router = APIRouter()
 _MAX_GLOSSARY_UPLOAD_BYTES = 10 * 1024 * 1024
+
+
+@router.get("/api/model-settings")
+async def get_model_settings_endpoint(request: Request):
+    await _require_admin(request)
+    return await get_model_settings()
+
+
+@router.post("/api/model-settings/check")
+async def check_model_settings_endpoint(req: CheckModelSettingsRequest, request: Request):
+    await _require_admin(request)
+    return await check_model_settings(req)
+
+
+@router.post("/api/model-settings/publish")
+async def publish_model_settings_endpoint(req: PublishModelSettingsRequest, request: Request):
+    login = await _require_admin(request)
+    result = await publish_model_settings(req, (login or {}).get("name") or "管理员")
+    await audit_log(request, "settings", "保存模型配置版本", f"v{result['version']}；配置已保存，实际业务尚未接入")
+    return result
+
+
+@router.post("/api/model-settings/versions/{version}/restore")
+async def restore_model_settings_endpoint(version: int, req: RestoreModelSettingsRequest, request: Request):
+    await _require_admin(request)
+    return await restore_model_settings(version, req)
 
 
 def _request_payload(request_model, *, exclude: set[str] | None = None) -> dict:

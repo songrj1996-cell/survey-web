@@ -57,6 +57,7 @@ const STAB_LOADERS = {
   texts: loadUiTextsSettings,
   prompts: () => loadPrompts(true),
   glossary: () => loadGlossary(true),
+  models: () => window.ModelSettings.load(),
   system: loadSystemSettings,
   perms: loadPermsTab,
   audit: loadAuditLogsTab,
@@ -69,7 +70,7 @@ async function switchSettingsTab(name) {
   document.querySelectorAll('.settings-nav__item').forEach(el => {
     el.classList.toggle('settings-nav__item--active', el.dataset.stab === name);
   });
-  ['texts', 'prompts', 'glossary', 'system', 'perms', 'audit'].forEach(k => {
+  ['texts', 'prompts', 'glossary', 'models', 'system', 'perms', 'audit'].forEach(k => {
     const el = $(`stab-content-${k}`);
     if (el) el.style.display = k === name ? '' : 'none';
   });

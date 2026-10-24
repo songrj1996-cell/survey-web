@@ -16,6 +16,7 @@ FEATURE_TREE = [
         {"key": "ui_texts", "label": "页面文案", "tab": "texts"},
         {"key": "prompts", "label": "提示词管理", "tab": "prompts"},
         {"key": "glossary", "label": "术语库", "tab": "glossary"},
+        {"key": "model_settings", "label": "模型管理", "tab": "models", "admin_only": True},
         {"key": "platform", "label": "平台设置", "tab": "system"},
         {"key": "members", "label": "成员与权限", "tab": "perms", "admin_only": True},
         {"key": "audit", "label": "用户日志", "tab": "audit", "view_only": True},
@@ -53,4 +54,5 @@ def permission_levels(user: dict) -> dict[str, str]:
         levels["audit"] = "read"
     # Ordinary whitelist entries can never create administrators.
     levels.pop("members", None)
+    levels.pop("model_settings", None)
     return levels
