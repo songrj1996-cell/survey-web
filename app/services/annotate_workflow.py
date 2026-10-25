@@ -46,6 +46,7 @@ from app.core.parsing import _parse_file
 from app.core.responses import sse_event
 from app.core.runtime_logging import runtime_log
 from app.core.security import _assign_session_owner, _find_history_for_login
+from app.services.llm_model_settings import record_model_snapshot, model_attempt_budget, call_model, model_operation, task_model_chain
 from app.integrations.llm_client import collect_chat_completion
 from app.services.audit import audit_log
 from app.services.auth import _current_login
@@ -106,53 +107,57 @@ async def _collect_annotate_json(
     max_http_attempts: int | None = None,
 ) -> tuple[list[dict], str]:
     """Call each configured model and retry malformed JSON once before failover."""
-    last_error = ""
-    for model in models:
-        current_prompt = user_prompt
-        for attempt in range(1, 3):
-            try:
-                completion_options = {}
-                if on_attempt_event is not None:
-                    completion_options["on_attempt_event"] = on_attempt_event
-                if max_http_attempts is not None:
-                    completion_options["max_http_attempts"] = max_http_attempts
-                output, actual_model = await collect_chat_completion(
-                    [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": current_prompt},
-                    ],
-                    models=(model,),
-                    max_tokens=max_tokens,
-                    reasoning_effort=reasoning_effort,
-                    **completion_options,
-                )
-            except Exception as exc:
-                last_error = _public_llm_error(str(exc))
-                _annotate_ai_log(
-                    "direct model failed", task=task, model=model,
-                    attempt=attempt, error=last_error,
-                )
-                break
+    stage_key = "annotate." + ("ai" if task.startswith("ai-") else "translation" if task.startswith("translation-") else "quality")
+    with model_attempt_budget(stage_key):
+        models = task_model_chain(stage_key, models)
+        last_error = ""
+        for model in models:
+            current_prompt = user_prompt
+            for attempt in range(1, 3):
+                try:
+                    completion_options = {}
+                    if on_attempt_event is not None:
+                        completion_options["on_attempt_event"] = on_attempt_event
+                    if max_http_attempts is not None:
+                        completion_options["max_http_attempts"] = max_http_attempts
+                    output, actual_model = await call_model(collect_chat_completion, stage_key,
+                        [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": current_prompt},
+                        ],
+                        models=(model,),
+                        max_tokens=max_tokens,
+                        reasoning_effort=reasoning_effort,
+                        **completion_options,
+                        selected_model=model,
+                    )
+                except Exception as exc:
+                    last_error = _public_llm_error(str(exc))
+                    _annotate_ai_log(
+                        "direct model failed", task=task, model=model,
+                        attempt=attempt, error=last_error,
+                    )
+                    break
 
-            parsed, parse_error = parser(output)
-            if parsed:
-                _annotate_ai_log(
-                    "direct model done", task=task, model=actual_model,
-                    attempt=attempt, answer_len=len(output),
-                )
-                return parsed, ""
+                parsed, parse_error = parser(output)
+                if parsed:
+                    _annotate_ai_log(
+                        "direct model done", task=task, model=actual_model,
+                        attempt=attempt, answer_len=len(output),
+                    )
+                    return parsed, ""
 
-            last_error = str(parse_error or "模型返回内容无法解析")
-            _annotate_ai_log(
-                "direct model schema invalid", task=task, model=actual_model,
-                attempt=attempt,
-            )
-            current_prompt = (
-                f"上次输出无法解析（{last_error}）。请重新处理并严格返回系统提示词指定的 "
-                "JSON，不要附加解释文字。\n\n"
-                f"{user_prompt}"
-            )
-    return [], last_error or "模型调用失败"
+                last_error = str(parse_error or "模型返回内容无法解析")
+                _annotate_ai_log(
+                    "direct model schema invalid", task=task, model=actual_model,
+                    attempt=attempt,
+                )
+                current_prompt = (
+                    f"上次输出无法解析（{last_error}）。请重新处理并严格返回系统提示词指定的 "
+                    "JSON，不要附加解释文字。\n\n"
+                    f"{user_prompt}"
+                )
+        return [], last_error or "模型调用失败"
 
 
 async def _call_ai_model(
@@ -834,6 +839,7 @@ async def _translate_headers(headers: list) -> tuple[list, str]:
 # ── 上传 ────────────────────────────────────────────────────────
 
 
+@model_operation
 async def handle_annotate_upload(filename: str, content: bytes, login: dict | None) -> dict:
     """解析上传文件、检测列、翻译表头、创建会话，返回前端所需的 result dict。"""
     try:
@@ -2065,7 +2071,8 @@ async def _run_ai_batch_checked(
     return batch_num, valid, missing, translation_missing, detail
 
 
-async def ai_detect_stream(sid: str, request: Request, retry_ids: set[str] | None = None):
+@model_operation
+async def _ai_detect_stream(sid: str, request: Request, retry_ids: set[str] | None = None):
     """Run only missing AI rows, retain prior trusted results, and repair translations."""
     sess = get_annotate_session(sid)
     if sess.get("ai_status") != "running":
@@ -2583,6 +2590,7 @@ def group_column_metadata(rows: list) -> dict:
             "detected_id_col": id_col, "detected_open_text_cols": [i for i in questions if i != id_col and i not in empty]}
 
 
+@model_operation
 async def annotate_group_feedback(task: dict, feedback: dict, checkpoint) -> None:
     """Use the existing strict evidence/holistic engine without a browser/SSE session.
 
@@ -2645,7 +2653,8 @@ async def annotate_group_feedback(task: dict, feedback: dict, checkpoint) -> Non
                     "model_error": error or current.get("model_error", "")})
 
 
-async def quality_stream(sid: str, request: Request, retry_ids: set[str] | None = None):
+@model_operation
+async def _quality_stream(sid: str, request: Request, retry_ids: set[str] | None = None):
     """Run only missing quality rows and retain prior trusted labels."""
     sess = get_annotate_session(sid)
     _prepare_quality_policy(sess)
@@ -2891,3 +2900,34 @@ async def quality_stream(sid: str, request: Request, retry_ids: set[str] | None 
         if translation_task is not None and not translation_task.done():
             translation_task.cancel()
             await asyncio.gather(translation_task, return_exceptions=True)
+
+
+async def _annotation_stream_with_settings(stage, sid, request, retry_ids):
+    sess = get_annotate_session(sid)
+    saved = (sess.get("llm_model_stage_snapshots") or {}).get(stage) or {}
+    resuming = bool(saved or sess.get(stage + "_results") or retry_ids is not None)
+
+    @model_operation(resume_from="previous")
+    async def run(previous=None):
+        metadata = {}
+        record_model_snapshot(metadata)
+        sess.setdefault("llm_model_stage_snapshots", {})[stage] = metadata
+        stream = _ai_detect_stream if stage == "ai" else _quality_stream
+        async for item in stream(sid, request, retry_ids):
+            yield item
+
+    try:
+        async for item in run(previous=saved if resuming else None):
+            yield item
+    except ValueError as exc:
+        yield sse_event({"type": "error", "message": str(exc)})
+
+
+async def ai_detect_stream(sid: str, request: Request, retry_ids: set[str] | None = None):
+    async for item in _annotation_stream_with_settings("ai", sid, request, retry_ids):
+        yield item
+
+
+async def quality_stream(sid: str, request: Request, retry_ids: set[str] | None = None):
+    async for item in _annotation_stream_with_settings("quality", sid, request, retry_ids):
+        yield item

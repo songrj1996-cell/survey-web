@@ -30,6 +30,7 @@ from app.core.config import (
     LLM_COMMENT_SYNTHESIS_REASONING,
 )
 from app.core.runtime_logging import runtime_log
+from app.services.llm_model_settings import model_attempt_budget, call_model, model_operation, task_model_chain
 from app.integrations.llm_client import collect_chat_completion
 from app.services.glossary_service import (
     normalize_glossary_data,
@@ -82,45 +83,49 @@ async def _comment_json_call(
     validate,
 ) -> tuple[list, str, bool]:
     """调用结构化评论任务，schema 失败时原模型再生成一次，然后切备选。"""
-    errors: list[str] = []
-    for model in models:
-        for schema_attempt in range(2):
-            correction = ""
-            if schema_attempt:
-                correction = (
-                    "\n\n上一次输出未通过结构校验。请重新完整生成，"
-                    "只输出符合系统提示词契约的 JSON 数组。"
+    stage_key = {'评论原文初筛': 'comment.quote_batch', '评论原文最终精选': 'comment.quote_final', '评论相关性筛选': 'comment.relevance', '评论主题提取': 'comment.extract', '评论主题合并': 'comment.merge', '评论分类': 'comment.classify', '中文评论舆情简报': 'comment.report'}.get(task, "comment.report")
+    with model_attempt_budget(stage_key):
+        models = task_model_chain(stage_key, models)
+        errors: list[str] = []
+        for model in models:
+            for schema_attempt in range(2):
+                correction = ""
+                if schema_attempt:
+                    correction = (
+                        "\n\n上一次输出未通过结构校验。请重新完整生成，"
+                        "只输出符合系统提示词契约的 JSON 数组。"
+                    )
+                try:
+                    raw, actual_model = await call_model(collect_chat_completion, stage_key,
+                        prepare_glossary_messages(
+                            [
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": query + correction},
+                            ]
+                        ),
+                        models=(model,),
+                        max_tokens=max_tokens,
+                        reasoning_effort=reasoning_effort,
+                        selected_model=model,
+                    )
+                except Exception as exc:
+                    errors.append(f"{model}: {type(exc).__name__}")
+                    break
+                parsed, parse_error = comment_analysis.loads_loose(raw)
+                validation_error = validate(parsed)
+                if isinstance(parsed, list) and not validation_error:
+                    return (
+                        normalize_glossary_data(
+                            parsed,
+                            protected_keys=_GLOSSARY_PROTECTED_DATA_KEYS,
+                        ),
+                        actual_model,
+                        bool(schema_attempt),
+                    )
+                errors.append(
+                    f"{model}: {validation_error or parse_error or '输出不是 JSON 数组'}"
                 )
-            try:
-                raw, actual_model = await collect_chat_completion(
-                    prepare_glossary_messages(
-                        [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": query + correction},
-                        ]
-                    ),
-                    models=(model,),
-                    max_tokens=max_tokens,
-                    reasoning_effort=reasoning_effort,
-                )
-            except Exception as exc:
-                errors.append(f"{model}: {type(exc).__name__}")
-                break
-            parsed, parse_error = comment_analysis.loads_loose(raw)
-            validation_error = validate(parsed)
-            if isinstance(parsed, list) and not validation_error:
-                return (
-                    normalize_glossary_data(
-                        parsed,
-                        protected_keys=_GLOSSARY_PROTECTED_DATA_KEYS,
-                    ),
-                    actual_model,
-                    bool(schema_attempt),
-                )
-            errors.append(
-                f"{model}: {validation_error or parse_error or '输出不是 JSON 数组'}"
-            )
-    raise RuntimeError(f"{task} 直连 LLM 输出校验失败；" + "; ".join(errors[-4:]))
+        raise RuntimeError(f"{task} 直连 LLM 输出校验失败；" + "; ".join(errors[-4:]))
 
 
 async def _comment_text_call(
@@ -133,40 +138,44 @@ async def _comment_text_call(
     max_tokens: int,
     validate,
 ) -> tuple[str, str, bool]:
-    errors: list[str] = []
-    for model in models:
-        for schema_attempt in range(2):
-            correction = ""
-            if schema_attempt:
-                correction = (
-                    "\n\n上一次输出未满足报告结构。请按系统提示词"
-                    "重新完整生成 Markdown，不要代码围栏或前言。"
-                )
-            try:
-                raw, actual_model = await collect_chat_completion(
-                    prepare_glossary_messages(
-                        [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": query + correction},
-                        ]
-                    ),
-                    models=(model,),
-                    max_tokens=max_tokens,
-                    reasoning_effort=reasoning_effort,
-                )
-            except Exception as exc:
-                errors.append(f"{model}: {type(exc).__name__}")
-                break
-            cleaned = str(raw or "").lstrip("\ufeff\u200b").strip()
-            validation_error = validate(cleaned)
-            if not validation_error:
-                return (
-                    normalize_glossary_terms(cleaned),
-                    actual_model,
-                    bool(schema_attempt),
-                )
-            errors.append(f"{model}: {validation_error}")
-    raise RuntimeError(f"{task} 直连 LLM 输出校验失败；" + "; ".join(errors[-4:]))
+    stage_key = {'评论原文初筛': 'comment.quote_batch', '评论原文最终精选': 'comment.quote_final', '评论相关性筛选': 'comment.relevance', '评论主题提取': 'comment.extract', '评论主题合并': 'comment.merge', '评论分类': 'comment.classify', '中文评论舆情简报': 'comment.report'}.get(task, "comment.report")
+    with model_attempt_budget(stage_key):
+        models = task_model_chain(stage_key, models)
+        errors: list[str] = []
+        for model in models:
+            for schema_attempt in range(2):
+                correction = ""
+                if schema_attempt:
+                    correction = (
+                        "\n\n上一次输出未满足报告结构。请按系统提示词"
+                        "重新完整生成 Markdown，不要代码围栏或前言。"
+                    )
+                try:
+                    raw, actual_model = await call_model(collect_chat_completion, stage_key,
+                        prepare_glossary_messages(
+                            [
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": query + correction},
+                            ]
+                        ),
+                        models=(model,),
+                        max_tokens=max_tokens,
+                        reasoning_effort=reasoning_effort,
+                        selected_model=model,
+                    )
+                except Exception as exc:
+                    errors.append(f"{model}: {type(exc).__name__}")
+                    break
+                cleaned = str(raw or "").lstrip("\ufeff\u200b").strip()
+                validation_error = validate(cleaned)
+                if not validation_error:
+                    return (
+                        normalize_glossary_terms(cleaned),
+                        actual_model,
+                        bool(schema_attempt),
+                    )
+                errors.append(f"{model}: {validation_error}")
+        raise RuntimeError(f"{task} 直连 LLM 输出校验失败；" + "; ".join(errors[-4:]))
 
 
 def _comment_selected_raw_comments_md(items: list[dict]) -> str:
@@ -209,6 +218,7 @@ def _comment_append_selected_raw_comments(report_md: str, selected_raw_comments:
     return (base + "\n\n" + selected_md).strip()
 
 
+@model_operation
 async def _select_comment_raw_quotes(sess: dict) -> list[dict]:
     """从清洗后的长评论候选中精选最多 50 条原文评论。失败由调用方隔离。"""
     post_title = sess.get("comment_post_title", "") or ""
@@ -560,6 +570,7 @@ async def _select_comment_raw_quotes(sess: dict) -> list[dict]:
     return selected
 
 
+@model_operation
 async def _comment_analysis_pipeline(sess: dict):
     """评论舆情分析流水线。异步生成器，yield ("progress", msg) / ("result", payload)。
 

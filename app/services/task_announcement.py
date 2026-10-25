@@ -7,6 +7,7 @@ from fastapi import HTTPException
 
 from app.core import config
 from app.core.llm_context import bind_llm_api_key, bind_llm_attempt_observer
+from app.services.llm_model_settings import call_model, model_operation
 from app.integrations.llm_client import collect_chat_completion
 from app.services.feature_access import require_permission
 from app.services.llm_credentials import require_background_llm_api_key
@@ -14,6 +15,7 @@ from app.services.llm_usage import start_llm_usage_task
 from app.storage.prompts import _get_prompt_text
 
 
+@model_operation
 async def extract_announcement(text: str, login):
     require_permission(login, "annotate", write=True)
     if not text.strip():
@@ -25,7 +27,7 @@ async def extract_announcement(text: str, login):
     try:
         with bind_llm_api_key(require_background_llm_api_key(login)), bind_llm_attempt_observer(recorder.on_attempt_event if recorder else None):
             async with asyncio.timeout(min(config.GROUP_RUN_TIMEOUT_SECONDS, 120)):
-                output, _ = await collect_chat_completion([
+                output, _ = await call_model(collect_chat_completion, "other.announcement", [
                     {"role": "system", "content": _get_prompt_text("task_announcement_system") + "\n" + protocol},
                     {"role": "user", "content": json.dumps({"announcement": text}, ensure_ascii=False)},
                 ], models=(config.LLM_TASK_ANNOUNCEMENT_MODEL,), max_tokens=4000, max_http_attempts=2)

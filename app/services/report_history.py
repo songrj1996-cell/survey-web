@@ -62,6 +62,7 @@ _SURVEY_DUPLICATE_CONTEXT_FIELDS = (
 _SURVEY_DUPLICATE_CONTEXT_SIMILARITY = 0.80
 DEFAULT_RERUN_VERSION_INSTRUCTION = "未填写补充要求，本次为重新生成"
 _VERSION_MIRROR_FIELDS = (
+    "llm_model_snapshot",
     *MODE_SNAPSHOT_FIELDS,
     "report_md",
     "title",
@@ -470,6 +471,7 @@ def save_to_history(
             "report_duration_seconds": timing_source.get(
                 "report_duration_seconds"
             ),
+            "llm_model_snapshot": deepcopy(active_source.get("llm_model_snapshot")),
             "report_md": active_source.get("report_md") or report_md,
             "plan": sess.get("plan"),
             "stats_md": sess.get("stats_md"),
@@ -526,7 +528,7 @@ def save_to_history(
                 "active_report_version": version_source["active_report_version"],
                 "next_report_version": version_source["next_report_version"],
             })
-            for field in ("report_llm_usage", "quick_report_diagnostics", *MODE_SNAPSHOT_FIELDS):
+            for field in ("llm_model_snapshot", "report_llm_usage", "quick_report_diagnostics", *MODE_SNAPSHOT_FIELDS):
                 if field in active_source:
                     entry[field] = deepcopy(active_source[field])
         if sess.get("mode") == "comment":
@@ -966,6 +968,7 @@ def save_annotate_to_history(sid: str, sess: dict, result_path: str, download_na
             "rows_fed": False,
             "mode": "annotate",
             "row_count": max(0, len(sess.get("rows") or []) - 1),
+            "llm_model_stage_snapshots": deepcopy(sess.get("llm_model_stage_snapshots") or {}),
             "annotate_completion": deepcopy(sess.get("completion") or {}),
             "annotate_updated_at": datetime.now().isoformat(),
             "annotate_result_path": result_path,

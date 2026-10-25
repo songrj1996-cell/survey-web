@@ -27,6 +27,7 @@ from app.core.interview_v2_dossier import (
     validate_dossier_output,
 )
 from app.core.security import _owner_from_login, _visible_to_owner
+from app.services.llm_model_settings import call_model, model_operation, task_model_settings, task_model_chain, model_configuration_fingerprint, record_model_snapshot
 from app.integrations.llm_client import collect_chat_completion
 from app.schemas.interview_v2_rerun import InterviewV2ParticipantDossierRerunRequest
 from app.services.interview_v2_dossier_service import _error, _parse_json, _public, _ready_project
@@ -96,7 +97,7 @@ def _prompt_bundle() -> tuple[dict[str, str], dict[str, Any]]:
 
 
 def _model_configuration() -> dict[str, Any]:
-    return {
+    result = {
         "attribute": {
             "models": [INTERVIEW_V2_ATTRIBUTE_MODEL, *INTERVIEW_V2_MODEL_FALLBACKS],
             "max_tokens": INTERVIEW_V2_ATTRIBUTE_MAX_TOKENS,
@@ -108,6 +109,12 @@ def _model_configuration() -> dict[str, Any]:
             "reasoning_effort": INTERVIEW_V2_DOSSIER_REASONING,
         },
     }
+
+    for stage in ("attribute", "dossier"):
+        configured = task_model_settings("interview_v2." + stage)
+        if configured:
+            result[stage] = {"models": list(task_model_chain("interview_v2." + stage, ())), "max_tokens": configured["primary"]["max_tokens"], "reasoning_effort": configured["primary"]["reasoning"], "candidates": [configured["primary"], *configured["fallbacks"]], "configuration_sha256": model_configuration_fingerprint()}
+    return result
 
 
 def _fingerprint(
@@ -183,6 +190,7 @@ def _release(
         ) from exc
 
 
+@model_operation
 async def create_participant_dossier_rerun(
     project_id: str, request: dict[str, Any], login: dict[str, Any] | None,
     idempotency_key: str,
@@ -326,7 +334,7 @@ async def create_participant_dossier_rerun(
             "evidence_allowlist": participant_input["evidence_allowlist"],
         }
         try:
-            attribute_text, attribute_model = await collect_chat_completion(
+            attribute_text, attribute_model = await call_model(collect_chat_completion, "interview_v2.attribute",
                 [
                     {"role": "system", "content": prompt_texts["interview_v2_attribute_system"]},
                     {"role": "user", "content": "<untrusted_interview_data>\n"
@@ -342,7 +350,7 @@ async def create_participant_dossier_rerun(
                 participant_input=participant_input,
             )
             dossier_payload = {**model_input, "validated_attributes": attributes}
-            dossier_text, dossier_model = await collect_chat_completion(
+            dossier_text, dossier_model = await call_model(collect_chat_completion, "interview_v2.dossier",
                 [
                     {"role": "system", "content": prompt_texts["interview_v2_dossier_system"]},
                     {"role": "user", "content": "<untrusted_interview_data>\n"
@@ -408,6 +416,7 @@ async def create_participant_dossier_rerun(
             },
         }
         try:
+            record_model_snapshot(revision)
             saved = store.save_participant_dossier_rerun_cas(
                 **operation_args, revision=revision
             )

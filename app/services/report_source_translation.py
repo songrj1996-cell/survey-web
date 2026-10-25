@@ -13,6 +13,7 @@ import re
 import unicodedata
 import weakref
 
+from app.services.llm_model_settings import call_model, model_operation, task_model_settings, task_model_chain, model_configuration_fingerprint
 from app.core import config
 from app.integrations.llm_client import collect_chat_completion
 from app.storage.prompts import _get_prompt_text
@@ -150,6 +151,7 @@ def _parse(answer, fragments):
     return translated, failed
 
 
+@model_operation(budget_key="evidence.translation")
 async def _translate_batch(fragments, *, system, settings, models, collect, slots, on_result):
     translated, pending, failures = {}, fragments, {}
     for repairing in (False, True):
@@ -158,7 +160,7 @@ async def _translate_batch(fragments, *, system, settings, models, collect, slot
         try:
             async with slots:
                 async with asyncio.timeout(settings["call_seconds"]):
-                    output = await collect(_messages(pending, system, repairing), models=models or None,
+                    output = await call_model(collect, "evidence.translation", _messages(pending, system, repairing), models=models or None,
                                            max_tokens=settings["max_tokens"],
                                            reasoning_effort=settings["reasoning"],
                                            max_http_attempts=settings["http_attempt_cap"])
@@ -248,6 +250,7 @@ async def _run_owned(owned, *, state, system, settings, models, collect):
                 state["pending"].pop(fingerprint, None)
 
 
+@model_operation
 async def translate_report_source_items(items, *, namespace: str, collect=None) -> list[dict]:
     """Return original-order source/translation pairs, using only verified cache.
 
@@ -282,6 +285,13 @@ async def translate_report_source_items(items, *, namespace: str, collect=None) 
                 "http_attempt_cap": config.LLM_QUICK_REPORT_HTTP_ATTEMPT_CAP}
     models = tuple(dict.fromkeys(model for model in (config.LLM_QUICK_REPORT_MODEL,
                                                      *config.LLM_QUICK_REPORT_FALLBACK_MODELS) if model))
+    models = task_model_chain("evidence.translation", models)
+    managed = task_model_settings("evidence.translation")
+    if managed:
+        settings["max_tokens"] = managed["primary"]["max_tokens"]
+        settings["reasoning"] = None if managed["primary"]["reasoning"] == "default" else managed["primary"]["reasoning"]
+        settings["call_seconds"] = managed["timeout_seconds"] or settings["call_seconds"]
+        settings["model_configuration"] = model_configuration_fingerprint()
     configuration = _digest({"schema": 1, "system": system, "contract": _CONTRACT, "models": models, "settings": settings})
     fingerprints = [_digest({"namespace": namespace, "question_key": item["question_key"],
                              "response_id": item["response_id"], "text": item["text"],

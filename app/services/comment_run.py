@@ -3,6 +3,7 @@ import asyncio
 
 from fastapi import HTTPException, Request
 
+from app.services.llm_model_settings import model_operation, record_model_snapshot
 from app.core.responses import sse_event
 from app.core.runtime_logging import runtime_log
 from app.services.comment_pipeline import (
@@ -22,6 +23,7 @@ def validate_comment_session_for_run(session_id: str) -> None:
         raise HTTPException(status_code=400, detail="该会话尚未完成评论预处理，请重新上传并等待预处理完成")
 
 
+@model_operation
 async def comment_run_stream(session_id: str, request: Request):
     """评论舆情分析 SSE 流程（async generator）。"""
     sess = get_session(session_id)
@@ -49,6 +51,7 @@ async def comment_run_stream(session_id: str, request: Request):
         sess["comment_result"] = result
         if result.get("report_md"):
             sess["report_md"] = result["report_md"]
+        record_model_snapshot(sess)
         save_session(session_id, sess)
         save_to_history(session_id, sess)
         yield sse_event({"type": "comment_done", **result, "sample_meta": sess.get("comment_sample_meta", {})})

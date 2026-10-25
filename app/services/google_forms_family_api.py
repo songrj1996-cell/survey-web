@@ -21,6 +21,7 @@ from app.integrations.google_forms_responses_client import (
     GoogleFormsResponsesClientError,
     GoogleFormsResponsesErrorCode,
 )
+from app.services.llm_model_settings import model_attempt_budget, call_model, model_operation
 from app.integrations.llm_client import collect_chat_completion
 from app.schemas.questionnaire import CanonicalQuestionType, QuestionnaireSnapshot
 from app.schemas.questionnaire_families import (
@@ -155,6 +156,7 @@ def _role(question_type) -> str:
     }.get(value, "ignore")
 
 
+@model_operation
 async def translate_family_variants_with_llm(
     owner_ref: str,
     title: str,
@@ -208,46 +210,47 @@ async def translate_family_variants_with_llm(
                 "content": query,
             },
         ])
-        try:
-            answer, _ = await collect_chat_completion(
-                messages,
-                models=(LLM_COLUMN_MODEL, *LLM_COLUMN_FALLBACK_MODELS),
-                max_tokens=LLM_COLUMN_MAX_TOKENS,
-                reasoning_effort=LLM_COLUMN_REASONING or None,
-                api_key=api_key,
-            )
+        with model_attempt_budget("survey.translation"):
             try:
-                translated = parse_questionnaire_translations(answer, questions)
-            except ValueError as parse_error:
-                repair_messages = prepare_glossary_messages([
-                    {
-                        "role": "system",
-                        "content": system_prompt,
-                    },
-                    {"role": "user", "content": query},
-                    {"role": "assistant", "content": answer},
-                    {
-                        "role": "user",
-                        "content": (
-                            f"上一次输出无法通过校验：{parse_error}。\n"
-                            "请只修复翻译 JSON，不得改变 question_id、数组长度或顺序，"
-                            "并确保英文题干已翻译为简体中文。"
-                        ),
-                    },
-                ])
-                repaired, _ = await collect_chat_completion(
-                    repair_messages,
+                answer, _ = await call_model(collect_chat_completion, "survey.translation",
+                    messages,
                     models=(LLM_COLUMN_MODEL, *LLM_COLUMN_FALLBACK_MODELS),
                     max_tokens=LLM_COLUMN_MAX_TOKENS,
                     reasoning_effort=LLM_COLUMN_REASONING or None,
                     api_key=api_key,
                 )
-                translated = parse_questionnaire_translations(
-                    repaired,
-                    questions,
-                )
-        except Exception as error:
-            raise GoogleFormsFamilyMappingUnavailableError() from error
+                try:
+                    translated = parse_questionnaire_translations(answer, questions)
+                except ValueError as parse_error:
+                    repair_messages = prepare_glossary_messages([
+                        {
+                            "role": "system",
+                            "content": system_prompt,
+                        },
+                        {"role": "user", "content": query},
+                        {"role": "assistant", "content": answer},
+                        {
+                            "role": "user",
+                            "content": (
+                                f"上一次输出无法通过校验：{parse_error}。\n"
+                                "请只修复翻译 JSON，不得改变 question_id、数组长度或顺序，"
+                                "并确保英文题干已翻译为简体中文。"
+                            ),
+                        },
+                    ])
+                    repaired, _ = await call_model(collect_chat_completion, "survey.translation",
+                        repair_messages,
+                        models=(LLM_COLUMN_MODEL, *LLM_COLUMN_FALLBACK_MODELS),
+                        max_tokens=LLM_COLUMN_MAX_TOKENS,
+                        reasoning_effort=LLM_COLUMN_REASONING or None,
+                        api_key=api_key,
+                    )
+                    translated = parse_questionnaire_translations(
+                        repaired,
+                        questions,
+                    )
+            except Exception as error:
+                raise GoogleFormsFamilyMappingUnavailableError() from error
         semantic_variant_id = questionnaire_family_variant_id(
             family_id,
             str(variant.language),

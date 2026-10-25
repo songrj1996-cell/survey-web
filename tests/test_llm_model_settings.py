@@ -55,7 +55,7 @@ class ModelSettingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["valid"])
         self.assertFalse(self.path.exists())
         self.assertEqual(list(Path(self.directory.name).iterdir()), [])
-        self.assertFalse(state["runtime_active"])
+        self.assertTrue(state["runtime_active"])
         self.assertEqual(state["version"], 0)
 
     async def test_all_default_stages_and_postwrite_rules_preserved(self):
@@ -78,7 +78,7 @@ class ModelSettingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(caught.exception.status_code, 409)
         self.assertEqual(self.path.read_bytes(), before)
         self.assertEqual(saved["version"], 1)
-        self.assertFalse(saved["runtime_active"])
+        self.assertTrue(saved["runtime_active"])
         self.assertEqual(saved["history"][0]["actor_name"], "测试管理员")
 
     async def test_concurrent_publish_only_one_wins(self):

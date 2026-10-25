@@ -4,6 +4,7 @@ import math
 import time
 
 from app.core import config
+from app.core.llm_context import current_llm_model_snapshot
 
 
 def unknown_capacity(reason="estimate_failed"):
@@ -25,7 +26,12 @@ def estimate_writer_capacity(request, *, model, output_tokens, estimate_input):
         limits = json.loads(config.POSTWRITE_WRITER_CONTEXT_LIMITS)
         if not isinstance(limits, dict):
             return unknown_capacity("invalid_configuration")
-        context_tokens = limits.get(model)
+        snapshot = current_llm_model_snapshot()
+        if snapshot and (snapshot["version"] > 0 or snapshot.get("use_saved_defaults")):
+            definition = next((m for m in snapshot["configuration"]["models"] if m["id"] == model), {})
+            context_tokens = definition.get("context_tokens")
+        else:
+            context_tokens = limits.get(model)
         if context_tokens is None:
             return unknown_capacity("unknown_model")
         warning = config.POSTWRITE_WRITER_WARNING_PERCENT

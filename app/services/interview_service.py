@@ -30,6 +30,7 @@ from app.core.interview_parsing import (
 from app.core.responses import sse_event
 from app.core.runtime_logging import runtime_log
 from app.core.security import _assign_session_owner, _visible_to_owner
+from app.services.llm_model_settings import call_model, model_operation, task_model_chain, record_model_snapshot
 from app.integrations.llm_client import collect_chat_completion
 from app.services.glossary_service import (
     normalize_glossary_data,
@@ -366,9 +367,9 @@ def get_interview_status(session_id: str, login: dict | None) -> dict:
     return _session_result(_require_owned_interview_session(session_id, login))
 
 
-async def _llm_with_heartbeats(messages: list[dict], **kwargs):
+async def _llm_with_heartbeats(messages: list[dict], *, task_key="interview.report", **kwargs):
     task = asyncio.create_task(
-        collect_chat_completion(prepare_glossary_messages(messages), **kwargs)
+        call_model(collect_chat_completion, task_key, prepare_glossary_messages(messages), selected_model=(kwargs.get("models") or [None])[0], **kwargs)
     )
     try:
         while True:
@@ -505,6 +506,7 @@ def _audit_messages(report_md: str, extraction: dict) -> list[dict]:
     ]
 
 
+@model_operation(budget_key=lambda args: "interview." + ({"extract": "extract", "write": "report", "audit": "audit", "review_audit": "audit"}.get(args["stage"], "repair")))
 async def _collect_stage(
     *,
     messages: list[dict],
@@ -518,7 +520,8 @@ async def _collect_stage(
     module_title: str = "",
     max_tokens: int | None = None,
 ):
-    models = _stage_models(model)
+    task_key = "interview." + ({"extract":"extract", "write":"report", "audit":"audit", "review_audit":"audit"}.get(stage, "repair"))
+    models = task_model_chain(task_key, _stage_models(model))
     last_error: Exception | None = None
     previous_model = ""
     for model_index, candidate in enumerate(models):
@@ -549,6 +552,7 @@ async def _collect_stage(
             async for result in _llm_with_heartbeats(
                 messages,
                 models=(candidate,),
+                task_key=task_key,
                 max_tokens=max_tokens,
                 reasoning_effort=reasoning,
             ):
@@ -630,6 +634,7 @@ def _review_selection_matches(issue: dict, selection: dict) -> bool:
     )
 
 
+@model_operation
 async def revise_interview_audit_issues_stream(
     session_id: str,
     selections: list[dict],
@@ -910,7 +915,7 @@ async def revise_interview_audit_issue_stream(
         yield chunk
 
 
-async def interview_report_stream(
+async def _interview_report_stream(
     session_id: str,
     request: Request,
     login: dict | None = None,
@@ -926,6 +931,7 @@ async def interview_report_stream(
             yield sse_event({"type": "interview_done", **_session_result(sess)})
             return
 
+        record_model_snapshot(sess)
         workbook = sess["interview_workbook"]
         valid_refs = interview_source_refs(workbook)
         models_used = dict(sess.get("interview_models_used") or {})
@@ -1320,3 +1326,19 @@ async def interview_report_stream(
                     "models_used": sess.get("interview_models_used") or {},
                 }
             )
+
+
+async def interview_report_stream(session_id: str, request: Request, login: dict | None = None):
+    sess = _require_owned_interview_session(session_id, login)
+    resuming = bool(sess.get("interview_extraction") or sess.get("llm_model_snapshot") or sess.get("interview_status") in {"running", "failed"})
+
+    @model_operation(resume_from="previous")
+    async def run(previous=None):
+        async for item in _interview_report_stream(session_id, request, login):
+            yield item
+
+    try:
+        async for item in run(previous=sess if resuming else None):
+            yield item
+    except ValueError as exc:
+        yield sse_event({"type": "error", "message": str(exc)})

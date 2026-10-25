@@ -18,6 +18,7 @@ from typing import Any, Literal
 
 import httpx
 
+from app.core.llm_context import current_llm_model_budget
 from app.core.config import (
     FEISHU_LOGIN_REQUIRED,
     LLM_API_BASE,
@@ -317,6 +318,7 @@ async def _request_chat(
     *,
     api_key: str,
     include_usage: bool = True,
+    reasoning_effort: str | None = None,
 ) -> _LLMResult:
     protocol: _Protocol = "chat"
     payload = {
@@ -327,6 +329,8 @@ async def _request_chat(
     }
     if include_usage:
         payload["stream_options"] = {"include_usage": True}
+    if reasoning_effort:
+        payload["reasoning_effort"] = reasoning_effort
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -777,6 +781,7 @@ async def _request_once(
         observation,
         api_key=api_key,
         include_usage=chat_include_usage,
+        reasoning_effort=reasoning_effort,
     )
 
 
@@ -789,6 +794,10 @@ async def collect_chat_completion(
     on_attempt_event: _AttemptEventCallback | None = None,
     api_key: str | None = None,
     max_http_attempts: int | None = None,
+    candidate_settings: list[dict] | None = None,
+    model_config_version: int | None = None,
+    model_task_key: str | None = None,
+    timeout_seconds: int | None = None,
 ) -> tuple[str, str]:
     """返回完整回答和实际请求模型；失败轮次不会暴露半截文本。
 
@@ -811,10 +820,11 @@ async def collect_chat_completion(
     if not configured_models:
         raise RuntimeError("未配置 LLM_REPORT_MODEL")
     request_max_tokens = max(1024, int(max_tokens or LLM_REPORT_MAX_TOKENS))
+    candidate_options = {c["model"]: c for c in candidate_settings or []}
 
     timeout = httpx.Timeout(
         connect=LLM_CONNECT_TIMEOUT,
-        read=LLM_READ_TIMEOUT,
+        read=timeout_seconds or LLM_READ_TIMEOUT,
         write=60.0,
         pool=LLM_CONNECT_TIMEOUT,
     )
@@ -867,6 +877,12 @@ async def collect_chat_completion(
             nonlocal attempt_number, previous_attempt
             if max_http_attempts is not None and attempt_number >= max_http_attempts:
                 raise RuntimeError("LLM actual HTTP attempt budget exhausted") from last_error
+            budget = current_llm_model_budget()
+            if budget and budget["key"] == model_task_key and budget["remaining"] is not None:
+                if budget["remaining"] <= 0:
+                    raise RuntimeError("已达到本环节的真实请求上限，未继续重试或切换备用模型")
+                budget["remaining"] -= 1
+            wire_reasoning = reasoning_effort if protocol != "chat" or model in candidate_options else None
             attempt_number += 1
             attempt_kind = "initial"
             if previous_attempt:
@@ -890,6 +906,9 @@ async def collect_chat_completion(
                 "attempt": attempt_number,
                 "max_output_tokens": request_max_tokens,
                 "started_at": datetime.now(timezone.utc).isoformat(),
+                "reasoning_effort": wire_reasoning,
+                "model_config_version": model_config_version,
+                "model_task_key": model_task_key,
             }
             previous_attempt = {**event_base, "chat_include_usage": chat_include_usage}
             observation = _AttemptObservation()
@@ -905,7 +924,7 @@ async def collect_chat_completion(
                     model,
                     protocol,
                     request_max_tokens,
-                    reasoning_effort,
+                    wire_reasoning,
                     observation,
                     api_key=request_api_key,
                     chat_include_usage=chat_include_usage,
@@ -968,7 +987,22 @@ async def collect_chat_completion(
                     raise
 
         for model_index, model in enumerate(configured_models):
+            if model in candidate_options:
+                selected = candidate_options[model]
+                capabilities = selected.get("capabilities") or {}
+                limit = capabilities.get("max_output_tokens")
+                if limit is not None and selected["max_tokens"] > limit:
+                    raise ValueError("输出长度超过当前模型目录上限，未发送请求")
+                if selected["reasoning"] not in capabilities.get("efforts", ["default"]):
+                    raise ValueError("推理程度不在当前模型的能力目录中，未发送请求")
+                request_max_tokens = selected["max_tokens"]
+                reasoning_effort = None if selected["reasoning"] == "default" else selected["reasoning"]
             for protocol in _protocol_order(model):
+                # Messages thinking is supported only by the existing explicit adapter.
+                # A requested effort must never disappear during protocol fallback.
+                if (model in candidate_options and reasoning_effort and protocol == "messages"
+                        and not model.lower().startswith(("claude-sonnet-5", "claude-opus-5", "claude-fable-5"))):
+                    continue
                 switch_protocol = False
                 for attempt in range(1, LLM_REPORT_MAX_ATTEMPTS + 1):
                     try:

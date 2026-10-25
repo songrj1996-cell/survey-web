@@ -4,6 +4,7 @@ from copy import deepcopy
 from datetime import datetime
 import re
 
+from app.services.llm_model_settings import record_model_snapshot
 from app.core.config import MAX_REPORT_VERSIONS
 from app.services.report_modes import MODE_SNAPSHOT_FIELDS, MODE_OBJECT_FIELDS, resolve_report_mode
 
@@ -25,12 +26,13 @@ _MIRROR_FIELDS = (
     "report_llm_usage",
     "report_style",
     "quick_report_diagnostics",
+    "llm_model_snapshot",
 )
 _TEXT_SNAPSHOT_FIELDS = tuple(
     field for field in _MIRROR_FIELDS
-    if field not in {"qa_messages", "comparison_validation", "report_llm_usage", "report_style", "quick_report_diagnostics", *MODE_SNAPSHOT_FIELDS}
+    if field not in {"llm_model_snapshot", "qa_messages", "comparison_validation", "report_llm_usage", "report_style", "quick_report_diagnostics", *MODE_SNAPSHOT_FIELDS}
 )
-_OPTIONAL_OBJECT_SNAPSHOT_FIELDS = ("report_llm_usage", "quick_report_diagnostics", *MODE_OBJECT_FIELDS)
+_OPTIONAL_OBJECT_SNAPSHOT_FIELDS = ("llm_model_snapshot", "report_llm_usage", "quick_report_diagnostics", *MODE_OBJECT_FIELDS)
 _SUMMARY_FIELDS = (
     "quick_completion_revision",
     "report_mode", "report_status",
@@ -156,7 +158,7 @@ def _snapshot_from(
 
     for field in _OPTIONAL_OBJECT_SNAPSHOT_FIELDS:
         # Audit belongs to the exact snapshot; never borrow a newer version's result.
-        if field == "report_audit" and field not in snapshot and snapshot.get("report_md"):
+        if field in {"report_audit", "llm_model_snapshot"} and field not in snapshot and snapshot.get("report_md"):
             result.pop(field, None)
             continue
         if field in snapshot:
@@ -346,6 +348,8 @@ def append_report_version(
     _require_source(source)
     if not isinstance(snapshot, dict):
         raise ValueError("报告版本快照必须是字典")
+    snapshot = deepcopy(snapshot)
+    record_model_snapshot(snapshot)
     versions = normalize_report_versions(source)
     if len(versions) >= MAX_REPORT_VERSIONS:
         raise ValueError(
@@ -385,7 +389,7 @@ def append_report_version(
         snapshot_fallback = {
             key: value
             for key, value in source.items()
-            if key not in {"report_llm_usage", "quick_report_diagnostics", "report_style", *MODE_SNAPSHOT_FIELDS}
+            if key not in {"llm_model_snapshot", "report_llm_usage", "quick_report_diagnostics", "report_style", *MODE_SNAPSHOT_FIELDS}
         }
     new_snapshot = _snapshot_from(
         snapshot,

@@ -21,6 +21,7 @@ from app.core.interview_v2_analysis import (
     validate_module_findings,
 )
 from app.core.security import _owner_from_login
+from app.services.llm_model_settings import call_model, model_operation, record_model_snapshot
 from app.integrations.llm_client import collect_chat_completion
 from app.services.interview_v2_dossier_service import _manifest, _ready_project
 from app.services.interview_v2_import_service import InterviewV2ImportError
@@ -230,6 +231,7 @@ def get_current_analysis(
     )
 
 
+@model_operation
 async def create_analysis_run(
     project_id: str,
     request: dict[str, Any],
@@ -272,7 +274,7 @@ async def create_analysis_run(
             "unreviewed_participant_ids": unreviewed,
             **module_input,
         }
-        response_text, model = await collect_chat_completion(
+        response_text, model = await call_model(collect_chat_completion, "interview_v2.analysis",
             [
                 {"role": "system", "content": _get_interview_v2_analysis_system_prompt()},
                 {
@@ -326,6 +328,7 @@ async def create_analysis_run(
         "created_by": _owner_from_login(login).get("owner_key", ""),
     }
     try:
+        record_model_snapshot(revision)
         saved = store.save_analysis_run_cas(
             project_id=project_id,
             base_analysis_run_id=request.get("base_analysis_run_id"),

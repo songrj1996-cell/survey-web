@@ -5,6 +5,7 @@ import hashlib
 import json
 import re
 import time
+from app.services.llm_model_settings import call_model, model_operation, task_model_settings, model_configuration_fingerprint, record_model_snapshot
 from app.core import config
 from app.integrations.llm_client import collect_chat_completion
 from app.services.report_postwrite_inputs import fingerprint, validate_frozen, check_comparisons
@@ -90,6 +91,10 @@ class BoundedCaller:
             output_tokens if output_tokens is not None else config.POSTWRITE_WRITER_OUTPUT_TOKENS)))
         self.registry_output_tokens = min(64000, max(1024, int(
             registry_output_tokens if registry_output_tokens is not None else config.POSTWRITE_REGISTRY_OUTPUT_TOKENS)))
+        writer = task_model_settings("insight.writer")
+        if writer:
+            self.model = writer["primary"]["model"]
+            self.writer_output_tokens = writer["primary"]["max_tokens"]
         self.ledger = ledger if ledger is not None else []
         self.started = time.monotonic()
         self.on_event = on_event
@@ -99,7 +104,11 @@ class BoundedCaller:
     async def call(self, stage, request):
         output_tokens = (self.writer_output_tokens if stage == "writer" else
                          self.registry_output_tokens if stage == "registry" else self.output_tokens)
-        reserve = estimate_tokens(request) + output_tokens
+        task_key = "insight." + (stage if stage in {"writer", "registry"} else "meaning" if stage.startswith("meaning:") else "quantity")
+        managed = task_model_settings(task_key)
+        if managed:
+            output_tokens = max(c["max_tokens"] for c in [managed["primary"], *managed["fallbacks"]])
+        reserve = (estimate_tokens(request) + output_tokens) * (managed["max_http_attempts"] or 1) if managed else estimate_tokens(request) + output_tokens
         remaining = (self.max_seconds - self.previous_seconds - (time.monotonic() - self.started)
                      if self.max_seconds > 0 else None)
         if (self.max_calls > 0 and len(self.ledger) >= self.max_calls
@@ -112,13 +121,13 @@ class BoundedCaller:
         if budgeted and any(c.get("state") in {"started", "cancelled", "failed"}
                             and not c.get("usage_complete") for c in self.ledger):
             raise BudgetStop("上次请求用量不完整，停止继续付费调用")
-        entry = {"stage": stage, "state": "started", "input_estimate": reserve - output_tokens,
+        entry = {"stage": stage, "state": "started", "input_estimate": estimate_tokens(request),
                  "output_cap": output_tokens,
                  "charged_or_reserved_tokens": reserve, "events": [], "usage_complete": False}
         self.ledger.append(entry)
         self.reserved += reserve
         async def event(item):
-            safe = {k: deepcopy(item[k]) for k in ("event", "status", "attempt", "model", "protocol", "usage", "usage_complete", "finish_reason", "fallback") if k in item}
+            safe = {k: deepcopy(item[k]) for k in ("event", "status", "attempt", "model", "protocol", "usage", "usage_complete", "finish_reason", "fallback", "model_config_version", "model_task_key", "reasoning_effort") if k in item}
             if type(item.get("http_status")) is int and 100 <= item["http_status"] <= 599:
                 safe["http_status"] = item["http_status"]
             if item.get("error_category") in _ERROR_CATEGORIES:
@@ -129,9 +138,12 @@ class BoundedCaller:
                 if isinstance(item.get(key), str) and re.fullmatch(r"[0-9a-f]{32}", item[key]):
                     safe[key] = item[key]
             entry["events"].append(safe)
-            if item.get("usage"):
-                entry["usage"] = deepcopy(item["usage"])
-                entry["usage_complete"] = bool(item.get("usage_complete"))
+            if item.get("status") in {"completed", "failed"}:
+                terminals = [e for e in entry["events"] if e.get("status") in {"completed", "failed"}]
+                usages = [e.get("usage") or {} for e in terminals]
+                entry["usage"] = {key: sum(u.get(key, 0) for u in usages) for key in ("input_tokens", "output_tokens")}
+                entry["usage"]["total_tokens"] = sum(u.get("total_tokens", u.get("input_tokens", 0) + u.get("output_tokens", 0)) for u in usages)
+                entry["usage_complete"] = bool(terminals) and all(e.get("usage_complete") for e in terminals)
             if self.on_event:
                 result = self.on_event(item)
                 if hasattr(result, "__await__"):
@@ -139,10 +151,10 @@ class BoundedCaller:
         started = time.monotonic()
         try:
             deadlines = [limit for limit in (self.call_seconds, remaining) if limit is not None and limit > 0]
-            pending = self.collect(request, models=[self.model], max_tokens=output_tokens,
-                reasoning_effort=self.reasoning or None, max_http_attempts=1, on_attempt_event=event)
+            pending = call_model(self.collect, task_key, request, models=[self.model], max_tokens=output_tokens,
+                reasoning_effort=self.reasoning or None, max_http_attempts=(managed["max_http_attempts"] or 1) if managed else 1, on_attempt_event=event)
             text, model = await asyncio.wait_for(pending, timeout=min(deadlines)) if deadlines else await pending
-            if any(e.get("finish_reason") in {"length", "max_tokens", "max_output_tokens"} for e in entry["events"]):
+            if any(e.get("status") != "failed" and e.get("finish_reason") in {"length", "max_tokens", "max_output_tokens"} for e in entry["events"]):
                 raise ValueError("模型输出被截断，本批未完成")
             entry.update(state="complete", actual_model=model, output_chars=len(text))
             return text
@@ -171,10 +183,13 @@ class BoundedCaller:
 
 def run_identity(frozen, prompts, instruction="", *, source_protocol=SOURCE_UNIT_FORMAT):
     validate_frozen(frozen)
-    return fingerprint({"frozen": frozen, "prompts": prompts, "instruction": instruction,
+    identity = {"frozen": frozen, "prompts": prompts, "instruction": instruction,
                             "model": config.LLM_POSTWRITE_MODEL, "reasoning": config.LLM_POSTWRITE_REASONING,
                             "protocols": [REGISTRY_FORMAT, source_protocol, COUNT_FORMAT],
-                            "batch_sizes": [config.POSTWRITE_CLAIMS_PER_BATCH, config.POSTWRITE_PLAYERS_PER_BATCH]})
+                            "batch_sizes": [config.POSTWRITE_CLAIMS_PER_BATCH, config.POSTWRITE_PLAYERS_PER_BATCH]}
+    if model_configuration_fingerprint():
+        identity["model_configuration"] = model_configuration_fingerprint()
+    return fingerprint(identity)
 
 
 def initial_draft_state(frozen, *, prompts, draft, instruction=""):
@@ -291,6 +306,7 @@ def pending_meaning_batches(state):
                       for i in range(0, len(untouched), config.POSTWRITE_CLAIMS_PER_BATCH)]
 
 
+@model_operation(resume_from="previous", persist_result=True)
 async def run_pipeline(frozen, *, prompts, instruction="", previous=None, collect=None,
                        on_progress=None, on_checkpoint=None, on_event=None, caller_options=None, stop_after=None):
     if stop_after not in (None, "registry"):
@@ -302,6 +318,7 @@ async def run_pipeline(frozen, *, prompts, instruction="", previous=None, collec
     if previous and previous.get("identity") != identity:
         raise ValueError("来源、规则或模型配置与原核验不同，不能混用检查点")
     state = deepcopy(previous or {"identity": identity, "draft": "", "registry": None, "steps": {}, "calls": []})
+    record_model_snapshot(state)
     state.pop("registration_only", None)
     state.pop("failure", None)
     state["stop_reason"] = ""

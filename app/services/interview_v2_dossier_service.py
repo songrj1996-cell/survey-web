@@ -25,6 +25,7 @@ from app.core.interview_v2_dossier import (
     validate_dossier_output,
 )
 from app.core.security import _owner_from_login
+from app.services.llm_model_settings import call_model, model_operation, record_model_snapshot
 from app.integrations.llm_client import collect_chat_completion
 from app.services.interview_v2_import_service import InterviewV2ImportError
 from app.services.interview_v2_status_service import (
@@ -150,6 +151,7 @@ def get_current_dossier(project_id: str, participant_id: str, login: dict[str, A
     return _public(project_id, public["import_id"], participant_id, current, source)
 
 
+@model_operation
 async def regenerate_dossier(project_id: str, participant_id: str, request: dict[str, Any], login: dict[str, Any] | None) -> dict[str, Any]:
     public, evidence, boundary, coverage, source = _ready_project(project_id, login)
     participant_input = build_participant_input(
@@ -164,7 +166,7 @@ async def regenerate_dossier(project_id: str, participant_id: str, request: dict
         "evidence_allowlist": participant_input["evidence_allowlist"],
     }
     models = (INTERVIEW_V2_ATTRIBUTE_MODEL, *INTERVIEW_V2_MODEL_FALLBACKS)
-    attribute_text, attribute_model = await collect_chat_completion(
+    attribute_text, attribute_model = await call_model(collect_chat_completion, "interview_v2.attribute",
         [{"role": "system", "content": _get_interview_v2_attribute_system_prompt()},
          {"role": "user", "content": "<untrusted_interview_data>\n" + json.dumps(model_input, ensure_ascii=False) + "\n</untrusted_interview_data>"}],
         models=models,
@@ -176,7 +178,7 @@ async def regenerate_dossier(project_id: str, participant_id: str, request: dict
     except InterviewV2DossierValidationError as exc:
         raise _error("DOSSIER_ATTRIBUTE_VALIDATION_FAILED", str(exc), status=502, retryable=True) from exc
     dossier_payload = {**model_input, "validated_attributes": attributes}
-    dossier_text, dossier_model = await collect_chat_completion(
+    dossier_text, dossier_model = await call_model(collect_chat_completion, "interview_v2.dossier",
         [{"role": "system", "content": _get_interview_v2_dossier_system_prompt()},
          {"role": "user", "content": "<untrusted_interview_data>\n" + json.dumps(dossier_payload, ensure_ascii=False) + "\n</untrusted_interview_data>"}],
         models=(INTERVIEW_V2_DOSSIER_MODEL, *INTERVIEW_V2_MODEL_FALLBACKS),
@@ -202,6 +204,7 @@ async def regenerate_dossier(project_id: str, participant_id: str, request: dict
         "created_by": _owner_from_login(login).get("owner_key", ""),
     }
     try:
+        record_model_snapshot(revision)
         saved = store.save_participant_dossier_cas(
             project_id=project_id,
             participant_id=participant_id,

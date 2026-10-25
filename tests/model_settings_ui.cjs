@@ -37,7 +37,7 @@ const {chromium} = require('playwright');
     const checks=[];
     await page.goto(base);
     await page.getByRole('tab',{name:'模型目录',exact:true}).waitFor();
-    assert.match(await page.locator('#model-settings-root').innerText(),/实际业务尚未接入/);
+    assert.match(await page.locator('#model-settings-root').innerText(),/发布后用于新任务/);
     assert(!fs.existsSync(configFile),'Reading settings must not create configuration');
     await page.getByRole('tab',{name:'模型目录',exact:true}).click();
     await page.getByRole('button',{name:'＋ 新增模型',exact:true}).click();

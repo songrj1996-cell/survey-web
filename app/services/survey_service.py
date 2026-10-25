@@ -56,6 +56,7 @@ from app.core.security import (
     _history_owner_key,
 )
 from app.core.text import _short_text
+from app.services.llm_model_settings import task_model_settings, call_model, model_operation, task_model_chain, record_model_snapshot, has_task_model, business_model_key, resume_model_snapshot, model_operation_scope
 from app.integrations.llm_client import collect_chat_completion
 from app.core import config as postwrite_config
 from app.services.report_postwrite_inputs import is_postwrite, freeze_inputs as freeze_postwrite_inputs, validate_frozen, qa_context as postwrite_qa_context
@@ -850,10 +851,10 @@ async def handle_survey_upload(
 # ── 列题型识别 SSE ───────────────────────────────────────────────
 
 
-async def _direct_llm_with_heartbeats(messages: list[dict], **kwargs):
+async def _direct_llm_with_heartbeats(messages: list[dict], *, task_key="survey.columns", **kwargs):
     """等待完整直连结果期间发送心跳；只在成功后暴露完整回答。"""
     task = asyncio.create_task(
-        collect_chat_completion(prepare_glossary_messages(messages), **kwargs)
+        call_model(collect_chat_completion, task_key, prepare_glossary_messages(messages), **kwargs)
     )
     try:
         while True:
@@ -900,6 +901,7 @@ def _json_repair_messages(
 
 
 @log_survey_stream("columns")
+@model_operation(budget_key=lambda args: "survey.translation" if get_session(args["session_id"]).get("column_provider") == "questionnaire" else "survey.columns")
 async def columns_stream(session_id: str, request: Request):
     """LLM 列题型识别 SSE 流程（async generator）。"""
     sess = get_session(session_id)
@@ -942,6 +944,7 @@ async def columns_stream(session_id: str, request: Request):
                     models=models,
                     max_tokens=LLM_COLUMN_MAX_TOKENS,
                     reasoning_effort=LLM_COLUMN_REASONING or None,
+                    task_key="survey.translation" if sess.get("column_provider") == "questionnaire" else "survey.columns",
                 ):
                     if event:
                         yield event
@@ -966,6 +969,7 @@ async def columns_stream(session_id: str, request: Request):
                         models=models,
                         max_tokens=LLM_COLUMN_MAX_TOKENS,
                         reasoning_effort=LLM_COLUMN_REASONING or None,
+                        task_key="survey.translation" if sess.get("column_provider") == "questionnaire" else "survey.columns",
                     ):
                         if event:
                             yield event
@@ -1031,6 +1035,7 @@ async def columns_stream(session_id: str, request: Request):
             models=models,
             max_tokens=LLM_COLUMN_MAX_TOKENS,
             reasoning_effort=LLM_COLUMN_REASONING or None,
+            task_key="survey.translation" if sess.get("column_provider") == "questionnaire" else "survey.columns",
         ):
             if event:
                 yield event
@@ -1055,6 +1060,7 @@ async def columns_stream(session_id: str, request: Request):
                 models=models,
                 max_tokens=LLM_COLUMN_MAX_TOKENS,
                 reasoning_effort=LLM_COLUMN_REASONING or None,
+                task_key="survey.translation" if sess.get("column_provider") == "questionnaire" else "survey.columns",
             ):
                 if event:
                     yield event
@@ -1527,6 +1533,7 @@ def prepare_duplicate_report_rerun(
 
 
 @log_survey_stream("plan")
+@model_operation(budget_key=lambda args: business_model_key("plan", get_session(args["session_id"])))
 async def plan_stream(session_id: str, request: Request):
     """分析方案生成 SSE 流程（async generator）。"""
     sess = get_session(session_id)
@@ -1573,6 +1580,7 @@ async def plan_stream(session_id: str, request: Request):
                 models=models,
                 max_tokens=LLM_PLANNER_MAX_TOKENS,
                 reasoning_effort=LLM_PLANNER_REASONING or None,
+                task_key=business_model_key("plan", sess),
             ):
                 if event:
                     yield event
@@ -1597,6 +1605,7 @@ async def plan_stream(session_id: str, request: Request):
                     models=models,
                     max_tokens=LLM_PLANNER_MAX_TOKENS,
                     reasoning_effort=LLM_PLANNER_REASONING or None,
+                    task_key=business_model_key("plan", sess),
                 ):
                     if event:
                         yield event
@@ -1679,6 +1688,7 @@ async def plan_stream(session_id: str, request: Request):
             models=models,
             max_tokens=LLM_PLANNER_MAX_TOKENS,
             reasoning_effort=LLM_PLANNER_REASONING or None,
+            task_key=business_model_key("plan", sess),
         ):
             if event:
                 yield event
@@ -1714,6 +1724,7 @@ async def plan_stream(session_id: str, request: Request):
                 models=models,
                 max_tokens=LLM_PLANNER_MAX_TOKENS,
                 reasoning_effort=LLM_PLANNER_REASONING or None,
+                task_key=business_model_key("plan", sess),
             ):
                 if event:
                     yield event
@@ -1783,6 +1794,7 @@ def _record_successful_plan_revision(sess: dict, user_text: str) -> None:
 
 
 @log_survey_stream("plan_revision")
+@model_operation(budget_key=lambda args: business_model_key("plan", get_session(args["session_id"])))
 async def plan_revision_stream(session_id: str, user_text: str, request: Request):
     """方案修订 SSE 流程（async generator）。"""
     sess = get_session(session_id)
@@ -1813,6 +1825,7 @@ async def plan_revision_stream(session_id: str, user_text: str, request: Request
                 models=models,
                 max_tokens=LLM_PLANNER_MAX_TOKENS,
                 reasoning_effort=LLM_PLANNER_REASONING or None,
+                task_key=business_model_key("plan", sess),
             ):
                 if event:
                     yield event
@@ -1837,6 +1850,7 @@ async def plan_revision_stream(session_id: str, user_text: str, request: Request
                     models=models,
                     max_tokens=LLM_PLANNER_MAX_TOKENS,
                     reasoning_effort=LLM_PLANNER_REASONING or None,
+                    task_key=business_model_key("plan", sess),
                 ):
                     if event:
                         yield event
@@ -1897,6 +1911,7 @@ async def plan_revision_stream(session_id: str, user_text: str, request: Request
             models=models,
             max_tokens=LLM_PLANNER_MAX_TOKENS,
             reasoning_effort=LLM_PLANNER_REASONING or None,
+            task_key=business_model_key("plan", sess),
         ):
             if event:
                 yield event
@@ -1926,6 +1941,7 @@ async def plan_revision_stream(session_id: str, user_text: str, request: Request
                 models=models,
                 max_tokens=LLM_PLANNER_MAX_TOKENS,
                 reasoning_effort=LLM_PLANNER_REASONING or None,
+                task_key=business_model_key("plan", sess),
             ):
                 if event:
                     yield event
@@ -1968,6 +1984,7 @@ async def plan_revision_stream(session_id: str, user_text: str, request: Request
 # ── 统计计算 ────────────────────────────────────────────────────
 
 
+@model_operation
 async def compute_survey_stats(session_id: str, request: Request) -> str:
     """计算统计数据，写入 session，返回 stats_md。"""
     sess = get_session(session_id)
@@ -2020,7 +2037,7 @@ async def _direct_writer_round(
 ) -> tuple[str, str]:
     """直连 LLM 完成一轮写作；成功后才把本轮加入本地对话历史。"""
     user_message = {"role": "user", "content": query}
-    answer, model = await collect_chat_completion(
+    answer, model = await call_model(collect_chat_completion, business_model_key("report"),
         prepare_glossary_messages([*messages, user_message]),
         on_attempt_event=on_attempt_event,
     )
@@ -2066,7 +2083,7 @@ async def _answer_qa_direct(
         if not qa_context:
             qa_context = _build_qa_context(source)
     models = (LLM_QA_MODEL, *LLM_QA_FALLBACK_MODELS)
-    answer, model = await collect_chat_completion(
+    answer, model = await call_model(collect_chat_completion, business_model_key("qa", source),
         prepare_glossary_messages(
             _build_direct_qa_messages(source, question, qa_context)
         ),
@@ -2119,6 +2136,7 @@ def get_report_sources(session_id: str, *, version=None, history_id: str = "", l
     return report_source_page(snapshot, **page)
 
 
+@model_operation
 async def translate_report_sources(session_id: str, *, version: int, response_ids: list[str],
                                    history_id: str = "", login=None) -> dict:
     from app.services.report_source_translation import translate_report_source_items
@@ -2233,8 +2251,13 @@ async def report_stream(session_id: str, request: Request, *, instruction: str =
             options = {"instruction": instruction, "base_version": base_version, "generation_kind": generation_kind}
             if engine in {_quick_report_stream, _postwrite_report_stream}:
                 options["retry_failed"] = retry_failed
-            async for event in engine(session_id, request, **options):
-                await queue.put(event)
+            saved = resume_model_snapshot(selected) if retry_failed else None
+            async with model_operation_scope(saved, resume=retry_failed) as model_snapshot:
+                model_snapshot["business"] = sess.get("mode", "")
+                # Bind again because the context deliberately stores detached copies.
+                async with model_operation_scope(model_snapshot):
+                    async for event in engine(session_id, request, **options):
+                        await queue.put(event)
         except Exception as exc:
             await queue.put(sse_event({"type": "error", "message": getattr(exc, "detail", str(exc))}))
         finally:
@@ -2343,6 +2366,7 @@ async def _postwrite_report_stream(session_id, request, *, instruction="", base_
         store = PostwriteRunStore()
         inputs = {"frozen": frozen, "prompts": prompts, "instruction": instruction,
                   "base_version": base["version"] if base else None, "owner_key": _history_owner_key(owner)}
+        record_model_snapshot(inputs)
         run_id = store.create(inputs, previous)
         report_log_run(run_id)
         latest = deepcopy(require_session_access(session_id, login, loader=get_session))
@@ -2414,9 +2438,10 @@ async def _postwrite_report_stream(session_id, request, *, instruction="", base_
                     "comparison_validation": deepcopy(result.get("comparison_validation") or {"status": "not_run"}),
                     "title": result["draft"].splitlines()[0].lstrip("# ")[:150],
                     "qa_context_md": postwrite_qa_context(result["draft"], frozen, result["audit"]), "qa_messages": [],
-                    "report_writer_provider": "direct_llm", "report_writer_model": postwrite_config.LLM_POSTWRITE_MODEL,
+                    "report_writer_provider": "direct_llm", "report_writer_model": next((c["actual_model"] for c in result.get("calls", []) if c.get("stage") == "writer" and c.get("actual_model")), (task_model_settings("insight.writer") or {}).get("primary", {}).get("model", postwrite_config.LLM_POSTWRITE_MODEL)),
                     "report_duration_seconds": round(time.perf_counter() - started, 3),
                     "report_completed_at": datetime.now().isoformat(timespec="seconds"), "report_llm_usage": tracker.snapshot()}
+        record_model_snapshot(snapshot)
         latest = deepcopy(require_session_access(session_id, login, loader=get_session))
         precommit = deepcopy(latest)
         latest.update(mode_fields("insight"))
@@ -2585,7 +2610,7 @@ async def _quick_report_stream(session_id: str, request: Request, *, instruction
                     raise ValueError("补全请求涉及成功题目，已阻止模型调用")
             local_callback = kwargs.get("on_attempt_event")
             tracking_callback = tracker.callback("themes")
-            primary_model = LLM_QUICK_REPORT_MODEL or next(iter(LLM_QUICK_REPORT_FALLBACK_MODELS), "")
+            primary_model = next(iter(task_model_chain("quick.summary", (LLM_QUICK_REPORT_MODEL, *LLM_QUICK_REPORT_FALLBACK_MODELS))), "")
             requested_models = kwargs.get("models") or ()
             selected_fallback = bool(primary_model and requested_models and requested_models[0] != primary_model)
             async def combined(event):
@@ -2650,6 +2675,7 @@ async def _quick_report_stream(session_id: str, request: Request, *, instruction
                     "quick_report_diagnostics": result["diagnostics"], "report_llm_usage": tracker.snapshot(),
                     "qa_context_md": quick_qa_context(markdown, frozen),
                     "qa_messages": [], "report_writer_provider": "direct_llm", **timing}
+        record_model_snapshot(snapshot)
         latest = deepcopy(require_session_access(session_id, login, loader=get_session))
         precommit = deepcopy(latest)
         latest.update(mode_fields("quick"))
@@ -3692,6 +3718,7 @@ async def _full_report_stream(
             "comparison_validation": comparison_validation,
             **completion_timing,
         }
+        record_model_snapshot(snapshot)
         report_log_phase("saving")
         if rerun_history_id:
             if str(sess.get("rerun_target_history_id") or "").strip() != rerun_history_id:
@@ -3823,6 +3850,7 @@ def _replace_report_in_qa_context(qa_context: str, report_md: str) -> str:
     return ""
 
 
+@model_operation
 async def partial_report_rerun_stream(
     history_id: str,
     request: Request,
@@ -3865,7 +3893,7 @@ async def partial_report_rerun_stream(
             {"role": "user", "content": query},
         ]
         task = asyncio.create_task(
-            collect_chat_completion(prepare_glossary_messages(request_messages))
+            call_model(collect_chat_completion, business_model_key("report"), prepare_glossary_messages(request_messages))
         )
         try:
             while True:
@@ -4251,6 +4279,7 @@ async def partial_report_rerun_stream(
             "report_completed_at": datetime.now().isoformat(timespec="milliseconds"),
             "report_duration_seconds": elapsed_seconds,
         }
+        record_model_snapshot(snapshot)
         committed_entry, committed = append_partial_rerun_to_history(
             target_id,
             snapshot,
@@ -4449,6 +4478,7 @@ def delete_owned_history_report_version(
     return _delete_history_report_version(target_id, version, login)
 
 
+@model_operation
 async def qa_stream(
     session_id: str,
     question: str,
@@ -4576,6 +4606,7 @@ async def qa_stream(
 # ── 历史报告 QA SSE ─────────────────────────────────────────────
 
 
+@model_operation
 async def history_qa_stream(
     history_id: str,
     question: str,
@@ -4763,14 +4794,14 @@ def validate_report_ready(session_id: str) -> bool:
             raise HTTPException(status_code=400, detail="请先确认数据和题目")
         if not selected_question_keys(sess["confirmed_columns"], sess.get("selected_question_keys")):
             raise HTTPException(status_code=400, detail="请选择至少一道可分析的题目")
-        if collect_source_questions(sess) and not (LLM_QUICK_REPORT_MODEL or LLM_QUICK_REPORT_FALLBACK_MODELS):
+        if collect_source_questions(sess) and not has_task_model("quick.summary", (LLM_QUICK_REPORT_MODEL, *LLM_QUICK_REPORT_FALLBACK_MODELS)):
             raise HTTPException(status_code=500, detail="未配置快速总结模型")
         return False
     if not all([sess.get("plan"), sess.get("rows"), sess.get("stats_md")]):
         raise HTTPException(status_code=400, detail="请先完成统计计算")
     if not LLM_API_KEY:
         raise HTTPException(status_code=500, detail="未配置 LLM_API_KEY")
-    if not LLM_REPORT_MODEL:
+    if not has_task_model(business_model_key("report", sess), (LLM_REPORT_MODEL,)):
         raise HTTPException(status_code=500, detail="未配置 LLM_REPORT_MODEL")
     return sess.get("mode") == "crosstab" or any(
         len(v) > LARGE_SAMPLE_THRESHOLD for v in sess.get("open_text", {}).values()
@@ -4793,7 +4824,7 @@ def validate_qa_ready(session_id: str, version: int | None = None) -> None:
         raise HTTPException(status_code=400, detail="请先生成报告")
     if not LLM_API_KEY:
         raise HTTPException(status_code=500, detail="未配置 LLM_API_KEY")
-    if not LLM_QA_MODEL:
+    if not has_task_model(business_model_key("qa", sess), (LLM_QA_MODEL, *LLM_QA_FALLBACK_MODELS)):
         raise HTTPException(status_code=500, detail="未配置 LLM_QA_MODEL")
 
 
@@ -4823,6 +4854,12 @@ def prepare_history_qa_context(
         raise HTTPException(status_code=400, detail="该历史记录没有可追问的报告")
     if not LLM_API_KEY:
         raise HTTPException(status_code=500, detail="未配置 LLM_API_KEY")
-    if not LLM_QA_MODEL:
+    if not has_task_model(business_model_key("qa", entry), (LLM_QA_MODEL, *LLM_QA_FALLBACK_MODELS)):
         raise HTTPException(status_code=500, detail="未配置 LLM_QA_MODEL")
     return history
+
+
+def has_session_model(session_id, kind, legacy):
+    sess = get_session(session_id)
+    key = "survey.translation" if kind == "columns" and sess.get("column_provider") == "questionnaire" else "survey.columns" if kind == "columns" else business_model_key(kind, sess)
+    return has_task_model(key, legacy)

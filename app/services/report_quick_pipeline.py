@@ -14,6 +14,7 @@ import inspect
 import json
 import time
 
+from app.services.llm_model_settings import call_model, model_operation, task_model_settings, task_model_chain, model_configuration_fingerprint, record_model_snapshot
 from app.core.config import (
     DEFAULT_QUICK_BATCH_SUMMARY_SYSTEM, DEFAULT_QUICK_QUESTION_MERGE_SYSTEM,
     DEFAULT_QUICK_QUESTION_SUMMARY_SYSTEM, LLM_QUICK_REPORT_CALL_TIMEOUT_SECONDS,
@@ -264,6 +265,7 @@ def _risk_sources(candidates):
     return result
 
 
+@model_operation(resume_from="checkpoint", persist_result=True)
 async def run_quick_pipeline(questions, *, background="", checkpoint=None,
                              retry_failed=False, on_progress=None, on_checkpoint=None,
                              collect=None, prompts=None) -> dict:
@@ -295,10 +297,17 @@ async def run_quick_pipeline(questions, *, background="", checkpoint=None,
         "max_tokens": LLM_QUICK_REPORT_MAX_TOKENS,
     }
     models = tuple(dict.fromkeys(m for m in (LLM_QUICK_REPORT_MODEL, *LLM_QUICK_REPORT_FALLBACK_MODELS) if m))
+    models = task_model_chain("quick.summary", models)
+    managed = task_model_settings("quick.summary")
+    if managed:
+        budgets["max_tokens"] = managed["primary"]["max_tokens"]
+        budgets["call_seconds"] = managed["timeout_seconds"] or budgets["call_seconds"]
     fingerprint_inputs = {"questions": questions, "background": background, "prompts": systems,
                           "budgets": budgets, "models": models, "reasoning": LLM_QUICK_REPORT_REASONING,
                           "contracts": {f"{stage}:{merging}": question_output_contract(stage, merging=merging)
                                         for stage in ("batch", "question") for merging in (False, True)}}
+    if model_configuration_fingerprint():
+        fingerprint_inputs["model_configuration"] = model_configuration_fingerprint()
     fingerprint = _checkpoint_fingerprint(fingerprint_inputs, ALGORITHM_VERSION)
     cached, producers = {}, {}
     if retry_failed and checkpoint is not None:
@@ -321,13 +330,15 @@ async def run_quick_pipeline(questions, *, background="", checkpoint=None,
     checkpoint_lock = asyncio.Lock()
 
     def current_checkpoint():
-        return {"fingerprint": fingerprint, "algorithm": ALGORITHM_VERSION,
+        value = {"fingerprint": fingerprint, "algorithm": ALGORITHM_VERSION,
                 "steps": {key: deepcopy(value) for key, value in steps.items()
                           if value and results.get(key, {}).get("status") != "complete"},
                 "question_algorithms": {key: producers.get(key, ALGORITHM_VERSION) for key, value in results.items()
                                         if value.get("status") == "complete"},
                 "questions": [deepcopy(results[q["question_key"]]) for q in questions
                               if results.get(q["question_key"], {}).get("status") == "complete"]}
+        record_model_snapshot(value)
+        return value
 
     async def save_checkpoint():
         async with checkpoint_lock:
@@ -373,6 +384,7 @@ async def run_quick_pipeline(questions, *, background="", checkpoint=None,
         def merge_chars(payload, *, stage):
             return sum(len(message["content"]) for message in messages_for(payload, stage=stage, system_key="merge"))
 
+        @model_operation(budget_key="quick.summary")
         async def request(payload, *, stage, system_key, allowed, required=()):
             messages = messages_for(payload, stage=stage, system_key=system_key)
             step_key = _digest({"messages": messages, "stage": stage, "operation": system_key})
@@ -435,7 +447,7 @@ async def run_quick_pipeline(questions, *, background="", checkpoint=None,
                     call_started = time.perf_counter()
                     try:
                         async with asyncio.timeout(budgets["call_seconds"]):
-                            output = await collect(messages, models=(selected_model,) if selected_model else None,
+                            output = await call_model(collect, "quick.summary", messages, selected_model=selected_model, models=(selected_model,) if selected_model else None,
                                                    max_tokens=budgets["max_tokens"], reasoning_effort=LLM_QUICK_REPORT_REASONING,
                                                    max_http_attempts=1, on_attempt_event=observe)
                     except TimeoutError as exc:

@@ -28,6 +28,7 @@ from app.core.interview_v2_report import (
     validate_report_section_rerun_output,
 )
 from app.core.security import _owner_from_login
+from app.services.llm_model_settings import call_model, model_operation, model_configuration_fingerprint, record_model_snapshot
 from app.integrations.llm_client import collect_chat_completion
 from app.services.interview_v2_import_service import InterviewV2ImportError
 from app.services.interview_v2_report_review_service import (
@@ -232,6 +233,7 @@ def _apply_audit(
     }
 
 
+@model_operation
 async def create_report_section_rerun(
     project_id: str,
     request: dict[str, Any],
@@ -255,6 +257,9 @@ async def create_report_section_rerun(
         ) from exc
 
     owner_key = _operation_owner(login)
+    if model_configuration_fingerprint():
+        rerun_input["model_configuration_sha256"] = model_configuration_fingerprint()
+        rerun_input["input_fingerprint"] = payload_sha256({k: v for k, v in rerun_input.items() if k != "input_fingerprint"})
     request_fingerprint = str(rerun_input["input_fingerprint"])
     operation_seed = payload_sha256({
         "owner_key": owner_key,
@@ -347,7 +352,7 @@ async def create_report_section_rerun(
     writer_model = ""
     audit_model = ""
     try:
-        writer_text, writer_model = await collect_chat_completion(
+        writer_text, writer_model = await call_model(collect_chat_completion, "interview_v2.report",
             [
                 {
                     "role": "system",
@@ -423,7 +428,7 @@ async def create_report_section_rerun(
             "stat_facts": rerun_input["report_input"]["stat_facts"],
             "deterministic_issues": validated["audit_issues"],
         }
-        audit_text, audit_model = await collect_chat_completion(
+        audit_text, audit_model = await call_model(collect_chat_completion, "interview_v2.audit",
             [
                 {
                     "role": "system",
@@ -534,6 +539,7 @@ async def create_report_section_rerun(
 
     report_committed = False
     try:
+        record_model_snapshot(next_revision)
         saved_next = store.save_report_version_cas(
             project_id=project_id,
             base_report_version_id=str(current.get("report_version_id") or ""),

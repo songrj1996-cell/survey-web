@@ -32,6 +32,7 @@ from app.core.config import (
     LLM_THEME_MERGE_MODEL,
     LLM_THEME_MERGE_REASONING,
 )
+from app.services.llm_model_settings import model_attempt_budget, call_model
 from app.integrations.llm_client import collect_chat_completion
 from app.services.branch_logic import branch_rule_for_column, branch_rule_label
 from app.services.glossary_service import (
@@ -743,112 +744,115 @@ async def _direct_json_call(
     validator,
     on_repair=None,
     on_attempt_event=None,
+    model_task_key="insight.extract",
 ) -> dict:
     """调用直连 LLM 并做一次针对 JSON/业务 schema 的纠错重试。"""
-    call_started = time.monotonic()
-    initial_started = call_started
-    try:
-        answer, model = await asyncio.wait_for(
-            collect_chat_completion(
-                prepare_glossary_messages(_llm_json_messages(system_prompt, query)),
-                models=models,
-                max_tokens=max_tokens,
-                reasoning_effort=reasoning_effort,
-                on_attempt_event=on_attempt_event,
-            ),
-            timeout=LLM_QUALITATIVE_CALL_TIMEOUT_SECONDS,
-        )
-    except Exception as exc:
-        return {
-            "data": None,
-            "model": "",
-            "raw_len": 0,
-            "repaired": False,
-            "error": (str(exc).strip() or type(exc).__name__)[:300],
-            "duration_seconds": round(time.monotonic() - call_started, 3),
-            "initial_duration_seconds": round(time.monotonic() - initial_started, 3),
-            "repair_duration_seconds": 0.0,
-        }
-    initial_duration = time.monotonic() - initial_started
-
-    parsed, parse_error = _json_loads_loose(answer)
-    validation_error = validator(parsed) if parsed else (parse_error or "invalid JSON")
-    if not validation_error:
-        return {
-            "data": normalize_glossary_data(
-                parsed,
-                protected_keys=_GLOSSARY_PROTECTED_DATA_KEYS,
-            ),
-            "model": model,
-            "raw_len": len(answer),
-            "repaired": False,
-            "error": "",
-            "duration_seconds": round(time.monotonic() - call_started, 3),
-            "initial_duration_seconds": round(initial_duration, 3),
-            "repair_duration_seconds": 0.0,
-        }
-
-    if on_repair:
-        on_repair(validation_error)
-
-    repair_messages = [
-        *_llm_json_messages(system_prompt, query),
-        {"role": "assistant", "content": answer[:24000]},
-        {
-            "role": "user",
-            "content": (
-                f"上一次输出未通过校验：{validation_error}。"
-                "请修复后重新输出完整 JSON；不得解释、不得使用 Markdown 围栏。"
-            ),
-        },
-    ]
-    repair_models = (model, *(m for m in models if m != model))
-    repair_started = time.monotonic()
-    try:
-        repaired_answer, repaired_model = await asyncio.wait_for(
-            collect_chat_completion(
-                prepare_glossary_messages(repair_messages),
-                models=repair_models,
-                max_tokens=max_tokens,
-                reasoning_effort=reasoning_effort,
-                on_attempt_event=on_attempt_event,
-            ),
-            timeout=LLM_QUALITATIVE_CALL_TIMEOUT_SECONDS,
-        )
-    except Exception as exc:
-        return {
-            "data": None,
-            "model": model,
-            "raw_len": len(answer),
-            "repaired": True,
-            "error": (str(exc).strip() or type(exc).__name__)[:300],
-            "duration_seconds": round(time.monotonic() - call_started, 3),
-            "initial_duration_seconds": round(initial_duration, 3),
-            "repair_duration_seconds": round(time.monotonic() - repair_started, 3),
-        }
-    repair_duration = time.monotonic() - repair_started
-
-    repaired, repair_parse_error = _json_loads_loose(repaired_answer)
-    repair_validation_error = (
-        validator(repaired) if repaired else (repair_parse_error or "invalid JSON")
-    )
-    return {
-        "data": (
-            normalize_glossary_data(
-                repaired,
-                protected_keys=_GLOSSARY_PROTECTED_DATA_KEYS,
+    with model_attempt_budget(model_task_key):
+        call_started = time.monotonic()
+        initial_started = call_started
+        try:
+            answer, model = await asyncio.wait_for(
+                call_model(collect_chat_completion, model_task_key,
+                    prepare_glossary_messages(_llm_json_messages(system_prompt, query)),
+                    models=models,
+                    max_tokens=max_tokens,
+                    reasoning_effort=reasoning_effort,
+                    on_attempt_event=on_attempt_event,
+                ),
+                timeout=LLM_QUALITATIVE_CALL_TIMEOUT_SECONDS,
             )
-            if not repair_validation_error
-            else None
-        ),
-        "model": repaired_model,
-        "raw_len": len(repaired_answer),
-        "repaired": True,
-        "error": repair_validation_error or "",
-        "duration_seconds": round(time.monotonic() - call_started, 3),
-        "initial_duration_seconds": round(initial_duration, 3),
-        "repair_duration_seconds": round(repair_duration, 3),
-    }
+        except Exception as exc:
+            return {
+                "data": None,
+                "model": "",
+                "raw_len": 0,
+                "repaired": False,
+                "error": (str(exc).strip() or type(exc).__name__)[:300],
+                "duration_seconds": round(time.monotonic() - call_started, 3),
+                "initial_duration_seconds": round(time.monotonic() - initial_started, 3),
+                "repair_duration_seconds": 0.0,
+            }
+        initial_duration = time.monotonic() - initial_started
+
+        parsed, parse_error = _json_loads_loose(answer)
+        validation_error = validator(parsed) if parsed else (parse_error or "invalid JSON")
+        if not validation_error:
+            return {
+                "data": normalize_glossary_data(
+                    parsed,
+                    protected_keys=_GLOSSARY_PROTECTED_DATA_KEYS,
+                ),
+                "model": model,
+                "raw_len": len(answer),
+                "repaired": False,
+                "error": "",
+                "duration_seconds": round(time.monotonic() - call_started, 3),
+                "initial_duration_seconds": round(initial_duration, 3),
+                "repair_duration_seconds": 0.0,
+            }
+
+        if on_repair:
+            on_repair(validation_error)
+
+        repair_messages = [
+            *_llm_json_messages(system_prompt, query),
+            {"role": "assistant", "content": answer[:24000]},
+            {
+                "role": "user",
+                "content": (
+                    f"上一次输出未通过校验：{validation_error}。"
+                    "请修复后重新输出完整 JSON；不得解释、不得使用 Markdown 围栏。"
+                ),
+            },
+        ]
+        repair_models = (model, *(m for m in models if m != model))
+        repair_started = time.monotonic()
+        try:
+            repaired_answer, repaired_model = await asyncio.wait_for(
+                call_model(collect_chat_completion, model_task_key,
+                    prepare_glossary_messages(repair_messages),
+                    preferred_model=model,
+                    models=repair_models,
+                    max_tokens=max_tokens,
+                    reasoning_effort=reasoning_effort,
+                    on_attempt_event=on_attempt_event,
+                ),
+                timeout=LLM_QUALITATIVE_CALL_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            return {
+                "data": None,
+                "model": model,
+                "raw_len": len(answer),
+                "repaired": True,
+                "error": (str(exc).strip() or type(exc).__name__)[:300],
+                "duration_seconds": round(time.monotonic() - call_started, 3),
+                "initial_duration_seconds": round(initial_duration, 3),
+                "repair_duration_seconds": round(time.monotonic() - repair_started, 3),
+            }
+        repair_duration = time.monotonic() - repair_started
+
+        repaired, repair_parse_error = _json_loads_loose(repaired_answer)
+        repair_validation_error = (
+            validator(repaired) if repaired else (repair_parse_error or "invalid JSON")
+        )
+        return {
+            "data": (
+                normalize_glossary_data(
+                    repaired,
+                    protected_keys=_GLOSSARY_PROTECTED_DATA_KEYS,
+                )
+                if not repair_validation_error
+                else None
+            ),
+            "model": repaired_model,
+            "raw_len": len(repaired_answer),
+            "repaired": True,
+            "error": repair_validation_error or "",
+            "duration_seconds": round(time.monotonic() - call_started, 3),
+            "initial_duration_seconds": round(initial_duration, 3),
+            "repair_duration_seconds": round(repair_duration, 3),
+        }
 
 
 async def _run_bounded_calls(
@@ -1372,6 +1376,7 @@ async def _classify_batch_direct(
         reasoning_effort=LLM_CLASSIFY_REASONING or None,
         validator=_root_validator,
         on_attempt_event=on_attempt_event,
+        model_task_key="insight.classify",
     )
     normalized = _normalize_classifications(
         first.get("data"), expected_ids, valid_theme_ids
@@ -1401,6 +1406,7 @@ async def _classify_batch_direct(
             reasoning_effort=LLM_CLASSIFY_REASONING or None,
             validator=_root_validator,
             on_attempt_event=on_attempt_event,
+            model_task_key="insight.classify",
         )
         repaired = _normalize_classifications(
             miss.get("data"), response_ids, valid_theme_ids
@@ -1706,6 +1712,7 @@ async def _batch_qualitative_analysis(
                         {"batch": bi, "error": error}
                     ),
                     on_attempt_event=on_attempt_event,
+                    model_task_key="insight.extract",
                 )
                 result["data"] = _hydrate_theme_candidate_quotes(
                     result.get("data"), source_texts
@@ -1850,6 +1857,7 @@ async def _batch_qualitative_analysis(
                     {"error": error}
                 ),
                 on_attempt_event=on_attempt_event,
+                model_task_key="insight.merge",
             )
 
         async for event_type, payload in _run_bounded_calls(

@@ -67,3 +67,20 @@ def bind_llm_attempt_observer(
         yield
     finally:
         _request_llm_attempt_observer.reset(token)
+
+
+_model_budget: ContextVar[dict | None] = ContextVar("llm_model_budget", default=None)
+
+
+def current_llm_model_budget():
+    # Intentionally shared across schema repairs within a single logical step.
+    return _model_budget.get()
+
+
+@contextmanager
+def bind_llm_model_budget(budget):
+    token = _model_budget.set(budget)
+    try:
+        yield
+    finally:
+        _model_budget.reset(token)

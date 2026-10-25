@@ -8,6 +8,8 @@ import uuid
 
 from fastapi import HTTPException
 
+from app.services.llm_model_settings import model_operation, model_operation_scope, resume_model_snapshot, record_model_snapshot
+from app.core.llm_context import bind_llm_model_snapshot
 from app.core import config
 from app.core.llm_context import bind_llm_api_key, bind_llm_attempt_observer
 from app.core.llm_limits import AttemptGate, bind_attempt_gate
@@ -21,6 +23,7 @@ from app.services.llm_usage import start_llm_usage_task
 from app.storage import group_workflow as store
 
 
+@model_operation
 async def prepare_run(task_id, request, login):
     """Annotation admission never reads rosters; identity settlement is a later step."""
     return start_run(task_id, request, login)
@@ -58,8 +61,9 @@ def start_run(task_id, request, login):
             raise HTTPException(409, "没有待补齐反馈，已完成结果和人工结论保持不变")
         require_background_llm_api_key(login)
         task.pop("annotation_auto_error", None)
-        if task.get("run"):
-            task["runs"].append(deepcopy(task["run"]))
+        previous_run = deepcopy(task.get("run") or {})
+        if previous_run:
+            task["runs"].append(previous_run)
         task["run"] = {"id": uuid.uuid4().hex, "version": task["version"], "stage": stage, "status": "queued",
                        "queued_at": tasks.now(), "schedule_at": tasks.now(), "started_at": None,
                        "target_ids": targets, "attempted_ids": [], "inflight_ids": [], "completed_ids": [],
@@ -67,6 +71,14 @@ def start_run(task_id, request, login):
                        "queue_wait_seconds": 0.0, "execution_seconds": 0.0, "save_seconds": 0.0,
                        "completed_slices": 0, "timing_partial": False,
                        "owner_login": {key: (login or {}).get(key, "") for key in ("open_id", "email", "name")}}
+        record_model_snapshot(task["run"])
+        if previous_run.get("stage") == stage:
+            try:
+                saved_models = resume_model_snapshot(previous_run)
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from exc
+            if saved_models is not None:
+                task["run"]["llm_model_snapshot"] = saved_models
         task["confirmed_version"] = None
         tasks._event(task, login, "启动后台标注", {"run_id": task["run"]["id"], "target_count": len(targets), "only_incomplete": True})
         return tasks.task_view(task, login)
@@ -162,6 +174,13 @@ async def _run_slice_impl(task_id, slots):
     slice_failed = False
     try:
         require_permission(login, "annotate", write=True)
+        async with model_operation_scope(run.get("llm_model_snapshot"),
+                                         resume=bool(run.get("llm_model_snapshot") or run.get("attempted_ids"))) as snapshot:
+            run["llm_model_snapshot"] = deepcopy(snapshot)
+        def save_snapshot(current):
+            active = _fenced(current, run_id, version)
+            active["llm_model_snapshot"] = deepcopy(snapshot)
+        measured_mutate("tasks", task_id, save_snapshot)
         key = require_background_llm_api_key(login)
         recorder = start_llm_usage_task(login, category="annotate", action="质量标注后台任务",
                                          reference_id=task_id, title=task["rules"]["name"])
@@ -170,7 +189,7 @@ async def _run_slice_impl(task_id, slots):
             if recorder:
                 await recorder.on_attempt_event(event)
             # Never persist messages, API keys, raw exceptions or HTTP headers.
-            safe = {key: event[key] for key in ("call_id", "status", "model", "attempt_kind", "started_at", "duration_ms", "usage", "fallback") if key in event}
+            safe = {key: event[key] for key in ("call_id", "status", "model", "attempt_kind", "started_at", "duration_ms", "usage", "fallback", "model_config_version", "model_task_key", "reasoning_effort") if key in event}
             def save(current):
                 active = _fenced(current, run_id, version)
                 active["attempt_events"].append(safe)
@@ -205,6 +224,7 @@ async def _run_slice_impl(task_id, slots):
                         active["attempted_ids"].append(row["id"])
                 measured_mutate("tasks", task_id, finish_row)
         with (
+            bind_llm_model_snapshot(snapshot),
             bind_llm_api_key(key),
             bind_llm_attempt_observer(observe),
             bind_attempt_gate(gate),

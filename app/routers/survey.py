@@ -5,6 +5,7 @@
 """
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, Query
 from fastapi.responses import JSONResponse, StreamingResponse
+from app.services.survey_service import has_session_model
 from app.core.llm_context import bind_llm_api_key
 
 from app.core.config import (
@@ -120,7 +121,7 @@ async def get_columns(session_id: str, request: Request):
         request, session_id, login_resolver=_current_login,
     )
     validate_columns_ready(session_id)
-    if columns_require_llm(session_id) and not LLM_COLUMN_MODEL:
+    if columns_require_llm(session_id) and not has_session_model(session_id, "columns", (LLM_COLUMN_MODEL,)):
         raise HTTPException(status_code=500, detail="未配置题型识别 LLM 分发服务")
     api_key = await require_request_llm_api_key(request)
     return StreamingResponse(
@@ -197,7 +198,7 @@ async def get_plan(session_id: str, request: Request):
         request, session_id, login_resolver=_current_login,
     )
     validate_plan_ready(session_id)
-    if not LLM_PLANNER_MODEL:
+    if not has_session_model(session_id, "plan", (LLM_PLANNER_MODEL,)):
         raise HTTPException(status_code=500, detail="未配置方案规划 LLM 分发服务")
     api_key = await require_request_llm_api_key(request)
     return StreamingResponse(

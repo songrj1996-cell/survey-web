@@ -25,6 +25,7 @@ from app.core.interview_v2_analysis import (
     validate_module_findings,
 )
 from app.core.security import _owner_from_login, _visible_to_owner
+from app.services.llm_model_settings import call_model, model_operation, task_model_settings, task_model_chain, model_configuration_fingerprint, record_model_snapshot
 from app.integrations.llm_client import collect_chat_completion
 from app.schemas.interview_v2_rerun import InterviewV2AnalysisModuleRerunRequest
 from app.services.interview_v2_analysis_service import _error, _frozen_dossiers, _now, _public
@@ -113,6 +114,7 @@ def _rerun_public(saved: dict, operation: dict, *, reused: bool) -> dict[str, An
     }
 
 
+@model_operation
 async def create_analysis_module_rerun(
     project_id: str, request: dict[str, Any], login: dict | None, idempotency_key: str,
 ) -> dict[str, Any]:
@@ -129,6 +131,13 @@ async def create_analysis_module_rerun(
         "max_tokens": INTERVIEW_V2_ANALYSIS_MAX_TOKENS,
         "reasoning_effort": INTERVIEW_V2_ANALYSIS_REASONING,
     }
+    configured = task_model_settings("interview_v2.analysis")
+    if configured:
+        models = {"models": list(task_model_chain("interview_v2.analysis", ())),
+                  "max_tokens": configured["primary"]["max_tokens"],
+                  "reasoning_effort": configured["primary"]["reasoning"],
+                  "candidates": [configured["primary"], *configured["fallbacks"]],
+                  "configuration_sha256": model_configuration_fingerprint()}
     try:
         prompt_text, prompts = _prompt_bundle()
         fingerprint = analysis_module_rerun_fingerprint(
@@ -170,7 +179,7 @@ async def create_analysis_module_rerun(
             **module_input,
         }
         try:
-            output, model = await collect_chat_completion(
+            output, model = await call_model(collect_chat_completion, "interview_v2.analysis",
                 [{"role": "system", "content": prompt_text}, {
                     "role": "user", "content": "<untrusted_interview_data>\n"
                     + json.dumps(model_payload, ensure_ascii=False) + "\n</untrusted_interview_data>",
@@ -213,6 +222,7 @@ async def create_analysis_module_rerun(
             if item["module_id"] == request["module_id"]:
                 item.update({"model": model, "rerun_id": operation["rerun_id"], "prompts": prompts})
         try:
+            record_model_snapshot(revision)
             saved = store.save_analysis_module_rerun_cas(**operation_args, revision=revision)
         except ValueError as exc:
             if str(exc) in {"analysis version conflict", "analysis input changed"}:

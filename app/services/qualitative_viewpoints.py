@@ -328,6 +328,7 @@ async def build_report_viewpoint_stats(
         return await report_engine._direct_json_call(
             _get_cross_question_prompt(),
             _build_cross_question_query(organization, candidates),
+            model_task_key="insight.cross",
             models=(
                 report_engine.LLM_THEME_MERGE_MODEL,
                 *report_engine.LLM_THEME_MERGE_FALLBACK_MODELS,

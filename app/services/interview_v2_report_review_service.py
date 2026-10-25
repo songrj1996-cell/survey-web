@@ -29,6 +29,7 @@ from app.core.interview_v2_report import (
     validate_report_section_output,
 )
 from app.core.security import _owner_from_login, _visible_to_owner
+from app.services.llm_model_settings import call_model, model_operation, record_model_snapshot
 from app.integrations.llm_client import collect_chat_completion
 from app.services.interview_v2_import_service import InterviewV2ImportError
 from app.services.interview_v2_report_service import (
@@ -209,6 +210,7 @@ def _save_mutation(
     base_section_revision: int | None, revision: dict[str, Any]
 ) -> dict[str, Any]:
     try:
+        record_model_snapshot(revision)
         return store.save_report_version_cas(
             project_id=project_id,
             base_report_version_id=base_report_version_id,
@@ -374,6 +376,7 @@ def _apply_section_result(
         revision["audit_status"] = "audited"
 
 
+@model_operation
 async def reaudit_report_section(
     section_id: str, request: dict[str, Any], login: dict[str, Any] | None
 ) -> dict[str, Any]:
@@ -414,7 +417,7 @@ async def reaudit_report_section(
             "stat_facts": report_input["stat_facts"],
             "instruction": "只登记正文中的主张和引用，不得改写 content。",
         }
-        extract_text, extract_model = await collect_chat_completion(
+        extract_text, extract_model = await call_model(collect_chat_completion, "interview_v2.report",
             [
                 {
                     "role": "system",
@@ -452,7 +455,7 @@ async def reaudit_report_section(
             "stat_facts": report_input["stat_facts"],
             "deterministic_issues": issues,
         }
-        audit_text, audit_model = await collect_chat_completion(
+        audit_text, audit_model = await call_model(collect_chat_completion, "interview_v2.audit",
             [
                 {
                     "role": "system",
