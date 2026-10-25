@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import hashlib
+from copy import deepcopy
+import math
 import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from app.core.security import _visible_to_owner
+from app.services.report_runtime_logging import log_model_attempt, model_attempt_details
 from app.storage.llm_usage import load_llm_usage, mutate_llm_usage
 from app.storage.sessions import get_session
 
@@ -89,6 +92,8 @@ class LLMUsageRecorder:
         self._known_calls: set[str] = set()
         self._closed_calls: set[str] = set()
         self._finished = False
+        self._model_setting_calls = {}
+        self._model_log_state = {}
         self._record = {
             "id": self.record_id,
             "category": category if category in _ALLOWED_CATEGORIES else "other",
@@ -108,6 +113,7 @@ class LLMUsageRecorder:
             "call_count": 0,
             "usage_reported_call_count": 0,
             "usage_missing_call_count": 0,
+            "model_settings_used": [],
         }
         self._insert()
 
@@ -125,6 +131,7 @@ class LLMUsageRecorder:
         snapshot["fallback_models_used"] = list(
             self._record["fallback_models_used"]
         )
+        snapshot["model_settings_used"] = deepcopy(self._record["model_settings_used"])
 
         def _mutate(owners: dict[str, list[dict]]) -> None:
             records = owners.setdefault(self.owner_id, [])
@@ -142,6 +149,9 @@ class LLMUsageRecorder:
         with self._lock:
             if self._finished:
                 return
+            details = model_attempt_details(event)
+            log_model_attempt(event, reference_id=self._record["reference_id"], state=self._model_log_state)
+            self._remember_model_settings(call_id, status, event, details)
             if call_id not in self._known_calls:
                 self._known_calls.add(call_id)
                 self._record["call_count"] += 1
@@ -149,7 +159,7 @@ class LLMUsageRecorder:
             _append_unique(
                 self._record["models_used"], event.get("response_model")
             )
-            if event.get("fallback"):
+            if event.get("fallback") or details.get("fallback"):
                 _append_unique(
                     self._record["fallback_models_used"],
                     event.get("response_model") or event.get("model"),
@@ -177,6 +187,28 @@ class LLMUsageRecorder:
                 self._record["usage_missing_call_count"] += 1
             self._record["updated_at"] = _iso_now()
             self._persist()
+
+    def _remember_model_settings(self, call_id, status, event, details):
+        if not details:
+            return
+        if call_id not in self._model_setting_calls:
+            fields = {k: details.get(k) for k in ("model_config_version", "model_task_key", "model",
+                      "reasoning_effort", "max_output_tokens", "protocol", "fallback")}
+            entry = next((item for item in self._record["model_settings_used"]
+                          if all(item.get(k) == value for k, value in fields.items())), None)
+            if entry is None:
+                entry = {**fields, "response_models": [], "http_attempts": 0,
+                         "completed_attempts": 0, "failed_attempts": 0, "elapsed_seconds": 0.0}
+                self._record["model_settings_used"].append(entry)
+            entry["http_attempts"] += 1
+            self._model_setting_calls[call_id] = entry
+        entry = self._model_setting_calls[call_id]
+        _append_unique(entry["response_models"], details.get("response_model"))
+        if status in {"completed", "failed"} and call_id not in self._closed_calls:
+            entry["completed_attempts" if status == "completed" else "failed_attempts"] += 1
+            elapsed = event.get("elapsed_seconds")
+            if type(elapsed) in (int, float) and math.isfinite(elapsed) and elapsed >= 0:
+                entry["elapsed_seconds"] = round(entry["elapsed_seconds"] + elapsed, 6)
 
     def finish(self, status: str) -> None:
         resolved = status if status in _ALLOWED_STATUSES else "failed"
@@ -262,7 +294,30 @@ def _public_record(record: dict) -> dict:
         "usage_missing_call_count": _token_value(
             record.get("usage_missing_call_count")
         ),
+        "model_settings_used": _public_model_settings(record.get("model_settings_used")),
     }
+
+
+def _public_model_settings(values):
+    """Read legacy records without migrations and never expose extra persisted fields."""
+    if not isinstance(values, list):
+        return []
+    result = []
+    for value in values:
+        details = model_attempt_details(value, infer_snapshot=False)
+        if not details:
+            continue
+        aliases = value.get("response_models")
+        aliases = aliases if isinstance(aliases, list) else []
+        result.append({**details,
+                       "response_models": [_clean_text(m, 100) for m in aliases
+                                           if model_attempt_details({"model": m}, infer_snapshot=False)],
+                       **{key: _token_value(value.get(key)) for key in (
+                           "http_attempts", "completed_attempts", "failed_attempts")},
+                       "elapsed_seconds": value.get("elapsed_seconds")
+                       if type(value.get("elapsed_seconds")) in (int, float)
+                       and math.isfinite(value["elapsed_seconds"]) and value["elapsed_seconds"] >= 0 else None})
+    return result
 
 
 def get_user_llm_usage(

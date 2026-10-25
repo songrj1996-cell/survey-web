@@ -90,6 +90,8 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([e["reasoning_effort"] for e in starts], ["high", "low"])
         self.assertTrue(all(e["model_config_version"] == 1 for e in events))
 
+
+
     async def test_schema_repairs_share_one_physical_http_budget(self):
         saved = snapshot()
         saved["configuration"]["tasks"]["survey.report"]["max_http_attempts"] = 2
@@ -195,6 +197,137 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
                 async with asyncio.timeout(.01):
                     await settings.call_model(slow, "survey.report", [])
         self.assertTrue(stopped.is_set())
+
+    async def test_usage_audit_keeps_frozen_parameters_fallback_and_unknown_cost(self):
+        import io
+        import json
+        from contextlib import redirect_stdout
+        from pathlib import Path
+        import tempfile
+        from app.core import config
+        from app.services import llm_usage
+        from app.storage import llm_usage as storage
+        login = {"name": "离线验收员", "email": "audit@example.test"}
+        with tempfile.TemporaryDirectory(dir=config.DATA_DIR) as directory, \
+             patch.object(storage, "USER_LLM_USAGE_FILE", str(Path(directory) / "usage.json")), \
+             bind_llm_model_snapshot(snapshot(1)), redirect_stdout(io.StringIO()):
+            recorder = llm_usage.start_llm_usage_task(login, category="comment", action="合成审计")
+            base = {"model_config_version": 1, "model_task_key": "comment.extract",
+                    "model": "test-backup", "reasoning_effort": "low", "max_output_tokens": 2048,
+                    "protocol": "responses", "fallback": False, "error": "PRIVATE_VENDOR_BODY",
+                    "messages": "PRIVATE_QUESTION", "api_key": "PRIVATE_KEY"}
+            for call, status in (("first", "failed"), ("second", "completed")):
+                await recorder.on_attempt_event({**base, "call_id": call, "status": "started"})
+                terminal = {**base, "call_id": call, "status": status, "elapsed_seconds": .25,
+                            "usage": None if status == "failed" else {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                            "usage_complete": status == "completed", "response_model": "actual-backup"}
+                await recorder.on_attempt_event(terminal)
+                await recorder.on_attempt_event(terminal)
+            recorder.finish("completed")
+            public = llm_usage.get_user_llm_usage(login, period="all")
+            stored = json.loads((Path(directory) / "usage.json").read_text(encoding="utf-8"))
+        record = public["records"][0]
+        self.assertEqual(record["call_count"], 2)
+        self.assertEqual(record["usage_missing_call_count"], 1)
+        self.assertEqual(record["total_tokens"], 15)
+        self.assertEqual(record["fallback_models_used"], ["test-backup", "actual-backup"])
+        parameters = record["model_settings_used"][0]
+        self.assertTrue(parameters["fallback"])
+        self.assertEqual(parameters["model_config_version"], 1)
+        self.assertEqual(parameters["model_task_key"], "comment.extract")
+        self.assertEqual(parameters["reasoning_effort"], "low")
+        self.assertEqual(parameters["max_output_tokens"], 2048)
+        self.assertEqual(parameters["http_attempts"], 2)
+        self.assertEqual(parameters["failed_attempts"], 1)
+        self.assertEqual(parameters["completed_attempts"], 1)
+        self.assertEqual(parameters["elapsed_seconds"], .5)
+        self.assertEqual(parameters["response_models"], ["actual-backup"])
+        self.assertNotIn("PRIVATE", json.dumps(stored))
+        self.assertNotIn(login["email"], json.dumps(stored))
+
+    async def test_model_logs_name_timezone_failures_retry_and_no_private_material(self):
+        import io
+        from contextlib import redirect_stdout
+        from app.core.runtime_logging import bind_runtime_operator, reset_runtime_operator
+        from app.services import report_runtime_logging as logs
+        output, state = io.StringIO(), {}
+        operator = bind_runtime_operator("离线验收员")
+        try:
+            with bind_llm_model_snapshot(snapshot(1)), redirect_stdout(output):
+                base = {"model_config_version": 1, "model_task_key": "survey.report", "model": "test-primary",
+                        "reasoning_effort": "high", "max_output_tokens": 4096, "protocol": "responses",
+                        "api_key": "PRIVATE_KEY", "error": "PRIVATE_VENDOR_ERROR", "messages": "PRIVATE_MATERIAL"}
+                logs.log_model_attempt({**base, "call_id": "a", "status": "started"}, state=state)
+                failure = {**base, "call_id": "a", "status": "failed", "http_status": 401,
+                           "error_category": "authentication_error", "usage_complete": False}
+                logs.log_model_attempt(failure, state=state)
+                logs.log_model_attempt(failure, state=state)
+                logs.log_model_attempt({**base, "call_id": "b", "status": "started", "attempt_kind": "retry"}, state=state)
+                logs.log_model_attempt({**base, "model": "test-backup", "call_id": "c", "status": "started",
+                                       "reasoning_effort": "low", "max_output_tokens": 2048}, state=state)
+        finally:
+            reset_runtime_operator(operator)
+        text = output.getvalue()
+        for phrase in ("操作人：离线验收员", "配置版本：v1", "推理程度：high", "推理程度：low", "备用模型",
+                       "正在重试", "HTTP 状态：401", "用量未知或不完整"):
+            self.assertIn(phrase, text)
+        self.assertEqual(text.count("本次模型请求未完成"), 1)
+        self.assertNotIn("PRIVATE", text)
+        self.assertNotIn("@", text)
+        self.assertRegex(text, r"\d{4}-\d\d-\d\d .*?[+-]\d\d:\d\d")
+
+    async def test_normal_batch_logs_are_summarized_but_failures_are_retained(self):
+        import io
+        from contextlib import redirect_stdout
+        from app.services import report_runtime_logging as logs
+        output, state = io.StringIO(), {}
+        with bind_llm_model_snapshot(snapshot(1)), redirect_stdout(output):
+            for i in range(100):
+                base = {"model": "test-primary", "model_task_key": "annotate.quality", "model_config_version": 1,
+                        "reasoning_effort": "high", "max_output_tokens": 4096, "protocol": "responses", "call_id": str(i)}
+                logs.log_model_attempt({**base, "status": "started"}, state=state)
+                logs.log_model_attempt({**base, "status": "completed", "usage_complete": True}, state=state)
+            for i in range(3):
+                logs.log_model_attempt({**base, "call_id": "failed-" + str(i), "status": "failed",
+                                        "error_category": "rate_limited", "http_status": 429}, state=state)
+        text = output.getvalue()
+        self.assertEqual(text.count("本环节开始请求模型"), 1)
+        self.assertEqual(text.count("本次模型请求已返回"), 1)
+        self.assertEqual(text.count("HTTP 状态：429"), 3)
+
+    async def test_survey_logging_preserves_stream_bytes_and_parent_observer(self):
+        import io
+        from contextlib import redirect_stdout
+        from app.core.llm_context import bind_llm_attempt_observer, current_llm_attempt_observer
+        from app.services import report_runtime_logging as logs
+        parent = AsyncMock()
+        chunk = 'data: {"type": "chunk", "content": "PRIVATE_REPORT"}\n\n'
+        @logs.log_survey_stream("report")
+        async def source(session_id):
+            observer = current_llm_attempt_observer()
+            await observer({"call_id": "a", "status": "started", "model": "test-primary"})
+            await observer({"call_id": "a", "status": "completed", "model": "test-primary", "usage_complete": True})
+            yield chunk
+        output = io.StringIO()
+        with bind_llm_attempt_observer(parent), redirect_stdout(output):
+            result = [item async for item in source("synthetic")]
+        self.assertEqual(result, [chunk])
+        self.assertEqual(parent.await_count, 2)
+        self.assertNotIn("PRIVATE", output.getvalue())
+        self.assertIsNone(current_llm_attempt_observer())
+        with bind_llm_attempt_observer(parent), patch.object(logs, "runtime_log", side_effect=OSError("synthetic log failure")):
+            failed_log_result = [item async for item in source("synthetic")]
+        self.assertEqual(failed_log_result, [chunk])
+        self.assertEqual(parent.await_count, 4)
+
+    async def test_legacy_usage_metadata_is_not_filled_from_current_task(self):
+        from app.services import llm_usage
+        old = {"model": "old-model", "model_config_version": None, "model_task_key": None,
+               "http_attempts": 1, "response_models": [], "elapsed_seconds": 0}
+        with bind_llm_model_snapshot(snapshot(2)):
+            public = llm_usage._public_record({"model_settings_used": [old]})
+        self.assertIsNone(public["model_settings_used"][0]["model_config_version"])
+        self.assertEqual(llm_usage._public_record({})["model_settings_used"], [])
 
 
 if __name__ == "__main__":

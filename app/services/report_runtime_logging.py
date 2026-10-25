@@ -10,6 +10,10 @@ import re
 import time
 
 from app.core import config
+from app.core.llm_context import (
+    bind_llm_attempt_observer, current_llm_attempt_observer, current_llm_model_snapshot,
+)
+from app.core.llm_model_registry import task_catalog
 from app.core.runtime_logging import runtime_log
 from app.integrations.llm_client import _attempt_error_category
 
@@ -33,6 +37,43 @@ _STAGES = {
     "finalize": "整理最终结果",
     "saving": "保存报告结果",
 }
+_MODEL_STAGES = {item["key"]: item["label"] for item in task_catalog()}
+_ATTEMPT_KINDS = {"initial", "retry", "model_fallback", "protocol_fallback", "usage_compatibility"}
+
+
+def model_attempt_details(event, *, infer_snapshot=True):
+    """Only request metadata may enter logs/usage; never copy arbitrary event fields."""
+    if not isinstance(event, dict):
+        return {}
+    model = event.get("model")
+    if not isinstance(model, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}", model):
+        return {}
+    snapshot = (current_llm_model_snapshot() or {}) if infer_snapshot else {}
+    version = event.get("model_config_version")
+    if version is None:
+        version = snapshot.get("version")
+    version = version if type(version) is int and version >= 0 else None
+    key = event.get("model_task_key")
+    key = key if isinstance(key, str) and key in _MODEL_STAGES else None
+    effort = event.get("reasoning_effort")
+    effort = effort if isinstance(effort, str) and re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", effort) else None
+    cap = event.get("max_output_tokens")
+    cap = cap if type(cap) is int and cap > 0 else None
+    protocol = event.get("protocol")
+    protocol = protocol if isinstance(protocol, str) and protocol in {"responses", "chat", "messages"} else None
+    fallback = event.get("fallback") is True
+    # Manual candidate loops call the client with one model at a time. Compare
+    # only against the matching frozen version, never the latest publication.
+    if key and snapshot.get("version") == version:
+        settings = snapshot.get("configuration", {}).get("tasks", {}).get(key, {})
+        fallback = fallback or model in {c["model"] for c in settings.get("fallbacks", [])}
+    result = {"model_config_version": version, "model_task_key": key, "model": model,
+              "reasoning_effort": effort, "max_output_tokens": cap, "protocol": protocol,
+              "fallback": fallback}
+    response_model = event.get("response_model")
+    if isinstance(response_model, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}", response_model):
+        result["response_model"] = response_model
+    return result
 
 
 def _logging_only(method):
@@ -46,6 +87,8 @@ def _logging_only(method):
 
 
 def _failure_explanation(category, http_status=None):
+    if category == "cancelled":
+        return "本次模型请求已取消，远端处理和用量可能尚未结束", "请先核对任务保留结果和本轮用量，再决定是否重试"
     if category == "already_running":
         return "同一任务已经在生成报告", "请回到当前任务查看进度，不要重复启动"
     if category == "source_unavailable":
@@ -65,6 +108,69 @@ def _failure_explanation(category, http_status=None):
     return "具体原因尚未确认", "请提供同一任务编号、阶段和时间给维护人员排查，先检查页面结果，避免反复点击生成"
 
 
+@_logging_only
+def log_model_attempt(event, *, reference_id="", state=None):
+    """Log failures and switches, but summarize repetitive successful batches."""
+    details = model_attempt_details(event)
+    if not details:
+        return
+    progress = _CURRENT.get()
+    if progress is not None:
+        state = progress.model_log_state
+        reference_id = progress.session_id
+    elif state is None:
+        return  # Callers without an operation-owned state must not create global deduplication.
+    status, call_id = event.get("status"), event.get("call_id")
+    if status not in {"started", "completed", "failed"} or not isinstance(call_id, str):
+        return
+    seen = state.setdefault("seen", set())
+    identity = (call_id, status)
+    if identity in seen:
+        return
+    seen.add(identity)
+    signature = tuple(details.get(k) for k in (
+        "model_config_version", "model_task_key", "model", "reasoning_effort", "max_output_tokens", "protocol"))
+    first = signature not in state.setdefault(status, set())
+    state[status].add(signature)
+    attempt_kind = event.get("attempt_kind")
+    retry = attempt_kind in _ATTEMPT_KINDS - {"initial"}
+    if status != "failed" and not first and not (status == "started" and retry):
+        return
+    stage = _MODEL_STAGES.get(details["model_task_key"], "模型请求")
+    version = details["model_config_version"]
+    fields = {"session_id": reference_id, "stage": stage,
+              "model": details.get("response_model") or details["model"],
+              "配置版本": "环境默认 v0" if version == 0 else f"v{version}" if version is not None else "未知",
+              "推理程度": details["reasoning_effort"] or "未显式指定",
+              "接口协议": {"responses": "Responses", "chat": "Chat", "messages": "Messages"}.get(details["protocol"], "未知")}
+    if details["max_output_tokens"] is not None:
+        fields["output_limit"] = details["max_output_tokens"]
+    http_status = event.get("http_status")
+    if type(http_status) is int and 100 <= http_status <= 599:
+        fields["http_status"] = http_status
+    elapsed = event.get("elapsed_seconds")
+    if type(elapsed) in (int, float) and math.isfinite(elapsed) and elapsed >= 0:
+        fields["elapsed_seconds"] = elapsed
+    if progress is not None:
+        fields["run_id"] = progress.run_id
+    if status == "started":
+        message = ("本次请求使用备用模型" if details["fallback"] else
+                   "正在尝试该模型的另一种接口协议" if attempt_kind == "protocol_fallback" else
+                   "正在兼容接口的用量参数" if attempt_kind == "usage_compatibility" else
+                   "正在重试模型请求" if attempt_kind == "retry" else "本环节开始请求模型")
+        level = "warning" if details["fallback"] or retry else "progress"
+    elif status == "failed":
+        reason, advice = _failure_explanation(event.get("error_category"), http_status)
+        message = f"本次模型请求未完成：{reason}。后续重试或备用切换以任务记录为准；若任务最终未完成，{advice}"
+        level = "warning"
+    else:
+        message, level = "本次模型请求已返回；报告是否完成以保存结果为准", "success"
+    if status in {"completed", "failed"} and not event.get("usage_complete"):
+        message += "；本次用量未知或不完整，不能按零消耗理解"
+    runtime_log("模型调用", level, message, **fields)
+
+
+
 class SurveyProgressLog:
     """One request's last known stage. No report text or raw vendor errors are logged."""
 
@@ -79,6 +185,7 @@ class SurveyProgressLog:
         self.last_question_counts = None
         self.retry_failed = retry_failed
         self.generation_kind = generation_kind
+        self.model_log_state = {}
 
     @_logging_only
     def emit(self, level, message, **fields):
@@ -263,6 +370,15 @@ def log_survey_stream(kind):
             progress = SurveyProgressLog(session_id, kind, retry_failed=kwargs.get("retry_failed", False),
                                          generation_kind=kwargs.get("generation_kind"))
             source = func(session_id, *args, **kwargs)
+            parent_observer = current_llm_attempt_observer()
+
+            async def observe_attempt(event):
+                log_model_attempt(event, reference_id=session_id, state=progress.model_log_state)
+                if parent_observer is not None:
+                    result = parent_observer(event)
+                    if hasattr(result, "__await__"):
+                        await result
+
             progress.start()
             try:
                 while True:
@@ -270,7 +386,8 @@ def log_survey_stream(kind):
                     # interleaved in one task or closed by another task/finalizer.
                     token = _CURRENT.set(progress)
                     try:
-                        event = await anext(source)
+                        with bind_llm_attempt_observer(observe_attempt):
+                            event = await anext(source)
                     except StopAsyncIteration:
                         break
                     finally:
@@ -286,7 +403,8 @@ def log_survey_stream(kind):
             finally:
                 token = _CURRENT.set(progress)
                 try:
-                    await source.aclose()
+                    with bind_llm_attempt_observer(observe_attempt):
+                        await source.aclose()
                 finally:
                     progress.finish()
                     _CURRENT.reset(token)
