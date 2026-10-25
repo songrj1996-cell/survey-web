@@ -13,7 +13,7 @@ from app.core import config
 from app.core.llm_context import (
     bind_llm_attempt_observer, current_llm_attempt_observer, current_llm_model_snapshot,
 )
-from app.core.llm_model_registry import task_catalog
+from app.core.llm_model_registry import capacity_estimate_metadata, task_catalog
 from app.core.runtime_logging import runtime_log
 from app.integrations.llm_client import _attempt_error_category
 
@@ -134,7 +134,14 @@ def log_model_attempt(event, *, reference_id="", state=None):
     state[status].add(signature)
     attempt_kind = event.get("attempt_kind")
     retry = attempt_kind in _ATTEMPT_KINDS - {"initial"}
-    if status != "failed" and not first and not (status == "started" and retry):
+    capacity = capacity_estimate_metadata(event.get("capacity_estimate"))
+    capacity_warning = (status == "started" and details["fallback"] and capacity
+                        and capacity["model"] == details["model"]
+                        and capacity["status"] in {"unknown", "near_limit", "over_limit"})
+    capacity_signature = (*signature, capacity.get("status"), capacity.get("input_estimate"),
+                          capacity.get("context_tokens"), capacity.get("output_reserved"))
+    new_capacity_warning = capacity_warning and capacity_signature not in state.setdefault("capacity", set())
+    if status != "failed" and not first and not (status == "started" and retry) and not new_capacity_warning:
         return
     stage = _MODEL_STAGES.get(details["model_task_key"], "模型请求")
     version = details["model_config_version"]
@@ -168,7 +175,16 @@ def log_model_attempt(event, *, reference_id="", state=None):
     if status in {"completed", "failed"} and not event.get("usage_complete"):
         message += "；本次用量未知或不完整，不能按零消耗理解"
     runtime_log("模型调用", level, message, **fields)
-
+    if new_capacity_warning:
+        state["capacity"].add(capacity_signature)
+        label = {"unknown": "暂时无法估算", "near_limit": "预估接近上限", "over_limit": "预估达到或超出上限"}[capacity["status"]]
+        capacity_fields = {"容量状态": label, "输出预留": capacity["output_reserved"]}
+        if capacity["status"] != "unknown":
+            capacity_fields.update({"输入预估": capacity["input_estimate"], "上下文容量": capacity["context_tokens"],
+                                    "预估占用百分比": capacity["occupancy_percent"]})
+        runtime_log("模型调用", "warning", f"备用模型容量{label}。这是本地预估，不代表模型服务已拒绝；"
+                    "容量未知或不足可能导致截断或失败。材料保持完整，按原规则继续请求，本提示不阻断写作。",
+                    **fields, **capacity_fields)
 
 
 class SurveyProgressLog:

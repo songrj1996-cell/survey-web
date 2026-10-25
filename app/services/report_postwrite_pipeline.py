@@ -7,6 +7,7 @@ import re
 import time
 from app.services.llm_model_settings import call_model, model_operation, task_model_settings, model_configuration_fingerprint, record_model_snapshot
 from app.core import config
+from app.core.llm_model_registry import capacity_estimate_metadata
 from app.integrations.llm_client import collect_chat_completion
 from app.services.report_postwrite_inputs import fingerprint, validate_frozen, check_comparisons
 from app.services.report_writer_capacity import estimate_writer_capacity, unknown_capacity
@@ -128,6 +129,9 @@ class BoundedCaller:
         self.reserved += reserve
         async def event(item):
             safe = {k: deepcopy(item[k]) for k in ("event", "status", "attempt", "model", "protocol", "usage", "usage_complete", "finish_reason", "fallback", "model_config_version", "model_task_key", "reasoning_effort") if k in item}
+            capacity = capacity_estimate_metadata(item.get("capacity_estimate"))
+            if capacity and capacity["model"] == item.get("model"):
+                safe["capacity_estimate"] = capacity
             if type(item.get("http_status")) is int and 100 <= item["http_status"] <= 599:
                 safe["http_status"] = item["http_status"]
             if item.get("error_category") in _ERROR_CATEGORIES:
@@ -335,6 +339,22 @@ async def run_pipeline(frozen, *, prompts, instruction="", previous=None, collec
     async def progress(stage, message, **extra):
         if on_progress:
             await on_progress({"phase": "postwrite", "stage": stage.split(":")[0], "status": "running", "message": message, **extra})
+    async def candidate_event(item):
+        try:
+            capacity = capacity_estimate_metadata(item.get("capacity_estimate"))
+            if (item.get("status") == "started" and item.get("model_task_key") == "insight.writer"
+                    and capacity and capacity["model"] == item.get("model")
+                    and capacity != state.get("writer_capacity")):
+                state["writer_capacity"] = capacity
+                await checkpoint()
+                await progress("writer_capacity", "已更新当前写作模型的容量预估，报告继续生成", status="completed",
+                               writer_capacity=deepcopy(capacity))
+        finally:
+            if on_event:
+                result = on_event(item)
+                if hasattr(result, "__await__"):
+                    await result
+    caller.on_event = candidate_event
     async def invoke(stage, request):
         await progress(stage, {"writer": "正在依据研究目标撰写初稿", "registry": "正在整理报告中需要核对的内容"}.get(stage, "正在核对原意、引用和人数范围"))
         # Persist pending reservation before the network request as well as after it.

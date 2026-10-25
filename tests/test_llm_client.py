@@ -1,5 +1,6 @@
 import asyncio
 import json
+from copy import deepcopy
 from datetime import datetime
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -54,6 +55,43 @@ class _FakeClient:
 
 
 class DirectLLMClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_managed_candidates_estimate_full_input_with_own_capacity_before_http(self):
+        messages = [{"role": "user", "content": "合成证据材料" * 4000}]
+        original, events, seen_before_send = deepcopy(messages), [], []
+        client = _FakeClient([
+            _FakeResponse(503, body=b"synthetic failure"),
+            _FakeResponse(lines=[_sse({"type": "response.output_text.delta", "delta": "done"}),
+                                 _sse({"type": "response.completed", "response": {"status": "completed"}})]),
+        ])
+        stream = client.stream
+        def observe_send(*args, **kwargs):
+            seen_before_send.append(deepcopy(events[-1]))
+            return stream(*args, **kwargs)
+        client.stream = observe_send
+        candidates = [{"model": model, "reasoning": "default", "max_tokens": output,
+                       "capabilities": {"context_tokens": context, "efforts": ["default"]}}
+                      for model, context, output in [("primary", 100000, 4096), ("backup", 4096, 2048)]]
+        with patch.object(llm_client.httpx, "AsyncClient", return_value=client), \
+             patch.object(llm_client, "LLM_API_BASE", "https://synthetic.invalid"), \
+             patch.object(llm_client, "LLM_REPORT_MAX_ATTEMPTS", 1):
+            result = await llm_client.collect_chat_completion(messages, models=["primary", "backup"],
+                candidate_settings=candidates, max_http_attempts=2, api_key="fixture-key",
+                on_attempt_event=events.append)
+        self.assertEqual(result, ("done", "backup"))
+        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(messages, original)
+        for request in client.calls:
+            self.assertEqual(request["json"]["input"], original)
+        self.assertEqual([e["status"] for e in seen_before_send], ["started", "started"])
+        estimates = [e["capacity_estimate"] for e in seen_before_send]
+        self.assertEqual([c["status"] for c in estimates], ["sufficient", "over_limit"])
+        self.assertEqual([c["context_tokens"] for c in estimates], [100000, 4096])
+        self.assertEqual([c["output_reserved"] for c in estimates], [4096, 2048])
+        self.assertEqual(estimates[0]["input_estimate"], estimates[1]["input_estimate"])
+        self.assertNotIn("合成证据材料", json.dumps(estimates, ensure_ascii=False))
+        for start, end in zip(events[::2], events[1::2]):
+            self.assertEqual(start["capacity_estimate"], end["capacity_estimate"])
+
     def setUp(self):
         self.login_required_patch = patch.object(
             llm_client,

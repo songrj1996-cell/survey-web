@@ -19,6 +19,7 @@ from typing import Any, Literal
 import httpx
 
 from app.core.llm_context import current_llm_model_budget
+from app.core.llm_model_registry import estimate_candidate_capacity
 from app.core.config import (
     FEISHU_LOGIN_REQUIRED,
     LLM_API_BASE,
@@ -833,6 +834,7 @@ async def collect_chat_completion(
     attempt_number = 0
     request_id = uuid.uuid4().hex
     previous_attempt: dict[str, Any] = {}
+    candidate_capacity = None
 
     def _terminal_event(
         status: str,
@@ -910,6 +912,8 @@ async def collect_chat_completion(
                 "model_config_version": model_config_version,
                 "model_task_key": model_task_key,
             }
+            if candidate_capacity is not None:
+                event_base["capacity_estimate"] = dict(candidate_capacity)
             previous_attempt = {**event_base, "chat_include_usage": chat_include_usage}
             observation = _AttemptObservation()
             started_clock = time.perf_counter()
@@ -987,6 +991,7 @@ async def collect_chat_completion(
                     raise
 
         for model_index, model in enumerate(configured_models):
+            candidate_capacity = None
             if model in candidate_options:
                 selected = candidate_options[model]
                 capabilities = selected.get("capabilities") or {}
@@ -997,6 +1002,8 @@ async def collect_chat_completion(
                     raise ValueError("推理程度不在当前模型的能力目录中，未发送请求")
                 request_max_tokens = selected["max_tokens"]
                 reasoning_effort = None if selected["reasoning"] == "default" else selected["reasoning"]
+                candidate_capacity = estimate_candidate_capacity(messages, model=model,
+                    context_tokens=capabilities.get("context_tokens"), output_tokens=request_max_tokens)
             for protocol in _protocol_order(model):
                 # Messages thinking is supported only by the existing explicit adapter.
                 # A requested effort must never disappear during protocol fallback.

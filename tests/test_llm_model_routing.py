@@ -88,9 +88,49 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([c["json"]["reasoning"]["effort"] for c in client.calls], ["high", "low"])
         starts = [e for e in events if e["status"] == "started"]
         self.assertEqual([e["reasoning_effort"] for e in starts], ["high", "low"])
+        self.assertEqual([e["capacity_estimate"]["model"] for e in starts], ["test-primary", "test-backup"])
+        self.assertEqual([e["capacity_estimate"]["output_reserved"] for e in starts], [4096, 2048])
         self.assertTrue(all(e["model_config_version"] == 1 for e in events))
 
+    async def test_capacity_advice_does_not_extend_http_budget(self):
+        saved = snapshot()
+        saved["configuration"]["models"][1]["context_tokens"] = 1024
+        saved["configuration"]["tasks"]["survey.report"]["max_http_attempts"] = 1
+        saved["configuration_sha256"] = fingerprint(saved["configuration"])
+        client = _FakeClient([_FakeResponse(503, body=b"synthetic failure")])
+        events = []
+        with bind_llm_model_snapshot(saved), patch.object(llm_client.httpx, "AsyncClient", return_value=client), \
+             patch.object(llm_client, "LLM_API_BASE", "https://synthetic.invalid"), \
+             patch.object(llm_client, "LLM_REPORT_MAX_ATTEMPTS", 1):
+            with self.assertRaisesRegex(RuntimeError, "budget exhausted"):
+                await settings.call_model(llm_client.collect_chat_completion, "survey.report", [],
+                                          api_key="fixture-key", on_attempt_event=events.append)
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual([e["model"] for e in events], ["test-primary", "test-primary"])
 
+    async def test_backup_capacity_logs_are_advisory_private_and_deduplicated(self):
+        from app.core.llm_model_registry import estimate_candidate_capacity
+        from app.services import report_runtime_logging as logs
+        for context, phrase in [(None, "暂时无法估算"), (5500, "预估接近上限"), (4096, "预估达到或超出上限")]:
+            with self.subTest(context=context):
+                capacity = estimate_candidate_capacity([{"role": "user", "content": "合成材料" * 100}],
+                    model="test-backup", context_tokens=context, output_tokens=2048)
+                capacity.update(message="PRIVATE_MATERIAL", impact="PRIVATE_KEY", extra="PRIVATE_VENDOR")
+                base = {"model": "test-backup", "model_config_version": 1, "model_task_key": "insight.writer",
+                        "max_output_tokens": 2048, "reasoning_effort": "low", "protocol": "responses",
+                        "capacity_estimate": capacity, "attempt_kind": "model_fallback"}
+                state = {}
+                with bind_llm_model_snapshot(snapshot()), patch.object(logs, "runtime_log") as logger:
+                    for call in ("one", "two"):
+                        logs.log_model_attempt({**base, "call_id": call, "status": "started"}, state=state)
+                        logs.log_model_attempt({**base, "call_id": call, "status": "completed", "usage_complete": True}, state=state)
+                warnings = [c for c in logger.call_args_list if "备用模型容量" in c.args[2]]
+                self.assertEqual(len(warnings), 1)
+                self.assertIn(phrase, warnings[0].args[2])
+                self.assertIn("不代表模型服务已拒绝", warnings[0].args[2])
+                self.assertIn("不阻断写作", warnings[0].args[2])
+                self.assertNotIn("PRIVATE", str(logger.call_args_list))
+                self.assertEqual(warnings[0].kwargs["输出预留"], 2048)
 
     async def test_schema_repairs_share_one_physical_http_budget(self):
         saved = snapshot()

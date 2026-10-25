@@ -2,8 +2,85 @@
 from dataclasses import dataclass
 import hashlib
 import json
+import math
+import re
 
 from app.core import config
+
+
+def _capacity_result(model, output_tokens, *, reason=None, input_tokens=None,
+                     context_tokens=None, warning=None):
+    result = {"status": "unknown", "method": "local_estimate_v1", "model": model,
+              "output_reserved": output_tokens, "reason": reason,
+              "occupancy_percent": None,
+              "message": "容量检查：暂时无法估算容量占用",
+              "impact": "容量风险尚不明确，按原规则继续处理；本提示不阻断请求。"}
+    if reason:
+        return result
+    required = input_tokens + output_tokens
+    percentage = required * 100 / context_tokens
+    shown = math.ceil(required * 1000 / context_tokens) / 10
+    status = ("over_limit" if required >= context_tokens else
+              "near_limit" if percentage > warning else "sufficient")
+    label, impact = {
+        "sufficient": ("预估余量充足", "预估值仅供参考，是否接受请求以模型服务实际返回为准。"),
+        "near_limit": ("接近上限", "可能发生截断或生成失败，按原规则继续处理；本提示不阻断请求。"),
+        "over_limit": ("已达到或超出上限", "可能发生截断或生成失败，按原规则继续处理；本提示不阻断请求。"),
+    }[status]
+    percent_text = "接近100" if status == "near_limit" and shown >= 100 else f"{shown:g}"
+    result.pop("reason")
+    result.update(status=status, input_estimate=input_tokens, context_tokens=context_tokens,
+                  required_estimate=required, occupancy_percent=shown, warning_percent=warning,
+                  message=f"容量预估：{percent_text}%（含输出预留） · {label}", impact=impact)
+    return result
+
+
+def estimate_candidate_capacity(messages, *, model, context_tokens, output_tokens):
+    """Read the whole text request; advisory only, never billed usage or admission.
+
+    Keep the writer's conservative character weights and structural reserve.
+    Unsupported message shapes (including images/tool calls) remain unknown.
+    """
+    try:
+        warning = config.POSTWRITE_WRITER_WARNING_PERCENT
+        if context_tokens is None:
+            return _capacity_result(model, output_tokens, reason="unknown_model")
+        if (type(context_tokens) is not int or context_tokens <= 0
+                or type(output_tokens) is not int or output_tokens <= 0
+                or type(warning) not in (int, float) or not math.isfinite(warning)
+                or not 0 < warning < 100):
+            return _capacity_result(model, output_tokens, reason="invalid_configuration")
+        if not isinstance(messages, list) or any(
+                not isinstance(m, dict) or not isinstance(m.get("content"), str)
+                or set(m) - {"role", "content", "name"}
+                or ("name" in m and not isinstance(m["name"], str)) for m in messages):
+            return _capacity_result(model, output_tokens, reason="unsupported_input")
+        text = "\n".join(m["content"] + ("\n" + m["name"] if "name" in m else "") for m in messages)
+        estimate = int(sum(1.5 if ord(c) > 127 else 0.4 for c in text)) + 2048
+        return _capacity_result(model, output_tokens, input_tokens=estimate,
+                                context_tokens=context_tokens, warning=warning)
+    except Exception:
+        return _capacity_result(model, output_tokens, reason="estimate_failed")
+
+
+def capacity_estimate_metadata(value):
+    """Rebuild safe numeric advice; event text and arbitrary fields are not trusted."""
+    if not isinstance(value, dict):
+        return {}
+    model, output = value.get("model"), value.get("output_reserved")
+    if (not isinstance(model, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}", model)
+            or type(output) is not int or output <= 0):
+        return {}
+    if value.get("status") == "unknown":
+        reason = value.get("reason")
+        if reason not in {"unknown_model", "invalid_configuration", "unsupported_input", "estimate_failed"}:
+            reason = "estimate_failed"
+        return _capacity_result(model, output, reason=reason)
+    tokens, context, warning = (value.get(k) for k in ("input_estimate", "context_tokens", "warning_percent"))
+    if (type(tokens) is not int or tokens < 0 or type(context) is not int or context <= 0
+            or type(warning) not in (int, float) or not math.isfinite(warning) or not 0 < warning < 100):
+        return {}
+    return _capacity_result(model, output, input_tokens=tokens, context_tokens=context, warning=warning)
 
 
 @dataclass(frozen=True)
