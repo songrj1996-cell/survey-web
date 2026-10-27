@@ -4,6 +4,8 @@ from contextlib import ExitStack, contextmanager, redirect_stdout
 from copy import deepcopy
 import io
 import json
+import errno
+import os
 import tempfile
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -15,6 +17,8 @@ from app.services.report_partial_rerun import partial_rerun_capability
 from app.services.report_postwrite_inputs import freeze_inputs
 from app.services.report_postwrite_pipeline import run_pipeline, BoundedCaller, BudgetStop, initial_draft_state, reuse_registry_state
 from app.storage.report_postwrite_runs import RunStore
+from app.storage import report_postwrite_runs as run_storage
+from app.core import runtime_logging
 from app.storage.prompts import DEFAULT_PROMPTS
 from tests.test_report_postwrite_audit import session, response, note_review
 
@@ -1439,3 +1443,264 @@ class StorageTests(unittest.TestCase):
         report_versions.append_report_version(source, {"report_md": "one", "report_audit": {"status": "complete"}})
         second = report_versions.append_report_version(source, {"report_md": "two"})
         self.assertNotIn("report_audit", second)
+
+
+def _checkpoint_permission_error(code=5):
+    error = PermissionError(errno.EACCES, "PRIVATE_CHECKPOINT_ERROR_BODY")
+    if code is not None:
+        error.winerror = code
+    return error
+
+
+class CheckpointRetryTests(unittest.TestCase):
+    def test_transient_windows_errors_reuse_one_complete_temporary_file(self):
+        for code in (5, 32, 33):
+            for failures in (1, 2):
+                with self.subTest(code=code, failures=failures), tempfile.TemporaryDirectory() as folder:
+                    store = RunStore(folder)
+                    run_id = store.create({"frozen": "synthetic"}, {"saved": 1})
+                    target = store._path(run_id)
+                    before = target.read_bytes()
+                    attempts, writes = [], []
+                    real_write = run_storage.Path.write_text
+
+                    def write(path, *args, **kwargs):
+                        writes.append(path)
+                        return real_write(path, *args, **kwargs)
+
+                    def publish(source, destination):
+                        source, destination = run_storage.Path(source), run_storage.Path(destination)
+                        attempts.append(source)
+                        self.assertEqual(json.loads(source.read_text(encoding="utf-8"))["state"], {"saved": 2})
+                        self.assertEqual(destination.read_bytes(), before)
+                        if len(attempts) <= failures:
+                            raise _checkpoint_permission_error(code)
+                        # Deterministic publication stub; native atomic replacement is tested below.
+                        destination.write_bytes(source.read_bytes())
+                        source.unlink()
+
+                    output = io.StringIO()
+                    with patch.object(run_storage.os, "replace", side_effect=publish), patch.object(
+                        run_storage, "sleep"
+                    ) as sleep, patch.object(run_storage.Path, "write_text", new=write), patch.object(
+                        runtime_logging, "_timestamp", return_value="2026-10-27 16:20:00.000+08:00"
+                    ), patch.object(runtime_logging, "current_runtime_operator", return_value="存储验收员"), redirect_stdout(output):
+                        store.save(run_id, {"inputs": {"frozen": "synthetic"}, "state": {"saved": 2}})
+                    self.assertEqual(len(attempts), failures + 1)
+                    self.assertEqual(len(set(attempts)), 1)
+                    self.assertEqual(len(writes), 1)
+                    self.assertEqual([item.args[0] for item in sleep.call_args_list], [0.02, 0.05][:failures])
+                    self.assertEqual(store.load(run_id)["state"], {"saved": 2})
+                    self.assertEqual(list(run_storage.Path(folder).glob("*.tmp")), [])
+                    log = output.getvalue()
+                    self.assertEqual(log.count("正在有限重试"), 1)
+                    self.assertEqual(log.count("已在本地重试后保存"), 1)
+                    self.assertIn("2026-10-27 16:20:00.000+08:00", log)
+                    self.assertIn("操作人：存储验收员", log)
+                    self.assertIn(f"Windows 错误码：{code}", log)
+                    self.assertNotIn("PRIVATE_CHECKPOINT_ERROR_BODY", log)
+                    self.assertNotIn(run_id, log)
+
+    def test_normal_replacement_does_not_wait_or_log(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = RunStore(folder)
+            run_id = store.create({"frozen": True})
+            output = io.StringIO()
+            with patch.object(run_storage.os, "replace") as replace, patch.object(run_storage, "sleep") as sleep, redirect_stdout(output):
+                store.save(run_id, {"inputs": {"frozen": True}, "state": {"done": True}})
+            replace.assert_called_once()
+            sleep.assert_not_called()
+            self.assertEqual(output.getvalue(), "")
+
+    def test_permanent_sharing_failure_is_bounded_and_preserves_old_bytes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = RunStore(folder)
+            run_id = store.create({"frozen": True}, {"saved": 1})
+            before = store._path(run_id).read_bytes()
+            error, output = _checkpoint_permission_error(), io.StringIO()
+            with patch.object(run_storage.os, "replace", side_effect=error) as replace, patch.object(
+                run_storage, "sleep"
+            ) as sleep, redirect_stdout(output):
+                with self.assertRaises(PermissionError) as caught:
+                    store.save(run_id, {"inputs": {"frozen": True}, "state": {"saved": 2}})
+            self.assertIs(caught.exception, error)
+            self.assertEqual(replace.call_count, 3)
+            self.assertEqual([item.args[0] for item in sleep.call_args_list], [0.02, 0.05])
+            self.assertAlmostEqual(sum(item.args[0] for item in sleep.call_args_list), 0.07)
+            self.assertEqual(store._path(run_id).read_bytes(), before)
+            self.assertEqual(list(run_storage.Path(folder).glob("*.tmp")), [])
+            self.assertEqual(output.getvalue().count("正在有限重试"), 1)
+            self.assertEqual(output.getvalue().count("核验检查点未能保存"), 1)
+            self.assertNotIn("已在本地重试后保存", output.getvalue())
+            self.assertNotIn("PRIVATE_CHECKPOINT_ERROR_BODY", output.getvalue())
+
+    def test_nonretryable_errors_fail_immediately(self):
+        for error in (OSError(errno.ENOSPC, "PRIVATE_DISK_FULL"), OSError(errno.EIO, "PRIVATE_IO_ERROR"),
+                      _checkpoint_permission_error(None), _checkpoint_permission_error(19)):
+            with self.subTest(error=type(error).__name__, winerror=getattr(error, "winerror", None)), tempfile.TemporaryDirectory() as folder:
+                store = RunStore(folder)
+                run_id = store.create({"frozen": True})
+                before = store._path(run_id).read_bytes()
+                output = io.StringIO()
+                with patch.object(run_storage.os, "replace", side_effect=error) as replace, patch.object(
+                    run_storage, "sleep"
+                ) as sleep, redirect_stdout(output):
+                    with self.assertRaises(OSError) as caught:
+                        store.save(run_id, {"inputs": {"frozen": True}, "state": {"saved": 2}})
+                self.assertIs(caught.exception, error)
+                replace.assert_called_once()
+                sleep.assert_not_called()
+                self.assertEqual(store._path(run_id).read_bytes(), before)
+                self.assertNotIn("PRIVATE", output.getvalue())
+
+    def test_input_corruption_and_invalid_ids_never_enter_replacement_retry(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = RunStore(folder)
+            run_id = store.create({"frozen": True})
+            with patch.object(run_storage.os, "replace") as replace, patch.object(run_storage, "sleep") as sleep:
+                with self.assertRaisesRegex(ValueError, "冻结输入不能修改"):
+                    store.save(run_id, {"inputs": {"frozen": False}})
+                with self.assertRaisesRegex(ValueError, "核验运行已存在"):
+                    store.save(run_id, {"inputs": {"frozen": True}}, create=True)
+                with self.assertRaises(ValueError):
+                    store.save("../invalid", {})
+                store._path(run_id).write_text("{corrupt", encoding="utf-8")
+                with self.assertRaises(json.JSONDecodeError):
+                    store.save(run_id, {"inputs": {"frozen": True}})
+                replace.assert_not_called()
+                sleep.assert_not_called()
+                self.assertEqual(store._path(run_id).read_text(encoding="utf-8"), "{corrupt")
+
+    def test_temporary_write_failure_never_enters_replacement_retry(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = RunStore(folder)
+            run_id = store.create({"frozen": True})
+            before = store._path(run_id).read_bytes()
+            output = io.StringIO()
+            with patch.object(run_storage.Path, "write_text", side_effect=OSError(errno.ENOSPC, "PRIVATE_DISK_FULL")), patch.object(
+                run_storage.os, "replace"
+            ) as replace, patch.object(run_storage, "sleep") as sleep, redirect_stdout(output):
+                with self.assertRaises(OSError):
+                    store.save(run_id, {"inputs": {"frozen": True}, "state": {"saved": 2}})
+            replace.assert_not_called()
+            sleep.assert_not_called()
+            self.assertEqual(store._path(run_id).read_bytes(), before)
+            self.assertEqual(list(run_storage.Path(folder).glob("*.tmp")), [])
+            self.assertIn("写入临时检查点", output.getvalue())
+            self.assertNotIn("PRIVATE_DISK_FULL", output.getvalue())
+
+    def test_cleanup_failure_preserves_original_failure(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = RunStore(folder)
+            run_id = store.create({"frozen": True})
+            before = store._path(run_id).read_bytes()
+            primary = OSError(errno.ENOSPC, "PRIVATE_PRIMARY_ERROR")
+            output = io.StringIO()
+            with patch.object(run_storage.os, "replace", side_effect=primary), patch.object(
+                run_storage.Path, "unlink", side_effect=_checkpoint_permission_error()
+            ), patch.object(run_storage, "sleep") as sleep, redirect_stdout(output):
+                with self.assertRaises(OSError) as caught:
+                    store.save(run_id, {"inputs": {"frozen": True}, "state": {"done": True}})
+            self.assertIs(caught.exception, primary)
+            sleep.assert_not_called()
+            self.assertEqual(store._path(run_id).read_bytes(), before)
+            self.assertEqual(len(list(run_storage.Path(folder).glob("*.tmp"))), 1)
+            self.assertIn("核验临时文件暂未能清理", output.getvalue())
+            self.assertNotIn("PRIVATE", output.getvalue())
+
+    def test_create_failure_does_not_claim_a_checkpoint_was_created(self):
+        with tempfile.TemporaryDirectory() as folder:
+            output = io.StringIO()
+            with patch.object(run_storage.os, "replace", side_effect=_checkpoint_permission_error()) as replace, patch.object(
+                run_storage, "sleep"
+            ), redirect_stdout(output):
+                with self.assertRaises(PermissionError):
+                    RunStore(folder).create({"frozen": True})
+            self.assertEqual(replace.call_count, 3)
+            self.assertEqual(list(run_storage.Path(folder).iterdir()), [])
+            self.assertNotIn("已在本地重试后保存", output.getvalue())
+
+
+@contextmanager
+def _one_native_checkpoint_collision(predicate):
+    """Hold a real Windows read handle until the first actual replace fails."""
+    import ctypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateFileW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p,
+                                  ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p]
+    kernel.CreateFileW.restype = ctypes.c_void_p
+    kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+    real_save, real_replace = RunStore.save, run_storage.os.replace
+    observed = {"injected": 0, "attempts": 0, "errors": [], "old_bytes_preserved": False}
+
+    def save(store, run_id, value, **kwargs):
+        if kwargs.get("create") or observed["injected"] or not predicate(value):
+            return real_save(store, run_id, value, **kwargs)
+        target = store._path(run_id)
+        before = target.read_bytes()
+        handle = kernel.CreateFileW(str(target), 0x80000000, 0x1 | 0x2, None, 3, 0x80, None)
+        if handle in (None, ctypes.c_void_p(-1).value):
+            raise ctypes.WinError(ctypes.get_last_error())
+        observed["injected"] += 1
+
+        def replace(source, destination):
+            nonlocal handle
+            observed["attempts"] += 1
+            try:
+                return real_replace(source, destination)
+            except OSError as error:
+                observed["errors"].append(getattr(error, "winerror", None))
+                observed["old_bytes_preserved"] = target.read_bytes() == before
+                if handle is not None:
+                    kernel.CloseHandle(handle)
+                    handle = None
+                raise
+        try:
+            with patch.object(run_storage.os, "replace", new=replace):
+                return real_save(store, run_id, value, **kwargs)
+        finally:
+            if handle is not None:
+                kernel.CloseHandle(handle)
+
+    with patch.object(RunStore, "save", new=save):
+        yield observed
+
+
+@unittest.skipUnless(os.name == "nt", "Native sharing-handle acceptance requires Windows")
+class CheckpointNativeRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def exercise(self, case_class, name, predicate):
+        case = case_class(name)
+        with _one_native_checkpoint_collision(predicate) as observed:
+            await getattr(case, name)()
+        self.assertEqual(observed["injected"], 1)
+        self.assertGreaterEqual(observed["attempts"], 2)
+        self.assertLessEqual(observed["attempts"], 3)
+        self.assertTrue(observed["errors"])
+        self.assertTrue(all(code in {5, 32, 33} for code in observed["errors"]))
+        self.assertTrue(observed["old_bytes_preserved"])
+
+    async def test_unknown_usage_resumes_without_rewriting_after_real_sharing_error(self):
+        await self.exercise(RuntimeBudgetPolicyTests,
+            "test_service_resumes_unknown_usage_registry_failure_without_rewriting",
+            lambda value: len(value.get("state", {}).get("calls", [])) >= 3 and not value.get("state", {}).get("registry"))
+
+    async def test_custom_writer_retains_source_cards_after_real_sharing_error(self):
+        await self.exercise(PipelineTests, "test_business_entry_loads_selected_writer_and_keeps_r_case_sources",
+            lambda value: value.get("inputs", {}).get("prompts", {}).get("writer", "").startswith("CUSTOM_WRITER_KEPT_BY_SETTINGS")
+            and (value.get("state", {}).get("registry") or {}).get("complete")
+            and len(value.get("state", {}).get("calls", [])) == 2)
+
+    async def test_resume_preserves_call_prefix_after_real_sharing_error(self):
+        await self.exercise(PipelineTests, "test_resume_failure_saves_partial_in_same_version_and_preserves_checkpoints",
+            lambda value: (value.get("state", {}).get("registry") or {}).get("complete")
+            and len(value.get("state", {}).get("calls", [])) == 2 and not value.get("state", {}).get("steps"))
+
+    async def test_manual_stop_remains_cancelled_after_real_sharing_error(self):
+        await self.exercise(PipelineTests, "test_manual_stop_during_resume_saves_same_version_and_existing_results",
+            lambda value: len(value.get("state", {}).get("calls", [])) >= 4
+            and value["state"]["calls"][-1].get("state") == "started"
+            and (value.get("state", {}).get("registry") or {}).get("complete"))
+
+    async def test_manual_stop_reaches_original_signal_without_extending_timeout(self):
+        await self.exercise(PipelineTests, "test_manual_stop_during_resume_saves_same_version_and_existing_results",
+            lambda value: len(value.get("state", {}).get("calls", [])) == 2 and not value.get("state", {}).get("registry"))
