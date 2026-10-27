@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import ExitStack, contextmanager
 from copy import deepcopy
 import json
@@ -104,6 +105,74 @@ def _event_payloads(events: list[str]) -> list[dict]:
         if event.startswith("data: "):
             payloads.append(json.loads(event.removeprefix("data: ").strip()))
     return payloads
+
+
+class ReportCloseLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_first_output_close_releases_guard_and_allows_same_session_again(self):
+        sess = _versioned_session()
+        before = deepcopy(sess)
+        with _isolated_report_runtime(sess, AsyncMock()) as runtime:
+            for _ in range(2):
+                stream = survey_service.report_stream("synthetic-first-close", object())
+                try:
+                    self.assertEqual(_event_payloads([await anext(stream)])[0]["type"], "session_ready")
+                    await stream.aclose()
+                    self.assertNotIn("synthetic-first-close", survey_service._REPORT_CANCEL_EVENTS)
+                finally:
+                    await stream.aclose()
+                    survey_service._REPORT_CANCEL_EVENTS.pop("synthetic-first-close", None)
+        self.assertEqual(sess, before)
+
+    async def test_generation_cancel_waits_for_child_and_keeps_existing_versions(self):
+        sess = _versioned_session()
+        before = deepcopy(sess)
+        started, closed = asyncio.Event(), asyncio.Event()
+        async def engine(*args, **kwargs):
+            try:
+                started.set()
+                await asyncio.Event().wait()
+                yield "unreachable"
+            finally:
+                closed.set()
+        with _isolated_report_runtime(sess, AsyncMock()), \
+             patch.object(survey_service, "_use_postwrite_engine", return_value=False), \
+             patch.object(survey_service, "resolve_report_mode", return_value="insight"), \
+             patch.object(survey_service, "_full_report_stream", engine), \
+             patch.object(survey_service, "runtime_log") as log:
+            stream = survey_service.report_stream("synthetic-report-cancel", object())
+            await anext(stream)
+            consumer = asyncio.create_task(anext(stream))
+            try:
+                await asyncio.wait_for(started.wait(), 2)
+                consumer.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await consumer
+                self.assertTrue(closed.is_set())
+                self.assertNotIn("synthetic-report-cancel", survey_service._REPORT_CANCEL_EVENTS)
+                self.assertIn("运行占用已清理", log.call_args.args[2])
+                self.assertEqual(sess, before)
+            finally:
+                consumer.cancel()
+                await asyncio.gather(consumer, return_exceptions=True)
+                await stream.aclose()
+
+    async def test_completion_and_engine_failure_both_release_guard(self):
+        for fail in (False, True):
+            with self.subTest(fail=fail):
+                sess = _versioned_session()
+                before = deepcopy(sess)
+                async def engine(*args, **kwargs):
+                    if fail:
+                        raise RuntimeError("synthetic failure")
+                    yield 'data: {"type":"report_done"}\n\n'
+                with _isolated_report_runtime(sess, AsyncMock()), \
+                     patch.object(survey_service, "_use_postwrite_engine", return_value=False), \
+                     patch.object(survey_service, "resolve_report_mode", return_value="insight"), \
+                     patch.object(survey_service, "_full_report_stream", engine):
+                    events = [item async for item in survey_service.report_stream("synthetic-report-finish", object())]
+                self.assertEqual(_event_payloads(events)[-1]["type"], "error" if fail else "report_done")
+                self.assertNotIn("synthetic-report-finish", survey_service._REPORT_CANCEL_EVENTS)
+                self.assertEqual(sess, before)
 
 
 class _TemporaryHistoryPathMixin:

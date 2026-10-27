@@ -17,6 +17,233 @@ from app.services import auth
 from app.services import annotate_workflow
 
 
+class AnnotationCloseLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    def session(self):
+        prior = {"id": "P1", "ai_prob": 1, "polish_prob": 2, "reason": "已有依据",
+                 "evidence": "已有反馈", "counter_evidence": "具体体验", "translations": {}}
+        return {"headers": ["ID", "反馈"], "rows": [["ID", "反馈"], ["P1", "已有反馈"], ["P2", "操作时按钮卡住"]],
+                "id_col": 0, "open_text_cols": [1], "tasks": {"ai_detect": True, "quality": False},
+                "ai_results": [prior], "confirmed_ai_ids": ["P1"], "ai_confirmation_complete": True}
+
+    async def test_close_before_worker_and_at_heartbeat_preserves_saved_results(self):
+        for at_heartbeat in (False, True):
+            with self.subTest(at_heartbeat=at_heartbeat):
+                sess = self.session()
+                before = deepcopy(sess)
+                closed = asyncio.Event()
+                calls = []
+                async def batch(*args):
+                    calls.append(args)
+                    try:
+                        await asyncio.Event().wait()
+                    finally:
+                        closed.set()
+                with patch.object(annotate_workflow, "get_annotate_session", return_value=sess), \
+                     patch.object(annotate_workflow, "_run_ai_batch_checked", batch), \
+                     patch.object(annotate_workflow, "_ANNOTATE_SSE_HEARTBEAT_SECONDS", 0.001), \
+                     patch.object(annotate_workflow, "runtime_log") as log:
+                    stream = annotate_workflow.ai_detect_stream("synthetic-ai-close", object(), retry_ids={"P2"})
+                    try:
+                        await anext(stream)
+                        if at_heartbeat:
+                            self.assertIn("heartbeat", await asyncio.wait_for(anext(stream), 2))
+                        await stream.aclose()
+                        self.assertEqual(sess["ai_status"], "incomplete")
+                        self.assertEqual(sess["ai_results"], before["ai_results"])
+                        self.assertEqual(sess["confirmed_ai_ids"], before["confirmed_ai_ids"])
+                        self.assertTrue(sess["ai_confirmation_complete"])
+                        self.assertEqual(len(calls), int(at_heartbeat))
+                        self.assertEqual(closed.is_set(), at_heartbeat)
+                        self.assertIn("本地子任务已清理", log.call_args.args[2])
+                        annotate_workflow.validate_annotate_session_for_ai("synthetic-ai-close")
+                    finally:
+                        await stream.aclose()
+
+    async def test_active_cancel_waits_for_worker_and_allows_retry(self):
+        sess = self.session()
+        started, closed = asyncio.Event(), asyncio.Event()
+        async def batch(*args):
+            try:
+                started.set()
+                await asyncio.Event().wait()
+            finally:
+                closed.set()
+        with patch.object(annotate_workflow, "get_annotate_session", return_value=sess), \
+             patch.object(annotate_workflow, "_run_ai_batch_checked", batch), \
+             patch.object(annotate_workflow, "runtime_log"):
+            stream = annotate_workflow.ai_detect_stream("synthetic-ai-cancel", object(), retry_ids={"P2"})
+            await anext(stream)
+            task = asyncio.create_task(anext(stream))
+            await asyncio.wait_for(started.wait(), 2)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            await stream.aclose()
+            self.assertTrue(closed.is_set())
+            self.assertEqual(sess["ai_status"], "incomplete")
+
+    async def test_close_after_done_does_not_downgrade_completed_result(self):
+        sess = self.session()
+        result = {**deepcopy(sess["ai_results"][0]), "id": "P2"}
+        with patch.object(annotate_workflow, "get_annotate_session", return_value=sess), \
+             patch.object(annotate_workflow, "_run_ai_batch_checked", AsyncMock(return_value=(1, [result], set(), set(), ""))), \
+             patch.object(annotate_workflow, "_publish_annotate_result", AsyncMock(return_value=None)), \
+             patch.object(annotate_workflow, "audit_log", AsyncMock()), \
+             patch.object(annotate_workflow, "runtime_log"):
+            stream = annotate_workflow.ai_detect_stream("synthetic-ai-done", object(), retry_ids={"P2"})
+            for _ in range(8):
+                event = json.loads((await anext(stream)).removeprefix("data: "))
+                if event["type"] == "ai_detect_done":
+                    break
+            self.assertEqual(event["type"], "ai_detect_done")
+            before = deepcopy(sess)
+            await stream.aclose()
+            self.assertEqual(sess, before)
+            self.assertEqual(sess["ai_status"], "complete")
+
+
+class QualityTerminalLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    def fixture(self, *, partial=False):
+        answer = "点两次组队按钮后界面卡住"
+        rows = [["ID", "遇到了什么问题？"], ["P1", answer]]
+        if partial:
+            rows.append(["P2", "夜间匹配等待很久"])
+        sess = {"headers": rows[0], "rows": rows, "id_col": 0, "open_text_cols": [1],
+                "tasks": {"quality": True, "ai_detect": False}}
+        result = {"id": "P1", "q_labels": {"col_1": "有效反馈"},
+                  "q_reasons": {"col_1": "描述了本人操作按钮时卡住的具体体验"},
+                  "q_evidence": {"col_1": answer}, "originals": {"col_1": answer},
+                  "q_checks": {"col_1": {"requirement": "specific_description", "support": "substantive"}},
+                  "translations": {}, "overall": "有效反馈", "overall_reason": "提供了具体操作体验",
+                  "overall_source": "model_holistic", "quality_policy_version": annotate.QUALITY_POLICY_VERSION}
+        return sess, result
+
+    async def test_done_boundary_preserves_complete_partial_and_translation_gap(self):
+        for outcome in ("complete", "partial", "translation_gap"):
+            for ending in ("close", "cancel", "exhaust"):
+                with self.subTest(outcome=outcome, ending=ending):
+                    sess, result = self.fixture(partial=outcome == "partial")
+                    missing = {"P2"} if outcome == "partial" else set()
+                    translation_gap = {"P1"} if outcome == "translation_gap" else set()
+                    with (
+                        patch.object(annotate_workflow, "get_annotate_session", return_value=sess),
+                        patch.object(annotate_workflow, "_run_one_quality_batch_strict",
+                                     AsyncMock(return_value=(1, [result], missing, ""))) as batch,
+                        patch.object(annotate_workflow, "_repair_missing_translations",
+                                     AsyncMock(return_value=(translation_gap, ""))) as translate,
+                        patch.object(annotate_workflow, "_publish_annotate_result", AsyncMock(return_value="")) as publish,
+                        patch.object(annotate_workflow, "audit_log", AsyncMock()) as audit,
+                        patch.object(annotate_workflow, "runtime_log") as log,
+                    ):
+                        stream = annotate_workflow.quality_stream("synthetic-quality-terminal", object())
+                        try:
+                            for _ in range(12):
+                                event = json.loads((await anext(stream)).removeprefix("data: "))
+                                if event["type"] == "quality_done":
+                                    break
+                            self.assertEqual(event["type"], "quality_done")
+                            self.assertEqual(sess["quality_status"], "incomplete" if missing else "complete")
+                            self.assertEqual(set(event["missing_ids"]), missing)
+                            self.assertEqual(set(event["missing_translation_ids"]), translation_gap)
+                            saved = deepcopy(sess)
+                            if ending == "close":
+                                await stream.aclose()
+                            elif ending == "cancel":
+                                with self.assertRaises(asyncio.CancelledError):
+                                    await stream.athrow(asyncio.CancelledError())
+                            else:
+                                with self.assertRaises(StopAsyncIteration):
+                                    await anext(stream)
+                            self.assertEqual(sess, saved)
+                            batch.assert_awaited_once()
+                            translate.assert_awaited_once()
+                            publish.assert_awaited_once()
+                            audit.assert_awaited_once()
+                            self.assertEqual(audit.await_args.args[2], "完成回答质量打标")
+                            self.assertFalse(any(call.args[1] == "error" for call in log.call_args_list))
+                        finally:
+                            await stream.aclose()
+
+    async def test_cancel_during_work_translation_publication_or_audit_remains_incomplete(self):
+        for stage in ("batch", "translation", "publication", "audit"):
+            with self.subTest(stage=stage):
+                sess, result = self.fixture()
+                started, cleaned = asyncio.Event(), asyncio.Event()
+                async def blocked(*args, **kwargs):
+                    started.set()
+                    try:
+                        await asyncio.Event().wait()
+                    finally:
+                        cleaned.set()
+                batch = AsyncMock(side_effect=blocked) if stage == "batch" else AsyncMock(return_value=(1, [result], set(), ""))
+                translate = AsyncMock(side_effect=blocked) if stage == "translation" else AsyncMock(return_value=(set(), ""))
+                publish = AsyncMock(side_effect=blocked) if stage == "publication" else AsyncMock(return_value="")
+                audit = AsyncMock(side_effect=blocked) if stage == "audit" else AsyncMock()
+                with (
+                    patch.object(annotate_workflow, "get_annotate_session", return_value=sess),
+                    patch.object(annotate_workflow, "_run_one_quality_batch_strict", batch),
+                    patch.object(annotate_workflow, "_repair_missing_translations", translate),
+                    patch.object(annotate_workflow, "_publish_annotate_result", publish),
+                    patch.object(annotate_workflow, "audit_log", audit),
+                    patch.object(annotate_workflow, "runtime_log"),
+                ):
+                    stream = annotate_workflow.quality_stream("synthetic-quality-interrupted", object())
+                    events = []
+                    async def consume():
+                        async for raw in stream:
+                            events.append(json.loads(raw.removeprefix("data: ")))
+                    consumer = asyncio.create_task(consume())
+                    try:
+                        await asyncio.wait_for(started.wait(), 2)
+                        consumer.cancel()
+                        with self.assertRaises(asyncio.CancelledError):
+                            await consumer
+                        self.assertTrue(cleaned.is_set())
+                        self.assertEqual(sess["quality_status"], "incomplete")
+                        self.assertNotIn("quality_done", [event["type"] for event in events])
+                        kept = next(item for item in sess["quality_results"] if item["id"] == "P1")
+                        self.assertEqual(kept["originals"], result["originals"])
+                        if stage != "batch":
+                            self.assertEqual(kept["q_labels"], result["q_labels"])
+                        self.assertEqual(batch.await_count, 1)
+                        self.assertEqual(translate.await_count, int(stage != "batch"))
+                        self.assertEqual(publish.await_count, int(stage in {"publication", "audit"}))
+                        self.assertEqual(audit.await_count, int(stage == "audit"))
+                    finally:
+                        consumer.cancel()
+                        await asyncio.gather(consumer, return_exceptions=True)
+                        await stream.aclose()
+
+    async def test_close_at_translation_progress_keeps_labels_without_publishing(self):
+        sess, result = self.fixture()
+        with (
+            patch.object(annotate_workflow, "get_annotate_session", return_value=sess),
+            patch.object(annotate_workflow, "_run_one_quality_batch_strict",
+                         AsyncMock(return_value=(1, [result], set(), ""))) as batch,
+            patch.object(annotate_workflow, "_repair_missing_translations", AsyncMock()) as translate,
+            patch.object(annotate_workflow, "_publish_annotate_result", AsyncMock()) as publish,
+            patch.object(annotate_workflow, "audit_log", AsyncMock()) as audit,
+            patch.object(annotate_workflow, "runtime_log"),
+        ):
+            stream = annotate_workflow.quality_stream("synthetic-quality-before-translation", object())
+            try:
+                for _ in range(8):
+                    event = json.loads((await anext(stream)).removeprefix("data: "))
+                    if event.get("phase") == "translation":
+                        break
+                self.assertEqual(event.get("phase"), "translation")
+                saved = deepcopy(sess["quality_results"])
+                await stream.aclose()
+                self.assertEqual(sess["quality_status"], "incomplete")
+                self.assertEqual(sess["quality_results"], saved)
+                batch.assert_awaited_once()
+                translate.assert_not_awaited()
+                publish.assert_not_awaited()
+                audit.assert_not_awaited()
+            finally:
+                await stream.aclose()
+
+
 class AnnotateRuleTests(unittest.TestCase):
     def test_annotation_model_log_translates_quality_translation_task(self):
         with patch.object(annotate_workflow, "runtime_log") as log:

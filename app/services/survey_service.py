@@ -5,7 +5,7 @@
 HTTP 参数解析与响应包装在 routers/survey。
 """
 import asyncio
-from contextlib import suppress
+from contextlib import aclosing, suppress
 from copy import deepcopy
 from datetime import datetime
 import hashlib
@@ -872,11 +872,12 @@ async def _direct_llm_with_heartbeats(messages: list[dict], *, task_key="survey.
 
 async def _run_direct_llm(messages: list[dict], **kwargs):
     """把直连调用包装成供 SSE 流程消费的统一事件。"""
-    async for kind, payload in _direct_llm_with_heartbeats(messages, **kwargs):
-        if kind == "heartbeat":
-            yield sse_event({"type": "heartbeat"}), None
-        else:
-            yield None, payload
+    async with aclosing(_direct_llm_with_heartbeats(messages, **kwargs)) as _direct_stream:
+        async for kind, payload in _direct_stream:
+            if kind == "heartbeat":
+                yield sse_event({"type": "heartbeat"}), None
+            else:
+                yield None, payload
 
 
 def _json_repair_messages(
@@ -939,17 +940,18 @@ async def columns_stream(session_id: str, request: Request):
                 ]
                 answer = ""
                 used_model = ""
-                async for event, result in _run_direct_llm(
+                async with aclosing(_run_direct_llm(
                     messages,
                     models=models,
                     max_tokens=LLM_COLUMN_MAX_TOKENS,
                     reasoning_effort=LLM_COLUMN_REASONING or None,
                     task_key="survey.translation" if sess.get("column_provider") == "questionnaire" else "survey.columns",
-                ):
-                    if event:
-                        yield event
-                    if result:
-                        answer, used_model = result
+                )) as _direct_stream:
+                    async for event, result in _direct_stream:
+                        if event:
+                            yield event
+                        if result:
+                            answer, used_model = result
                 try:
                     translations = parse_questionnaire_translations(answer, questions)
                 except ValueError as exc:
@@ -964,17 +966,18 @@ async def columns_stream(session_id: str, request: Request):
                         ),
                     )
                     retry_answer = ""
-                    async for event, result in _run_direct_llm(
+                    async with aclosing(_run_direct_llm(
                         retry_messages,
                         models=models,
                         max_tokens=LLM_COLUMN_MAX_TOKENS,
                         reasoning_effort=LLM_COLUMN_REASONING or None,
                         task_key="survey.translation" if sess.get("column_provider") == "questionnaire" else "survey.columns",
-                    ):
-                        if event:
-                            yield event
-                        if result:
-                            retry_answer, used_model = result
+                    )) as _direct_stream:
+                        async for event, result in _direct_stream:
+                            if event:
+                                yield event
+                            if result:
+                                retry_answer, used_model = result
                     translations = parse_questionnaire_translations(
                         retry_answer, questions,
                     )
@@ -1030,17 +1033,18 @@ async def columns_stream(session_id: str, request: Request):
         ]
         answer = ""
         used_model = ""
-        async for event, result in _run_direct_llm(
+        async with aclosing(_run_direct_llm(
             messages,
             models=models,
             max_tokens=LLM_COLUMN_MAX_TOKENS,
             reasoning_effort=LLM_COLUMN_REASONING or None,
             task_key="survey.translation" if sess.get("column_provider") == "questionnaire" else "survey.columns",
-        ):
-            if event:
-                yield event
-            if result:
-                answer, used_model = result
+        )) as _direct_stream:
+            async for event, result in _direct_stream:
+                if event:
+                    yield event
+                if result:
+                    answer, used_model = result
         for event in _content_events(answer):
             yield event
 
@@ -1055,17 +1059,18 @@ async def columns_stream(session_id: str, request: Request):
                 "请严格按 schema 用 ```json``` 围栏重新输出，不要附加任何解释文字。",
             )
             retry_answer = ""
-            async for event, result in _run_direct_llm(
+            async with aclosing(_run_direct_llm(
                 retry_messages,
                 models=models,
                 max_tokens=LLM_COLUMN_MAX_TOKENS,
                 reasoning_effort=LLM_COLUMN_REASONING or None,
                 task_key="survey.translation" if sess.get("column_provider") == "questionnaire" else "survey.columns",
-            ):
-                if event:
-                    yield event
-                if result:
-                    retry_answer, used_model = result
+            )) as _direct_stream:
+                async for event, result in _direct_stream:
+                    if event:
+                        yield event
+                    if result:
+                        retry_answer, used_model = result
             questions, err = survey_plan.parse_columns_from_llm(retry_answer, header_count)
 
         if not questions:
@@ -1099,6 +1104,10 @@ async def columns_stream(session_id: str, request: Request):
             metadata={"session_id": session_id, "columns": len(questions)},
         )
         yield sse_event({"type": "columns_ready", "columns": _column_display_metadata(sess, questions)})
+    except (asyncio.CancelledError, GeneratorExit):
+        runtime_log('问卷分析', "info", "本次请求已停止，本地子任务已清理；已保存结果保留",
+                    session_id=session_id, stage='列题型识别')
+        raise
     except Exception as e:
         report_log_failure(session_id, error=e, prefix="识别问卷题型失败")
         yield sse_event({"type": "error", "message": str(e)})
@@ -1532,6 +1541,22 @@ def prepare_duplicate_report_rerun(
 # ── 方案生成 SSE ────────────────────────────────────────────────
 
 
+def _save_plan_with_model_snapshot(session_id: str, sess: dict) -> None:
+    """Keep planning provenance separate from existing report recovery data."""
+    metadata = {}
+    record_model_snapshot(metadata)
+    if metadata:
+        sess.setdefault("llm_model_stage_snapshots", {})["plan"] = metadata
+    save_session(session_id, sess)
+    if metadata:
+        version = metadata["llm_model_snapshot"]["version"]
+        runtime_log(
+            "问卷报告", "info", "本次规划配置已随方案保存",
+            session_id=session_id, stage="方案规划", model=sess.get("planner_model"),
+            **{"配置版本": f"v{version}" if version else "环境默认 v0"},
+        )
+
+
 @log_survey_stream("plan")
 @model_operation(budget_key=lambda args: business_model_key("plan", get_session(args["session_id"])))
 async def plan_stream(session_id: str, request: Request):
@@ -1575,17 +1600,18 @@ async def plan_stream(session_id: str, request: Request):
             ]
             answer = ""
             used_model = ""
-            async for event, result in _run_direct_llm(
+            async with aclosing(_run_direct_llm(
                 messages,
                 models=models,
                 max_tokens=LLM_PLANNER_MAX_TOKENS,
                 reasoning_effort=LLM_PLANNER_REASONING or None,
                 task_key=business_model_key("plan", sess),
-            ):
-                if event:
-                    yield event
-                if result:
-                    answer, used_model = result
+            )) as _direct_stream:
+                async for event, result in _direct_stream:
+                    if event:
+                        yield event
+                    if result:
+                        answer, used_model = result
             for event in _content_events(answer):
                 yield event
             ctp, err = survey_plan.parse_crosstab_plan(answer)
@@ -1600,17 +1626,18 @@ async def plan_stream(session_id: str, request: Request):
                     "用 ```json``` 围栏，不要解释文字。",
                 )
                 retry_answer = ""
-                async for event, result in _run_direct_llm(
+                async with aclosing(_run_direct_llm(
                     retry_messages,
                     models=models,
                     max_tokens=LLM_PLANNER_MAX_TOKENS,
                     reasoning_effort=LLM_PLANNER_REASONING or None,
                     task_key=business_model_key("plan", sess),
-                ):
-                    if event:
-                        yield event
-                    if result:
-                        retry_answer, used_model = result
+                )) as _direct_stream:
+                    async for event, result in _direct_stream:
+                        if event:
+                            yield event
+                        if result:
+                            retry_answer, used_model = result
                 ctp, err = survey_plan.parse_crosstab_plan(retry_answer)
             if not ctp:
                 yield sse_event({"type": "error", "message": f"章节大纲解析失败：{err}"}); return
@@ -1626,7 +1653,7 @@ async def plan_stream(session_id: str, request: Request):
             sess["planner_conv_id"] = ""
             sess["planner_provider"] = "direct_llm"
             sess["planner_model"] = used_model
-            save_session(session_id, sess)
+            _save_plan_with_model_snapshot(session_id, sess)
             card_text = _render_crosstab_plan_card(plan)
             await audit_log(
                 request, "survey", "生成章节大纲",
@@ -1683,17 +1710,18 @@ async def plan_stream(session_id: str, request: Request):
         ]
         full_answer = ""
         used_model = ""
-        async for event, result in _run_direct_llm(
+        async with aclosing(_run_direct_llm(
             messages,
             models=models,
             max_tokens=LLM_PLANNER_MAX_TOKENS,
             reasoning_effort=LLM_PLANNER_REASONING or None,
             task_key=business_model_key("plan", sess),
-        ):
-            if event:
-                yield event
-            if result:
-                full_answer, used_model = result
+        )) as _direct_stream:
+            async for event, result in _direct_stream:
+                if event:
+                    yield event
+                if result:
+                    full_answer, used_model = result
         for event in _content_events(full_answer):
             yield event
         headers = rows[0]
@@ -1719,17 +1747,18 @@ async def plan_stream(session_id: str, request: Request):
                 "请严格按 JSON schema 重新输出完整 plan，不要附加解释文字。",
             )
             retry_answer = ""
-            async for event, result in _run_direct_llm(
+            async with aclosing(_run_direct_llm(
                 retry_messages,
                 models=models,
                 max_tokens=LLM_PLANNER_MAX_TOKENS,
                 reasoning_effort=LLM_PLANNER_REASONING or None,
                 task_key=business_model_key("plan", sess),
-            ):
-                if event:
-                    yield event
-                if result:
-                    retry_answer, used_model = result
+            )) as _direct_stream:
+                async for event, result in _direct_stream:
+                    if event:
+                        yield event
+                    if result:
+                        retry_answer, used_model = result
             plan, err = survey_plan.parse_plan_from_llm(
                 retry_answer,
                 len(headers),
@@ -1751,7 +1780,7 @@ async def plan_stream(session_id: str, request: Request):
         sess["planner_conv_id"] = ""
         sess["planner_provider"] = "direct_llm"
         sess["planner_model"] = used_model
-        save_session(session_id, sess)
+        _save_plan_with_model_snapshot(session_id, sess)
         card_text = survey_plan.render_plan_for_user(plan, headers)
         await audit_log(
             request, "survey", "生成分析方案",
@@ -1759,6 +1788,10 @@ async def plan_stream(session_id: str, request: Request):
             metadata={"session_id": session_id, "parts": len(plan.get("parts", []))},
         )
         yield sse_event({"type": "plan_ready", "plan": plan, "card_text": card_text, "headers": headers})
+    except (asyncio.CancelledError, GeneratorExit):
+        runtime_log('问卷分析', "info", "本次请求已停止，本地子任务已清理；已保存结果保留",
+                    session_id=session_id, stage='方案规划')
+        raise
     except Exception as e:
         report_log_failure(session_id, error=e, prefix="生成分析方案失败")
         yield sse_event({"type": "error", "message": str(e)})
@@ -1817,7 +1850,7 @@ async def plan_revision_stream(session_id: str, user_text: str, request: Request
             models = (LLM_PLANNER_MODEL, *LLM_PLANNER_FALLBACK_MODELS)
             answer = ""
             used_model = ""
-            async for event, result in _run_direct_llm(
+            async with aclosing(_run_direct_llm(
                 [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": rev_q},
@@ -1826,11 +1859,12 @@ async def plan_revision_stream(session_id: str, user_text: str, request: Request
                 max_tokens=LLM_PLANNER_MAX_TOKENS,
                 reasoning_effort=LLM_PLANNER_REASONING or None,
                 task_key=business_model_key("plan", sess),
-            ):
-                if event:
-                    yield event
-                if result:
-                    answer, used_model = result
+            )) as _direct_stream:
+                async for event, result in _direct_stream:
+                    if event:
+                        yield event
+                    if result:
+                        answer, used_model = result
             for event in _content_events(answer):
                 yield event
             ctp, err = survey_plan.parse_crosstab_plan(answer)
@@ -1845,17 +1879,18 @@ async def plan_revision_stream(session_id: str, user_text: str, request: Request
                     "用 ```json``` 围栏，不要解释文字。",
                 )
                 retry_answer = ""
-                async for event, result in _run_direct_llm(
+                async with aclosing(_run_direct_llm(
                     retry_messages,
                     models=models,
                     max_tokens=LLM_PLANNER_MAX_TOKENS,
                     reasoning_effort=LLM_PLANNER_REASONING or None,
                     task_key=business_model_key("plan", sess),
-                ):
-                    if event:
-                        yield event
-                    if result:
-                        retry_answer, used_model = result
+                )) as _direct_stream:
+                    async for event, result in _direct_stream:
+                        if event:
+                            yield event
+                        if result:
+                            retry_answer, used_model = result
                 ctp, err = survey_plan.parse_crosstab_plan(retry_answer)
             if not ctp:
                 yield sse_event({"type": "error", "message": f"修订章节大纲解析失败：{err}"}); return
@@ -1868,7 +1903,7 @@ async def plan_revision_stream(session_id: str, user_text: str, request: Request
             sess["planner_provider"] = "direct_llm"
             sess["planner_model"] = used_model
             _record_successful_plan_revision(sess, user_text)
-            save_session(session_id, sess)
+            _save_plan_with_model_snapshot(session_id, sess)
             card_text = _render_crosstab_plan_card(new_plan)
             await audit_log(
                 request, "survey", "修订章节大纲",
@@ -1903,7 +1938,7 @@ async def plan_revision_stream(session_id: str, user_text: str, request: Request
         models = (LLM_PLANNER_MODEL, *LLM_PLANNER_FALLBACK_MODELS)
         full_answer = ""
         used_model = ""
-        async for event, result in _run_direct_llm(
+        async with aclosing(_run_direct_llm(
             [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": revision_query},
@@ -1912,11 +1947,12 @@ async def plan_revision_stream(session_id: str, user_text: str, request: Request
             max_tokens=LLM_PLANNER_MAX_TOKENS,
             reasoning_effort=LLM_PLANNER_REASONING or None,
             task_key=business_model_key("plan", sess),
-        ):
-            if event:
-                yield event
-            if result:
-                full_answer, used_model = result
+        )) as _direct_stream:
+            async for event, result in _direct_stream:
+                if event:
+                    yield event
+                if result:
+                    full_answer, used_model = result
         for event in _content_events(full_answer):
             yield event
         new_plan, err = survey_plan.parse_plan_from_llm(
@@ -1936,17 +1972,18 @@ async def plan_revision_stream(session_id: str, user_text: str, request: Request
             yield sse_event({"type": "progress", "message": "方案格式校验中，正在修订输出…"})
             yield sse_event({"type": "chunk", "content": "\n\n正在按严格 JSON 格式重新修订方案...\n"})
             retry_answer = ""
-            async for event, result in _run_direct_llm(
+            async with aclosing(_run_direct_llm(
                 retry_messages,
                 models=models,
                 max_tokens=LLM_PLANNER_MAX_TOKENS,
                 reasoning_effort=LLM_PLANNER_REASONING or None,
                 task_key=business_model_key("plan", sess),
-            ):
-                if event:
-                    yield event
-                if result:
-                    retry_answer, used_model = result
+            )) as _direct_stream:
+                async for event, result in _direct_stream:
+                    if event:
+                        yield event
+                    if result:
+                        retry_answer, used_model = result
             new_plan, err = survey_plan.parse_plan_from_llm(
                 retry_answer,
                 len(headers),
@@ -1968,7 +2005,7 @@ async def plan_revision_stream(session_id: str, user_text: str, request: Request
         sess["planner_provider"] = "direct_llm"
         sess["planner_model"] = used_model
         _record_successful_plan_revision(sess, user_text)
-        save_session(session_id, sess)
+        _save_plan_with_model_snapshot(session_id, sess)
         card_text = survey_plan.render_plan_for_user(new_plan, headers)
         await audit_log(
             request, "survey", "修订分析方案",
@@ -1976,6 +2013,10 @@ async def plan_revision_stream(session_id: str, user_text: str, request: Request
             metadata={"session_id": session_id},
         )
         yield sse_event({"type": "plan_ready", "plan": new_plan, "card_text": card_text, "headers": headers})
+    except (asyncio.CancelledError, GeneratorExit):
+        runtime_log('问卷分析', "info", "本次请求已停止，本地子任务已清理；已保存结果保留",
+                    session_id=session_id, stage='方案修订')
+        raise
     except Exception as e:
         report_log_failure(session_id, error=e, prefix="修订分析方案失败")
         yield sse_event({"type": "error", "message": str(e)})
@@ -2238,35 +2279,35 @@ async def report_stream(session_id: str, request: Request, *, instruction: str =
         return
     cancel = asyncio.Event()
     _REPORT_CANCEL_EVENTS[session_id] = cancel
-    yield sse_event({"type": "session_ready", "session_id": session_id})
-    queue = asyncio.Queue()
-    engine = _postwrite_report_stream if _use_postwrite_engine(selected) else (_quick_report_stream if resolve_report_mode(selected) == "quick" else _full_report_stream)
-    if retry_failed and engine not in {_quick_report_stream, _postwrite_report_stream}:
-        _REPORT_CANCEL_EVENTS.pop(session_id, None)
-        yield sse_event({"type": "error", "message": "失败题目重试仅适用于快速总结"})
-        return
-
-    async def pump():
-        try:
-            options = {"instruction": instruction, "base_version": base_version, "generation_kind": generation_kind}
-            if engine in {_quick_report_stream, _postwrite_report_stream}:
-                options["retry_failed"] = retry_failed
-            saved = resume_model_snapshot(selected) if retry_failed else None
-            async with model_operation_scope(saved, resume=retry_failed) as model_snapshot:
-                model_snapshot["business"] = sess.get("mode", "")
-                # Bind again because the context deliberately stores detached copies.
-                async with model_operation_scope(model_snapshot):
-                    async for event in engine(session_id, request, **options):
-                        await queue.put(event)
-        except Exception as exc:
-            await queue.put(sse_event({"type": "error", "message": getattr(exc, "detail", str(exc))}))
-        finally:
-            await queue.put(None)
-
-    task = asyncio.create_task(pump())
-    cancelled = asyncio.create_task(cancel.wait())
-    pending = None
+    task = cancelled = pending = None
+    stopped = False
     try:
+        yield sse_event({"type": "session_ready", "session_id": session_id})
+        queue = asyncio.Queue()
+        engine = _postwrite_report_stream if _use_postwrite_engine(selected) else (_quick_report_stream if resolve_report_mode(selected) == "quick" else _full_report_stream)
+        if retry_failed and engine not in {_quick_report_stream, _postwrite_report_stream}:
+            yield sse_event({"type": "error", "message": "失败题目重试仅适用于快速总结"})
+            return
+
+        async def pump():
+            try:
+                options = {"instruction": instruction, "base_version": base_version, "generation_kind": generation_kind}
+                if engine in {_quick_report_stream, _postwrite_report_stream}:
+                    options["retry_failed"] = retry_failed
+                saved = resume_model_snapshot(selected) if retry_failed else None
+                async with model_operation_scope(saved, resume=retry_failed) as model_snapshot:
+                    model_snapshot["business"] = sess.get("mode", "")
+                    # Bind again because the context deliberately stores detached copies.
+                    async with model_operation_scope(model_snapshot):
+                        async for event in engine(session_id, request, **options):
+                            await queue.put(event)
+            except Exception as exc:
+                await queue.put(sse_event({"type": "error", "message": getattr(exc, "detail", str(exc))}))
+            finally:
+                await queue.put(None)
+
+        task = asyncio.create_task(pump())
+        cancelled = asyncio.create_task(cancel.wait())
         while True:
             pending = asyncio.create_task(queue.get())
             done, _ = await asyncio.wait({pending, cancelled}, timeout=1, return_when=asyncio.FIRST_COMPLETED)
@@ -2296,6 +2337,9 @@ async def report_stream(session_id: str, request: Request, *, instruction: str =
             if event is None:
                 break
             yield event
+    except (asyncio.CancelledError, GeneratorExit):
+        stopped = True
+        raise
     finally:
         for child in (task, cancelled, pending):
             if child is not None:
@@ -2303,6 +2347,9 @@ async def report_stream(session_id: str, request: Request, *, instruction: str =
                 with suppress(asyncio.CancelledError):
                     await child
         _REPORT_CANCEL_EVENTS.pop(session_id, None)
+        if stopped:
+            runtime_log("问卷分析", "info", "报告连接已关闭，本地子任务及运行占用已清理；已保存版本保留",
+                        session_id=session_id, stage="报告生成")
 
 
 async def _postwrite_report_stream(session_id, request, *, instruction="", base_version=None, generation_kind=None, retry_failed=False):

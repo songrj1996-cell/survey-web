@@ -1,4 +1,6 @@
 from copy import deepcopy
+import asyncio
+from contextlib import ExitStack
 import json
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -67,6 +69,78 @@ def _open_text_plan_json_with_unexpected_focus() -> str:
         },
         ensure_ascii=False,
     )
+
+
+class PlannerCloseLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def check_close(self, operation, mode="standard", *, boundary="heartbeat"):
+        sess = {"mode": mode, "rows": [["段位", "主玩位置", "界面满意度"], ["金", "中", "4"]],
+                "plan": json.loads(_plan_json()), "confirmed_columns": [],
+                "questionnaire_text": "合成满意度研究", "crosstab_questions": ["满意度"],
+                "planner_messages": [], "planner_model": "prior-fixture"}
+        before = deepcopy(sess["plan"])
+        started, closed = asyncio.Event(), asyncio.Event()
+        async def collector(*args, **kwargs):
+            try:
+                started.set()
+                await asyncio.Event().wait()
+            finally:
+                closed.set()
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(survey_service, "get_session", return_value=sess))
+            stack.enter_context(patch.object(survey_service, "_ensure_branch_rules", return_value=[]))
+            saved = stack.enter_context(patch.object(survey_service, "save_session"))
+            stack.enter_context(patch.object(survey_service, "audit_log", AsyncMock()))
+            calls = stack.enter_context(patch.object(survey_service, "collect_chat_completion", AsyncMock(side_effect=collector)))
+            stack.enter_context(patch.object(survey_service, "LLM_STREAM_HEARTBEAT_SECONDS", 0.001))
+            log = stack.enter_context(patch.object(survey_service, "runtime_log"))
+            args = ("synthetic-planning", "调整顺序", object()) if operation == "plan_revision" else ("synthetic-planning", object())
+            stream = getattr(survey_service, operation + "_stream")(*args)
+            consumer = None
+            try:
+                if boundary == "cancel":
+                    async def consume():
+                        async for _ in stream:
+                            pass
+                    consumer = asyncio.create_task(consume())
+                    await asyncio.wait_for(started.wait(), 2)
+                    consumer.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await consumer
+                else:
+                    for _ in range(8):
+                        await asyncio.wait_for(anext(stream), 2)
+                        if boundary == "first" or started.is_set():
+                            break
+                    await stream.aclose()
+                # These entries first yield a heartbeat after starting the
+                # request; closing must reclaim that one request, not retry it.
+                self.assertEqual(calls.await_count, 1)
+                self.assertTrue(closed.is_set())
+                self.assertEqual(sess["plan"], before)
+                saved.assert_not_called()
+                if boundary != "first":
+                    self.assertIn("本地子任务已清理", log.call_args.args[2])
+            finally:
+                if consumer is not None:
+                    consumer.cancel()
+                    await asyncio.gather(consumer, return_exceptions=True)
+                await stream.aclose()
+
+    async def test_all_planner_relays_close_their_waiting_request(self):
+        for operation, mode in (("columns", "standard"), ("plan", "standard"), ("plan", "crosstab"),
+                                ("plan_revision", "standard"), ("plan_revision", "crosstab")):
+            with self.subTest(operation=operation, mode=mode):
+                await self.check_close(operation, mode)
+
+    async def test_close_at_first_output_reclaims_request_without_restarting(self):
+        for operation in ("columns", "plan", "plan_revision"):
+            with self.subTest(operation=operation):
+                await self.check_close(operation, boundary="first")
+
+    async def test_cancellation_does_not_try_backup_or_save_partial_plan(self):
+        for operation in ("columns", "plan", "plan_revision"):
+            with self.subTest(operation=operation):
+                await self.check_close(operation, boundary="cancel")
 
 
 class DirectSurveyPlannerTests(unittest.IsolatedAsyncioTestCase):

@@ -5,7 +5,7 @@
 纯标注算法在 annotate 模块;HTTP 参数解析与响应包装在 routers/annotate。
 """
 import asyncio
-from contextlib import contextmanager
+from contextlib import aclosing, contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
 import json
@@ -2123,6 +2123,7 @@ async def _ai_detect_stream(sid: str, request: Request, retry_ids: set[str] | No
         ),
     )
     pending: set[asyncio.Task] = set()
+    stopped = False
     try:
         yield sse_event({
             "type": "started",
@@ -2246,8 +2247,10 @@ async def _ai_detect_stream(sid: str, request: Request, retry_ids: set[str] | No
             "missing_ids": sorted(all_missing_ids),
             "missing_translation_ids": sorted(all_missing_translation_ids),
         })
-    except asyncio.CancelledError:
-        sess["ai_status"] = "incomplete"
+    except (asyncio.CancelledError, GeneratorExit):
+        stopped = True
+        if sess.get("ai_status") != "complete":
+            sess["ai_status"] = "incomplete"
         raise
     except Exception as exc:
         sess["ai_status"] = "incomplete"
@@ -2257,6 +2260,9 @@ async def _ai_detect_stream(sid: str, request: Request, retry_ids: set[str] | No
             task.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
+        if stopped:
+            runtime_log("数据标注", "info", "AI 作答识别连接已关闭，本地子任务已清理；已保存结果保留",
+                        session_id=sid, stage="AI 作答识别")
 
 
 async def _run_invalid_quality_review_stage(
@@ -2738,6 +2744,9 @@ async def _quality_stream(sid: str, request: Request, retry_ids: set[str] | None
     retain_progress()
     pending: set[asyncio.Task] = set()
     translation_task: asyncio.Task | None = None
+    # Status can be complete while publication/auditing is still pending.
+    # Only the terminal event makes subsequent consumer closure harmless.
+    completion_emitted = False
     try:
         yield sse_event({
             "type": "progress", "done": 0, "total": len(batches),
@@ -2877,7 +2886,7 @@ async def _quality_stream(sid: str, request: Request, retry_ids: set[str] | None
                 "missing_translations": len(missing_translation_ids),
             },
         )
-        yield sse_event({
+        done_event = sse_event({
             "type": "quality_done", "completion": _annotate_completion(sess), "history_saved": not bool(sess.get("history_save_error")), "count": len(all_results),
             "complete_count": len(expected_ids - all_missing_ids - missing_overall_ids),
             "results": all_results, "missing_ids": sorted(all_missing_ids),
@@ -2885,9 +2894,12 @@ async def _quality_stream(sid: str, request: Request, retry_ids: set[str] | None
             "missing_translation_ids": sorted(missing_translation_ids),
             "quality_duration_seconds": sess.get("quality_duration_seconds"),
         })
+        completion_emitted = True
+        yield done_event
     except (asyncio.CancelledError, GeneratorExit):
-        retain_progress()
-        sess["quality_status"] = "incomplete"
+        if not completion_emitted:
+            retain_progress()
+            sess["quality_status"] = "incomplete"
         raise
     except Exception as exc:
         sess["quality_status"] = "incomplete"
@@ -2913,21 +2925,29 @@ async def _annotation_stream_with_settings(stage, sid, request, retry_ids):
         record_model_snapshot(metadata)
         sess.setdefault("llm_model_stage_snapshots", {})[stage] = metadata
         stream = _ai_detect_stream if stage == "ai" else _quality_stream
-        async for item in stream(sid, request, retry_ids):
-            yield item
+        async with aclosing(stream(sid, request, retry_ids)) as source:
+            async for item in source:
+                yield item
 
     try:
-        async for item in run(previous=saved if resuming else None):
-            yield item
+        async with aclosing(run(previous=saved if resuming else None)) as source:
+            async for item in source:
+                yield item
+    except (asyncio.CancelledError, GeneratorExit):
+        runtime_log("数据标注", "info", "本次标注请求已停止，本地子任务已清理；已保存结果保留",
+                    session_id=sid, stage="AI 作答识别" if stage == "ai" else "质量标注")
+        raise
     except ValueError as exc:
         yield sse_event({"type": "error", "message": str(exc)})
 
 
 async def ai_detect_stream(sid: str, request: Request, retry_ids: set[str] | None = None):
-    async for item in _annotation_stream_with_settings("ai", sid, request, retry_ids):
-        yield item
+    async with aclosing(_annotation_stream_with_settings("ai", sid, request, retry_ids)) as source:
+        async for item in source:
+            yield item
 
 
 async def quality_stream(sid: str, request: Request, retry_ids: set[str] | None = None):
-    async for item in _annotation_stream_with_settings("quality", sid, request, retry_ids):
-        yield item
+    async with aclosing(_annotation_stream_with_settings("quality", sid, request, retry_ids)) as source:
+        async for item in source:
+            yield item

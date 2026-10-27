@@ -12,7 +12,7 @@ class InterviewPermissionMigrationTests(unittest.TestCase):
             ALL_PERMS,
             [
                 "survey", "interview", "comment", "annotate", "reward", "roster",
-                "ui_texts", "prompts", "glossary", "platform", "members", "audit",
+                "ui_texts", "prompts", "glossary", "model_settings", "platform", "members", "audit",
             ],
         )
 

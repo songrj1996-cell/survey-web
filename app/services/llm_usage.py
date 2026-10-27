@@ -11,13 +11,17 @@ from typing import Any
 
 from app.core.security import _visible_to_owner
 from app.services.report_runtime_logging import log_model_attempt, model_attempt_details
-from app.storage.llm_usage import load_llm_usage, mutate_llm_usage
+from app.storage.llm_usage import UsageStorageError, load_llm_usage, mutate_llm_usage
 from app.storage.sessions import get_session
 
 
 _ALLOWED_PERIODS = {"7d", "30d", "all"}
 _ALLOWED_CATEGORIES = {"survey", "comment", "interview", "annotate", "other"}
 _ALLOWED_STATUSES = {"running", "completed", "failed", "cancelled"}
+
+
+class UsageUnavailableError(RuntimeError):
+    """Usage could not be read; an empty/zero summary would be misleading."""
 
 
 def _utc_now() -> datetime:
@@ -338,7 +342,11 @@ def get_user_llm_usage(
     safe_offset = max(0, int(offset or 0))
     safe_limit = min(100, max(1, int(limit or 20)))
 
-    records = [_public_record(item) for item in load_llm_usage().get(owner_id, [])]
+    try:
+        owners = load_llm_usage()
+    except UsageStorageError as exc:
+        raise UsageUnavailableError("暂时无法读取用量记录，请稍后重试；这不代表没有用量") from exc
+    records = [_public_record(item) for item in owners.get(owner_id, [])]
     cutoff = None
     if selected_period != "all":
         days = 7 if selected_period == "7d" else 30

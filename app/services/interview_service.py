@@ -1,5 +1,6 @@
 """访谈报告完整流程：多 Sheet 证据归并、分模块写作、审校、归档与恢复。"""
 import asyncio
+from contextlib import aclosing
 import json
 import re
 from pathlib import Path
@@ -549,37 +550,38 @@ async def _collect_stage(
             ),
         )
         try:
-            async for result in _llm_with_heartbeats(
+            async with aclosing(_llm_with_heartbeats(
                 messages,
                 models=(candidate,),
                 task_key=task_key,
                 max_tokens=max_tokens,
                 reasoning_effort=reasoning,
-            ):
-                if result is None:
-                    yield (
-                        "heartbeat",
-                        sse_event(
-                            {
-                                "type": "heartbeat",
-                                "stage": stage,
-                                "percent": percent,
-                                "model": candidate,
-                                "is_fallback": is_fallback,
-                                "module_index": module_index,
-                                "total_modules": total_modules,
-                                "module_title": module_title,
-                            }
-                        ),
-                    )
-                    if await request.is_disconnected():
-                        return
-                    continue
-                answer, used_model = result
-                if stage not in {"extract", "audit", "review_audit"}:
-                    answer = _normalize_interview_markdown(answer)
-                yield ("result", (answer, used_model))
-                return
+            )) as _stage_stream:
+                async for result in _stage_stream:
+                    if result is None:
+                        yield (
+                            "heartbeat",
+                            sse_event(
+                                {
+                                    "type": "heartbeat",
+                                    "stage": stage,
+                                    "percent": percent,
+                                    "model": candidate,
+                                    "is_fallback": is_fallback,
+                                    "module_index": module_index,
+                                    "total_modules": total_modules,
+                                    "module_title": module_title,
+                                }
+                            ),
+                        )
+                        if await request.is_disconnected():
+                            return
+                        continue
+                    answer, used_model = result
+                    if stage not in {"extract", "audit", "review_audit"}:
+                        answer = _normalize_interview_markdown(answer)
+                    yield ("result", (answer, used_model))
+                    return
         except Exception as exc:
             last_error = exc
             previous_model = candidate
@@ -736,7 +738,7 @@ async def revise_interview_audit_issues_stream(
                 })
                 repaired_md = ""
                 repair_model = ""
-                async for kind, result in _collect_stage(
+                async with aclosing(_collect_stage(
                     messages=_module_repair_messages(
                         str(target_report.get("report_md") or ""),
                         target_module,
@@ -749,11 +751,12 @@ async def revise_interview_audit_issues_stream(
                     stage="review_repair",
                     percent=95 + min(2, module_number),
                     module_title=module_title,
-                ):
-                    if kind == "heartbeat":
-                        yield result
-                    else:
-                        repaired_md, repair_model = result
+                )) as _stage_stream:
+                    async for kind, result in _stage_stream:
+                        if kind == "heartbeat":
+                            yield result
+                        else:
+                            repaired_md, repair_model = result
                 if not repaired_md:
                     raise RuntimeError(f"模块“{module_title}”未返回有效修订内容")
 
@@ -779,18 +782,19 @@ async def revise_interview_audit_issues_stream(
             })
             audit_text = ""
             audit_model = ""
-            async for kind, result in _collect_stage(
+            async with aclosing(_collect_stage(
                 messages=_audit_messages(candidate_report_md, extraction),
                 model=INTERVIEW_AUDIT_MODEL,
                 reasoning=INTERVIEW_AUDIT_REASONING,
                 request=request,
                 stage="review_audit",
                 percent=98,
-            ):
-                if kind == "heartbeat":
-                    yield result
-                else:
-                    audit_text, audit_model = result
+            )) as _stage_stream:
+                async for kind, result in _stage_stream:
+                    if kind == "heartbeat":
+                        yield result
+                    else:
+                        audit_text, audit_model = result
             if not audit_text:
                 raise RuntimeError("统一复审未返回有效结果，整批报告未被修改")
 
@@ -869,6 +873,10 @@ async def revise_interview_audit_issues_stream(
                 "message": sess["interview_progress_message"],
                 **_session_result(sess),
             })
+        except (asyncio.CancelledError, GeneratorExit):
+            runtime_log('访谈报告', "info", "本次请求已停止，本地子任务已清理；已保存结果保留",
+                        session_id=session_id, stage='人工复核修订')
+            raise
         except Exception as exc:
             runtime_log(
                 "访谈报告", "error", "保存批量人工复核结果失败",
@@ -906,13 +914,14 @@ async def revise_interview_audit_issue_stream(
         "problem": str(issue.get("problem") or ""),
         "suggestion": str(issue.get("suggestion") or ""),
     }
-    async for chunk in revise_interview_audit_issues_stream(
+    async with aclosing(revise_interview_audit_issues_stream(
         session_id,
         [selection],
         request,
         login,
-    ):
-        yield chunk
+    )) as _stage_stream:
+        async for chunk in _stage_stream:
+            yield chunk
 
 
 async def _interview_report_stream(
@@ -953,7 +962,7 @@ async def _interview_report_stream(
                     message=sess["interview_progress_message"],
                 )
                 extraction_text = ""
-                async for kind, result in _collect_stage(
+                async with aclosing(_collect_stage(
                     messages=_extract_messages(
                         sess["interview_source_text"],
                         sess.get("interview_research_focus", ""),
@@ -964,11 +973,12 @@ async def _interview_report_stream(
                     request=request,
                     stage="extract",
                     percent=8,
-                ):
-                    if kind == "heartbeat":
-                        yield result
-                    else:
-                        extraction_text, models_used["extract"] = result
+                )) as _stage_stream:
+                    async for kind, result in _stage_stream:
+                        if kind == "heartbeat":
+                            yield result
+                        else:
+                            extraction_text, models_used["extract"] = result
                 if not extraction_text:
                     return
                 extraction = _parse_json_object(extraction_text, "证据归并")
@@ -1025,7 +1035,7 @@ async def _interview_report_stream(
                     module_title=title,
                 )
                 module_md = ""
-                async for kind, result in _collect_stage(
+                async with aclosing(_collect_stage(
                     messages=_module_messages(
                         module,
                         players,
@@ -1040,18 +1050,19 @@ async def _interview_report_stream(
                     module_index=index + 1,
                     total_modules=total_modules,
                     module_title=title,
-                ):
-                    if kind == "heartbeat":
-                        yield result
-                    else:
-                        module_md, models_used[f"module_{index + 1}"] = result
+                )) as _stage_stream:
+                    async for kind, result in _stage_stream:
+                        if kind == "heartbeat":
+                            yield result
+                        else:
+                            module_md, models_used[f"module_{index + 1}"] = result
                 if not module_md:
                     return
 
                 structure_issues = _module_structure_issues(module_md, title, valid_refs)
                 if structure_issues:
                     repaired_md = ""
-                    async for kind, result in _collect_stage(
+                    async with aclosing(_collect_stage(
                         messages=_module_repair_messages(
                             module_md,
                             module,
@@ -1066,11 +1077,12 @@ async def _interview_report_stream(
                         module_index=index + 1,
                         total_modules=total_modules,
                         module_title=title,
-                    ):
-                        if kind == "heartbeat":
-                            yield result
-                        else:
-                            repaired_md, models_used[f"module_{index + 1}_repair"] = result
+                    )) as _stage_stream:
+                        async for kind, result in _stage_stream:
+                            if kind == "heartbeat":
+                                yield result
+                            else:
+                                repaired_md, models_used[f"module_{index + 1}_repair"] = result
                     if not repaired_md:
                         return
                     module_md = repaired_md
@@ -1134,7 +1146,7 @@ async def _interview_report_stream(
                     total_modules=total_modules,
                 )
                 audit_text = ""
-                async for kind, result in _collect_stage(
+                async with aclosing(_collect_stage(
                     messages=_audit_messages(report_md, extraction),
                     model=INTERVIEW_AUDIT_MODEL,
                     reasoning=INTERVIEW_AUDIT_REASONING,
@@ -1142,11 +1154,12 @@ async def _interview_report_stream(
                     stage="audit",
                     percent=audit_percent,
                     total_modules=total_modules,
-                ):
-                    if kind == "heartbeat":
-                        yield result
-                    else:
-                        audit_text, models_used[f"audit_{repair_round + 1}"] = result
+                )) as _stage_stream:
+                    async for kind, result in _stage_stream:
+                        if kind == "heartbeat":
+                            yield result
+                        else:
+                            audit_text, models_used[f"audit_{repair_round + 1}"] = result
                 if not audit_text:
                     return
                 audit = _parse_json_object(audit_text, "报告审校")
@@ -1218,7 +1231,7 @@ async def _interview_report_stream(
                     if not issue_list:
                         continue
                     repaired_md = ""
-                    async for kind, result in _collect_stage(
+                    async with aclosing(_collect_stage(
                         messages=_module_repair_messages(
                             item["report_md"],
                             modules[index],
@@ -1233,13 +1246,14 @@ async def _interview_report_stream(
                         module_index=index + 1,
                         total_modules=total_modules,
                         module_title=title,
-                    ):
-                        if kind == "heartbeat":
-                            yield result
-                        else:
-                            repaired_md, models_used[
-                                f"module_{index + 1}_audit_repair_{repair_round + 1}"
-                            ] = result
+                    )) as _stage_stream:
+                        async for kind, result in _stage_stream:
+                            if kind == "heartbeat":
+                                yield result
+                            else:
+                                repaired_md, models_used[
+                                    f"module_{index + 1}_audit_repair_{repair_round + 1}"
+                                ] = result
                     if not repaired_md:
                         return
                     item["report_md"] = repaired_md.strip()
@@ -1306,6 +1320,10 @@ async def _interview_report_stream(
                 total_modules=total_modules,
             )
             yield sse_event({"type": "interview_done", **_session_result(sess)})
+        except (asyncio.CancelledError, GeneratorExit):
+            runtime_log('访谈报告', "info", "本次请求已停止，本地子任务已清理；已保存结果保留",
+                        session_id=session_id, stage='访谈报告生成')
+            raise
         except Exception as exc:
             sess["interview_status"] = "failed"
             sess["interview_progress_message"] = str(exc)
@@ -1334,11 +1352,13 @@ async def interview_report_stream(session_id: str, request: Request, login: dict
 
     @model_operation(resume_from="previous")
     async def run(previous=None):
-        async for item in _interview_report_stream(session_id, request, login):
-            yield item
+        async with aclosing(_interview_report_stream(session_id, request, login)) as source:
+            async for item in source:
+                yield item
 
     try:
-        async for item in run(previous=sess if resuming else None):
-            yield item
+        async with aclosing(run(previous=sess if resuming else None)) as source:
+            async for item in source:
+                yield item
     except ValueError as exc:
         yield sse_event({"type": "error", "message": str(exc)})

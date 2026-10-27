@@ -208,20 +208,38 @@ async def stream_with_llm_api_key(
         title=title,
         history_id=history_id,
     )
+    iterator = aiter(stream)
+    observer = recorder.on_attempt_event if recorder else None
+    status = "completed"
     try:
-        with bind_llm_api_key(api_key), bind_llm_attempt_observer(
-            recorder.on_attempt_event if recorder else None
-        ):
-            async for chunk in stream:
+        try:
+            while True:
+                # Restore the caller's context before yielding. Consumers may
+                # interleave streams or close one from a different task.
+                with bind_llm_api_key(api_key), bind_llm_attempt_observer(observer):
+                    try:
+                        chunk = await anext(iterator)
+                    except StopAsyncIteration:
+                        break
                 yield chunk
+        except (asyncio.CancelledError, GeneratorExit):
+            status = "cancelled"
+            raise
+        finally:
+            with bind_llm_api_key(api_key), bind_llm_attempt_observer(observer):
+                close = getattr(iterator, "aclose", None)
+                if close is not None:
+                    await close()
     except (asyncio.CancelledError, GeneratorExit):
-        _finish_usage_recorder(recorder, "cancelled")
+        status = "cancelled"
         raise
     except BaseException:
-        _finish_usage_recorder(recorder, "failed")
+        if status != "cancelled":
+            status = "failed"
         raise
-    else:
-        _finish_usage_recorder(recorder, "completed")
+    finally:
+        # Child cleanup may report its last usage event, so finish afterwards.
+        _finish_usage_recorder(recorder, status)
 
 
 async def run_with_llm_api_key(

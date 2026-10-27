@@ -9,7 +9,7 @@ from app.services.llm_credentials import (
     get_user_llm_key_status,
     validate_and_save_user_llm_api_key,
 )
-from app.services.llm_usage import get_user_llm_usage
+from app.services.llm_usage import UsageUnavailableError, get_user_llm_usage
 
 
 router = APIRouter()
@@ -43,14 +43,17 @@ async def get_profile_llm_usage(
     limit: int = Query(20, ge=1, le=100),
 ):
     login = await _profile_login(request)
-    return get_user_llm_usage(
-        login,
-        period=period,
-        category=category,
-        status=status,
-        offset=offset,
-        limit=limit,
-    )
+    try:
+        return get_user_llm_usage(
+            login,
+            period=period,
+            category=category,
+            status=status,
+            offset=offset,
+            limit=limit,
+        )
+    except UsageUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @router.put("/api/profile/llm-key")

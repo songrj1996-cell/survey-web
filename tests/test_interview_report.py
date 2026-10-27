@@ -1,3 +1,5 @@
+import asyncio
+from copy import deepcopy
 import json
 from pathlib import Path
 import tempfile
@@ -36,6 +38,93 @@ def _workbook_bytes() -> bytes:
 class _Request:
     async def is_disconnected(self):
         return False
+
+
+class InterviewCloseLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def check_close(self, stage, *, cancel=False, first=False):
+        sid = "72345678-1234-1234-1234-123456789abc"
+        workbook = parse_interview_workbook("合成访谈.xlsx", _workbook_bytes())
+        module = "## 战斗反馈\n\n### 模块判断\n\n需要理解原因。\n\n### 主要发现\n\n#### 发现1：反馈不足\n\nP01 希望失败后能立刻知道原因。[来源：记录者A!B2]\n\n### 产品建议\n\n增加提示。"
+        issue = {"module_title": "战斗反馈", "problem": "原因不够清楚", "suggestion": "补充原因"}
+        sess = {"session_id": sid, "kind": "interview", "mode": "interview", "filename": "合成访谈.xlsx",
+                "interview_workbook": workbook, "interview_source_text": serialize_interview_workbook(workbook)}
+        if stage != "extract":
+            sess["interview_extraction"] = {"players": [{"player_id": "P01"}], "modules": [{"title": "战斗反馈",
+                "evidence": [{"player_id": "P01", "source_refs": ["记录者A!B2"]}]}]}
+        if stage in {"audit", "single_review", "batch_review"}:
+            sess["interview_module_reports"] = [{"title": "战斗反馈", "report_md": module}]
+        if stage.endswith("review"):
+            sess.update(interview_status="completed", report_md="# 已存报告\n\n" + module,
+                        interview_audit={"status": "warning", "issues": [issue]})
+        stored_modules = deepcopy(sess.get("interview_module_reports"))
+        stored_report = sess.get("report_md")
+        started, closed = asyncio.Event(), asyncio.Event()
+        async def collector(*args, **kwargs):
+            try:
+                started.set()
+                await asyncio.Event().wait()
+            finally:
+                closed.set()
+        with patch.object(interview_service, "get_session", return_value=sess), \
+             patch.object(interview_service, "_visible_to_owner", return_value=True), \
+             patch.object(interview_service, "save_session"), \
+             patch.object(interview_service, "save_to_history") as archive, \
+             patch.object(interview_service, "LLM_STREAM_HEARTBEAT_SECONDS", 0.001), \
+             patch.object(interview_service, "runtime_log") as log, \
+             patch.object(interview_service, "collect_chat_completion", AsyncMock(side_effect=collector)) as model:
+            if stage == "single_review":
+                stream = interview_service.revise_interview_audit_issue_stream(sid, 0, _Request(), None)
+            elif stage == "batch_review":
+                stream = interview_service.revise_interview_audit_issues_stream(sid, [{"issue_index": 0, **issue}], _Request(), None)
+            else:
+                stream = interview_service.interview_report_stream(sid, _Request())
+            consumer = None
+            try:
+                if cancel:
+                    async def consume():
+                        async for _ in stream:
+                            pass
+                    consumer = asyncio.create_task(consume())
+                    await asyncio.wait_for(started.wait(), 2)
+                    consumer.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await consumer
+                else:
+                    for _ in range(12):
+                        await asyncio.wait_for(anext(stream), 2)
+                        if first or started.is_set():
+                            break
+                    await stream.aclose()
+                self.assertEqual(model.await_count, 0 if first else 1)
+                self.assertEqual(closed.is_set(), not first)
+                self.assertFalse(interview_service._INTERVIEW_LOCKS[sid].locked())
+                self.assertEqual(sess.get("interview_module_reports"), stored_modules)
+                self.assertEqual(sess.get("report_md"), stored_report)
+                archive.assert_not_called()
+                self.assertIn("已保存结果保留", log.call_args.args[2])
+                if stage.endswith("review"):
+                    self.assertEqual(sess["interview_status"], "completed")
+            finally:
+                if consumer is not None:
+                    consumer.cancel()
+                    await asyncio.gather(consumer, return_exceptions=True)
+                await stream.aclose()
+                interview_service._INTERVIEW_LOCKS.pop(sid, None)
+
+    async def test_all_generation_and_review_relays_close_waiting_model(self):
+        for stage in ("extract", "write", "audit", "single_review", "batch_review"):
+            with self.subTest(stage=stage):
+                await self.check_close(stage)
+
+    async def test_active_cancel_keeps_archived_content_and_releases_lock(self):
+        for stage in ("extract", "write", "audit", "single_review", "batch_review"):
+            with self.subTest(stage=stage):
+                await self.check_close(stage, cancel=True)
+
+    async def test_first_progress_close_starts_no_model(self):
+        for stage in ("extract", "write", "audit", "single_review", "batch_review"):
+            with self.subTest(stage=stage):
+                await self.check_close(stage, first=True)
 
 
 class InterviewParsingTests(unittest.TestCase):

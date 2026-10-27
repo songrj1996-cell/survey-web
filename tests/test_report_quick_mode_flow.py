@@ -389,15 +389,45 @@ class QuickReportFlowTests(unittest.IsolatedAsyncioTestCase):
 
 class QuickReportEndpointTests(unittest.TestCase):
     def test_mode_selection_is_owner_guarded_before_plan(self):
+        from pathlib import Path
+        import tempfile
+        from app.core import config
+        from app.services import auth, feature_access
+        from app.storage import sessions
+
         app = FastAPI()
         app.include_router(survey_router.router)
-        with TestClient(app) as client, patch.object(survey_router, 'require_session_request_access', new=AsyncMock()) as access, patch.object(survey_router, 'set_survey_analysis_settings', return_value={'report_mode': 'quick'}) as update:
-            response = client.post('/api/analysis-settings/s', json={'report_mode': 'quick'})
+        owner = {'email': 'owner@offline.invalid', 'name': '离线测试用户'}
+        with tempfile.TemporaryDirectory(prefix='quick-mode-session-') as folder, ExitStack() as stack:
+            stack.enter_context(patch.object(sessions, '_SESSION_DIR', Path(folder) / 'sessions'))
+            stack.enter_context(patch.object(config, 'FEISHU_LOGIN_REQUIRED', True))
+            gate_login = stack.enter_context(patch.object(auth, '_current_login', AsyncMock(return_value=owner)))
+            route_login = stack.enter_context(patch.object(survey_router, '_current_login', AsyncMock(return_value=owner)))
+            permissions = stack.enter_context(patch.object(feature_access, '_get_user_permission_levels', return_value={'survey': 'use'}))
+            access = stack.enter_context(patch.object(survey_router, 'require_session_request_access',
+                AsyncMock(wraps=survey_router.require_session_request_access)))
+            update = stack.enter_context(patch.object(survey_router, 'set_survey_analysis_settings', return_value={'report_mode': 'quick'}))
+            sid = sessions.new_session()
+            sessions.save_session(sid, {'mode': 'standard', 'owner_key': 'email:' + owner['email'],
+                'rows': [['ID', '体验'], ['P1', '合成回答']]})
+            client = stack.enter_context(TestClient(app))
+            path = '/api/analysis-settings/' + sid
+            response = client.post(path, json={'report_mode': 'quick'})
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.json()['report_mode'], 'quick')
-            update.assert_called_once_with('s', None, report_mode='quick')
+            update.assert_called_once_with(sid, None, report_mode='quick')
             access.assert_awaited_once()
-            self.assertEqual(client.post('/api/analysis-settings/s', json={'report_mode': 'invalid'}).status_code, 422)
+            self.assertEqual(client.post(path, json={'report_mode': 'invalid'}).status_code, 422)
+            invalid_session = client.post('/api/analysis-settings/s', json={'report_mode': 'quick'})
+            self.assertEqual(invalid_session.status_code, 400)
+            self.assertEqual(invalid_session.json()['detail'], '无效的会话 ID')
+            gate_login.return_value = route_login.return_value = {'email': 'other@offline.invalid'}
+            self.assertEqual(client.post(path, json={'report_mode': 'quick'}).status_code, 404)
+            gate_login.return_value = route_login.return_value = owner
+            permissions.return_value = {}
+            self.assertEqual(client.post(path, json={'report_mode': 'quick'}).status_code, 403)
+            update.assert_called_once_with(sid, None, report_mode='quick')
+            access.assert_awaited_once()
 
 
 if __name__ == '__main__':

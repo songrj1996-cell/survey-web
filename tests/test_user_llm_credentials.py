@@ -1,17 +1,131 @@
+import asyncio
 import json
 import os
 import tempfile
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from cryptography.fernet import Fernet
 from fastapi import HTTPException
 
-from app.core.llm_context import current_llm_api_key
+from app.core.llm_context import (current_llm_api_key, current_llm_attempt_observer,
+                                 bind_llm_api_key, bind_llm_attempt_observer)
 from app.routers import profile as profile_router
 from app.services import llm_credentials
 from app.storage import llm_credentials as credential_storage
 from app.storage import llm_usage as usage_storage
+
+
+class StreamCredentialLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_interleaved_streams_restore_caller_and_keep_usage_separate(self):
+        first, second = Mock(), Mock()
+        async def source():
+            for _ in range(2):
+                current_llm_attempt_observer()(current_llm_api_key())
+                yield current_llm_api_key()
+        with patch.object(llm_credentials, "_usage_recorder_for_request", AsyncMock(side_effect=[first, second])), \
+             bind_llm_api_key("caller-fixture"), bind_llm_attempt_observer(None):
+            a = llm_credentials.stream_with_llm_api_key(source(), "fixture-a")
+            b = llm_credentials.stream_with_llm_api_key(source(), "fixture-b")
+            try:
+                for stream, key in ((a, "fixture-a"), (b, "fixture-b"), (a, "fixture-a"), (b, "fixture-b")):
+                    self.assertEqual(await anext(stream), key)
+                    self.assertEqual(current_llm_api_key(), "caller-fixture")
+                    self.assertIsNone(current_llm_attempt_observer())
+                for stream in (a, b):
+                    with self.assertRaises(StopAsyncIteration):
+                        await anext(stream)
+            finally:
+                await b.aclose()
+                await a.aclose()
+        self.assertEqual(first.on_attempt_event.call_args_list, [unittest.mock.call("fixture-a")] * 2)
+        self.assertEqual(second.on_attempt_event.call_args_list, [unittest.mock.call("fixture-b")] * 2)
+        first.finish.assert_called_once_with("completed")
+        second.finish.assert_called_once_with("completed")
+
+    async def test_cross_task_close_waits_for_child_usage_before_finishing_once(self):
+        recorder, events = Mock(), []
+        recorder.finish.side_effect = lambda status: events.append(("finish", status))
+        async def source():
+            try:
+                yield "progress"
+            finally:
+                await asyncio.sleep(0)
+                self.assertEqual(current_llm_api_key(), "fixture-key")
+                self.assertEqual(current_llm_attempt_observer(), recorder.on_attempt_event)
+                events.append(("child", "closed"))
+        with patch.object(llm_credentials, "_usage_recorder_for_request", AsyncMock(return_value=recorder)):
+            wrapped = llm_credentials.stream_with_llm_api_key(source(), "fixture-key")
+            self.assertEqual(await asyncio.create_task(anext(wrapped)), "progress")
+            await wrapped.aclose()
+            await wrapped.aclose()
+        self.assertEqual(events, [("child", "closed"), ("finish", "cancelled")])
+        self.assertEqual(current_llm_api_key(), "")
+
+    async def test_independent_consumer_tasks_keep_key_and_observer_separate(self):
+        entered = [asyncio.Event(), asyncio.Event()]
+        recorders = [Mock(), Mock()]
+        async def consume(index):
+            async def source():
+                entered[index].set()
+                await entered[1 - index].wait()
+                current_llm_attempt_observer()(current_llm_api_key())
+                yield current_llm_api_key()
+            return [value async for value in llm_credentials.stream_with_llm_api_key(source(), f"fixture-{index}")]
+        with patch.object(llm_credentials, "_usage_recorder_for_request", AsyncMock(side_effect=recorders)):
+            results = await asyncio.wait_for(asyncio.gather(consume(0), consume(1)), 2)
+        self.assertEqual(results, [["fixture-0"], ["fixture-1"]])
+        for index, recorder in enumerate(recorders):
+            recorder.on_attempt_event.assert_called_once_with(f"fixture-{index}")
+            recorder.finish.assert_called_once_with("completed")
+        self.assertEqual(current_llm_api_key(), "")
+
+    async def test_concurrent_consumers_and_active_cancel_keep_context_and_status(self):
+        ready = asyncio.Event()
+        closed = asyncio.Event()
+        recorder = Mock()
+        async def source():
+            try:
+                ready.set()
+                await asyncio.Event().wait()
+                yield "unreachable"
+            finally:
+                self.assertEqual(current_llm_api_key(), "fixture-cancel")
+                closed.set()
+        with patch.object(llm_credentials, "_usage_recorder_for_request", AsyncMock(return_value=recorder)):
+            wrapped = llm_credentials.stream_with_llm_api_key(source(), "fixture-cancel")
+            task = asyncio.create_task(anext(wrapped))
+            await asyncio.wait_for(ready.wait(), 2)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            await wrapped.aclose()
+        self.assertTrue(closed.is_set())
+        recorder.finish.assert_called_once_with("cancelled")
+        self.assertEqual(current_llm_api_key(), "")
+
+    async def test_child_failure_and_cleanup_failure_finish_once_without_success(self):
+        for during_cleanup in (False, True):
+            with self.subTest(during_cleanup=during_cleanup):
+                recorder = Mock()
+                async def source():
+                    try:
+                        if not during_cleanup:
+                            raise RuntimeError("synthetic source failure")
+                        yield "progress"
+                    finally:
+                        if during_cleanup:
+                            raise RuntimeError("synthetic cleanup failure")
+                with patch.object(llm_credentials, "_usage_recorder_for_request", AsyncMock(return_value=recorder)):
+                    wrapped = llm_credentials.stream_with_llm_api_key(source(), "fixture-key")
+                    with self.assertRaises(RuntimeError):
+                        if during_cleanup:
+                            await anext(wrapped)
+                            await wrapped.aclose()
+                        else:
+                            await anext(wrapped)
+                recorder.finish.assert_called_once_with("cancelled" if during_cleanup else "failed")
+                self.assertEqual(current_llm_api_key(), "")
 
 
 class UserLlmCredentialTests(unittest.IsolatedAsyncioTestCase):

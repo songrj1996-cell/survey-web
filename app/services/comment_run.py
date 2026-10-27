@@ -28,6 +28,7 @@ async def comment_run_stream(session_id: str, request: Request):
     """评论舆情分析 SSE 流程（async generator）。"""
     sess = get_session(session_id)
     quote_task: asyncio.Task | None = None
+    failure_message: str | None = None
     try:
         if sess.get("comment_long_candidates"):
             quote_task = asyncio.create_task(_select_comment_raw_quotes(sess))
@@ -96,8 +97,26 @@ async def comment_run_stream(session_id: str, request: Request):
                 "selected_raw_comments": [],
                 "report_md": result.get("report_md") or "",
             })
+    except (asyncio.CancelledError, GeneratorExit):
+        runtime_log(
+            "评论分析", "info", "评论分析已停止；已保存的结果仍保留",
+            stage="停止处理", session_id=session_id,
+        )
+        raise
     except Exception as e:
-        if quote_task and not quote_task.done():
-            quote_task.cancel()
+        failure_message = str(e)
+    finally:
+        if quote_task is not None:
+            unfinished = not quote_task.done()
+            if unfinished:
+                quote_task.cancel()
+            # Closing the stream, cancellation and early returns all own this
+            # child. Also retrieve exceptions from a child already completed.
             await asyncio.gather(quote_task, return_exceptions=True)
-        yield sse_event({"type": "error", "message": str(e)})
+            if unfinished:
+                runtime_log(
+                    "评论分析", "info", "已停止并回收未完成的玩家原文精选任务",
+                    stage="结束原文精选", session_id=session_id,
+                )
+    if failure_message is not None:
+        yield sse_event({"type": "error", "message": failure_message})
