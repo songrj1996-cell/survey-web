@@ -1,5 +1,7 @@
 # 核验检查点保存的 Windows 临时冲突修复
 
+本文件主体保留独立 BUG 阶段的验收快照。随后用户批准的提交与整合已完成：独立 BUG 分支提交为 `5fd08b4`，设置分支通过 `c5bf4d1` 合入该实现，再通过 `b8ef9c0` 整合 main@`2da56d7`，两次无冲突。组合版本的 87 项报告用例全部通过；完整 285 项回归另有未改动群组存储的一项错误、80 项报告前端另有旧设置测试夹具七项失败，故整体 NO-GO。详情及新增测试范围方案见本设置工作树 `docs/settings-navigation.md`。没有合入主干、推送、部署、调用真实模型或操作真实数据。下文“尚未提交”“未整合”等状态仅指独立阶段。
+
 本次为独立 BUG 修复。用户已批准 `app/storage/report_postwrite_runs.py`、`tests/test_report_postwrite_flow.py` 和本文档三个文件，工作树为 `C:/Users/admin/.codex/worktrees/postwrite-checkpoint-storage/survey-web`，分支 `codex/bugfix-postwrite-checkpoint-storage`，基线 `main@65144bcd418e36c812bfc0c37b2fa179a4ffd3bc`。日志筛选栏修复留在原设置工作树，两者分别验收，不在本轮整合。
 
 ## 复现与原因
