@@ -181,8 +181,8 @@ test('bounded preview timing uses only local formatting and preserves the Markdo
   fs.writeFileSync(path.join(artifacts, 'preview-timing.json'), JSON.stringify(metrics, null, 2));
 });
 
-test('case typography and numbered subheadings stay readable on desktop and narrow light/dark pages', async t => {
-  const md = '# 合成展示报告\n\n## 四、合成章节\n\n### 4.1 **合成小节标题**\n\n普通报告正文，其中有**黑体加粗文本**。\n\n典型玩家案例｜R26：这是合成玩家的经历，案例内容应小于普通正文。\n\nR56：第二段合成案例，保留玩家编号与完整文字。\n\n### 5.1 合成第二小节\n\n普通分析段落不进入案例框。\n\n#### 典型玩家案例 | R73：标题形式的合成案例。';
+test('case typography and peer subheadings stay readable on desktop and narrow light/dark pages', async t => {
+  const md = '# 合成展示报告\n\n## 四、合成章节\n\n### 4.1 **合成小节标题**\n\n普通报告正文，其中有**黑体加粗文本**。\n\n典型玩家案例｜R26：这是合成玩家的经历，案例内容应小于普通正文。\n\nR56：第二段合成案例，保留玩家编号与完整文字。\n\n### 5.1 合成第二小节\n\n普通分析段落不进入案例框。\n\n## 八、优化建议\n\n### 第一优先：合成优化方向\n\n合成建议正文。\n\n### 定位层面的提醒\n\n同一层级的无编号标题采用相同格式。\n\n### 典型玩家案例 | R73：标题形式的合成案例。';
   const evidence = [];
   for (const width of [1100, 390]) {
     const page = await fixture(t, md, {status: 'complete'}, width);
@@ -198,10 +198,12 @@ test('case typography and numbered subheadings stay readable on desktop and narr
         };
         const el = document.getElementById('report-content');
         return {normal: style(el.querySelector('p')), strong: style(el.querySelector('p strong')),
+          chapters: [...el.querySelectorAll('h2')].map(style),
           cases: [...el.querySelectorAll('.report-player-case')].map(style),
           labels: [...el.querySelectorAll('.report-player-case__label')].map(label => ({...style(label), visibleText: label.innerText.trim()})),
-          subheadings: [...el.querySelectorAll('h3.report-postwrite-subheading')].map(heading => ({...style(heading),
+          subheadings: [...el.querySelectorAll('h3.report-postwrite-subheading')].map(heading => ({...style(heading), text: heading.textContent,
             strongColor: heading.querySelector('strong') ? getComputedStyle(heading.querySelector('strong')).color : null})),
+          caseHeadingStyledAsSection: [...el.querySelectorAll('.report-player-case h3')].some(heading => heading.classList.contains('report-postwrite-subheading')),
           separators: [...el.querySelectorAll('.report-player-case__separator')].map(separator => getComputedStyle(separator).display),
           background: getComputedStyle(document.body).backgroundColor,
           noOverflow: [...el.querySelectorAll('.report-player-case')].every(box => box.scrollWidth <= box.clientWidth + 1)};
@@ -212,9 +214,13 @@ test('case typography and numbered subheadings stay readable on desktop and narr
       assert(metrics.labels.every(item => item.size === '15px' && item.weight === '700' && item.visibleText === '典型玩家案例'));
       assert.equal(metrics.separators.length, 2);
       assert(metrics.separators.every(display => display === 'none'));
-      assert.equal(metrics.subheadings.length, 2);
+      assert.equal(metrics.subheadings.length, 4);
+      assert(metrics.subheadings.some(item => item.text.startsWith('第一优先')));
+      assert(metrics.subheadings.some(item => item.text === '定位层面的提醒'));
+      assert(metrics.chapters.every(item => item.size === '16px'));
+      assert.equal(metrics.caseHeadingStyledAsSection, false);
       const purple = theme === 'light' ? 'rgb(109, 40, 217)' : 'rgb(167, 139, 250)';
-      assert(metrics.subheadings.every(item => item.color === purple && item.weight === '700'));
+      assert(metrics.subheadings.every(item => item.size === '15px' && item.color === purple && item.weight === '700'));
       assert.equal(metrics.subheadings[0].strongColor, purple);
       assert.notEqual(metrics.strong.color, purple);
       function luminance(rgb) {
