@@ -13,7 +13,7 @@ const renderer = core.slice(core.indexOf('function renderMarkdown(md)'), core.in
 const review = fs.readFileSync(path.join(root, 'static/js/features/report-postwrite-review.js'), 'utf8');
 const marked = fs.readFileSync(path.join(path.dirname(require.resolve('marked')), 'marked.umd.js'), 'utf8');
 const css = fs.readFileSync(path.join(root, 'static/style.css'), 'utf8');
-const artifacts = path.join(root, '.test-artifacts/player-cases');
+const artifacts = path.join(root, '.test-artifacts/player-case-typography');
 let browser;
 
 test.before(async () => {
@@ -179,4 +179,108 @@ test('bounded preview timing uses only local formatting and preserves the Markdo
   assert.equal(metrics.markdownUnchanged, true);
   fs.mkdirSync(artifacts, {recursive: true});
   fs.writeFileSync(path.join(artifacts, 'preview-timing.json'), JSON.stringify(metrics, null, 2));
+});
+
+test('case typography and numbered subheadings stay readable on desktop and narrow light/dark pages', async t => {
+  const md = '# 合成展示报告\n\n## 四、合成章节\n\n### 4.1 **合成小节标题**\n\n普通报告正文，其中有**黑体加粗文本**。\n\n典型玩家案例｜R26：这是合成玩家的经历，案例内容应小于普通正文。\n\nR56：第二段合成案例，保留玩家编号与完整文字。\n\n### 5.1 合成第二小节\n\n普通分析段落不进入案例框。\n\n#### 典型玩家案例 | R73：标题形式的合成案例。';
+  const evidence = [];
+  for (const width of [1100, 390]) {
+    const page = await fixture(t, md, {status: 'complete'}, width);
+    for (const theme of ['light', 'dark']) {
+      await page.evaluate(theme => { document.documentElement.dataset.theme = theme; }, theme);
+      await page.locator('body').evaluate(async body => {
+        await Promise.all(body.getAnimations().map(animation => animation.finished.catch(() => {})));
+      });
+      const metrics = await page.evaluate(() => {
+        const style = element => {
+          const value = getComputedStyle(element);
+          return {size: value.fontSize, weight: value.fontWeight, color: value.color};
+        };
+        const el = document.getElementById('report-content');
+        return {normal: style(el.querySelector('p')), strong: style(el.querySelector('p strong')),
+          cases: [...el.querySelectorAll('.report-player-case')].map(style),
+          labels: [...el.querySelectorAll('.report-player-case__label')].map(label => ({...style(label), visibleText: label.innerText.trim()})),
+          subheadings: [...el.querySelectorAll('h3.report-postwrite-subheading')].map(heading => ({...style(heading),
+            strongColor: heading.querySelector('strong') ? getComputedStyle(heading.querySelector('strong')).color : null})),
+          separators: [...el.querySelectorAll('.report-player-case__separator')].map(separator => getComputedStyle(separator).display),
+          background: getComputedStyle(document.body).backgroundColor,
+          noOverflow: [...el.querySelectorAll('.report-player-case')].every(box => box.scrollWidth <= box.clientWidth + 1)};
+      });
+      assert.equal(metrics.normal.size, '14px');
+      assert.equal(metrics.cases.length, 2);
+      assert(metrics.cases.every(item => item.size === '13px'));
+      assert(metrics.labels.every(item => item.size === '15px' && item.weight === '700' && item.visibleText === '典型玩家案例'));
+      assert.equal(metrics.separators.length, 2);
+      assert(metrics.separators.every(display => display === 'none'));
+      assert.equal(metrics.subheadings.length, 2);
+      const purple = theme === 'light' ? 'rgb(109, 40, 217)' : 'rgb(167, 139, 250)';
+      assert(metrics.subheadings.every(item => item.color === purple && item.weight === '700'));
+      assert.equal(metrics.subheadings[0].strongColor, purple);
+      assert.notEqual(metrics.strong.color, purple);
+      function luminance(rgb) {
+        const [r, g, b] = rgb.match(/\d+/g).slice(0, 3).map(Number).map(n => n / 255)
+          .map(n => n <= 0.04045 ? n / 12.92 : ((n + 0.055) / 1.055) ** 2.4);
+        return r * .2126 + g * .7152 + b * .0722;
+      }
+      const foreground = luminance(purple), background = luminance(metrics.background);
+      const contrast = (Math.max(foreground, background) + .05) / (Math.min(foreground, background) + .05);
+      assert(contrast >= 4.5, '小节标题对比度不足：' + contrast);
+      assert(metrics.noOverflow);
+      assert.equal(await page.locator('#report-content').textContent(), await page.evaluate(() => beforeCaseText));
+      evidence.push({width, theme, ...metrics, subheadingContrast: contrast});
+      fs.mkdirSync(artifacts, {recursive: true});
+      await page.screenshot({path: path.join(artifacts, `typography-${width}-${theme}.png`), fullPage: true});
+    }
+  }
+  fs.writeFileSync(path.join(artifacts, 'typography-metrics.json'), JSON.stringify(evidence, null, 2));
+});
+
+test('hiding a label separator preserves body punctuation and restores ordinary versions exactly', async t => {
+  const md = '## 合成章节\n\n### 4.1 合成小节\n\n典型玩家案例｜R73：正文里的 A|B、C｜D 均保留。';
+  const page = await fixture(t, md);
+  assert.equal(await page.locator('.report-player-case__separator').count(), 1);
+  assert.match(await page.locator('.report-player-case').innerText(), /A\|B、C｜D/);
+  await page.evaluate(() => {
+    const el = document.getElementById('report-content');
+    applyPostwritePlayerCases(el, caseContext);
+    applyPostwritePlayerCases(el, {reportAudit: null});
+  });
+  assert.equal(await page.locator('.report-player-case__separator, .report-postwrite-subheading, .report-player-case__label').count(), 0);
+  assert.equal(await page.locator('#report-content').textContent(), await page.evaluate(() => beforeCaseText));
+  assert.match(await page.locator('#report-content').innerText(), /典型玩家案例｜R73/);
+  assert.equal(await page.locator('h3').evaluate(node => getComputedStyle(node).fontWeight), '600');
+  await page.evaluate(() => {
+    const el = document.getElementById('report-content');
+    applyPostwritePlayerCases(el, caseContext);
+    applyPostwritePlayerCases(el, caseContext);
+  });
+  assert.equal(await page.locator('.report-player-case__separator').count(), 1);
+  assert.equal(await page.locator('.report-player-case__label').count(), 1);
+  assert.equal(await page.locator('.report-postwrite-subheading').count(), 1);
+});
+
+test('real review panel button locates a case containing the hidden separator and a repeated sentence', async t => {
+  const original = '典型玩家案例｜R73：**合成玩家**需要时间熟悉规则。';
+  const md = '# 合成报告\n\n## 定位章节\n\n### 4.1 合成小节\n\n' + original + '\n\n## 对照章节\n\n' + original;
+  const page = await fixture(t, md);
+  const model = await page.evaluate(({md, original}) => {
+    const ctx = {reportMd: md, reportAudit: {status: 'complete', checks: [{id: 'C001', verdict: 'issue', complete: true,
+      original, reason: '合成定位提示', sources: []}], checkpoint: {registry: {complete: true,
+        claims: [{id: 'C001', original, block_ids: ['B0004']}]}}}};
+    const model = PostwriteReview.build(ctx);
+    const panel = document.createElement('section'); panel.id = 'synthetic-review'; document.body.appendChild(panel);
+    PostwriteReview.render(panel, model, {canEdit: false, busy: false,
+      onLocate: issue => { window.locatedThroughButton = PostwriteReview.locate(document.getElementById('report-content'), issue); }});
+    return {issues: model.issues.length, canLocate: model.issues[0].canLocate};
+  }, {md, original});
+  assert.equal(model.issues, 1);
+  assert(model.canLocate);
+  await page.getByRole('button', {name: '定位到报告原句', exact: true}).click();
+  assert(await page.evaluate(() => locatedThroughButton));
+  const marks = await page.locator('mark.postwrite-report-highlight').evaluateAll(nodes => ({count: nodes.length,
+    firstCaseOnly: nodes.every(node => node.closest('.report-player-case') === document.querySelector('.report-player-case'))}));
+  assert(marks.count > 0 && marks.firstCaseOnly);
+  assert.equal(await page.locator('.report-player-case__separator').first().evaluate(node => getComputedStyle(node).display), 'none');
+  await page.evaluate(() => PostwriteReview.clearHighlights(document.getElementById('report-content')));
+  assert.equal(await page.locator('#report-content').textContent(), await page.evaluate(() => beforeCaseText));
 });
