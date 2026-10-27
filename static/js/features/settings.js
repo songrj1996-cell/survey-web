@@ -54,28 +54,49 @@ document.addEventListener('keydown', async e => {
 // ============================================================
 
 const STAB_LOADERS = {
-  texts: loadUiTextsSettings,
   prompts: () => loadPrompts(true),
   glossary: () => loadGlossary(true),
   models: () => window.ModelSettings.load(),
+  functions: () => loadSystemSettings('functions'),
   system: loadSystemSettings,
   perms: loadPermsTab,
   audit: loadAuditLogsTab,
 };
 
+const SETTINGS_PAGES = {
+  models: ['模型管理', '按业务环节维护模型、推理程度与备用配置。'],
+  prompts: ['提示词管理', '维护各业务环节的提示词，核对修改内容与版本历史。'],
+  glossary: ['术语库', '统一专有名词、译名和别名，支持维护与批量导入。'],
+  functions: ['功能设置', '控制业务入口和处理流程；具体生效范围以各项说明为准。'],
+  system: ['平台设置', '管理个人使用偏好；当前查看范围仅对当前管理员账号生效。'],
+  perms: ['成员与权限', '维护成员状态和功能授权，核对权限变更记录。'],
+  audit: ['操作日志', '查询操作记录，核对时间、结果及失败说明。'],
+};
+const SETTINGS_LAST_TAB = 'settings-last-tab';
+
 async function switchSettingsTab(name) {
+  if (!STAB_LOADERS[name] || !PlatformPermissions.canOpenTab(name)) return false;
   if (window.membersHasDraft?.() && !await window.membersMayLeave()) return;
-  const feature = PlatformPermissions.catalog().flatMap(group => group.children).find(item => item.tab === name);
-  if (feature && !PlatformPermissions.allowed(feature.key)) return;
   document.querySelectorAll('.settings-nav__item').forEach(el => {
     el.classList.toggle('settings-nav__item--active', el.dataset.stab === name);
+    if (el.dataset.stab === name) el.setAttribute('aria-current', 'page');
+    else el.removeAttribute('aria-current');
   });
-  ['texts', 'prompts', 'glossary', 'models', 'system', 'perms', 'audit'].forEach(k => {
+  Object.keys(STAB_LOADERS).forEach(k => {
     const el = $(`stab-content-${k}`);
     if (el) el.style.display = k === name ? '' : 'none';
   });
+  const heading = $('settings-page-heading');
+  if (heading) {
+    // Existing editors already provide their page title, description and status.
+    heading.hidden = ['models', 'prompts', 'glossary', 'perms'].includes(name);
+    $('settings-page-title').textContent = SETTINGS_PAGES[name][0];
+    $('settings-page-description').textContent = SETTINGS_PAGES[name][1];
+  }
+  try { localStorage.setItem(SETTINGS_LAST_TAB, name); } catch {}
   if (name !== 'prompts') closePromptEditor();
-  if (STAB_LOADERS[name]) STAB_LOADERS[name]();
+  await STAB_LOADERS[name]();
+  return true;
 }
 
 document.querySelectorAll('.settings-nav__item[data-stab]').forEach(el => {
@@ -88,10 +109,18 @@ document.querySelectorAll('.settings-nav__item[data-stab]').forEach(el => {
   const toggleBtn = $('btn-settings-nav-toggle');
   if (!nav || !toggleBtn) return;
   const STORAGE_KEY = 'settings-nav-collapsed';
-  if (localStorage.getItem(STORAGE_KEY) === '1') nav.classList.add('settings-nav--collapsed');
+  try { if (localStorage.getItem(STORAGE_KEY) === '1') nav.classList.add('settings-nav--collapsed'); } catch {}
+  const updateLabel = () => {
+    const collapsed = nav.classList.contains('settings-nav--collapsed');
+    toggleBtn.title = collapsed ? '展开导航' : '折叠导航';
+    toggleBtn.setAttribute('aria-label', toggleBtn.title);
+    toggleBtn.setAttribute('aria-expanded', String(!collapsed));
+  };
+  updateLabel();
   toggleBtn.addEventListener('click', () => {
     const collapsed = nav.classList.toggle('settings-nav--collapsed');
-    localStorage.setItem(STORAGE_KEY, collapsed ? '1' : '0');
+    try { localStorage.setItem(STORAGE_KEY, collapsed ? '1' : '0'); } catch {}
+    updateLabel();
   });
 })();
 
@@ -110,9 +139,13 @@ document.querySelectorAll('.settings-nav__item[data-stab]').forEach(el => {
 
 function loadActiveSettingsTab() {
   const active = document.querySelector('.settings-nav__item--active');
-  const allowedTab = PlatformPermissions.catalog().flatMap(group => group.children).find(item => item.tab && PlatformPermissions.allowed(item.key))?.tab;
-  const name = active && active.style.display !== 'none' ? active.dataset.stab : allowedTab;
-  switchSettingsTab(name);
+  let remembered;
+  try { remembered = localStorage.getItem(SETTINGS_LAST_TAB); } catch {}
+  const first = [...document.querySelectorAll('.settings-nav__item[data-stab]')]
+    .find(item => PlatformPermissions.canOpenTab(item.dataset.stab))?.dataset.stab;
+  const name = [remembered, active?.dataset.stab, first].find(tab => tab && PlatformPermissions.canOpenTab(tab));
+  if (name) return switchSettingsTab(name);
+  return false;
 }
 
 // ── 术语库 ──────────────────────────────────────────────────
@@ -1078,7 +1111,7 @@ async function loadAuditLogsTab() {
     if (!resp.ok) throw new Error(data.detail || '加载失败');
     renderAuditLogsTab(data);
   } catch (e) {
-    body.innerHTML = `<div class="hist-empty">加载用户日志失败：${esc(e.message)}</div>`;
+    body.innerHTML = `<div class="hist-empty">加载操作日志失败：${esc(e.message)}</div>`;
   }
 }
 
@@ -1821,57 +1854,6 @@ async function loadPrompts(force = false) {
   }
 }
 
-async function loadUiTextsSettings() {
-  const body = $('stab-content-texts');
-  body.innerHTML = `<div class="hist-empty"><div class="spinner" style="margin:0 auto"></div></div>`;
-  try {
-    const resp = await fetch('/api/ui-texts');
-    if (!resp.ok) throw new Error('加载失败');
-    const texts = await resp.json();
-    body.innerHTML = Object.entries(texts).map(([key, item]) => `
-      <div class="uitext-card" data-uitext-key="${esc(key)}">
-        <div class="uitext-card__label">${esc(item.label)}</div>
-        <textarea class="prompt-textarea uitext-textarea" rows="2">${esc(item.current)}</textarea>
-        <div class="uitext-card__actions">
-          <button class="btn btn--primary btn--sm" data-uitext-save="${esc(key)}">保存</button>
-        </div>
-      </div>
-    `).join('');
-    if (!PlatformPermissions.canUse('ui_texts')) {
-      body.querySelectorAll('textarea').forEach(el=>el.readOnly=true);
-      body.querySelectorAll('[data-uitext-save]').forEach(el=>el.disabled=true);
-    }
-  } catch (e) {
-    body.innerHTML = `<div class="hist-empty">加载失败：${esc(e.message)}</div>`;
-  }
-}
-
-$('stab-content-texts').addEventListener('click', async e => {
-  const btn = e.target.closest('[data-uitext-save]');
-  if (!btn) return;
-  const key = btn.dataset.uitextSave;
-  const card = btn.closest('.uitext-card');
-  const textarea = card.querySelector('.uitext-textarea');
-  try {
-    btn.textContent = '保存中…';
-    btn.disabled = true;
-    const resp = await fetch(`/api/ui-texts/${key}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ content: textarea.value }),
-    });
-    if (!resp.ok) { const d = await resp.json(); throw new Error(d.detail || '保存失败'); }
-    showToast('文案已保存', 'success');
-    const el = document.querySelector(`[data-uitext="${key}"]`);
-    if (el) el.textContent = textarea.value;
-  } catch (err) {
-    showToast(`保存失败：${err.message}`, 'error');
-  } finally {
-    btn.textContent = '保存';
-    btn.disabled = false;
-  }
-});
-
 window.addEventListener('storage', event => {
   if (event.key === 'group-management-scope-updated') {
     window.dispatchEvent(new Event('group-management-scope-changed'));
@@ -1879,14 +1861,14 @@ window.addEventListener('storage', event => {
   }
 });
 
-async function loadSystemSettings() {
-  const body = $('stab-content-system');
+async function loadSystemSettings(section = 'system') {
+  const body = $(section === 'functions' ? 'stab-content-functions' : 'stab-content-system');
   body.innerHTML = `<div class="hist-empty"><div class="spinner" style="margin:0 auto"></div></div>`;
   try {
     const resp = await fetch('/api/app-settings');
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.detail || '加载失败');
-    body.innerHTML = `
+    body.innerHTML = section === 'functions' ? `
       <div class="uitext-card">
         <div class="uitext-card__label" id="duplicate-reminder-settings-title">重复文件提醒</div>
         <div class="prompt-card__desc">各功能独立控制。开启后，发现匹配的历史报告时，会提示查看已有报告或重新分析；关闭后按正常流程继续。保存后对下一次操作生效。</div>
@@ -1925,7 +1907,7 @@ async function loadSystemSettings() {
           <span>先写作后核验</span>
         </label>
       </div>
-      ${data.group_management_preferences ? `
+    ` : data.group_management_preferences ? `
       <div class="uitext-card">
         <div class="uitext-card__label">群组管理 · 个人查看范围</div>
         <div class="prompt-card__desc">仅对当前管理员账号生效。勾选后，质量标注、奖励导入、其他奖励和奖励批次仅显示自己创建的记录；取消后可查看并操作全部记录。共享名单配置仍可使用，已启动的后台标注继续执行。</div>
@@ -1933,11 +1915,10 @@ async function loadSystemSettings() {
           <input type="checkbox" id="setting-group-only-self" data-revision="${data.group_management_preferences.revision}" ${data.group_management_preferences.only_self ? 'checked' : ''} />
           <span>仅看自己</span>
         </label>
-      </div>` : ''}
-    `;
+      </div>` : '<div class="hist-empty">当前账号没有可调整的平台偏好。</div>';
     if (!PlatformPermissions.canUse('platform')) body.querySelectorAll('input').forEach(el=>el.disabled=true);
   } catch (e) {
-    body.innerHTML = `<div class="hist-empty">加载平台设置失败：${esc(e.message)}</div>`;
+    body.innerHTML = `<div class="hist-empty">加载${section === 'functions' ? '功能设置' : '平台设置'}失败：${esc(e.message)}</div>`;
   }
 }
 
@@ -1969,7 +1950,7 @@ async function saveGroupManagementScope(input) {
   } finally { input.disabled = false; }
 }
 
-$('stab-content-system')?.addEventListener('change', async e => {
+$('settings-content')?.addEventListener('change', async e => {
   if (e.target.id === 'setting-group-only-self') {
     await saveGroupManagementScope(e.target);
     return;
@@ -1994,7 +1975,7 @@ $('stab-content-system')?.addEventListener('change', async e => {
     if (!resp.ok) throw new Error(data.detail || '保存失败');
     input.checked = !!data[settingKey];
     showToast(settingKey === 'report_postwrite_enabled'
-      ? `先写作后核验已${input.checked ? '开启' : '关闭'}，对后续操作立即生效` : '平台设置已保存', 'success');
+      ? `先写作后核验已${input.checked ? '开启' : '关闭'}，对后续操作立即生效` : '功能设置已保存', 'success');
     if (settingKey === 'report_quick_mode_enabled'
         && state.currentStep === 2 && state.sessionId
         && !state.reportStyleSelection?.locked

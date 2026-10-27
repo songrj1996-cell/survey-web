@@ -1,22 +1,33 @@
 // Server-supplied permission catalog is the single source for menu and checkbox labels.
 window.PlatformPermissions = (() => {
-  let catalog = [], levels = {}, settingsVisible = false;
+  let catalog = [], levels = {}, settingsVisible = false, isAdmin = false;
   const allowed = key => Object.prototype.hasOwnProperty.call(levels, key);
   const canUse = key => levels[key] === 'use';
+  const tabs = feature => feature.tabs || (feature.tab ? [feature.tab] : []);
+  const featureForTab = name => catalog.flatMap(group => group.children).find(feature => tabs(feature).includes(name));
+  const canOpenTab = name => {
+    const feature = featureForTab(name);
+    return !!feature && allowed(feature.key) && (!feature.admin_only || isAdmin)
+      && (!(feature.admin_tabs || []).includes(name) || isAdmin);
+  };
   function apply(identity) {
     catalog = identity.feature_catalog || [];
     levels = identity.permission_levels || Object.fromEntries((identity.perms || []).map(key => [key, 'use']));
+    isAdmin = identity.is_admin === true;
     const navigation = document.querySelector('.sidebar__nav');
     settingsVisible = false;
+    document.querySelectorAll('.settings-nav__item[data-stab]').forEach(tab => { tab.style.display = 'none'; });
     catalog.forEach(group => {
       // Settings stay inside their drawer; the main sidebar has one footer entry.
       if (group.key === 'settings') {
         group.children.forEach(feature => {
-          const show = allowed(feature.key) && (!feature.admin_only || identity.is_admin);
-          document.querySelectorAll(`.settings-nav__item[data-stab="${feature.tab}"]`).forEach(tab => {
-            tab.style.display = show ? '' : 'none';
+          tabs(feature).forEach(name => {
+            const show = canOpenTab(name);
+            document.querySelectorAll(`.settings-nav__item[data-stab="${name}"]`).forEach(tab => {
+              tab.style.display = show ? '' : 'none';
+            });
+            if (show) settingsVisible = true;
           });
-          if (show && (identity.is_admin || canUse(feature.key))) settingsVisible = true;
         });
         return;
       }
@@ -42,7 +53,17 @@ window.PlatformPermissions = (() => {
     });
     const settingsEntry = document.getElementById('nav-settings');
     if (settingsEntry) settingsEntry.hidden = !settingsVisible;
-    ['settings-nav-admin-label','settings-nav-admin-sep'].forEach(id => { const el = document.getElementById(id); if (el) el.style.display = 'none'; });
+    document.querySelectorAll('[data-settings-group]').forEach(group => {
+      group.hidden = ![...group.querySelectorAll('.settings-nav__item[data-stab]')].some(item => canOpenTab(item.dataset.stab));
+    });
+    const active = document.querySelector('.settings-nav__item--active');
+    if (active && !canOpenTab(active.dataset.stab)) {
+      active.classList.remove('settings-nav__item--active');
+      active.removeAttribute('aria-current');
+      document.querySelectorAll('[data-settings-panel]').forEach(panel => { panel.style.display = 'none'; });
+      const heading = document.getElementById('settings-page-heading');
+      if (heading) heading.hidden = true;
+    }
     return catalog.flatMap(group => group.children.filter(f => !f.tab && allowed(f.key)).map(f => f.key));
   }
   function tree(container, selected = [], disabled = false) {
@@ -67,7 +88,7 @@ window.PlatformPermissions = (() => {
       inputs.forEach(input => input.onchange = update); update(); container.append(fieldset);
     });
   }
-  return {apply, allowed, canUse, tree, canOpenSettings: () => settingsVisible, catalog: () => catalog, selected: element => [...element.querySelectorAll('[data-permission]:checked')].map(input => input.value)};
+  return {apply, allowed, canUse, tree, canOpenTab, featureForTab, canOpenSettings: () => settingsVisible, catalog: () => catalog, selected: element => [...element.querySelectorAll('[data-permission]:checked')].map(input => input.value)};
 })();
 
 window.workflowTime = value => {

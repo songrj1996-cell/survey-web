@@ -10,6 +10,24 @@ from app.core import runtime_logging
 
 
 class RuntimeLoggingTests(unittest.TestCase):
+    def test_settings_actions_and_retired_copy_explain_result_without_content(self):
+        cases = (
+            ("GET", "/api/app-settings", "读取功能与平台设置"),
+            ("PATCH", "/api/app-settings", "修改功能设置"),
+            ("PATCH", "/api/group-management/preferences", "修改群组管理个人查看范围"),
+            ("GET", "/api/ui-texts", "读取固定页面文案"),
+        )
+        for method, path, phrase in cases:
+            with self.subTest(path=path):
+                self.assertIn(phrase, self.access(method, path, streaming=False))
+        rendered = self.access("PUT", "/api/ui-texts/upload_guide", 410, streaming=False)
+        self.assertIn("此入口已停用，请刷新页面", rendered)
+        self.assertIn("需要调整文案时请修改程序", rendered)
+        self.assertIn("HTTP 410", rendered)
+        self.assertIn("/api/ui-texts/upload_guide", rendered)
+        self.assertIn("操作人：日志测试员", rendered)
+        self.assertNotIn("[成功]", rendered)
+
     def access(self, method, path, status=200, *, streaming=None):
         runtime_logging.register_access_operator(("127.0.0.1", 50401), "日志测试员", streaming=streaming)
         record = logging.LogRecord(

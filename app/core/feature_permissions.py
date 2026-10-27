@@ -13,13 +13,13 @@ FEATURE_TREE = [
         {"key": "roster", "label": "名单来源"},
     ]},
     {"key": "settings", "label": "设置", "children": [
-        {"key": "ui_texts", "label": "页面文案", "tab": "texts"},
         {"key": "prompts", "label": "提示词管理", "tab": "prompts"},
         {"key": "glossary", "label": "术语库", "tab": "glossary"},
         {"key": "model_settings", "label": "模型管理", "tab": "models", "admin_only": True},
-        {"key": "platform", "label": "平台设置", "tab": "system"},
+        {"key": "platform", "label": "功能与平台设置", "tab": "system",
+         "tabs": ["functions", "system"], "admin_tabs": ["system"]},
         {"key": "members", "label": "成员与权限", "tab": "perms", "admin_only": True},
-        {"key": "audit", "label": "用户日志", "tab": "audit", "view_only": True},
+        {"key": "audit", "label": "操作日志", "tab": "audit", "view_only": True},
     ]},
 ]
 ALL_PERMS = [item["key"] for group in FEATURE_TREE for item in group["children"]]

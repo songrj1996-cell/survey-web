@@ -1,4 +1,4 @@
-"""services/settings_service:提示词 / 页面文案 / 系统设置的读取与更新。"""
+"""提示词和设置维护；页面说明只从代码读取，不写入历史文案文件。"""
 import hashlib
 from datetime import datetime
 
@@ -12,7 +12,7 @@ from app.storage.prompts import (
     _prompt_update_transaction,
 )
 from app.storage.settings import _load_app_settings, _save_app_settings
-from app.storage.ui_texts import _load_ui_texts, _save_ui_texts
+from app.storage.ui_texts import _load_ui_texts
 from app.services.group_access import admin_preferences, save_admin_preferences
 
 _MAX_PROMPT_LENGTH = 100_000
@@ -75,14 +75,6 @@ def update_prompt(
 
 def get_all_ui_texts() -> dict:
     return _load_ui_texts()
-
-
-def update_ui_text(key: str, content: str) -> None:
-    texts = _load_ui_texts()
-    if key not in texts:
-        raise HTTPException(status_code=404, detail=f"ui-text '{key}' 不存在")
-    texts[key]["current"] = content
-    _save_ui_texts(texts)
 
 
 def get_app_settings() -> dict:

@@ -4019,11 +4019,13 @@ body {
   flex-direction: column;
   gap: 14px;
   min-width: 0;
+  container-type: inline-size;
+  container-name: audit-panel;
 }
 
 .audit-filters {
   display: grid;
-  grid-template-columns: repeat(4, minmax(150px, 1fr)) auto auto;
+  grid-template-columns: minmax(0, 1fr);
   gap: 10px;
   align-items: end;
 }
@@ -4031,6 +4033,7 @@ body {
 .audit-filters label {
   display: flex;
   flex-direction: column;
+  min-width: 0;
   gap: 6px;
   font-size: 12px;
   color: var(--text-3);
@@ -4039,6 +4042,8 @@ body {
 .audit-filters input,
 .audit-filters select {
   width: 100%;
+  min-width: 0;
+  max-width: 100%;
   height: 34px;
   padding: 0 10px;
   border: 1px solid var(--border);
@@ -4218,9 +4223,15 @@ body {
   padding: 28px 12px;
 }
 
-@media (max-width: 960px) {
+@container audit-panel (min-width: 420px) {
   .audit-filters {
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@container audit-panel (min-width: 800px) {
+  .audit-filters {
+    grid-template-columns: repeat(4, minmax(0, 1fr)) auto auto;
   }
 }
 
@@ -9711,6 +9722,30 @@ body {
 
 .settings-nav--collapsed .settings-nav__icon {
   margin: 0;
+}
+
+/* 设置按用途分组；折叠时保留图标和可聚焦的名称提示。 */
+#settings-nav { overflow: visible; }
+.settings-nav__group { display: flex; flex-direction: column; gap: 3px; }
+.settings-nav__group[hidden], .settings-page-heading[hidden] { display: none; }
+.settings-nav__group + .settings-nav__group { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); }
+#settings-nav .settings-nav__group-label { font-size: 11px; letter-spacing: .04em; padding: 7px 10px; }
+#settings-nav .settings-nav__item { position: relative; width: 100%; min-height: 40px; border: 0; padding: 10px; font: inherit; font-size: 13px; text-align: left; background: transparent; gap: 10px; }
+#settings-nav .settings-nav__item:hover { background: var(--glass); }
+#settings-nav .settings-nav__item--active { color: var(--accent); background: var(--accent-soft); box-shadow: inset 3px 0 var(--accent); font-weight: 600; }
+#settings-nav .settings-nav__item:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+#settings-nav .settings-nav__icon { width: 18px; height: 18px; }
+#settings-nav .settings-nav__item span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.settings-page-heading { margin: 0; padding-bottom: 16px; border-bottom: 1px solid var(--border); }
+.settings-page-heading h2 { margin: 0 0 6px; font-size: 19px; color: var(--text); }
+.settings-page-heading p { margin: 0; font-size: 12px; color: var(--text-3); line-height: 1.7; }
+#settings-nav.settings-nav--collapsed .settings-nav__item { gap: 0; }
+#settings-nav.settings-nav--collapsed .settings-nav__group + .settings-nav__group { margin-top: 10px; padding-top: 10px; }
+#settings-nav.settings-nav--collapsed .settings-nav__item:is(:hover,:focus-visible)::after { content: attr(data-label); position: absolute; left: calc(100% + 10px); top: 50%; transform: translateY(-50%); background: var(--text); color: var(--bg); padding: 6px 10px; border-radius: 6px; white-space: nowrap; font-size: 12px; z-index: 20; pointer-events: none; }
+@media (max-width: 768px) {
+  #settings-nav { width: 48px; padding: 10px 5px; }
+  #settings-nav .settings-nav__item { justify-content: center; gap: 0; min-height: 42px; padding: 10px 0; }
+  #settings-nav .settings-nav__item:is(:hover,:focus-visible)::after { content: attr(data-label); position: absolute; left: calc(100% + 10px); top: 50%; transform: translateY(-50%); background: var(--text); color: var(--bg); padding: 6px 10px; border-radius: 6px; white-space: nowrap; font-size: 12px; z-index: 20; pointer-events: none; }
 }
 
 /* ============================================================

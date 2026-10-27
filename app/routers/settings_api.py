@@ -1,4 +1,4 @@
-"""routers/settings_api:上传说明 / 提示词 / 页面文案 / 系统设置接口（HTTP 壳）。
+"""上传说明 / 提示词 / 只读页面文案 / 功能与平台设置接口（HTTP 壳）。
 
 读写逻辑全部在 services/settings_service。
 """
@@ -43,13 +43,12 @@ from app.services.settings_service import (
     update_app_settings,
     update_group_management_preferences,
     update_prompt,
-    update_ui_text,
 )
 
 async def _require_settings_access(request: Request):
     path = request.url.path
     feature = ('glossary' if path.startswith('/api/glossary') else 'prompts' if path.startswith('/api/prompts')
-               else 'ui_texts' if path.startswith('/api/ui-texts') else 'platform')
+               else 'platform')
     return await _require_feature(request, feature, action='read' if request.method == 'GET' else 'use')
 
 
@@ -136,10 +135,11 @@ async def get_ui_texts():
 
 @router.put("/api/ui-texts/{key}")
 async def update_ui_text_endpoint(key: str, req: UiTextUpdateRequest, request: Request):
-    await _require_settings_access(request)
-    update_ui_text(key, req.content)
-    await audit_log(request, "settings", "修改页面文案", f"{key}；内容：{_short_text(req.content)}")
-    return {"ok": True, "key": key}
+    await _require_admin(request)
+    raise HTTPException(
+        status_code=410,
+        detail="页面文案已改为由程序统一维护，后台保存入口已停用。请刷新页面；需要调整文案时请修改程序。",
+    )
 
 
 @router.get("/api/app-settings")
@@ -160,7 +160,7 @@ async def update_group_management_preferences_endpoint(req: GroupManagementPrefe
 async def update_app_settings_endpoint(req: AppSettingsPatch, request: Request):
     await _require_settings_access(request)
     settings, detail = update_app_settings(req)
-    await audit_log(request, "settings", "修改平台设置", detail)
+    await audit_log(request, "settings", "修改功能设置", detail)
     return settings
 
 

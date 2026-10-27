@@ -407,7 +407,7 @@ class PromptCatalogTests(unittest.TestCase):
             hashlib.sha256(report_prompt["current"].encode("utf-8")).hexdigest(),
         )
 
-    def test_upload_guide_uses_new_default_without_history_and_custom_with_history(self):
+    def test_upload_guide_uses_code_default_and_preserves_legacy_files(self):
         scenarios = [
             ({"current": "OLD_DEFAULT", "history": []}, DEFAULT_UPLOAD_GUIDE),
             (
@@ -415,7 +415,7 @@ class PromptCatalogTests(unittest.TestCase):
                     "current": "CUSTOM_GUIDE",
                     "history": [{"ts": "2026-01-01", "content": "old", "note": "custom"}],
                 },
-                "CUSTOM_GUIDE",
+                DEFAULT_UPLOAD_GUIDE,
             ),
         ]
         for legacy_entry, expected in scenarios:
@@ -425,16 +425,13 @@ class PromptCatalogTests(unittest.TestCase):
                     ui_file = os.path.join(temp_dir, "ui_texts.json")
                     _write_json(prompt_file, {"upload_guide": legacy_entry})
                     _write_json(ui_file, {})
-                    with (
-                        patch.object(ui_text_storage, "PROMPTS_FILE", prompt_file),
-                        patch.object(ui_text_storage, "UI_TEXTS_FILE", ui_file),
-                    ):
+                    with patch("builtins.open", side_effect=AssertionError("Fixed copy must not access legacy files")):
                         loaded = ui_text_storage._load_ui_texts()
-                        first_hash = _sha256(ui_file)
-                        ui_text_storage._load_ui_texts()
-                        second_hash = _sha256(ui_file)
+                    first_hash = _sha256(ui_file)
+                    loaded["upload_guide"]["current"] = "CALLER_CHANGE"
+                    self.assertEqual(ui_text_storage._load_ui_texts()["upload_guide"]["current"], expected)
+                    second_hash = _sha256(ui_file)
 
-                self.assertEqual(loaded["upload_guide"]["current"], expected)
                 self.assertEqual(first_hash, second_hash)
 
     def test_prompt_update_is_atomic_and_rejects_empty_or_noop_content(self):
@@ -663,21 +660,21 @@ class PromptApiAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         )
         audit_log.assert_awaited_once()
 
-    async def test_ui_text_put_requires_feature_access(self):
+    async def test_ui_text_put_requires_admin_and_reports_retirement_without_audit_success(self):
         request = object()
         require_admin = AsyncMock(return_value={"email": "admin@example.com"})
         with (
-            patch.object(settings_api, "_require_settings_access", new=require_admin),
-            patch.object(settings_api, "update_ui_text") as update_ui_text,
-            patch.object(settings_api, "audit_log", new=AsyncMock()),
+            patch.object(settings_api, "_require_admin", new=require_admin),
+            patch.object(settings_api, "audit_log", new=AsyncMock()) as audit_log,
         ):
-            await settings_api.update_ui_text_endpoint(
-                "upload_guide",
-                settings_api.UiTextUpdateRequest(content="safe guide"),
-                request,
-            )
+            with self.assertRaises(HTTPException) as caught:
+                await settings_api.update_ui_text_endpoint(
+                    "upload_guide", settings_api.UiTextUpdateRequest(content="safe guide"), request,
+                )
+        self.assertEqual(caught.exception.status_code, 410)
+        self.assertIn("请刷新页面", caught.exception.detail)
         require_admin.assert_awaited_once_with(request)
-        update_ui_text.assert_called_once_with("upload_guide", "safe guide")
+        audit_log.assert_not_called()
 
     async def test_prompt_get_stops_before_storage_when_admin_check_fails(self):
         denied = HTTPException(status_code=403, detail="需要管理员权限")

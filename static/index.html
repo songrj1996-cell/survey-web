@@ -11,7 +11,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Roboto+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/style.css?v=76" />
+  <link rel="stylesheet" href="/static/style.css?v=77" />
   <link rel="stylesheet" href="/static/questionnaire-sources.css?v=1" />
   <link rel="stylesheet" href="/static/report-quick.css?v=11" />
   <link rel="stylesheet" href="/static/survey-entry.css?v=8" />
@@ -1777,102 +1777,76 @@
       <div class="drawer__body" id="settings-body">
         <div class="settings-layout">
           <!-- 左导航 -->
-          <nav class="settings-nav" id="settings-nav">
+          <nav class="settings-nav" id="settings-nav" aria-label="设置分类">
             <div class="settings-nav__toggle">
-              <button class="settings-nav__toggle-btn" id="btn-settings-nav-toggle" title="折叠导航" aria-label="折叠导航">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <polyline points="15 18 9 12 15 6" />
-                </svg>
+              <button type="button" class="settings-nav__toggle-btn" id="btn-settings-nav-toggle" title="折叠导航" aria-label="折叠导航" aria-expanded="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><polyline points="15 18 9 12 15 6"/></svg>
               </button>
             </div>
-            <div class="settings-nav__group-label">内容管理</div>
-            <div class="settings-nav__item settings-nav__item--active" data-stab="texts">
-              <svg class="settings-nav__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
-                <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" />
-              </svg>
-              <span>页面文案</span>
-            </div>
-            <div class="settings-nav__item" data-stab="prompts">
-              <svg class="settings-nav__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <circle cx="12" cy="12" r="3" />
-                <path
-                  d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
-              </svg>
-              <span>提示词管理</span>
-            </div>
-            <div class="settings-nav__item" data-stab="glossary">
-              <svg class="settings-nav__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M4 7h6" />
-                <path d="M4 12h10" />
-                <path d="M4 17h8" />
-                <path d="M16 6h4v4" />
-                <path d="M13 18h7" />
-                <path d="M17 10v8" />
-              </svg>
-              <span>术语库</span>
-            </div>
-            <button type="button" class="settings-nav__item model-settings-nav" data-stab="models" style="display:none"><span>模型管理</span></button>
-            <div class="settings-nav__sep" id="settings-nav-admin-sep" style="display:none"></div>
-            <div class="settings-nav__group-label" id="settings-nav-admin-label" style="display:none">管理员</div>
-            <div class="settings-nav__item" data-stab="system" id="stab-system-nav" style="display:none">
-              <svg class="settings-nav__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <circle cx="12" cy="12" r="3" />
-                <path d="M3 12h3" />
-                <path d="M18 12h3" />
-                <path d="M12 3v3" />
-                <path d="M12 18v3" />
-              </svg>
-              <span>平台设置</span>
-            </div>
-            <div class="settings-nav__item" data-stab="perms" id="stab-perms-nav" style="display:none">
-              <svg class="settings-nav__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" />
-                <circle cx="9" cy="7" r="4" />
-                <path d="M23 21v-2a4 4 0 0 0-3-3.87" />
-                <path d="M16 3.13a4 4 0 0 1 0 7.75" />
-              </svg>
-              <span>成员与权限</span>
-            </div>
-            <div class="settings-nav__item" data-stab="audit" id="stab-audit-nav" style="display:none">
-              <svg class="settings-nav__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M9 7h6" />
-                <path d="M9 12h6" />
-                <path d="M9 17h4" />
-                <rect x="4" y="3" width="16" height="18" rx="2" />
-              </svg>
-              <span>用户日志</span>
-            </div>
+            <section class="settings-nav__group" data-settings-group="business" aria-labelledby="settings-group-business" hidden>
+              <div class="settings-nav__group-label" id="settings-group-business">业务配置</div>
+              <button type="button" class="settings-nav__item" data-stab="models" data-label="模型管理" aria-label="模型管理" title="模型管理" style="display:none">
+                <svg class="settings-nav__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/><rect x="9" y="9" width="6" height="6" rx="1"/><path d="M9 3v3m6-3v3M9 18v3m6-3v3M3 9h3m-3 6h3m12-6h3m-3 6h3"/></svg>
+                <span>模型管理</span>
+              </button>
+              <button type="button" class="settings-nav__item" data-stab="prompts" data-label="提示词管理" aria-label="提示词管理" title="提示词管理" style="display:none">
+                <svg class="settings-nav__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 11.5a8.4 8.4 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.4 8.4 0 0 1-3.8-.9L3 21l1.9-5.7a8.4 8.4 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.4 8.4 0 0 1 3.8-.9H13a8.5 8.5 0 0 1 8 8v.5Z"/><path d="M8 9h8m-8 4h5"/></svg>
+                <span>提示词管理</span>
+              </button>
+              <button type="button" class="settings-nav__item" data-stab="glossary" data-label="术语库" aria-label="术语库" title="术语库" style="display:none">
+                <svg class="settings-nav__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 6c-3-2-6-2-10-1v15c4-1 7-1 10 1 3-2 6-2 10-1V5c-4-1-7-1-10 1Zm0 0v15"/></svg>
+                <span>术语库</span>
+              </button>
+              <button type="button" class="settings-nav__item" data-stab="functions" data-label="功能设置" aria-label="功能设置" title="功能设置" style="display:none">
+                <svg class="settings-nav__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h16M4 17h16"/><circle cx="8" cy="7" r="3"/><circle cx="16" cy="17" r="3"/></svg>
+                <span>功能设置</span>
+              </button>
+            </section>
+            <section class="settings-nav__group" data-settings-group="platform" aria-labelledby="settings-group-platform" hidden>
+              <div class="settings-nav__group-label" id="settings-group-platform">平台管理</div>
+              <button type="button" class="settings-nav__item" id="stab-system-nav" data-stab="system" data-label="平台设置" aria-label="平台设置" title="平台设置" style="display:none">
+                <svg class="settings-nav__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v4m0 10v4M3 12h4m10 0h4"/><circle cx="12" cy="12" r="5"/></svg>
+                <span>平台设置</span>
+              </button>
+              <button type="button" class="settings-nav__item" id="stab-perms-nav" data-stab="perms" data-label="成员与权限" aria-label="成员与权限" title="成员与权限" style="display:none">
+                <svg class="settings-nav__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2m20 0v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/><circle cx="9" cy="7" r="4"/></svg>
+                <span>成员与权限</span>
+              </button>
+              <button type="button" class="settings-nav__item" id="stab-audit-nav" data-stab="audit" data-label="操作日志" aria-label="操作日志" title="操作日志" style="display:none">
+                <svg class="settings-nav__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 7h8m-8 5h8m-8 5h5"/></svg>
+                <span>操作日志</span>
+              </button>
+            </section>
           </nav>
           <!-- 右内容 -->
           <div class="settings-content" id="settings-content">
-            <div id="stab-content-texts">
+            <header class="settings-page-heading" id="settings-page-heading" hidden>
+              <h2 id="settings-page-title"></h2>
+              <p id="settings-page-description"></p>
+            </header>
+            <div id="stab-content-prompts" data-settings-panel style="display:none">
               <div class="hist-empty">
                 <div class="spinner" style="margin:0 auto"></div>
               </div>
             </div>
-            <div id="stab-content-prompts" style="display:none">
+            <div id="stab-content-glossary" data-settings-panel style="display:none">
               <div class="hist-empty">
                 <div class="spinner" style="margin:0 auto"></div>
               </div>
             </div>
-            <div id="stab-content-glossary" style="display:none">
+            <div id="stab-content-models" data-settings-panel style="display:none"><div id="model-settings-root"></div></div>
+            <div id="stab-content-functions" data-settings-panel style="display:none"></div>
+            <div id="stab-content-system" data-settings-panel style="display:none">
               <div class="hist-empty">
                 <div class="spinner" style="margin:0 auto"></div>
               </div>
             </div>
-            <div id="stab-content-models" style="display:none"><div id="model-settings-root"></div></div>
-            <div id="stab-content-system" style="display:none">
+            <div id="stab-content-perms" data-settings-panel style="display:none">
               <div class="hist-empty">
                 <div class="spinner" style="margin:0 auto"></div>
               </div>
             </div>
-            <div id="stab-content-perms" style="display:none">
-              <div class="hist-empty">
-                <div class="spinner" style="margin:0 auto"></div>
-              </div>
-            </div>
-            <div id="stab-content-audit" style="display:none">
+            <div id="stab-content-audit" data-settings-panel style="display:none">
               <div class="hist-empty">
                 <div class="spinner" style="margin:0 auto"></div>
               </div>
@@ -2179,7 +2153,7 @@
   <script src="https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js"></script>
   <!-- app.js 已按业务线拆分;顺序固定:core 最先,各 feature 居中(均含原顺序的初始化代码) -->
   <script src="/static/js/core/core.js?v=38"></script>
-  <script src="/static/js/core/feature-permissions.js?v=4"></script>
+  <script src="/static/js/core/feature-permissions.js?v=5"></script>
   <script src="/static/js/features/report-quick.js?v=10"></script>
   <script src="/static/js/features/survey.js?v=42"></script>
   <script src="/static/js/features/survey-entry.js?v=5"></script>
@@ -2188,7 +2162,7 @@
   <script src="/static/js/features/report.js?v=57"></script>
   <script src="/static/js/features/profile.js?v=2"></script>
   <script src="/static/js/features/model-settings.js?v=1"></script>
-  <script src="/static/js/features/settings.js?v=43"></script>
+  <script src="/static/js/features/settings.js?v=44"></script>
   <script src="/static/js/features/history.js?v=39"></script>
   <script src="/static/js/features/interview.js?v=10"></script>
   <script src="/static/js/features/interview-v2.js?v=7"></script>

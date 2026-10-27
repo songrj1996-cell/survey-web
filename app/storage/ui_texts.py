@@ -1,13 +1,8 @@
-"""storage/ui_texts:可配置页面文案的读取、迁移与原子写入。"""
+"""固定页面说明目录。只返回代码副本，不读取、迁移或写入历史 JSON。"""
 from copy import deepcopy
-import json
-import os
-import tempfile
-import threading
 
-from app.core.config import DEFAULT_UPLOAD_GUIDE, PROMPTS_FILE, UI_TEXTS_FILE
+from app.core.config import DEFAULT_UPLOAD_GUIDE
 
-_UI_TEXTS_LOCK = threading.RLock()
 
 DEFAULT_UI_TEXTS: dict = {
     "upload_guide": {
@@ -68,92 +63,6 @@ DEFAULT_UI_TEXTS: dict = {
 }
 
 
-def _legacy_upload_guide() -> str | None:
-    """仅迁移有编辑历史的旧上传说明；旧默认值升级为当前默认。"""
-    try:
-        with open(PROMPTS_FILE, "r", encoding="utf-8") as prompt_file:
-            prompts = json.load(prompt_file)
-        entry = prompts.get("upload_guide", {})
-        if not entry.get("history"):
-            return None
-        content = entry.get("current")
-        return content if isinstance(content, str) else None
-    except (FileNotFoundError, OSError, json.JSONDecodeError, AttributeError):
-        return None
-
-
-def _atomic_write_json(path: str, value: dict) -> None:
-    directory = os.path.dirname(path) or "."
-    os.makedirs(directory, exist_ok=True)
-    temp_path = ""
-    try:
-        with tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            dir=directory,
-            prefix=f".{os.path.basename(path)}.",
-            suffix=".tmp",
-            delete=False,
-        ) as temp_file:
-            temp_path = temp_file.name
-            json.dump(value, temp_file, ensure_ascii=False, indent=2)
-            temp_file.flush()
-            os.fsync(temp_file.fileno())
-        os.replace(temp_path, path)
-        temp_path = ""
-    finally:
-        if temp_path:
-            try:
-                os.remove(temp_path)
-            except FileNotFoundError:
-                pass
-
-
-def _new_defaults_with_legacy_guide() -> dict:
-    data = deepcopy(DEFAULT_UI_TEXTS)
-    legacy = _legacy_upload_guide()
-    if legacy is not None:
-        data["upload_guide"]["current"] = legacy
-    return data
-
-
 def _load_ui_texts() -> dict:
-    with _UI_TEXTS_LOCK:
-        if not os.path.exists(UI_TEXTS_FILE):
-            data = _new_defaults_with_legacy_guide()
-            _atomic_write_json(UI_TEXTS_FILE, data)
-            return data
-        with open(UI_TEXTS_FILE, "r", encoding="utf-8") as ui_file:
-            data = json.load(ui_file)
-        if not isinstance(data, dict):
-            raise ValueError("页面文案存储格式无效")
-
-        dirty = False
-        for key, default in DEFAULT_UI_TEXTS.items():
-            entry = data.get(key)
-            if entry is None:
-                entry = deepcopy(default)
-                if key == "upload_guide":
-                    legacy = _legacy_upload_guide()
-                    if legacy is not None:
-                        entry["current"] = legacy
-                data[key] = entry
-                dirty = True
-                continue
-            if not isinstance(entry, dict):
-                raise ValueError("页面文案条目格式无效")
-            for field in ("key", "label"):
-                if entry.get(field) != default[field]:
-                    entry[field] = default[field]
-                    dirty = True
-            if "current" not in entry:
-                entry["current"] = default["current"]
-                dirty = True
-        if dirty:
-            _atomic_write_json(UI_TEXTS_FILE, data)
-        return data
-
-
-def _save_ui_texts(texts: dict) -> None:
-    with _UI_TEXTS_LOCK:
-        _atomic_write_json(UI_TEXTS_FILE, texts)
+    """保留旧只读调用契约；返回独立副本，调用方不能改变代码默认值。"""
+    return deepcopy(DEFAULT_UI_TEXTS)

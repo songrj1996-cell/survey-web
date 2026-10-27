@@ -429,8 +429,12 @@ def _http_action(method: str, raw_path: str) -> tuple[str, str]:
         return "飞书", "处理飞书功能"
     if path.startswith("/api/profile"):
         return "个人中心", "读取当前账号和个人配置"
+    if path == "/api/app-settings":
+        return "设置", "读取功能与平台设置" if method == "GET" else "修改功能设置"
+    if path == "/api/group-management/preferences":
+        return "平台设置", "修改群组管理个人查看范围"
     if path.startswith("/api/ui-texts"):
-        return "页面", "读取页面文案"
+        return "页面文案", "读取固定页面文案" if method == "GET" else "使用已停用的文案保存入口"
     if path.startswith("/api/upload-guide"):
         return "页面", "读取上传说明"
     if method == "GET" and path == "/api/admin/audit-logs":
@@ -508,6 +512,8 @@ class HumanAccessFormatter(logging.Formatter):
             area, action = _http_action(method, path)
             history_detail = bool(re.fullmatch(r"/api/history/[^/?]+", path.split("?", 1)[0]))
             level, result = _http_result(status, history_detail=history_detail)
+            if status == 410 and path.split("?", 1)[0].startswith("/api/ui-texts/"):
+                result = "未完成：此入口已停用，请刷新页面；需要调整文案时请修改程序"
             if 200 <= status < 300:
                 if streaming:
                     level = "progress"
