@@ -1530,6 +1530,23 @@ function stylePlayerCaseLabel(element) {
       range.setStart(start, 0); range.setEnd(node, remaining);
       const label = doc.createElement('span'); label.className = 'report-player-case__label';
       label.appendChild(range.extractContents()); range.insertNode(label);
+      if (/[｜|]$/.test(prefix[0])) {
+        const labelWalker = doc.createTreeWalker(label, 4);
+        let textNode, lastText = null;
+        while ((textNode = labelWalker.nextNode())) {
+          if (textNode.textContent.length) lastText = textNode;
+        }
+        if (lastText) {
+          const separatorRange = doc.createRange();
+          separatorRange.setStart(lastText, lastText.textContent.length - 1);
+          separatorRange.setEnd(lastText, lastText.textContent.length);
+          const separator = doc.createElement('span');
+          separator.className = 'report-player-case__separator';
+          separator.setAttribute('aria-hidden', 'true');
+          separator.appendChild(separatorRange.extractContents());
+          separatorRange.insertNode(separator);
+        }
+      }
       return;
     }
     remaining -= node.textContent.length;
@@ -1542,8 +1559,13 @@ function applyPostwritePlayerCases(content, ctx) {
   const enabled = !!audit && typeof audit === 'object' && !Array.isArray(audit) && Object.keys(audit).length > 0;
   const previouslyEnabled = content.classList.contains('report-postwrite-cases');
   content.classList.toggle('report-postwrite-cases', enabled);
+  content.querySelectorAll('h3').forEach(heading => {
+    heading.classList.toggle('report-postwrite-subheading', enabled
+      && /^\d+[.．]\d+(?=[^\d.．]|$)/.test(heading.textContent.trim()));
+  });
   if (!enabled) {
     if (!previouslyEnabled && !content.querySelector('.report-player-case')) return;
+    content.querySelectorAll('.report-player-case__separator').forEach(separator => separator.replaceWith(...separator.childNodes));
     content.querySelectorAll('.report-player-case__label').forEach(label => label.replaceWith(...label.childNodes));
     content.querySelectorAll('.report-player-case').forEach(box => box.replaceWith(...box.childNodes));
     content.normalize();

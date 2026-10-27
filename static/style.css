@@ -3086,6 +3086,7 @@ body {
   border: 1px solid var(--border);
   border-radius: 9px;
   color: var(--text-2);
+  font-size: 13px;
   overflow-wrap: anywhere;
   min-width: 0;
 }
@@ -3122,14 +3123,33 @@ body {
   display: block;
   margin: 0 0 10px;
   color: var(--text-2);
-  font-size: 13px;
-  font-weight: 400;
+  font-size: 15px;
+  font-weight: 700;
   line-height: 1.5;
 }
 
 .report-postwrite-cases .report-player-case__label strong {
   color: inherit;
   font-weight: inherit;
+}
+
+.report-postwrite-cases .report-player-case__separator {
+  display: none;
+}
+
+.report-postwrite-cases h3.report-postwrite-subheading {
+  color: #a78bfa;
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.report-postwrite-cases h3.report-postwrite-subheading strong {
+  color: inherit;
+  font-weight: inherit;
+}
+
+[data-theme="light"] .report-postwrite-cases h3.report-postwrite-subheading {
+  color: #6d28d9;
 }
 
 .report-postwrite-cases .report-player-case > h1,
