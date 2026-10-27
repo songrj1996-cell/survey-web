@@ -4,28 +4,40 @@ const path = require('node:path');
 const test = require('node:test');
 const vm = require('node:vm');
 const source = fs.readFileSync(path.join(__dirname, '../static/js/features/settings.js'), 'utf8');
-const start = source.indexOf('async function loadSystemSettings()');
-const section = source.slice(start, source.indexOf("\nwindow.addEventListener('beforeunload'", start));
+const start = source.indexOf('async function loadSystemSettings(');
+const end = source.indexOf("\nwindow.addEventListener('beforeunload'", start);
+assert(start >= 0 && end > start, 'Settings loader and event section must exist before running the fixture');
+const section = source.slice(start, end);
 
 function fixture({enabled = false, canUse = true, patchError = null, deferPatch = false} = {}) {
   const nodes = new Map(), handlers = {}, requests = [], toasts = [];
-  const saved = {report_postwrite_enabled:enabled, report_quick_mode_enabled:false};
+  const saved = {report_postwrite_enabled:enabled, report_quick_mode_enabled:false,
+    group_management_preferences:{only_self:true, revision:1}};
   let release, styleRefreshes = 0;
-  const body = {
-    _html:'',
-    set innerHTML(value) {
-      this._html = value;
-      for (const match of value.matchAll(/<input\b([^>]+)>/g)) {
-        const id = /id="([^"]+)"/.exec(match[1])?.[1];
-        if (id) nodes.set(id, {id, checked:/\bchecked\b/.test(match[1]), disabled:false,
-          closest(selector) {return selector.split(',').some(s => s.trim() === '#' + id) ? this : null;}});
-      }
-    },
-    get innerHTML() {return this._html;},
-    querySelectorAll() {return [...nodes.values()].filter(node => node !== body);},
-    addEventListener(name, handler) {handlers[name] = handler;},
-  };
-  nodes.set('stab-content-system', body);
+  function panel(id) {
+    const element = {
+      _html:'', inputs:[],
+      set innerHTML(value) {
+        for (const input of this.inputs) if (nodes.get(input.id) === input) nodes.delete(input.id);
+        this.inputs = [];
+        this._html = value;
+        for (const match of value.matchAll(/<input\b([^>]+)>/g)) {
+          const inputId = /id="([^"]+)"/.exec(match[1])?.[1];
+          if (!inputId) continue;
+          const input = {id:inputId, checked:/\bchecked\b/.test(match[1]), disabled:false,
+            closest(selector) {return selector.split(',').some(s => s.trim() === '#' + inputId) ? this : null;}};
+          this.inputs.push(input);
+          nodes.set(inputId, input);
+        }
+      },
+      get innerHTML() {return this._html;},
+      querySelectorAll() {return this.inputs;},
+    };
+    nodes.set(id, element);
+    return element;
+  }
+  const body = panel('stab-content-functions'), platformBody = panel('stab-content-system');
+  nodes.set('settings-content', {addEventListener(name, handler) {handlers[name] = handler;}});
   const fetch = async (url, options = {}) => {
     requests.push({url, ...options});
     if (options.method === 'PATCH') {
@@ -42,8 +54,8 @@ function fixture({enabled = false, canUse = true, patchError = null, deferPatch 
     loadReportStyleOptions:async()=>{styleRefreshes++;},
   });
   vm.runInContext(section, ctx);
-  return {nodes, body, requests, toasts, saved,
-    load:()=>vm.runInContext('loadSystemSettings()', ctx),
+  return {nodes, body, platformBody, requests, toasts, saved,
+    load:(section = 'functions')=>vm.runInContext('loadSystemSettings(' + JSON.stringify(section) + ')', ctx),
     change:id=>{const input=nodes.get(id);input.checked=!input.checked;return handlers.change({target:input});},
     release:()=>release(), styleRefreshes:()=>styleRefreshes};
 }
@@ -101,4 +113,20 @@ test('the existing quick-report setting keeps its own request and refresh behavi
   assert.deepEqual(JSON.parse(f.requests.at(-1).body), {report_quick_mode_enabled:true});
   assert.equal(f.styleRefreshes(), 1);
   assert.equal(f.saved.report_postwrite_enabled, false);
+});
+
+test('platform preferences stay separate from business switches without writing on either page load', async () => {
+  const f=fixture({enabled:true});
+  await f.load();
+  assert.doesNotMatch(f.body.innerHTML, /setting-group-only-self/);
+  const functionsMarkup=f.body.innerHTML;
+  await f.load('system');
+  assert.match(f.platformBody.innerHTML, /setting-group-only-self/);
+  assert.doesNotMatch(f.platformBody.innerHTML,
+    /setting-(?:survey-duplicate|comment-duplicate|google-forms-entry|report-quick-mode|report-postwrite)/);
+  assert.equal(f.body.innerHTML, functionsMarkup);
+  assert.equal(f.nodes.get('setting-report-postwrite').checked, true);
+  assert.equal(f.saved.report_postwrite_enabled, true);
+  assert.equal(f.requests.length, 2);
+  assert(f.requests.every(request => request.url === '/api/app-settings' && request.method === undefined));
 });
