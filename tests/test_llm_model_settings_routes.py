@@ -81,6 +81,12 @@ class ModelSettingsRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(restored.json()["restored_from"], 1)
         self.assertEqual((await self.client.get("/api/model-settings")).json()["version"], 2)
         self.assertEqual(self.audit.await_count, 2)
+        for version, recorded in enumerate(self.audit.await_args_list, start=1):
+            self.assertEqual(recorded.args[1:3], ("settings", "保存模型配置版本"))
+            self.assertEqual(
+                recorded.args[3],
+                f"v{version}；配置已发布，新任务使用此版本，进行中及恢复的任务沿用原配置",
+            )
         self.assertEqual(first.json()["history"][0]["actor_name"], "测试管理员")
         self.model_call.assert_not_called()
 

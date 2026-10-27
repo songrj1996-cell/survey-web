@@ -73,7 +73,7 @@ async def check_model_settings_endpoint(req: CheckModelSettingsRequest, request:
 async def publish_model_settings_endpoint(req: PublishModelSettingsRequest, request: Request):
     login = await _require_admin(request)
     result = await publish_model_settings(req, (login or {}).get("name") or "管理员")
-    await audit_log(request, "settings", "保存模型配置版本", f"v{result['version']}；配置已保存，实际业务尚未接入")
+    await audit_log(request, "settings", "保存模型配置版本", f"v{result['version']}；配置已发布，新任务使用此版本，进行中及恢复的任务沿用原配置")
     return result
 
 
