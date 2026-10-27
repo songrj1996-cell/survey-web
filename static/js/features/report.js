@@ -1561,7 +1561,8 @@ function applyPostwritePlayerCases(content, ctx) {
   content.classList.toggle('report-postwrite-cases', enabled);
   content.querySelectorAll('h3').forEach(heading => {
     heading.classList.toggle('report-postwrite-subheading', enabled
-      && /^\d+[.．]\d+(?=[^\d.．]|$)/.test(heading.textContent.trim()));
+      && !heading.closest('.report-player-case')
+      && !playerCaseLabelKind(playerCaseText(heading)));
   });
   if (!enabled) {
     if (!previouslyEnabled && !content.querySelector('.report-player-case')) return;
