@@ -433,7 +433,11 @@ async def history_qa(req: HistoryQARequest, request: Request):
             category="survey",
             action="历史报告追问",
             reference_id=req.history_id,
-            title=str(history.get("title") or ""),
+            title=next(
+                (str(entry.get("title") or "") for entry in history
+                 if entry.get("id") == req.history_id),
+                "",
+            ),
             history_id=req.history_id,
         ),
         media_type="text/event-stream",
