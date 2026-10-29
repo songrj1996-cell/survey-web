@@ -1,0 +1,141 @@
+// Synthetic list/handler checks. --serve previews the same production UI in memory.
+// No app startup, real data, model calls, dependencies or generated files.
+const assert=require('node:assert/strict');
+const fs=require('node:fs'),path=require('node:path'),vm=require('node:vm');
+const root=path.resolve(__dirname,'..');
+const source=fs.readFileSync(path.join(root,'static/js/features/group-tasks.js'),'utf8');
+const escapeHtml=value=>String(value??'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+function fixture(patch={}){
+  return {id:'synthetic',version:1,owner_name:'合成负责人',can_edit:true,status:'ready',
+    rules:{name:'合成标注任务',payout_date:'2026-10-30',ai_detect:false},
+    headers:['玩家 ID','体验反馈'],mapping:{id_col:0,open_text_cols:[1]},feedback:[],runs:[],
+    workflow:{max_step:4},annotation_issues:[],
+    summary:{complete_count:38,pending_count:4,feedback_count:42,player_count:42},
+    annotation:{phase:'quality_progress',complete:false,options:{ai_detect:false,quality:true},
+      total:42,ai_done:42,quality_total:42,quality_done:38,review_ids:[],reviewed_ids:[],high_threshold:80,review_threshold:60},...patch};
+}
+function run(stage='quality',status='incomplete',error=''){
+  return {stage,status,error,completed_ids:Array.from({length:38},(_,i)=>String(i)),
+    attempted_ids:Array.from({length:42},(_,i)=>String(i)),target_ids:Array.from({length:42},(_,i)=>String(i))};
+}
+const aiAnnotation={...fixture().annotation,phase:'ai_progress',options:{ai_detect:true,quality:true},ai_done:38};
+const completeAnnotation={...fixture().annotation,phase:'results',complete:true,quality_done:42};
+const cases=[
+  ['规则待填写',fixture({status:'draft'}),'待配置','warning','完善任务'],
+  ['输入待处理',fixture({status:'input_issues'}),'输入待处理','warning','处理输入问题'],
+  ['等待启动 AI',fixture({annotation:aiAnnotation}),'待开始 AI 识别','warning','前往开始识别'],
+  ['等待启动质量打标',fixture(),'待开始质量打标','warning','前往开始打标'],
+  ['排队',fixture({status:'queued',run:run('quality','queued','旧批次失败')}),'排队中','neutral','查看进度'],
+  ['AI 正在运行',fixture({status:'running',run:run('ai','running','部分失败'),annotation:aiAnnotation}),'AI 识别中','neutral','查看进度'],
+  ['质量正在运行',fixture({status:'running',run:run('quality','running','部分失败')}),'质量打标中','neutral','查看进度'],
+  ['等待人工确认',fixture({status:'awaiting_ai_confirmation',run:run('ai'),annotation:{...aiAnnotation,phase:'ai_review'}}),'待确认 AI 作答','warning','确认 AI 作答'],
+  ['结果待确认',fixture({status:'awaiting_confirmation',annotation:completeAnnotation}),'待确认','warning','查看结果'],
+  ['仅 AI 标注完成',fixture({status:'annotation_done',annotation:{...completeAnnotation,options:{ai_detect:true,quality:false}}}),'标注完成','neutral','查看结果'],
+  ['可结算',fixture({status:'confirmed',annotation:completeAnnotation}),'可结算','neutral','查看结果'],
+  ['AI 失败但外层仍是 ready',fixture({run:run('ai'),annotation:aiAnnotation}),'AI 识别未完成','error','查看并重试'],
+  ['质量打标未完成',fixture({status:'incomplete',run:run()}),'质量打标未完成','error','查看并重试'],
+  ['自动衔接失败',fixture({status:'incomplete',run:run('ai','completed'),annotation_auto_error:'合成启动失败'}),'后续标注未启动','error','查看并处理'],
+  ['旧任务缺少运行记录',fixture({status:'incomplete'}),'标注待补齐','error','查看并处理'],
+  ['当前校验发现缓存缺失',fixture({status:'incomplete',run:run('quality','completed')}),'质量打标未完成','error','查看并重试'],
+  ['有错误但无明确结束状态',fixture({status:'incomplete',run:{...run('quality','incomplete','本轮失败'),status:undefined}}),'质量打标未完成','error','查看并重试'],
+];
+function environment(){
+  class Element{
+    constructor(){this.innerHTML='';this.textContent='';this.value='';this.style={};this.listeners={};this.isConnected=true;this.queries=new Map();
+      this.classList={add(){},remove(){},toggle(){},contains(){return false;}};}
+    addEventListener(type,handler){this.listeners[type]=handler;}
+    querySelectorAll(){return [];}
+    querySelector(selector){if(!this.queries.has(selector))this.queries.set(selector,new Element());return this.queries.get(selector);}
+    insertAdjacentHTML(where,html){this.innerHTML+=html;}
+    getBoundingClientRect(){return {right:100};}
+  }
+  const nodes=new Map(),requests=[],toasts=[];
+  const $=id=>{if(!nodes.has(id))nodes.set(id,new Element());return nodes.get(id);};
+  let items=[],selected,poll;
+  const context={console,$,esc:escapeHtml,document:{hidden:false},PlatformPermissions:{canUse:()=>true},
+    showToast:(...args)=>toasts.push(args),setInterval:fn=>{poll=fn;},window:{addEventListener(){},workflowConfirm:async()=>true,
+      workflowRequest:async(url,options)=>{requests.push({url,options});assert(!options?.method||options.method==='GET','list actions must never submit a run');
+        if(url==='/api/group-tasks')return {tasks:items};
+        if(url==='/api/group-tasks/groups')return {groups:[]};
+        if(url===`/api/group-tasks/${selected?.id}`)return selected;
+        throw new Error('Unexpected synthetic request '+url);}}};
+  vm.createContext(context);
+  vm.runInContext(source.replace('return {open,list};','return {open,list,tests:{listState,renderList}};'),context);
+  return {context,$,requests,toasts,tests:context.window.GroupTasks.tests,poll:()=>poll(),setItems:value=>{items=value;},setSelected:value=>{selected=value;}};
+}
+async function checks(){
+  const env=environment(),{tests,$}=env;
+  for(const [name,task,label,tone,button] of cases){
+    const before=JSON.stringify(task),state=tests.listState(task);
+    assert.equal(state.label,label,name);assert.equal(state.tone,tone,name);assert.equal(state.button,button,name);
+    assert.equal(JSON.stringify(task),before,'display must not change saved results: '+name);
+    tests.renderList([task]);
+    const html=$('gw-task-list').innerHTML;
+    assert(html.includes(`gw-list-badge--${tone}">${label}</span>`),name);
+    assert.match(html,new RegExp(`data-gw="view"[^>]*>${button}</button>`),name);
+    assert(html.includes('任务记录')&&html.includes('任务设置'),name);
+    const readOnly=tests.listState({...task,can_edit:false});
+    assert.equal(readOnly.button,'查看详情',name);
+    if(tone!=='neutral'){
+      assert.match(readOnly.hint,/请联系任务负责人处理/,name);
+      assert.doesNotMatch(readOnly.hint,/重试|请开始|请完成/,name);
+    }
+  }
+  const stopped=fixture({status:'incomplete',run:run()});
+  const retrying={...stopped,status:'queued',run:run('quality','queued'),annotation_auto_error:'旧错误'};
+  const recovered={...stopped,status:'confirmed',annotation:completeAnnotation,annotation_auto_error:'旧错误'};
+  env.setItems([stopped]);await env.context.window.GroupTasks.list();
+  assert.match($('gw-task-list').innerHTML,/gw-list-badge--error/);
+  env.setItems([retrying]);await env.poll();
+  assert.doesNotMatch($('gw-task-list').innerHTML,/gw-list-badge--error/);
+  env.setItems([recovered]);await env.poll();
+  assert.match($('gw-task-list').innerHTML,/可结算/);assert.doesNotMatch($('gw-task-list').innerHTML,/gw-list-badge--error/);
+  assert.equal(tests.listState(fixture({status:'awaiting_ai_confirmation',annotation:{...aiAnnotation,phase:'ai_review'},run:run('ai','incomplete','历史错误')})).tone,'warning','AI review must clear the historical failure');
+  for(const [reason,expected] of [['服务中断，已保存结果',/服务中断.*重复模型费用/],['本轮达到执行预算',/达到执行限制/],['个人模型凭据不可用',/检查个人模型设置/],['权限不可用',/联系管理员/],['权限或个人模型凭据不可用',/权限或模型凭据不可用/],['内部异常<secret>',/本轮已停止/]]){
+    const hint=tests.listState({...stopped,run:run('quality','incomplete',reason)}).hint;
+    assert.match(hint,expected);assert(!hint.includes('<secret>'),'raw errors must not enter the list');
+  }
+  const hostile=fixture({rules:{name:'<img src=x onerror=alert(1)>',payout_date:'2026-10-30'},owner_name:'<script>bad</script>'});
+  tests.renderList([hostile]);assert.doesNotMatch($('gw-task-list').innerHTML,/<img|<script>/);
+  env.setItems([stopped,recovered]);await env.context.window.GroupTasks.list();
+  $('gw-list-filter').oninput({target:{value:'无匹配项'}});assert.match($('gw-task-list').innerHTML,/尚无匹配任务/);
+  $('gw-list-filter').oninput({target:{value:''}});
+  // Use the actual delegated list button handler. It must open the matching stage without POSTing.
+  for(const selected of [stopped,fixture({run:run('ai'),annotation:aiAnnotation,workflow:{max_step:3},rules:{name:'AI 合成任务',ai_detect:true}})]){
+    env.setSelected(selected);
+    const button={dataset:{gw:'view',id:selected.id},isConnected:true,disabled:false};
+    await $('group-tasks-panel').listeners.click({target:{closest:selector=>selector==='[data-gw]'?button:null}});
+    const stage=selected.run.stage;
+    assert.match($(`ga-${stage==='ai'?'ai':'quality'}-progress-msg`).textContent,/未完成/);
+    assert($('gw-content').innerHTML.includes(stage==='ai'?'重试 AI 识别':'重试质量打标'));
+  }
+  assert.deepEqual(env.toasts,[]);
+  console.log(`Quality list status UI passed: ${cases.length} states, read-only permissions, recovery polling, errors, escaping, search and stage-opening handlers; no mutation requests.`);
+}
+function serve(){
+  const http=require('node:http');
+  const items=cases.map(([name,t],i)=>{
+    const item=structuredClone({...t,id:'synthetic-'+i,rules:{...t.rules,name}});
+    if(item.annotation.complete)item.summary={...item.summary,complete_count:42,pending_count:0};
+    if(item.annotation.phase==='ai_review'||item.run?.status==='completed'){
+      if(item.run){item.run.completed_ids=[...item.run.target_ids];item.run.attempted_ids=[...item.run.target_ids];}
+    }
+    if(item.status==='draft')item.summary={...item.summary,complete_count:0,pending_count:0,feedback_count:0,player_count:0};
+    return item;
+  });
+  const html=`<!doctype html><html lang="zh-CN" data-theme="light"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>质量标注列表 · 合成状态验证</title><link rel="stylesheet" href="/style.css"><style>html,body{height:auto;overflow:auto}body{padding:24px}#group-tasks-panel{padding:24px;background:var(--surface);border-radius:14px}.qa-controls{display:flex;gap:8px;margin-bottom:16px}@media(max-width:600px){body{padding:8px}#group-tasks-panel{padding:12px}}</style><body><div class="qa-controls"><button class="btn btn--ghost" id="qa-theme">切换明暗主题</button><button class="btn btn--ghost" id="qa-readonly">切换只读查看</button><span>合成任务，不连接后台或模型</span></div><section id="group-tasks-panel"></section><script>
+    const fixtures=${JSON.stringify(items).replace(/</g,'\\u003c')};let readOnly=false;
+    window.$=id=>document.getElementById(id);window.esc=${escapeHtml.toString()};window.PlatformPermissions={canUse:()=>!readOnly};
+    window.showToast=message=>console.error(message);window.workflowTime=String;window.formatReportDuration=String;window.workflowConfirm=async()=>true;
+    window.workflowRequest=async(url,options)=>{if(options?.method&&options.method!=='GET')throw Error('合成验证禁止写入');if(url==='/api/group-tasks')return {tasks:fixtures.map(t=>({...t,can_edit:!readOnly}))};if(url.endsWith('/groups'))return {groups:[]};const t=fixtures.find(t=>url==='/api/group-tasks/'+t.id);if(t)return {...t,can_edit:!readOnly};throw Error('未配置的合成接口');};
+    $('qa-theme').onclick=()=>document.documentElement.dataset.theme=document.documentElement.dataset.theme==='light'?'dark':'light';
+    $('qa-readonly').onclick=()=>{readOnly=!readOnly;GroupTasks.list();};
+    </script><script src="/group-tasks.js"></script><script>GroupTasks.list();</script></body></html>`;
+  const server=http.createServer((req,res)=>{
+    const routes={'/':[html,'text/html; charset=utf-8'],'/style.css':[fs.readFileSync(path.join(root,'static/style.css')),'text/css'],'/group-tasks.js':[source,'text/javascript; charset=utf-8']};
+    const resource=routes[req.url];if(!resource){res.writeHead(404);res.end();return;}
+    res.writeHead(200,{'Content-Type':resource[1]});res.end(resource[0]);
+  });
+  server.listen(0,'127.0.0.1',()=>console.log('Synthetic quality-list preview: http://127.0.0.1:'+server.address().port));
+}
+checks().then(()=>{if(process.argv.includes('--serve'))serve();}).catch(error=>{console.error(error);process.exitCode=1;});

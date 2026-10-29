@@ -46,6 +46,43 @@ window.GroupTasks = (() => {
     const total=t.run?.target_ids?.length||t.summary.feedback_count, done=t.run?.completed_ids?.length??t.summary.complete_count;
     return `<progress class="workflow-progress" max="${Math.max(1,total)}" value="${done}" aria-label="${h(t.rules?.name||'任务')}完成进度"></progress>`;
   }
+  function listState(t) {
+    const a=t.annotation||{},run=t.run||{};
+    const state=(label,tone,button,hint,needsAction=false)=>({label,tone,button:t.can_edit?button:'查看详情',hint:!t.can_edit&&needsAction?'当前任务需要处理；请联系任务负责人处理，可进入查看详情。':hint});
+    // A partial batch can fail while other batches are still running or queued.
+    if(['queued','running'].includes(t.status)||['queued','running'].includes(run.status)){
+      const queued=t.status==='queued'||run.status==='queued';
+      return state(queued?'排队中':run.stage==='ai'?'AI 识别中':'质量打标中','neutral','查看进度',queued?'后台排队中，无需重复操作。':'后台正在处理，无需重复操作。');
+    }
+    if(t.status==='draft')return state('待配置','warning','完善任务','请补齐任务规则并上传反馈。',true);
+    if(t.status==='input_issues')return state('输入待处理','warning','处理输入问题','请处理输入检查中的待办项。',true);
+    // Current completeness/phase wins over errors left by an earlier run.
+    if(a.phase==='ai_review'||t.status==='awaiting_ai_confirmation')return state('待确认 AI 作答','warning','确认 AI 作答','请完成人工复核，才能继续后续流程。',true);
+    if(a.complete||['annotation_done','awaiting_confirmation','confirmed'].includes(t.status)){
+      if(t.status==='confirmed')return state('可结算','neutral','查看结果','可进入任务记录核对并复制结果。');
+      if(t.status==='annotation_done')return state('标注完成','neutral','查看结果','本任务所选标注已完成。');
+      return state('待确认','warning','查看结果','请进入任务记录处理待办事项。',true);
+    }
+    const stage=a.phase==='ai_progress'?'ai':a.phase==='quality_progress'?'quality':null;
+    if(t.annotation_auto_error&&stage==='quality')return state('后续标注未启动','error','查看并处理','质量打标未能自动启动；请进入查看失败提示，处理后启动质量打标。',true);
+    const stopped=stage&&run.stage===stage&&(run.status==='incomplete'||Boolean(run.error)||run.status==='completed'&&t.status==='incomplete');
+    if(stopped){
+      const name=stage==='ai'?'AI 识别':'质量打标',reason=String(run.error||'');
+      let hint='本轮已停止，仍有未完成反馈。';
+      if(/服务.*(中断|停止)/.test(reason))hint='服务中断，已保存成功结果；重试可能产生重复模型费用。';
+      else if(/预算|耗时限制/.test(reason))hint='本轮已达到执行限制，仍有未完成反馈。';
+      else if(/权限/.test(reason)&&/凭据|密钥|API Key/i.test(reason))hint='执行权限或模型凭据不可用，请进入查看具体提示。';
+      else if(/凭据|密钥|API Key/i.test(reason))hint='模型凭据不可用，请进入查看提示并检查个人模型设置。';
+      else if(/权限/.test(reason))hint='执行权限不可用，请进入查看提示并联系管理员处理。';
+      return state(`${name}未完成`,'error','查看并重试',`${hint} 请进入查看失败提示，处理后重试${stage==='ai'?' AI 识别':'质量打标'}。`,true);
+    }
+    if(t.status==='incomplete')return state('标注待补齐','error','查看并处理','当前未在运行；请进入确认缺失项并继续处理。',true);
+    if(t.status==='ready'||stage){
+      const ai=stage?stage==='ai':a.options?.ai_detect??t.rules.ai_detect;
+      return state(ai?'待开始 AI 识别':'待开始质量打标','warning',ai?'前往开始识别':'前往开始打标',ai?'请确认标注设置并开始识别。':'请开始质量打标。',true);
+    }
+    return state(statusNames[t.status]||'状态待确认','warning','查看并处理','请进入查看任务当前状态。',true);
+  }
   async function open({home=false}={}) {
     if(home){
       if(!await mayLeave())return;
@@ -66,7 +103,10 @@ window.GroupTasks = (() => {
     latestList=items;
     $('gw-list-summary').innerHTML=[['标注中',items.filter(t=>t.status==='running').length],['排队中',items.filter(t=>t.status==='queued').length],['待处理任务',items.filter(t=>!['confirmed','annotation_done'].includes(t.status)).length],['可结算任务',items.filter(t=>t.status==='confirmed').length]].map(([label,value])=>`<span>${label}<strong>${value}</strong></span>`).join('');
     const filtered = items.filter(t => `${t.rules.name} ${t.owner_name}`.toLowerCase().includes(listFilter.toLowerCase())).sort((a,b)=>Number(['running','queued'].includes(b.status))-Number(['running','queued'].includes(a.status)));
-    $('gw-task-list').innerHTML = filtered.length ? `<div class="workflow-table-wrap"><table class="workflow-table"><thead><tr><th>任务</th><th>负责人</th><th>发奖日期</th><th>状态与进度</th><th></th></tr></thead><tbody>${filtered.map(t=>`<tr><td><strong>${h(t.rules.name||'未命名任务')}</strong><small>${t.rules.group_name?h(t.rules.group_name)+' · ':''}${t.summary.player_count} 位玩家 · ${t.summary.feedback_count} 份反馈</small></td><td>${h(t.owner_name)}</td><td>${h(t.rules.payout_date||'待确认')}</td><td><span class="workflow-badge">${statusNames[t.status]}</span>${progressBar(t)}<small>${h(progress(t))}</small></td><td>${btn('view',t.annotation?.complete?'查看结果':t.can_edit?'继续处理':'查看',false,false,`data-id="${t.id}" data-result-ready="${Boolean(t.annotation?.complete)}"`)}${btn('records','任务记录',false,!recordsAvailable(t),`data-id="${t.id}" title="${recordsAvailable(t)?'查看玩家完成结果并复制到飞书':'完成质量标注后可查看任务记录'}"`)}${t.can_edit?btn('settings','任务设置',false,false,`data-id="${t.id}"`):''}</td></tr>`).join('')}</tbody></table></div>` : '<div class="workflow-empty">尚无匹配任务。新建任务后，依次设置规则、上传核查、标注与计奖。</div>';
+    $('gw-task-list').innerHTML = filtered.length ? `<div class="workflow-table-wrap"><table class="workflow-table"><thead><tr><th>任务</th><th>负责人</th><th>发奖日期</th><th>状态与进度</th><th></th></tr></thead><tbody>${filtered.map(t=>{
+      const s=listState(t);
+      return `<tr><td><strong>${h(t.rules.name||'未命名任务')}</strong><small>${t.rules.group_name?h(t.rules.group_name)+' · ':''}${t.summary.player_count} 位玩家 · ${t.summary.feedback_count} 份反馈</small></td><td>${h(t.owner_name)}</td><td>${h(t.rules.payout_date||'待确认')}</td><td class="gw-list-status"><span class="workflow-badge gw-list-badge--${s.tone}">${h(s.label)}</span>${progressBar(t)}<small>${h(progress(t))}</small><small class="gw-list-hint gw-list-hint--${s.tone}">${h(s.hint)}</small></td><td>${btn('view',s.button,false,false,`data-id="${h(t.id)}" data-result-ready="${Boolean(t.annotation?.complete)}"`)}${btn('records','任务记录',false,!recordsAvailable(t),`data-id="${t.id}" title="${recordsAvailable(t)?'查看玩家完成结果并复制到飞书':'完成质量标注后可查看任务记录'}"`)}${t.can_edit?btn('settings','任务设置',false,false,`data-id="${t.id}"`):''}</td></tr>`;
+    }).join('')}</tbody></table></div>` : '<div class="workflow-empty">尚无匹配任务。新建任务后，依次设置规则、上传核查、标注与计奖。</div>';
   }
   async function load(id) { await fetchGroups(); task=await api(`/api/group-tasks/${id}`); render(); }
   function render() {

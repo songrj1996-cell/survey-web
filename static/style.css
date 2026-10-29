@@ -13814,6 +13814,12 @@ body {
 .workflow-summary{display:flex;gap:24px;padding:18px 0;flex-wrap:wrap}.workflow-summary span{display:flex;flex-direction:column;gap:7px;color:var(--text-2);font-size:12px}.workflow-summary strong{font-size:22px;color:var(--text);font-variant-numeric:tabular-nums}
 .workflow-table-wrap{overflow:auto;max-width:100%}.workflow-table{width:100%;border-collapse:collapse;text-align:left;font-size:13px;white-space:nowrap}
 .workflow-table td,.workflow-table th{padding:14px 12px;border-bottom:1px solid var(--border)}.workflow-table th{color:var(--text-2);font-weight:500}.workflow-table small{display:block;color:var(--text-2);font-size:11px;margin-top:6px}
+#gw-task-list .gw-list-status{min-width:280px;width:32%;white-space:normal}
+#gw-task-list .gw-list-badge--error{color:var(--red);border-color:var(--red);background:color-mix(in srgb,var(--red) 8%,var(--surface))}
+#gw-task-list .gw-list-badge--warning{color:var(--amber);border-color:var(--amber);background:color-mix(in srgb,var(--amber) 8%,var(--surface))}
+#gw-task-list .gw-list-hint{max-width:440px;line-height:1.65;overflow-wrap:anywhere}
+#gw-task-list .gw-list-hint--error{color:var(--red)}
+[data-theme="light"] #gw-task-list{--red:#b91c1c;--amber:#926100}
 .workflow-checks{display:flex;flex-wrap:wrap;gap:14px;border:0;padding:16px 0}.workflow-checks legend{font-size:13px}.workflow-checks label{display:flex;align-items:center;gap:8px;font-size:13px}
 .workflow-feedback{border:1px solid var(--border);border-radius:10px;background:var(--surface);padding:16px 20px;margin:12px 0}
 .workflow-feedback summary{cursor:pointer;line-height:1.7;font-size:13px}.workflow-feedback[open]>summary{margin-bottom:16px}.workflow-answers{display:grid;gap:14px;margin:16px 0}.workflow-answers section{border-left:2px solid var(--border);padding-left:14px}
