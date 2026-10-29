@@ -30,6 +30,54 @@ def _publish_in_process(path, payload, output):
 
 
 class ModelSettingsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_delete_unused_model_keeps_snapshots_and_restores_history(self):
+        state = await service.get_model_settings()
+        cfg = deepcopy(state['configuration'])
+        unused = {'id': 'synthetic-unused', 'name': '未引用模型', 'efforts': ['default'],
+                  'context_tokens': None, 'max_output_tokens': None, 'verified': False, 'verification_note': ''}
+        cfg['models'].append(unused)
+        first = await self.publish(state, cfg)
+        snapshot = await service.build_model_snapshot()
+        deleted = deepcopy(first['configuration'])
+        deleted['models'] = [m for m in deleted['models'] if m['id'] != unused['id']]
+        checked = await service.check_model_settings(CheckModelSettingsRequest(
+            expected_revision=first['revision'], configuration=deleted))
+        self.assertTrue(checked['valid'])
+        second = await self.publish(first, deleted)
+        self.assertEqual(second['configuration']['tasks'], first['configuration']['tasks'])
+        self.assertNotIn(unused, second['configuration']['models'])
+        self.assertIn(unused, second['history'][1]['configuration']['models'])
+        self.assertEqual(service.validate_model_snapshot(snapshot), snapshot)
+        self.assertIn(unused, snapshot['configuration']['models'])
+        with self.assertRaises(HTTPException) as error:
+            await self.publish(first, deleted)
+        self.assertEqual(error.exception.status_code, 409)
+        before = self.path.read_bytes()
+        restored = await service.restore_model_settings(1, RestoreModelSettingsRequest(expected_revision=second['revision']))
+        self.assertEqual(self.path.read_bytes(), before)
+        third = await self.publish(second, restored['configuration'], restored_from=1)
+        self.assertIn(unused, third['configuration']['models'])
+        self.assertEqual([h['version'] for h in third['history']], [3, 2, 1])
+
+    async def test_deleting_a_primary_or_fallback_reference_cannot_publish(self):
+        state = await service.get_model_settings()
+        for role in ('primary', 'fallback'):
+            cfg = deepcopy(state['configuration'])
+            task = cfg['tasks']['insight.writer']
+            referenced = task['primary']['model']
+            if role == 'fallback':
+                referenced = next(m['id'] for m in cfg['models'] if m['id'] != referenced)
+                task['fallbacks'] = [{'model': referenced, 'reasoning': 'default', 'max_tokens': 1024}]
+                task['max_http_attempts'] = 2
+            cfg['models'] = [m for m in cfg['models'] if m['id'] != referenced]
+            checked = await service.check_model_settings(CheckModelSettingsRequest(expected_revision=state['revision'], configuration=cfg))
+            self.assertFalse(checked['valid'])
+            self.assertTrue(any('所选模型不在目录中' in e for e in checked['errors']))
+            with self.assertRaises(HTTPException) as error:
+                await self.publish(state, cfg)
+            self.assertEqual(error.exception.status_code, 422)
+            self.assertFalse(self.path.exists())
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory(prefix="model-settings-", dir=config.DATA_DIR)
         self.path = Path(self.directory.name) / "models.json"
