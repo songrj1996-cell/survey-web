@@ -331,11 +331,20 @@ def _refresh_checks(task: dict) -> None:
         if row["adv"] and str(mapping.get("adv_col")) in row.get("cell_issues", {}) and "adv" not in edits:
             row["issues"].append({"kind": "adv", "message": "ADV：" + row["cell_issues"][str(mapping["adv_col"])]})
         candidates = by_player.get(row["player_id"], [])
-        chosen = [item for item in candidates if item["key"] == edits.get("candidate_key")]
+        active = [item for item in candidates if item.get("eligible") is True]
+        chosen = [item for item in active if item["key"] == edits.get("candidate_key")]
+        row["reward_excluded"] = row["player_id"] in task.get("reward_exclusions", {})
+        row["reward_exclusion_available"] = bool(snapshot and candidates and all(item.get("eligible") is False for item in candidates))
         row["identity_candidates"] = deepcopy(candidates)
-        row["identity"] = deepcopy(chosen[0] if len(chosen) == 1 else candidates[0] if len(candidates) == 1 else None)
+        row["identity_choices"] = deepcopy(active)
+        row["identity"] = deepcopy(active[0] if len(active) == 1 else chosen[0] if len(chosen) == 1 else None)
+        row["identity_selection"] = "automatic" if len(active) == 1 else "manual" if chosen else "unresolved"
         if snapshot and row["player_id"] and not row["identity"]:
-            row["issues"].append({"kind": "roster_identity", "message": "身份匹配多个名单条目，请明确选择" if candidates else "名单中找不到 playerid，请修正身份或维护名单后重新读取"})
+            message = ("多个名单条目均为群内成员，请选择所属群" if len(active) > 1 else
+                       "匹配的名单条目均不在群内，可排除该玩家奖励" if row["reward_exclusion_available"] else
+                       "名单状态尚未识别，请维护名单来源后重新读取" if candidates else
+                       "名单中找不到 playerid，请维护名单后重新读取")
+            row["issues"].append({"kind": "roster_identity", "message": message})
         if row["identity"] and row["identity"].get("identity_error"):
             row["issues"].append({"kind": "roster_identity", "message": row["identity"]["identity_error"]})
         raw_count = edits.get("count", _cell(row, mapping.get("count_col")))
@@ -352,6 +361,8 @@ def _refresh_checks(task: dict) -> None:
             row["gate"] = {"status": "fail", "reason": f"实际完成 {count} 场，要求至少 {task['rules']['min_count']} 场；按任务规则判为无效，未进行 AI 判断。"}
         else:
             row["gate"] = {"status": "pass", "reason": f"实际完成 {count} 场，达到至少 {task['rules']['min_count']} 场要求"}
+        if row["reward_excluded"]:
+            row["issues"] = [issue for issue in row["issues"] if issue["kind"] not in ("roster_identity", "adv")]
     if not task["rules"]["allow_repeat"]:
         def check_group(members, *, roster_only):
             if len(members) < 2:
@@ -376,7 +387,7 @@ def _refresh_checks(task: dict) -> None:
         account_groups = defaultdict(list)
         for row in task["feedback"]:
             ori = (row.get("identity") or {}).get("ori")
-            if ori and not row["excluded"]:
+            if ori and not row["excluded"] and not row["reward_excluded"]:
                 account_groups[ori].append(row)
         for members in account_groups.values():
             if len({row["player_id"] for row in members}) > 1:
@@ -407,17 +418,44 @@ async def refresh_roster(task_id, version, login):
     def mutate(current):
         current["roster_snapshot"] = snapshot
         current["roster_error"] = ""
-        return {"snapshot_id": snapshot["id"], "read_at": snapshot["read_at"]}
+        _refresh_checks(current)
+        automatic = {row["player_id"] for row in current["feedback"]
+                     if not row["excluded"] and not row["reward_excluded"] and row["identity_selection"] == "automatic"}
+        return {"snapshot_id": snapshot["id"], "read_at": snapshot["read_at"],
+                "自动匹配玩家数": len(automatic)}
     return {"ok": True, "task": _change(task_id, login, version, "刷新名单并核查身份", mutate)}
 
 
 def correct_feedback(task_id, response_id, request, login):
     def mutate(task):
         row = _row(task, response_id)
+        _refresh_checks(task)
         updates = request.model_dump(exclude_unset=True, exclude={"expected_version", "note"})
         if {"player_id", "count"} & updates.keys():
             raise HTTPException(409, "原始反馈和数据校验值不能修改；请修正文件后新建任务")
         updates = {key: value for key, value in updates.items() if value is not None or key == "count"}
+        excluded = updates.pop("reward_excluded", None)
+        if excluded is not None:
+            if set(updates):
+                raise HTTPException(422, "排除或恢复奖励不能同时修改名单身份")
+            if not annotation_complete(task):
+                raise HTTPException(409, "请先完成质量标注，再核对玩家奖励")
+            if excluded and (not row["reward_exclusion_available"] or task.get("roster_error")):
+                raise HTTPException(409, "请读取最新名单；仅当匹配身份均不在群内时可排除奖励")
+            decisions = task.setdefault("reward_exclusions", {})
+            before = deepcopy(decisions.get(row["player_id"]))
+            if excluded:
+                decisions[row["player_id"]] = {"at": now(), **owner_identity(login),
+                                                "snapshot_id": task["roster_snapshot"]["id"]}
+            else:
+                decisions.pop(row["player_id"], None)
+            return {"player_id": row["player_id"], "reward_excluded": excluded, "before": before,
+                    "处理结果": "已排除该玩家在本任务中的全部奖励" if excluded else "已恢复该玩家奖励，需重新核对名单"}
+        if "candidate_key" in updates:
+            if updates["candidate_key"] not in {item["key"] for item in row["identity_choices"]}:
+                raise HTTPException(409, "名单身份已变化，请从当前群内成员中重新选择")
+        if "adv" in updates and not request.note:
+            raise HTTPException(422, "修改 ADV 仍需填写处理说明")
         previous = deepcopy(row["corrections"])
         row["corrections"].update(updates)
         task["duplicate_decisions"] = {}
@@ -426,7 +464,9 @@ def correct_feedback(task_id, response_id, request, login):
         row["reviews"].append({"kind": "input", "at": now(), **owner_identity(login),
                                "before": previous, "after": deepcopy(row["corrections"]), "note": request.note.strip()})
         return {"response_id": response_id, "changes": updates, "note": request.note.strip()}
-    return _change(task_id, login, request.expected_version, "修正反馈输入", mutate)
+    action = (("排除玩家奖励" if request.reward_excluded else "恢复玩家奖励") if request.reward_excluded is not None else
+              "保存名单身份选择" if request.candidate_key is not None else "修正反馈输入")
+    return _change(task_id, login, request.expected_version, action, mutate)
 
 
 def resolve_duplicate(task_id, request, login):
@@ -472,6 +512,8 @@ def effective_result(task: dict, row: dict) -> dict:
                 "reason": row.get("model_error") or "输入或质量结果尚未完整，可处理异常或重试缺项", "base": None, "excellent": None}
     base = (task["rules"].get("base_reward") or 0) if label != "无效反馈" else 0
     extra = (task["rules"].get("excellent_reward") or 0) if label == "优秀反馈" else 0
+    if row.get("reward_excluded"):
+        base, extra = 0, 0
     return {"complete": True, "source": source, "label": label, "reason": reason, "base": base, "excellent": extra}
 
 

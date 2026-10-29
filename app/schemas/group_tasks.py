@@ -72,7 +72,8 @@ class FeedbackCorrection(BaseModel):
     count: StrictInt | None = Field(default=None, ge=0, le=2147483647)
     adv: str | None = Field(default=None, max_length=200)
     candidate_key: str | None = Field(default=None, max_length=128)
-    note: str = Field(min_length=1, max_length=2000)
+    reward_excluded: StrictBool | None = None
+    note: str = Field(default="", max_length=2000)
 
 
 class DuplicateDecision(BaseModel):

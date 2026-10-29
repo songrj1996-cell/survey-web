@@ -11,6 +11,53 @@ from app.storage import group_workflow as store
 
 
 class RewardBatchTests(WorkflowCase):
+    def test_manual_exclusion_survives_new_membership_and_omits_final_txt(self):
+        from app.schemas.group_tasks import FeedbackCorrection
+        task = self.make_task(labels=('优秀反馈', '有效反馈'))
+        other = entry('008123456789', '1234567(2345)', 'group_c')
+        def seed(current):
+            current['feedback'][1]['cells'][0] = other['player_id']
+            current['roster_snapshot'] = snapshot([entry(eligible=False), entry(source='group_b', eligible=False), other])
+            tasks._refresh_checks(current)
+        store.mutate('tasks', task['id'], seed)
+        task = tasks.correct_feedback(task['id'], task['feedback'][0]['id'], FeedbackCorrection(
+            expected_version=task['version'], reward_excluded=True), LOGIN)
+        for source in ('group_a', 'group_b', 'group_c'):
+            store.create('sources', source, {'id': source, 'revision': 1, 'enabled': True})
+        fresh = snapshot([entry(), entry(source='group_b'), other])
+        with patch.object(rewards, 'read_roster_snapshot', AsyncMock(return_value=fresh)):
+            preview = asyncio.run(rewards.create_preview(RewardSelection(dates=['2026-10-14'],
+                task_versions={task['id']: task['version']}), LOGIN))
+        self.assertTrue(preview['ready'])
+        self.assertFalse(preview['identity_issues'])
+        self.assertEqual(preview['result']['total_diamonds'], 100)
+        self.assertEqual(preview['excluded_rows'][0]['player_id'], entry()['player_id'])
+        self.assertIn('手动排除', preview['excluded_rows'][0]['exclusion_reason'])
+        batch = self.generate(preview, roster=fresh)
+        self.assertEqual(batch['txt_preview'], '2345\t1234567\t301-100\r\n')
+        self.assertEqual(len(batch['excluded_rows']), 1)
+        self.assertNotIn('818043063', batch['txt_preview'])
+
+    def test_exclusion_is_scoped_to_one_task_and_restore_invalidates_preview(self):
+        from app.schemas.group_tasks import FeedbackCorrection
+        first = self.make_task(labels=('有效反馈',))
+        second = self.make_task(labels=('有效反馈',))
+        store.mutate('tasks', first['id'], lambda current: current.update(roster_snapshot=snapshot([entry(eligible=False)])))
+        first = tasks.correct_feedback(first['id'], first['feedback'][0]['id'], FeedbackCorrection(
+            expected_version=first['version'], reward_excluded=True), LOGIN)
+        store.create('sources', 'group_a', {'id': 'group_a', 'revision': 1, 'enabled': True})
+        with patch.object(rewards, 'read_roster_snapshot', AsyncMock(return_value=snapshot())):
+            preview = asyncio.run(rewards.create_preview(RewardSelection(dates=['2026-10-14'],
+                task_versions={first['id']: first['version'], second['id']: second['version']}), LOGIN))
+        self.assertTrue(preview['ready'])
+        self.assertEqual(preview['result']['total_diamonds'], 100)
+        self.assertEqual(len(preview['excluded_rows']), 1)
+        tasks.correct_feedback(first['id'], first['feedback'][0]['id'], FeedbackCorrection(
+            expected_version=first['version'], reward_excluded=False), LOGIN)
+        with self.assertRaises(HTTPException):
+            self.generate(preview)
+        self.assertFalse(rewards._ledger()['batches'])
+
     def test_multiple_completed_tasks_settle_together_without_task_roster_confirmation(self):
         first=self.make_task();second=self.make_task(labels=('有效反馈',))
         tasks.update_rules(second['id'],second['version'],__import__('app.schemas.group_tasks',fromlist=['TaskRules']).TaskRules(**{**second['rules'],'name':'第二项任务'}),LOGIN)

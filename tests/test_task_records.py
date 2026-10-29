@@ -7,6 +7,48 @@ from app.services.task_records import aggregate_players, clipboard_records, look
 
 
 class TaskRecordsTests(WorkflowCase):
+    def test_excluded_player_remains_visible_but_is_not_copied(self):
+        from test_group_tasks import entry, snapshot
+        from app.schemas.group_tasks import FeedbackCorrection
+        from app.storage import group_workflow as store
+        task = self.make_task(labels=('优秀反馈', '有效反馈'))
+        second = entry('008123456789', '1234567(2345)', 'group_b')
+        def seed(current):
+            current['feedback'][1]['cells'][0] = second['player_id']
+            current['roster_snapshot'] = snapshot([entry(eligible=False), second])
+            tasks._refresh_checks(current)
+        store.mutate('tasks', task['id'], seed)
+        task = tasks.correct_feedback(task['id'], task['feedback'][0]['id'], FeedbackCorrection(
+            expected_version=task['version'], reward_excluded=True), LOGIN)
+        task = tasks.confirm_task(task['id'], task['version'], LOGIN)
+        self.assertEqual(len(task['players']), 2)
+        self.assertEqual(task['players'][0]['total'], 0)
+        reference = {'sheet_title': '名单乙', 'player_col': 0, 'ori_col': 1, 'status_col': 2,
+                     'target_spreadsheet': 'testbook', 'group_name': '群乙'}
+        with patch('app.services.roster_sources.validate_formula_reference', AsyncMock(return_value=reference)) as read:
+            copied = asyncio.run(clipboard_records(task['id'], task['version'], LOGIN))
+        self.assertEqual(copied['count'], 1)
+        self.assertNotIn(entry()['player_id'], copied['text'])
+        self.assertIn(second['player_id'], copied['text'])
+        self.assertEqual(copied['text'].split('\t')[-3:], ['100', '0', '0'])
+        read.assert_awaited_once_with('group_b', LOGIN)
+
+    def test_all_players_excluded_can_confirm_but_have_no_clipboard_rows(self):
+        from test_group_tasks import entry, snapshot
+        from app.schemas.group_tasks import FeedbackCorrection
+        from app.storage import group_workflow as store
+        from fastapi import HTTPException
+        task = self.make_task(labels=('有效反馈',))
+        store.mutate('tasks', task['id'], lambda current: current.update(roster_snapshot=snapshot([entry(eligible=False)])))
+        task = tasks.correct_feedback(task['id'], task['feedback'][0]['id'], FeedbackCorrection(
+            expected_version=task['version'], reward_excluded=True), LOGIN)
+        task = tasks.confirm_task(task['id'], task['version'], LOGIN)
+        with patch('app.services.roster_sources.validate_formula_reference', AsyncMock()) as read:
+            with self.assertRaises(HTTPException) as caught:
+                asyncio.run(clipboard_records(task['id'], task['version'], LOGIN))
+        self.assertEqual(caught.exception.status_code, 409)
+        read.assert_not_awaited()
+
     def test_fixed_twelve_columns_numbers_and_current_row_formula(self):
         task=self.make_task();task=tasks.confirm_task(task["id"],task["version"],LOGIN)
         reference={"sheet_title":"名单'甲","player_col":2,"ori_col":4,"status_col":3,"target_spreadsheet":"testbook","group_name":"测试群甲"}

@@ -148,39 +148,40 @@ window.GroupTasks = (() => {
     const rows=task.feedback.filter(row=>!row.excluded&&(row.issues||[]).some(issue=>['roster_identity','adv'].includes(issue.kind)));
     const duplicates=(task.duplicate_groups||[]).filter(group=>group.roster_only&&!group.keep_response_id);
     return `<div class="gw-record-issues">${(task.confirmation_issues||[]).filter(issue=>!issue.response_id).map(issue=>`<p class="workflow-error">${h(issue.message)}</p>`).join('')}
-      ${rows.map(row=>`<details class="workflow-feedback" open><summary>第 ${row.source_row} 行 · ${h(row.player_id)}</summary>${row.issues.map(issue=>`<p class="workflow-error">${h(issue.message)}</p>`).join('')}${row.identity_candidates?.length>1?`<label class="workflow-field">选择名单身份<select data-fix="candidate_key" ${disabled()}><option value="">请选择</option>${row.identity_candidates.map(c=>`<option value="${h(c.key)}" ${row.identity?.key===c.key?'selected':''}>${h(c.group_name)} · ${h(c.ori)} · ${h(c.status)}</option>`).join('')}</select></label><label class="workflow-field">处理说明<input data-fix="note" ${disabled()}></label>${btn('record-identity','保存身份选择',false,!editable()||recordBusy,`data-id="${h(row.id)}"`)}`:'<p class="workflow-muted">请维护名单后重新读取；原始反馈中的 ID 不在此修改。</p>'}</details>`).join('')}
+      ${rows.map(row=>`<details class="workflow-feedback" open><summary>第 ${row.source_row} 行 · ${h(row.player_id)}</summary>${row.issues.map(issue=>`<p class="workflow-error">${h(issue.message)}</p>`).join('')}${row.identity_choices?.length>1?`<label class="workflow-field">选择名单身份<select data-fix="candidate_key" ${disabled()}><option value="">请选择</option>${row.identity_choices.map(c=>`<option value="${h(c.key)}" ${row.identity?.key===c.key?'selected':''}>${h(c.group_name)} · ${h(c.ori)} · ${h(c.status)}</option>`).join('')}</select></label>${btn('record-identity','保存身份选择',false,!editable()||recordBusy,`data-id="${h(row.id)}"`)}`:'<p class="workflow-muted">请维护名单后重新读取；原始反馈中的 ID 不在此修改。</p>'}${row.reward_exclusion_available?btn('record-exclude','排除该玩家奖励',false,!editable()||recordBusy,`data-id="${h(row.id)}"`):''}</details>`).join('')}
       ${duplicates.map(group=>`<details class="workflow-feedback" open><summary>重复账号待核对 · ${group.response_ids.length} 份反馈</summary>${group.response_ids.map(id=>{const row=task.feedback.find(item=>item.id===id);return `<p>第 ${row.source_row} 行 · ${h(row.player_id)} ${btn('record-duplicate','保留此份',false,!editable()||recordBusy,`data-group="${h(group.id)}" data-id="${h(id)}"`)}</p>`;}).join('')}</details>`).join('')}</div>`;
   }
   function renderRecords() {
     const all=task.players||[], groups=[...new Map(all.filter(p=>p.source_id).map(p=>[p.source_id,p.group_name])).entries()];
     if(groupFilter&&!groups.some(([id])=>id===groupFilter))groups.push([groupFilter,'原选群（当前无记录）']);
-    const players=all.filter(p=>!groupFilter||p.source_id===groupFilter), confirmed=recordsConfirmed();
+    const players=all.filter(p=>!groupFilter||p.source_id===groupFilter), copyPlayers=players.filter(p=>!p.reward_excluded), confirmed=recordsConfirmed();
     const scope=groupFilter?groups.find(([id])=>id===groupFilter)[1]:'全部群';
     const total=key=>players.every(p=>p[key]!==null&&p[key]!==undefined)?players.reduce((sum,p)=>sum+p[key],0).toLocaleString():'待补齐';
-    const notice=recordBusy?recordNotice:confirmed?'当前任务记录已确认，可以复制':!task.roster_snapshot?'请先读取最新名单，核对玩家账号和群内状态':(task.confirmation_issues||[]).length?'仍有事项待核对，暂不能复制':'当前记录尚未确认或结果已有更新，请核对后确认';
+    const notice=recordBusy?recordNotice:confirmed?(copyPlayers.length?'当前任务记录已确认，可以复制':'当前任务记录已确认，本范围没有可复制玩家'):!task.roster_snapshot?'请先读取最新名单，核对玩家账号和群内状态':(task.confirmation_issues||[]).length?'仍有事项待核对，暂不能复制':'当前记录尚未确认或结果已有更新，请核对后确认';
     const status=task.roster_snapshot?`名单读取时间：${h(workflowTime(task.roster_snapshot.read_at))}`:'读取已配置的名单后，在此处理身份匹配和账号冲突。';
-    const tableRows=players.map(p=>{const cells=[task.rules.payout_date,task.rules.name,p.player_id,p.ori||'待匹配',p.adv||'—',p.identity?.status||'待匹配',p.form_valid?'是':'否',p.data_value??'待补齐',p.data_pass===null?'不适用':p.data_pass?'是':'否',p.base??'待补齐',p.excellent??'待补齐',0];return '<tr>'+cells.map(cell=>`<td>${h(cell)}</td>`).join('')+'</tr>';}).join('');
-    $('gw-result-body').innerHTML=`<section class="gw-records"><div class="workflow-heading"><div><h2>任务记录</h2><p class="workflow-muted">一位玩家一行，按固定 12 列复制到现有飞书表格。</p></div>${btn('copy',recordBusy&&recordNotice.includes('复制')?'正在复制…':'复制任务记录',true,!confirmed||recordBusy||!players.length)}</div>
+    const tableRows=players.map(p=>{const cells=[task.rules.payout_date,task.rules.name,p.player_id,p.ori||'待匹配',p.adv||'—',p.reward_excluded?'已排除奖励':p.identity?.status||'待匹配',p.form_valid?'是':'否',p.data_value??'待补齐',p.data_pass===null?'不适用':p.data_pass?'是':'否',p.base??'待补齐',p.excellent??'待补齐',0];return '<tr>'+cells.map(cell=>`<td>${h(cell)}</td>`).join('')+'</tr>';}).join('');
+    $('gw-result-body').innerHTML=`<section class="gw-records"><div class="workflow-heading"><div><h2>任务记录</h2><p class="workflow-muted">一位玩家一行，按固定 12 列复制到现有飞书表格。</p></div>${btn('copy',recordBusy&&recordNotice.includes('复制')?'正在复制…':'复制任务记录',true,!confirmed||recordBusy||!copyPlayers.length)}</div>
       <div class="gw-record-status" role="status" aria-live="polite"><div><strong>${h(notice)}</strong><p>${status}</p><p>账号与群内状态复制为查询公式，粘贴后跟随人员名单更新。</p>${!recordBusy&&recordNotice?`<p class="gw-record-operation">${h(recordNotice)}</p>`:''}</div><div class="workflow-toolbar">${btn('record-roster',task.roster_snapshot?'重新读取名单':'读取最新名单',false,!editable()||recordBusy)}${!confirmed?btn('record-confirm','确认任务记录',true,!editable()||recordBusy||!!task.confirmation_issues?.length):''}</div></div>
-      <div class="gw-record-filter"><label>所属群 <select data-filter id="gw-group" ${recordBusy?'disabled':''}><option value="">全部群</option>${groups.map(([id,name])=>`<option value="${h(id)}" ${id===groupFilter?'selected':''}>${h(name)}</option>`).join('')}</select></label><span>复制范围：${h(scope)} · ${players.length} 位玩家 · 无表头 12 列</span></div>
+      <div class="gw-record-filter"><label>所属群 <select data-filter id="gw-group" ${recordBusy?'disabled':''}><option value="">全部群</option>${groups.map(([id,name])=>`<option value="${h(id)}" ${id===groupFilter?'selected':''}>${h(name)}</option>`).join('')}</select></label><span>复制范围：${h(scope)} · ${copyPlayers.length} 位玩家 · 无表头 12 列${players.some(p=>p.reward_excluded)?' · 已排除 '+players.filter(p=>p.reward_excluded).length+' 位玩家奖励':''}</span></div>
       <div class="gw-record-summary">${[['玩家人数',players.length+' 位'],['基础奖励',total('base')+' 钻'],['优秀追加',total('excellent')+' 钻'],['合计',total('total')+' 钻']].map(([label,value])=>`<div><span>${label}</span><strong>${value}</strong></div>`).join('')}</div>
       ${!confirmed?recordIssues():''}
       <div class="workflow-table-wrap gw-record-table" tabindex="0" role="region" aria-label="玩家任务记录，固定 12 列"><table class="workflow-table"><thead><tr>${recordColumns.map((label,i)=>`<th scope="col">${h(label)}${[3,5].includes(i)?'<small class="gw-formula-badge">公式</small>':''}</th>`).join('')}</tr></thead><tbody>${tableRows||'<tr><td colspan="12">当前范围没有玩家记录。</td></tr>'}</tbody></table></div>
-      <div class="gw-record-details">${players.map(p=>`<details class="workflow-feedback"><summary>玩家 ${h(p.player_id)} · ${p.feedback_count} 份反馈 · ${Object.entries(p.composition||{}).map(([label,count])=>h(label)+' '+count+' 份').join(' / ')}</summary>${(p.response_ids||[]).map(id=>{const row=task.feedback.find(r=>r.id===id);return `<div class="gw-record-response"><span>第 ${row.source_row} 行反馈 · ${h(row.outcome?.label||'待补齐')} · 基础 ${row.outcome?.base??'待确定'} + 优秀追加 ${row.outcome?.excellent??'待确定'} 钻</span>${btn('record-response','查看原文与依据 →',false,recordBusy,`data-id="${h(id)}"`)}</div>`;}).join('')}${(p.issues||[]).map(issue=>`<p class="workflow-error">${h(issue)}</p>`).join('')}${p.adv_choices?.length>1?`<label class="workflow-field">确认任务记录中的 ADV<input data-player-adv value="${h(p.adv)}" ${disabled()}></label><label class="workflow-field">处理说明<input data-player-note ${disabled()}></label>${btn('record-adv','保存 ADV 决定',false,!editable()||recordBusy,`data-player="${h(p.player_id)}"`)}`:''}</details>`).join('')}</div>
+      <div class="gw-record-details">${players.map(p=>`<details class="workflow-feedback"><summary>玩家 ${h(p.player_id)} · ${p.feedback_count} 份反馈 · ${Object.entries(p.composition||{}).map(([label,count])=>h(label)+' '+count+' 份').join(' / ')}</summary>${(p.response_ids||[]).map(id=>{const row=task.feedback.find(r=>r.id===id);return `<div class="gw-record-response"><span>第 ${row.source_row} 行反馈 · ${h(row.outcome?.label||'待补齐')} · 基础 ${row.outcome?.base??'待确定'} + 优秀追加 ${row.outcome?.excellent??'待确定'} 钻</span>${btn('record-response','查看原文与依据 →',false,recordBusy,`data-id="${h(id)}"`)}</div>`;}).join('')}${p.reward_excluded?`<p class="workflow-muted">已排除该玩家在本任务中的全部奖励；反馈与质量标注结果保留，不纳入复制和发奖名单。</p>${btn('record-restore-reward','恢复该玩家奖励',false,!editable()||recordBusy,`data-id="${h(p.response_ids[0])}"`)}`:''}${(p.issues||[]).map(issue=>`<p class="workflow-error">${h(issue)}</p>`).join('')}${!p.reward_excluded&&p.adv_choices?.length>1?`<label class="workflow-field">确认任务记录中的 ADV<input data-player-adv value="${h(p.adv)}" ${disabled()}></label><label class="workflow-field">处理说明<input data-player-note ${disabled()}></label>${btn('record-adv','保存 ADV 决定',false,!editable()||recordBusy,`data-player="${h(p.player_id)}"`)}`:''}</details>`).join('')}</div>
       <div class="gw-record-footer"><p class="workflow-muted">复制后直接粘贴到飞书已有表头下；长 ID 保留为文本。${task.rules.allow_repeat?'份数包含保留的无效反馈。':!task.rules.requires_count?'本任务不要求体验次数，该列复制时留空。':''}</p><details><summary>查看 12 列说明</summary><ol class="workflow-copy-columns">${recordColumns.map(label=>`<li>${h(label)}</li>`).join('')}</ol><p class="workflow-muted">ori 与当前群内状态为公式；其他奖励默认 0。不同目标工作簿请按群分别复制。</p></details></div></section>`;
     $('gw-group').onchange=async e=>{if(!await mayLeave()){e.target.value=groupFilter;return;}groupFilter=e.target.value;recordNotice='';render();};
   }
   async function recordAction(name,button) {
     if(recordBusy)return;
-    if(!['record-identity','record-adv'].includes(name)&&!await mayLeave())return;
+    if(!['record-identity','record-adv','record-exclude','record-restore-reward'].includes(name)&&!await mayLeave())return;
     if(recordBusy)return;
     if(name==='copy'&&!recordsConfirmed())throw new Error('请先核对并确认当前版本的任务记录');
     if(name!=='copy'&&!editable())throw new Error('当前任务仅可查看，无法修改记录');
     const id=task.id, version=task.version, epoch=scopeEpoch, source=groupFilter;
-    const messages={copy:'正在准备复制内容…','record-roster':'正在读取最新名单…','record-confirm':'正在确认任务记录…','record-identity':'正在保存身份选择…','record-duplicate':'正在保存重复账号决定…','record-adv':'正在保存 ADV 决定…'};
+    const messages={copy:'正在准备复制内容…','record-roster':'正在读取最新名单…','record-confirm':'正在确认任务记录…','record-identity':'正在保存身份选择…','record-duplicate':'正在保存重复账号决定…','record-adv':'正在保存 ADV 决定…','record-exclude':'正在排除该玩家奖励…','record-restore-reward':'正在恢复该玩家奖励…'};
     let operation,body={};
-    if(name==='record-identity'){const panel=button.closest('details');body={candidate_key:panel.querySelector('[data-fix="candidate_key"]').value,note:panel.querySelector('[data-fix="note"]').value.trim()};if(!body.candidate_key||!body.note)throw new Error('请选择名单身份并填写处理说明');operation='feedback/'+button.dataset.id;}
+    if(name==='record-identity'){const panel=button.closest('details');body={candidate_key:panel.querySelector('[data-fix="candidate_key"]').value};if(!body.candidate_key)throw new Error('请选择名单身份');operation='feedback/'+button.dataset.id;}
     if(name==='record-adv'){const panel=button.closest('details');body={player_id:button.dataset.player,adv:panel.querySelector('[data-player-adv]').value,note:panel.querySelector('[data-player-note]').value.trim()};if(!body.note)throw new Error('请填写 ADV 处理说明');operation='player-adv';}
+    if(['record-exclude','record-restore-reward'].includes(name)){body={reward_excluded:name==='record-exclude'};operation='feedback/'+button.dataset.id;}
     recordBusy=true;recordNotice=messages[name];render();
     try {
       if(name==='copy'){
@@ -204,11 +205,11 @@ window.GroupTasks = (() => {
       }else{
         operation=operation||({'record-roster':'roster','record-confirm':'confirm','record-duplicate':'duplicates'}[name]);
         if(name==='record-duplicate')body={group_id:button.dataset.group,keep_response_id:button.dataset.id};
-        const value=await api('/api/group-tasks/'+id+'/'+operation,{method:['record-identity','record-adv'].includes(name)?'PUT':'POST',body:{expected_version:version,...body}});
+        const value=await api('/api/group-tasks/'+id+'/'+operation,{method:['record-identity','record-adv','record-exclude','record-restore-reward'].includes(name)?'PUT':'POST',body:{expected_version:version,...body}});
         if(epoch!==scopeEpoch||task?.id!==id)return;
         task=value.task||value;dirty=false;changedFields.clear();
         if(value.ok===false)throw new Error(task.roster_error||'名单未能读取，请检查名单来源后重试');
-        recordNotice=({'record-roster':'最新名单已读取，请核对后确认任务记录','record-confirm':'当前任务记录已确认，可以复制','record-identity':'身份选择已保存，请重新核对记录','record-duplicate':'重复账号决定已保存，请重新核对记录','record-adv':'ADV 决定已保存，请重新核对记录'})[name]+' · '+workflowTime(new Date().toISOString());
+        recordNotice=({'record-roster':'最新名单已读取，请核对后确认任务记录','record-confirm':'当前任务记录已确认','record-identity':'身份选择已保存，请重新核对记录','record-duplicate':'重复账号决定已保存，请重新核对记录','record-adv':'ADV 决定已保存，请重新核对记录','record-exclude':'已排除该玩家奖励，反馈和标注结果已保留','record-restore-reward':'已恢复该玩家奖励，请重新核对名单'})[name]+' · '+workflowTime(new Date().toISOString());
         showToast(recordNotice,'success');
       }
     }catch(err){
@@ -998,7 +999,7 @@ for (const filterId of [
       if(button.dataset.tab==='records'&&!recordsAvailable(task))throw new Error('完成质量标注后可查看任务记录');
       if(await mayLeave()){resultTab=button.dataset.tab;step=4;render();root.querySelector('#gw-tab-'+resultTab)?.focus();}return;
     }
-    if(['copy','record-roster','record-confirm','record-identity','record-duplicate','record-adv'].includes(name)){await recordAction(name,button);return;}
+    if(['copy','record-roster','record-confirm','record-identity','record-duplicate','record-adv','record-exclude','record-restore-reward'].includes(name)){await recordAction(name,button);return;}
     if(name==='annotation-results'){resultTab='quality';step=4;render();return;}
     if(name==='upload-view'||name==='columns'){uploadView=name==='upload-view';step=2;render();return;}
 

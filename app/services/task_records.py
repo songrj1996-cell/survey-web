@@ -19,10 +19,11 @@ def aggregate_players(task: dict) -> list[dict]:
                        (row.get("identity") or {}).get("ori", "")) for row in rows}
         advs = sorted({row.get("adv", "") for row in rows if row.get("adv")})
         decision = task.get("player_adv", {}).get(player_id)
+        reward_excluded = player_id in task.get("reward_exclusions", {})
         issues = []
-        if len(identities) != 1 or not all(source and ori for source, ori in identities):
+        if not reward_excluded and (len(identities) != 1 or not all(source and ori for source, ori in identities)):
             issues.append("同一玩家的群或 ori 不唯一，请修正反馈身份")
-        if len(advs) > 1 and decision is None:
+        if not reward_excluded and len(advs) > 1 and decision is None:
             issues.append("同一玩家有不同 ADV，请明确选择记录账号")
         identity = rows[0].get("identity") or {}
         complete = all(item["complete"] for item in outcomes)
@@ -34,6 +35,7 @@ def aggregate_players(task: dict) -> list[dict]:
             "player_id": player_id, "ori": identity.get("ori", ""),
             "source_id": identity.get("source_id", ""), "group_name": identity.get("group_name", ""),
             "identity": identity, "adv": decision["value"] if decision else (advs[0] if len(advs) == 1 else ""),
+            "reward_excluded": reward_excluded,
             "adv_choices": advs, "response_ids": [row["id"] for row in rows],
             "feedback_count": len(rows), "composition": dict(composition), "issues": issues,
             "complete": complete, "base": base, "excellent": excellent,
@@ -81,7 +83,7 @@ async def clipboard_records(task_id: str, version: int, login, source_id: str = 
     task = load_task(task_id, login)
     if task["version"] != version or task.get("confirmed_version") != version or readiness_issues(task, settlement=True):
         raise HTTPException(409, "请先确认当前版本的完整任务结果")
-    players = [p for p in aggregate_players(task) if not source_id or p["source_id"] == source_id]
+    players = [p for p in aggregate_players(task) if not p["reward_excluded"] and (not source_id or p["source_id"] == source_id)]
     if not players:
         raise HTTPException(409, "当前复制范围没有记录")
     references = {}

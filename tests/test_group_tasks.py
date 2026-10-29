@@ -56,6 +56,115 @@ class WorkflowCase(unittest.TestCase):
 
 
 class GroupTaskTests(WorkflowCase):
+    def roster_task(self, entries, labels=('优秀反馈', '有效反馈')):
+        task = self.make_task(labels=labels)
+        def seed(current):
+            current['roster_snapshot'] = snapshot(entries)
+            tasks._refresh_checks(current)
+        store.mutate('tasks', task['id'], seed)
+        return tasks.task_view(store.read('tasks', task['id']), LOGIN)
+
+    def test_only_active_identity_is_automatic_regardless_of_order_or_old_choice(self):
+        active, retired = entry(), entry(source='group_b', eligible=False)
+        active['status'] = '群内成员'
+        for entries in ([active, retired], [retired, active]):
+            task = self.roster_task(entries)
+            task = store.read('tasks', task['id'])
+            for row in task['feedback']:
+                row['corrections']['candidate_key'] = retired['key']
+            tasks._refresh_checks(task)
+            self.assertTrue(all(row['identity']['key'] == active['key'] for row in task['feedback']))
+            self.assertTrue(all(row['identity_selection'] == 'automatic' for row in task['feedback']))
+            self.assertFalse(tasks.readiness_issues(task, settlement=True))
+            self.assertEqual(tasks.task_view(task, LOGIN)['players'][0]['total'], 300)
+
+    def test_multiple_active_identities_require_choice_and_save_without_note(self):
+        first, second, retired = entry(), entry(source='group_b'), entry(source='group_c', eligible=False)
+        task = self.roster_task([first, second, retired], labels=('有效反馈',))
+        row = task['feedback'][0]
+        self.assertIsNone(row['identity'])
+        self.assertEqual([c['key'] for c in row['identity_choices']], [first['key'], second['key']])
+        with self.assertRaises(HTTPException):
+            tasks.confirm_task(task['id'], task['version'], LOGIN)
+        updated = tasks.correct_feedback(task['id'], row['id'], FeedbackCorrection(
+            expected_version=task['version'], candidate_key=second['key']), LOGIN)
+        self.assertEqual(updated['feedback'][0]['identity']['key'], second['key'])
+        self.assertEqual(updated['feedback'][0]['reviews'][-1]['note'], '')
+        self.assertFalse(updated['confirmation_issues'])
+        tasks.confirm_task(updated['id'], updated['version'], LOGIN)
+
+    def test_identity_http_endpoint_accepts_no_note_and_rejects_stale_version(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from app.routers import group_tasks as router
+        task = self.roster_task([entry(), entry(source='group_b')], labels=('有效反馈',))
+        app = FastAPI()
+        app.include_router(router.router)
+        url = f"/api/group-tasks/{task['id']}/feedback/{task['feedback'][0]['id']}"
+        with patch.object(router, '_current_login', AsyncMock(return_value=LOGIN)), TestClient(app) as client:
+            payload = {'expected_version': task['version'], 'candidate_key': entry()['key']}
+            result = client.put(url, json=payload)
+            self.assertEqual(result.status_code, 200, result.text)
+            self.assertEqual(client.put(url, json=payload).status_code, 409)
+
+    def test_no_active_identity_offers_exclusion_not_arbitrary_group(self):
+        for entries in ([entry(eligible=False)], [entry(eligible=False), entry(source='group_b', eligible=False)]):
+            task = self.roster_task(entries)
+            row = task['feedback'][0]
+            self.assertIsNone(row['identity'])
+            self.assertTrue(row['reward_exclusion_available'])
+            self.assertTrue(task['confirmation_issues'])
+
+    def test_exclusion_covers_all_feedback_persists_and_restores_without_losing_quality(self):
+        task = self.roster_task([entry(eligible=False), entry(source='group_b', eligible=False)])
+        before = deepcopy(task['feedback'])
+        row = before[0]
+        excluded = tasks.correct_feedback(task['id'], row['id'], FeedbackCorrection(
+            expected_version=task['version'], reward_excluded=True), LOGIN)
+        self.assertTrue(all(r['reward_excluded'] for r in excluded['feedback']))
+        self.assertEqual(excluded['summary']['base'] + excluded['summary']['excellent'], 0)
+        self.assertFalse(excluded['confirmation_issues'])
+        for old, new in zip(before, excluded['feedback']):
+            for key in ('cells', 'quality', 'quality_complete'):
+                self.assertEqual(old[key], new[key])
+            self.assertEqual(old['outcome']['label'], new['outcome']['label'])
+            self.assertFalse(new['excluded'])
+        confirmed = tasks.confirm_task(task['id'], excluded['version'], LOGIN)
+        reread = tasks.task_view(store.read('tasks', task['id']), LOGIN)
+        self.assertTrue(reread['players'][0]['reward_excluded'])
+        self.assertEqual(reread['events'][-2]['action'], '排除玩家奖励')
+        restored = tasks.correct_feedback(task['id'], row['id'], FeedbackCorrection(
+            expected_version=confirmed['version'], reward_excluded=False), LOGIN)
+        self.assertFalse(restored['players'][0]['reward_excluded'])
+        self.assertEqual(restored['players'][0]['total'], 300)
+        self.assertTrue(restored['confirmation_issues'])
+        self.assertIsNone(restored['confirmed_version'])
+
+    def test_exclusion_cannot_bypass_active_unknown_missing_or_failed_roster(self):
+        unknown = entry(eligible=False)
+        unknown.update(eligible=None, status='待核实', status_error='未知状态')
+        for entries in ([entry()], [unknown], [entry(player='different', eligible=False)]):
+            task = self.roster_task(entries)
+            with self.assertRaises(HTTPException):
+                tasks.correct_feedback(task['id'], task['feedback'][0]['id'], FeedbackCorrection(
+                    expected_version=task['version'], reward_excluded=True), LOGIN)
+        task = self.roster_task([entry(eligible=False)])
+        store.mutate('tasks', task['id'], lambda current: current.update(roster_error='合成读取失败'))
+        with self.assertRaises(HTTPException):
+            tasks.correct_feedback(task['id'], task['feedback'][0]['id'], FeedbackCorrection(
+                expected_version=task['version'], reward_excluded=True), LOGIN)
+
+    def test_refresh_logs_automatic_count_and_invalidates_old_member_choice(self):
+        task = self.roster_task([entry(), entry(source='group_b')], labels=('有效反馈',))
+        row = task['feedback'][0]
+        task = tasks.correct_feedback(task['id'], row['id'], FeedbackCorrection(
+            expected_version=task['version'], candidate_key=entry(source='group_b')['key']), LOGIN)
+        with patch('app.services.roster_sources.read_roster_snapshot', AsyncMock(
+                return_value=snapshot([entry(), entry(source='group_b', eligible=False)]))):
+            task = asyncio.run(tasks.refresh_roster(task['id'], task['version'], LOGIN))['task']
+        self.assertEqual(task['feedback'][0]['identity']['source_id'], 'group_a')
+        self.assertEqual(task['events'][-1]['details']['自动匹配玩家数'], 1)
+
     def test_multiple_group_settings_preserve_annotation_identity_and_rewards(self):
         from app.schemas.group_tasks import TaskSettingsUpdate
         task = self.make_task(labels=('有效反馈',))

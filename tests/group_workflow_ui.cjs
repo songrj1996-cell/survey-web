@@ -46,11 +46,11 @@ permissions.tree(editor,[],true);assert.equal(editor.querySelectorAll('[data-per
   panel.querySelector=selector=>{const rule=selector.match(/data-rule="([^"]+)"/);if(rule)return fields.get(rule[1]);const suggestion=selector.match(/data-suggestion="([^"]+)"/);if(suggestion){if(!hints.has(suggestion[1]))hints.set(suggestion[1],new Element());return hints.get(suggestion[1]);}return null;};
   panel.querySelectorAll=()=>[];
   const task={id:'task',rules:{name:'已存名称'},summary:{complete_count:0,feedback_count:0},owner_name:'合成操作者',version:1,status:'draft',can_edit:true};
-  let poll;const requests=[],toasts=[],clipboardWrites=[];let fetchedTask=task,requestHook;
+  let poll;const requests=[],toasts=[],clipboardWrites=[];let fetchedTask=task,requestHook,actionPanel;
   const ui={window:{addEventListener(){},workflowConfirm:async()=>false,workflowRequest:async(url,options)=>{requests.push({url,options});if(requestHook){const handled=await requestHook(url,options);if(handled!==undefined)return handled;}if(url.endsWith('/groups'))return {groups:[{id:'group_a',name:'群甲'},{id:'group_b',name:'群乙'}]};if(url.endsWith('/announcement'))return{suggestions:{name:{value:'识别名称',evidence:'公告'},base_reward:{value:100,evidence:'100'}},warnings:[]};return fetchedTask;}},document:{hidden:false,createElement:tag=>new Element(tag)},$,esc:x=>String(x??''),workflowTime:context.window.workflowTime,showToast:(...args)=>toasts.push(args),confirm:()=>false,setInterval:fn=>{poll=fn;},PlatformPermissions:permissions,console,Blob,navigator:{clipboard:{writeText:async text=>clipboardWrites.push(text)}}};
   ui.formatReportDuration=String;
   vm.createContext(ui);vm.runInContext(fs.readFileSync(path.join(root,'static/js/features/group-tasks.js'),'utf8'),ui);
-  const click=async(action,extra={})=>{const button={dataset:{gw:action,...extra},disabled:false,isConnected:true};await panel.listeners.click({target:{closest:selector=>selector==='[data-gw]'?button:null}});};
+  const click=async(action,extra={})=>{const button={dataset:{gw:action,...extra},disabled:false,isConnected:true,closest:()=>actionPanel};await panel.listeners.click({target:{closest:selector=>selector==='[data-gw]'?button:null}});};
   await click('view',{id:'task'});
   assert.doesNotMatch(panel.innerHTML,/data-step="[2-6]"/,'unfinished rules expose no later-stage action');
   const draftHtml=panel.innerHTML;
@@ -117,6 +117,65 @@ permissions.tree(editor,[],true);assert.equal(editor.querySelectorAll('[data-per
   assert.match(records(),/全部群 · 2 位玩家/);
   assert.doesNotMatch(records(),/data-gw="copy" disabled/);
   assert.match($('ga-panel-6').querySelector('.panel__header').innerHTML,/data-tab="records" aria-selected="true"/);
+  // Identity resolution has no note control or note payload; only current members compete.
+  const stableTask=fetchedTask;
+  const activeChoices=[{key:'a',group_name:'群甲',ori:'800000000(6001)',status:'群内成员'},
+    {key:'b',group_name:'群乙',ori:'800000000(6001)',status:'群内成员'}];
+  const ambiguous={...feedback[0],identity:null,identity_choices:activeChoices,identity_candidates:activeChoices,
+    issues:[{kind:'roster_identity',message:'多个名单条目均为群内成员，请选择所属群'}]};
+  fetchedTask={...stableTask,confirmed_version:null,feedback:[ambiguous,feedback[1]],
+    confirmation_issues:[{response_id:ambiguous.id,message:ambiguous.issues[0].message}]};
+  await click('records',{id:'task'});
+  assert.match(records(),/data-fix="candidate_key"/);
+  assert.doesNotMatch(records(),/处理说明|data-fix="note"/);
+  let candidateValue='';
+  actionPanel={querySelector:selector=>{assert.equal(selector,'[data-fix="candidate_key"]');return{value:candidateValue};}};
+  const beforeChoice=requests.length;await click('record-identity',{id:'response0'});
+  assert.equal(requests.length,beforeChoice,'empty identity still requires a choice');
+  candidateValue='b';
+  requestHook=async(url,options)=>{if(url.endsWith('/feedback/response0')){
+    assert.equal(options.method,'PUT');assert.equal(options.body.candidate_key,'b');
+    assert(!('note' in options.body),'identity save never asks for or sends a note');
+    fetchedTask={...stableTask,confirmed_version:null};return fetchedTask;
+  }};
+  await click('record-identity',{id:'response0'});
+  assert(toasts.at(-1)[0].includes('身份选择已保存'));
+  fetchedTask={...stableTask,feedback:[{...feedback[0],identity_choices:[activeChoices[0]],identity_candidates:activeChoices},feedback[1]]};
+  requestHook=undefined;await click('records',{id:'task'});
+  assert.doesNotMatch(records(),/data-fix="candidate_key"|保存身份选择/,'automatic match needs no manual save');
+  const inactive={...ambiguous,identity_choices:[],reward_exclusion_available:true,
+    issues:[{kind:'roster_identity',message:'匹配的名单条目均不在群内，可排除该玩家奖励'}]};
+  const inactiveTask={...stableTask,confirmed_version:null,feedback:[inactive,feedback[1]],
+    confirmation_issues:[{response_id:inactive.id,message:inactive.issues[0].message}]};
+  fetchedTask=inactiveTask;await click('records',{id:'task'});
+  assert.match(records(),/排除该玩家奖励/);
+  assert.doesNotMatch(records(),/data-fix="candidate_key"|处理说明/);
+  requestHook=async(url,options)=>{if(url.endsWith('/feedback/response0')){
+    assert.equal(options.method,'PUT');assert.equal(options.body.reward_excluded,true);
+    assert(!('note' in options.body));
+    fetchedTask={...stableTask,confirmed_version:null,feedback:[{...feedback[0],reward_excluded:true,outcome:{...feedback[0].outcome,base:0,excellent:0}},feedback[1]],
+      players:[{...players[0],reward_excluded:true,base:0,excellent:0,total:0},players[1]]};return fetchedTask;
+  }};
+  await click('record-exclude',{id:'response0'});
+  assert.match(records(),/已排除该玩家在本任务中的全部奖励/);
+  assert.match(records(),/复制范围：全部群 · 1 位玩家/);
+  assert.match(records(),/恢复该玩家奖励/);
+  requestHook=async(url,options)=>{if(url.endsWith('/feedback/response0')){
+    assert.equal(options.body.reward_excluded,false);fetchedTask=inactiveTask;return fetchedTask;
+  }};
+  await click('record-restore-reward',{id:'response0'});
+  assert.match(records(),/排除该玩家奖励/);
+  assert(toasts.at(-1)[0].includes('已恢复该玩家奖励'));
+  fetchedTask={...inactiveTask,can_edit:false};requestHook=undefined;await click('records',{id:'task'});
+  assert.match(records(),/data-gw="record-exclude" disabled/);
+  fetchedTask={...stableTask,can_edit:false,feedback:[{...feedback[0],reward_excluded:true}],
+    players:[{...players[0],reward_excluded:true,base:0,excellent:0,total:0}]};
+  await click('records',{id:'task'});
+  assert.match(records(),/当前任务记录已确认，本范围没有可复制玩家/);
+  assert.match(records(),/data-gw="copy" disabled/);
+  assert.match(records(),/data-gw="record-restore-reward" disabled/);
+  fetchedTask=stableTask;await click('records',{id:'task'});
+  console.log('Identity and exclusion handlers passed: no note, active-only choice, automatic match, exclude, restore and read-only protection.');
   await $('gw-group').onchange({target:{value:'group_b'}});
   assert.match(records(),/群乙 · 1 位玩家/);
   assert(records().includes(players[1].player_id)&&!records().includes(players[0].player_id));

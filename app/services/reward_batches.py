@@ -84,6 +84,7 @@ def _collect_sources(selection, login):
                          "sheet": "", "source_id": "", "row_number": index,
                          "date": task["rules"]["payout_date"], "task": task["rules"]["name"], "player_id": player["player_id"],
                          "previous_identity": player["identity"], "response_ids": player["response_ids"],
+                         "reward_excluded": player["reward_excluded"],
                          "normal_reward": player["base"], "excellent_reward": player["excellent"], "other_reward": 0,
                          "total_reward": player["total"], "version": version})
     for identifier in dict.fromkeys(selection["other_reward_ids"]):
@@ -133,6 +134,10 @@ def _reconcile(rows, snapshot, identity_choices):
     eligible, excluded, issues, changes = [], [], [], []
     for original in rows:
         row = deepcopy(original)
+        if row.get("reward_excluded"):
+            row["exclusion_reason"] = "任务中已手动排除该玩家奖励"
+            excluded.append(row)
+            continue
         candidates = [entry for entry in by_player[row["player_id"]] if not row.get("source_id") or entry["source_id"] == row["source_id"]]
         # Retired memberships cannot compete with an active identity. Unknown states
         # remain candidates so that missing configuration never silently pays a player.
