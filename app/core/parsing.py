@@ -20,14 +20,26 @@ def _parse_csv(content: bytes) -> list[list]:
     raise ValueError("无法解析 CSV 文件，请确认文件编码为 UTF-8 或 GBK")
 
 
-def _parse_excel(content: bytes) -> list[list]:
+def _excel_cell_text(value: object, *, normalize_integer_numbers: bool) -> str:
+    if value is None:
+        return ""
+    # Only normalize actual Excel numbers; text IDs must retain every character.
+    if normalize_integer_numbers and isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
+def _parse_excel(content: bytes, *, normalize_integer_numbers: bool = False) -> list[list]:
     try:
         wb = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
         try:
             ws = wb.active
             rows = []
             for row in ws.iter_rows(values_only=True):
-                rows.append([("" if c is None else str(c)) for c in row])
+                rows.append([
+                    _excel_cell_text(c, normalize_integer_numbers=normalize_integer_numbers)
+                    for c in row
+                ])
         finally:
             wb.close()
     except (
@@ -43,18 +55,20 @@ def _parse_excel(content: bytes) -> list[list]:
     return rows
 
 
-def _parse_file(filename: str, content: bytes) -> list[list]:
+def _parse_file(
+    filename: str, content: bytes, *, normalize_integer_numbers: bool = False,
+) -> list[list]:
     name_lower = filename.lower()
     if name_lower.endswith(".csv"):
         return _parse_csv(content)
     elif name_lower.endswith(".xlsx"):
-        return _parse_excel(content)
+        return _parse_excel(content, normalize_integer_numbers=normalize_integer_numbers)
     raise ValueError("不支持的文件格式，请上传 .csv 或 .xlsx 文件")
 
 
 def parse_file_with_cell_metadata(filename: str, content: bytes) -> tuple[list[list], dict]:
     """Opt-in identity safety metadata; existing survey parsing is unchanged."""
-    rows = _parse_file(filename, content)
+    rows = _parse_file(filename, content, normalize_integer_numbers=True)
     issues: dict[str, str] = {}
     if filename.lower().endswith(".xlsx"):
         workbook = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=False)

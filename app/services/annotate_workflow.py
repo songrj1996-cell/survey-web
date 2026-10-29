@@ -843,7 +843,7 @@ async def _translate_headers(headers: list) -> tuple[list, str]:
 async def handle_annotate_upload(filename: str, content: bytes, login: dict | None) -> dict:
     """解析上传文件、检测列、翻译表头、创建会话，返回前端所需的 result dict。"""
     try:
-        rows = _parse_file(filename, content)
+        rows = _parse_file(filename, content, normalize_integer_numbers=True)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 

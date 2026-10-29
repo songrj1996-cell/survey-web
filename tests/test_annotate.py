@@ -2,6 +2,7 @@ import asyncio
 import io
 import json
 import unittest
+import zipfile
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
@@ -1079,6 +1080,54 @@ class AnnotateRuleTests(unittest.TestCase):
         self.assertIn("/quality-review", script)
         self.assertIn("human_reviews", script)
         self.assertIn("annApplyQualityLabel", script)
+
+
+class AnnotateIdentityUploadTests(unittest.IsolatedAsyncioTestCase):
+    async def test_uploaded_numeric_id_stays_text_through_matching_and_export(self):
+        for raw in ("12345678901.0", "1.2345678901E+10"):
+            with self.subTest(raw=raw):
+                workbook = openpyxl.Workbook()
+                workbook.active.append(["WhatsApp", "Q1"])
+                workbook.active.append([12345678901, "具体回答"])
+                buffer = io.BytesIO()
+                workbook.save(buffer)
+                workbook.close()
+                content = io.BytesIO()
+                with zipfile.ZipFile(buffer) as source, zipfile.ZipFile(content, "w") as target:
+                    for name in source.namelist():
+                        data = source.read(name)
+                        if name == "xl/worksheets/sheet1.xml":
+                            data = data.replace(b"<v>12345678901</v>", f"<v>{raw}</v>".encode())
+                        target.writestr(name, data)
+                # No translation/model call or shared session cleanup during this check.
+                with patch.object(annotate_workflow, "annotate_sessions", {}), patch.object(
+                    annotate_workflow, "_translate_headers", new=AsyncMock(return_value=(["WhatsApp", "Q1"], "")),
+                ) as translate:
+                    uploaded = await annotate_workflow.handle_annotate_upload("responses.xlsx", content.getvalue(), None)
+                    session = annotate_workflow.annotate_sessions[uploaded["session_id"]]
+                    self.assertEqual(uploaded["id_col"], 0)
+                    self.assertEqual(uploaded["preview"][0][0], "12345678901")
+                    self.assertEqual(annotate_workflow._row_id(session["rows"][1], 0), "12345678901")
+                    session.update(
+                        open_text_cols=[1], tasks={"quality": True, "ai_detect": False},
+                        quality_results=[{
+                            "id": "12345678901", "q_labels": {"col_1": "有效反馈"},
+                            "q_reasons": {"col_1": "回答给出了题目要求的信息"},
+                            "q_evidence": {"col_1": "具体回答"},
+                            "q_checks": {"col_1": {"requirement": "direct_answer", "support": "substantive"}},
+                            "overall": "有效反馈", "overall_reason": "回答内容完整且切题",
+                        }],
+                    )
+                    exported, _ = annotate_workflow._build_annotate_excel_from_session(session)
+                    translate.assert_awaited_once()
+                result = openpyxl.load_workbook(io.BytesIO(exported))
+                self.addCleanup(result.close)
+                sheet = result.active
+                headers = [cell.value for cell in sheet[1]]
+                identity = sheet.cell(2, headers.index("WhatsApp") + 1)
+                self.assertEqual(identity.value, "12345678901")
+                self.assertEqual(identity.data_type, "s")
+                self.assertEqual(sheet.cell(2, headers.index("[Q1]质量标注") + 1).value, "有效反馈")
 
 
 class AnnotateReviewTests(unittest.IsolatedAsyncioTestCase):
