@@ -7,12 +7,20 @@ class Element {
   append(...items){this.children.push(...items.filter(item=>typeof item!=='string'));}
   replaceChildren(...items){this.children=items;}
   querySelectorAll(selector){const out=[];const walk=node=>{for(const item of node.children){if(selector==='[data-permission]'&&item.dataset.permission||selector==='[data-permission]:checked'&&item.dataset.permission&&item.checked)out.push(item);walk(item);}};walk(this);return out;}
-  querySelector(){return null;}
+  querySelector(selector){
+    if(!['.panel__header','.panel__desc','.ann-done-block','.step-bar'].includes(selector))return null;
+    this.queries=this.queries||new Map();
+    if(!this.queries.has(selector))this.queries.set(selector,new Element());
+    return this.queries.get(selector);
+  }
+  setAttribute(name,value){this[name]=value;}
+  removeAttribute(name){delete this[name];}
+  insertAdjacentHTML(position,html){this.innerHTML=(this.innerHTML||'')+html;}
   closest(){return this;}
   addEventListener(event,callback){this.listeners[event]=callback;}
 }
 const document={createElement:tag=>new Element(tag),querySelectorAll:()=>[],getElementById:()=>null};
-const nav=new Element();document.querySelector=()=>nav;
+const nav=new Element();document.querySelector=selector=>selector==='.sidebar__nav'?nav:null;
 let response={ok:true,json:async()=>({})};
 const context={window:{},document,FormData:class{},fetch:async()=>response,console};
 vm.createContext(context);vm.runInContext(fs.readFileSync(path.join(root,'static/js/core/feature-permissions.js'),'utf8'),context);
@@ -38,8 +46,9 @@ permissions.tree(editor,[],true);assert.equal(editor.querySelectorAll('[data-per
   panel.querySelector=selector=>{const rule=selector.match(/data-rule="([^"]+)"/);if(rule)return fields.get(rule[1]);const suggestion=selector.match(/data-suggestion="([^"]+)"/);if(suggestion){if(!hints.has(suggestion[1]))hints.set(suggestion[1],new Element());return hints.get(suggestion[1]);}return null;};
   panel.querySelectorAll=()=>[];
   const task={id:'task',rules:{name:'已存名称'},summary:{complete_count:0,feedback_count:0},owner_name:'合成操作者',version:1,status:'draft',can_edit:true};
-  let poll;const requests=[];let fetchedTask=task;
-  const ui={window:{addEventListener(){},workflowConfirm:async()=>false,workflowRequest:async(url,options)=>{requests.push({url,options});if(url.endsWith('/groups'))return {groups:[{id:'group_a',name:'群甲'},{id:'group_b',name:'群乙'}]};if(url.endsWith('/announcement'))return{suggestions:{name:{value:'识别名称',evidence:'公告'},base_reward:{value:100,evidence:'100'}},warnings:[]};return fetchedTask;}},document:{hidden:false,createElement:tag=>new Element(tag)},$,esc:x=>String(x??''),showToast(){},confirm:()=>false,setInterval:fn=>{poll=fn;},PlatformPermissions:permissions,console};
+  let poll;const requests=[],toasts=[],clipboardWrites=[];let fetchedTask=task,requestHook;
+  const ui={window:{addEventListener(){},workflowConfirm:async()=>false,workflowRequest:async(url,options)=>{requests.push({url,options});if(requestHook){const handled=await requestHook(url,options);if(handled!==undefined)return handled;}if(url.endsWith('/groups'))return {groups:[{id:'group_a',name:'群甲'},{id:'group_b',name:'群乙'}]};if(url.endsWith('/announcement'))return{suggestions:{name:{value:'识别名称',evidence:'公告'},base_reward:{value:100,evidence:'100'}},warnings:[]};return fetchedTask;}},document:{hidden:false,createElement:tag=>new Element(tag)},$,esc:x=>String(x??''),workflowTime:context.window.workflowTime,showToast:(...args)=>toasts.push(args),confirm:()=>false,setInterval:fn=>{poll=fn;},PlatformPermissions:permissions,console,Blob,navigator:{clipboard:{writeText:async text=>clipboardWrites.push(text)}}};
+  ui.formatReportDuration=String;
   vm.createContext(ui);vm.runInContext(fs.readFileSync(path.join(root,'static/js/features/group-tasks.js'),'utf8'),ui);
   const click=async(action,extra={})=>{const button={dataset:{gw:action,...extra},disabled:false,isConnected:true};await panel.listeners.click({target:{closest:selector=>selector==='[data-gw]'?button:null}});};
   await click('view',{id:'task'});
@@ -87,4 +96,87 @@ permissions.tree(editor,[],true);assert.equal(editor.querySelectorAll('[data-per
   assert.deepEqual(Array.from(requests.at(-1).options.body.rules.group_source_ids),['group_b','retired'],'new-task rules also submit a group list');
   console.log('Group workflow UI contracts passed: permissions, parent tri-state, empty defaults, structured errors, announcement draft protection, polling and leave protection.');
   console.log('Task group multiselect passed: legacy selection, settings/rules submission, empty selection and inactive groups.');
+
+  // Exercise the actual delegated handlers, not just the presence of a label.
+  const quality={overall:'优秀反馈',overall_reason:'合成判断',q_labels:{col_1:'优秀反馈'},q_reasons:{col_1:'具体体验'}};
+  const feedback=['group_a','group_b'].map((group,i)=>({id:'response'+i,source_row:i+2,player_id:'10000000000000000'+i,excluded:false,quality_complete:true,quality,
+    answers:[{column:1,question:'操作体验',answer:'合成回答'+i}],issues:[],identity:{source_id:group,group_name:i?'群乙':'群甲',status:'群内人员'},outcome:{label:'优秀反馈',base:100,excellent:100}}));
+  const players=feedback.map((row,i)=>({player_id:row.player_id,source_id:row.identity.source_id,group_name:row.identity.group_name,identity:row.identity,
+    ori:'80000000'+i+'(6001)',adv:'',form_valid:true,data_value:'',data_pass:null,base:100,excellent:100,total:200,
+    feedback_count:1,response_ids:[row.id],composition:{'优秀反馈':1},issues:[],adv_choices:[]}));
+  fetchedTask={...task,version:7,confirmed_version:7,updated_at:'2026-10-29T01:00:00Z',rules:{...fetchedTask.rules,ai_detect:false,allow_repeat:false,requires_count:false},
+    headers:['playerid','操作体验'],mapping:{id_col:0,open_text_cols:[1]},feedback,players,runs:[],input_issues:[],confirmation_issues:[],duplicate_groups:[],
+    workflow:{max_step:6},summary:{complete_count:2,feedback_count:2,player_count:2,base:200,excellent:200},
+    annotation:{phase:'results',complete:true,options:{ai_detect:false,quality:true},review_ids:[],reviewed_ids:[],high_threshold:80,review_threshold:60},
+    roster_snapshot:{read_at:'2026-10-29T01:00:00Z'},status:'confirmed'};
+  await click('records',{id:'task'});
+  const records=()=>$('gw-result-body').innerHTML;
+  assert.match(records(),/当前任务记录已确认，可以复制/);
+  assert.equal((records().match(/<th scope="col">/g)||[]).length,12);
+  assert.equal((records().match(/<td>/g)||[]).length,24,'one row per player, 12 columns per row');
+  assert.match(records(),/全部群 · 2 位玩家/);
+  assert.doesNotMatch(records(),/data-gw="copy" disabled/);
+  assert.match($('ga-panel-6').querySelector('.panel__header').innerHTML,/data-tab="records" aria-selected="true"/);
+  await $('gw-group').onchange({target:{value:'group_b'}});
+  assert.match(records(),/群乙 · 1 位玩家/);
+  assert(records().includes(players[1].player_id)&&!records().includes(players[0].player_id));
+  let clipboardFailure=false;
+  const payload={text:Array.from({length:12},(_,i)=>String(i)).join('\t'),html:'<table><tr>'+Array.from({length:12},(_,i)=>'<td>'+i+'</td>').join('')+'</tr></table>',columns:12,count:1,scope:'群乙'};
+  requestHook=async url=>{if(url.includes('/clipboard?')){if(clipboardFailure)throw Object.assign(new Error('任务已更新'),{status:409});return payload;}};
+  await click('copy');
+  assert.equal(clipboardWrites.at(-1),payload.text);
+  assert.match(requests.at(-1).url,/clipboard\?version=7&source_id=group_b$/);
+  assert(toasts.some(([message,type])=>type==='success'&&message.includes('已复制群乙，1 行')));
+  assert(!panel.innerHTML.includes('gw-copy-dialog'),'copy has no preview dialog');
+  ui.window.ClipboardItem=class {constructor(formats){this.formats=formats;}};
+  ui.navigator.clipboard.write=async items=>{
+    const formats=items[0].formats;
+    const [plain,html]=await Promise.all([formats['text/plain'],formats['text/html']]);
+    clipboardWrites.push({text:await plain.text(),html:await html.text()});
+  };
+  await click('copy');
+  assert.deepEqual(clipboardWrites.at(-1),{text:payload.text,html:payload.html},'plain text and HTML preserve one server result');
+  let release,startCopy;
+  const copyStarted=new Promise(resolve=>{startCopy=resolve;});
+  requestHook=url=>url.includes('/clipboard?')?new Promise(resolve=>{release=resolve;startCopy();}):undefined;
+  const copying=click('copy');
+  await copyStarted;
+  assert.equal(await ui.window.groupWorkflowMayLeave(),false,'leaving is blocked while the clipboard result is being prepared');
+  const beforeRequests=requests.length;await click('copy');
+  assert.equal(requests.length,beforeRequests,'double click does not issue a second copy request');
+  release(payload);await copying;
+  requestHook=async url=>{if(url.includes('/clipboard?'))throw Object.assign(new Error('公式目标未同步'),{status:409});};
+  const copiedCount=clipboardWrites.length;
+  await click('copy');
+  assert.equal(clipboardWrites.length,copiedCount);
+  assert.match(records(),/复制失败：公式目标未同步（HTTP 409）/);
+  fetchedTask={...fetchedTask,version:8,confirmed_version:null,updated_at:'2026-10-29T02:00:00Z'};
+  await poll();
+  assert.match(records(),/data-gw="copy" disabled/,'changed results must be confirmed again');
+  assert.match(records(),/群乙 · 1 位玩家/,'background refresh preserves the selected group');
+  requestHook=async(url,options)=>{
+    if(url.endsWith('/confirm')){assert.equal(options.body.expected_version,8);fetchedTask={...fetchedTask,confirmed_version:8};return fetchedTask;}
+    if(url.endsWith('/roster')){fetchedTask={...fetchedTask,confirmed_version:null,confirmation_issues:[{kind:'roster',message:'合成名单读取失败'}],roster_error:'合成名单读取失败'};return{ok:false,task:fetchedTask};}
+  };
+  await click('record-confirm');assert.match(records(),/当前任务记录已确认，可以复制/);
+  await click('record-roster');
+  assert.match(records(),/合成名单读取失败/);assert.match(records(),/data-gw="copy" disabled/);
+  requestHook=undefined;fetchedTask={...fetchedTask,confirmation_issues:[],roster_error:'',can_edit:false,confirmed_version:8};
+  await click('records',{id:'task'});
+  assert.match(records(),/data-gw="record-roster" disabled/,'read-only viewers cannot refresh or save');
+  assert.doesNotMatch(records(),/data-gw="copy" disabled/,'confirmed records remain copyable for authorized readers');
+  await $('gw-group').onchange({target:{value:'group_b'}});
+  await click('record-response',{id:'response1'});
+  assert.match($('ga-quality-profile-pane').innerHTML,/100000000000000001/,'source link opens the selected player: '+JSON.stringify(toasts.slice(-2)));
+  await click('result-tab',{tab:'records'});
+  assert.match(records(),/群乙 · 1 位玩家/,'returning from quality review retains the group filter');
+  fetchedTask={...fetchedTask,players:[players[0]],feedback:[feedback[0]],updated_at:'2026-10-29T03:00:00Z'};
+  await poll();
+  assert.match(records(),/原选群（当前无记录） · 0 位玩家/,'a vanished group never silently expands the copy scope');
+  assert.match(records(),/data-gw="copy" disabled/);
+  fetchedTask={...fetchedTask,annotation:{...fetchedTask.annotation,complete:false}};
+  const requestsBefore=requests.length;await click('records',{id:'task'});
+  assert(toasts.at(-1)[0].includes('完成质量标注后'));
+  assert.equal(requests.length,requestsBefore+2,'opening an unfinished task only fetches groups and task');
+  console.log('Task-record handlers passed: direct entry, 12 columns, scoped copy, rich clipboard, busy protection, stale versions, roster failures, read-only state and exact player navigation.');
 })().catch(err=>{console.error(err);process.exitCode=1;});

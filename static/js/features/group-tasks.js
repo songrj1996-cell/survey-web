@@ -16,7 +16,7 @@ window.GroupTasks = (() => {
   };
   const statusNames = {awaiting_ai_confirmation:'待确认 AI 作答',draft:'待配置',input_issues:'输入待处理',ready:'待标注',queued:'排队中',running:'标注中',incomplete:'待补齐',annotation_done:'标注完成',awaiting_confirmation:'待确认',confirmed:'可结算'};
   let task = null, step = 1, dirty = false, listFilter = '', groupFilter = '', qualityFilter = '', showAllInputs = false, pollBusy = false;
-  let uploadView=false, settingsView=false, requestBusy=0;
+  let uploadView=false, settingsView=false, requestBusy=0, resultTab='quality', recordBusy=false, recordNotice='';
   let selectedResponse = '', latestList = [], clipboardPreview = null, configuredGroups = [], aiChoices = null;
   const maxStep = () => Math.min(4, task?.workflow?.max_step || 1);
   async function fetchGroups() { configuredGroups=(await api('/api/group-tasks/groups')).groups||[]; }
@@ -28,7 +28,7 @@ window.GroupTasks = (() => {
   const editable = () => task?.can_edit && !busy();
   const disabled = () => editable() ? '' : 'disabled';
   const error = e => { if (!e.scopeChanged) showToast(e.message, 'error', 6500); };
-  async function mayLeave() { if (!dirty) return true; if (!await window.workflowConfirm('当前任务有未保存的填写。继续编辑会保留原文；放弃后才会切换页面。')) return false; dirty=false; aiChoices=null; changedFields.clear(); return true; }
+  async function mayLeave() { if(recordBusy){showToast('正在处理任务记录，请等待当前操作结束','error');return false;} if (!dirty) return true; if (!await window.workflowConfirm('当前任务有未保存的填写。继续编辑会保留原文；放弃后才会切换页面。')) return false; dirty=false; aiChoices=null; changedFields.clear(); return true; }
   window.groupWorkflowMayLeave = mayLeave;
   window.groupWorkflowHasDraft = () => dirty;
   window.addEventListener('beforeunload', event => { if (dirty) { event.preventDefault(); event.returnValue = ''; } });
@@ -49,13 +49,13 @@ window.GroupTasks = (() => {
   async function open({home=false}={}) {
     if(home){
       if(!await mayLeave())return;
-      task=null;step=1;settingsView=false;uploadView=false;selectedResponse='';listFilter='';groupFilter='';qualityFilter='';showAllInputs=false;aiChoices=null;clipboardPreview=null;changedFields.clear();
+      task=null;step=1;settingsView=false;uploadView=false;resultTab='quality';recordNotice='';selectedResponse='';listFilter='';groupFilter='';qualityFilter='';showAllInputs=false;aiChoices=null;clipboardPreview=null;changedFields.clear();
     }
     root.classList.remove('panel--hidden');if(dirty)return;if(task)await load(task.id);else await list();
   }
   async function list() {
     try {
-      const data = await api('/api/group-tasks'); task = null; settingsView=false; root.classList.remove('workflow-annotation');
+      const data = await api('/api/group-tasks'); task = null; settingsView=false; resultTab='quality'; recordNotice=''; root.classList.remove('workflow-annotation');
       root.innerHTML = `<div class="workflow-heading"><div><h1 class="panel__title">质量标注</h1><p class="panel__desc">从任务规则到反馈质量与奖励，记录和进度随时可继续。</p></div>${btn('new','新建任务',true,!PlatformPermissions.canUse('annotate'))}</div>
         <div id="gw-list-summary" class="workflow-summary"></div><div class="workflow-toolbar"><input id="gw-list-filter" aria-label="搜索任务" placeholder="搜索任务或负责人" value="${h(listFilter)}">${btn('list','刷新列表')}<span class="workflow-muted">后台标注不受页面关闭影响</span></div><div id="gw-task-list"></div>`;
       renderList(data.tasks);
@@ -66,7 +66,7 @@ window.GroupTasks = (() => {
     latestList=items;
     $('gw-list-summary').innerHTML=[['标注中',items.filter(t=>t.status==='running').length],['排队中',items.filter(t=>t.status==='queued').length],['待处理任务',items.filter(t=>!['confirmed','annotation_done'].includes(t.status)).length],['可结算任务',items.filter(t=>t.status==='confirmed').length]].map(([label,value])=>`<span>${label}<strong>${value}</strong></span>`).join('');
     const filtered = items.filter(t => `${t.rules.name} ${t.owner_name}`.toLowerCase().includes(listFilter.toLowerCase())).sort((a,b)=>Number(['running','queued'].includes(b.status))-Number(['running','queued'].includes(a.status)));
-    $('gw-task-list').innerHTML = filtered.length ? `<div class="workflow-table-wrap"><table class="workflow-table"><thead><tr><th>任务</th><th>负责人</th><th>发奖日期</th><th>状态与进度</th><th></th></tr></thead><tbody>${filtered.map(t=>`<tr><td><strong>${h(t.rules.name||'未命名任务')}</strong><small>${t.rules.group_name?h(t.rules.group_name)+' · ':''}${t.summary.player_count} 位玩家 · ${t.summary.feedback_count} 份反馈</small></td><td>${h(t.owner_name)}</td><td>${h(t.rules.payout_date||'待确认')}</td><td><span class="workflow-badge">${statusNames[t.status]}</span>${progressBar(t)}<small>${h(progress(t))}</small></td><td>${btn('view',t.annotation?.complete?'查看结果':t.can_edit?'继续处理':'查看',false,false,`data-id="${t.id}" data-result-ready="${Boolean(t.annotation?.complete)}"`)}${t.can_edit?btn('settings','任务设置',false,false,`data-id="${t.id}"`):''}</td></tr>`).join('')}</tbody></table></div>` : '<div class="workflow-empty">尚无匹配任务。新建任务后，依次设置规则、上传核查、标注与计奖。</div>';
+    $('gw-task-list').innerHTML = filtered.length ? `<div class="workflow-table-wrap"><table class="workflow-table"><thead><tr><th>任务</th><th>负责人</th><th>发奖日期</th><th>状态与进度</th><th></th></tr></thead><tbody>${filtered.map(t=>`<tr><td><strong>${h(t.rules.name||'未命名任务')}</strong><small>${t.rules.group_name?h(t.rules.group_name)+' · ':''}${t.summary.player_count} 位玩家 · ${t.summary.feedback_count} 份反馈</small></td><td>${h(t.owner_name)}</td><td>${h(t.rules.payout_date||'待确认')}</td><td><span class="workflow-badge">${statusNames[t.status]}</span>${progressBar(t)}<small>${h(progress(t))}</small></td><td>${btn('view',t.annotation?.complete?'查看结果':t.can_edit?'继续处理':'查看',false,false,`data-id="${t.id}" data-result-ready="${Boolean(t.annotation?.complete)}"`)}${btn('records','任务记录',false,!recordsAvailable(t),`data-id="${t.id}" title="${recordsAvailable(t)?'查看玩家完成结果并复制到飞书':'完成质量标注后可查看任务记录'}"`)}${t.can_edit?btn('settings','任务设置',false,false,`data-id="${t.id}"`):''}</td></tr>`).join('')}</tbody></table></div>` : '<div class="workflow-empty">尚无匹配任务。新建任务后，依次设置规则、上传核查、标注与计奖。</div>';
   }
   async function load(id) { await fetchGroups(); task=await api(`/api/group-tasks/${id}`); render(); }
   function render() {
@@ -138,14 +138,88 @@ window.GroupTasks = (() => {
     $('gw-content').innerHTML=`<section class="workflow-card"><div class="workflow-heading"><div><h2>名单与奖励核对</h2><p class="workflow-muted">质量标注已完成。现在读取最新名单，匹配玩家账号、状态和实际所属群。</p></div>${btn('roster',task.roster_snapshot?'重新读取名单':'读取最新名单',true,!editable())}</div></section>${renderInputIssues(true)}<section class="workflow-card"><h2>确认任务结果</h2>${task.confirmation_issues.map(issue=>`<p class="workflow-muted">${h(issue.message)}</p>`).join('')||'<p>名单与质量结果完整，可以确认用于奖励整理。</p>'}<div class="workflow-toolbar">${btn('confirm','确认结果并查看任务记录 →',true,!editable()||!!task.confirmation_issues.length)}</div></section>`;
     bindInputIssues();
   }
-  function groupOptions() { return '<option value="">全部群</option>'+[...new Map(task.feedback.filter(row=>row.identity).map(row=>[row.identity.source_id,row.identity.group_name])).entries()].map(([id,name])=>`<option value="${id}" ${id===groupFilter?'selected':''}>${h(name)}</option>`).join(''); }
+  const recordColumns=['发奖日期','任务名称','playerid','ori','ADV','当前群内状态','表单有效','体验次数 / 反馈份数','数据任务完成','基础奖励','优秀追加','其他奖励'];
+  const recordsAvailable = value => !!value?.annotation?.complete && value.annotation.options?.quality !== false;
+  const recordsConfirmed = () => recordsAvailable(task) && task.confirmed_version===task.version && !(task.confirmation_issues||[]).length && !busy();
+  function resultTabs() {
+    return '<div class="gw-result-tabs" role="tablist" aria-label="结果查看方式">'+[['quality','质量复核'],['records','任务记录']].map(([value,label])=>`<button type="button" id="gw-tab-${value}" role="tab" data-gw="result-tab" data-tab="${value}" aria-selected="${resultTab===value}" aria-controls="gw-result-body" ${value==='records'&&!recordsAvailable(task)?'disabled title="完成质量标注后可查看任务记录"':''}>${label}</button>`).join('')+'</div>';
+  }
+  function recordIssues() {
+    const rows=task.feedback.filter(row=>!row.excluded&&(row.issues||[]).some(issue=>['roster_identity','adv'].includes(issue.kind)));
+    const duplicates=(task.duplicate_groups||[]).filter(group=>group.roster_only&&!group.keep_response_id);
+    return `<div class="gw-record-issues">${(task.confirmation_issues||[]).filter(issue=>!issue.response_id).map(issue=>`<p class="workflow-error">${h(issue.message)}</p>`).join('')}
+      ${rows.map(row=>`<details class="workflow-feedback" open><summary>第 ${row.source_row} 行 · ${h(row.player_id)}</summary>${row.issues.map(issue=>`<p class="workflow-error">${h(issue.message)}</p>`).join('')}${row.identity_candidates?.length>1?`<label class="workflow-field">选择名单身份<select data-fix="candidate_key" ${disabled()}><option value="">请选择</option>${row.identity_candidates.map(c=>`<option value="${h(c.key)}" ${row.identity?.key===c.key?'selected':''}>${h(c.group_name)} · ${h(c.ori)} · ${h(c.status)}</option>`).join('')}</select></label><label class="workflow-field">处理说明<input data-fix="note" ${disabled()}></label>${btn('record-identity','保存身份选择',false,!editable()||recordBusy,`data-id="${h(row.id)}"`)}`:'<p class="workflow-muted">请维护名单后重新读取；原始反馈中的 ID 不在此修改。</p>'}</details>`).join('')}
+      ${duplicates.map(group=>`<details class="workflow-feedback" open><summary>重复账号待核对 · ${group.response_ids.length} 份反馈</summary>${group.response_ids.map(id=>{const row=task.feedback.find(item=>item.id===id);return `<p>第 ${row.source_row} 行 · ${h(row.player_id)} ${btn('record-duplicate','保留此份',false,!editable()||recordBusy,`data-group="${h(group.id)}" data-id="${h(id)}"`)}</p>`;}).join('')}</details>`).join('')}</div>`;
+  }
   function renderRecords() {
-    const players=task.players.filter(p=>!groupFilter||p.source_id===groupFilter);
-    $('gw-content').innerHTML=`<section class="workflow-card"><div class="workflow-heading"><div><h2>任务记录</h2><p class="workflow-muted">一位玩家一行。复制范围：${groupFilter?h(players[0]?.group_name||'当前群'):'本任务全部群'} · ${players.length} 行 · 无表头 12 列。</p></div>${btn('copy','复制任务记录',true,task.confirmed_version!==task.version)}</div><div class="workflow-toolbar"><label>所属群 <select data-filter id="gw-group">${groupOptions()}</select></label><span class="workflow-muted">${task.rules.allow_repeat?'数据列为保留反馈份数，含无效反馈':task.rules.requires_count?'数据列为实际体验次数':'数据列不适用，复制时留空'}</span></div>
-      <div class="workflow-table-wrap"><table class="workflow-table"><thead><tr><th>玩家 / 群</th><th>ori / ADV</th><th>有效</th><th>次数 / 份数</th><th>数据任务</th><th>基础</th><th>优秀追加</th><th>其他</th><th>合计</th></tr></thead><tbody>${players.map(p=>`<tr><td>${h(p.player_id)}<small>${h(p.group_name)}</small></td><td>${h(p.ori)}<small>${h(p.adv||'ADV 未填写')}</small></td><td>${p.form_valid?'是':'否'}</td><td>${p.data_value??'待补齐'}</td><td>${p.data_pass===null?'不适用':p.data_pass?'是':'否'}</td><td>${p.base??'待补齐'}</td><td>${p.excellent??'待补齐'}</td><td>0</td><td>${p.total??'待补齐'}</td></tr>`).join('')}</tbody></table></div>
-      ${players.map(p=>`<details class="workflow-feedback"><summary>${h(p.player_id)} · ${Object.entries(p.composition).map(([label,count])=>`${count} ${h(label)}`).join(' / ')}</summary>${p.response_ids.map(id=>{const row=task.feedback.find(r=>r.id===id);return `<p>第 ${row.source_row} 行：${h(row.outcome.label||'待补齐')} · 基础 ${row.outcome.base??'待确定'} + 优秀追加 ${row.outcome.excellent??'待确定'} · ${h(row.gate?.reason||'')} ${btn('record-response','查看原文与依据',false,false,`data-id="${row.id}"`)}</p>`;}).join('')}${p.issues.map(issue=>`<p class="workflow-error">${h(issue)}</p>`).join('')}${p.adv_choices.length>1?`<label class="workflow-field">确认任务记录中的 ADV<input data-player-adv value="${h(p.adv)}" placeholder="按实际账号填写，也可明确留空" ${disabled()}></label><label class="workflow-field">处理说明<input data-player-note ${disabled()}></label>${btn('adv','保存 ADV 决定',false,!editable(),`data-player="${h(p.player_id)}"`)}`:''}</details>`).join('')}
-      <details><summary>查看完整复制列顺序（12 列）</summary><ol class="workflow-copy-columns">${['发奖日期','任务名称','playerid','ori（查询公式）','ADV','当前状态（查询公式）','表单有效','体验次数 / 反馈份数','数据任务完成','基础奖励','优秀追加','其他奖励'].map(label=>`<li>${h(label)}</li>`).join('')}</ol></details><p class="workflow-muted">ori 与当前状态会复制为查找公式。生成 TXT 前仍会读取最新名单。</p><div class="workflow-toolbar">${PlatformPermissions.allowed('reward')?btn('rewards','进入奖励整理 →',true,task.confirmed_version!==task.version):''}</div></section>`;
-    if($('gw-group'))$('gw-group').onchange=async e=>{if(!await mayLeave()){e.target.value=groupFilter;return;}groupFilter=e.target.value;render();};
+    const all=task.players||[], groups=[...new Map(all.filter(p=>p.source_id).map(p=>[p.source_id,p.group_name])).entries()];
+    if(groupFilter&&!groups.some(([id])=>id===groupFilter))groups.push([groupFilter,'原选群（当前无记录）']);
+    const players=all.filter(p=>!groupFilter||p.source_id===groupFilter), confirmed=recordsConfirmed();
+    const scope=groupFilter?groups.find(([id])=>id===groupFilter)[1]:'全部群';
+    const total=key=>players.every(p=>p[key]!==null&&p[key]!==undefined)?players.reduce((sum,p)=>sum+p[key],0).toLocaleString():'待补齐';
+    const notice=recordBusy?recordNotice:confirmed?'当前任务记录已确认，可以复制':!task.roster_snapshot?'请先读取最新名单，核对玩家账号和群内状态':(task.confirmation_issues||[]).length?'仍有事项待核对，暂不能复制':'当前记录尚未确认或结果已有更新，请核对后确认';
+    const status=task.roster_snapshot?`名单读取时间：${h(workflowTime(task.roster_snapshot.read_at))}`:'读取已配置的名单后，在此处理身份匹配和账号冲突。';
+    const tableRows=players.map(p=>{const cells=[task.rules.payout_date,task.rules.name,p.player_id,p.ori||'待匹配',p.adv||'—',p.identity?.status||'待匹配',p.form_valid?'是':'否',p.data_value??'待补齐',p.data_pass===null?'不适用':p.data_pass?'是':'否',p.base??'待补齐',p.excellent??'待补齐',0];return '<tr>'+cells.map(cell=>`<td>${h(cell)}</td>`).join('')+'</tr>';}).join('');
+    $('gw-result-body').innerHTML=`<section class="gw-records"><div class="workflow-heading"><div><h2>任务记录</h2><p class="workflow-muted">一位玩家一行，按固定 12 列复制到现有飞书表格。</p></div>${btn('copy',recordBusy&&recordNotice.includes('复制')?'正在复制…':'复制任务记录',true,!confirmed||recordBusy||!players.length)}</div>
+      <div class="gw-record-status" role="status" aria-live="polite"><div><strong>${h(notice)}</strong><p>${status}</p><p>账号与群内状态复制为查询公式，粘贴后跟随人员名单更新。</p>${!recordBusy&&recordNotice?`<p class="gw-record-operation">${h(recordNotice)}</p>`:''}</div><div class="workflow-toolbar">${btn('record-roster',task.roster_snapshot?'重新读取名单':'读取最新名单',false,!editable()||recordBusy)}${!confirmed?btn('record-confirm','确认任务记录',true,!editable()||recordBusy||!!task.confirmation_issues?.length):''}</div></div>
+      <div class="gw-record-filter"><label>所属群 <select data-filter id="gw-group" ${recordBusy?'disabled':''}><option value="">全部群</option>${groups.map(([id,name])=>`<option value="${h(id)}" ${id===groupFilter?'selected':''}>${h(name)}</option>`).join('')}</select></label><span>复制范围：${h(scope)} · ${players.length} 位玩家 · 无表头 12 列</span></div>
+      <div class="gw-record-summary">${[['玩家人数',players.length+' 位'],['基础奖励',total('base')+' 钻'],['优秀追加',total('excellent')+' 钻'],['合计',total('total')+' 钻']].map(([label,value])=>`<div><span>${label}</span><strong>${value}</strong></div>`).join('')}</div>
+      ${!confirmed?recordIssues():''}
+      <div class="workflow-table-wrap gw-record-table" tabindex="0" role="region" aria-label="玩家任务记录，固定 12 列"><table class="workflow-table"><thead><tr>${recordColumns.map((label,i)=>`<th scope="col">${h(label)}${[3,5].includes(i)?'<small class="gw-formula-badge">公式</small>':''}</th>`).join('')}</tr></thead><tbody>${tableRows||'<tr><td colspan="12">当前范围没有玩家记录。</td></tr>'}</tbody></table></div>
+      <div class="gw-record-details">${players.map(p=>`<details class="workflow-feedback"><summary>玩家 ${h(p.player_id)} · ${p.feedback_count} 份反馈 · ${Object.entries(p.composition||{}).map(([label,count])=>h(label)+' '+count+' 份').join(' / ')}</summary>${(p.response_ids||[]).map(id=>{const row=task.feedback.find(r=>r.id===id);return `<div class="gw-record-response"><span>第 ${row.source_row} 行反馈 · ${h(row.outcome?.label||'待补齐')} · 基础 ${row.outcome?.base??'待确定'} + 优秀追加 ${row.outcome?.excellent??'待确定'} 钻</span>${btn('record-response','查看原文与依据 →',false,recordBusy,`data-id="${h(id)}"`)}</div>`;}).join('')}${(p.issues||[]).map(issue=>`<p class="workflow-error">${h(issue)}</p>`).join('')}${p.adv_choices?.length>1?`<label class="workflow-field">确认任务记录中的 ADV<input data-player-adv value="${h(p.adv)}" ${disabled()}></label><label class="workflow-field">处理说明<input data-player-note ${disabled()}></label>${btn('record-adv','保存 ADV 决定',false,!editable()||recordBusy,`data-player="${h(p.player_id)}"`)}`:''}</details>`).join('')}</div>
+      <div class="gw-record-footer"><p class="workflow-muted">复制后直接粘贴到飞书已有表头下；长 ID 保留为文本。${task.rules.allow_repeat?'份数包含保留的无效反馈。':!task.rules.requires_count?'本任务不要求体验次数，该列复制时留空。':''}</p><details><summary>查看 12 列说明</summary><ol class="workflow-copy-columns">${recordColumns.map(label=>`<li>${h(label)}</li>`).join('')}</ol><p class="workflow-muted">ori 与当前群内状态为公式；其他奖励默认 0。不同目标工作簿请按群分别复制。</p></details></div></section>`;
+    $('gw-group').onchange=async e=>{if(!await mayLeave()){e.target.value=groupFilter;return;}groupFilter=e.target.value;recordNotice='';render();};
+  }
+  async function recordAction(name,button) {
+    if(recordBusy)return;
+    if(!['record-identity','record-adv'].includes(name)&&!await mayLeave())return;
+    if(recordBusy)return;
+    if(name==='copy'&&!recordsConfirmed())throw new Error('请先核对并确认当前版本的任务记录');
+    if(name!=='copy'&&!editable())throw new Error('当前任务仅可查看，无法修改记录');
+    const id=task.id, version=task.version, epoch=scopeEpoch, source=groupFilter;
+    const messages={copy:'正在准备复制内容…','record-roster':'正在读取最新名单…','record-confirm':'正在确认任务记录…','record-identity':'正在保存身份选择…','record-duplicate':'正在保存重复账号决定…','record-adv':'正在保存 ADV 决定…'};
+    let operation,body={};
+    if(name==='record-identity'){const panel=button.closest('details');body={candidate_key:panel.querySelector('[data-fix="candidate_key"]').value,note:panel.querySelector('[data-fix="note"]').value.trim()};if(!body.candidate_key||!body.note)throw new Error('请选择名单身份并填写处理说明');operation='feedback/'+button.dataset.id;}
+    if(name==='record-adv'){const panel=button.closest('details');body={player_id:button.dataset.player,adv:panel.querySelector('[data-player-adv]').value,note:panel.querySelector('[data-player-note]').value.trim()};if(!body.note)throw new Error('请填写 ADV 处理说明');operation='player-adv';}
+    recordBusy=true;recordNotice=messages[name];render();
+    try {
+      if(name==='copy'){
+        if(!navigator.clipboard)throw new Error('浏览器未开放剪贴板，请使用安全连接或本机地址并允许剪贴板访问');
+        const payload=api('/api/group-tasks/'+id+'/clipboard?version='+version+'&source_id='+encodeURIComponent(source)).then(value=>{
+          if(epoch!==scopeEpoch||task?.id!==id||task.version!==version||groupFilter!==source)throw new Error('记录或复制范围已更新，请重新核对后复制');
+          if(value.columns!==12||!value.count)throw new Error('没有可复制的完整 12 列记录');
+          return value;
+        });
+        // Promise-backed ClipboardItems keep the write inside the user's click activation.
+        // Both formats share one server request; no extra confirmation dialog is needed.
+        let copied;
+        try {
+          if(window.ClipboardItem&&navigator.clipboard.write){
+            const item=new window.ClipboardItem({'text/plain':payload.then(v=>new Blob([v.text],{type:'text/plain'})),'text/html':payload.then(v=>new Blob([v.html],{type:'text/html'}))});
+            await navigator.clipboard.write([item]);copied=await payload;
+          }else{copied=await payload;await navigator.clipboard.writeText(copied.text);}
+        }catch(err){await payload.catch(()=>{});throw err;}
+        recordNotice='已复制'+copied.scope+'，'+copied.count+' 行任务记录 · '+workflowTime(new Date().toISOString());
+        showToast(recordNotice,'success');
+      }else{
+        operation=operation||({'record-roster':'roster','record-confirm':'confirm','record-duplicate':'duplicates'}[name]);
+        if(name==='record-duplicate')body={group_id:button.dataset.group,keep_response_id:button.dataset.id};
+        const value=await api('/api/group-tasks/'+id+'/'+operation,{method:['record-identity','record-adv'].includes(name)?'PUT':'POST',body:{expected_version:version,...body}});
+        if(epoch!==scopeEpoch||task?.id!==id)return;
+        task=value.task||value;dirty=false;changedFields.clear();
+        if(value.ok===false)throw new Error(task.roster_error||'名单未能读取，请检查名单来源后重试');
+        recordNotice=({'record-roster':'最新名单已读取，请核对后确认任务记录','record-confirm':'当前任务记录已确认，可以复制','record-identity':'身份选择已保存，请重新核对记录','record-duplicate':'重复账号决定已保存，请重新核对记录','record-adv':'ADV 决定已保存，请重新核对记录'})[name]+' · '+workflowTime(new Date().toISOString());
+        showToast(recordNotice,'success');
+      }
+    }catch(err){
+      if(epoch!==scopeEpoch)return;
+      recordNotice=(name==='copy'?'复制失败：':'任务记录操作失败：')+err.message+(err.status?'（HTTP '+err.status+'）':'')+'；请核对提示后重试。';
+      if(err.status===409){try{const latest=await api('/api/group-tasks/'+id);if(task?.id===id)task=latest;}catch{}}
+      error(new Error(recordNotice));
+    }finally{
+      recordBusy=false;
+      if(epoch===scopeEpoch&&task?.id===id)render();
+    }
   }
 
   // View markup and rendering functions from 6b4740a; API/state adapters follow.
@@ -800,7 +874,14 @@ async function finishAIReview() {
 function renderJudgments() {
   if(task.annotation.phase==='ai_progress'||task.annotation.phase==='ai_review'){step=3;renderAI();return;}
   if(task.annotation.phase==='quality_progress'){renderAnnotationProgress('quality');return;}
-  syncAnnotation();annPage(6);annElement('ann-done-text').innerHTML=annBuildDoneSummary();
+  if(!recordsAvailable(task))resultTab='quality';
+  syncAnnotation();annPage(6);
+  const panel=$('ga-panel-6');
+  panel.querySelector('.panel__desc').textContent='查看质量复核，或按玩家汇总任务完成情况并复制到飞书';
+  panel.querySelector('.panel__header').insertAdjacentHTML('afterend',resultTabs());
+  const body=panel.querySelector('.ann-done-block');body.id='gw-result-body';body.setAttribute('role','tabpanel');body.setAttribute('aria-labelledby','gw-tab-'+resultTab);
+  if(resultTab==='records'&&recordsAvailable(task)){renderRecords();return;}
+  annElement('ann-done-text').innerHTML=annBuildDoneSummary();
   annRenderQualityPreview();bindQualityReview();
   bindAnn('ann-btn-download',()=>{window.location.href=`/api/group-tasks/${task.id}/annotation-download`;});
   annElement('ann-btn-download').disabled=!task.annotation.complete;
@@ -913,16 +994,33 @@ for (const filterId of [
       await api(`/api/group-tasks/${task.id}`,{method:'DELETE',body:{expected_version:task.version}});dirty=false;await list();showToast('任务已删除','success');return;
     }
     if(name==='annotation-run'){await startAnnotationStage();return;}
-    if(name==='annotation-results'){step=4;render();return;}
+    if(name==='result-tab'){
+      if(button.dataset.tab==='records'&&!recordsAvailable(task))throw new Error('完成质量标注后可查看任务记录');
+      if(await mayLeave()){resultTab=button.dataset.tab;step=4;render();root.querySelector('#gw-tab-'+resultTab)?.focus();}return;
+    }
+    if(['copy','record-roster','record-confirm','record-identity','record-duplicate','record-adv'].includes(name)){await recordAction(name,button);return;}
+    if(name==='annotation-results'){resultTab='quality';step=4;render();return;}
     if(name==='upload-view'||name==='columns'){uploadView=name==='upload-view';step=2;render();return;}
 
     if(name==='quality-filter'){if(!await mayLeave())return;qualityFilter=button.dataset.value;renderJudgments();return;}
-    if(name==='record-response'){if(!await mayLeave())return;selectedResponse=button.dataset.id;qualityFilter='';step=4;render();return;}
+    if(name==='record-response'){
+      if(!await mayLeave())return;
+      const row=task.feedback.find(item=>item.id===button.dataset.id);
+      if(!row)return;
+      if(row.confirmed_ai||!row.quality_complete){
+        const line=button.closest('.gw-record-response');
+        if(!line.nextElementSibling?.classList.contains('gw-record-evidence'))line.insertAdjacentHTML('afterend','<div class="gw-record-evidence">'+feedbackText(row)+'<p>'+h(row.outcome?.reason||'未进入质量打标，请结合原文和任务规则核对')+'</p></div>');
+        return;
+      }
+      selectedResponse=row.id;qualityFilter='';resultTab='quality';step=4;render();
+      ['ann-quality-overall-filter','ann-quality-question-filter','ann-quality-adjustment-filter'].forEach(id=>annElement(id).value='all');
+      annGoToQualityPlayer(selectedResponse);return;
+    }
     if(name==='response'){if(step!==3&&!await mayLeave())return;selectedResponse=button.dataset.id;render();return;}
     if(name==='rewards'){if(await mayLeave())switchMode('reward');return;}
     if(name==='new'){if(!await mayLeave())return;settingsView=false;await fetchGroups();task=await api('/api/group-tasks',{method:'POST',body:{}});uploadView=false;step=1;render();return;}
     if(name==='back'||name==='list'){if(await mayLeave())await list();return;}
-    if(name==='view'){if(await mayLeave()){settingsView=false;await fetchGroups();task=await api(`/api/group-tasks/${button.dataset.id}`);selectedResponse='';groupFilter='';qualityFilter='';uploadView=false;step=task.annotation?.complete?4:maxStep();render();}return;}
+    if(name==='view'||name==='records'){if(await mayLeave()){settingsView=false;resultTab=name==='records'?'records':'quality';recordNotice='';await fetchGroups();task=await api(`/api/group-tasks/${button.dataset.id}`);selectedResponse='';groupFilter='';qualityFilter='';uploadView=false;if(resultTab==='records'&&!recordsAvailable(task)){resultTab='quality';throw new Error('完成质量标注后可查看任务记录');}step=task.annotation?.complete?4:maxStep();render();}return;}
     if(name==='step'){if(+button.dataset.step>maxStep())throw new Error('请先完成前面的步骤');if(await mayLeave()){step=+button.dataset.step;render();root.scrollIntoView({block:'start'});}return;}
     if(name==='reload'){if(await mayLeave())await load(task.id);return;}
     if(name==='save-rules') {
@@ -964,20 +1062,7 @@ for (const filterId of [
     if(name==='confirm-ai'||name==='confirm-current-ai'){const ids=aiChoices||new Set(task.feedback.filter(row=>!row.excluded&&row.confirmed_ai).map(row=>row.id));if(name==='confirm-current-ai'){root.querySelector('[data-ai-current]').checked?ids.add(button.dataset.id):ids.delete(button.dataset.id);}await mutate('confirm-ai',{response_ids:[...ids]});step=Math.min(4,maxStep());render();return;}
     if(name==='confirm'){await mutate('confirm',{});step=6;render();showToast('当前任务版本已确认，可到奖励整理选择','success');return;}
     if(name==='adv'){const panel=button.closest('details');await mutate('player-adv',{player_id:button.dataset.player,adv:panel.querySelector('[data-player-adv]').value,note:panel.querySelector('[data-player-note]').value},'PUT');return;}
-    if(name==='close-copy'){$('gw-copy-dialog').close();return;}
-    if(name==='copy') {
-      clipboardPreview=await api(`/api/group-tasks/${task.id}/clipboard?version=${task.version}&source_id=${encodeURIComponent(groupFilter)}`);
-      root.querySelector('#gw-copy-dialog')?.remove();
-      root.insertAdjacentHTML('beforeend',`<dialog id="gw-copy-dialog" class="workflow-dialog" aria-labelledby="gw-copy-title"><h2 id="gw-copy-title">任务记录 · 复制预览</h2><p>${h(clipboardPreview.scope)} · ${clipboardPreview.count} 行 · 无表头 12 列</p><textarea readonly aria-label="待复制任务记录" rows="10">${h(clipboardPreview.text)}</textarea><p class="workflow-muted">Tab 分列，换行分行；保留 playerid 文本与 ori、状态查询公式。</p><div class="workflow-toolbar">${btn('close-copy','关闭')}${btn('copy-confirm','复制内容',true)}</div></dialog>`);
-      $('gw-copy-dialog').showModal();return;
-    }
-    if(name==='copy-confirm') {
-      const payload=clipboardPreview;if(!payload)return;
-      if(!navigator.clipboard)throw new Error('浏览器不支持剪贴板写入，请使用安全连接或本机地址，并允许剪贴板访问');
-      if(window.ClipboardItem&&navigator.clipboard.write)await navigator.clipboard.write([new ClipboardItem({'text/plain':new Blob([payload.text],{type:'text/plain'}),'text/html':new Blob([payload.html],{type:'text/html'})})]);
-      else await navigator.clipboard.writeText(payload.text);
-      showToast(`已复制${payload.scope}，${payload.count} 行任务记录`,'success');
-    }
+
   }
   root.addEventListener('input', e=>{
     const el=e.target;
@@ -989,6 +1074,13 @@ for (const filterId of [
     root.querySelectorAll('.gw-task-group-select[open]').forEach(control=>{if(!control.contains(event.target))control.open=false;});
   });
   root.addEventListener('keydown',event=>{
+    const tab=event.target.closest('[data-gw="result-tab"]');
+    if(tab&&['ArrowLeft','ArrowRight','Home','End'].includes(event.key)){
+      event.preventDefault();
+      const tabs=[...root.querySelectorAll('[data-gw="result-tab"]:not(:disabled)')];
+      const index=tabs.indexOf(tab),next=event.key==='Home'?0:event.key==='End'?tabs.length-1:(index+(event.key==='ArrowLeft'?-1:1)+tabs.length)%tabs.length;
+      tabs[next]?.focus();tabs[next]?.click();return;
+    }
     const control=event.target.closest('.gw-task-group-select');
     if(event.key==='Escape'&&control?.open){control.open=false;control.querySelector('summary').focus();event.preventDefault();}
   });
@@ -1021,7 +1113,7 @@ for (const filterId of [
     }catch{}finally{pollBusy=false;}
   },3000);
   window.addEventListener('group-management-scope-changed', () => {
-    scopeEpoch++; task=null; dirty=false; settingsView=false; aiChoices=null; clipboardPreview=null;
+    scopeEpoch++; task=null; dirty=false; settingsView=false; resultTab='quality';recordNotice=''; aiChoices=null; clipboardPreview=null;
     changedFields.clear(); latestList=[]; step=1;
     Object.assign(annState, {headers:[], headersZh:[], openTextCols:[], aiResults:[], reviewAiResults:[],
       qualityResults:[], qualityCount:0, aiReviewedIds:new Set(), confirmedAiIds:new Set(),
