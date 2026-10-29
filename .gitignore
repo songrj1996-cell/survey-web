@@ -19,6 +19,8 @@ tmp/
 
 # local group/reward acceptance fixtures, login state and evidence
 .verification/group-reward/
+.test-artifacts/
+.test-tmp/
 
 # editor / OS
 .DS_Store
