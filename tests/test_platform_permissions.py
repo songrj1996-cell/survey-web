@@ -12,7 +12,97 @@ from app.services import auth, admin_users, feature_access
 from app.storage import whitelist
 
 
+def make_member_delete_ui_app():
+    """Only synthetic member routes, with no app.main startup or external login."""
+    from fastapi import FastAPI
+    from fastapi.responses import HTMLResponse
+    from fastapi.staticfiles import StaticFiles
+    from app.routers import admin as routes
+    from app.services import audit
+    admin = {'email': 'admin@example.test', 'name': '界面验证管理员'}
+    for module in (auth, security, admin_users):
+        module.FEISHU_ADMIN_EMAILS = {admin['email']}
+        module.FEISHU_ALLOWED_EMAILS = set()
+    auth._current_login = AsyncMock(return_value=admin)
+    audit._current_login = auth._current_login
+    whitelist._save_whitelist([
+        {'email': 'member@example.test', 'name': '待删除成员', 'perms': ['annotate'], 'enabled': True,
+         'perms_v': 4, 'revision': 1, 'permission_history': [{'at': '2026-10-29T00:00:00Z'}]},
+        {'email': 'ou_synthetic', 'name': '保留成员', 'perms': ['survey'], 'enabled': False, 'perms_v': 4, 'revision': 1},
+    ])
+    root = Path(__file__).resolve().parents[1]
+    app = FastAPI(); app.include_router(routes.router)
+    app.mount('/static', StaticFiles(directory=root / 'static'), name='static')
+
+    @app.get('/', response_class=HTMLResponse)
+    def page():
+        return '''<!doctype html><html lang="zh-CN" data-theme="light"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="/static/style.css"></head><body style="overflow:auto;height:auto"><nav class="sidebar__nav" hidden></nav><div id="settings-drawer" style="padding:16px;max-width:1024px;margin:auto"><div id="settings-content"><div id="stab-content-perms"></div></div></div><p id="test-toast" role="status"></p><script>
+        window.$=id=>document.getElementById(id);window.state={};
+        window.esc=value=>{const node=document.createElement('span');node.textContent=String(value??'');return node.innerHTML.replace(/"/g,'&quot;');};
+        window.showToast=(message,type)=>{const node=$('test-toast');node.textContent=message;node.dataset.type=type;};
+        window.refreshFeishuStatus=async()=>{};
+        </script><script src="/static/js/core/feature-permissions.js"></script><script src="/static/js/features/settings.js"></script><script>
+        workflowRequest('/api/admin/users').then(data=>{PlatformPermissions.apply({feature_catalog:data.feature_catalog,is_admin:true});return loadPermsTab();});
+        </script></body></html>'''
+
+    return app
+
+
 class PlatformHttpPermissionsTests(unittest.IsolatedAsyncioTestCase, WorkflowCase):
+    async def test_delete_member_endpoint_guards_and_audit(self):
+        import httpx
+        from contextlib import ExitStack
+        from fastapi import FastAPI
+        from app.routers import admin as routes
+        admin = {'email': 'admin@example.test', 'name': '管理员甲'}
+        member = {'email': 'member@example.test', 'name': '合成成员', 'perms': ['annotate'],
+                  'enabled': True, 'perms_v': 4, 'revision': 2}
+        path = Path(self.tmp.name) / 'whitelist.json'
+        app = FastAPI(); app.include_router(routes.router)
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(whitelist, 'WHITELIST_FILE', path))
+            for module in (security, admin_users):
+                stack.enter_context(patch.object(module, 'FEISHU_ADMIN_EMAILS', {admin['email']}))
+                stack.enter_context(patch.object(module, 'FEISHU_ALLOWED_EMAILS', set()))
+            stack.enter_context(patch.object(auth, 'FEISHU_LOGIN_REQUIRED', True))
+            login = stack.enter_context(patch.object(auth, '_current_login', AsyncMock(return_value=admin)))
+            audit = stack.enter_context(patch.object(routes, 'audit_log', AsyncMock()))
+            log = stack.enter_context(patch.object(routes, 'runtime_log'))
+            whitelist._save_whitelist([member])
+            before = path.read_bytes()
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://isolated.test') as client:
+                url = '/api/admin/users/member@example.test'
+                for suffix, status in (('', 422), ('?expected_revision=0', 422),
+                                       ('?expected_revision=1', 409)):
+                    response = await client.delete(url + suffix)
+                    self.assertEqual(response.status_code, status, response.text)
+                    self.assertEqual(path.read_bytes(), before)
+                for denied in (None, member):
+                    login.return_value = denied
+                    self.assertEqual((await client.delete(url + '?expected_revision=2')).status_code, 403)
+                    self.assertEqual(path.read_bytes(), before)
+                login.return_value = admin
+                self.assertEqual((await client.delete('/api/admin/users/admin@example.test?expected_revision=1')).status_code, 403)
+                self.assertEqual((await client.delete('/api/admin/users/missing@example.test?expected_revision=1')).status_code, 404)
+                with patch.object(admin_users, 'mutate_whitelist', side_effect=OSError('synthetic storage failure')):
+                    failed = await client.delete(url + '?expected_revision=2')
+                self.assertEqual(failed.status_code, 503)
+                self.assertNotIn('synthetic', failed.text)
+                self.assertEqual(path.read_bytes(), before)
+                audit.assert_not_awaited()
+                self.assertEqual(log.call_args.kwargs['http_status'], 503)
+                self.assertIn('刷新', failed.json()['detail'])
+                response = await client.delete(url + '?expected_revision=2')
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(whitelist._load_whitelist(), [])
+                self.assertEqual(auth._get_user_perms(member), [])
+                self.assertEqual(log.call_args.kwargs['http_status'], 200)
+                audit.assert_awaited_once()
+                detail = audit.await_args.args[3]
+                self.assertIn('合成成员', detail)
+                self.assertNotIn(member['email'], detail)
+                self.assertEqual((await client.delete(url + '?expected_revision=2')).status_code, 404)
+
     async def test_admin_reads_other_members_history_but_cannot_change_it(self):
         import httpx
         from contextlib import ExitStack
@@ -76,6 +166,48 @@ class PlatformHttpPermissionsTests(unittest.IsolatedAsyncioTestCase, WorkflowCas
 
 
 class PlatformPermissionsTests(WorkflowCase):
+    def test_delete_removes_only_the_member_and_preserves_business_files(self):
+        path = Path(self.tmp.name) / 'whitelist.json'
+        retained = {'email': 'other@example.test', 'name': '保留成员', 'perms': ['survey'],
+                    'enabled': True, 'perms_v': 4, 'revision': 3, 'permission_history': [{'at': 'synthetic'}]}
+        records = [Path(self.tmp.name) / name for name in ('history.json', 'audit_logs.json', 'task.json')]
+        for record in records:
+            record.write_text('{"synthetic":"keep-exactly"}', encoding='utf-8')
+        original = [record.read_bytes() for record in records]
+        with patch.object(whitelist, 'WHITELIST_FILE', path):
+            for enabled in (True, False):
+                whitelist._save_whitelist([{'email': 'member@example.test', 'name': '待删除成员',
+                    'perms': ['annotate'], 'enabled': enabled, 'revision': 1, 'perms_v': 4,
+                    'permission_history': [{'at': 'synthetic'}]}, retained])
+                detail = admin_users.delete_whitelist_user(' MEMBER@EXAMPLE.TEST ', expected_revision=1)
+                self.assertEqual(whitelist._load_whitelist(), [retained])
+                self.assertIn('待删除成员', detail)
+                self.assertEqual([record.read_bytes() for record in records], original)
+
+    def test_delete_revision_admin_and_invalid_identifier_never_write(self):
+        path = Path(self.tmp.name) / 'whitelist.json'
+        with patch.object(whitelist, 'WHITELIST_FILE', path):
+            whitelist._save_whitelist([{'email': 'ou_synthetic', 'name': '合成成员', 'perms': ['annotate'],
+                                        'enabled': True, 'revision': 2, 'perms_v': 4}])
+            before = path.read_bytes()
+            for revision in (None, 1, True, '2'):
+                with self.assertRaises(HTTPException) as error:
+                    admin_users.delete_whitelist_user('ou_synthetic', expected_revision=revision)
+                self.assertEqual(error.exception.status_code, 409)
+                self.assertEqual(path.read_bytes(), before)
+            for key in ('FEISHU_ADMIN_EMAILS', 'FEISHU_ALLOWED_EMAILS'):
+                with patch.object(admin_users, key, {'ou_synthetic'}):
+                    with self.assertRaises(HTTPException) as error:
+                        admin_users.delete_whitelist_user('ou_synthetic', expected_revision=2)
+                    self.assertEqual(error.exception.status_code, 403)
+                    self.assertEqual(path.read_bytes(), before)
+            with self.assertRaises(HTTPException) as error:
+                admin_users.delete_whitelist_user('姓名不是账号', expected_revision=2)
+            self.assertEqual(error.exception.status_code, 422)
+            self.assertEqual(path.read_bytes(), before)
+            admin_users.delete_whitelist_user('ou_synthetic', expected_revision=2)
+            self.assertEqual(whitelist._load_whitelist(), [])
+
     def test_conservative_old_permissions_and_readonly(self):
         self.assertEqual(permission_levels({"perms":{"survey":"read","annotate":True,"roster":False,"members":True}}),{"survey":"read","annotate":"use"})
         self.assertEqual(permission_levels({"perms":["survey","annotate"],"read_only":True}),{"survey":"read","annotate":"read"})

@@ -2,7 +2,7 @@
 
 白名单读写在 services/admin_users，审计日志过滤在 services/admin_audit。
 """
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 
 from app.schemas.requests import AdminUserPatch, AdminUserRequest
 from app.services.admin_audit import query_audit_logs
@@ -10,6 +10,7 @@ from app.services.admin_users import add_whitelist_user, delete_whitelist_user, 
 from app.services.audit import audit_log
 from app.services.auth import _admin_user_rows, _require_admin, _require_feature
 from app.core.feature_permissions import feature_catalog
+from app.core.runtime_logging import runtime_log
 
 router = APIRouter()
 
@@ -50,8 +51,18 @@ async def admin_update_user(email: str, req: AdminUserPatch, request: Request):
 
 
 @router.delete("/api/admin/users/{email}")
-async def admin_delete_user(email: str, request: Request):
-    await _require_admin(request)
-    delete_whitelist_user(email.strip().lower())
-    await audit_log(request, "admin", "删除用户", email.strip().lower())
+async def admin_delete_user(email: str, request: Request, expected_revision: int = Query(..., ge=1)):
+    try:
+        await _require_admin(request)
+        detail = delete_whitelist_user(email.strip().lower(), expected_revision)
+    except HTTPException as exc:
+        runtime_log("成员与权限", "warning", f"删除成员未完成：{exc.detail}",
+                    http_status=exc.status_code, path="DELETE /api/admin/users/{成员账号}")
+        raise
+    except OSError as exc:
+        runtime_log("成员与权限", "error", "删除成员未完成；请重新读取成员列表核对结果，再决定是否重试",
+                    http_status=503, path="DELETE /api/admin/users/{成员账号}")
+        raise HTTPException(503, "删除未完成，请刷新成员列表核对结果后重试") from exc
+    await audit_log(request, "admin", "删除成员", detail)
+    runtime_log("成员与权限", "success", detail, http_status=200, path="DELETE /api/admin/users/{成员账号}")
     return {"ok": True}
