@@ -102,7 +102,101 @@ async function rewardScopeRaceChecks(rejectOld=false){
   assert.equal(env.toasts.length,0);
 }
 
+async function memberDeleteBrowserChecks(){
+  const dataDir=process.env.DATA_DIR,project=path.resolve(__dirname,'..');
+  assert(dataDir&&path.resolve(dataDir).startsWith(project+path.sep),'Member browser checks require isolated DATA_DIR');
+  const {chromium}=require('playwright'),{spawn}=require('node:child_process');
+  const socket=require('node:net').createServer();await new Promise(resolve=>socket.listen(0,'127.0.0.1',resolve));
+  const port=socket.address().port;await new Promise(resolve=>socket.close(resolve));
+  const server=spawn('python',['-c',`import sys;sys.path.insert(0,'tests');import uvicorn;from test_platform_permissions import make_member_delete_ui_app;uvicorn.run(make_member_delete_ui_app(),host='127.0.0.1',port=${port},log_level='error')`],
+    {cwd:project,env:{...process.env,PYTHONDONTWRITEBYTECODE:'1',PYTHONIOENCODING:'utf-8'},windowsHide:true,stdio:['ignore','pipe','pipe']});
+  let output='',browser;server.stdout.on('data',v=>output+=v);server.stderr.on('data',v=>output+=v);
+  const base=`http://127.0.0.1:${port}`,checks=[],errors=[],external=[];
+  try{
+    let ready=false;
+    for(let i=0;i<100;i++){
+      if(server.exitCode!==null)throw Error('Member fixture exited: '+output);
+      try{if((await fetch(base+'/api/admin/users')).ok){ready=true;break;}}catch{}
+      await new Promise(resolve=>setTimeout(resolve,100));
+    }
+    assert(ready,'Member fixture startup failed: '+output);
+    browser=await chromium.launch({headless:true,executablePath:process.env.MEMBER_TEST_BROWSER});
+    const page=await browser.newPage({viewport:{width:1024,height:1000}});page.setDefaultTimeout(5000);
+    page.on('pageerror',e=>errors.push(e.message));
+    await page.route('**/*',route=>{if(route.request().url().startsWith(base+'/'))return route.continue();external.push(route.request().url());return route.abort();});
+    await page.goto(base);
+    await page.locator('[data-member="admin@example.test"]').click();
+    assert.equal(await page.locator('#member-delete').count(),0,'protected administrator has no delete button');
+    await page.getByRole('button',{name:'新增成员',exact:true}).click();
+    assert.equal(await page.locator('#member-delete').count(),0,'unsaved member has no delete button');
+    await page.getByRole('button',{name:'撤销修改',exact:true}).click();
+    await page.locator('[data-member="member@example.test"]').click();
+    await page.locator('#member-name').fill('未保存的名字');
+    const original=fs.readFileSync(path.join(dataDir,'whitelist.json'),'utf8');
+    await page.locator('#member-delete').click();
+    const dialog=()=>page.getByRole('dialog',{name:'确认当前操作'});
+    assert.match(await dialog().innerText(),/权限变更历史/);assert.match(await dialog().innerText(),/未保存的修改也会放弃/);
+    await dialog().locator('[data-answer="stay"]').click();
+    assert.equal(await page.locator('#member-name').inputValue(),'未保存的名字');
+    assert.equal(fs.readFileSync(path.join(dataDir,'whitelist.json'),'utf8'),original);
+    // The request fails at transport level: draft and member stay editable.
+    await page.route('**/api/admin/users/*',route=>route.request().method()==='DELETE'?route.abort():route.continue());
+    await page.locator('#member-delete').click();await dialog().locator('[data-answer="continue"]').click();
+    await page.locator('#test-toast').filter({hasText:'刷新成员列表核对结果'}).waitFor();
+    assert.equal(await page.locator('#member-name').inputValue(),'未保存的名字');
+    assert.equal(await page.locator('#member-delete').isEnabled(),true);
+    assert.equal(fs.readFileSync(path.join(dataDir,'whitelist.json'),'utf8'),original);
+    await page.unroute('**/api/admin/users/*');
+    // Another administrator saves a newer revision while this editor remains open.
+    const changed=await fetch(base+'/api/admin/users/member@example.test',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:'远端更新成员',expected_revision:1})});
+    assert.equal(changed.status,200,await changed.text());
+    await page.locator('#member-delete').click();await dialog().locator('[data-answer="continue"]').click();
+    await page.locator('#test-toast').filter({hasText:'HTTP 409'}).waitFor();
+    assert.equal(await page.locator('#member-name').inputValue(),'未保存的名字');
+    assert(JSON.parse(fs.readFileSync(path.join(dataDir,'whitelist.json'),'utf8')).users.some(u=>u.name==='远端更新成员'));
+    checks.push('受保护管理员与新增成员无删除入口；取消、网络失败、过期版本均保留成员与草稿');
+    await page.locator('#member-cancel').click();
+    await page.reload();
+    await page.locator('[data-member="member@example.test"]').click();
+    for(const width of [1024,390,320]){
+      await page.setViewportSize({width,height:1000});
+      assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false,`members ${width}px overflow`);
+    }
+    await page.evaluate(()=>document.documentElement.dataset.theme='dark');
+    await page.waitForFunction(()=>getComputedStyle(document.body).color==='rgb(226, 232, 240)');
+    await page.screenshot({path:path.join(dataDir,'member-delete-narrow.png'),fullPage:true});
+    const history=path.join(dataDir,'history.json');fs.writeFileSync(history,'{"synthetic":"saved-report"}');
+    const taskFile=path.join(dataDir,'retained-task.json');fs.writeFileSync(taskFile,'{"synthetic":"saved-task"}');
+    let release;const pending=new Promise(resolve=>{release=resolve;});let deletions=0;
+    await page.route('**/api/admin/users/*',async route=>{if(route.request().method()==='DELETE'){deletions++;await pending;}await route.continue();});
+    await page.locator('#member-delete').click();await dialog().locator('[data-answer="continue"]').click();
+    await page.waitForFunction(()=>document.querySelector('#member-delete')?.textContent==='正在删除…');
+    assert.equal(await page.locator('#member-delete').isDisabled(),true);
+    await page.evaluate(()=>document.querySelector('#member-delete').click());
+    assert.equal(deletions,1,'duplicate click must not send another DELETE');release();
+    await page.locator('#test-toast').filter({hasText:'成员权限条目已删除'}).waitFor();
+    assert.equal(await page.locator('[data-member="member@example.test"]').count(),0);
+    assert.equal(await page.locator('[data-member="ou_synthetic"]').count(),1);
+    assert.equal(fs.readFileSync(history,'utf8'),'{"synthetic":"saved-report"}');
+    assert.equal(fs.readFileSync(taskFile,'utf8'),'{"synthetic":"saved-task"}');
+    const audit=JSON.parse(fs.readFileSync(path.join(dataDir,'audit_logs.json'),'utf8'));
+    const entries=Array.isArray(audit)?audit:audit.logs;
+    const deleted=entries.find(e=>e.action==='删除成员');
+    assert(deleted);assert.match(deleted.detail,/远端更新成员/);assert(!deleted.detail.includes('member@example.test'));
+    await page.locator('[data-member="ou_synthetic"]').click();
+    await page.locator('#member-delete').click();await dialog().locator('[data-answer="continue"]').click();
+    await page.locator('[data-member="ou_synthetic"]').waitFor({state:'detached'});
+    checks.push('1024/390/320px及深色无溢出；删除防重复，启用/停用成员均真正移除，报告任务保留，日志按姓名记录');
+    assert.deepEqual(errors,[]);assert.deepEqual(external,[]);
+    console.log(JSON.stringify({memberBrowser:true,checks,pageErrors:errors,externalRequests:external},null,2));
+  }finally{
+    if(browser)await browser.close();server.kill();
+    await new Promise(resolve=>server.exitCode!==null?resolve():server.once('exit',resolve));
+  }
+}
+
 (async()=>{
   await settingsChecks();await taskScopeRaceChecks();await rewardScopeRaceChecks();await rewardScopeRaceChecks(true);
   console.log('PASS: admin-only settings, saved scope restoration, cancellation/failure handling, cache/selection clearing, and stale task/reward responses.');
+  if(process.env.MEMBER_TEST_BROWSER)await memberDeleteBrowserChecks();
 })().catch(error=>{console.error(error);process.exitCode=1;});

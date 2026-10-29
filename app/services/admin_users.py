@@ -81,5 +81,18 @@ def update_whitelist_user(email, perms, enabled, name=None, expected_revision=No
     return mutate_whitelist(update)
 
 
-def delete_whitelist_user(email):
-    raise HTTPException(409, "成员记录需要保留，请在成员编辑中停用并保存")
+def delete_whitelist_user(email, expected_revision=None):
+    email = _identifier(email)
+    if email in FEISHU_ADMIN_EMAILS or email in FEISHU_ALLOWED_EMAILS:
+        raise HTTPException(403, "管理员身份由平台配置保护，不能删除")
+
+    def delete(users):
+        member = next((u for u in users if u.get("email", "").lower() == email), None)
+        if member is None:
+            raise HTTPException(404, "成员不存在，请刷新成员列表")
+        if type(expected_revision) is not int or expected_revision != member.get("revision", 1):
+            raise HTTPException(409, "成员资料已变化，请刷新后重新确认删除")
+        users.remove(member)
+        return f"已删除成员：{member.get('name') or '未记录姓名'}；权限条目及条目内变更历史已移除，历史报告、任务和已有操作日志保留"
+
+    return mutate_whitelist(delete)

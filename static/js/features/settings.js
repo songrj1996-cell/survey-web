@@ -972,9 +972,10 @@ async function downloadGlossaryFile(url, fallbackName) {
 
 // ── 权限配置 ──────────────────────────────────────────────────
 
-const memberUi = {users: [], editing: null, dirty: false, query: '', status: 'all', tab: 'members'};
+const memberUi = {users: [], editing: null, dirty: false, deleting: false, query: '', status: 'all', tab: 'members'};
 window.membersHasDraft = () => memberUi.dirty;
 window.membersMayLeave = async () => {
+  if (memberUi.deleting) return false;
   if (!memberUi.dirty) return true;
   if (!await window.workflowConfirm('成员权限修改尚未保存。放弃只影响这份草稿，已保存的权限保持不变。')) return false;
   memberUi.dirty = false; memberUi.editing = null; return true;
@@ -982,7 +983,7 @@ window.membersMayLeave = async () => {
 window.addEventListener('beforeunload', event => { if (memberUi.dirty) { event.preventDefault(); event.returnValue = ''; } });
 
 async function loadPermsTab() {
-  if (memberUi.dirty) return;
+  if (memberUi.dirty || memberUi.deleting) return;
   const body = $('stab-content-perms');
   body.innerHTML = '<div class="hist-empty">正在加载成员…</div>';
   try {
@@ -1073,17 +1074,44 @@ function renderMemberEditor() {
   };
   target.oninput=updateEffect;target.onchange=updateEffect;updateEffect();
   if(locked)return;
+  if(existing){
+    const button=document.createElement('button');
+    button.type='button';button.className='btn btn--ghost';button.id='member-delete';button.textContent='删除成员';
+    $('member-save').parentElement.appendChild(button);
+    button.onclick=async()=>{
+      if(memberUi.deleting)return;
+      const controls=[...target.querySelectorAll('button,input,select,textarea')].map(el=>[el,el.disabled]);
+      memberUi.deleting=true;
+      controls.forEach(([el])=>{el.disabled=true;});
+      try{
+        const text=`确认删除成员“${user.name||'未记录姓名'}”？这会移除该成员的权限条目及条目内权限变更历史，之后的业务请求将失去相应权限。历史报告、任务和已有操作日志保留。${memberUi.dirty?'当前未保存的修改也会放弃。':''}`;
+        if(!await window.workflowConfirm(text,'删除成员'))return;
+        $('member-save-state').textContent='正在删除成员…';button.textContent='正在删除…';
+        await workflowRequest('/api/admin/users/'+encodeURIComponent(user.email)+'?expected_revision='+encodeURIComponent(user.revision),{method:'DELETE'});
+        memberUi.users=memberUi.users.filter(item=>item.email!==user.email);
+        memberUi.dirty=false;memberUi.editing=null;
+        renderMemberContent();showToast('成员权限条目已删除，历史业务记录保留','success');
+      }catch(error){
+        showToast(error.message+(error.status?`（HTTP ${error.status}）`:'')+'；请刷新成员列表核对结果后重试。','error',6000);
+      }finally{
+        memberUi.deleting=false;
+        controls.forEach(([el,disabled])=>{el.disabled=disabled;});
+        if(button.isConnected){button.textContent='删除成员';$('member-save-state').textContent=memberUi.dirty?'修改尚未保存':'当前配置已保存';}
+      }
+    };
+  }
   $('member-cancel').onclick=()=>{memberUi.dirty=false;memberUi.editing=existing?structuredClone(memberUi.users.find(item=>item.email===user.email)):null;renderMemberEditor();};
   $('member-save').onclick=async()=>{
     const body={name:$('member-name').value.trim(),email:$('member-email').value.trim(),enabled:$('member-enabled').checked,perms:PlatformPermissions.selected($('member-permission-tree'))};
     if(!body.name||!body.email){showToast('请填写显示姓名和唯一账号','error');return;}
     if(body.enabled&&!body.perms.length){showToast('启用成员至少需要一项功能权限','error');return;}
     const button=$('member-save');button.disabled=true;
+    if(existing)$('member-delete').disabled=true;
     try{
       if(existing){delete body.email;body.expected_revision=user.revision;}
       await workflowRequest('/api/admin/users'+(existing?'/'+encodeURIComponent(user.email):''),{method:existing?'PATCH':'POST',body});
       memberUi.dirty=false;memberUi.editing=null;showToast('成员资料与权限已保存','success');await loadPermsTab();await refreshFeishuStatus();
-    }catch(error){showToast(error.message,'error',6000);}finally{if(button.isConnected)button.disabled=false;}
+    }catch(error){showToast(error.message,'error',6000);}finally{if(button.isConnected){button.disabled=false;if(existing)$('member-delete').disabled=false;}}
   };
 }
 
