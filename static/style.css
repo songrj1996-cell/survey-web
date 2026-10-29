@@ -13993,16 +13993,32 @@ body {
 #group-tasks-panel .gw-record-table tr:hover td { background:var(--accent-soft); }
 #group-tasks-panel .gw-record-table td:nth-child(3) { font-variant-numeric:tabular-nums; }
 #group-tasks-panel .gw-record-table .gw-formula-badge { display:inline-block; color:var(--accent); font-size:10px; background:var(--accent-soft); border-radius:4px; padding:2px 4px; margin-left:4px; }
-#group-tasks-panel .gw-record-details { display:grid; gap:10px; }
-#group-tasks-panel .gw-record-details .workflow-feedback { margin:0; background:var(--surface); }
-#group-tasks-panel .gw-record-response { display:flex; justify-content:space-between; flex-wrap:wrap; align-items:center; gap:12px; padding:12px 0; font-size:13px; border-top:1px solid var(--border); }
-#group-tasks-panel .gw-record-response .btn { color:var(--accent); }
 #group-tasks-panel .gw-record-footer { display:flex; flex-wrap:wrap; justify-content:space-between; align-items:flex-start; gap:16px; }
 #group-tasks-panel .gw-record-footer > p { flex:1 1 260px; font-size:12px; }
 #group-tasks-panel .gw-record-footer details { max-width:100%; font-size:13px; }
 #group-tasks-panel .gw-record-footer summary { padding:10px 14px; border:1px solid var(--border); border-radius:8px; cursor:pointer; }
 #group-tasks-panel .gw-record-issues:empty { display:none; }
+#group-tasks-panel .gw-record-issues { display:grid; gap:10px; min-width:0; }
+#group-tasks-panel .gw-record-issues .gw-record-issue-notice { margin:0; overflow-wrap:anywhere; }
+#group-tasks-panel .gw-record-issue { display:grid; grid-template-columns:minmax(170px,230px) minmax(0,1fr) auto; align-items:center; gap:12px 20px; margin:0; padding:12px 16px; min-width:0; }
+#group-tasks-panel .gw-record-issue-title { margin:0; font-size:13px; font-weight:500; line-height:1.7; overflow-wrap:anywhere; }
+#group-tasks-panel .gw-record-issue-body { min-width:0; overflow-wrap:anywhere; }
+#group-tasks-panel .gw-record-issue-body p { margin:2px 0; }
+#group-tasks-panel .gw-record-issue-body .workflow-field { margin:8px 0 0; min-width:0; }
+#group-tasks-panel .gw-record-issue-body select { min-width:0; max-width:100%; width:100%; }
+#group-tasks-panel .gw-record-issue-actions { display:flex; flex-wrap:wrap; justify-content:flex-end; gap:8px; max-width:100%; }
+#group-tasks-panel .gw-record-issue-actions:empty { display:none; }
+#group-tasks-panel .gw-record-duplicate-choice { display:flex; align-items:center; flex-wrap:wrap; gap:8px 16px; margin:4px 0; font-size:13px; }
+#group-tasks-panel .gw-record-adv-fields { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
+@media(min-width:761px) and (max-width:1100px) {
+  #group-tasks-panel .gw-record-issue { grid-template-columns:minmax(150px,190px) minmax(0,1fr); gap:10px 16px; }
+  #group-tasks-panel .gw-record-issue-actions { grid-column:2; justify-content:flex-start; }
+}
 @media(max-width:760px) {
+  #group-tasks-panel .gw-record-issue { grid-template-columns:minmax(0,1fr); gap:6px; }
+  #group-tasks-panel .gw-record-adv-fields { grid-template-columns:minmax(0,1fr); gap:4px; }
+  #group-tasks-panel .gw-record-issue-actions { justify-content:flex-start; margin-top:4px; }
+  #group-tasks-panel .gw-record-issue-actions .btn { max-width:100%; white-space:normal; overflow-wrap:anywhere; }
   #group-tasks-panel .gw-records .workflow-heading, #group-tasks-panel .gw-record-status { flex-direction:column; align-items:stretch; }
   #group-tasks-panel .gw-record-status .workflow-toolbar { flex-wrap:wrap; }
   #group-tasks-panel .gw-record-summary { grid-template-columns:repeat(2,minmax(0,1fr)); }

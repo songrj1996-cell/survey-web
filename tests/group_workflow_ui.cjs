@@ -112,6 +112,7 @@ permissions.tree(editor,[],true);assert.equal(editor.querySelectorAll('[data-per
   await click('records',{id:'task'});
   const records=()=>$('gw-result-body').innerHTML;
   assert.match(records(),/当前任务记录已确认，可以复制/);
+  assert.doesNotMatch(records(),/gw-record-details|gw-record-issue|data-gw="record-response"/,'normal players appear only in the table');
   assert.equal((records().match(/<th scope="col">/g)||[]).length,12);
   assert.equal((records().match(/<td>/g)||[]).length,24,'one row per player, 12 columns per row');
   assert.match(records(),/全部群 · 2 位玩家/);
@@ -127,6 +128,7 @@ permissions.tree(editor,[],true);assert.equal(editor.querySelectorAll('[data-per
     confirmation_issues:[{response_id:ambiguous.id,message:ambiguous.issues[0].message}]};
   await click('records',{id:'task'});
   assert.match(records(),/data-fix="candidate_key"/);
+  assert.match(records(),/<article class="workflow-feedback gw-record-issue"><h3 class="gw-record-issue-title">/,'identity issues are visible without opening a disclosure');
   assert.doesNotMatch(records(),/处理说明|data-fix="note"/);
   let candidateValue='';
   actionPanel={querySelector:selector=>{assert.equal(selector,'[data-fix="candidate_key"]');return{value:candidateValue};}};
@@ -149,6 +151,27 @@ permissions.tree(editor,[],true);assert.equal(editor.querySelectorAll('[data-per
     confirmation_issues:[{response_id:inactive.id,message:inactive.issues[0].message}]};
   fetchedTask=inactiveTask;await click('records',{id:'task'});
   assert.match(records(),/排除该玩家奖励/);
+  const aggregateMessage='同一玩家的群或 ori 不唯一，请修正反馈身份';
+  fetchedTask={...inactiveTask,confirmation_issues:[...inactiveTask.confirmation_issues,
+    {kind:'player',player_id:feedback[0].player_id,message:aggregateMessage},
+    {kind:'player',player_id:feedback[1].player_id,message:aggregateMessage},
+    {kind:'roster',message:'另一个必须保留的问题'}]};
+  await click('records',{id:'task'});
+  assert.match(records(),new RegExp(aggregateMessage+'（2 项）'),'repeated notices are counted rather than stacked');
+  assert.equal((records().match(/class="workflow-error gw-record-issue-notice"/g)||[]).length,2,'different notices are never dropped');
+  assert.match(records(),/匹配的名单条目均不在群内，可排除该玩家奖励/,'the row-specific cause stays visible');
+  const duplicateTask={...stableTask,confirmed_version:null,duplicate_groups:[{id:'duplicate-1',roster_only:true,response_ids:['response0','response1']}],
+    confirmation_issues:[{kind:'duplicate',message:'重复账号待核对'}]};
+  fetchedTask=duplicateTask;await click('records',{id:'task'});
+  assert.equal((records().match(/data-gw="record-duplicate"/g)||[]).length,2,'every duplicate candidate keeps its own action');
+  requestHook=async(url,options)=>{if(url.endsWith('/duplicates')){
+    assert.equal(options.body.group_id,'duplicate-1');assert.equal(options.body.keep_response_id,'response1');
+    fetchedTask={...stableTask,confirmed_version:null};return fetchedTask;
+  }};
+  await click('record-duplicate',{group:'duplicate-1',id:'response1'});
+  assert.doesNotMatch(records(),/data-gw="record-duplicate"/);
+  requestHook=undefined;
+  fetchedTask=inactiveTask;await click('records',{id:'task'});
   assert.doesNotMatch(records(),/data-fix="candidate_key"|处理说明/);
   requestHook=async(url,options)=>{if(url.endsWith('/feedback/response0')){
     assert.equal(options.method,'PUT');assert.equal(options.body.reward_excluded,true);
@@ -158,6 +181,7 @@ permissions.tree(editor,[],true);assert.equal(editor.querySelectorAll('[data-per
   }};
   await click('record-exclude',{id:'response0'});
   assert.match(records(),/已排除该玩家在本任务中的全部奖励/);
+  assert(records().indexOf('data-gw="record-restore-reward"')<records().indexOf('class="workflow-table-wrap gw-record-table"'),'restore action is above the table');
   assert.match(records(),/复制范围：全部群 · 1 位玩家/);
   assert.match(records(),/恢复该玩家奖励/);
   requestHook=async(url,options)=>{if(url.endsWith('/feedback/response0')){
@@ -174,6 +198,24 @@ permissions.tree(editor,[],true);assert.equal(editor.querySelectorAll('[data-per
   assert.match(records(),/当前任务记录已确认，本范围没有可复制玩家/);
   assert.match(records(),/data-gw="copy" disabled/);
   assert.match(records(),/data-gw="record-restore-reward" disabled/);
+  assert.doesNotMatch(records(),/gw-record-details/);
+  const advIssue='同一玩家有不同 ADV，请明确选择记录账号';
+  fetchedTask={...stableTask,confirmed_version:null,players:[{...players[0],adv_choices:['A','B'],issues:[advIssue]},players[1]],
+    confirmation_issues:[{kind:'player',player_id:players[0].player_id,message:advIssue}]};
+  await click('records',{id:'task'});
+  assert(records().indexOf('data-gw="record-adv"')<records().indexOf('class="workflow-table-wrap gw-record-table"'),'ADV decision is above the table');
+  let advNote='';actionPanel={querySelector:selector=>({value:selector==='[data-player-adv]'?'B':advNote})};
+  const beforeAdv=requests.length;await click('record-adv',{player:players[0].player_id});
+  assert.equal(requests.length,beforeAdv,'ADV explanation remains required');
+  advNote='合成核对说明';
+  requestHook=async(url,options)=>{if(url.endsWith('/player-adv')){
+    assert.equal(options.method,'PUT');assert.equal(options.body.adv,'B');assert.equal(options.body.note,advNote);
+    assert.equal(options.body.player_id,players[0].player_id);fetchedTask={...stableTask,confirmed_version:null};return fetchedTask;
+  }};
+  await click('record-adv',{player:players[0].player_id});
+  assert.match(toasts.at(-1)[0],/ADV 决定已保存/);
+  assert.doesNotMatch(records(),/data-gw="record-adv"/,'resolved ADV no longer adds a player card');
+  requestHook=undefined;
   fetchedTask=stableTask;await click('records',{id:'task'});
   console.log('Identity and exclusion handlers passed: no note, active-only choice, automatic match, exclude, restore and read-only protection.');
   await $('gw-group').onchange({target:{value:'group_b'}});
