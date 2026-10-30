@@ -127,10 +127,10 @@ window.GroupTasks = (() => {
     const annotationView=!settingsView&&step>=2&&step<=4;
     const stageResume=annotationView&&step>=3&&task.status==='paused'&&['ai_progress','quality_progress'].includes(task.annotation?.phase);
     root.classList.toggle('workflow-annotation',annotationView);
-    root.innerHTML = `<div class="workflow-heading gw-task-heading"><div class="gw-task-title"><h1 class="panel__title" title="${h(task.rules.name||'新任务')}">${h(task.rules.name||'新任务')}</h1><p id="gw-task-meta" class="panel__desc">${taskMeta(task)}</p></div><div class="gw-task-actions"><span id="gw-progress" class="workflow-badge">${h(progress(task))}</span>${stageResume?'':runControls(task)}${annotationView?'':btn('back','← 返回任务列表')}</div></div>
+    root.innerHTML = `<div class="workflow-heading gw-task-heading"><div class="gw-task-title"><h1 class="panel__title" title="${h(task.rules.name||'新任务')}">${h(task.rules.name||'新任务')}</h1><p id="gw-task-meta" class="panel__desc">${taskMeta(task)}</p></div><div class="gw-task-actions"><span id="gw-progress" class="workflow-badge">${h(progress(task))}</span>${stageResume||(settingsView&&task.status==='paused')?'':runControls(task)}${annotationView?'':btn('back','← 返回任务列表')}</div></div>
       <div id="gw-annotation-navigation" class="gw-annotation-navigation" hidden></div>
       ${!task.can_edit?'<p class="workflow-notice">当前为只读查看，标注与发奖结果由任务负责人维护。</p>':''}
-      ${busy()?`<p class="workflow-notice">${task.status==='paused'?'任务已暂停，点击“继续任务”后恢复处理。':task.status==='pausing'?'暂停中，当前已开始的反馈保存后暂停；期间仍可能调用模型。':'正在排队或标注。'}暂时不能修改本任务的文件、题目选择和标注规则；可以查看进度或处理其他任务。</p>`:''}
+      ${busy()?`<p class="workflow-notice">${task.status==='paused'?(settingsView?'任务已暂停，可返回任务列表继续。':'任务已暂停，点击“继续任务”后恢复处理。'):task.status==='pausing'?'暂停中，当前已开始的反馈保存后暂停；期间仍可能调用模型。':'正在排队或标注。'}暂时不能修改本任务的文件、题目选择和标注规则；可以查看进度或处理其他任务。</p>`:''}
       <div id="gw-progress-track" hidden></div><div id="gw-update-hint" hidden class="workflow-notice">任务信息已更新。${btn('reload','查看最新结果')}</div><p id="gw-rule-save-status" class="workflow-muted" role="status" aria-live="polite" hidden></p><div id="gw-content"></div>`;
     if(settingsView)renderSettings();else [null,renderRules,renderInputs,renderAI,renderJudgments][step]();
     if(ruleSaveNotice?.taskId===task.id)showRuleSaveNotice(ruleSaveNotice.message,ruleSaveNotice.failed);

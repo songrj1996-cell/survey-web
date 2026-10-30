@@ -142,6 +142,10 @@ async function checks(){
   controlled={...controlled,status:'paused',run:{...controlled.run,status:'paused'}};
   env.setItems([controlled]);await env.poll();
   assert.match($('gw-task-list').innerHTML,/继续任务/);
+  await controlClick('resume');
+  assert.match($('gw-task-list').innerHTML,/排队中/,'list resume still works');
+  controlled={...controlled,status:'paused',run:{...controlled.run,status:'paused'}};
+  env.setItems([controlled]);await env.context.window.GroupTasks.list();
   env.setSelected(controlled);
   const view={dataset:{gw:'view',id:active.id},isConnected:true,disabled:false};
   await $('group-tasks-panel').listeners.click({target:{closest:selector=>selector==='[data-gw]'?view:null}});
@@ -159,7 +163,7 @@ async function checks(){
   env.setItems([{...controlled,can_edit:false}]);await env.context.window.GroupTasks.list();
   const beforeDenied=env.requests.length;await controlClick('pause');assert.equal(env.requests.length,beforeDenied,'read-only action sends no request');
   await pausedDeleteChecks();
-  console.log(`Quality list status UI passed: ${cases.length} states, read-only permissions, polling, navigation, pause/resume/error handlers, paused deletion/cancel/failure and stage-heading resume placement.`);
+  console.log(`Quality list status UI passed: ${cases.length} states, settings resume hidden, list/stage resume handlers, read-only permissions, polling, navigation and paused deletion/cancel/failure.`);
 }
 async function pausedDeleteChecks(){
   const env=environment(),{$}=env;
@@ -172,6 +176,12 @@ async function pausedDeleteChecks(){
       const selected=fixture({id:'delete-task',status,can_edit,run:{...run('quality',status==='pausing'?'running':status),pause_requested:status==='pausing'}});
       env.setSelected(selected);env.setItems([selected]);await env.context.window.GroupTasks.list();await click('settings');
       const html=$('gw-content').innerHTML;
+      assert.doesNotMatch($('group-tasks-panel').innerHTML+html,/data-gw="resume"/,'settings never expose a resume button');
+      assert.match($('group-tasks-panel').innerHTML,/data-gw="back"/,'settings keep the return-to-list entry');
+      if(status==='paused'){
+        assert.match($('group-tasks-panel').innerHTML,/任务已暂停，可返回任务列表继续/);
+        assert.doesNotMatch($('group-tasks-panel').innerHTML,/点击“继续任务”/,'settings hint must match the available controls');
+      }
       assert.match(html,/data-gw="save-settings" disabled/,'paused/active settings stay locked');
       if(status==='paused'&&can_edit){assert.match(html,/data-gw="delete-task"\s+>/);assert.match(html,/任务已暂停，可以删除/);}
       else{
@@ -201,6 +211,19 @@ async function pausedDeleteChecks(){
       if(can_edit)assert.equal((heading.match(/data-gw="resume"/g)||[]).length,1);
       else assert.doesNotMatch(heading,/data-gw="resume"/);
       assert.doesNotMatch($('gw-content').innerHTML,/data-gw="resume"/,'resume is outside the progress block');
+      if(can_edit){
+        let resumed=false;
+        env.setControl((url,options)=>{
+          assert.equal(url,`/api/group-tasks/${selected.id}/resume`);assert.equal(options.method,'POST');
+          assert.equal(options.body.run_id,selected.run.id);assert.equal(options.body.expected_version,selected.version);
+          resumed=true;return {...selected,status:'queued',run:{...selected.run,status:'queued'}};
+        });
+        const button={dataset:{gw:'resume',id:selected.id,runId:selected.run.id,version:String(selected.version)},isConnected:true,disabled:false};
+        await $('group-tasks-panel').listeners.click({target:{closest:selector=>selector==='[data-gw]'?button:null}});
+        assert(resumed,'stage resume handler still submits the matching run');
+        assert.match(env.toasts.at(-1)[0],/任务已继续/);
+        assert.doesNotMatch($('group-tasks-panel').innerHTML,/data-gw="resume"/,'resume leaves the paused state');
+      }
     }
   }
 }
