@@ -57,13 +57,14 @@ def load_task(task_id: str, login: dict | None, *, write=False, feature="annotat
     return require_record(None if value and value.get("deleted_at") else value, login, write=write)
 
 
-def _ensure_version(task: dict, version: int, *, allow_busy=False) -> None:
+def _ensure_version(task: dict, version: int, *, allow_busy=False, allow_paused=False) -> None:
     if task.get("deleted_at"):
         raise HTTPException(404, "任务已删除")
     if task["version"] != version:
         raise HTTPException(409, "任务已更新，请刷新后核对新版本再操作")
-    if not allow_busy and (task.get("run") or {}).get("status") in ACTIVE_RUNS | {"paused"}:
-        raise HTTPException(409, "本任务正在排队、标注或已暂停，暂时不能修改或删除；请先继续任务，其他任务仍可操作")
+    run_status = (task.get("run") or {}).get("status")
+    if not allow_busy and (run_status in ACTIVE_RUNS or run_status == "paused" and not allow_paused):
+        raise HTTPException(409, "排队、标注或暂停中的任务暂时不能修改或删除；已暂停任务可继续或删除，暂时不能编辑")
 
 
 def create_task(rules: TaskRules, login: dict | None) -> dict:
@@ -168,7 +169,7 @@ def delete_task(task_id, version, login):
     load_task(task_id, login, write=True)
     def validate(task):
         require_record(task, login, write=True)
-        _ensure_version(task, version)
+        _ensure_version(task, version, allow_paused=True)
     try:
         store.archive_task(task_id, validate, {"deleted_at": now(), "deleted_by": owner_identity(login)})
     except FileNotFoundError:

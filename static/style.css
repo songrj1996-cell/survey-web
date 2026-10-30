@@ -13901,6 +13901,12 @@ body {
 #group-tasks-panel .ann-ai-confirm-footer { justify-content:space-between; }
 #group-tasks-panel .workflow-task-navigation { margin:0; }
 #group-tasks-panel .ann-progress-block { margin:24px 0; }
+#group-tasks-panel .gw-stage-progress-heading { flex-direction:row; align-items:center; justify-content:space-between; gap:24px; }
+#group-tasks-panel .gw-stage-progress-copy { display:flex; flex-direction:column; gap:5px; min-width:0; overflow-wrap:anywhere; }
+#group-tasks-panel .gw-stage-progress-heading > .btn { flex:none; white-space:nowrap; }
+@media(max-width:600px) {
+  #group-tasks-panel .gw-stage-progress-heading { gap:12px; }
+}
 #group-tasks-panel .ann-warn-item { padding:8px 12px; margin-bottom:4px; border-radius:6px; background:rgba(232,171,65,.13); color:var(--warning,#b07918); overflow-wrap:anywhere; }
 #group-tasks-panel .ann-warn-item--error { background:rgba(240,94,94,.1); color:var(--danger,#e24b5b); }
 #group-tasks-panel .ann-col-row input[type=number] { max-width:150px; }

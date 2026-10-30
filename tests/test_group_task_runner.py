@@ -297,6 +297,90 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase, WorkflowCase):
         self.assertEqual(rejected.exception.status_code, 503)
         self.assertEqual(store.read('tasks', task['id'])['run']['status'], 'paused')
 
+    async def test_paused_delete_archives_results_and_blocks_resume_api(self):
+        import httpx
+        import json
+        from pathlib import Path
+        from fastapi import FastAPI
+        from unittest.mock import AsyncMock
+        from app.routers import group_tasks as routes
+        task = self.make_task(labels=('优秀反馈', None))
+        control = self.start_for_control(task)
+        runner.pause_run(task['id'], control, LOGIN)
+        before = store.read('tasks', task['id'])
+        historical = {'id': 'historical-batch', 'task_id': task['id'], 'items': ['saved-reward']}
+        store.create('ledger', historical['id'], historical)
+        app = FastAPI()
+        app.include_router(routes.router)
+        with patch.object(routes, '_current_login', AsyncMock(return_value=LOGIN)):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://isolated.test') as client:
+                deleted = await client.request('DELETE', '/api/group-tasks/'+task['id'], json={'expected_version': task['version']})
+                self.assertEqual(deleted.status_code, 200)
+                self.assertTrue(deleted.json()['deleted'])
+                resumed = await client.post('/api/group-tasks/'+task['id']+'/resume', json=control.model_dump())
+                self.assertEqual(resumed.status_code, 404)
+                listing = await client.get('/api/group-tasks')
+                self.assertNotIn(task['id'], [item['id'] for item in listing.json()['tasks']])
+        archive = Path(config.GROUP_WORKFLOW_DATA_DIR)/'deleted_tasks'/f"{task['id']}-v{task['version']}"
+        self.assertEqual(json.loads((archive/'task.json').read_text(encoding='utf-8')), before)
+        for upload in before['uploads']:
+            self.assertEqual((archive/f"{upload['id']}.bin").read_bytes(), store.read_blob(upload['id']))
+        self.assertEqual(store.read('ledger', historical['id']), historical)
+        self.assertTrue(store.read('tasks', task['id'])['deleted_at'])
+        with patch.object(runner, 'annotate_group_feedback') as annotate:
+            await runner._run_slice(task['id'], asyncio.Semaphore(1))
+        annotate.assert_not_called()
+
+    async def test_delete_rejects_queued_running_and_pausing_without_archiving(self):
+        from pathlib import Path
+        from fastapi import HTTPException
+        for status, pause_requested in [('queued', False), ('running', False), ('running', True)]:
+            with self.subTest(status=status, pause_requested=pause_requested):
+                task = self.make_task(labels=(None,))
+                self.start_for_control(task)
+                store.mutate('tasks', task['id'], lambda current: current['run'].update(status=status, pause_requested=pause_requested))
+                before = store.read('tasks', task['id'])
+                with self.assertRaises(HTTPException) as rejected:
+                    runner.tasks.delete_task(task['id'], task['version'], LOGIN)
+                self.assertEqual(rejected.exception.status_code, 409)
+                self.assertEqual(store.read('tasks', task['id']), before)
+                archive = Path(config.GROUP_WORKFLOW_DATA_DIR)/'deleted_tasks'/f"{task['id']}-v{task['version']}"
+                self.assertFalse(archive.exists())
+
+    async def test_paused_delete_still_enforces_version_owner_and_backup(self):
+        from fastapi import HTTPException
+        task = self.make_task(labels=('优秀反馈', None))
+        control = self.start_for_control(task)
+        runner.pause_run(task['id'], control, LOGIN)
+        before = store.read('tasks', task['id'])
+        for version, login in [(task['version']+1, LOGIN), (task['version'], {'email':'other@example.test'})]:
+            with self.assertRaises(HTTPException):
+                runner.tasks.delete_task(task['id'], version, login)
+            self.assertEqual(store.read('tasks', task['id']), before)
+        with patch.object(runner.tasks, 'require_permission', side_effect=HTTPException(403, '只读账号')):
+            with self.assertRaises(HTTPException) as readonly:
+                runner.tasks.delete_task(task['id'], task['version'], LOGIN)
+        self.assertEqual(readonly.exception.status_code, 403)
+        with patch.object(store, 'read_blob', return_value=b'corrupt'):
+            with self.assertRaises(HTTPException) as invalid_backup:
+                runner.tasks.delete_task(task['id'], task['version'], LOGIN)
+        self.assertEqual(invalid_backup.exception.status_code, 409)
+        self.assertEqual(store.read('tasks', task['id']), before)
+        with patch.object(runner, 'require_background_llm_api_key', return_value='test-key'):
+            self.assertEqual((await runner.resume_run(task['id'], control, LOGIN))['status'], 'queued')
+
+    async def test_resume_before_delete_keeps_active_task(self):
+        from fastapi import HTTPException
+        task = self.make_task(labels=(None,))
+        control = self.start_for_control(task)
+        runner.pause_run(task['id'], control, LOGIN)
+        with patch.object(runner, 'require_background_llm_api_key', return_value='test-key'):
+            await runner.resume_run(task['id'], control, LOGIN)
+        with self.assertRaises(HTTPException) as rejected:
+            runner.tasks.delete_task(task['id'], task['version'], LOGIN)
+        self.assertEqual(rejected.exception.status_code, 409)
+        self.assertEqual(store.read('tasks', task['id'])['run']['status'], 'queued')
+
     async def test_admission_never_reads_roster_and_repeated_start_is_idempotent(self):
         from fastapi import HTTPException
         from unittest.mock import AsyncMock

@@ -27,6 +27,7 @@ window.GroupTasks = (() => {
   const btn = (action, text, primary=false, disabled=false, extra='') => `<button type="button" class="btn ${primary?'btn--primary':'btn--ghost'}" data-gw="${action}" ${disabled?'disabled':''} ${extra}>${text}</button>`;
   const busy = () => task && ['queued','running','pausing','paused'].includes(task.status);
   const editable = () => task?.can_edit && !busy() && !ruleSave;
+  const deletable = () => task?.can_edit && !['queued','running','pausing'].includes(task.status) && !ruleSave;
   const disabled = () => editable() ? '' : 'disabled';
   const error = e => { if (!e.scopeChanged) showToast(e.message, 'error', 6500); };
   async function mayLeave() { if(ruleSave){showToast('正在保存任务信息，请等待保存结束','error');return false;} if(recordBusy){showToast('正在处理任务记录，请等待当前操作结束','error');return false;} if (!dirty) return true; if (!await window.workflowConfirm('当前任务有未保存的填写。继续编辑会保留原文；放弃后才会切换页面。')) return false; dirty=false; aiChoices=null; changedFields.clear(); return true; }
@@ -124,8 +125,9 @@ window.GroupTasks = (() => {
   function render() {
     step=Math.min(step,maxStep()); if(step===3&&!task.rules.ai_detect)step=4;
     const annotationView=!settingsView&&step>=2&&step<=4;
+    const stageResume=annotationView&&step>=3&&task.status==='paused'&&['ai_progress','quality_progress'].includes(task.annotation?.phase);
     root.classList.toggle('workflow-annotation',annotationView);
-    root.innerHTML = `<div class="workflow-heading gw-task-heading"><div class="gw-task-title"><h1 class="panel__title" title="${h(task.rules.name||'新任务')}">${h(task.rules.name||'新任务')}</h1><p id="gw-task-meta" class="panel__desc">${taskMeta(task)}</p></div><div class="gw-task-actions"><span id="gw-progress" class="workflow-badge">${h(progress(task))}</span>${runControls(task)}${annotationView?'':btn('back','← 返回任务列表')}</div></div>
+    root.innerHTML = `<div class="workflow-heading gw-task-heading"><div class="gw-task-title"><h1 class="panel__title" title="${h(task.rules.name||'新任务')}">${h(task.rules.name||'新任务')}</h1><p id="gw-task-meta" class="panel__desc">${taskMeta(task)}</p></div><div class="gw-task-actions"><span id="gw-progress" class="workflow-badge">${h(progress(task))}</span>${stageResume?'':runControls(task)}${annotationView?'':btn('back','← 返回任务列表')}</div></div>
       <div id="gw-annotation-navigation" class="gw-annotation-navigation" hidden></div>
       ${!task.can_edit?'<p class="workflow-notice">当前为只读查看，标注与发奖结果由任务负责人维护。</p>':''}
       ${busy()?`<p class="workflow-notice">${task.status==='paused'?'任务已暂停，点击“继续任务”后恢复处理。':task.status==='pausing'?'暂停中，当前已开始的反馈保存后暂停；期间仍可能调用模型。':'正在排队或标注。'}暂时不能修改本任务的文件、题目选择和标注规则；可以查看进度或处理其他任务。</p>`:''}
@@ -155,7 +157,7 @@ window.GroupTasks = (() => {
     control.querySelector('[data-group-summary-text]').textContent=[...control.querySelectorAll('[data-task-group]:checked')].map(item=>item.dataset.groupName).join('、')||'请选择群组';
   }
   function renderSettings() {
-    $('gw-content').innerHTML=`<section class="workflow-card"><h2>任务设置</h2><div class="workflow-form-grid">${ruleField('name','任务名称')}${ruleField('payout_date','奖励发放日期','date','请手动确认发奖日期')}${ruleField('base_reward','每份基础奖励（钻石）','number')}${ruleField('excellent_reward','每份优秀额外奖励（钻石）','number','额外追加，不包含基础奖励')}${groupSetting()}</div><p class="workflow-muted">标注依据和原始反馈已固定。反馈有变化时，请新建任务。</p><div class="workflow-toolbar">${btn('save-settings','保存设置',true,!editable())}</div></section><section class="workflow-card gw-delete-card"><h2>删除任务</h2><p>删除整条任务及标注记录，已生成的历史发奖批次保留。</p>${busy()?'<p class="workflow-muted">正在排队或标注，请等待处理结束后再删除。</p>':''}${btn('delete-task','删除任务',false,!editable())}</section>`;
+    $('gw-content').innerHTML=`<section class="workflow-card"><h2>任务设置</h2><div class="workflow-form-grid">${ruleField('name','任务名称')}${ruleField('payout_date','奖励发放日期','date','请手动确认发奖日期')}${ruleField('base_reward','每份基础奖励（钻石）','number')}${ruleField('excellent_reward','每份优秀额外奖励（钻石）','number','额外追加，不包含基础奖励')}${groupSetting()}</div><p class="workflow-muted">标注依据和原始反馈已固定。反馈有变化时，请新建任务。</p><div class="workflow-toolbar">${btn('save-settings','保存设置',true,!editable())}</div></section><section class="workflow-card gw-delete-card"><h2>删除任务</h2><p>删除整条任务及标注记录，已生成的历史发奖批次保留。</p>${['queued','running','pausing'].includes(task.status)?'<p class="workflow-muted">正在排队、标注或暂停中，请等待任务已暂停或处理结束后再删除。</p>':task.status==='paused'?'<p class="workflow-muted">任务已暂停，可以删除；删除后将无法继续本任务。</p>':''}${btn('delete-task','删除任务',false,!deletable())}</section>`;
   }
   function renderRules() {
     $('gw-content').innerHTML = `<section class="workflow-card"><h2>任务公告</h2><p class="workflow-muted">可选，识别后仍可手动修改。</p>
@@ -909,8 +911,15 @@ function renderAnnotationProgress(stage) {
   annElement(`ann-${prefix}-progress-msg`).textContent=suspended?`${statusNames[task.status]}：已完成 ${done} / ${total} 份反馈`:active?`${run.status==='queued'?'排队等待中':'正在分批分析'}：已完成 ${done} / ${total} 份反馈`: `${ai?'AI 识别':'质量打标'}未完成：${done} 条有效结果，仍有 ${total-done} 行未回填`;
   if(suspended){
     const panel=annElement(`ann-panel-${ai?3:5}`);
-    panel.querySelector('.panel__title').textContent=`${ai?'AI 作答识别':'回答质量打标'} · ${statusNames[task.status]}`;
-    panel.querySelector('.panel__desc').textContent=task.status==='paused'?'当前结果已保存，点击“继续任务”后恢复处理。':'当前已开始的反馈保存后暂停；期间仍可能调用模型。';
+    const title=`${ai?'AI 作答识别':'回答质量打标'} · ${statusNames[task.status]}`;
+    const description=task.status==='paused'?'当前结果已保存，点击“继续任务”后恢复处理。':'当前已开始的反馈保存后暂停；期间仍可能调用模型。';
+    panel.querySelector('.panel__title').textContent=title;
+    panel.querySelector('.panel__desc').textContent=description;
+    if(task.status==='paused'){
+      const heading=panel.querySelector('.panel__header');
+      heading.classList.add('gw-stage-progress-heading');
+      heading.innerHTML=`<div class="gw-stage-progress-copy"><h1 class="panel__title">${h(title)}</h1><p class="panel__desc">${h(description)}</p></div>${runControls(task)}`;
+    }
   }
   const errors=task.feedback.filter(r=>!r.excluded&&r.model_error&&!(ai?r.ai_complete:r.quality_complete||r.confirmed_ai)).map(r=>`第 ${r.source_row} 行：${r.model_error}`);
   if(run?.stage===stage&&run.error)errors.push(run.error);
@@ -1094,6 +1103,7 @@ for (const filterId of [
       await saveRuleForm('settings',body);return;
     }
     if(name==='delete-task'){
+      if(!deletable())throw new Error('当前任务不能删除，请确认权限，并等待任务已暂停或处理结束。');
       if(!await window.workflowConfirm(`确认删除“${task.rules.name||'未命名任务'}”及其全部标注记录？删除后将不能再用于新的发奖批次；已生成的历史批次保留。`,'删除任务'))return;
       await api(`/api/group-tasks/${task.id}`,{method:'DELETE',body:{expected_version:task.version}});dirty=false;await list();showToast('任务已删除','success');return;
     }

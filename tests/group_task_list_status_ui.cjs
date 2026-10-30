@@ -54,12 +54,13 @@ function environment(){
   }
   const nodes=new Map(),requests=[],toasts=[];
   const $=id=>{if(!nodes.has(id))nodes.set(id,new Element());return nodes.get(id);};
-  let items=[],selected,poll,controlHandler;
+  let items=[],selected,poll,controlHandler,confirmHandler=async()=>true;
   const context={console,$,esc:escapeHtml,document:{hidden:false},PlatformPermissions:{canUse:()=>true},
-    showToast:(...args)=>toasts.push(args),setInterval:fn=>{poll=fn;},window:{addEventListener(){},workflowConfirm:async()=>true,
+    showToast:(...args)=>toasts.push(args),setInterval:fn=>{poll=fn;},window:{addEventListener(){},workflowConfirm:(...args)=>confirmHandler(...args),
       workflowRequest:async(url,options)=>{requests.push({url,options});if(options?.method&&options.method!=='GET'){
           assert(controlHandler,'ordinary navigation must never submit a run');
-          assert.match(url,/\/(pause|resume)$/);assert.equal(options.method,'POST');return controlHandler(url,options);
+          if(options.method!=='DELETE'){assert.match(url,/\/(pause|resume)$/);assert.equal(options.method,'POST');}
+          return controlHandler(url,options);
         }
         if(url==='/api/group-tasks')return {tasks:items};
         if(url==='/api/group-tasks/groups')return {groups:[]};
@@ -67,7 +68,7 @@ function environment(){
         throw new Error('Unexpected synthetic request '+url);}}};
   vm.createContext(context);
   vm.runInContext(source.replace('return {open,list};','return {open,list,tests:{listState,renderList}};'),context);
-  return {context,$,requests,toasts,tests:context.window.GroupTasks.tests,poll:()=>poll(),setItems:value=>{items=value;},setSelected:value=>{selected=value;},setControl:value=>{controlHandler=value;}};
+  return {context,$,requests,toasts,tests:context.window.GroupTasks.tests,poll:()=>poll(),setItems:value=>{items=value;},setSelected:value=>{selected=value;},setControl:value=>{controlHandler=value;},setConfirm:value=>{confirmHandler=value;}};
 }
 async function checks(){
   const env=environment(),{tests,$}=env;
@@ -146,6 +147,8 @@ async function checks(){
   await $('group-tasks-panel').listeners.click({target:{closest:selector=>selector==='[data-gw]'?view:null}});
   assert.match($('ga-quality-progress-msg').textContent,/已暂停/);
   assert.match($('ga-panel-5').querySelector('.panel__desc').textContent,/当前结果已保存/);
+  assert.doesNotMatch($('group-tasks-panel').innerHTML,/data-gw="resume"/,'resume moves out of the task heading');
+  assert.match($('ga-panel-5').querySelector('.panel__header').innerHTML,/gw-stage-progress-copy[\s\S]*data-gw="resume"/,'resume follows stage text in its heading');
   assert.doesNotMatch($('gw-content').innerHTML,/data-gw="annotation-run"/,'paused detail must not expose a restart shortcut');
   await controlClick('resume');
   await env.context.window.GroupTasks.list();
@@ -155,12 +158,57 @@ async function checks(){
   assert.match($('gw-task-list').innerHTML,/排队中/,'a failed save cannot show a successful pause');
   env.setItems([{...controlled,can_edit:false}]);await env.context.window.GroupTasks.list();
   const beforeDenied=env.requests.length;await controlClick('pause');assert.equal(env.requests.length,beforeDenied,'read-only action sends no request');
-  console.log(`Quality list status UI passed: ${cases.length} states, no separate records button, read-only permissions, polling, escaping, navigation and pause/resume/error handlers; only explicit control actions may POST.`);
+  await pausedDeleteChecks();
+  console.log(`Quality list status UI passed: ${cases.length} states, read-only permissions, polling, navigation, pause/resume/error handlers, paused deletion/cancel/failure and stage-heading resume placement.`);
+}
+async function pausedDeleteChecks(){
+  const env=environment(),{$}=env;
+  async function click(gw,id='delete-task'){
+    const button={dataset:{gw,id},isConnected:true,disabled:false};
+    await $('group-tasks-panel').listeners.click({target:{closest:selector=>selector==='[data-gw]'?button:null}});
+  }
+  for(const status of ['queued','running','pausing','paused']){
+    for(const can_edit of [true,false]){
+      const selected=fixture({id:'delete-task',status,can_edit,run:{...run('quality',status==='pausing'?'running':status),pause_requested:status==='pausing'}});
+      env.setSelected(selected);env.setItems([selected]);await env.context.window.GroupTasks.list();await click('settings');
+      const html=$('gw-content').innerHTML;
+      assert.match(html,/data-gw="save-settings" disabled/,'paused/active settings stay locked');
+      if(status==='paused'&&can_edit){assert.match(html,/data-gw="delete-task"\s+>/);assert.match(html,/任务已暂停，可以删除/);}
+      else{
+        assert.match(html,/data-gw="delete-task" disabled/);
+        const before=env.requests.length;await click('delete-task');
+        assert.equal(env.requests.length,before,'disabled state also checked by action handler');
+      }
+    }
+  }
+  let paused=fixture({id:'delete-task',status:'paused',run:run('quality','paused')});
+  env.setSelected(paused);env.setItems([paused]);await env.context.window.GroupTasks.list();await click('settings');
+  let deletes=0;
+  env.setControl((url,options)=>{assert.equal(options.method,'DELETE');assert.equal(url,'/api/group-tasks/delete-task');assert.equal(options.body.expected_version,paused.version);deletes++;return {deleted:true};});
+  env.setConfirm(async()=>false);await click('delete-task');assert.equal(deletes,0,'cancel does not delete');
+  env.setConfirm(async()=>true);
+  env.setControl(()=>{throw Error('合成备份校验失败');});await click('delete-task');
+  assert.match(env.toasts.at(-1)[0],/备份校验失败/);assert.match($('gw-content').innerHTML,/任务已暂停，可以删除/,'failed deletion preserves settings');
+  env.setControl((url,options)=>{assert.equal(options.method,'DELETE');assert.equal(options.body.expected_version,paused.version);deletes++;env.setItems([]);return {deleted:true};});
+  await click('delete-task');assert.equal(deletes,1);assert.match($('gw-task-list').innerHTML,/尚无匹配任务/);assert.match(env.toasts.at(-1)[0],/任务已删除/);
+  for(const [stage,ai_detect] of [['ai',true],['ai',false],['quality',false]]){
+    for(const can_edit of [true,false]){
+      const selected=fixture({id:'delete-task',can_edit,status:'paused',run:run(stage,'paused'),annotation:stage==='ai'?aiAnnotation:fixture().annotation,workflow:{max_step:stage==='ai'?3:4},rules:{name:'暂停布局样本',ai_detect}});
+      env.setSelected(selected);env.setItems([selected]);await env.context.window.GroupTasks.list();await click('view');
+      const heading=$(`ga-panel-${stage==='ai'?3:5}`).querySelector('.panel__header').innerHTML;
+      assert.match(heading,/gw-stage-progress-copy/);
+      assert.doesNotMatch($('group-tasks-panel').innerHTML,/data-gw="resume"/);
+      if(can_edit)assert.equal((heading.match(/data-gw="resume"/g)||[]).length,1);
+      else assert.doesNotMatch(heading,/data-gw="resume"/);
+      assert.doesNotMatch($('gw-content').innerHTML,/data-gw="resume"/,'resume is outside the progress block');
+    }
+  }
 }
 function serve(){
   const http=require('node:http');
   const items=cases.map(([name,t],i)=>{
     const item=structuredClone({...t,id:'synthetic-'+i,rules:{...t.rules,name}});
+    if(['ai_progress','ai_review'].includes(item.annotation.phase)){item.workflow.max_step=3;item.rules.ai_detect=true;}
     if(item.annotation.complete)item.summary={...item.summary,complete_count:42,pending_count:0};
     if(item.annotation.phase==='ai_review'||item.run?.status==='completed'){
       if(item.run){item.run.completed_ids=[...item.run.target_ids];item.run.attempted_ids=[...item.run.target_ids];}
@@ -174,6 +222,11 @@ function serve(){
     window.showToast=message=>console.log(message);window.workflowTime=String;window.formatReportDuration=String;window.workflowConfirm=async()=>true;
     window.workflowRequest=async(url,options)=>{
       if(options?.method&&options.method!=='GET'){
+        if(options.method==='DELETE'){
+          const index=fixtures.findIndex(t=>url==='/api/group-tasks/'+t.id),t=fixtures[index];
+          if(!t||readOnly||['queued','running','pausing'].includes(t.status)||options.body.expected_version!==t.version)throw Error('合成删除被拒绝');
+          fixtures.splice(index,1);return {id:t.id,deleted:true};
+        }
         const match=url.match(/^\\/api\\/group-tasks\\/([^/]+)\\/(pause|resume)$/),t=match&&fixtures.find(t=>t.id===match[1]);
         if(!t||readOnly||options.body.run_id!==t.run?.id||options.body.expected_version!==t.version)throw Error('合成操作被拒绝');
         if(match[2]==='pause'){
