@@ -10,13 +10,16 @@ from pathlib import Path
 import re
 import tempfile
 import threading
+import time
 from typing import Callable
 
 from app.core import config
 from app.core.file_lock import acquire_exclusive_file_lock, release_file_lock
+from app.core.runtime_logging import runtime_log
 
 _LOCK = threading.RLock()
 _LOCAL = threading.local()
+_IS_WINDOWS = os.name == "nt"
 _KINDS = {"tasks", "sources", "snapshots", "previews", "other_rewards", "ledger", "members", "imports", "preferences"}
 
 
@@ -68,6 +71,27 @@ def _read(path: Path) -> dict | None:
     return value
 
 
+def _replace_with_retry(temporary: str, path: Path) -> None:
+    """Retry only a rejected Windows rename, keeping the same payload and lock."""
+    delays = config.GROUP_FILE_REPLACE_RETRY_DELAYS_SECONDS
+    for attempt in range(len(delays) + 1):
+        try:
+            os.replace(temporary, path)
+        except OSError as exc:
+            retryable = _IS_WINDOWS and isinstance(exc, PermissionError) and getattr(exc, "winerror", None) in (5, 32)
+            if retryable and attempt < len(delays):
+                if attempt == 0:
+                    runtime_log("群组记录保存", "warning", "Windows 拒绝替换记录文件，将在限定等待后重试保存", path=path, code=exc.winerror)
+                time.sleep(delays[attempt])
+                continue
+            runtime_log("群组记录保存", "error", "记录保存失败，未确认新结果已写入；本次未主动清空原文件，请核对状态后重试", path=path,
+                        code=getattr(exc, "winerror", None) or exc.errno, attempt=attempt + 1)
+            raise
+        if attempt:
+            runtime_log("群组记录保存", "success", "记录文件重试保存成功，写入内容保持不变", path=path, attempt=attempt + 1)
+        return
+
+
 def _write(path: Path, document: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(prefix=".save-", suffix=".tmp", dir=path.parent)
@@ -76,10 +100,14 @@ def _write(path: Path, document: dict) -> None:
             json.dump(document, output, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
             output.flush()
             os.fsync(output.fileno())
-        os.replace(temporary, path)
+        _replace_with_retry(temporary, path)
     finally:
         if os.path.exists(temporary):
-            os.unlink(temporary)
+            try:
+                os.unlink(temporary)
+            except OSError:
+                # Do not hide the original persistence error with a cleanup error.
+                runtime_log("群组记录保存", "warning", "本次临时保存文件未能清理，原始保存错误仍会返回；请联系管理员核查", path=temporary)
 
 
 def read(kind: str, identifier: str) -> dict | None:
