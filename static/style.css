@@ -13817,6 +13817,11 @@ body {
 #gw-task-list .gw-list-status{min-width:280px;width:32%;white-space:normal}
 #gw-task-list .gw-list-badge--error{color:var(--red);border-color:var(--red);background:color-mix(in srgb,var(--red) 8%,var(--surface))}
 #gw-task-list .gw-list-badge--warning{color:var(--amber);border-color:var(--amber);background:color-mix(in srgb,var(--amber) 8%,var(--surface))}
+.gw-settled-badge,#gw-task-list .gw-list-badge--settled,.rb-status--paid{color:var(--green);border-color:var(--green);background:color-mix(in srgb,var(--green) 8%,var(--surface))}
+.rb-status--pending{color:var(--amber);border-color:var(--amber);background:color-mix(in srgb,var(--amber) 8%,var(--surface))}
+.rb-status--voided{color:var(--text-2);border-style:dashed;background:var(--surface-2)}
+[data-theme="light"] .gw-settled-badge,[data-theme="light"] #gw-task-list .gw-list-badge--settled,[data-theme="light"] .rb-status--paid{color:#166534;border-color:#15803d}
+[data-theme="light"] .rb-status--pending{color:#926100;border-color:#926100}
 #gw-task-list .gw-list-hint{max-width:440px;line-height:1.65;overflow-wrap:anywhere}
 #gw-task-list .gw-list-hint--error{color:var(--red)}
 [data-theme="light"] #gw-task-list{--red:#b91c1c;--amber:#926100}

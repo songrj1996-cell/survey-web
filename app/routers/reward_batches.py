@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Request
 from app.core.responses import _make_download_response
-from app.schemas.reward_batches import BatchGenerate, BatchResolution, OtherRewardCreate, RewardSelection
+from app.schemas.reward_batches import BatchAction, BatchGenerate, BatchResolution, OtherRewardCreate, RewardSelection
 from app.services.auth import _current_login
 from app.services import reward_batches as service
 
@@ -51,3 +51,13 @@ async def batch(batch_id: str, request: Request):
 async def download(batch_id: str, request: Request):
     content, filename = service.download_batch(batch_id, await _current_login(request))
     return _make_download_response(content, "text/plain; charset=utf-8", filename)
+
+
+@router.post("/{batch_id}/void")
+async def void_batch(batch_id: str, body: BatchAction, request: Request):
+    return service.void_batch(batch_id, body, await _current_login(request))
+
+
+@router.post("/{batch_id}/confirm-paid")
+async def confirm_paid(batch_id: str, body: BatchAction, request: Request):
+    return service.confirm_paid(batch_id, body, await _current_login(request))

@@ -22,15 +22,38 @@ def _ledger():
     return store.read("ledger", "payouts") or {"batches": {}, "claims": {}, "idempotency": {}}
 
 
+def _batch_view(batch, login):
+    result = deepcopy(batch)
+    result.setdefault("status", "pending")
+    result.setdefault("revision", 1)
+    result["can_manage"] = (not config.FEISHU_LOGIN_REQUIRED
+                            or _get_user_permission_levels(login).get("reward") == "use")
+    return result
+
+
+def _replay_batch(batch, login):
+    require_record(batch, login, write=True)
+    if batch.get("status") == "voided":
+        raise HTTPException(409, "原批次已作废，请重新选择来源并预览，不能重放原生成请求")
+    return _batch_view(batch, login)
+
+
+def _require_fresh_preview(ledger, identifier):
+    if any(batch.get("preview_id") == identifier and batch.get("status") == "voided"
+           for batch in ledger["batches"].values()):
+        raise HTTPException(409, "此预览对应的批次已作废，请重新选择来源并创建新预览")
+
+
 def choices(login):
     require_permission(login, "reward")
     access = record_scope(login)
     may_write = not config.FEISHU_LOGIN_REQUIRED or _get_user_permission_levels(login).get("reward") == "use"
     ledger = _ledger()
+    settlements = tasks._paid_task_settlements(ledger)
     available = []
     for task in store.list_records("tasks"):
         if not task.get("deleted_at") and access.can_read(task):
-            item = tasks.task_view(task, login, summary=True, access=access)
+            item = tasks.task_view(task, login, summary=True, access=access, settlements=settlements)
             item["consumed"] = ledger["claims"].get("task:" + task["id"])
             item["selectable"] = (tasks.reward_ready(task)
                                   and may_write and not item["consumed"])
@@ -47,7 +70,8 @@ def choices(login):
                for record in store.list_records("imports") if not record.get("deleted_at") and access.can_read(record) and import_is_ready(record)]
     groups = [{"id": source["id"], "name": source["name"]} for source in store.list_records("sources") if source["enabled"]]
     return {"tasks": available, "other_rewards": others, "imports": imports, "groups": groups,
-            "batches": [{key: batch.get(key) for key in ("id", "created_at", "owner_name", "dates", "total_diamonds", "unique_accounts")}
+            "batches": [{**{key: batch.get(key) for key in ("id", "created_at", "owner_name", "dates", "total_diamonds", "unique_accounts")},
+                         "status": batch.get("status", "pending"), "revision": batch.get("revision", 1)}
                         for batch in ledger["batches"].values() if access.can_read(batch)]}
 
 
@@ -259,7 +283,8 @@ async def generate_batch(identifier, request, login):
         batch = require_record(_ledger()["batches"][previous], login, write=True)
         if batch["preview_id"] != identifier:
             raise HTTPException(409, "此生成标识已用于另一份预览")
-        return deepcopy(batch)
+        return _replay_batch(batch, login)
+    _require_fresh_preview(_ledger(), identifier)
     preview = require_record(store.read("previews", identifier), login, write=True)
     if preview["revision"] != request.expected_revision:
         raise HTTPException(409, "预览版本已变化，请重新核对")
@@ -286,7 +311,8 @@ async def generate_batch(identifier, request, login):
             existing = ledger["batches"][repeated]
             if existing["preview_id"] != identifier:
                 raise HTTPException(409, "此生成标识已用于另一份预览")
-            return existing
+            return _replay_batch(existing, login)
+        _require_fresh_preview(ledger, identifier)
         current = require_record(store.read("previews", identifier), login, write=True)
         if current["revision"] != request.expected_revision:
             raise HTTPException(409, "预览已更新，请重新核对")
@@ -313,7 +339,7 @@ async def generate_batch(identifier, request, login):
         if any(key in ledger["claims"] for key in claim_keys):
             raise HTTPException(409, "来源或同日同任务账号奖励已进入历史批次，不能再次计入；请查看批次及版本差异")
         batch_id = uuid.uuid4().hex
-        batch = {"id": batch_id, "preview_id": identifier, "preview_revision": current["revision"], "created_at": tasks.now(), **owner,
+        batch = {"id": batch_id, "status": "pending", "revision": 1, "preview_id": identifier, "preview_revision": current["revision"], "created_at": tasks.now(), **owner,
                  "dates": current["selection"]["dates"], "selection": current["selection"], "task_versions": current["task_versions"],
                  "source_rows": current["source_rows"], "roster_snapshot": snapshot, "selections": current["selections"],
                  "identity_choices": current["identity_choices"], "selected_rows": resolved["selected_rows"],
@@ -323,12 +349,53 @@ async def generate_batch(identifier, request, login):
         for key in claim_keys:
             ledger["claims"][key] = batch_id
         return batch
-    return store.mutate("ledger", "payouts", commit, default={"batches": {}, "claims": {}, "idempotency": {}})
+    return _batch_view(store.mutate("ledger", "payouts", commit, default={"batches": {}, "claims": {}, "idempotency": {}}), login)
+
+
+def _change_batch_status(identifier, request, login, target):
+    require_permission(login, "reward", write=True)
+    if not request.confirmed:
+        raise HTTPException(422, "请先确认本次批次操作")
+    operator = owner_identity(login)
+    def update(ledger):
+        batch = require_record(ledger["batches"].get(identifier), login, write=True)
+        status = batch.get("status", "pending")
+        if status == target:
+            return batch  # Retrying a successful action must not create another event/backup.
+        if status != "pending":
+            raise HTTPException(409, "批次已发放或已作废，不能执行此操作，请刷新批次")
+        if batch.get("revision", 1) != request.expected_revision:
+            raise HTTPException(409, "批次状态已变化，请刷新后重新核对")
+        if target == "voided":
+            for key in batch["claims"]:
+                if ledger["claims"].get(key) == identifier:
+                    del ledger["claims"][key]
+        at = tasks.now()
+        batch.update(status=target, revision=batch.get("revision", 1) + 1)
+        field = "paid" if target == "paid" else "voided"
+        batch.update({field + "_at": at, field + "_by": operator["owner_name"]})
+        batch.setdefault("events", []).append({"action": target, "at": at,
+                                               "operator_name": operator["owner_name"], "operator_key": operator["owner_key"]})
+        return batch
+    try:
+        require_record(_ledger()["batches"].get(identifier), login, write=True)
+        result = store.mutate_with_backup("ledger", "payouts", update)
+    except OSError:
+        raise HTTPException(503, "批次备份或保存失败，未确认操作成功，请刷新核对后重试") from None
+    return _batch_view(result, login)
+
+
+def void_batch(identifier, request, login):
+    return _change_batch_status(identifier, request, login, "voided")
+
+
+def confirm_paid(identifier, request, login):
+    return _change_batch_status(identifier, request, login, "paid")
 
 
 def get_batch(identifier, login):
     require_permission(login, "reward")
-    batch = deepcopy(require_record(_ledger()["batches"].get(identifier), login))
+    batch = _batch_view(require_record(_ledger()["batches"].get(identifier), login), login)
     differences = []
     for task_id, frozen in batch["task_versions"].items():
         current = store.read("tasks", task_id)
@@ -351,4 +418,6 @@ def get_batch(identifier, login):
 
 def download_batch(identifier, login):
     batch = get_batch(identifier, login)
+    if batch["status"] == "voided":
+        raise HTTPException(409, "此批次已作废，不能下载发奖 TXT；请使用重新生成的有效批次")
     return batch["txt_preview"].encode("utf-8"), f"奖励发放-{batch['dates'][0]}-{identifier[:8]}.txt"

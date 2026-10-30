@@ -1,6 +1,6 @@
 window.RewardBatches = (() => {
   const root=$('reward-batches-panel'),h=value=>esc(String(value??''));
-  let scopeEpoch=0;
+  let scopeEpoch=0,lifecycleBusy=false;
   const request=window.workflowRequest;
   const api=async(...args)=>{
     const epoch=scopeEpoch;
@@ -15,6 +15,9 @@ window.RewardBatches = (() => {
   };
   let data={tasks:[],other_rewards:[],imports:[],groups:[],batches:[]},dates=new Set(),selectedTasks=new Set(),selectedOthers=new Set(),selectedImports=new Set(),preview=null,batch=null,generationKey=null;
   const button=(action,label,primary=false,disabled=false,extra='')=>`<button type="button" class="btn ${primary?'btn--primary':'btn--ghost'}" data-rb="${action}" ${disabled?'disabled':''} ${extra}>${label}</button>`;
+  const batchStatus=b=>b.status||'pending';
+  const batchBadge=b=>`<span class="workflow-badge rb-status--${h(batchStatus(b))}">${h({pending:'待发放',paid:'已发放',voided:'已作废'}[batchStatus(b)]||'状态待确认')}</span>`;
+  const batchHistoryRow=item=>`<div class="workflow-source-choice"><span>${batchBadge(item)} ${h(item.dates.join('、'))} · ${item.total_diamonds} 钻<small>${h(item.owner_name)} · ${h(workflowTime(item.created_at))} · ${item.unique_accounts} 个账号</small></span>${button('batch',batchStatus(item)==='voided'?'查看记录':'查看与下载',false,false,`data-id="${h(item.id)}"`)}</div>`;
   function createGenerationKey(){
     if(typeof window.crypto.randomUUID==='function')return window.crypto.randomUUID();
     // getRandomValues also works on HTTP pages where randomUUID is unavailable.
@@ -24,14 +27,14 @@ window.RewardBatches = (() => {
   }
   async function open({home=false}={}){
     if(home){dates.clear();selectedTasks.clear();selectedOthers.clear();selectedImports.clear();preview=null;batch=null;generationKey=null;}
-    root.classList.remove('panel--hidden');try{data=await api('/api/reward-batches/choices');render();}catch(e){if(!e.scopeChanged)showToast(e.message,'error');}
+    root.classList.remove('panel--hidden');try{data=await api('/api/reward-batches/choices');if(batch)batch=await api(`/api/reward-batches/${batch.id}`);render();}catch(e){if(!e.scopeChanged)showToast(e.message,'error');}
   }
   function render(){
     root.innerHTML=`<div class="workflow-heading"><div><h1 class="panel__title">奖励整理</h1><p class="panel__desc">明确选择日期与来源，核对最新名单，再保存发奖 TXT 批次。</p></div>${button('refresh','刷新奖励列表',false,false,'title="更新任务、其他奖励与导入记录；核对名单请点击读取最新名单并预览"')}</div><div class="workflow-toolbar">${button('import','导入已有奖励 Excel',false,!PlatformPermissions.canUse('reward'))}${button('other','录入其他奖励',false,!PlatformPermissions.canUse('reward'))}${button('history','查看批次记录')}</div><div id="rb-other"></div><div id="rb-body"></div>`;
     if(batch){renderBatch();renderVersionDifferences();return;}if(preview){renderPreview();return;}renderChoices();renderHistory();
   }
   function renderHistory(){
-    $('rb-body').insertAdjacentHTML('beforeend',`<section class="workflow-card" id="rb-history"><div class="workflow-heading"><h2>奖励批次</h2><span class="workflow-muted">已生成名单不代表已实际发放</span></div>${data.batches.slice().reverse().map(item=>`<div class="workflow-source-choice"><span>${h(item.dates.join('、'))} · ${item.total_diamonds} 钻<small>${h(item.owner_name)} · ${h(workflowTime(item.created_at))} · ${item.unique_accounts} 个账号</small></span>${button('batch','查看与下载',false,false,`data-id="${item.id}"`)}</div>`).join('')||'<p class="workflow-muted">尚未生成批次。</p>'}</section>`);
+    $('rb-body').insertAdjacentHTML('beforeend',`<section class="workflow-card" id="rb-history"><div class="workflow-heading"><h2>奖励批次</h2><span class="workflow-muted">已生成名单不代表已实际发放</span></div>${data.batches.slice().reverse().map(batchHistoryRow).join('')||'<p class="workflow-muted">尚未生成批次。</p>'}</section>`);
   }
   function availableDates(){
     return [...new Set([...data.tasks.map(t=>t.rules.payout_date),...data.other_rewards.map(r=>r.payout_date),...data.imports.flatMap(i=>i.analysis_request?.reward_dates||[])].filter(Boolean))].sort();
@@ -98,14 +101,19 @@ window.RewardBatches = (() => {
     return `<div class="reward-checklist-grid"><section class="reward-checklist"><h3>按人核对 · ${result.unique_accounts} 个账号 · ${result.total_diamonds} 钻</h3><p class="workflow-muted">每个游戏账号只出现一次，展开查看该账号的奖励来源。</p><div class="reward-checklist-scroll">${result.accounts.map(account=>`<details class="reward-disclosure reward-account"><summary><span>${h(account.account)}<small>${(account.sources||[]).length} 条奖励来源</small></span><strong>${account.total_diamonds} 钻</strong></summary>${rows(account.sources||[])}</details>`).join('')||'<p>当前没有可发放账号。</p>'}</div></section><section class="reward-checklist"><h3>按任务核对 · ${tasks.size} 项 · ${result.total_diamonds} 钻</h3><p class="workflow-muted">按来源群和任务分别统计；同一账号参加不同任务，会分别计入对应任务人数。</p><div class="reward-checklist-scroll">${[...tasks.values()].map(item=>`<details class="reward-disclosure reward-task"><summary><span>${h(item.task)}<small>${h(item.sheet)} · ${item.accounts.size} 个账号</small></span><strong>${item.total} 钻</strong></summary>${rows(item.rows)}</details>`).join('')||'<p>当前没有可发放任务。</p>'}</div></section></div>`;
   }
   function renderBatch(){
-    $('rb-body').innerHTML=`<section class="workflow-card"><div class="workflow-heading"><div><h2>已保存发奖批次</h2><p class="workflow-muted">${h(workflowTime(batch.created_at))} · ${h(batch.owner_name)} · ${batch.dates.join('、')}</p></div>${button('choices','返回来源选择')}</div><div class="workflow-summary"><span>账号 <strong>${batch.unique_accounts}</strong></span><span>总额 <strong>${batch.total_diamonds} 钻</strong></span></div><p>此批次的来源、金额、名单状态和 TXT 已固定保存。再次下载不会创建新批次。</p><div class="workflow-toolbar"><a class="btn btn--primary" href="/api/reward-batches/${batch.id}/download">下载 TXT</a> ${button('copy-txt','复制 TXT 内容')}</div><details open><summary>已保存 TXT 内容</summary><pre class="workflow-pre workflow-txt">${h(batch.txt_preview)}</pre></details>${accountDetails(batch)}<details><summary>来源版本与金额</summary>${Object.entries(batch.task_versions||{}).map(([id,entry])=>`<p>${h(entry.rules.name)} · 已发奖来源版本 ${entry.version}${data.tasks.find(t=>t.id===id)?` · 任务当前版本 ${data.tasks.find(t=>t.id===id).version}`:''}</p>`).join('')}<pre class="workflow-pre">${h(batch.note_full)}</pre></details></section>`;
+    const status=batchStatus(batch),pending=status==='pending',voided=status==='voided';
+    const manage=pending&&PlatformPermissions.canUse('reward')&&batch.can_manage!==false;
+    const actionNote=status==='paid'?`<p class="workflow-notice">已由 ${h(batch.paid_by)} 于 ${h(workflowTime(batch.paid_at))} 确认已发放。此记录由操作者确认，不是游戏到账回执。</p>`:
+      voided?`<p class="workflow-notice">已由 ${h(batch.voided_by)} 于 ${h(workflowTime(batch.voided_at))} 作废。原记录保留，奖励来源已释放，请使用重新生成的有效批次。已下载或复制到外部的旧 TXT 请停止使用。</p>`:
+      '<p class="workflow-muted">此批次尚未确认发放。实际发奖完成后，请点击“确认已发放”；选错来源且尚未发放时，可作废并重新选择。</p>';
+    $('rb-body').innerHTML=`<section class="workflow-card"><div class="workflow-heading"><div><h2>已保存发奖批次 ${batchBadge(batch)}</h2><p class="workflow-muted">${h(workflowTime(batch.created_at))} · ${h(batch.owner_name)} · ${h(batch.dates.join('、'))}</p></div>${button('choices','返回来源选择')}</div><div class="workflow-summary"><span>账号 <strong>${batch.unique_accounts}</strong></span><span>总额 <strong>${batch.total_diamonds} 钻</strong></span></div><p>此批次的来源、金额、名单状态和 TXT 已固定保存。再次下载不会创建新批次。</p>${actionNote}<div class="workflow-toolbar">${voided?'<span class="workflow-muted">已作废，TXT 下载和复制已停用</span>':`<a class="btn btn--primary" href="/api/reward-batches/${h(batch.id)}/download">下载 TXT</a> ${button('copy-txt','复制 TXT 内容')}`}${manage?button('confirm-paid','确认已发放',true)+button('void','作废批次并重新选择'):''}</div><details open><summary>已保存 TXT 内容${voided?'（已作废，不可用于发奖）':''}</summary><pre class="workflow-pre workflow-txt">${h(batch.txt_preview)}</pre></details>${accountDetails(batch)}<details><summary>来源版本与金额</summary>${Object.entries(batch.task_versions||{}).map(([id,entry])=>`<p>${h(entry.rules.name)} · 批次来源版本 ${entry.version}${data.tasks.find(t=>t.id===id)?` · 任务当前版本 ${data.tasks.find(t=>t.id===id).version}`:''}</p>`).join('')}<pre class="workflow-pre">${h(batch.note_full)}</pre></details></section>`;
   }
   function renderVersionDifferences(){
     const differences=batch?.current_source_differences||[];
     if(!differences.length)return;
     const labels={name:'任务名称',payout_date:'发奖日期',base_reward:'基础奖励',excellent_reward:'优秀追加',requires_count:'次数门槛',min_count:'最低次数',allow_repeat:'重复提交',announcement:'公告',ai_detect:'AI 作答识别'};
     const value=v=>v===null?'未填写':v===true?'开启':v===false?'关闭':String(v);
-    $('rb-body').insertAdjacentHTML('beforeend',`<section class="workflow-card"><h2>来源后续修改</h2><p class="workflow-notice">以下任务在生成批次后有改动。历史 TXT 保持原样，这些来源不能再次全额发放；差额或冲正需要另行核对处理。</p>${differences.map(d=>`<div class="workflow-subcard"><strong>${h(d.task_name)} · V${d.old_version} → V${d.current_version}</strong><p>任务计算总额：${d.old_total} → ${d.current_total??'待补齐'} 钻 · 玩家：${d.old_player_count} → ${d.current_player_count}</p>${Object.entries(d.rule_changes).map(([key,change])=>`<p>${h(labels[key]||key)}：${h(value(change.before))} → ${h(value(change.after))}</p>`).join('')}<p class="workflow-muted">任务计算总额包含当时因群内状态等原因未发放的部分，不等于应补发金额。</p></div>`).join('')}</section>`);
+    $('rb-body').insertAdjacentHTML('beforeend',`<section class="workflow-card"><h2>来源后续修改</h2><p class="workflow-notice">${batchStatus(batch)==='voided'?'以下任务在原批次生成后有改动。原批次已作废，重新生成时请核对当前任务结果。':'以下任务在生成批次后有改动。历史 TXT 保持原样，这些来源不能再次全额发放；差额或冲正需要另行核对处理。'}</p>${differences.map(d=>`<div class="workflow-subcard"><strong>${h(d.task_name)} · V${d.old_version} → V${d.current_version}</strong><p>任务计算总额：${d.old_total} → ${d.current_total??'待补齐'} 钻 · 玩家：${d.old_player_count} → ${d.current_player_count}</p>${Object.entries(d.rule_changes).map(([key,change])=>`<p>${h(labels[key]||key)}：${h(value(change.before))} → ${h(value(change.after))}</p>`).join('')}<p class="workflow-muted">任务计算总额包含当时因群内状态等原因未发放的部分，不等于应补发金额。</p></div>`).join('')}</section>`);
   }
   function otherForm(){
     $('rb-other').innerHTML=`<dialog id="rb-other-dialog" class="workflow-dialog" aria-label="录入独立其他奖励"><h2>录入独立其他奖励</h2><p class="workflow-muted">用于抽奖、小活动等，不改变反馈质量或任务基础奖励资格。</p><div class="workflow-form-grid"><label class="workflow-field">奖励发放日期<input id="rb-other-date" type="date"></label><label class="workflow-field">所属群<select id="rb-other-group"><option value="">请选择</option>${data.groups.map(g=>`<option value="${g.id}">${h(g.name)}</option>`).join('')}</select></label><label class="workflow-field">playerid<input id="rb-other-player"></label><label class="workflow-field">奖励金额（正整数钻石）<input id="rb-other-amount" type="number" min="1" step="1"></label></div><label class="workflow-field">奖励原因<textarea id="rb-other-reason"></textarea></label><div id="rb-other-identity"></div><div class="workflow-toolbar">${button('cancel-other','取消')}${button('save-other','保存其他奖励',true)}</div></dialog>`;
@@ -119,10 +127,24 @@ window.RewardBatches = (() => {
     showToast('已保留导入映射和所选日期，请核对奖励来源后预览最新名单','success');
   }
   root.addEventListener('click',async e=>{
-    const b=e.target.closest('[data-rb]');if(!b||b.disabled)return;b.disabled=true;
+    const b=e.target.closest('[data-rb]');if(!b||b.disabled||lifecycleBusy)return;b.disabled=true;
     try{
       const action=b.dataset.rb;
-      if(action==='copy-txt'){await navigator.clipboard.writeText(batch.txt_preview);showToast('已复制本批次 TXT 内容','success');}
+      if(action==='void'||action==='confirm-paid'){
+        if(!batch||batchStatus(batch)!=='pending'||batch.can_manage===false||!PlatformPermissions.canUse('reward'))return;
+        const target=batch,epoch=scopeEpoch;
+        lifecycleBusy=true;
+        const message=action==='void'?`确认此批次尚未实际发放，并作废？\n${target.dates.join('、')} · ${target.unique_accounts} 个账号 · ${target.total_diamonds} 钻\n作废后释放奖励来源，返回重新选择。已下载的旧 TXT 请停止使用。`:
+          `确认已经按本批次 TXT 完成实际发放？\n${target.dates.join('、')} · ${target.unique_accounts} 个账号 · ${target.total_diamonds} 钻\n确认后关联质量标注任务显示“已结算”，此批次不能再作废。`;
+        if(!await workflowConfirm(message,action==='void'?'作废批次':'确认已发放')||scopeEpoch!==epoch||batch?.id!==target.id)return;
+        batch=await api(`/api/reward-batches/${target.id}/${action}`,{method:'POST',body:{expected_revision:target.revision||1,confirmed:true}});
+        data.batches=data.batches.map(item=>item.id===batch.id?{...item,...batch}:item);
+        if(action==='void'){
+          dates=new Set(target.dates);selectedTasks.clear();selectedOthers.clear();selectedImports.clear();preview=null;batch=null;generationKey=null;
+          await open();showToast('批次已作废，请重新选择奖励来源','success');
+        }else{render();showToast('已确认发放，关联质量标注任务已结算','success');}
+      }
+      if(action==='copy-txt'&&batch&&batchStatus(batch)!=='voided'){await navigator.clipboard.writeText(batch.txt_preview);showToast('已复制本批次 TXT 内容','success');}
       if(action==='refresh')await open();
       if(action==='delete-import'){
         const item=data.imports.find(i=>i.id===b.dataset.id);
@@ -153,13 +175,16 @@ window.RewardBatches = (() => {
         preview=await api(`/api/reward-batches/previews/${preview.id}`,{method:'PUT',body:{expected_revision:preview.revision,selections,identity_choices}});generationKey=createGenerationKey();render();
       }
       if(action==='generate'){generationKey ||= createGenerationKey();batch=await api(`/api/reward-batches/previews/${preview.id}/generate`,{method:'POST',body:{expected_revision:preview.revision,idempotency_key:generationKey}});preview=null;render();showToast('批次已保存，可下载 TXT','success');}
-      if(action==='history'){$('rb-body').innerHTML=`<section class="workflow-card"><h2>发奖批次记录</h2>${data.batches.slice().reverse().map(item=>`<div class="workflow-source-choice"><span>${item.dates.join('、')} · ${item.total_diamonds} 钻<small>${h(item.owner_name)} · ${h(workflowTime(item.created_at))} · ${item.unique_accounts} 个账号</small></span>${button('batch','查看与下载',false,false,`data-id="${item.id}"`)}</div>`).join('')||'<p class="workflow-muted">尚未生成批次。</p>'}<div class="workflow-toolbar">${button('choices','返回来源选择')}</div></section>`;}
+      if(action==='history'){$('rb-body').innerHTML=`<section class="workflow-card"><h2>发奖批次记录</h2>${data.batches.slice().reverse().map(batchHistoryRow).join('')||'<p class="workflow-muted">尚未生成批次。</p>'}<div class="workflow-toolbar">${button('choices','返回来源选择')}</div></section>`;}
       if(action==='batch'){batch=await api(`/api/reward-batches/${b.dataset.id}`);preview=null;render();}
     }catch(err){
+      if(['void','confirm-paid'].includes(b.dataset.rb)&&batch&&!err.scopeChanged){
+        try{batch=await api(`/api/reward-batches/${batch.id}`);render();}catch(refreshError){if(refreshError.scopeChanged)return;}
+      }
       if(err.detail?.preview){preview=err.detail.preview;generationKey=createGenerationKey();render();}
       if(err.detail?.candidates?.length&&$('rb-other-identity'))$('rb-other-identity').innerHTML=`<label class="workflow-field">选择匹配身份<select id="rb-other-candidate"><option value="">请选择</option>${err.detail.candidates.map(c=>`<option value="${c.key}">${h(c.group_name)} · ${h(c.ori)} · 第 ${c.row_number} 行</option>`).join('')}</select></label>`;
       if(!err.scopeChanged)showToast(err.message,'error',7000);
-    }finally{if(b.isConnected)b.disabled=false;}
+    }finally{if(['void','confirm-paid'].includes(b.dataset.rb))lifecycleBusy=false;if(b.isConnected)b.disabled=false;}
   });
   window.addEventListener?.('group-management-scope-changed',()=>{
     scopeEpoch++;data={tasks:[],other_rewards:[],imports:[],groups:[],batches:[]};

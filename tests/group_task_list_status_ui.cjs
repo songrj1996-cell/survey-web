@@ -20,6 +20,7 @@ function run(stage='quality',status='incomplete',error=''){
 }
 const aiAnnotation={...fixture().annotation,phase:'ai_progress',options:{ai_detect:true,quality:true},ai_done:38};
 const completeAnnotation={...fixture().annotation,phase:'results',complete:true,quality_done:42};
+const paid={batch_id:'paid-batch',version:1,paid_at:'2026-10-30T07:00:00+00:00',paid_by:'合成发奖人',changed:false};
 const cases=[
   ['规则待填写',fixture({status:'draft'}),'待配置','warning','完善任务'],
   ['输入待处理',fixture({status:'input_issues'}),'输入待处理','warning','处理输入问题'],
@@ -34,6 +35,9 @@ const cases=[
   ['等待人工确认',fixture({status:'awaiting_ai_confirmation',run:run('ai'),annotation:{...aiAnnotation,phase:'ai_review'}}),'待确认 AI 作答','warning','确认 AI 作答'],
   ['结果待确认',fixture({status:'awaiting_confirmation',annotation:completeAnnotation}),'待确认','warning','查看结果'],
   ['仅 AI 标注完成',fixture({status:'annotation_done',annotation:{...completeAnnotation,options:{ai_detect:true,quality:false}}}),'标注完成','neutral','查看结果'],
+  ['已结算',fixture({status:'confirmed',annotation:completeAnnotation,settlement:paid}),'已结算','settled','查看结果'],
+  ['已结算后又标注中',fixture({status:'running',run:run('quality','running'),settlement:{...paid,changed:true}}),'质量打标中','neutral','查看进度'],
+  ['已结算后结果未补齐',fixture({status:'incomplete',run:run(),settlement:{...paid,changed:true}}),'质量打标未完成','error','查看并重试'],
   ['可结算',fixture({status:'confirmed',annotation:completeAnnotation}),'可结算','neutral','查看结果'],
   ['AI 失败但外层仍是 ready',fixture({run:run('ai'),annotation:aiAnnotation}),'AI 识别未完成','error','查看并重试'],
   ['质量打标未完成',fixture({status:'incomplete',run:run()}),'质量打标未完成','error','查看并重试'],
@@ -55,7 +59,7 @@ function environment(){
   const nodes=new Map(),requests=[],toasts=[];
   const $=id=>{if(!nodes.has(id))nodes.set(id,new Element());return nodes.get(id);};
   let items=[],selected,poll,controlHandler,confirmHandler=async()=>true;
-  const context={console,$,esc:escapeHtml,document:{hidden:false},PlatformPermissions:{canUse:()=>true},
+  const context={console,$,workflowTime:String,esc:escapeHtml,document:{hidden:false},PlatformPermissions:{canUse:()=>true},
     showToast:(...args)=>toasts.push(args),setInterval:fn=>{poll=fn;},window:{addEventListener(){},workflowConfirm:(...args)=>confirmHandler(...args),
       workflowRequest:async(url,options)=>{requests.push({url,options});if(options?.method&&options.method!=='GET'){
           assert(controlHandler,'ordinary navigation must never submit a run');
@@ -88,13 +92,25 @@ async function checks(){
     else assert.doesNotMatch(html,/data-gw="(?:pause|resume)"/,name);
     const readOnly=tests.listState({...task,can_edit:false});
     assert.equal(readOnly.button,'查看详情',name);
-    if(tone!=='neutral'&&task.status!=='pausing'){
+    if(!['neutral','settled'].includes(tone)&&task.status!=='pausing'){
       assert.match(readOnly.hint,/请联系任务负责人处理/,name);
       assert.doesNotMatch(readOnly.hint,/重试|请开始|请完成/,name);
     }
     tests.renderList([{...task,can_edit:false}]);
     assert.doesNotMatch($('gw-task-list').innerHTML,/data-gw="(?:pause|resume)"/,'read-only controls hidden: '+name);
   }
+  tests.renderList([fixture({status:'confirmed',annotation:completeAnnotation,settlement:paid}),fixture({status:'confirmed',annotation:completeAnnotation})]);
+  assert.match($('gw-task-list').innerHTML,/gw-list-badge--settled/);
+  assert.match($('gw-task-list').innerHTML,/data-gw="settings"/,'settlement cannot disable task settings');
+  assert.match($('gw-list-summary').innerHTML,/可结算任务<strong>1/);
+  assert.match($('gw-list-summary').innerHTML,/已结算任务<strong>1/);
+  tests.renderList([fixture({status:'incomplete',run:run(),settlement:{...paid,changed:true}})]);
+  assert.match($('gw-task-list').innerHTML,/gw-list-badge--error/);
+  assert.match($('gw-task-list').innerHTML,/gw-settled-badge/);
+  assert.match($('gw-task-list').innerHTML,/结算后有修改/);
+  tests.renderList([fixture({settlement_unavailable:true})]);
+  assert.match($('gw-task-list').innerHTML,/结算状态暂时无法读取/);
+  assert.match($('gw-task-list').innerHTML,/任务设置/);
   const stopped=fixture({status:'incomplete',run:run()});
   const retrying={...stopped,status:'queued',run:run('quality','queued'),annotation_auto_error:'旧错误'};
   const recovered={...stopped,status:'confirmed',annotation:completeAnnotation,annotation_auto_error:'旧错误'};

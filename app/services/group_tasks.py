@@ -813,7 +813,24 @@ def confirm_task(task_id, version, login):
     return store.mutate("tasks", task_id, apply)
 
 
-def task_view(task: dict, login, *, summary=False, access=None) -> dict:
+def _paid_task_settlements(ledger=None):
+    """Display metadata only; annotation readiness and task documents never change."""
+    if ledger is None:
+        try:
+            ledger = store.read("ledger", "payouts") or {}
+        except (OSError, ValueError):
+            return {"__unavailable__": True}
+    result = {}
+    for batch in ledger.get("batches", {}).values():
+        if batch.get("status") != "paid":
+            continue
+        for task_id, frozen in batch.get("task_versions", {}).items():
+            result[task_id] = {"batch_id": batch["id"], "version": frozen["version"],
+                               "paid_at": batch["paid_at"], "paid_by": batch["paid_by"]}
+    return result
+
+
+def task_view(task: dict, login, *, summary=False, access=None, settlements=None) -> dict:
     from app.services.task_records import aggregate_players
     # Re-evaluate legacy saved checks under the current workflow without rewriting history.
     task = deepcopy(task)
@@ -862,6 +879,12 @@ def task_view(task: dict, login, *, summary=False, access=None) -> dict:
     else:
         status = "awaiting_confirmation"
     result["status"] = status
+    settlement_map = _paid_task_settlements() if settlements is None else settlements
+    if settlement_map.get("__unavailable__"):
+        result["settlement_unavailable"] = True
+    paid = settlement_map.get(task["id"])
+    if paid:
+        result["settlement"] = {**paid, "changed": paid["version"] != task["version"]}
     result["workflow"] = workflow_state(task)
     result["annotation"] = annotation_status(task)
     if (result.get("run") or {}).get("stage") == "quality":
@@ -889,7 +912,8 @@ def task_view(task: dict, login, *, summary=False, access=None) -> dict:
 def list_tasks(login, *, feature="annotate") -> list[dict]:
     require_permission(login, feature)
     access = record_scope(login)
-    result = [task_view(task, login, summary=True, access=access) for task in store.list_records("tasks") if not task.get("deleted_at") and access.can_read(task)]
+    settlements = _paid_task_settlements()
+    result = [task_view(task, login, summary=True, access=access, settlements=settlements) for task in store.list_records("tasks") if not task.get("deleted_at") and access.can_read(task)]
     result.sort(key=lambda item: item["created_at"], reverse=True)
     queue = sorted((item for item in store.list_records("tasks") if (item.get("run") or {}).get("status") == "queued"),
                    key=lambda item: (item["run"].get("schedule_at", item["run"]["queued_at"]), item["run"]["id"]))

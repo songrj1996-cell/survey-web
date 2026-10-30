@@ -270,3 +270,80 @@ class GroupWorkflowStorageTests(unittest.TestCase):
                 store._write(self.target, self.new)
         self.assertEqual(self.target.read_bytes(), self.old)
         self.assertEqual(list(self.root.glob('.save-*.tmp')), [])
+
+
+    def test_backed_mutation_keeps_exact_original_bytes_and_idempotent_retry(self):
+        import hashlib
+        with patch.object(config, 'GROUP_WORKFLOW_DATA_DIR', self.root/'workflow'):
+            original = {'batches': {'old': {'status': 'pending'}}, 'claims': {'task:old': 'old'}}
+            store.create('ledger', 'payouts', original)
+            path = self.root/'workflow'/'ledger'/'payouts.json'
+            raw = path.read_bytes()
+            def change(document):
+                document['batches']['old']['status'] = 'voided'
+                document['claims'].clear()
+                return document
+            result = store.mutate_with_backup('ledger', 'payouts', change)
+            backups = list((self.root/'workflow'/'backups'/'ledger'/'payouts').glob('*.json'))
+            self.assertEqual(len(backups), 1)
+            self.assertEqual(backups[0].read_bytes(), raw)
+            self.assertIn(hashlib.sha256(raw).hexdigest(), backups[0].name)
+            self.assertEqual(json.loads(backups[0].read_text('utf-8')), original)
+            self.assertEqual(store.read('ledger', 'payouts'), result)
+            store.mutate_with_backup('ledger', 'payouts', change)
+            self.assertEqual(len(list(backups[0].parent.glob('*.json'))), 1)
+
+    def test_corrupt_backup_and_failed_replace_keep_original_record(self):
+        with patch.object(config, 'GROUP_WORKFLOW_DATA_DIR', self.root/'workflow'):
+            original = {'status': 'pending', 'claims': ['preserved']}
+            store.create('ledger', 'payouts', original)
+            path = self.root/'workflow'/'ledger'/'payouts.json'
+            raw = path.read_bytes()
+            actual_read = Path.read_bytes
+            def read_bytes(candidate):
+                return b'{"corrupt":true}' if 'backups' in candidate.parts else actual_read(candidate)
+            with patch.object(Path, 'read_bytes', read_bytes):
+                with self.assertRaises(OSError):
+                    store.mutate_with_backup('ledger', 'payouts', lambda d: d.update(status='voided'))
+            self.assertEqual(path.read_bytes(), raw)
+            with patch.object(store, '_write', side_effect=OSError('synthetic full disk')):
+                with self.assertRaises(OSError):
+                    store.mutate_with_backup('ledger', 'payouts', lambda d: d.update(status='paid'))
+            self.assertEqual(path.read_bytes(), raw)
+            backups = list((self.root/'workflow'/'backups'/'ledger'/'payouts').glob('*.json'))
+            self.assertTrue(all(backup.read_bytes() == raw for backup in backups))
+
+
+    def test_long_windows_backup_path_is_shortened_and_verified_snapshot_is_reused(self):
+        import hashlib
+        suffix=Path('backups')/'ledger'/'payouts'/('f'*64+'.json')
+        width=max(1,252-len(str(self.root/'x'/suffix))+1)
+        directory=self.root/('x'*width)
+        with patch.object(config,'GROUP_WORKFLOW_DATA_DIR',directory):
+            original={'status':'pending','claims':['preserved']}
+            store.create('ledger','payouts',original)
+            path=directory/'ledger'/'payouts.json'
+            raw=path.read_bytes();digest=hashlib.sha256(raw).hexdigest()
+            backup=directory/'backups'/'ledger'/'payouts'/(digest+'.json')
+            self.assertLessEqual(len(str(backup)),252)
+            self.assertGreater(len(str(backup.parent/('f'*32+'-'+digest+'.json'))),260)
+            with patch.object(store,'_write',side_effect=FileNotFoundError('synthetic save failure')):
+                with self.assertRaises(FileNotFoundError):
+                    store.mutate_with_backup('ledger','payouts',lambda d:d.update(status='paid'))
+            self.assertEqual(path.read_bytes(),raw)
+            self.assertEqual(backup.read_bytes(),raw)
+            saved=store.mutate_with_backup('ledger','payouts',lambda d:(d.update(status='paid') or d))
+            self.assertEqual(saved['status'],'paid')
+            self.assertEqual(len(list(backup.parent.glob('*.json'))),1,'retry reuses the fully verified snapshot')
+
+    def test_existing_corrupt_content_addressed_backup_blocks_mutation(self):
+        import hashlib
+        directory=self.root/'workflow'
+        with patch.object(config,'GROUP_WORKFLOW_DATA_DIR',directory):
+            store.create('ledger','payouts',{'status':'pending'})
+            path=directory/'ledger'/'payouts.json';raw=path.read_bytes()
+            backup=directory/'backups'/'ledger'/'payouts'/(hashlib.sha256(raw).hexdigest()+'.json')
+            backup.parent.mkdir(parents=True);backup.write_text('{"corrupt":true}',encoding='utf-8')
+            with self.assertRaises(OSError):
+                store.mutate_with_backup('ledger','payouts',lambda d:d.update(status='paid'))
+            self.assertEqual(path.read_bytes(),raw)

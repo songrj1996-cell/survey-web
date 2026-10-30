@@ -149,6 +149,40 @@ def mutate(kind: str, identifier: str, change: Callable[[dict], object], *, defa
         return deepcopy(result)
 
 
+def _verified_backup(path: Path, kind: str, identifier: str) -> None:
+    """Keep an independent, byte-verified recovery copy before replacing a record."""
+    payload = path.read_bytes()
+    digest = hashlib.sha256(payload).hexdigest()
+    directory = _root() / "backups" / kind / _identifier(identifier)
+    directory.mkdir(parents=True, exist_ok=True)
+    backup = directory / f"{digest}.json"
+    try:
+        with backup.open("xb") as output:
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+    except FileExistsError:
+        pass  # A retry can reuse the same content-addressed snapshot after full verification.
+    recovered = backup.read_bytes()
+    if recovered != payload or hashlib.sha256(recovered).hexdigest() != digest or _read(backup) != _read(path):
+        raise OSError("备份校验失败，原记录未修改")
+
+
+def mutate_with_backup(kind: str, identifier: str, change: Callable[[dict], object]):
+    """Validate a candidate, back up the old record, then atomically replace it."""
+    with locked():
+        path = _path(kind, identifier)
+        original = _read(path)
+        if original is None:
+            raise FileNotFoundError(identifier)
+        document = deepcopy(original)
+        result = change(document)
+        if document != original:
+            _verified_backup(path, kind, identifier)
+            _write(path, document)
+        return deepcopy(result)
+
+
 def save_blob(identifier: str, content: bytes) -> str:
     """Immutable originals. Duplicate identical saves are harmless."""
     with locked():

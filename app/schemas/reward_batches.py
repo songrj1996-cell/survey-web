@@ -1,6 +1,6 @@
 """Selections are explicit; previews do not reserve or spend a source."""
 from datetime import date
-from pydantic import BaseModel, ConfigDict, Field, StrictInt
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt
 
 
 class OtherRewardCreate(BaseModel):
@@ -30,3 +30,9 @@ class BatchResolution(BaseModel):
 class BatchGenerate(BaseModel):
     expected_revision: StrictInt = Field(ge=1)
     idempotency_key: str = Field(min_length=16, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
+
+
+class BatchAction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_revision: StrictInt = Field(ge=1)
+    confirmed: StrictBool

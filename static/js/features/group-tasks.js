@@ -20,6 +20,9 @@ window.GroupTasks = (() => {
   let selectedResponse = '', latestList = [], clipboardPreview = null, configuredGroups = [], aiChoices = null;
   const maxStep = () => Math.min(4, task?.workflow?.max_step || 1);
   async function fetchGroups() { configuredGroups=(await api('/api/group-tasks/groups')).groups||[]; }
+  const settlementBadge=t=>t.settlement?'<span class="workflow-badge gw-settled-badge">已结算</span>':'';
+  const settlementNote=t=>t.settlement?`V${t.settlement.version} 已由 ${h(t.settlement.paid_by)} 于 ${h(workflowTime(t.settlement.paid_at))} 确认发放${t.settlement.changed?'；结算后有修改，当前差异尚未确认发放':''}`:'';
+  const settlementWarning=t=>t.settlement_unavailable?'<small class="workflow-muted">结算状态暂时无法读取，请稍后刷新核对。</small>':'';
   const taskMeta = t => `${t.rules.group_name ? h(t.rules.group_name)+' · ' : ''}${h(t.owner_name)} · ${statusNames[t.status]}`;
   const changedFields = new Set();
   let ruleSave = null, ruleSaveNotice = null;
@@ -63,6 +66,7 @@ window.GroupTasks = (() => {
     // Current completeness/phase wins over errors left by an earlier run.
     if(a.phase==='ai_review'||t.status==='awaiting_ai_confirmation')return state('待确认 AI 作答','warning','确认 AI 作答','请完成人工复核，才能继续后续流程。',true);
     if(a.complete||['annotation_done','awaiting_confirmation','confirmed'].includes(t.status)){
+      if(t.settlement)return state('已结算','settled','查看结果',settlementNote(t));
       if(t.status==='confirmed')return state('可结算','neutral','查看结果','可进入任务记录核对并复制结果。');
       if(t.status==='annotation_done')return state('标注完成','neutral','查看结果','本任务所选标注已完成。');
       return state('待确认','warning','查看结果','请进入任务记录处理待办事项。',true);
@@ -114,11 +118,11 @@ window.GroupTasks = (() => {
   }
   function renderList(items) {
     latestList=items;
-    $('gw-list-summary').innerHTML=[['标注中',items.filter(t=>['running','pausing'].includes(t.status)).length],['排队中',items.filter(t=>t.status==='queued').length],['待处理任务',items.filter(t=>!['confirmed','annotation_done'].includes(t.status)).length],['可结算任务',items.filter(t=>t.status==='confirmed').length]].map(([label,value])=>`<span>${label}<strong>${value}</strong></span>`).join('');
+    $('gw-list-summary').innerHTML=[['标注中',items.filter(t=>['running','pausing'].includes(t.status)).length],['排队中',items.filter(t=>t.status==='queued').length],['待处理任务',items.filter(t=>!['confirmed','annotation_done'].includes(t.status)).length],['可结算任务',items.filter(t=>t.status==='confirmed'&&!t.settlement).length],['已结算任务',items.filter(t=>t.settlement).length]].map(([label,value])=>`<span>${label}<strong>${value}</strong></span>`).join('');
     const filtered = items.filter(t => `${t.rules.name} ${t.owner_name}`.toLowerCase().includes(listFilter.toLowerCase())).sort((a,b)=>Number(['running','queued','pausing'].includes(b.status))-Number(['running','queued','pausing'].includes(a.status)));
     $('gw-task-list').innerHTML = filtered.length ? `<div class="workflow-table-wrap"><table class="workflow-table"><thead><tr><th>任务</th><th>负责人</th><th>发奖日期</th><th>状态与进度</th><th></th></tr></thead><tbody>${filtered.map(t=>{
       const s=listState(t);
-      return `<tr><td><strong>${h(t.rules.name||'未命名任务')}</strong><small>${t.rules.group_name?h(t.rules.group_name)+' · ':''}${t.summary.player_count} 位玩家 · ${t.summary.feedback_count} 份反馈</small></td><td>${h(t.owner_name)}</td><td>${h(t.rules.payout_date||'待确认')}</td><td class="gw-list-status"><span class="workflow-badge gw-list-badge--${s.tone}">${h(s.label)}</span>${progressBar(t)}<small>${h(progress(t))}</small><small class="gw-list-hint gw-list-hint--${s.tone}">${h(s.hint)}</small></td><td>${btn('view',s.button,false,false,`data-id="${h(t.id)}" data-result-ready="${Boolean(t.annotation?.complete)}"`)}${runControls(t)}${t.can_edit?btn('settings','任务设置',false,false,`data-id="${t.id}"`):''}</td></tr>`;
+      return `<tr><td><strong>${h(t.rules.name||'未命名任务')}</strong><small>${t.rules.group_name?h(t.rules.group_name)+' · ':''}${t.summary.player_count} 位玩家 · ${t.summary.feedback_count} 份反馈</small></td><td>${h(t.owner_name)}</td><td>${h(t.rules.payout_date||'待确认')}</td><td class="gw-list-status"><span class="workflow-badge gw-list-badge--${s.tone}">${h(s.label)}</span>${t.settlement&&s.label!=='已结算'?settlementBadge(t):''}${progressBar(t)}<small>${h(progress(t))}</small><small class="gw-list-hint gw-list-hint--${s.tone}">${h(s.hint)}</small>${settlementWarning(t)}${t.settlement&&s.label!=='已结算'?`<small>${h(settlementNote(t))}</small>`:''}</td><td>${btn('view',s.button,false,false,`data-id="${h(t.id)}" data-result-ready="${Boolean(t.annotation?.complete)}"`)}${runControls(t)}${t.can_edit?btn('settings','任务设置',false,false,`data-id="${t.id}"`):''}</td></tr>`;
     }).join('')}</tbody></table></div>` : '<div class="workflow-empty">尚无匹配任务。新建任务后，依次设置规则、上传核查、标注与计奖。</div>';
   }
   async function load(id) { await fetchGroups(); task=await api(`/api/group-tasks/${id}`); render(); }
@@ -127,7 +131,7 @@ window.GroupTasks = (() => {
     const annotationView=!settingsView&&step>=2&&step<=4;
     const stageResume=annotationView&&step>=3&&task.status==='paused'&&['ai_progress','quality_progress'].includes(task.annotation?.phase);
     root.classList.toggle('workflow-annotation',annotationView);
-    root.innerHTML = `<div class="workflow-heading gw-task-heading"><div class="gw-task-title"><h1 class="panel__title" title="${h(task.rules.name||'新任务')}">${h(task.rules.name||'新任务')}</h1><p id="gw-task-meta" class="panel__desc">${taskMeta(task)}</p></div><div class="gw-task-actions"><span id="gw-progress" class="workflow-badge">${h(progress(task))}</span>${stageResume||(settingsView&&task.status==='paused')?'':runControls(task)}${annotationView?'':btn('back','← 返回任务列表')}</div></div>
+    root.innerHTML = `<div class="workflow-heading gw-task-heading"><div class="gw-task-title"><h1 class="panel__title" title="${h(task.rules.name||'新任务')}">${h(task.rules.name||'新任务')}</h1>${settlementBadge(task)}${settlementWarning(task)}${task.settlement?`<p class="workflow-muted">${h(settlementNote(task))}</p>`:''}<p id="gw-task-meta" class="panel__desc">${taskMeta(task)}</p></div><div class="gw-task-actions"><span id="gw-progress" class="workflow-badge">${h(progress(task))}</span>${stageResume||(settingsView&&task.status==='paused')?'':runControls(task)}${annotationView?'':btn('back','← 返回任务列表')}</div></div>
       <div id="gw-annotation-navigation" class="gw-annotation-navigation" hidden></div>
       ${!task.can_edit?'<p class="workflow-notice">当前为只读查看，标注与发奖结果由任务负责人维护。</p>':''}
       ${busy()?`<p class="workflow-notice">${task.status==='paused'?(settingsView?'任务已暂停，可返回任务列表继续。':'任务已暂停，点击“继续任务”后恢复处理。'):task.status==='pausing'?'暂停中，当前已开始的反馈保存后暂停；期间仍可能调用模型。':'正在排队或标注。'}暂时不能修改本任务的文件、题目选择和标注规则；可以查看进度或处理其他任务。</p>`:''}
