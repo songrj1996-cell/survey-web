@@ -36,7 +36,111 @@ leaves[2].checked=false;leaves[2].onchange();assert.equal(parent.indeterminate,t
 assert.deepEqual(Array.from(permissions.selected(editor)),['annotate','reward']);
 permissions.tree(editor,[],true);assert.equal(editor.querySelectorAll('[data-permission]').every(x=>x.disabled),true);
 
+// These tests exercise the real delegated handlers with deferred in-memory responses.
+async function verifyRuleEditSafety() {
+  const clone=value=>JSON.parse(JSON.stringify(value));
+  const deferred=()=>{let resolve,reject;const promise=new Promise((yes,no)=>{resolve=yes;reject=no;});return{promise,resolve,reject};};
+  async function fixture(saved={}) {
+    const state={requests:[],toasts:[],confirmations:0,windowEvents:{},poll:null,gate:null,failure:null,
+      task:{id:'synthetic',version:1,status:'draft',can_edit:true,owner_name:'合成操作者',workflow:{max_step:1},
+        summary:{complete_count:0,feedback_count:0},annotation:{complete:false},
+        rules:{name:'',announcement:'合成公告',payout_date:'2026-10-30',base_reward:null,excellent_reward:null,
+          requires_count:false,min_count:null,allow_repeat:false,ai_detect:false,group_source_ids:[]},...saved},
+      suggestions:{name:{value:'识别旧名',evidence:'合成公告'},base_reward:{value:100,evidence:'100'},
+        requires_count:{value:true,evidence:'要求次数'},allow_repeat:{value:true,evidence:'允许重复'}}};
+    const nodes=new Map(),$=id=>{if(!nodes.has(id))nodes.set(id,new Element());return nodes.get(id);};
+    const panel=$('group-tasks-panel'),fields=new Map(Object.keys(state.task.rules).filter(key=>key!=='group_source_ids').map(key=>{
+      const field=new Element('input');field.dataset.rule=key;
+      field.matches=selector=>selector==='input,textarea,select';return[key,field];
+    })),hints=new Map(),buttons=new Map();
+    const readonly=new Element('input');readonly.disabled=true;
+    const button=name=>{if(!buttons.has(name)){const el=new Element('button');el.dataset.gw=name;buttons.set(name,el);}return buttons.get(name);};
+    panel.querySelector=selector=>{
+      const rule=selector.match(/data-rule="([^"]+)"/);if(rule)return fields.get(rule[1]);
+      const hint=selector.match(/data-suggestion="([^"]+)"/);if(hint){if(!hints.has(hint[1]))hints.set(hint[1],new Element());return hints.get(hint[1]);}return null;
+    };
+    panel.querySelectorAll=selector=>selector==='[data-rule]'?[...fields.values()]:
+      selector==='input,textarea,select,button'?[...fields.values(),...buttons.values(),readonly]:[];
+    const ui={window:{addEventListener:(name,fn)=>state.windowEvents[name]=fn,
+      workflowConfirm:async()=>{state.confirmations++;return false;},workflowRequest:async(url,options={})=>{
+        state.requests.push({url,method:options.method||'GET',body:options.body?clone(options.body):null});
+        if(url.endsWith('/groups'))return{groups:[]};
+        if(url.endsWith('/announcement'))return{suggestions:clone(state.suggestions)};
+        if(url.endsWith('/rules')||url.endsWith('/settings')){
+          if(state.gate){state.gate.started.resolve();await state.gate.response.promise;}
+          if(state.failure)throw state.failure;
+          state.task={...state.task,version:state.task.version+1,rules:url.endsWith('/rules')?clone(options.body.rules):
+            {...state.task.rules,...clone(options.body)}};
+          delete state.task.rules.expected_version;return clone(state.task);
+        }
+        return clone(state.task);
+      }},document:{hidden:false,createElement:tag=>new Element(tag)},$,esc:String,
+      workflowTime:context.window.workflowTime,showToast:(...args)=>state.toasts.push(args),
+      PlatformPermissions:permissions,setInterval:fn=>state.poll=fn,console};
+    vm.createContext(ui);vm.runInContext(fs.readFileSync(path.join(root,'static/js/features/group-tasks.js'),'utf8'),ui);
+    const click=async(name,extra={})=>{const el=button(name);Object.assign(el.dataset,extra);
+      await panel.listeners.click({target:{closest:selector=>selector==='[data-gw]'?el:null}});};
+    const syncFields=()=>{for(const[key,field]of fields)field.value=String(state.task.rules[key]??'');};
+    const input=(key,value)=>{const field=fields.get(key);assert.equal(field.disabled,false,'editing requires an unlocked field');field.value=String(value);panel.listeners.input({target:field});};
+    const hold=()=>{state.gate={started:deferred(),response:deferred()};return state.gate;};
+    syncFields();await click('view',{id:'synthetic'});
+    return{state,ui,fields,hints,buttons,readonly,$,click,input,hold,syncFields};
+  }
+  for(const action of ['save-rules','save-settings']) {
+    const f=await fixture();if(action==='save-settings')await f.click('settings',{id:'synthetic'});
+    f.input('name','手改新名');f.input('base_reward',0);f.input('excellent_reward',0);
+    f.buttons.set('extract',new Element('button'));f.buttons.get('extract').dataset.gw='extract';
+    const gate=f.hold(),saving=f.click(action);await gate.started.promise;
+    assert([...f.fields.values()].every(field=>field.disabled),'every rule field is locked before awaiting save');
+    assert.equal(f.buttons.get('extract').disabled,true);
+    assert.match(f.$('gw-rule-save-status').textContent,/正在保存.*UTC\+8/);
+    const count=f.state.requests.length;
+    await f.click(action);await f.click('back');await f.click('extract');await f.ui.window.GroupTasks.list();await f.ui.window.GroupTasks.open({home:true});
+    assert.equal(f.state.requests.length,count,'pending save prevents duplicate requests and switching');
+    assert.equal(await f.ui.window.groupWorkflowMayLeave(),false);
+    gate.response.resolve();await saving;f.state.gate=null;
+    assert.equal(f.state.task.rules.name,'手改新名');assert.equal(f.state.task.rules.base_reward,0);
+    assert([...f.fields.values()].every(field=>!field.disabled),'success unlocks controls');
+    assert.equal(f.readonly.disabled,true,'pre-existing disabled state is preserved');
+    assert.equal(f.ui.window.groupWorkflowHasDraft(),false);
+    assert.match(f.$('gw-rule-save-status').textContent,/已保存.*UTC\+8/);
+    for(const status of [409,422,500,null]) {
+      f.input('name','失败时保留原文');f.state.failure=Object.assign(new Error(status?'合成保存失败':'合成网络超时'),status?{status}:{});
+      const failures=f.state.toasts.length;await f.click(action);
+      assert.equal(f.fields.get('name').value,'失败时保留原文');assert.equal(f.fields.get('name').disabled,false);
+      assert.equal(f.ui.window.groupWorkflowHasDraft(),true);assert.equal(f.readonly.disabled,true);
+      const notice=f.$('gw-rule-save-status').textContent;
+      assert.match(notice,/未能确认保存成功.*填写内容已保留.*UTC\+8/);
+      assert(notice.includes('/api/group-tasks/synthetic/'));if(status)assert(notice.includes('HTTP '+status));
+      assert(f.state.toasts.slice(failures).every(([,type])=>type==='error'));
+    }
+    f.state.failure=null;await f.click(action);assert.equal(f.ui.window.groupWorkflowHasDraft(),false,'successful retry clears draft');
+  }
+  const initial=await fixture();await initial.click('extract');
+  assert.equal(initial.fields.get('name').value,'识别旧名');assert.equal(initial.fields.get('requires_count').value,'true','untouched false defaults can be prefilled initially');
+  initial.input('name','已保存手工名');initial.input('base_reward',0);initial.input('requires_count','false');initial.input('allow_repeat','false');
+  await initial.click('save-rules'); // Partial configuration: excellent_reward remains null.
+  const savedManualRules=clone(initial.state.task);
+  for(const reopen of [false,true]) {
+    const f=reopen?await fixture(savedManualRules):initial;
+    f.syncFields();await f.click('extract');
+    assert.equal(f.fields.get('name').value,'已保存手工名');assert.equal(f.fields.get('base_reward').value,'0');
+    assert.equal(f.fields.get('requires_count').value,'false');assert.equal(f.fields.get('allow_repeat').value,'false');
+    assert.match(f.$('gw-extraction-status').textContent,/原值已保留.*采用后请保存.*UTC\+8/);
+    f.hints.get('name').children.at(-1).onclick();assert.equal(f.fields.get('name').value,'识别旧名');
+    await f.click('save-rules');assert.equal(f.state.task.rules.name,'识别旧名','adopted suggestion persists only after explicit save');
+  }
+  const saved=await fixture({version:2,rules:{...initial.state.task.rules,excellent_reward:0}});
+  saved.state.suggestions={excellent_reward:{value:20,evidence:'优秀20'}};await saved.click('extract');
+  assert.equal(saved.fields.get('excellent_reward').value,'0','saved zero is protected');
+  const blank=await fixture({version:2,rules:{...initial.state.task.rules,excellent_reward:null}});
+  blank.state.suggestions={excellent_reward:{value:20,evidence:'优秀20'}};await blank.click('extract');
+  assert.equal(blank.fields.get('excellent_reward').value,'20','an unfilled saved field is still prefilled');
+  console.log('Rule edit safety passed: both save locks, duplicate/switch prevention, success/retry, HTTP 409/422/500 and timeout recovery, partial-save/reopen protection, explicit adoption, zero/false and first extraction.');
+}
+
 (async()=>{
+  await verifyRuleEditSafety();
   response={ok:false,status:409,json:async()=>({detail:{message:'名单发生变化',preview:{id:'review-again'}}})};
   await assert.rejects(context.window.workflowRequest('/synthetic'),err=>err.status===409&&err.detail.preview.id==='review-again');
   const nodes=new Map();const $=id=>{if(!nodes.has(id))nodes.set(id,new Element());return nodes.get(id);};

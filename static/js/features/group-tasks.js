@@ -22,16 +22,17 @@ window.GroupTasks = (() => {
   async function fetchGroups() { configuredGroups=(await api('/api/group-tasks/groups')).groups||[]; }
   const taskMeta = t => `${t.rules.group_name ? h(t.rules.group_name)+' · ' : ''}${h(t.owner_name)} · ${statusNames[t.status]}`;
   const changedFields = new Set();
+  let ruleSave = null, ruleSaveNotice = null;
   const h = value => esc(String(value ?? ''));
   const btn = (action, text, primary=false, disabled=false, extra='') => `<button type="button" class="btn ${primary?'btn--primary':'btn--ghost'}" data-gw="${action}" ${disabled?'disabled':''} ${extra}>${text}</button>`;
   const busy = () => task && ['queued','running'].includes(task.status);
-  const editable = () => task?.can_edit && !busy();
+  const editable = () => task?.can_edit && !busy() && !ruleSave;
   const disabled = () => editable() ? '' : 'disabled';
   const error = e => { if (!e.scopeChanged) showToast(e.message, 'error', 6500); };
-  async function mayLeave() { if(recordBusy){showToast('正在处理任务记录，请等待当前操作结束','error');return false;} if (!dirty) return true; if (!await window.workflowConfirm('当前任务有未保存的填写。继续编辑会保留原文；放弃后才会切换页面。')) return false; dirty=false; aiChoices=null; changedFields.clear(); return true; }
+  async function mayLeave() { if(ruleSave){showToast('正在保存任务信息，请等待保存结束','error');return false;} if(recordBusy){showToast('正在处理任务记录，请等待当前操作结束','error');return false;} if (!dirty) return true; if (!await window.workflowConfirm('当前任务有未保存的填写。继续编辑会保留原文；放弃后才会切换页面。')) return false; dirty=false; aiChoices=null; changedFields.clear(); return true; }
   window.groupWorkflowMayLeave = mayLeave;
-  window.groupWorkflowHasDraft = () => dirty;
-  window.addEventListener('beforeunload', event => { if (dirty) { event.preventDefault(); event.returnValue = ''; } });
+  window.groupWorkflowHasDraft = () => dirty || Boolean(ruleSave);
+  window.addEventListener('beforeunload', event => { if (dirty || ruleSave) { event.preventDefault(); event.returnValue = ''; } });
   function progress(t) {
     const run = t.run;
     if (!run) return `${t.summary.complete_count} / ${t.summary.feedback_count} 份结果完整`;
@@ -84,6 +85,7 @@ window.GroupTasks = (() => {
     return state(statusNames[t.status]||'状态待确认','warning','查看并处理','请进入查看任务当前状态。',true);
   }
   async function open({home=false}={}) {
+    if(ruleSave)return;
     if(home){
       if(!await mayLeave())return;
       task=null;step=1;settingsView=false;uploadView=false;resultTab='quality';recordNotice='';selectedResponse='';listFilter='';groupFilter='';qualityFilter='';showAllInputs=false;aiChoices=null;clipboardPreview=null;changedFields.clear();
@@ -91,6 +93,7 @@ window.GroupTasks = (() => {
     root.classList.remove('panel--hidden');if(dirty)return;if(task)await load(task.id);else await list();
   }
   async function list() {
+    if(ruleSave)return;
     try {
       const data = await api('/api/group-tasks'); task = null; settingsView=false; resultTab='quality'; recordNotice=''; root.classList.remove('workflow-annotation');
       root.innerHTML = `<div class="workflow-heading"><div><h1 class="panel__title">质量标注</h1><p class="panel__desc">从任务规则到反馈质量与奖励，记录和进度随时可继续。</p></div>${btn('new','新建任务',true,!PlatformPermissions.canUse('annotate'))}</div>
@@ -117,8 +120,9 @@ window.GroupTasks = (() => {
       <div id="gw-annotation-navigation" class="gw-annotation-navigation" hidden></div>
       ${!task.can_edit?'<p class="workflow-notice">当前为只读查看，标注与发奖结果由任务负责人维护。</p>':''}
       ${busy()?'<p class="workflow-notice">正在标注，暂时不能修改本任务的文件、题目选择和标注规则；可以查看进度或处理其他任务。</p>':''}
-      <div id="gw-progress-track" hidden></div><div id="gw-update-hint" hidden class="workflow-notice">任务信息已更新。${btn('reload','查看最新结果')}</div><div id="gw-content"></div>`;
+      <div id="gw-progress-track" hidden></div><div id="gw-update-hint" hidden class="workflow-notice">任务信息已更新。${btn('reload','查看最新结果')}</div><p id="gw-rule-save-status" class="workflow-muted" role="status" aria-live="polite" hidden></p><div id="gw-content"></div>`;
     if(settingsView)renderSettings();else [null,renderRules,renderInputs,renderAI,renderJudgments][step]();
+    if(ruleSaveNotice?.taskId===task.id)showRuleSaveNotice(ruleSaveNotice.message,ruleSaveNotice.failed);
   }
   function ruleField(key,label,type='text',hint='') {
     const required=['name','payout_date','base_reward','excellent_reward','min_count'].includes(key);
@@ -1023,6 +1027,38 @@ for (const filterId of [
 
 }
 
+  function showRuleSaveNotice(message, failed=false) {
+    ruleSaveNotice={taskId:task.id,message,failed};
+    const notice=$('gw-rule-save-status');
+    if(notice){notice.textContent=message;notice.hidden=false;notice.classList.toggle('workflow-error',failed);}
+  }
+  async function saveRuleForm(path, body) {
+    if(ruleSave)return;
+    const pending={taskId:task.id,epoch:scopeEpoch},url=`/api/group-tasks/${task.id}/${path}`;
+    const controls=[...root.querySelectorAll('input,textarea,select,button')].map(el=>[el,el.disabled]);
+    const payload={expected_version:task.version,...body};
+    ruleSave=pending;
+    controls.forEach(([el])=>el.disabled=true);
+    showRuleSaveNotice('正在保存任务信息，请等待保存结束 · '+workflowTime(new Date().toISOString()));
+    try {
+      const value=await api(url,{method:'PUT',body:payload});
+      if(ruleSave!==pending||task?.id!==pending.taskId)return;
+      task=value.task||value;aiChoices=null;dirty=false;changedFields.clear();ruleSave=null;
+      if(path==='rules')step=Math.min(2,maxStep());
+      const message=path==='settings'?'任务设置已保存，标注结果保持不变':maxStep()<2?'规则已保存，请补齐任务名称、日期、奖励和次数要求':'任务规则已保存';
+      ruleSaveNotice={taskId:task.id,message:message+' · '+workflowTime(new Date().toISOString()),failed:false};
+      render();showToast(ruleSaveNotice.message,'success');
+    } catch(e) {
+      if(!e.scopeChanged&&scopeEpoch===pending.epoch&&task?.id===pending.taskId){
+        const recovery=e.status===409?'填写内容已保留，请先核对最新任务后再保存':'填写内容已保留，请核对后重试';
+        const message='未能确认保存成功：'+e.message+(e.status?'（HTTP '+e.status+'）':'')+'；请求：'+url+'；'+recovery+' · '+workflowTime(new Date().toISOString());
+        showRuleSaveNotice(message,true);showToast(message,'error',6500);
+      }
+    } finally {
+      if(ruleSave===pending)ruleSave=null;
+      controls.forEach(([el,wasDisabled])=>{if(el.isConnected)el.disabled=wasDisabled;});
+    }
+  }
   async function mutate(path,body,method='POST') { const value=await api(`/api/group-tasks/${task.id}/${path}`,{method,body:{expected_version:task.version,...body}}); task=value.task||value; aiChoices=null; dirty=false;changedFields.clear();render();return value; }
   async function action(button) {
     const name=button.dataset.gw;
@@ -1033,7 +1069,7 @@ for (const filterId of [
       const body={};root.querySelectorAll('[data-rule]').forEach(el=>{body[el.dataset.rule]=['base_reward','excellent_reward'].includes(el.dataset.rule)?el.value===''?null:Number(el.value):el.value;});
       body.group_source_ids=selectedGroupIds();
       if(!body.name.trim()||!body.payout_date||body.base_reward===null||body.excellent_reward===null)throw new Error('请补齐任务名称、发奖日期和两项奖励金额（允许 0）');
-      await mutate('settings',body,'PUT');showToast('任务设置已保存，标注结果保持不变','success');return;
+      await saveRuleForm('settings',body);return;
     }
     if(name==='delete-task'){
       if(!await window.workflowConfirm(`确认删除“${task.rules.name||'未命名任务'}”及其全部标注记录？删除后将不能再用于新的发奖批次；已生成的历史批次保留。`,'删除任务'))return;
@@ -1072,22 +1108,26 @@ for (const filterId of [
     if(name==='save-rules') {
       const rules={...task.rules};root.querySelectorAll('[data-rule]').forEach(el=>{const key=el.dataset.rule;rules[key]=['requires_count','allow_repeat','ai_detect'].includes(key)?el.value==='true':['base_reward','excellent_reward','min_count'].includes(key)?el.value===''?null:Number(el.value):key==='payout_date'?el.value||null:el.value;});
       rules.group_source_ids=selectedGroupIds();
-      await mutate('rules',{rules},'PUT');step=Math.min(2,maxStep());render();showToast(maxStep()<2?'规则已保存，请补齐任务名称、日期、奖励和次数要求':'任务规则已保存',maxStep()<2?'error':'success');return;
+      await saveRuleForm('rules',{rules});return;
     }
     if(name==='extract') {
       const taskId=task.id,status=$('gw-extraction-status');status.textContent='识别中…';status.dataset.state='running';
       try {
       const result=await api('/api/group-tasks/announcement',{method:'POST',body:{announcement:root.querySelector('[data-rule="announcement"]').value}});
       if(task?.id!==taskId||!status.isConnected)return;
+      if(ruleSave){status.dataset.state='success';status.textContent='正在保存，本次识别建议未应用；保存后可重新识别';return;}
+      const hasSavedRules=task.version>1||task.rules_initialized||Boolean(task.rules.name?.trim());
+      let conflicts=0;
       Object.entries(result.suggestions).forEach(([key,item])=>{
         const field=root.querySelector(`[data-rule="${key}"]`),hint=root.querySelector(`[data-suggestion="${key}"]`); if(!field)return;
-        if(changedFields.has(key)&&String(item.value)!==field.value){if(hint){hint.textContent=`新识别值：${item.value}。`;const adopt=document.createElement('button');adopt.type='button';adopt.className='btn btn--ghost btn--sm';adopt.textContent='采用识别值';adopt.onclick=()=>{field.value=String(item.value);dirty=true;hint.textContent='已采用识别值，请保存规则';root.querySelector('[data-rule="requires_count"]').onchange();};hint.append(adopt);}}
+        const saved=task.rules[key],protectSaved=hasSavedRules&&saved!==null&&saved!==undefined&&String(saved).trim()!=='';
+        if((changedFields.has(key)||protectSaved)&&String(item.value)!==field.value){conflicts++;if(hint){hint.textContent=`原值已保留；新识别建议：${item.value}。`;const adopt=document.createElement('button');adopt.type='button';adopt.className='btn btn--ghost btn--sm';adopt.textContent='采用识别值';adopt.onclick=()=>{if(ruleSave)return;field.value=String(item.value);dirty=true;changedFields.add(key);updateFieldState(field);hint.textContent='已采用识别值，请保存规则';root.querySelector('[data-rule="requires_count"]').onchange();};hint.append(adopt);}}
         else {field.value=String(item.value); if(hint)hint.textContent=`识别依据：${item.evidence}`;dirty=true;}
       });
       root.querySelector('[data-rule="requires_count"]').onchange();
       root.querySelectorAll('[data-rule]').forEach(updateFieldState);
       const missing=[...root.querySelectorAll('input[required]')].filter(el=>!el.closest('label').hidden&&el.value.trim()==='');
-      status.dataset.state='success';status.textContent=missing.length?'部分识别成功，请补齐标出的必填项':'识别成功，请核对下方规则';
+      status.dataset.state='success';status.textContent=(conflicts?`识别完成，${conflicts} 项建议与现有规则不同，原值已保留；采用后请保存。`:'识别成功，请核对下方规则。')+(missing.length?'请补齐标出的必填项。':'')+' · '+workflowTime(new Date().toISOString());
       }catch(e){if(status.isConnected){status.dataset.state='error';status.textContent='识别失败：'+e.message+'；可重试或手动填写';}throw e;}return;
     }
     if(name==='upload') {const file=$('gw-upload').files[0];if(!file)throw new Error('请先选择反馈文件');if(task.feedback.length)throw new Error('该任务已有原始反馈，反馈变动请新建任务');const form=new FormData();form.append('file',file);form.append('expected_version',String(task.version));task=await api(`/api/group-tasks/${task.id}/upload`,{method:'POST',body:form});dirty=false;render();return;}
@@ -1139,7 +1179,7 @@ for (const filterId of [
       }
       return;
     }
-    const button=e.target.closest('[data-gw]');if(!button||button.disabled)return;button.disabled=true;requestBusy++;try{await action(button);}catch(err){error(err);}finally{requestBusy--;if(button.isConnected)button.disabled=false;}
+    const button=e.target.closest('[data-gw]');if(!button||button.disabled||ruleSave)return;button.disabled=true;requestBusy++;try{await action(button);}catch(err){error(err);}finally{requestBusy--;if(button.isConnected)button.disabled=false;}
   });
   setInterval(async()=>{
     if(pollBusy||requestBusy||root.classList.contains('panel--hidden')||document.hidden)return;
@@ -1159,7 +1199,7 @@ for (const filterId of [
     }catch{}finally{pollBusy=false;}
   },3000);
   window.addEventListener('group-management-scope-changed', () => {
-    scopeEpoch++; task=null; dirty=false; settingsView=false; resultTab='quality';recordNotice=''; aiChoices=null; clipboardPreview=null;
+    scopeEpoch++; task=null; dirty=false; settingsView=false; resultTab='quality';recordNotice=''; aiChoices=null; clipboardPreview=null;ruleSave=null;ruleSaveNotice=null;
     changedFields.clear(); latestList=[]; step=1;
     Object.assign(annState, {headers:[], headersZh:[], openTextCols:[], aiResults:[], reviewAiResults:[],
       qualityResults:[], qualityCount:0, aiReviewedIds:new Set(), confirmedAiIds:new Set(),
