@@ -32,6 +32,30 @@ class TaskRecordsTests(WorkflowCase):
         self.assertEqual(task['feedback'][0]['quality'], original['quality'])
         self.assertEqual(task['players'][0]['total'], 200)
 
+    def test_unmatched_excluded_player_does_not_enter_clipboard(self):
+        from test_group_tasks import entry, snapshot
+        from app.schemas.group_tasks import FeedbackCorrection
+        from app.storage import group_workflow as store
+        task = self.make_task(labels=('优秀反馈', '有效反馈'))
+        other = entry('008123456789', '1234567(2345)', 'group_b')
+        def seed(current):
+            current['feedback'][1]['cells'][0] = other['player_id']
+            current['roster_snapshot'] = snapshot([other])
+        store.mutate('tasks', task['id'], seed)
+        task = tasks.correct_feedback(task['id'], task['feedback'][0]['id'], FeedbackCorrection(
+            expected_version=task['version'], reward_excluded=True), LOGIN)
+        task = tasks.confirm_task(task['id'], task['version'], LOGIN)
+        self.assertEqual(len(task['players']), 2)
+        self.assertEqual(task['players'][0]['total'], 0)
+        reference = {'sheet_title': '名单乙', 'player_col': 0, 'ori_col': 1, 'status_col': 2,
+                     'target_spreadsheet': 'testbook', 'group_name': '群乙'}
+        with patch('app.services.roster_sources.validate_formula_reference', AsyncMock(return_value=reference)) as read:
+            copied = asyncio.run(clipboard_records(task['id'], task['version'], LOGIN))
+        self.assertEqual(copied['count'], 1)
+        self.assertNotIn(entry()['player_id'], copied['text'])
+        self.assertIn(other['player_id'], copied['text'])
+        read.assert_awaited_once_with('group_b', LOGIN)
+
     def test_excluded_player_remains_visible_but_is_not_copied(self):
         from test_group_tasks import entry, snapshot
         from app.schemas.group_tasks import FeedbackCorrection
