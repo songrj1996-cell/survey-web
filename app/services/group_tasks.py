@@ -61,8 +61,8 @@ def _ensure_version(task: dict, version: int, *, allow_busy=False) -> None:
         raise HTTPException(404, "任务已删除")
     if task["version"] != version:
         raise HTTPException(409, "任务已更新，请刷新后核对新版本再操作")
-    if not allow_busy and (task.get("run") or {}).get("status") in ACTIVE_RUNS:
-        raise HTTPException(409, "本任务正在排队或标注，暂时不能修改或删除；其他任务仍可操作")
+    if not allow_busy and (task.get("run") or {}).get("status") in ACTIVE_RUNS | {"paused"}:
+        raise HTTPException(409, "本任务正在排队、标注或已暂停，暂时不能修改或删除；请先继续任务，其他任务仍可操作")
 
 
 def create_task(rules: TaskRules, login: dict | None) -> dict:
@@ -825,6 +825,7 @@ def task_view(task: dict, login, *, summary=False, access=None) -> dict:
     for saved_run in [result.get("run"), *result.get("runs", [])]:
         if saved_run:
             saved_run.pop("owner_login", None)
+            saved_run.pop("pause_login", None)
     retained = [row for row in task["feedback"] if not row.get("excluded")]
     outcomes = [effective_result(task, row) for row in retained]
     result["summary"] = {
@@ -835,8 +836,10 @@ def task_view(task: dict, login, *, summary=False, access=None) -> dict:
         "excellent": sum(item["excellent"] or 0 for item in outcomes),
     }
     run = task.get("run") or {}
-    if run.get("status") in ACTIVE_RUNS:
-        status = run["status"]
+    if run.get("status") == "paused":
+        status = "paused"
+    elif run.get("status") in ACTIVE_RUNS:
+        status = "pausing" if run.get("pause_requested") else run["status"]
     elif not task["feedback"]:
         status = "draft"
     elif readiness_issues(task):

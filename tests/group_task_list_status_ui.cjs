@@ -15,7 +15,7 @@ function fixture(patch={}){
       total:42,ai_done:42,quality_total:42,quality_done:38,review_ids:[],reviewed_ids:[],high_threshold:80,review_threshold:60},...patch};
 }
 function run(stage='quality',status='incomplete',error=''){
-  return {stage,status,error,completed_ids:Array.from({length:38},(_,i)=>String(i)),
+  return {id:'run-'+stage,version:1,stage,status,error,completed_ids:Array.from({length:38},(_,i)=>String(i)),
     attempted_ids:Array.from({length:42},(_,i)=>String(i)),target_ids:Array.from({length:42},(_,i)=>String(i))};
 }
 const aiAnnotation={...fixture().annotation,phase:'ai_progress',options:{ai_detect:true,quality:true},ai_done:38};
@@ -28,6 +28,9 @@ const cases=[
   ['排队',fixture({status:'queued',run:run('quality','queued','旧批次失败')}),'排队中','neutral','查看进度'],
   ['AI 正在运行',fixture({status:'running',run:run('ai','running','部分失败'),annotation:aiAnnotation}),'AI 识别中','neutral','查看进度'],
   ['质量正在运行',fixture({status:'running',run:run('quality','running','部分失败')}),'质量打标中','neutral','查看进度'],
+  ['等待当前反馈保存后暂停',fixture({status:'pausing',run:{...run('quality','running'),pause_requested:true}}),'暂停中','warning','查看进度'],
+  ['已暂停等待继续',fixture({status:'paused',run:{...run('quality','paused'),pause_requested:true}}),'已暂停','warning','查看进度'],
+  ['暂停中遇到重启',fixture({status:'paused',run:{...run('ai','paused'),pause_requested:true,timing_partial:true},annotation:aiAnnotation}),'已暂停','warning','查看进度'],
   ['等待人工确认',fixture({status:'awaiting_ai_confirmation',run:run('ai'),annotation:{...aiAnnotation,phase:'ai_review'}}),'待确认 AI 作答','warning','确认 AI 作答'],
   ['结果待确认',fixture({status:'awaiting_confirmation',annotation:completeAnnotation}),'待确认','warning','查看结果'],
   ['仅 AI 标注完成',fixture({status:'annotation_done',annotation:{...completeAnnotation,options:{ai_detect:true,quality:false}}}),'标注完成','neutral','查看结果'],
@@ -51,17 +54,20 @@ function environment(){
   }
   const nodes=new Map(),requests=[],toasts=[];
   const $=id=>{if(!nodes.has(id))nodes.set(id,new Element());return nodes.get(id);};
-  let items=[],selected,poll;
+  let items=[],selected,poll,controlHandler;
   const context={console,$,esc:escapeHtml,document:{hidden:false},PlatformPermissions:{canUse:()=>true},
     showToast:(...args)=>toasts.push(args),setInterval:fn=>{poll=fn;},window:{addEventListener(){},workflowConfirm:async()=>true,
-      workflowRequest:async(url,options)=>{requests.push({url,options});assert(!options?.method||options.method==='GET','list actions must never submit a run');
+      workflowRequest:async(url,options)=>{requests.push({url,options});if(options?.method&&options.method!=='GET'){
+          assert(controlHandler,'ordinary navigation must never submit a run');
+          assert.match(url,/\/(pause|resume)$/);assert.equal(options.method,'POST');return controlHandler(url,options);
+        }
         if(url==='/api/group-tasks')return {tasks:items};
         if(url==='/api/group-tasks/groups')return {groups:[]};
         if(url===`/api/group-tasks/${selected?.id}`)return selected;
         throw new Error('Unexpected synthetic request '+url);}}};
   vm.createContext(context);
   vm.runInContext(source.replace('return {open,list};','return {open,list,tests:{listState,renderList}};'),context);
-  return {context,$,requests,toasts,tests:context.window.GroupTasks.tests,poll:()=>poll(),setItems:value=>{items=value;},setSelected:value=>{selected=value;}};
+  return {context,$,requests,toasts,tests:context.window.GroupTasks.tests,poll:()=>poll(),setItems:value=>{items=value;},setSelected:value=>{selected=value;},setControl:value=>{controlHandler=value;}};
 }
 async function checks(){
   const env=environment(),{tests,$}=env;
@@ -73,13 +79,20 @@ async function checks(){
     const html=$('gw-task-list').innerHTML;
     assert(html.includes(`gw-list-badge--${tone}">${label}</span>`),name);
     assert.match(html,new RegExp(`data-gw="view"[^>]*>${button}</button>`),name);
-    assert(html.includes('任务记录')&&html.includes('任务设置'),name);
+    assert.doesNotMatch(html,/data-gw="records"/,'task records stay inside result tabs: '+name);
+    assert(html.includes('任务设置'),name);
+    if(['running','queued'].includes(task.status))assert.match(html,/data-gw="pause"[^>]*>暂停任务<\/button>/,name);
+    else if(task.status==='pausing')assert.match(html,/data-gw="pause" disabled[^>]*>正在暂停…<\/button>/,name);
+    else if(task.status==='paused')assert.match(html,/data-gw="resume"[^>]*>继续任务<\/button>/,name);
+    else assert.doesNotMatch(html,/data-gw="(?:pause|resume)"/,name);
     const readOnly=tests.listState({...task,can_edit:false});
     assert.equal(readOnly.button,'查看详情',name);
-    if(tone!=='neutral'){
+    if(tone!=='neutral'&&task.status!=='pausing'){
       assert.match(readOnly.hint,/请联系任务负责人处理/,name);
       assert.doesNotMatch(readOnly.hint,/重试|请开始|请完成/,name);
     }
+    tests.renderList([{...task,can_edit:false}]);
+    assert.doesNotMatch($('gw-task-list').innerHTML,/data-gw="(?:pause|resume)"/,'read-only controls hidden: '+name);
   }
   const stopped=fixture({status:'incomplete',run:run()});
   const retrying={...stopped,status:'queued',run:run('quality','queued'),annotation_auto_error:'旧错误'};
@@ -110,7 +123,39 @@ async function checks(){
     assert($('gw-content').innerHTML.includes(stage==='ai'?'重试 AI 识别':'重试质量打标'));
   }
   assert.deepEqual(env.toasts,[]);
-  console.log(`Quality list status UI passed: ${cases.length} states, read-only permissions, recovery polling, errors, escaping, search and stage-opening handlers; no mutation requests.`);
+  await env.context.window.GroupTasks.list();
+  const active=fixture({id:'control-task',status:'running',run:run('quality','running')});
+  let controlled=active;
+  env.setItems([active]);await env.context.window.GroupTasks.list();
+  env.setControl((url,options)=>{
+    assert.equal(options.body.expected_version,active.version);assert.equal(options.body.run_id,active.run.id);
+    controlled={...controlled,status:url.endsWith('/pause')?'pausing':'queued',run:{...controlled.run,status:url.endsWith('/pause')?'running':'queued',pause_requested:url.endsWith('/pause')}};
+    env.setItems([controlled]);return controlled;
+  });
+  async function controlClick(action){
+    const button={dataset:{gw:action,id:active.id,runId:active.run.id,version:String(active.version)},isConnected:true,disabled:false};
+    await $('group-tasks-panel').listeners.click({target:{closest:selector=>selector==='[data-gw]'?button:null}});
+  }
+  await controlClick('pause');
+  assert.match($('gw-task-list').innerHTML,/正在暂停…/);assert.match(env.toasts.at(-1)[0],/保存后暂停/);
+  controlled={...controlled,status:'paused',run:{...controlled.run,status:'paused'}};
+  env.setItems([controlled]);await env.poll();
+  assert.match($('gw-task-list').innerHTML,/继续任务/);
+  env.setSelected(controlled);
+  const view={dataset:{gw:'view',id:active.id},isConnected:true,disabled:false};
+  await $('group-tasks-panel').listeners.click({target:{closest:selector=>selector==='[data-gw]'?view:null}});
+  assert.match($('ga-quality-progress-msg').textContent,/已暂停/);
+  assert.match($('ga-panel-5').querySelector('.panel__desc').textContent,/当前结果已保存/);
+  assert.doesNotMatch($('gw-content').innerHTML,/data-gw="annotation-run"/,'paused detail must not expose a restart shortcut');
+  await controlClick('resume');
+  await env.context.window.GroupTasks.list();
+  assert.match($('gw-task-list').innerHTML,/排队中/);assert.doesNotMatch($('gw-task-list').innerHTML,/继续任务/);
+  env.setControl(()=>{throw new Error('合成保存失败');});
+  await controlClick('pause');assert.match(env.toasts.at(-1)[0],/合成保存失败/);
+  assert.match($('gw-task-list').innerHTML,/排队中/,'a failed save cannot show a successful pause');
+  env.setItems([{...controlled,can_edit:false}]);await env.context.window.GroupTasks.list();
+  const beforeDenied=env.requests.length;await controlClick('pause');assert.equal(env.requests.length,beforeDenied,'read-only action sends no request');
+  console.log(`Quality list status UI passed: ${cases.length} states, no separate records button, read-only permissions, polling, escaping, navigation and pause/resume/error handlers; only explicit control actions may POST.`);
 }
 function serve(){
   const http=require('node:http');
@@ -126,8 +171,21 @@ function serve(){
   const html=`<!doctype html><html lang="zh-CN" data-theme="light"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>质量标注列表 · 合成状态验证</title><link rel="stylesheet" href="/style.css"><style>html,body{height:auto;overflow:auto}body{padding:24px}#group-tasks-panel{padding:24px;background:var(--surface);border-radius:14px}.qa-controls{display:flex;gap:8px;margin-bottom:16px}@media(max-width:600px){body{padding:8px}#group-tasks-panel{padding:12px}}</style><body><div class="qa-controls"><button class="btn btn--ghost" id="qa-theme">切换明暗主题</button><button class="btn btn--ghost" id="qa-readonly">切换只读查看</button><span>合成任务，不连接后台或模型</span></div><section id="group-tasks-panel"></section><script>
     const fixtures=${JSON.stringify(items).replace(/</g,'\\u003c')};let readOnly=false;
     window.$=id=>document.getElementById(id);window.esc=${escapeHtml.toString()};window.PlatformPermissions={canUse:()=>!readOnly};
-    window.showToast=message=>console.error(message);window.workflowTime=String;window.formatReportDuration=String;window.workflowConfirm=async()=>true;
-    window.workflowRequest=async(url,options)=>{if(options?.method&&options.method!=='GET')throw Error('合成验证禁止写入');if(url==='/api/group-tasks')return {tasks:fixtures.map(t=>({...t,can_edit:!readOnly}))};if(url.endsWith('/groups'))return {groups:[]};const t=fixtures.find(t=>url==='/api/group-tasks/'+t.id);if(t)return {...t,can_edit:!readOnly};throw Error('未配置的合成接口');};
+    window.showToast=message=>console.log(message);window.workflowTime=String;window.formatReportDuration=String;window.workflowConfirm=async()=>true;
+    window.workflowRequest=async(url,options)=>{
+      if(options?.method&&options.method!=='GET'){
+        const match=url.match(/^\\/api\\/group-tasks\\/([^/]+)\\/(pause|resume)$/),t=match&&fixtures.find(t=>t.id===match[1]);
+        if(!t||readOnly||options.body.run_id!==t.run?.id||options.body.expected_version!==t.version)throw Error('合成操作被拒绝');
+        if(match[2]==='pause'){
+          if(!['queued','running'].includes(t.status))throw Error('合成状态已变化');
+          t.status=t.status==='running'?'pausing':'paused';t.run.pause_requested=true;
+          if(t.status==='paused')t.run.status='paused';
+          else setTimeout(()=>{t.status='paused';t.run.status='paused';t.updated_at=String(Date.now());},1000);
+        }else{if(t.status!=='paused')throw Error('合成任务尚未暂停');t.status='queued';t.run.status='queued';t.run.pause_requested=false;}
+        t.updated_at=String(Date.now());return {...t,can_edit:!readOnly};
+      }
+      if(url==='/api/group-tasks')return {tasks:fixtures.map(t=>({...t,can_edit:!readOnly}))};if(url.endsWith('/groups'))return {groups:[]};const t=fixtures.find(t=>url==='/api/group-tasks/'+t.id);if(t)return {...t,can_edit:!readOnly};throw Error('未配置的合成接口');
+    };
     $('qa-theme').onclick=()=>document.documentElement.dataset.theme=document.documentElement.dataset.theme==='light'?'dark':'light';
     $('qa-readonly').onclick=()=>{readOnly=!readOnly;GroupTasks.list();};
     </script><script src="/group-tasks.js"></script><script>GroupTasks.list();</script></body></html>`;

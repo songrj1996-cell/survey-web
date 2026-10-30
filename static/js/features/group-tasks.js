@@ -14,7 +14,7 @@ window.GroupTasks = (() => {
       throw e;
     }
   };
-  const statusNames = {awaiting_ai_confirmation:'待确认 AI 作答',draft:'待配置',input_issues:'输入待处理',ready:'待标注',queued:'排队中',running:'标注中',incomplete:'待补齐',annotation_done:'标注完成',awaiting_confirmation:'待确认',confirmed:'可结算'};
+  const statusNames = {paused:'已暂停',pausing:'暂停中',awaiting_ai_confirmation:'待确认 AI 作答',draft:'待配置',input_issues:'输入待处理',ready:'待标注',queued:'排队中',running:'标注中',incomplete:'待补齐',annotation_done:'标注完成',awaiting_confirmation:'待确认',confirmed:'可结算'};
   let task = null, step = 1, dirty = false, listFilter = '', groupFilter = '', qualityFilter = '', showAllInputs = false, pollBusy = false;
   let uploadView=false, settingsView=false, requestBusy=0, resultTab='quality', recordBusy=false, recordNotice='';
   let selectedResponse = '', latestList = [], clipboardPreview = null, configuredGroups = [], aiChoices = null;
@@ -24,7 +24,7 @@ window.GroupTasks = (() => {
   const changedFields = new Set();
   const h = value => esc(String(value ?? ''));
   const btn = (action, text, primary=false, disabled=false, extra='') => `<button type="button" class="btn ${primary?'btn--primary':'btn--ghost'}" data-gw="${action}" ${disabled?'disabled':''} ${extra}>${text}</button>`;
-  const busy = () => task && ['queued','running'].includes(task.status);
+  const busy = () => task && ['queued','running','pausing','paused'].includes(task.status);
   const editable = () => task?.can_edit && !busy();
   const disabled = () => editable() ? '' : 'disabled';
   const error = e => { if (!e.scopeChanged) showToast(e.message, 'error', 6500); };
@@ -49,6 +49,8 @@ window.GroupTasks = (() => {
   function listState(t) {
     const a=t.annotation||{},run=t.run||{};
     const state=(label,tone,button,hint,needsAction=false)=>({label,tone,button:t.can_edit?button:'查看详情',hint:!t.can_edit&&needsAction?'当前任务需要处理；请联系任务负责人处理，可进入查看详情。':hint});
+    if(t.status==='paused'||run.status==='paused')return state('已暂停','warning','查看进度',run.timing_partial?'服务曾中断，任务保持暂停；继续时未确认的远端请求可能产生重复模型费用。':'已保存当前结果，点击“继续任务”后处理剩余反馈。',true);
+    if(t.status==='pausing'||run.pause_requested&&['queued','running'].includes(run.status))return state('暂停中','warning','查看进度','当前已开始的反馈保存后暂停；期间仍可能调用模型。');
     // A partial batch can fail while other batches are still running or queued.
     if(['queued','running'].includes(t.status)||['queued','running'].includes(run.status)){
       const queued=t.status==='queued'||run.status==='queued';
@@ -83,6 +85,13 @@ window.GroupTasks = (() => {
     }
     return state(statusNames[t.status]||'状态待确认','warning','查看并处理','请进入查看任务当前状态。',true);
   }
+  function runControls(t) {
+    if(!t.can_edit||!t.run?.id)return '';
+    const attrs=`data-id="${h(t.id)}" data-run-id="${h(t.run.id)}" data-version="${t.version}"`;
+    if(t.status==='paused')return btn('resume','继续任务',false,false,attrs);
+    if(t.status==='pausing'||t.run.pause_requested&&['running','queued'].includes(t.run.status))return btn('pause','正在暂停…',false,true,attrs);
+    return ['running','queued'].includes(t.status)?btn('pause','暂停任务',false,false,attrs):'';
+  }
   async function open({home=false}={}) {
     if(home){
       if(!await mayLeave())return;
@@ -101,11 +110,11 @@ window.GroupTasks = (() => {
   }
   function renderList(items) {
     latestList=items;
-    $('gw-list-summary').innerHTML=[['标注中',items.filter(t=>t.status==='running').length],['排队中',items.filter(t=>t.status==='queued').length],['待处理任务',items.filter(t=>!['confirmed','annotation_done'].includes(t.status)).length],['可结算任务',items.filter(t=>t.status==='confirmed').length]].map(([label,value])=>`<span>${label}<strong>${value}</strong></span>`).join('');
-    const filtered = items.filter(t => `${t.rules.name} ${t.owner_name}`.toLowerCase().includes(listFilter.toLowerCase())).sort((a,b)=>Number(['running','queued'].includes(b.status))-Number(['running','queued'].includes(a.status)));
+    $('gw-list-summary').innerHTML=[['标注中',items.filter(t=>['running','pausing'].includes(t.status)).length],['排队中',items.filter(t=>t.status==='queued').length],['待处理任务',items.filter(t=>!['confirmed','annotation_done'].includes(t.status)).length],['可结算任务',items.filter(t=>t.status==='confirmed').length]].map(([label,value])=>`<span>${label}<strong>${value}</strong></span>`).join('');
+    const filtered = items.filter(t => `${t.rules.name} ${t.owner_name}`.toLowerCase().includes(listFilter.toLowerCase())).sort((a,b)=>Number(['running','queued','pausing'].includes(b.status))-Number(['running','queued','pausing'].includes(a.status)));
     $('gw-task-list').innerHTML = filtered.length ? `<div class="workflow-table-wrap"><table class="workflow-table"><thead><tr><th>任务</th><th>负责人</th><th>发奖日期</th><th>状态与进度</th><th></th></tr></thead><tbody>${filtered.map(t=>{
       const s=listState(t);
-      return `<tr><td><strong>${h(t.rules.name||'未命名任务')}</strong><small>${t.rules.group_name?h(t.rules.group_name)+' · ':''}${t.summary.player_count} 位玩家 · ${t.summary.feedback_count} 份反馈</small></td><td>${h(t.owner_name)}</td><td>${h(t.rules.payout_date||'待确认')}</td><td class="gw-list-status"><span class="workflow-badge gw-list-badge--${s.tone}">${h(s.label)}</span>${progressBar(t)}<small>${h(progress(t))}</small><small class="gw-list-hint gw-list-hint--${s.tone}">${h(s.hint)}</small></td><td>${btn('view',s.button,false,false,`data-id="${h(t.id)}" data-result-ready="${Boolean(t.annotation?.complete)}"`)}${btn('records','任务记录',false,!recordsAvailable(t),`data-id="${t.id}" title="${recordsAvailable(t)?'查看玩家完成结果并复制到飞书':'完成质量标注后可查看任务记录'}"`)}${t.can_edit?btn('settings','任务设置',false,false,`data-id="${t.id}"`):''}</td></tr>`;
+      return `<tr><td><strong>${h(t.rules.name||'未命名任务')}</strong><small>${t.rules.group_name?h(t.rules.group_name)+' · ':''}${t.summary.player_count} 位玩家 · ${t.summary.feedback_count} 份反馈</small></td><td>${h(t.owner_name)}</td><td>${h(t.rules.payout_date||'待确认')}</td><td class="gw-list-status"><span class="workflow-badge gw-list-badge--${s.tone}">${h(s.label)}</span>${progressBar(t)}<small>${h(progress(t))}</small><small class="gw-list-hint gw-list-hint--${s.tone}">${h(s.hint)}</small></td><td>${btn('view',s.button,false,false,`data-id="${h(t.id)}" data-result-ready="${Boolean(t.annotation?.complete)}"`)}${runControls(t)}${t.can_edit?btn('settings','任务设置',false,false,`data-id="${t.id}"`):''}</td></tr>`;
     }).join('')}</tbody></table></div>` : '<div class="workflow-empty">尚无匹配任务。新建任务后，依次设置规则、上传核查、标注与计奖。</div>';
   }
   async function load(id) { await fetchGroups(); task=await api(`/api/group-tasks/${id}`); render(); }
@@ -113,10 +122,10 @@ window.GroupTasks = (() => {
     step=Math.min(step,maxStep()); if(step===3&&!task.rules.ai_detect)step=4;
     const annotationView=!settingsView&&step>=2&&step<=4;
     root.classList.toggle('workflow-annotation',annotationView);
-    root.innerHTML = `<div class="workflow-heading gw-task-heading"><div class="gw-task-title"><h1 class="panel__title" title="${h(task.rules.name||'新任务')}">${h(task.rules.name||'新任务')}</h1><p id="gw-task-meta" class="panel__desc">${taskMeta(task)}</p></div><div class="gw-task-actions"><span id="gw-progress" class="workflow-badge">${h(progress(task))}</span>${annotationView?'':btn('back','← 返回任务列表')}</div></div>
+    root.innerHTML = `<div class="workflow-heading gw-task-heading"><div class="gw-task-title"><h1 class="panel__title" title="${h(task.rules.name||'新任务')}">${h(task.rules.name||'新任务')}</h1><p id="gw-task-meta" class="panel__desc">${taskMeta(task)}</p></div><div class="gw-task-actions"><span id="gw-progress" class="workflow-badge">${h(progress(task))}</span>${runControls(task)}${annotationView?'':btn('back','← 返回任务列表')}</div></div>
       <div id="gw-annotation-navigation" class="gw-annotation-navigation" hidden></div>
       ${!task.can_edit?'<p class="workflow-notice">当前为只读查看，标注与发奖结果由任务负责人维护。</p>':''}
-      ${busy()?'<p class="workflow-notice">正在标注，暂时不能修改本任务的文件、题目选择和标注规则；可以查看进度或处理其他任务。</p>':''}
+      ${busy()?`<p class="workflow-notice">${task.status==='paused'?'任务已暂停，点击“继续任务”后恢复处理。':task.status==='pausing'?'暂停中，当前已开始的反馈保存后暂停；期间仍可能调用模型。':'正在排队或标注。'}暂时不能修改本任务的文件、题目选择和标注规则；可以查看进度或处理其他任务。</p>`:''}
       <div id="gw-progress-track" hidden></div><div id="gw-update-hint" hidden class="workflow-notice">任务信息已更新。${btn('reload','查看最新结果')}</div><div id="gw-content"></div>`;
     if(settingsView)renderSettings();else [null,renderRules,renderInputs,renderAI,renderJudgments][step]();
   }
@@ -889,15 +898,21 @@ async function startAnnotationStage() {
 }
 function renderAnnotationProgress(stage) {
   const ai=stage==='ai',a=task.annotation,run=task.run,active=run?.stage===stage&&['running','queued'].includes(run.status);
+  const suspended=['paused','pausing'].includes(task.status);
   annPage(ai?3:5);
   const prefix=ai?'ai':'quality',done=ai?a.ai_done:a.quality_done,total=ai?a.total:a.quality_total;
   annElement(`ann-${prefix}-progress-bar`).style.width=`${total?done/total*100:100}%`;
-  annElement(`ann-${prefix}-progress-msg`).textContent=active?`${run.status==='queued'?'排队等待中':'正在分批分析'}：已完成 ${done} / ${total} 份反馈`: `${ai?'AI 识别':'质量打标'}未完成：${done} 条有效结果，仍有 ${total-done} 行未回填`;
+  annElement(`ann-${prefix}-progress-msg`).textContent=suspended?`${statusNames[task.status]}：已完成 ${done} / ${total} 份反馈`:active?`${run.status==='queued'?'排队等待中':'正在分批分析'}：已完成 ${done} / ${total} 份反馈`: `${ai?'AI 识别':'质量打标'}未完成：${done} 条有效结果，仍有 ${total-done} 行未回填`;
+  if(suspended){
+    const panel=annElement(`ann-panel-${ai?3:5}`);
+    panel.querySelector('.panel__title').textContent=`${ai?'AI 作答识别':'回答质量打标'} · ${statusNames[task.status]}`;
+    panel.querySelector('.panel__desc').textContent=task.status==='paused'?'当前结果已保存，点击“继续任务”后恢复处理。':'当前已开始的反馈保存后暂停；期间仍可能调用模型。';
+  }
   const errors=task.feedback.filter(r=>!r.excluded&&r.model_error&&!(ai?r.ai_complete:r.quality_complete||r.confirmed_ai)).map(r=>`第 ${r.source_row} 行：${r.model_error}`);
   if(run?.stage===stage&&run.error)errors.push(run.error);
   if(task.annotation_auto_error)errors.push(task.annotation_auto_error);
-  annElement(`ann-${prefix}-warn-log`).innerHTML=errors.map(message=>`<div class="ann-warn-item">${h(message)}</div>`).join('')+(!active&&errors.length?`<div class="ann-warn-item ann-warn-item--error">仍有 ${total-done} 行没有得到完整结果，已停止后续${ai?'质量打标':'结果预览'}。请重试${ai?' AI 识别':'质量打标'}。</div>`:'');
-  $('gw-content').insertAdjacentHTML('beforeend',`<div class="workflow-toolbar">${!active?btn('annotation-run',run?.stage===stage?ai?'重试 AI 识别':'重试质量打标':ai?'开始 AI 作答识别':'开始质量打标',true,!editable()):''}</div>`);
+  annElement(`ann-${prefix}-warn-log`).innerHTML=errors.map(message=>`<div class="ann-warn-item">${h(message)}</div>`).join('')+(!active&&!suspended&&errors.length?`<div class="ann-warn-item ann-warn-item--error">仍有 ${total-done} 行没有得到完整结果，已停止后续${ai?'质量打标':'结果预览'}。请重试${ai?' AI 识别':'质量打标'}。</div>`:'');
+  $('gw-content').insertAdjacentHTML('beforeend',`<div class="workflow-toolbar">${!active&&!suspended?btn('annotation-run',run?.stage===stage?ai?'重试 AI 识别':'重试质量打标':ai?'开始 AI 作答识别':'开始质量打标',true,!editable()):''}</div>`);
 }
 function renderAI() {
   if(task.annotation.phase==='ai_progress'){renderAnnotationProgress('ai');return;}
@@ -1026,6 +1041,13 @@ for (const filterId of [
   async function mutate(path,body,method='POST') { const value=await api(`/api/group-tasks/${task.id}/${path}`,{method,body:{expected_version:task.version,...body}}); task=value.task||value; aiChoices=null; dirty=false;changedFields.clear();render();return value; }
   async function action(button) {
     const name=button.dataset.gw;
+    if(name==='pause'||name==='resume'){
+      const id=button.dataset.id,current=task?.id===id?task:latestList.find(t=>t.id===id);
+      if(!current?.can_edit)throw new Error('当前仅可查看任务，不能暂停或继续');
+      const value=await api(`/api/group-tasks/${id}/${name}`,{method:'POST',body:{expected_version:Number(button.dataset.version),run_id:button.dataset.runId}});
+      if(task?.id===id){task=value;render();}else if(!task)await list();
+      showToast(value.status==='pausing'?'暂停申请已接受，当前反馈保存后暂停；期间仍可能调用模型。':value.status==='paused'?'任务已暂停，已有结果保留。':'任务已继续，正在排队处理剩余反馈。','success');return;
+    }
     if(name==='settings'){
       if(!await mayLeave())return;await fetchGroups();task=await api(`/api/group-tasks/${button.dataset.id}`);settingsView=true;render();return;
     }

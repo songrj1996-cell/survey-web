@@ -3,10 +3,10 @@ from fastapi import APIRouter, File, Form, Request, UploadFile, HTTPException, R
 from urllib.parse import quote
 
 from app.schemas.group_tasks import (AIReviewDecision, AnnouncementRequest, ConfirmAI, DuplicateDecision, FeedbackCorrection, MappingUpdate,
-                                    PlayerADVDecision, QualityOverride, RunTask, TaskCreate, TaskRulesUpdate, TaskSettingsUpdate, VersionRequest)
+                                    PlayerADVDecision, QualityOverride, RunControlRequest, RunTask, TaskCreate, TaskRulesUpdate, TaskSettingsUpdate, VersionRequest)
 from app.services.auth import _current_login
 from app.services import group_tasks as service
-from app.services.group_task_runner import prepare_run
+from app.services.group_task_runner import pause_run, prepare_run, resume_run
 from app.services.task_announcement import extract_announcement
 from app.services.task_records import clipboard_records
 from app.services.llm_credentials import require_request_llm_api_key, run_with_llm_api_key
@@ -105,6 +105,16 @@ async def duplicates(task_id: str, body: DuplicateDecision, request: Request):
 @router.post("/{task_id}/run")
 async def run(task_id: str, body: RunTask, request: Request):
     return await prepare_run(task_id, body, await _current_login(request))
+
+
+@router.post("/{task_id}/pause")
+async def pause(task_id: str, body: RunControlRequest, request: Request):
+    return pause_run(task_id, body, await _current_login(request))
+
+
+@router.post("/{task_id}/resume")
+async def resume(task_id: str, body: RunControlRequest, request: Request):
+    return await resume_run(task_id, body, await _current_login(request))
 
 
 @router.put("/{task_id}/feedback/{response_id}/quality")

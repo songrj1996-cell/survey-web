@@ -1,15 +1,302 @@
 import asyncio
+from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 import unittest
 from unittest.mock import patch
 
 from test_group_tasks import WorkflowCase, LOGIN, snapshot, entry
 from app.core import config
-from app.schemas.group_tasks import RunTask
+from app.schemas.group_tasks import RunControlRequest, RunTask
 from app.services import group_task_runner as runner
 from app.storage import group_workflow as store
 
 
 class RunnerTests(unittest.IsolatedAsyncioTestCase, WorkflowCase):
+    def start_for_control(self, task):
+        with patch.object(runner, 'require_background_llm_api_key', return_value='test-key'):
+            started = runner.start_run(task['id'], RunTask(expected_version=task['version']), LOGIN)
+        return RunControlRequest(expected_version=task['version'], run_id=started['run']['id'])
+
+    async def test_queued_pause_is_durable_idempotent_and_resumes_same_budget_and_snapshot(self):
+        task = self.make_task(labels=(None, None))
+        control = self.start_for_control(task)
+        paused = runner.pause_run(task['id'], control, LOGIN)
+        self.assertEqual(paused['status'], 'paused')
+        self.assertNotIn('pause_login', paused['run'])
+        self.assertNotIn('owner_login', paused['run'])
+        first = store.read('tasks', task['id'])
+        runner.pause_run(task['id'], control, LOGIN)
+        self.assertEqual(store.read('tasks', task['id']), first)
+        runner.recover_interrupted_runs()
+        self.assertEqual(store.read('tasks', task['id']), first)
+        called = []
+        async def unexpected(*args):
+            called.append(args)
+        with patch.object(runner, 'annotate_group_feedback', unexpected):
+            await runner._run_slice(task['id'], asyncio.Semaphore(1))
+        self.assertEqual(called, [])
+        with patch.object(runner, 'require_background_llm_api_key', return_value='test-key'):
+            resumed = await runner.resume_run(task['id'], control, LOGIN)
+            repeated = await runner.resume_run(task['id'], control, LOGIN)
+        self.assertEqual(resumed['status'], 'queued')
+        self.assertEqual(repeated['run'], resumed['run'])
+        self.assertEqual(resumed['run']['id'], control.run_id)
+        self.assertEqual(resumed['run']['http_attempts'], first['run']['http_attempts'])
+        self.assertEqual(resumed['run']['target_ids'], first['run']['target_ids'])
+        self.assertEqual(resumed['run'].get('paused_seconds', 0), 0, 'pause before first start must not enlarge the execution budget')
+
+    async def test_running_pause_saves_current_feedback_and_resume_does_not_repeat_success(self):
+        task = self.make_task(labels=('优秀反馈', None, None))
+        task['feedback'][0]['manual_quality'] = {'label': '有效反馈', 'note': '人工保留'}
+        store.mutate('tasks', task['id'], lambda current: current.update(task))
+        control = self.start_for_control(task)
+        entered, release = asyncio.Event(), asyncio.Event()
+        processed = []
+        async def annotate(current, row, checkpoint):
+            processed.append(row['id'])
+            if len(processed) == 1:
+                entered.set()
+                await release.wait()
+            checkpoint({'quality': {'overall': '有效反馈', 'overall_reason': '合成验证', 'q_labels': {'col_1': '有效反馈'}}, 'quality_complete': True})
+        with patch.object(runner, 'require_background_llm_api_key', return_value='test-key'), patch.object(runner, 'start_llm_usage_task', return_value=None), patch.object(runner, 'annotate_group_feedback', annotate), patch.object(config, 'GROUP_TASK_REQUEST_CONCURRENCY', 1):
+            executing = asyncio.create_task(runner._run_slice(task['id'], asyncio.Semaphore(1)))
+            try:
+                async with asyncio.timeout(5):
+                    await entered.wait()
+                self.assertEqual(runner.pause_run(task['id'], control, LOGIN)['status'], 'pausing')
+                self.assertEqual(runner.pause_run(task['id'], control, LOGIN)['status'], 'pausing')
+                with self.assertRaises(Exception) as early:
+                    await runner.resume_run(task['id'], control, LOGIN)
+                self.assertEqual(early.exception.status_code, 409)
+            finally:
+                release.set()
+                await executing
+            paused = store.read('tasks', task['id'])
+            self.assertEqual(paused['run']['status'], 'paused')
+            self.assertEqual(len(processed), 1)
+            self.assertTrue(paused['feedback'][1]['quality_complete'])
+            self.assertEqual(paused['feedback'][0]['manual_quality'], task['feedback'][0]['manual_quality'])
+            saved_models = deepcopy(paused['run']['llm_model_snapshot'])
+            await runner.resume_run(task['id'], control, LOGIN)
+            await runner._run_slice(task['id'], asyncio.Semaphore(1))
+        completed = store.read('tasks', task['id'])
+        self.assertEqual(completed['run']['status'], 'completed')
+        self.assertEqual(processed, [task['feedback'][1]['id'], task['feedback'][2]['id']])
+        current_models = completed['run']['llm_model_snapshot']
+        for key in ('version', 'revision', 'configuration_sha256', 'configuration'):
+            self.assertEqual(current_models[key], saved_models[key])
+        self.assertEqual(current_models.get('use_saved_defaults', False), saved_models.get('use_saved_defaults', False))
+        self.assertEqual(completed['run']['id'], control.run_id)
+        self.assertEqual(completed['feedback'][0]['manual_quality'], task['feedback'][0]['manual_quality'])
+
+    async def test_pause_wait_is_excluded_but_attempt_limit_is_preserved(self):
+        task = self.make_task(labels=(None,))
+        control = self.start_for_control(task)
+        runner.pause_run(task['id'], control, LOGIN)
+        def long_pause(current):
+            current['run'].update(started_at=(datetime.now(timezone.utc)-timedelta(hours=2, seconds=5)).isoformat(),
+                                  paused_at=(datetime.now(timezone.utc)-timedelta(hours=2)).isoformat(), http_attempts=2)
+        store.mutate('tasks', task['id'], long_pause)
+        with patch.object(runner, 'require_background_llm_api_key', return_value='test-key'):
+            resumed = await runner.resume_run(task['id'], control, LOGIN)
+        self.assertGreater(resumed['run']['paused_seconds'], 7199)
+        self.assertLess(runner._run_elapsed(resumed['run']), 10)
+        with patch.object(config, 'GROUP_RUN_MAX_HTTP_ATTEMPTS', 2):
+            with self.assertRaisesRegex(RuntimeError, '请求预算'):
+                runner._attempt_reservation(task['id'], control.run_id, task['version'])
+        self.assertEqual(store.read('tasks', task['id'])['run']['http_attempts'], 2)
+
+    async def test_restart_during_pause_keeps_pause_and_uncertain_request_warning(self):
+        task = self.make_task(labels=('有效反馈', None))
+        control = self.start_for_control(task)
+        store.mutate('tasks', task['id'], lambda current: current['run'].update(status='running', inflight_ids=[task['feedback'][1]['id']]))
+        runner.pause_run(task['id'], control, LOGIN)
+        runner.recover_interrupted_runs()
+        saved = store.read('tasks', task['id'])
+        self.assertEqual(saved['run']['status'], 'paused')
+        self.assertTrue(saved['run']['timing_partial'])
+        self.assertIn('重复模型费用', saved['run']['error'])
+        self.assertTrue(saved['feedback'][0]['quality_complete'])
+        with self.assertRaises(RuntimeError):
+            runner._fenced(saved, control.run_id, task['version'])
+
+    async def test_ai_pause_blocks_automatic_quality_and_resume_continues_stage(self):
+        task = self.make_task(labels=(None,))
+        def enable_ai(current):
+            current['rules']['ai_detect'] = True
+            current['annotation_options'] = {'ai_detect': True, 'quality': True, 'background': ''}
+        store.mutate('tasks', task['id'], enable_ai)
+        task = store.read('tasks', task['id'])
+        control = self.start_for_control(task)
+        async def annotate(current, row, checkpoint):
+            checkpoint({'ai': {'ai_prob': 0, 'reason': '合成验证'}, 'ai_complete': True})
+            runner.pause_run(task['id'], control, LOGIN)
+        with patch.object(runner, 'require_background_llm_api_key', return_value='test-key'), patch.object(runner, 'start_llm_usage_task', return_value=None), patch.object(runner, 'annotate_group_feedback', annotate):
+            await runner._run_slice(task['id'], asyncio.Semaphore(1))
+            paused = store.read('tasks', task['id'])
+            self.assertEqual(paused['run']['status'], 'paused')
+            self.assertEqual(paused['run']['stage'], 'ai')
+            self.assertFalse(paused['ai_confirmation_complete'])
+            await runner.resume_run(task['id'], control, LOGIN)
+            await runner._run_slice(task['id'], asyncio.Semaphore(1))
+        resumed = store.read('tasks', task['id'])
+        self.assertTrue(resumed['ai_confirmation_complete'])
+        self.assertEqual(resumed['run']['stage'], 'quality')
+        self.assertEqual(resumed['run']['status'], 'queued')
+        for key in ('version', 'configuration_sha256', 'configuration'):
+            self.assertEqual(resumed['run']['llm_model_snapshot'][key], paused['run']['llm_model_snapshot'][key])
+
+    async def test_resume_validates_saved_models_without_loading_new_published_settings(self):
+        from app.services import llm_model_settings
+        from unittest.mock import AsyncMock
+        task = self.make_task(labels=(None,))
+        with patch.object(runner, 'require_background_llm_api_key', return_value='test-key'):
+            started = await runner.prepare_run(task['id'], RunTask(expected_version=task['version']), LOGIN)
+            control = RunControlRequest(expected_version=task['version'], run_id=started['run']['id'])
+            runner.pause_run(task['id'], control, LOGIN)
+            saved = store.read('tasks', task['id'])['run']['llm_model_snapshot']
+            with patch.object(llm_model_settings, 'build_model_snapshot', AsyncMock(side_effect=AssertionError('must not load a replacement model setting'))):
+                resumed = await runner.resume_run(task['id'], control, LOGIN)
+        self.assertEqual(resumed['run']['llm_model_snapshot']['configuration_sha256'], saved['configuration_sha256'])
+
+    async def test_pause_after_ai_completion_still_blocks_pending_automatic_transition(self):
+        task = self.make_task(labels=(None,))
+        def enable_ai(current):
+            current['rules']['ai_detect'] = True
+            current['annotation_options'] = {'ai_detect': True, 'quality': True, 'background': ''}
+        store.mutate('tasks', task['id'], enable_ai)
+        task = store.read('tasks', task['id'])
+        control = self.start_for_control(task)
+        original_mutate = store.mutate
+        async def annotate(current, row, checkpoint):
+            checkpoint({'ai': {'ai_prob': 0, 'reason': '合成验证'}, 'ai_complete': True})
+        def intercept(kind, identifier, change, **kwargs):
+            result = original_mutate(kind, identifier, change, **kwargs)
+            # Insert the request exactly after finish writes completed, before auto-confirm.
+            saved = store.read('tasks', task['id'])
+            if getattr(change, '__name__', '') == 'finish' and saved['run']['status'] == 'completed':
+                runner.pause_run(task['id'], control, LOGIN)
+            return result
+        with patch.object(runner, 'require_background_llm_api_key', return_value='test-key'), patch.object(runner, 'start_llm_usage_task', return_value=None), patch.object(runner, 'annotate_group_feedback', annotate), patch.object(store, 'mutate', side_effect=intercept):
+            await runner._run_slice(task['id'], asyncio.Semaphore(1))
+        saved = store.read('tasks', task['id'])
+        self.assertEqual(saved['run']['status'], 'paused')
+        self.assertEqual(saved['run']['stage'], 'ai')
+        self.assertFalse(saved['ai_confirmation_complete'])
+
+    async def test_paused_task_does_not_consume_scheduler_slot_or_block_another_task(self):
+        paused_task, other = self.make_task(labels=(None,)), self.make_task(labels=(None,))
+        control = self.start_for_control(paused_task)
+        runner.pause_run(paused_task['id'], control, LOGIN)
+        self.start_for_control(other)
+        processed = []
+        async def annotate(current, row, checkpoint):
+            processed.append(current['id'])
+            checkpoint({'quality': {'overall': '有效反馈', 'overall_reason': '合成验证', 'q_labels': {'col_1': '有效反馈'}}, 'quality_complete': True})
+        with patch.object(runner, 'require_background_llm_api_key', return_value='test-key'), patch.object(runner, 'start_llm_usage_task', return_value=None), patch.object(runner, 'annotate_group_feedback', annotate), patch.object(config, 'GROUP_TASK_CONCURRENCY', 1):
+            scheduler = asyncio.create_task(runner._scheduler())
+            try:
+                async with asyncio.timeout(5):
+                    while store.read('tasks', other['id'])['run']['status'] != 'completed':
+                        await asyncio.sleep(.02)
+            finally:
+                scheduler.cancel()
+                await asyncio.gather(scheduler, return_exceptions=True)
+        self.assertEqual(processed, [other['id']])
+        self.assertEqual(store.read('tasks', paused_task['id'])['run']['status'], 'paused')
+
+    async def test_pause_logs_have_timezone_and_name_without_account_identifiers(self):
+        import io
+        from contextlib import redirect_stdout
+        task = self.make_task(labels=(None,))
+        control = self.start_for_control(task)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            runner.pause_run(task['id'], control, LOGIN)
+            with patch.object(runner, 'require_background_llm_api_key', return_value='test-key'):
+                await runner.resume_run(task['id'], control, LOGIN)
+        text = output.getvalue()
+        self.assertIn('任务已暂停', text)
+        self.assertIn('任务已继续', text)
+        self.assertIn(LOGIN['name'], text)
+        self.assertNotIn(LOGIN['email'], text)
+        self.assertRegex(text, r'\[\d{4}-\d{2}-\d{2} [^\]]+[+-]\d{2}:\d{2}\]')
+
+    async def test_completed_quality_wins_over_last_feedback_pause_request(self):
+        task = self.make_task(labels=(None,))
+        control = self.start_for_control(task)
+        async def annotate(current, row, checkpoint):
+            runner.pause_run(task['id'], control, LOGIN)
+            checkpoint({'quality': {'overall': '有效反馈', 'overall_reason': '合成验证', 'q_labels': {'col_1': '有效反馈'}}, 'quality_complete': True})
+        with patch.object(runner, 'require_background_llm_api_key', return_value='test-key'), patch.object(runner, 'start_llm_usage_task', return_value=None), patch.object(runner, 'annotate_group_feedback', annotate):
+            await runner._run_slice(task['id'], asyncio.Semaphore(1))
+        completed = store.read('tasks', task['id'])
+        self.assertEqual(completed['run']['status'], 'completed')
+        self.assertFalse(completed['run']['pause_requested'])
+
+    async def test_control_rejects_stale_version_run_readonly_and_edit_while_paused(self):
+        from fastapi import HTTPException
+        from app.services import group_tasks as tasks
+        task = self.make_task(labels=(None,))
+        control = self.start_for_control(task)
+        for request in [RunControlRequest(expected_version=task['version']+1, run_id=control.run_id), RunControlRequest(expected_version=task['version'], run_id='different-run')]:
+            with self.assertRaises(HTTPException) as rejected:
+                runner.pause_run(task['id'], request, LOGIN)
+            self.assertEqual(rejected.exception.status_code, 409)
+        with patch.object(runner, 'require_permission', side_effect=HTTPException(403, '只读账号')):
+            with self.assertRaises(HTTPException) as denied:
+                runner.pause_run(task['id'], control, LOGIN)
+            self.assertEqual(denied.exception.status_code, 403)
+        runner.pause_run(task['id'], control, LOGIN)
+        with self.assertRaises(HTTPException):
+            tasks._ensure_version(store.read('tasks', task['id']), task['version'])
+        with patch.object(runner, 'require_background_llm_api_key', return_value='test-key'):
+            with self.assertRaisesRegex(HTTPException, '继续任务'):
+                runner.start_run(task['id'], RunTask(expected_version=task['version']), LOGIN)
+        with patch.object(runner, 'require_background_llm_api_key', side_effect=HTTPException(403, '凭据不可用')):
+            with self.assertRaises(HTTPException):
+                await runner.resume_run(task['id'], control, LOGIN)
+        self.assertEqual(store.read('tasks', task['id'])['run']['status'], 'paused')
+
+    async def test_control_endpoints_validate_target_and_show_persistent_state(self):
+        import httpx
+        from fastapi import FastAPI
+        from unittest.mock import AsyncMock
+        from app.routers import group_tasks as routes
+        task = self.make_task(labels=(None,))
+        control = self.start_for_control(task)
+        app = FastAPI()
+        app.include_router(routes.router)
+        with patch.object(routes, '_current_login', AsyncMock(return_value=LOGIN)), patch.object(runner, 'require_background_llm_api_key', return_value='test-key'):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://isolated.test') as client:
+                response = await client.post('/api/group-tasks/'+task['id']+'/pause', json={'expected_version': task['version']})
+                self.assertEqual(response.status_code, 422)
+                paused = await client.post('/api/group-tasks/'+task['id']+'/pause', json=control.model_dump())
+                self.assertEqual(paused.status_code, 200)
+                self.assertEqual(paused.json()['status'], 'paused')
+                listing = await client.get('/api/group-tasks')
+                self.assertEqual(listing.json()['tasks'][0]['status'], 'paused')
+                resumed = await client.post('/api/group-tasks/'+task['id']+'/resume', json=control.model_dump())
+                self.assertEqual(resumed.status_code, 200)
+                self.assertEqual(resumed.json()['run']['id'], control.run_id)
+
+    async def test_control_storage_failure_does_not_report_success_or_lose_results(self):
+        from fastapi import HTTPException
+        task = self.make_task(labels=('优秀反馈', None))
+        control = self.start_for_control(task)
+        before = store.read('tasks', task['id'])
+        with patch.object(store, 'mutate', side_effect=PermissionError('synthetic write failure')):
+            with self.assertRaises(HTTPException) as rejected:
+                runner.pause_run(task['id'], control, LOGIN)
+        self.assertEqual(rejected.exception.status_code, 503)
+        self.assertEqual(store.read('tasks', task['id']), before)
+        runner.pause_run(task['id'], control, LOGIN)
+        with patch.object(runner.tasks, 'load_task', side_effect=PermissionError('synthetic read failure')):
+            with self.assertRaises(HTTPException) as rejected:
+                await runner.resume_run(task['id'], control, LOGIN)
+        self.assertEqual(rejected.exception.status_code, 503)
+        self.assertEqual(store.read('tasks', task['id'])['run']['status'], 'paused')
+
     async def test_admission_never_reads_roster_and_repeated_start_is_idempotent(self):
         from fastapi import HTTPException
         from unittest.mock import AsyncMock

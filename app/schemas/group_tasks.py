@@ -110,6 +110,10 @@ class VersionRequest(BaseModel):
     expected_version: StrictInt = Field(ge=1)
 
 
+class RunControlRequest(VersionRequest):
+    run_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
+
+
 class PlayerADVDecision(BaseModel):
     expected_version: StrictInt = Field(ge=1)
     player_id: str = Field(min_length=1, max_length=200)

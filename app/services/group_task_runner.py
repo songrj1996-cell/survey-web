@@ -1,6 +1,6 @@
 """Durable fair task scheduler. Browser disconnects cannot cancel a logical run."""
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from copy import deepcopy
 from datetime import datetime, timezone
 from time import perf_counter
@@ -13,7 +13,7 @@ from app.core.llm_context import bind_llm_model_snapshot
 from app.core import config
 from app.core.llm_context import bind_llm_api_key, bind_llm_attempt_observer
 from app.core.llm_limits import AttemptGate, bind_attempt_gate
-from app.core.runtime_logging import bind_runtime_operator, reset_runtime_operator, runtime_operator_from_login
+from app.core.runtime_logging import bind_runtime_operator, reset_runtime_operator, runtime_operator_from_login, runtime_log
 from app.services import group_tasks as tasks
 from app.services.annotate_workflow import annotate_group_feedback, bind_annotate_log_area
 from app.services.feature_access import require_permission
@@ -37,6 +37,8 @@ def start_run(task_id, request, login):
         tasks._ensure_version(task, request.expected_version, allow_busy=True)
         if (task.get("run") or {}).get("status") in tasks.ACTIVE_RUNS:
             return tasks.task_view(task, login)
+        if (task.get("run") or {}).get("status") == "paused":
+            raise HTTPException(409, "任务已暂停，请使用继续任务；不会新建一轮或重置执行额度")
         tasks._refresh_checks(task)
         issues = tasks.readiness_issues(task)
         if issues:
@@ -85,6 +87,113 @@ def start_run(task_id, request, login):
     return store.mutate("tasks", task_id, apply)
 
 
+def _run_elapsed(run):
+    if not run.get("started_at"):
+        return 0.0
+    return max(0.0, (datetime.now(timezone.utc) - datetime.fromisoformat(run["started_at"])).total_seconds()
+               - run.get("paused_seconds", 0.0))
+
+
+def _control_log(level, message, login, **fields):
+    token = bind_runtime_operator(runtime_operator_from_login(login, anonymous_label="本地操作者"))
+    try:
+        runtime_log("群组质量标注", level, message, **fields)
+    finally:
+        reset_runtime_operator(token)
+
+
+def _mark_paused(task, login):
+    run = task["run"]
+    run.update(status="paused", paused_at=tasks.now(), pause_requested=True)
+    tasks._event(task, run.get("pause_login") or login, "任务已暂停", {"run_id": run["id"]})
+
+
+def _control_run(task_id, request, login, *, resume):
+    messages = []
+    try:
+        tasks.load_task(task_id, login, write=True)
+        require_permission(login, "annotate", write=True)
+
+        def apply(task):
+            require_record(task, login, write=True)
+            tasks._ensure_version(task, request.expected_version, allow_busy=True)
+            run = task.get("run") or {}
+            if run.get("id") != request.run_id or run.get("version") != task["version"]:
+                raise HTTPException(409, "任务运行轮次已变化，请刷新后再操作")
+            if resume:
+                if run.get("status") in tasks.ACTIVE_RUNS and not run.get("pause_requested"):
+                    return tasks.task_view(task, login)  # Repeated resume is idempotent.
+                if run.get("status") != "paused":
+                    raise HTTPException(409, "当前尚未暂停完成，请等待后刷新；未启动新任务")
+                require_background_llm_api_key(login)
+                # Validate the saved snapshot; never adopt newly published model settings.
+                try:
+                    snapshot = resume_model_snapshot(run)
+                except ValueError as exc:
+                    raise HTTPException(409, str(exc)) from exc
+                if snapshot is not None:
+                    run["llm_model_snapshot"] = deepcopy(snapshot)
+                paused = max(0.0, (datetime.now(timezone.utc) - datetime.fromisoformat(run["paused_at"])).total_seconds())
+                # A run paused before its first claim has no execution clock to suspend.
+                if run.get("started_at"):
+                    run["paused_seconds"] = run.get("paused_seconds", 0.0) + paused
+                run.update(status="queued", pause_requested=False, paused_at=None, schedule_at=tasks.now(), resumed_at=tasks.now(),
+                           owner_login={key: (login or {}).get(key, "") for key in ("open_id", "email", "name")})
+                tasks._event(task, login, "继续后台标注", {"run_id": run["id"], "preserved_budget": True})
+                messages.append("任务已继续，重新排队处理剩余反馈；已有结果和已用执行额度保留")
+            else:
+                if run.get("status") == "paused" or run.get("pause_requested"):
+                    return tasks.task_view(task, login)
+                # Also fence the narrow gap between AI completion and automatic quality admission.
+                between_stages = (run.get("status") == "completed" and run.get("stage") == "ai"
+                                  and tasks.annotation_settings(task)["quality"]
+                                  and not tasks.annotation_status(task)["quality_complete"])
+                if run.get("status") not in tasks.ACTIVE_RUNS and not between_stages:
+                    raise HTTPException(409, "当前任务未在排队或运行，请刷新查看最新状态")
+                run.update(pause_requested=True, pause_requested_at=tasks.now(),
+                           pause_login={key: (login or {}).get(key, "") for key in ("open_id", "email", "name")})
+                tasks._event(task, login, "申请暂停后台标注", {"run_id": run["id"]})
+                if run["status"] == "running":
+                    messages.append("暂停申请已接受，当前已开始的反馈保存后暂停；期间仍可能调用模型")
+                else:
+                    if run["status"] == "queued":
+                        run["queue_wait_seconds"] = run.get("queue_wait_seconds", 0.0) + max(
+                            0.0, (datetime.now(timezone.utc) - datetime.fromisoformat(run.get("schedule_at", run["queued_at"]))).total_seconds())
+                    _mark_paused(task, login)
+                    messages.append("任务已暂停，不再开始后续反馈；点击继续任务后恢复")
+            task["updated_at"] = tasks.now()
+            return tasks.task_view(task, login)
+
+        result = store.mutate("tasks", task_id, apply)
+        for message in messages:
+            _control_log("info", message, login)
+        return result
+    except HTTPException as exc:
+        _control_log("warning", "继续任务未完成，请核对页面提示后重试" if resume else "暂停任务未完成，请刷新核对页面提示后重试", login,
+                     http_status=exc.status_code, path=f"/api/group-tasks/{task_id}/{'resume' if resume else 'pause'}")
+        raise
+    except OSError as exc:
+        _control_log("error", "任务操作未能确认保存，请刷新核对状态后重试", login)
+        raise HTTPException(503, "任务操作未能确认保存，请刷新核对当前状态后重试") from exc
+
+
+def pause_run(task_id, request, login):
+    return _control_run(task_id, request, login, resume=False)
+
+
+async def resume_run(task_id, request, login):
+    try:
+        current = tasks.load_task(task_id, login, write=True)
+        async with model_operation_scope((current.get("run") or {}).get("llm_model_snapshot"), resume=True):
+            return _control_run(task_id, request, login, resume=True)
+    except ValueError as exc:
+        _control_log("warning", "原模型设置未能核验，任务保持暂停；请查看页面提示", login)
+        raise HTTPException(409, str(exc)) from exc
+    except OSError as exc:
+        _control_log("error", "继续任务未能确认当前状态，请刷新核对后重试", login)
+        raise HTTPException(503, "继续任务未能确认当前状态，请刷新核对后重试") from exc
+
+
 def _fenced(task, run_id, version):
     run = task.get("run") or {}
     if run.get("id") != run_id or run.get("version") != version or task["version"] != version or run.get("status") not in tasks.ACTIVE_RUNS:
@@ -108,14 +217,22 @@ def recover_interrupted_runs(task_ids=None):
                     if row["id"] in run.get("inflight_ids", []) and not tasks.effective_result(current, row)["complete"]:
                         row["model_error"] = run["error"]
                 run["inflight_ids"] = []
-            store.mutate("tasks", task["id"], recover)
+                if run.get("pause_requested"):
+                    _mark_paused(current, run.get("owner_login") or None)
+                    # The service cannot reconstruct in-flight time; do not charge downtime
+                    # after the durable pause request against the execution timeout.
+                    run["paused_at"] = run.get("pause_requested_at") or run["paused_at"]
+                current["updated_at"] = tasks.now()
+                return run.get("status") == "paused"
+            paused = store.mutate("tasks", task["id"], recover)
+            if paused:
+                _control_log("warning", "服务中断后保持任务暂停，已保存结果保留；未确认的远端请求在继续时可能产生重复模型费用", (task.get("run") or {}).get("pause_login"))
 
 
 def _attempt_reservation(task_id, run_id, version, mutate=store.mutate):
     def reserve(task):
         run = _fenced(task, run_id, version)
-        started = datetime.fromisoformat(run["started_at"])
-        if (datetime.now(timezone.utc) - started).total_seconds() >= config.GROUP_RUN_TIMEOUT_SECONDS:
+        if _run_elapsed(run) >= config.GROUP_RUN_TIMEOUT_SECONDS:
             raise RuntimeError("本轮已达到总耗时限制，请核对未完成反馈后重试")
         if run["http_attempts"] >= config.GROUP_RUN_MAX_HTTP_ATTEMPTS:
             raise RuntimeError("本轮已达到模型请求预算，请核对未完成反馈后重试")
@@ -209,7 +326,7 @@ async def _run_slice_impl(task_id, slots):
                     current["updated_at"] = tasks.now()
                 measured_mutate("tasks", task_id, save)
             try:
-                remaining_time = config.GROUP_RUN_TIMEOUT_SECONDS - (datetime.now(timezone.utc) - datetime.fromisoformat(run["started_at"])).total_seconds()
+                remaining_time = config.GROUP_RUN_TIMEOUT_SECONDS - _run_elapsed(run)
                 async with asyncio.timeout(max(0, remaining_time)):
                     await annotate_group_feedback(task, row, checkpoint)
             except asyncio.CancelledError:
@@ -245,18 +362,25 @@ async def _run_slice_impl(task_id, slots):
         def finish(current):
             active = _fenced(current, run_id, version)
             active["inflight_ids"] = []
-            expired = (datetime.now(timezone.utc) - datetime.fromisoformat(active["started_at"])).total_seconds() >= config.GROUP_RUN_TIMEOUT_SECONDS
+            expired = _run_elapsed(active) >= config.GROUP_RUN_TIMEOUT_SECONDS
             exhausted = active["http_attempts"] >= config.GROUP_RUN_MAX_HTTP_ATTEMPTS
             remaining = set(active["target_ids"]) - set(active["attempted_ids"])
-            if remaining and not failure and not expired and not exhausted:
+            complete = len(active["completed_ids"]) == len(active["target_ids"])
+            if active.get("pause_requested") and not (complete and active.get("stage") == "quality"):
+                active["error"] = failure or active.get("error", "")
+                _mark_paused(current, login)
+            elif remaining and not failure and not expired and not exhausted:
                 # Round robin: put this task behind already waiting tasks after a bounded slice.
                 active.update(status="queued", schedule_at=tasks.now())
             else:
-                complete = len(active["completed_ids"]) == len(active["target_ids"])
                 active.update(status="completed" if complete else "incomplete", ended_at=tasks.now(),
                               error=failure or ("本轮达到执行预算，剩余反馈可明确重试" if expired or exhausted else ""))
+                active["pause_requested"] = False
             current["updated_at"] = tasks.now()
-        measured_mutate("tasks", task_id, finish)
+            return deepcopy(active) if active.get("status") == "paused" else None
+        paused_run = measured_mutate("tasks", task_id, finish)
+        if paused_run:
+            _control_log("info", "当前反馈已保存，任务已暂停；不会自动开始后续反馈", paused_run.get("pause_login") or login)
         elapsed = perf_counter() - execution_started
 
         def save_timing(current):
@@ -277,18 +401,19 @@ async def _run_slice_impl(task_id, slots):
             state = tasks.annotation_status(latest)
             if state["ai_complete"] and not state["review_ids"]:
                 def auto_confirm(current):
-                    if current["version"] == version and current["run"]["id"] == run_id:
+                    if current["version"] == version and current["run"]["id"] == run_id and current["run"]["status"] == "completed" and not current["run"].get("pause_requested"):
                         current["ai_confirmation_complete"] = True
                         current["updated_at"] = tasks.now()
                 store.mutate("tasks", task_id, auto_confirm)
                 if state["options"]["quality"] and not state["quality_complete"]:
                     from app.schemas.group_tasks import RunTask
                     try:
-                        with continue_authorized_run():
+                        continuation_models = bind_llm_model_snapshot(snapshot) if latest["run"].get("resumed_at") else nullcontext()
+                        with continue_authorized_run(), continuation_models:
                             start_run(task_id, RunTask(expected_version=version, stage="quality"), login)
                     except HTTPException as exc:
                         def save_next_error(current):
-                            if current["version"] == version:
+                            if current["version"] == version and current["run"]["status"] != "paused":
                                 current["annotation_auto_error"] = str(exc.detail)
                         store.mutate("tasks", task_id, save_next_error)
 
