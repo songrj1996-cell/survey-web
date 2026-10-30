@@ -56,6 +56,43 @@ class WorkflowCase(unittest.TestCase):
 
 
 class GroupTaskTests(WorkflowCase):
+    def test_hidden_formatting_matches_both_sides_without_rewriting_sources(self):
+        plain = entry()['player_id']
+        for roster_id, feedback_id in (('\u202a' + plain + '\u202c', plain),
+                                       (plain, '\ufeff' + plain + '\u200b'),
+                                       ('\u2066' + plain + '\u2069', '\u200e' + plain)):
+            with self.subTest(roster_id=ascii(roster_id), feedback_id=ascii(feedback_id)):
+                task = self.make_task(labels=('有效反馈',))
+                task['feedback'][0]['cells'][0] = feedback_id
+                task['roster_snapshot'] = snapshot([entry(player=roster_id)])
+                before = deepcopy(task)
+                tasks._refresh_checks(task)
+                self.assertEqual(task['feedback'][0]['identity']['player_id'], roster_id)
+                self.assertEqual(task['feedback'][0]['identity_selection'], 'automatic')
+                self.assertEqual(task['feedback'][0]['cells'], before['feedback'][0]['cells'])
+                self.assertEqual(task['roster_snapshot'], before['roster_snapshot'])
+                self.assertFalse(tasks.readiness_issues(task, settlement=True))
+
+    def test_identity_key_only_removes_explicit_formatting(self):
+        from app.core.player_identity import player_identity_key
+        formatting = '\u200b\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2060\u2066\u2067\u2068\u2069\ufeff'
+        self.assertEqual(player_identity_key(formatting + '00123' + formatting), '00123')
+        for value in ('00123', '+628123', '123.0', '12 3', '12-3', '12\u200c3', '12\u200d3'):
+            self.assertEqual(player_identity_key(value), value)
+        self.assertNotEqual(player_identity_key('83866270215'), player_identity_key('83866370215'))
+
+    def test_hidden_formatting_collision_and_empty_ids_cannot_automatch(self):
+        plain = entry()['player_id']
+        task = self.roster_task([entry(), entry(player='\u202a' + plain + '\u202c', source='group_b')])
+        self.assertIsNone(task['feedback'][0]['identity'])
+        self.assertEqual(len(task['feedback'][0]['identity_choices']), 2)
+        task = self.make_task(labels=('有效反馈',))
+        task['feedback'][0]['cells'][0] = '\u202a\u202c'
+        task['roster_snapshot'] = snapshot([entry(player='\u200b')])
+        tasks._refresh_checks(task)
+        self.assertIsNone(task['feedback'][0]['identity'])
+        self.assertTrue(any(issue['kind'] == 'identity' for issue in task['feedback'][0]['issues']))
+
     def roster_task(self, entries, labels=('优秀反馈', '有效反馈')):
         task = self.make_task(labels=labels)
         def seed(current):

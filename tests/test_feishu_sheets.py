@@ -12,6 +12,27 @@ from app.storage import group_workflow as store
 
 
 class FeishuSheetsTests(WorkflowCase):
+    def test_formula_reference_preserves_raw_id_and_rejects_normalized_duplicates(self):
+        from copy import deepcopy
+        source = {**RosterSourceInput(name='测试群', spreadsheet_url='abcdefghij123456', sheet_id='sheet_a',
+                  player_col=0, ori_col=1, status_col=2).model_dump(), 'id': 'group_a', 'revision': 1,
+                  'sheet_title': '名单'}
+        source['formula'].update(mode='same_workbook', sheet_title='名单', target_spreadsheet='abcdefghij123456')
+        store.create('sources', source['id'], source)
+        raw_id = '\u202a' + entry()['player_id'] + '\u202c'
+        payload = {'spreadsheet': 'abcdefghij123456', 'sheet': {'title': '名单'},
+                   'values': [['playerid', 'ori', '状态'], [raw_id, '818043063(6389)', '群内人员']]}
+        before = deepcopy(payload)
+        with patch.object(sheets, 'read_sheet', AsyncMock(return_value=payload)):
+            reference = asyncio.run(sources.validate_formula_reference('group_a', {**LOGIN, 'token': 'fake'}))
+        self.assertEqual(reference['player_ids'][entry()['player_id']], raw_id)
+        self.assertEqual(payload, before)
+        payload['values'].append([entry()['player_id'], '818043064(6389)', '群内人员'])
+        with patch.object(sheets, 'read_sheet', AsyncMock(return_value=payload)):
+            with self.assertRaises(HTTPException) as caught:
+                asyncio.run(sources.validate_formula_reference('group_a', {**LOGIN, 'token': 'fake'}))
+        self.assertIn('重复 playerid', caught.exception.detail)
+
     def test_urls_are_parsed_not_fetched_and_private_hosts_rejected(self):
         self.assertEqual(sheets.parse_reference("https://tenant.feishu.cn/wiki/abcdefghij123456?sheet=sheet_a"),("wiki","abcdefghij123456"))
         for value in ("http://127.0.0.1/sheets/abcdefghij123456","https://feishu.cn.evil.test/sheets/abcdefghij123456","https://user@tenant.feishu.cn/sheets/abcdefghij123456"):

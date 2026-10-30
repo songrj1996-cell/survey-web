@@ -7,6 +7,31 @@ from app.services.task_records import aggregate_players, clipboard_records, look
 
 
 class TaskRecordsTests(WorkflowCase):
+    def test_clipboard_uses_exact_current_roster_id_for_match_formula(self):
+        from html import escape
+        from copy import deepcopy
+        from test_group_tasks import entry, snapshot
+        from app.storage import group_workflow as store
+        task = self.make_task(labels=('优秀反馈',))
+        original = deepcopy(task['feedback'][0])
+        old_id = '\u202a' + entry()['player_id'] + '\u202c'
+        store.mutate('tasks', task['id'], lambda current: current.update(roster_snapshot=snapshot([entry(player=old_id)])))
+        task = tasks.confirm_task(task['id'], task['version'], LOGIN)
+        current_id = '\u200e' + entry()['player_id']
+        reference = {'sheet_title': '名单', 'player_col': 0, 'ori_col': 1, 'status_col': 2,
+                     'target_spreadsheet': 'testbook', 'group_name': '测试群',
+                     'player_ids': {entry()['player_id']: current_id}}
+        with patch('app.services.roster_sources.validate_formula_reference', AsyncMock(return_value=reference)):
+            copied = asyncio.run(clipboard_records(task['id'], task['version'], LOGIN))
+        cells = copied['text'].split('\t')
+        self.assertEqual(cells[2], _text(current_id, force_text=True))
+        self.assertIn(escape(cells[2]), copied['html'])
+        self.assertEqual(len(cells), 12)
+        self.assertIn('MATCH(INDEX($C:$C,ROW())', cells[3])
+        self.assertEqual(task['feedback'][0]['cells'], original['cells'])
+        self.assertEqual(task['feedback'][0]['quality'], original['quality'])
+        self.assertEqual(task['players'][0]['total'], 200)
+
     def test_excluded_player_remains_visible_but_is_not_copied(self):
         from test_group_tasks import entry, snapshot
         from app.schemas.group_tasks import FeedbackCorrection

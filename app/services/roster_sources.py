@@ -5,6 +5,7 @@ import re
 import uuid
 
 from fastapi import HTTPException
+from app.core.player_identity import player_identity_key
 
 from app.integrations import feishu_sheets as sheets
 from app.services.feature_access import owner_identity, require_permission
@@ -232,10 +233,13 @@ async def validate_formula_reference(source_id, login):
             if signatures(synced["entries"]) != signatures(data["entries"]):
                 raise sheets.SheetsError("目标同步名单与来源不一致，请先同步再复制，不能生成错误查找公式")
             reference["target_spreadsheet"] = target
-        duplicates = Counter(row["player_id"] for row in data["entries"])
+        duplicates = Counter(player_identity_key(row["player_id"]) for row in data["entries"])
         if any(count > 1 for count in duplicates.values()):
             raise sheets.SheetsError("名单中有重复 playerid，查找公式不能唯一定位；请先在名单中处理重复")
         reference["group_name"] = source["name"]
+        # Keep the exact current source text for MATCH formulas, including invisible
+        # formatting. Comparison keys must never be written back to the roster.
+        reference["player_ids"] = {player_identity_key(row["player_id"]): row["player_id"] for row in data["entries"]}
         return reference
     except sheets.SheetsError as exc:
         raise HTTPException(409, f"{source['name']}：{exc}") from None

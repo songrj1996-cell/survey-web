@@ -13,6 +13,7 @@ from fastapi import HTTPException
 
 from app.core import config
 from app.core.parsing import parse_file_with_cell_metadata
+from app.core.player_identity import player_identity_key
 from app.schemas.group_tasks import FeedbackMapping, TaskRules
 from app.services.feature_access import owner_identity, require_permission
 from app.services.group_access import record_scope, require_record
@@ -315,7 +316,7 @@ def _refresh_checks(task: dict) -> None:
     entries = (snapshot or {}).get("entries", [])
     by_player = defaultdict(list)
     for entry in entries:
-        by_player[entry["player_id"]].append(entry)
+        by_player[player_identity_key(entry["player_id"])].append(entry)
     if not snapshot or task.get("roster_error"):
         task["input_issues"].append({"kind": "roster", "message": task.get("roster_error") or "请读取已配置的飞书名单以核查身份"})
     for row in task["feedback"]:
@@ -324,13 +325,14 @@ def _refresh_checks(task: dict) -> None:
         row["adv"] = str(edits.get("adv", _cell(row, mapping.get("adv_col")))).strip()
         row["excluded"] = False
         row["issues"] = []
-        if not row["player_id"]:
+        if not player_identity_key(row["player_id"]):
             row["issues"].append({"kind": "identity", "message": "playerid 为空，请补填原始身份"})
         elif str(mapping["id_col"]) in row.get("cell_issues", {}) and "player_id" not in edits:
             row["issues"].append({"kind": "identity", "message": row["cell_issues"][str(mapping["id_col"])]})
         if row["adv"] and str(mapping.get("adv_col")) in row.get("cell_issues", {}) and "adv" not in edits:
             row["issues"].append({"kind": "adv", "message": "ADV：" + row["cell_issues"][str(mapping["adv_col"])]})
-        candidates = by_player.get(row["player_id"], [])
+        player_key = player_identity_key(row["player_id"])
+        candidates = by_player.get(player_key, []) if player_key else []
         active = [item for item in candidates if item.get("eligible") is True]
         chosen = [item for item in active if item["key"] == edits.get("candidate_key")]
         row["reward_excluded"] = row["player_id"] in task.get("reward_exclusions", {})

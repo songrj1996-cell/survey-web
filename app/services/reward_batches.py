@@ -4,6 +4,7 @@ from copy import deepcopy
 import uuid
 
 from fastapi import HTTPException
+from app.core.player_identity import player_identity_key
 
 from app.schemas.reward_roster import RewardAnalyzeRequest
 from app.services import group_tasks as tasks
@@ -130,7 +131,7 @@ def _collect_sources(selection, login):
 def _reconcile(rows, snapshot, identity_choices):
     by_player = defaultdict(list)
     for entry in snapshot["entries"]:
-        by_player[entry["player_id"]].append(entry)
+        by_player[player_identity_key(entry["player_id"])].append(entry)
     eligible, excluded, issues, changes = [], [], [], []
     for original in rows:
         row = deepcopy(original)
@@ -138,7 +139,9 @@ def _reconcile(rows, snapshot, identity_choices):
             row["exclusion_reason"] = "任务中已手动排除该玩家奖励"
             excluded.append(row)
             continue
-        candidates = [entry for entry in by_player[row["player_id"]] if not row.get("source_id") or entry["source_id"] == row["source_id"]]
+        player_key = player_identity_key(row["player_id"])
+        candidates = [entry for entry in by_player[player_key] if player_key
+                      and (not row.get("source_id") or entry["source_id"] == row["source_id"])]
         # Retired memberships cannot compete with an active identity. Unknown states
         # remain candidates so that missing configuration never silently pays a player.
         current_candidates = [entry for entry in candidates if entry.get("eligible") is not False]

@@ -11,6 +11,26 @@ from app.storage import group_workflow as store
 
 
 class RewardBatchTests(WorkflowCase):
+    def test_fresh_roster_hidden_formatting_still_generates_correct_txt(self):
+        task, _, selection = self.prepare()
+        raw_id = '\u202a' + entry()['player_id'] + '\u202c'
+        fresh = snapshot([entry(player=raw_id)])
+        with patch.object(rewards, 'read_roster_snapshot', AsyncMock(return_value=fresh)):
+            preview = asyncio.run(rewards.create_preview(selection, LOGIN))
+        self.assertTrue(preview['ready'])
+        self.assertFalse(preview['identity_issues'])
+        batch = self.generate(preview, roster=fresh)
+        self.assertEqual(batch['txt_preview'], '6389\t818043063\t301-500\r\n')
+        self.assertEqual(batch['total_diamonds'], 500)
+
+    def test_settlement_does_not_fuzzy_match_or_choose_hidden_id_collisions(self):
+        row = {'row_id': 'synthetic', 'player_id': '83866270215', 'task': '合成任务', 'sheet': ''}
+        _, _, issues, _ = rewards._reconcile([row], snapshot([entry(player='83866370215')]), {})
+        self.assertEqual(len(issues), 1)
+        row['player_id'] = entry()['player_id']
+        _, _, issues, _ = rewards._reconcile([row], snapshot([entry(), entry(player='\u202a' + row['player_id'] + '\u202c', source='group_b')]), {})
+        self.assertEqual(len(issues[0]['candidates']), 2)
+
     def test_manual_exclusion_survives_new_membership_and_omits_final_txt(self):
         from app.schemas.group_tasks import FeedbackCorrection
         task = self.make_task(labels=('优秀反馈', '有效反馈'))

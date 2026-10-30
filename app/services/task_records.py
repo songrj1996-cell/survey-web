@@ -4,6 +4,7 @@ from html import escape
 import re
 
 from fastapi import HTTPException
+from app.core.player_identity import player_identity_key
 
 
 def aggregate_players(task: dict) -> list[dict]:
@@ -95,7 +96,9 @@ async def clipboard_records(task_id: str, version: int, login, source_id: str = 
     rows, html_rows = [], []
     for player in players:
         reference = references[player["source_id"]]
-        cells = [task["rules"]["payout_date"], _text(task["rules"]["name"]), _text(player["player_id"], force_text=True),
+        lookup_id = reference.get("player_ids", {}).get(player_identity_key(player["player_id"]),
+                    (player.get("identity") or {}).get("player_id", player["player_id"]))
+        cells = [task["rules"]["payout_date"], _text(task["rules"]["name"]), _text(lookup_id, force_text=True),
                  lookup_formula(reference, reference["ori_col"]), _text(player["adv"], force_text=bool(player["adv"])),
                  lookup_formula(reference, reference["status_col"]), "是" if player["form_valid"] else "否",
                  player["data_value"], "不适用" if player["data_pass"] is None else "是" if player["data_pass"] else "否",
