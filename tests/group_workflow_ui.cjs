@@ -294,6 +294,38 @@ async function verifyRuleEditSafety() {
   await click('record-restore-reward',{id:'response0'});
   assert.match(records(),/排除该玩家奖励/);
   assert(toasts.at(-1)[0].includes('已恢复该玩家奖励'));
+  const unmatched={...inactive,identity_candidates:[],identity_choices:[],
+    issues:[{kind:'roster_identity',message:'名单中找不到 playerid，请核对名单后重新读取，或排除该玩家奖励'}]};
+  const unmatchedTask={...inactiveTask,feedback:[unmatched,feedback[1]],
+    confirmation_issues:[{response_id:unmatched.id,message:unmatched.issues[0].message}]};
+  requestHook=undefined;fetchedTask=unmatchedTask;await click('records',{id:'task'});
+  assert.match(records(),/名单中找不到 playerid/);
+  assert.match(records(),/data-gw="record-exclude"/);
+  assert.match(records(),/反馈和标注结果保留/);
+  assert.doesNotMatch(records(),/data-fix="candidate_key"/);
+  requestHook=async(url,options)=>{if(url.endsWith('/feedback/response0')){
+    assert.equal(options.body.reward_excluded,true);
+    assert.equal(options.body.expected_version,unmatchedTask.version);
+    fetchedTask={...stableTask,confirmed_version:null,feedback:[{...feedback[0],reward_excluded:true},feedback[1]],
+      players:[{...players[0],reward_excluded:true,base:0,excellent:0,total:0},players[1]]};return fetchedTask;
+  }};
+  await click('record-exclude',{id:'response0'});
+  assert.match(records(),/恢复该玩家奖励/);
+  assert.match(records(),/复制范围：全部群 · 1 位玩家/);
+  requestHook=async(url,options)=>{if(url.endsWith('/feedback/response0')){
+    assert.equal(options.body.reward_excluded,false);fetchedTask=unmatchedTask;return fetchedTask;
+  }};
+  await click('record-restore-reward',{id:'response0'});
+  assert.match(records(),/名单中找不到 playerid/);
+  assert.match(records(),/data-gw="record-exclude"/);
+  requestHook=undefined;
+  for(const failed of [
+    {...unmatchedTask,can_edit:false},
+    {...unmatchedTask,roster_error:'合成读取失败',feedback:[{...unmatched,reward_exclusion_available:false},feedback[1]]}
+  ]){
+    fetchedTask=failed;await click('records',{id:'task'});
+    assert(failed.can_edit===false?/data-gw="record-exclude" disabled/.test(records()):!records().includes('data-gw="record-exclude"'));
+  }
   fetchedTask={...inactiveTask,can_edit:false};requestHook=undefined;await click('records',{id:'task'});
   assert.match(records(),/data-gw="record-exclude" disabled/);
   fetchedTask={...stableTask,can_edit:false,feedback:[{...feedback[0],reward_excluded:true}],

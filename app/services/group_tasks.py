@@ -334,16 +334,19 @@ def _refresh_checks(task: dict) -> None:
         active = [item for item in candidates if item.get("eligible") is True]
         chosen = [item for item in active if item["key"] == edits.get("candidate_key")]
         row["reward_excluded"] = row["player_id"] in task.get("reward_exclusions", {})
-        row["reward_exclusion_available"] = bool(snapshot and candidates and all(item.get("eligible") is False for item in candidates))
+        row["reward_exclusion_available"] = bool(
+            snapshot and not task.get("roster_error") and row["player_id"]
+            and not any(issue["kind"] == "identity" for issue in row["issues"])
+            and (not candidates or all(item.get("eligible") is False for item in candidates)))
         row["identity_candidates"] = deepcopy(candidates)
         row["identity_choices"] = deepcopy(active)
         row["identity"] = deepcopy(active[0] if len(active) == 1 else chosen[0] if len(chosen) == 1 else None)
         row["identity_selection"] = "automatic" if len(active) == 1 else "manual" if chosen else "unresolved"
         if snapshot and row["player_id"] and not row["identity"]:
             message = ("多个名单条目均为群内成员，请选择所属群" if len(active) > 1 else
-                       "匹配的名单条目均不在群内，可排除该玩家奖励" if row["reward_exclusion_available"] else
+                       "匹配的名单条目均不在群内，可排除该玩家奖励" if candidates and row["reward_exclusion_available"] else
                        "名单状态尚未识别，请维护名单来源后重新读取" if candidates else
-                       "名单中找不到 playerid，请维护名单后重新读取")
+                       "名单中找不到 playerid，请核对名单后重新读取，或排除该玩家奖励")
             row["issues"].append({"kind": "roster_identity", "message": message})
         if row["identity"] and row["identity"].get("identity_error"):
             row["issues"].append({"kind": "roster_identity", "message": row["identity"]["identity_error"]})
@@ -441,12 +444,13 @@ def correct_feedback(task_id, response_id, request, login):
             if not annotation_complete(task):
                 raise HTTPException(409, "请先完成质量标注，再核对玩家奖励")
             if excluded and (not row["reward_exclusion_available"] or task.get("roster_error")):
-                raise HTTPException(409, "请读取最新名单；仅当匹配身份均不在群内时可排除奖励")
+                raise HTTPException(409, "请成功读取最新名单；仅当名单中找不到 playerid 或匹配身份均不在群内时可排除奖励")
             decisions = task.setdefault("reward_exclusions", {})
             before = deepcopy(decisions.get(row["player_id"]))
             if excluded:
                 decisions[row["player_id"]] = {"at": now(), **owner_identity(login),
-                                                "snapshot_id": task["roster_snapshot"]["id"]}
+                                                "snapshot_id": task["roster_snapshot"]["id"],
+                                                "reason": "名单中找不到 playerid" if not row["identity_candidates"] else "匹配身份均不在群内"}
             else:
                 decisions.pop(row["player_id"], None)
             return {"player_id": row["player_id"], "reward_excluded": excluded, "before": before,

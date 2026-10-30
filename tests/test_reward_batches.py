@@ -11,6 +11,34 @@ from app.storage import group_workflow as store
 
 
 class RewardBatchTests(WorkflowCase):
+    def test_unmatched_player_exclusion_persists_into_txt_and_stales_on_restore(self):
+        from app.schemas.group_tasks import FeedbackCorrection
+        task = self.make_task(labels=('优秀反馈', '有效反馈'))
+        other = entry('008123456789', '1234567(2345)', 'group_b')
+        def seed(current):
+            current['feedback'][1]['cells'][0] = other['player_id']
+            current['roster_snapshot'] = snapshot([other])
+        store.mutate('tasks', task['id'], seed)
+        task = tasks.correct_feedback(task['id'], task['feedback'][0]['id'], FeedbackCorrection(
+            expected_version=task['version'], reward_excluded=True), LOGIN)
+        store.create('sources', 'group_b', {'id': 'group_b', 'revision': 1, 'enabled': True})
+        fresh = snapshot([other])
+        with patch.object(rewards, 'read_roster_snapshot', AsyncMock(return_value=fresh)):
+            preview = asyncio.run(rewards.create_preview(RewardSelection(dates=['2026-10-14'],
+                task_versions={task['id']: task['version']}), LOGIN))
+        self.assertTrue(preview['ready'])
+        self.assertFalse(preview['identity_issues'])
+        self.assertEqual(preview['result']['total_diamonds'], 100)
+        self.assertEqual(preview['excluded_rows'][0]['player_id'], entry()['player_id'])
+        batch = self.generate(preview, roster=fresh)
+        self.assertEqual(batch['txt_preview'], '2345\t1234567\t301-100\r\n')
+        self.assertEqual(len(batch['excluded_rows']), 1)
+        tasks.correct_feedback(task['id'], task['feedback'][0]['id'], FeedbackCorrection(
+            expected_version=task['version'], reward_excluded=False), LOGIN)
+        with self.assertRaises(HTTPException):
+            self.generate(preview, key='different-key-after-restore', roster=fresh)
+        self.assertEqual(rewards.get_batch(batch['id'], LOGIN)['txt_preview'], batch['txt_preview'])
+
     def test_manual_exclusion_survives_new_membership_and_omits_final_txt(self):
         from app.schemas.group_tasks import FeedbackCorrection
         task = self.make_task(labels=('优秀反馈', '有效反馈'))
