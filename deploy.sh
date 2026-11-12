@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# survey-web 部署脚本（Ubuntu 20/22，Python 3.10+，systemd）
+# survey-web 部署脚本（Ubuntu 22，Python 3.12+，systemd）
+# 注意：代码依赖 Python 3.11+ 的特性（asyncio.timeout、wait_for 抛内置 TimeoutError），
+# 服务器须先装好 python3.12（Ubuntu 22.04 需 deadsnakes PPA），否则本脚本第 3 步会直接报错退出。
 # 在服务器上 git clone 或 scp 代码后，以 root 运行：sudo ./deploy.sh
 set -euo pipefail
 
@@ -42,7 +44,7 @@ chown -R "$SERVICE_USER:$SERVICE_USER" "$DEPLOY_DIR"
 # 3. Python 虚拟环境 + 依赖
 echo ""
 echo "==> [3/6] 创建 Python venv 并安装依赖…"
-python3 -m venv "$DEPLOY_DIR/.venv"
+python3.12 -m venv "$DEPLOY_DIR/.venv"
 "$DEPLOY_DIR/.venv/bin/pip" install -q --upgrade pip
 "$DEPLOY_DIR/.venv/bin/pip" install -r "$DEPLOY_DIR/requirements.txt"
 
